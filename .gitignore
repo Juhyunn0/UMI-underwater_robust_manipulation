@@ -1,0 +1,35 @@
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Vendor / large binaries (ZED SDK installers, wheels, etc.)
+vendor/
+*.run
+*.whl
+*.tar.gz
+*.zip
+
+# Local build cache
+build_cache/
+
+# Large dataset directory (recordings, calibration data, etc.)
+data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# Make sure requirements.txt is tracked even if a parent rule would match
+!requirements.txt

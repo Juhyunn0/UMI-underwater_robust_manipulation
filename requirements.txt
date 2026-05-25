@@ -1,0 +1,14 @@
+# Core scientific stack
+numpy>=2.0,<3.0
+opencv-python>=4.10
+
+# AprilTag detection
+pupil-apriltags>=1.0.4
+
+# Factor-graph SLAM
+gtsam>=4.2
+
+# ZED SDK Python bindings (pyzed):
+# Install from the ZED SDK or the wheel in vendor/ (e.g., vendor/pyzed-5.2-cp314-cp314-linux_x86_64.whl)
+# rather than from PyPI on most Linux systems.
+# pyzed==5.2

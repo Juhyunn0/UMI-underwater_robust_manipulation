@@ -1,0 +1,26 @@
+pool:
+  length_m: 4.877
+  width_m: 1.8
+  depth_m: 1.143
+  # Visualization water fill level; load_runtime_config mirrors water.surface_height_m here.
+  water_depth_m: 0.8255
+  pool_corner_offset_m: 0.10
+  pool_long_axis: "y"
+  # Tag 1 is the world-frame anchor. Keep this at the measured anchor location
+  # used by the fixed pool overlay; for the Tag-1 frame it is normally origin.
+  tag1_position_m: [0.0, 0.108, 0.0]
+
+water:
+  # Fixed water-surface height above the anchor-tag floor plane, in the Tag-1
+  # world frame. Update this when the pool water level changes.
+  surface_height_m: 0.8255
+  n_air: 1.0
+  n_water: 1.333
+  # Override hook for the true gravity/up vector in the anchor frame.
+  # Existing TagSLAM maps place the camera above the floor at negative Z.
+  up_axis_world: [0.0, 0.0, -1.0]
+
+tags:
+  # Physical AprilTag edge length used by both SLAM pose estimation and visualization.
+  # Explicit --tag-size overrides this value for experiments.
+  tag_size_m: 0.170
