@@ -459,6 +459,114 @@ within one run on one host).
 
 ---
 
+## Experiment workflow (GUI end-to-end)
+
+The **Experiment** tab in the Gantry Control Panel (`src/gantry_panel.py`) provides a
+single-click workflow that coordinates gantry motion, fisheye+TagSLAM recording, and
+post-run comparison plots.
+
+### Quick-start
+
+```bash
+# Real hardware
+python src/gantry_panel.py
+
+# Mock gantry + mock camera (no hardware needed — end-to-end smoke test)
+python src/gantry_panel.py --mock --mock-camera
+```
+
+### Checklist → Countdown → Run → Outputs
+
+1. **Pre-flight checklist** — all indicators must turn green:
+   - Controller connected (connect from the Connection bar first)
+   - Home reference set for X, Y, Z (home all axes on the Setup tab)
+   - Soft limits loaded (auto-loaded on connect; reload from Setup if needed)
+   - Path defined (add waypoints on the Sequences tab, or load a CSV)
+   - Fisheye camera reachable (click **Test Camera** on the Experiment tab)
+   - Fisheye calibration YAML loaded (browse to your `fisheye_calibration.yaml`)
+   - Tag size configured (default 0.170 m)
+
+2. **Path source** — choose *Sequences tab waypoints* (default) or a CSV file
+   (`x_mm,y_mm,z_mm,speed_mm_s,dwell_s`).  From the Sequences tab you can click
+   **→ Experiment** to copy waypoints and jump to the Experiment tab.
+
+3. **Experiment parameters**:
+   - *Pre-motion countdown* (default 2 s): countdown before motion starts.
+     The fisheye+TagSLAM detector starts during the countdown when
+     *Tag detection during countdown* is checked (default ON), giving the SLAM
+     backend a few frames to bootstrap before motion begins.
+   - *Post-motion settle time* (default 2 s): keep recording after the last
+     waypoint to capture overshoot/oscillation.
+   - *Output folder name*: leave blank for an auto-generated timestamp.
+
+4. Click **▶ Start Experiment**.  The state label cycles:
+   `COUNTDOWN T−2.0s` → `MOTION (waypoint 3/12)` → `SETTLE` → `POSTPROCESS` → `DONE`
+
+5. Click **■ Stop Experiment** (or hit **⚠ EMERGENCY STOP ALL**) at any time to
+   abort cleanly.  Partial data is post-processed, `run_metadata.json` gains
+   `"aborted": true`.
+
+### Output files in `data/YYYYMMDD/<timestamp>_experiment/`
+
+| File | Content |
+|------|---------|
+| `gantry_telemetry.csv` | 100 Hz gantry pose/vel/acc (unchanged schema) |
+| `camera_trajectory.csv` | TagSLAM camera poses + `gantry_x/y/z_mm`, `translation_error_mm` |
+| `tag_poses.csv` | Optimized tag positions |
+| `trajectory_interactive.html` | 3D interactive viewer |
+| `comparison_topdown.png` | Top-down overlay: camera traj (viridis) + gantry GT (orange) |
+| `comparison_plot.png` | 3×3 grid: pose/vel/acc × X/Y/Z, gantry vs AprilTag |
+| `pose_velocity_acceleration.html` | Interactive 9-panel comparison (synchronized hover) |
+| `run_metadata.json` | CLI args, timing, output paths, alignment note |
+| `frames/` | Raw fisheye frames (if recording was active) |
+
+### Aligning the two CSVs in pandas
+
+Both CSVs share the column `elapsed_s = timestamp_monotonic − t0` where `t0` is
+the monotonic time at the start of the countdown.  To merge them:
+
+```python
+import pandas as pd
+
+gantry = pd.read_csv("gantry_telemetry.csv")
+camera = pd.read_csv("camera_trajectory.csv")
+
+# Nearest-neighbour join within one camera frame interval
+merged = pd.merge_asof(
+    camera.sort_values("elapsed_s"),
+    gantry.sort_values("elapsed_s"),
+    on="elapsed_s",
+    direction="nearest",
+    tolerance=1.0 / 30,   # one 30-fps frame
+    suffixes=("_cam", "_gantry"),
+)
+```
+
+### Calibrating `gantry_anchor_offset_mm`
+
+By default, the overlay plot aligns the two trajectories at their first sample
+("first-sample-zeroed").  For a metrically correct alignment, measure the vector
+from the gantry's home origin to the anchor AprilTag and add it to your
+calibration YAML:
+
+```yaml
+# fisheye_calibration.yaml
+K: ...
+D: ...
+image_size: [1280, 720]
+T_gantry_camera:
+  - [1,0,0,0]
+  - [0,1,0,0]
+  - [0,0,1,-0.17]
+  - [0,0,0,1]
+gantry_anchor_offset_mm: [1250.0, 800.0, 0.0]   # X, Y, Z from gantry home to anchor tag
+```
+
+When this key is present, the overlay plot and `run_metadata.json` report
+`"alignment": "gantry_anchor_offset_mm"` instead of the fallback warning.
+
+---
+
 ## Safety notes
 
 * `Ctrl+C` triggers a SIGINT that calls `controller.stop_axis(mode=2)` on

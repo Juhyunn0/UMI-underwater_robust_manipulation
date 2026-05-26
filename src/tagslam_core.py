@@ -4445,3 +4445,631 @@ def print_backend_update(update: BackendUpdate, observations: list[TagObservatio
         f"detections={tag_ids} used={update.used_observation_count}{std_text}",
         flush=True,
     )
+
+
+# =============================================================================
+# Experiment comparison visualizations (new — do not touch existing writers)
+# =============================================================================
+
+def write_overlay_topdown_plot(
+    path: Path,
+    gantry_traj_mm: list[dict],
+    camera_traj_rows: list[dict],
+    tag_pose_rows: list[dict],
+    anchor_id: int,
+    T_gantry_camera: "np.ndarray | None",
+    pool_cfg: dict,
+    gantry_anchor_offset_mm: "list[float] | None" = None,
+    run_name: str = "",
+) -> "Path | None":
+    """Top-down (X, Y) matplotlib PNG that overlays:
+    - Pool outline (light gray dashed, from pool_cfg)
+    - AprilTag positions (numbered markers, anchor highlighted in cyan)
+    - Estimated camera trajectory (viridis colormap, time-encoded)
+    - Gantry ground-truth trajectory (orange dashed)
+
+    Frame alignment:
+    - If *gantry_anchor_offset_mm* is provided, subtract it from gantry XY
+      before plotting so both trajectories share the same origin.
+    - Otherwise a first-sample offset is applied (approximate alignment).
+
+    Returns the written path or None on error.
+    """
+    try:
+        os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.cm as cm
+        import matplotlib.patches as mpatches
+    except ImportError as exc:
+        path.with_suffix(".txt").write_text(
+            f"matplotlib required for overlay plot.\n{exc}\n", encoding="utf-8"
+        )
+        return None
+
+    if not camera_traj_rows:
+        return None
+
+    # ── camera trajectory (meters, SLAM world frame) ─────────────────────────
+    cam_xy = []
+    for row in camera_traj_rows:
+        try:
+            cam_xy.append((float(row["x_m"]), float(row["y_m"])))
+        except (KeyError, ValueError):
+            pass
+    if not cam_xy:
+        return None
+
+    # ── gantry trajectory (mm → m, aligned) ─────────────────────────────────
+    gantry_xy_m = []
+    for row in gantry_traj_mm:
+        try:
+            gx = float(row.get("x_mm", 0.0)) / 1000.0
+            gy = float(row.get("y_mm", 0.0)) / 1000.0
+            if T_gantry_camera is not None:
+                # Add camera-body offset in gantry frame (same as render_topdown_panel)
+                gx += float(T_gantry_camera[0, 3])
+                gy += float(T_gantry_camera[1, 3])
+            gantry_xy_m.append((gx, gy))
+        except (KeyError, ValueError):
+            pass
+
+    # Alignment: subtract anchor offset or first-sample align
+    if gantry_anchor_offset_mm is not None and len(gantry_anchor_offset_mm) >= 2:
+        ox = gantry_anchor_offset_mm[0] / 1000.0
+        oy = gantry_anchor_offset_mm[1] / 1000.0
+        gantry_xy_m = [(x - ox, y - oy) for x, y in gantry_xy_m]
+        aligned_note = "gantry_anchor_offset_mm"
+    elif gantry_xy_m and cam_xy:
+        ox = gantry_xy_m[0][0] - cam_xy[0][0]
+        oy = gantry_xy_m[0][1] - cam_xy[0][1]
+        gantry_xy_m = [(x - ox, y - oy) for x, y in gantry_xy_m]
+        aligned_note = "first-sample-zeroed"
+    else:
+        aligned_note = "none"
+
+    # ── tag positions ─────────────────────────────────────────────────────────
+    tag_xy = {}
+    for row in tag_pose_rows:
+        try:
+            tid = int(row["tag_id"])
+            tag_xy[tid] = (float(row["x_m"]), float(row["y_m"]))
+        except (KeyError, ValueError):
+            pass
+
+    # ── pool outline ─────────────────────────────────────────────────────────
+    pool_cfg = normalize_pool_config(pool_cfg)
+    pool_geom = compute_pool_geometry(pool_cfg)
+
+    # ── plot ─────────────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(10, 8), dpi=140)
+    ax.set_facecolor("#0f0f12")
+    fig.patch.set_facecolor("#0f0f12")
+
+    # Pool floor outline
+    floor = pool_geom.floor  # shape (4, 3)
+    closed = np.vstack([floor, floor[0]])
+    ax.plot(closed[:, 0], closed[:, 1],
+            color="#444", linestyle="--", linewidth=1.2, label="Pool outline")
+
+    # Tags
+    for tid, (tx, ty) in tag_xy.items():
+        color = "#00e5e5" if tid == anchor_id else "#aaa"
+        ax.scatter(tx, ty, color=color, s=40, zorder=5)
+        ax.annotate(str(tid), (tx, ty), textcoords="offset points", xytext=(5, 4),
+                    fontsize=7, color=color)
+
+    # Camera trajectory (viridis)
+    n = len(cam_xy)
+    if n >= 2:
+        cmap = cm.get_cmap("viridis")
+        for i in range(n - 1):
+            t_frac = i / max(n - 1, 1)
+            ax.plot([cam_xy[i][0], cam_xy[i + 1][0]],
+                    [cam_xy[i][1], cam_xy[i + 1][1]],
+                    color=cmap(t_frac), linewidth=1.5, alpha=0.9)
+        ax.scatter(*cam_xy[0],  color=cmap(0.0),  s=60, zorder=6, marker="^")
+        ax.scatter(*cam_xy[-1], color=cmap(1.0),  s=60, zorder=6, marker="s")
+    sm = plt.cm.ScalarMappable(cmap="viridis", norm=plt.Normalize(0, 1))
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, fraction=0.03, pad=0.02)
+    cbar.set_label("time", color="#ccc", fontsize=9)
+    cbar.ax.yaxis.set_tick_params(color="#ccc")
+    plt.setp(plt.getp(cbar.ax.axes, "yticklabels"), color="#ccc", fontsize=8)
+
+    # Gantry trajectory
+    if len(gantry_xy_m) >= 2:
+        gx_arr = [p[0] for p in gantry_xy_m]
+        gy_arr = [p[1] for p in gantry_xy_m]
+        ax.plot(gx_arr, gy_arr, color="#ff7700", linestyle="--",
+                linewidth=1.8, alpha=0.85, zorder=4)
+        ax.scatter(gx_arr[0],  gy_arr[0],  color="#ff7700", s=60, zorder=6, marker="^")
+        ax.scatter(gx_arr[-1], gy_arr[-1], color="#ff7700", s=60, zorder=6, marker="s")
+
+    # Legend
+    legend_items = [
+        mpatches.Patch(facecolor="#555", label="Pool"),
+        plt.Line2D([0], [0], color=cm.get_cmap("viridis")(0.5), linewidth=2, label="Camera (viridis)"),
+        plt.Line2D([0], [0], color="#ff7700", linestyle="--", linewidth=2, label="Gantry GT"),
+    ]
+    ax.legend(handles=legend_items, facecolor="#222", edgecolor="#555",
+              labelcolor="#ddd", fontsize=8, loc="upper left")
+
+    title = run_name or "Experiment"
+    ax.set_title(f"{title} — Top-down (X, Y) [m]  align={aligned_note}",
+                 color="#ddd", fontsize=11)
+    ax.set_xlabel("X [m]", color="#ccc")
+    ax.set_ylabel("Y [m]", color="#ccc")
+    ax.tick_params(colors="#aaa")
+    for sp in ax.spines.values():
+        sp.set_color("#444")
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=140, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return path
+
+
+def write_pose_velocity_acceleration_plot(
+    path: Path,
+    gantry_csv: Path,
+    camera_csv: Path,
+) -> "Path | None":
+    """3×3 matplotlib PNG: rows = Pose / Velocity / Acceleration, cols = X / Y / Z.
+
+    Overlays gantry ground truth (solid blue) and AprilTag estimate (dashed red).
+    Velocity and acceleration for the camera trajectory are derived using the
+    same 5-sample SMA central-difference as GantryTelemetryLogger.
+    Per-axis pose RMSE (mm) annotated in subplot titles.
+    """
+    try:
+        os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        path.with_suffix(".txt").write_text(
+            f"matplotlib required.\n{exc}\n", encoding="utf-8"
+        )
+        return None
+
+    import csv as _csv
+
+    def _load_csv(p: Path) -> list[dict[str, str]]:
+        if not p.exists():
+            return []
+        with p.open(newline="", encoding="utf-8") as fh:
+            return list(_csv.DictReader(fh))
+
+    g_rows = _load_csv(gantry_csv)
+    c_rows = _load_csv(camera_csv)
+
+    if not g_rows or not c_rows:
+        return None
+
+    # ── extract gantry arrays ─────────────────────────────────────────────────
+    def _col(rows: list[dict], key: str) -> "np.ndarray":
+        vals = []
+        for r in rows:
+            try:
+                vals.append(float(r[key]))
+            except (KeyError, ValueError):
+                vals.append(float("nan"))
+        return np.array(vals, dtype=np.float64)
+
+    g_t   = _col(g_rows, "elapsed_s")
+    g_x   = _col(g_rows, "x_mm")
+    g_y   = _col(g_rows, "y_mm")
+    g_z   = _col(g_rows, "z_mm")
+    g_vx  = _col(g_rows, "vx_mm_s")
+    g_vy  = _col(g_rows, "vy_mm_s")
+    g_vz  = _col(g_rows, "vz_mm_s")
+    g_ax  = _col(g_rows, "ax_mm_s2")
+    g_ay  = _col(g_rows, "ay_mm_s2")
+    g_az  = _col(g_rows, "az_mm_s2")
+
+    # ── extract camera arrays (m → mm; derive vel/acc) ────────────────────────
+    c_t   = _col(c_rows, "elapsed_s")
+    c_x_m = _col(c_rows, "x_m")
+    c_y_m = _col(c_rows, "y_m")
+    c_z_m = _col(c_rows, "z_m")
+    c_x   = c_x_m * 1000.0
+    c_y   = c_y_m * 1000.0
+    c_z   = c_z_m * 1000.0
+
+    def _sma_deriv(t: "np.ndarray", x: "np.ndarray", window: int = 5) -> "np.ndarray":
+        """5-sample SMA central difference — matches GantryTelemetryLogger convention."""
+        n = len(t)
+        dx = np.full(n, np.nan, dtype=np.float64)
+        half = window // 2
+        for i in range(half, n - half):
+            t_front = np.nanmean(t[i - half: i])
+            t_back  = np.nanmean(t[i + 1: i + 1 + half])
+            x_front = np.nanmean(x[i - half: i])
+            x_back  = np.nanmean(x[i + 1: i + 1 + half])
+            dt = t_back - t_front
+            if dt > 0:
+                dx[i] = (x_back - x_front) / dt
+        return dx
+
+    # velocity in mm/s, acceleration in mm/s²
+    c_vx = _sma_deriv(c_t, c_x)
+    c_vy = _sma_deriv(c_t, c_y)
+    c_vz = _sma_deriv(c_t, c_z)
+    c_ax = _sma_deriv(c_t, c_vx)
+    c_ay = _sma_deriv(c_t, c_vy)
+    c_az = _sma_deriv(c_t, c_vz)
+
+    # cm/s and cm/s² for display (match panel convention)
+    def _mm_to_cm(a: "np.ndarray") -> "np.ndarray":
+        return a / 10.0
+
+    # ── RMSE ─────────────────────────────────────────────────────────────────
+    def _rmse_mm(gantry_arr: "np.ndarray", g_t_arr: "np.ndarray",
+                 cam_arr: "np.ndarray", c_t_arr: "np.ndarray") -> float:
+        """Interpolate camera onto gantry time grid; compute RMSE in mm."""
+        if len(c_t_arr) < 2:
+            return float("nan")
+        finite_g = np.isfinite(gantry_arr) & np.isfinite(g_t_arr)
+        finite_c = np.isfinite(cam_arr)    & np.isfinite(c_t_arr)
+        if not finite_g.any() or not finite_c.any():
+            return float("nan")
+        c_interp = np.interp(
+            g_t_arr[finite_g], c_t_arr[finite_c], cam_arr[finite_c]
+        )
+        diff = gantry_arr[finite_g] - c_interp
+        return float(np.sqrt(np.nanmean(diff ** 2)))
+
+    rmse_x = _rmse_mm(g_x, g_t, c_x, c_t)
+    rmse_y = _rmse_mm(g_y, g_t, c_y, c_t)
+    rmse_z = _rmse_mm(g_z, g_t, c_z, c_t)
+
+    # ── figure ────────────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(3, 3, figsize=(15, 9), dpi=130, sharey="row")
+    fig.patch.set_facecolor("#0f0f12")
+    axes_flat = axes.flatten()
+    for ax in axes_flat:
+        ax.set_facecolor("#1a1a1d")
+        ax.tick_params(colors="#aaa", labelsize=8)
+        for sp in ax.spines.values():
+            sp.set_color("#333")
+
+    rows_data = [
+        # (row_label, gantry_arrs, cam_arrs, y_label, scale)
+        ("Pose",         [g_x, g_y, g_z],  [c_x, c_y, c_z],  "mm",     1.0),
+        ("Velocity",     [g_vx, g_vy, g_vz], [c_vx, c_vy, c_vz], "cm/s", 0.1),
+        ("Acceleration", [g_ax, g_ay, g_az], [c_ax, c_ay, c_az], "cm/s²", 0.1),
+    ]
+    col_labels = ["X", "Y", "Z"]
+    rmse_vals = [rmse_x, rmse_y, rmse_z]
+
+    for row_idx, (row_lbl, g_arrs, c_arrs, y_lbl, scale) in enumerate(rows_data):
+        for col_idx, (g_arr, c_arr, col_lbl) in enumerate(zip(g_arrs, c_arrs, col_labels)):
+            ax = axes[row_idx][col_idx]
+            ax.plot(g_t, g_arr * scale, color="#4ea1ff", linewidth=1.2,
+                    label="Gantry GT", alpha=0.9)
+            ax.plot(c_t, c_arr * scale, color="#ff5555", linestyle="--",
+                    linewidth=1.0, label="AprilTag", alpha=0.85)
+
+            if row_idx == 0:  # pose row → annotate RMSE
+                rmse = rmse_vals[col_idx]
+                rmse_str = f"{rmse:.1f} mm" if np.isfinite(rmse) else "N/A"
+                title = f"{col_lbl}  [RMSE={rmse_str}]"
+            else:
+                title = col_lbl
+            ax.set_title(title, color="#ddd", fontsize=9, pad=4)
+            ax.set_ylabel(y_lbl, color="#aaa", fontsize=8)
+            if row_idx == 2:
+                ax.set_xlabel("elapsed [s]", color="#aaa", fontsize=8)
+            if row_idx == 0 and col_idx == 0:
+                ax.legend(facecolor="#222", edgecolor="#555",
+                          labelcolor="#ddd", fontsize=7, loc="upper left")
+
+    fig.text(0.02, 0.5, "Pose / Velocity / Acceleration",
+             va="center", rotation="vertical", color="#ccc", fontsize=10)
+    fig.suptitle(
+        "Gantry GT vs AprilTag Estimate\n"
+        "(AprilTag vel/acc: 5-sample SMA + central difference, matching gantry-logger convention)",
+        color="#ddd", fontsize=10,
+    )
+    fig.tight_layout(rect=[0.03, 0, 1, 0.93])
+    fig.savefig(path, dpi=130, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return path
+
+
+def write_pose_velocity_acceleration_html(
+    path: Path,
+    gantry_csv: Path,
+    camera_csv: Path,
+) -> Path:
+    """Interactive HTML with 9 subplots (3×3: pose/vel/acc × X/Y/Z).
+
+    Features:
+    - Plain JS + Canvas — no external libraries.
+    - Synchronized hover: hovering one panel highlights the same timestamp on all 9.
+    - Toggle buttons to show/hide either curve (gantry or AprilTag).
+    """
+    import csv as _csv
+    import json as _json
+
+    def _load_csv(p: Path) -> list[dict[str, str]]:
+        if not p.exists():
+            return []
+        with p.open(newline="", encoding="utf-8") as fh:
+            return list(_csv.DictReader(fh))
+
+    g_rows = _load_csv(gantry_csv)
+    c_rows = _load_csv(camera_csv)
+
+    def _col(rows: list[dict], key: str) -> list[float]:
+        out = []
+        for r in rows:
+            try:
+                out.append(float(r[key]))
+            except (KeyError, ValueError):
+                out.append(float("nan"))
+        return out
+
+    def _sma_deriv(t: list[float], x: list[float], window: int = 5) -> list[float]:
+        n = len(t)
+        dx = [float("nan")] * n
+        half = window // 2
+        for i in range(half, n - half):
+            t_front = sum(t[max(0, i - half): i]) / half if half > 0 else t[i]
+            t_back  = sum(t[i + 1: i + 1 + half]) / half if half > 0 else t[i]
+            x_front = sum(x[max(0, i - half): i]) / half if half > 0 else x[i]
+            x_back  = sum(x[i + 1: i + 1 + half]) / half if half > 0 else x[i]
+            dt = t_back - t_front
+            if dt > 0:
+                dx[i] = (x_back - x_front) / dt
+        return dx
+
+    g_t  = _col(g_rows, "elapsed_s")
+    g_x  = _col(g_rows, "x_mm")
+    g_y  = _col(g_rows, "y_mm")
+    g_z  = _col(g_rows, "z_mm")
+    g_vx = _col(g_rows, "vx_mm_s")
+    g_vy = _col(g_rows, "vy_mm_s")
+    g_vz = _col(g_rows, "vz_mm_s")
+    g_ax = _col(g_rows, "ax_mm_s2")
+    g_ay = _col(g_rows, "ay_mm_s2")
+    g_az = _col(g_rows, "az_mm_s2")
+
+    c_t_raw  = _col(c_rows, "elapsed_s")
+    c_x_mm = [v * 1000.0 for v in _col(c_rows, "x_m")]
+    c_y_mm = [v * 1000.0 for v in _col(c_rows, "y_m")]
+    c_z_mm = [v * 1000.0 for v in _col(c_rows, "z_m")]
+    c_vx = _sma_deriv(c_t_raw, c_x_mm)
+    c_vy = _sma_deriv(c_t_raw, c_y_mm)
+    c_vz = _sma_deriv(c_t_raw, c_z_mm)
+    c_ax = _sma_deriv(c_t_raw, c_vx)
+    c_ay = _sma_deriv(c_t_raw, c_vy)
+    c_az = _sma_deriv(c_t_raw, c_vz)
+
+    def _clean(vals: list[float]) -> list[float | None]:
+        return [None if (v != v) else v for v in vals]  # nan → None for JSON
+
+    data_json = _json.dumps({
+        "gantry": {
+            "t": _clean(g_t),
+            "pose": [_clean(g_x), _clean(g_y), _clean(g_z)],
+            "vel":  [_clean(g_vx), _clean(g_vy), _clean(g_vz)],
+            "acc":  [_clean(g_ax), _clean(g_ay), _clean(g_az)],
+        },
+        "camera": {
+            "t": _clean(c_t_raw),
+            "pose": [_clean(c_x_mm), _clean(c_y_mm), _clean(c_z_mm)],
+            "vel":  [_clean(c_vx), _clean(c_vy), _clean(c_vz)],
+            "acc":  [_clean(c_ax), _clean(c_ay), _clean(c_az)],
+        },
+        "labels": {
+            "rows": ["Pose (mm)", "Velocity (cm/s)", "Acceleration (cm/s²)"],
+            "cols": ["X", "Y", "Z"],
+            "gantry_color": "#4ea1ff",
+            "camera_color": "#ff5555",
+        },
+    })
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Pose / Velocity / Acceleration — Experiment Comparison</title>
+<style>
+  body {{ background:#0f0f12; color:#ddd; font-family:sans-serif; margin:10px; }}
+  h2 {{ color:#4ea1ff; }}
+  .controls {{ margin-bottom:10px; }}
+  button {{ background:#2a2a2e; color:#ddd; border:1px solid #444; border-radius:4px;
+            padding:5px 14px; cursor:pointer; margin-right:6px; font-size:13px; }}
+  button.active {{ background:#1a73e8; border-color:#1a73e8; }}
+  .grid {{ display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }}
+  .cell {{ position:relative; }}
+  canvas {{ background:#1a1a1d; border:1px solid #333; border-radius:4px; display:block; width:100%; }}
+  .row-lbl {{ grid-column:1/-1; color:#888; font-size:11px; margin:4px 0 0 0; padding-left:4px;
+              border-left:3px solid #333; }}
+  .tooltip {{ position:absolute; pointer-events:none; background:#222; border:1px solid #555;
+              padding:4px 8px; font-size:11px; border-radius:4px; white-space:nowrap;
+              display:none; z-index:10; }}
+</style>
+</head>
+<body>
+<h2>Experiment: Pose / Velocity / Acceleration Comparison</h2>
+<p style="font-size:11px;color:#888;">
+  AprilTag vel/acc derived via 5-sample SMA + central difference, matching gantry-logger convention.<br>
+  Hover any panel to synchronize the crosshair across all 9.
+</p>
+<div class="controls">
+  <button id="btn_gantry" class="active" onclick="toggleSeries('gantry')">Gantry GT</button>
+  <button id="btn_camera" class="active" onclick="toggleSeries('camera')">AprilTag</button>
+</div>
+<div class="grid" id="grid"></div>
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+const RAW = {data_json};
+const SCALES = [1, 0.1, 0.1];  // mm→mm, mm/s→cm/s, mm/s²→cm/s²
+const SHOW = {{gantry:true, camera:true}};
+
+const canvases = [];
+const contexts = [];
+const chartData = [];  // per-cell: {{minT,maxT,minY,maxY,gantry,camera}}
+
+function toggleSeries(name) {{
+  SHOW[name] = !SHOW[name];
+  document.getElementById('btn_' + name).className = SHOW[name] ? 'active' : '';
+  renderAll();
+}}
+
+function buildGrid() {{
+  const grid = document.getElementById('grid');
+  const rowNames = RAW.labels.rows;
+  const colNames = RAW.labels.cols;
+  for (let r = 0; r < 3; r++) {{
+    const lbl = document.createElement('div');
+    lbl.className = 'row-lbl';
+    lbl.textContent = rowNames[r];
+    grid.appendChild(lbl);
+    for (let c = 0; c < 3; c++) {{
+      const cell = document.createElement('div');
+      cell.className = 'cell';
+      const canvas = document.createElement('canvas');
+      canvas.width = 420; canvas.height = 180;
+      cell.appendChild(canvas);
+      grid.appendChild(cell);
+      canvases.push(canvas);
+      contexts.push(canvas.getContext('2d'));
+
+      const idx = r * 3 + c;
+      const sc = SCALES[r];
+      const gt = (RAW.gantry[['pose','vel','acc'][r]][c] || []).map((v,i) => [RAW.gantry.t[i], v === null ? null : v * sc]);
+      const cm_ = (RAW.camera[['pose','vel','acc'][r]][c] || []).map((v,i) => [RAW.camera.t[i], v === null ? null : v * sc]);
+
+      const allY = [...gt.map(p=>p[1]), ...cm_.map(p=>p[1])].filter(v=>v!==null);
+      const allT = [...gt.map(p=>p[0]), ...cm_.map(p=>p[0])].filter(v=>v!==null);
+      chartData.push({{
+        label: colNames[c],
+        rowLabel: rowNames[r],
+        gantry: gt, camera: cm_,
+        minT: allT.length ? Math.min(...allT) : 0,
+        maxT: allT.length ? Math.max(...allT) : 1,
+        minY: allY.length ? Math.min(...allY) : -1,
+        maxY: allY.length ? Math.max(...allY) : 1,
+      }});
+
+      canvas.addEventListener('mousemove', e => onHover(e, canvas, idx));
+      canvas.addEventListener('mouseleave', () => {{
+        renderAll();
+        document.getElementById('tooltip').style.display = 'none';
+      }});
+    }}
+  }}
+}}
+
+function toPixel(val, min, max, pxMin, pxMax) {{
+  if (max === min) return (pxMin + pxMax) / 2;
+  return pxMin + (val - min) / (max - min) * (pxMax - pxMin);
+}}
+
+function drawChart(ctx, data, crossT) {{
+  const W = ctx.canvas.width, H = ctx.canvas.height;
+  const L=40, R=8, T=20, B=28;
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle='#1a1a1d'; ctx.fillRect(0,0,W,H);
+
+  const pxL=L, pxR=W-R, pxT=T, pxB=H-B;
+  const {{minT,maxT,minY,maxY,label,gantry,camera}} = data;
+  const ySpan = maxY-minY || 1;
+  const yPad  = ySpan*0.08;
+  const yLo   = minY - yPad, yHi = maxY + yPad;
+
+  // Axes
+  ctx.strokeStyle='#333'; ctx.lineWidth=1;
+  ctx.strokeRect(pxL, pxT, pxR-pxL, pxB-pxT);
+
+  // Grid lines (3 horizontal)
+  ctx.setLineDash([2,4]);
+  for (let k=0; k<=3; k++) {{
+    const yv = yLo + (yHi - yLo) * k / 3;
+    const py = toPixel(yv, yHi, yLo, pxT, pxB);
+    ctx.strokeStyle='#2a2a2a'; ctx.beginPath();
+    ctx.moveTo(pxL, py); ctx.lineTo(pxR, py); ctx.stroke();
+    ctx.fillStyle='#777'; ctx.font='9px sans-serif'; ctx.fillText(yv.toFixed(1), 2, py+3);
+  }}
+  ctx.setLineDash([]);
+
+  // Title
+  ctx.fillStyle='#bbb'; ctx.font='bold 10px sans-serif';
+  ctx.fillText(label, pxL+4, T-6);
+
+  function drawSeries(pts, color) {{
+    if (!pts || pts.length < 2) return;
+    ctx.beginPath(); ctx.strokeStyle=color; ctx.lineWidth=1.4;
+    let started = false;
+    for (const [t,y] of pts) {{
+      if (t === null || y === null) {{ started=false; continue; }}
+      const px = toPixel(t, minT, maxT, pxL, pxR);
+      const py = toPixel(y, yHi, yLo, pxT, pxB);
+      if (!started) {{ ctx.moveTo(px,py); started=true; }} else ctx.lineTo(px,py);
+    }}
+    ctx.stroke();
+  }}
+
+  if (SHOW.gantry) drawSeries(gantry, RAW.labels.gantry_color);
+  if (SHOW.camera) drawSeries(camera, RAW.labels.camera_color);
+
+  // Crosshair
+  if (crossT !== null) {{
+    const px = toPixel(crossT, minT, maxT, pxL, pxR);
+    ctx.setLineDash([3,3]); ctx.strokeStyle='rgba(255,255,255,0.4)'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(px,pxT); ctx.lineTo(px,pxB); ctx.stroke();
+    ctx.setLineDash([]);
+  }}
+}}
+
+function renderAll(crossT) {{
+  chartData.forEach((data, idx) => drawChart(contexts[idx], data, crossT||null));
+}}
+
+function onHover(e, canvas, idx) {{
+  const rect = canvas.getBoundingClientRect();
+  const L=40, R=8;
+  const W=canvas.width, pxL=L, pxR=W-R;
+  const rawX = e.clientX - rect.left;
+  const frac = (rawX * (W / rect.width) - pxL) / (pxR - pxL);
+  const data = chartData[idx];
+  const t = data.minT + frac * (data.maxT - data.minT);
+  renderAll(t);
+
+  // Tooltip
+  const tip = document.getElementById('tooltip');
+  // Interpolate gantry value
+  function interpVal(pts, tq) {{
+    if (!pts || pts.length < 2) return null;
+    for (let i=1; i<pts.length; i++) {{
+      const [t0,y0]=pts[i-1], [t1,y1]=pts[i];
+      if (t0===null||t1===null||y0===null||y1===null) continue;
+      if (tq>=t0 && tq<=t1) {{
+        return y0 + (y1-y0)*(tq-t0)/(t1-t0);
+      }}
+    }}
+    return null;
+  }}
+  const gv = interpVal(data.gantry, t);
+  const cv = interpVal(data.camera, t);
+  const fmt = v => v===null ? 'N/A' : v.toFixed(2);
+  tip.innerHTML = `t=${{t.toFixed(2)}}s | Gantry: ${{fmt(gv)}} | AprilTag: ${{fmt(cv)}}`;
+  tip.style.display = 'block';
+  tip.style.left = (e.pageX + 12) + 'px';
+  tip.style.top  = (e.pageY - 20) + 'px';
+}}
+
+buildGrid();
+renderAll();
+</script>
+</body>
+</html>"""
+
+    path.write_text(html, encoding="utf-8")
+    return path

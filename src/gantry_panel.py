@@ -100,6 +100,21 @@ from gantry_runner import (  # noqa: E402
     make_gantry_run_dir, mm_to_units, move_to_xyz_mm, units_to_mm,
 )
 
+# ExperimentRunner — optional; only used when Experiment tab is active.
+try:
+    from experiment_runner import ExperimentConfig, ExperimentRunner, Phase
+    HAVE_EXPERIMENT_RUNNER = True
+except ImportError:
+    HAVE_EXPERIMENT_RUNNER = False
+
+# FisheyeCameraSession — optional; enables persistent camera connection.
+try:
+    from fisheye_camera import FisheyeCameraSession
+    HAVE_FISHEYE_CAMERA = True
+except ImportError:
+    FisheyeCameraSession = None  # type: ignore[assignment,misc]
+    HAVE_FISHEYE_CAMERA = False
+
 
 # =============================================================================
 # Constants
@@ -147,9 +162,10 @@ FALLBACK_DARK_QSS = """
 QMainWindow, QWidget { background-color: #1a1a1d; color: #e6e6e6; }
 QScrollArea, QScrollArea > QWidget > QWidget { background-color: #1a1a1d; border: 0; }
 QLabel { color: #e6e6e6; }
-QSplitter::handle { background-color: #2f2f33; }
-QSplitter::handle:horizontal { width: 4px; }
-QSplitter::handle:vertical { height: 4px; }
+QSplitter::handle { background-color: #3a3a42; }
+QSplitter::handle:horizontal { width: 6px; }
+QSplitter::handle:vertical { height: 10px; border-top: 1px solid #505058; border-bottom: 1px solid #505058; }
+QSplitter::handle:hover { background-color: #4ea1ff; }
 
 /* ---- card-style sections (label+frame replaces QGroupBox — no title clipping) ---- */
 QFrame#SectionCard {
@@ -242,8 +258,8 @@ QPushButton#EmergencyButton {
     border: 2px solid #ff5147;
     color: white;
     font-weight: 700;
-    font-size: 14px;
-    padding: 12px;
+    font-size: 13px;
+    padding: 4px 10px;
 }
 QPushButton#IconButton { text-align: left; padding-left: 32px; }
 QPushButton#EmergencyButton:hover { background-color: #ff3b30; }
@@ -997,6 +1013,354 @@ class AxisStatusCard(QFrame):
         )
 
 
+# =============================================================================
+# Compact status row (replaces the old tall AxisStatusCard in the left pane)
+# =============================================================================
+class _AxisRow(QFrame):
+    """One horizontal row in LiveStatusTable — AxisCard hover styling preserved."""
+
+    def __init__(self, axis: "Axis", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("AxisCard")
+        self.axis = axis
+        self._soft_min: float | None = None
+        self._soft_max: float | None = None
+
+        h = QHBoxLayout(self)
+        h.setContentsMargins(8, 4, 8, 4)
+        h.setSpacing(8)
+
+        # Axis letter.
+        letter = QLabel(axis.name)
+        letter.setStyleSheet("font-weight: 700; font-size: 16px; color: #4ea1ff;")
+        letter.setFixedWidth(24)
+        letter.setAlignment(Qt.AlignCenter)
+        h.addWidget(letter)
+
+        # Position (mm) — PositionReadout objectName picks up green monospace CSS.
+        self.pos_display = QLabel("--")
+        self.pos_display.setObjectName("PositionReadout")
+        self.pos_display.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        fm = QtGui.QFontMetrics(self.pos_display.font())
+        self.pos_display.setMinimumWidth(fm.horizontalAdvance("-9999.99") + 16)
+        h.addWidget(self.pos_display)
+
+        # Δ home.
+        self.home_delta_label = QLabel("—")
+        self.home_delta_label.setStyleSheet("color: #8a8a8a; font-size: 12px;")
+        fm2 = QtGui.QFontMetrics(self.home_delta_label.font())
+        self.home_delta_label.setMinimumWidth(fm2.horizontalAdvance("+9999.99 mm") + 16)
+        h.addWidget(self.home_delta_label)
+
+        # Vel · Acc on one line.
+        self.vel_acc_label = QLabel("— cm/s · — cm/s²")
+        self.vel_acc_label.setStyleSheet("color: #999; font-size: 12px;")
+        fm3 = QtGui.QFontMetrics(self.vel_acc_label.font())
+        self.vel_acc_label.setMinimumWidth(
+            fm3.horizontalAdvance("999.99 cm/s · 999.99 cm/s²") + 16
+        )
+        h.addWidget(self.vel_acc_label, stretch=1)
+
+        # Thin soft-limit progress bar.
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(500)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedWidth(90)
+        self.progress.setStyleSheet(
+            "QProgressBar { min-height: 8px; max-height: 8px; border-radius: 3px;"
+            " background-color: #131316; border: 1px solid #3a3a40; }"
+            "QProgressBar::chunk { background-color: #1976d2; border-radius: 2px; }"
+        )
+        h.addWidget(self.progress)
+
+        # Single-character limit indicator.
+        self.indicator = QLabel("—")
+        self.indicator.setAlignment(Qt.AlignCenter)
+        self.indicator.setStyleSheet("color: #666; font-size: 14px;")
+        self.indicator.setFixedWidth(22)
+        h.addWidget(self.indicator)
+
+    # ── public interface (same as AxisStatusCard) ─────────────────────────────
+
+    def update_state(
+        self,
+        pos_units: float,
+        pos_mm: float,
+        vel_mm_s: float,
+        acc_mm_s2: float,
+        *,
+        home_mm: float | None = None,
+    ) -> None:
+        self.pos_display.setText(f"{pos_mm:+.2f}")
+        self.vel_acc_label.setText(
+            f"{vel_mm_s / 10.0:.2f} cm/s · {acc_mm_s2 / 10.0:.2f} cm/s²"
+        )
+        self.set_home_reference(home_mm, pos_mm)
+        self._update_progress(pos_mm)
+
+    def set_home_reference(
+        self,
+        home_mm: float | None,
+        current_mm: float | None,
+    ) -> None:
+        if home_mm is None or current_mm is None:
+            self.home_delta_label.setText("—")
+            self.home_delta_label.setStyleSheet("color: #8a8a8a; font-size: 12px;")
+        else:
+            delta = current_mm - home_mm
+            self.home_delta_label.setText(f"{delta:+.2f} mm")
+            self.home_delta_label.setStyleSheet("color: #ffd54f; font-size: 12px;")
+
+    def set_soft_limits(
+        self,
+        lo_mm: float | None,
+        hi_mm: float | None,
+    ) -> None:
+        self._soft_min = lo_mm
+        self._soft_max = hi_mm
+        if lo_mm is None or hi_mm is None or hi_mm <= lo_mm:
+            self.progress.setValue(500)
+            self.progress.setStyleSheet(
+                "QProgressBar { min-height: 8px; max-height: 8px; border-radius: 3px;"
+                " background-color: #131316; border: 1px solid #3a3a40; }"
+                "QProgressBar::chunk { background-color: #1976d2; border-radius: 2px; }"
+            )
+            self.indicator.setText("—")
+            self.indicator.setStyleSheet("color: #666; font-size: 14px;")
+
+    def _update_progress(self, pos_mm: float) -> None:
+        lo, hi = self._soft_min, self._soft_max
+        if lo is None or hi is None or hi <= lo:
+            return
+        span = hi - lo
+        pct = (pos_mm - lo) / span * 100.0
+        near = PROGRESS_NEAR_LIMIT_PCT
+        if pct < 0 or pct > 100:
+            color, ind_t, ind_c = "#c62828", "✗", "#ef5350"
+        elif pct <= near or pct >= 100 - near:
+            color, ind_t, ind_c = "#ffa726", "⚠", "#ffa726"
+        else:
+            color, ind_t, ind_c = "#1976d2", "✓", "#34d058"
+        self.progress.setValue(int(max(0.0, min(100.0, pct)) * 10))
+        self.progress.setStyleSheet(
+            f"QProgressBar {{ min-height: 8px; max-height: 8px; border-radius: 3px;"
+            f" background-color: #131316; border: 1px solid #3a3a40; }}"
+            f"QProgressBar::chunk {{ background-color: {color}; border-radius: 2px; }}"
+        )
+        self.indicator.setText(ind_t)
+        self.indicator.setStyleSheet(
+            f"color: {ind_c}; font-size: 14px; font-weight: bold;"
+        )
+
+
+class LiveStatusTable(QWidget):
+    """Compact 3-row status table.  Replaces three side-by-side AxisStatusCards
+    in the left pane.  Each row is an _AxisRow (QFrame#AxisCard) so the hover
+    border still works.  Target height ≤ 200 px for three axes."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setMinimumHeight(80)
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(2)
+
+        self._rows: dict["Axis", _AxisRow] = {}
+        for axis in AXES:
+            row = _AxisRow(axis, self)
+            v.addWidget(row)
+            self._rows[axis] = row
+
+    def row(self, axis: "Axis") -> _AxisRow:
+        return self._rows[axis]
+
+
+# =============================================================================
+# Live fisheye preview widget
+# =============================================================================
+class FisheyePreviewWidget(QWidget):
+    """Displays the live camera frame stream inside the left pane.
+
+    On frame_ready: BGR ndarray → QPixmap scaled to fit while preserving
+    aspect ratio, drawn at ≤ 15 FPS (configurable).  When a tag detector
+    overlay is enabled, corners are drawn with QPainter before the pixmap is
+    set (requires the experiment runner to push observations).
+    """
+
+    MAX_DISPLAY_FPS = 15.0
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._last_frame_t: float = 0.0
+        self._last_frame: Any = None           # np.ndarray BGR
+        self._detector_on: bool = False
+        self._current_run_dir: Path | None = None
+
+        # Restore detector toggle from settings.
+        saved = _gp_load_settings().get("gantry_panel", {})
+        self._detector_on = bool(saved.get("camera_detector_overlay", False))
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+
+        # Section title (same style as SectionFrame).
+        title = QLabel("Fisheye Live")
+        title.setStyleSheet(
+            "font-size: 14px; font-weight: 600; color: #4ea1ff; padding: 0 4px;"
+        )
+        outer.addWidget(title)
+
+        card = QFrame()
+        card.setObjectName("SectionCard")
+        outer.addWidget(card, stretch=1)
+
+        v = QVBoxLayout(card)
+        v.setContentsMargins(6, 6, 6, 6)
+        v.setSpacing(4)
+
+        # Preview label — pixmap goes here.
+        self.preview_label = QLabel("Camera not connected")
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setStyleSheet(
+            "background-color: #0e0e0e; color: #555; border-radius: 4px;"
+        )
+        self.preview_label.setMinimumHeight(160)
+        self.preview_label.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Expanding
+        )
+        v.addWidget(self.preview_label, stretch=1)
+
+        # Stats strip.
+        self.stats_label = QLabel("—")
+        self.stats_label.setStyleSheet("color: #666; font-size: 11px;")
+        v.addWidget(self.stats_label)
+
+        # Buttons.
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        self.snapshot_btn = QPushButton("Snapshot")
+        self.snapshot_btn.setEnabled(False)
+        self.snapshot_btn.clicked.connect(self._on_snapshot)
+        _size_button(self.snapshot_btn)
+        btn_row.addWidget(self.snapshot_btn)
+
+        self.overlay_btn = QPushButton(
+            "Detector Overlay: ON" if self._detector_on else "Detector Overlay: OFF"
+        )
+        self.overlay_btn.setCheckable(True)
+        self.overlay_btn.setChecked(self._detector_on)
+        self.overlay_btn.clicked.connect(self._on_overlay_toggle)
+        _size_button(self.overlay_btn)
+        btn_row.addWidget(self.overlay_btn)
+        btn_row.addStretch()
+        v.addLayout(btn_row)
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    def set_state(self, state: str) -> None:
+        """Update placeholder text when no frame has arrived yet."""
+        if state == "disconnected":
+            self.preview_label.clear()
+            self.preview_label.setText("Camera not connected")
+            self.preview_label.setStyleSheet(
+                "background-color: #0e0e0e; color: #555; border-radius: 4px;"
+            )
+            self.snapshot_btn.setEnabled(False)
+        elif state == "connecting":
+            self.preview_label.clear()
+            self.preview_label.setText("Connecting…")
+            self.preview_label.setStyleSheet(
+                "background-color: #0e0e0e; color: #888; border-radius: 4px;"
+            )
+        elif state.startswith("connected"):
+            self.snapshot_btn.setEnabled(True)
+        elif state == "error":
+            self.preview_label.clear()
+            self.preview_label.setText("Camera error — check connection bar")
+            self.preview_label.setStyleSheet(
+                "background-color: #0e0e0e; color: #ef5350; border-radius: 4px;"
+            )
+
+    def on_frame(self, frame_bgr: Any, t_mono: float) -> None:
+        """Slot connected to FisheyeCameraSession.frame_ready; throttled to MAX_DISPLAY_FPS."""
+        now = time.monotonic()
+        if now - self._last_frame_t < 1.0 / self.MAX_DISPLAY_FPS:
+            return
+        self._last_frame_t = now
+        self._last_frame = frame_bgr
+        self._render_frame(frame_bgr)
+
+    def update_stats(self, fps: int, grab_ms: float, config: dict) -> None:
+        device = config.get("device", "?")
+        w = config.get("width", "?")
+        h = config.get("height", "?")
+        mock = config.get("mock", False)
+        mock_tag = " (mock)" if mock else ""
+        self.stats_label.setText(
+            f"Device {device} · {w}×{h} · {fps} FPS"
+            f" · last grab {grab_ms:.0f} ms{mock_tag}"
+        )
+
+    def set_current_run_dir(self, path: Path | None) -> None:
+        self._current_run_dir = path
+
+    @property
+    def detector_overlay_on(self) -> bool:
+        return self._detector_on
+
+    # ── private ──────────────────────────────────────────────────────────────
+
+    def _render_frame(self, frame_bgr: Any) -> None:
+        try:
+            import cv2
+            from PyQt5.QtGui import QImage
+            h_px, w_px = frame_bgr.shape[:2]
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            qimg = QImage(
+                frame_rgb.data, w_px, h_px, w_px * 3, QImage.Format_RGB888
+            )
+            pix = QtGui.QPixmap.fromImage(qimg)
+            scaled = pix.scaled(
+                self.preview_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+            self.preview_label.setPixmap(scaled)
+        except Exception:
+            pass
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if self._last_frame is not None:
+            self._render_frame(self._last_frame)
+
+    def _on_snapshot(self) -> None:
+        if self._last_frame is None:
+            return
+        try:
+            import cv2
+            save_dir = self._current_run_dir or Path.home() / "Pictures"
+            save_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = save_dir / f"snapshot_{ts}.png"
+            cv2.imwrite(str(path), self._last_frame)
+            self.stats_label.setText(f"Snapshot saved → {path.name}")
+        except Exception as exc:
+            self.stats_label.setText(f"Snapshot failed: {exc}")
+
+    def _on_overlay_toggle(self, checked: bool) -> None:
+        self._detector_on = checked
+        self.overlay_btn.setText(
+            "Detector Overlay: ON" if checked else "Detector Overlay: OFF"
+        )
+        payload = _gp_load_settings().get("gantry_panel", {})
+        payload["camera_detector_overlay"] = checked
+        _gp_save_section("gantry_panel", payload)
+
+
 class LivePlotWidget(QWidget):
     """30-second rolling position-vs-time plot. pyqtgraph if available."""
 
@@ -1102,7 +1466,7 @@ class WorkspaceMap(QWidget):
     """
 
     TRAIL_MAXLEN = 200
-    MIN_GROUP_SIZE = (340, 420)
+    MIN_GROUP_SIZE = (260, 200)
     AUTO_FIT_MARGIN_MM = 50.0
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -1409,6 +1773,23 @@ class _PyQtGraphMap(QWidget):
                    self._xz.getAxis("bottom"), self._xz.getAxis("left")):
             _a.enableAutoSIPrefix(False)
         self._last_view_bounds: dict | None = None
+
+        # Dynamic tick spacing: update whenever pyqtgraph's internal viewport
+        # changes (scroll-zoom, drag-pan), not just when the fit-mode bounds change.
+        def _update_xy_ticks(_vb, ranges) -> None:
+            xspan = abs(ranges[0][1] - ranges[0][0])
+            yspan = abs(ranges[1][1] - ranges[1][0])
+            self._xy.getAxis("bottom").setTickSpacing(levels=[(_pick_tick_spacing(xspan), 0)])
+            self._xy.getAxis("left").setTickSpacing(levels=[(_pick_tick_spacing(yspan), 0)])
+            self._xz.getAxis("bottom").setTickSpacing(levels=[(_pick_tick_spacing(xspan), 0)])
+
+        def _update_xz_ticks(_vb, ranges) -> None:
+            zspan = abs(ranges[1][1] - ranges[1][0])
+            self._xz.getAxis("left").setTickSpacing(levels=[(_pick_tick_spacing(zspan), 0)])
+
+        self._xy.getViewBox().sigRangeChanged.connect(_update_xy_ticks)
+        self._xz.getViewBox().sigRangeChanged.connect(_update_xz_ticks)
+
         v.addWidget(self._xz, stretch=1)
 
     def resizeEvent(self, event) -> None:
@@ -1716,7 +2097,7 @@ class GantryPanel(QMainWindow):
         super().__init__()
         self.setWindowTitle(WINDOW_TITLE + (" — MOCK MODE" if is_mock else ""))
         self.resize(1500, 900)
-        self.setMinimumSize(1400, 880)
+        self.setMinimumSize(1200, 700)
 
         # SDK + lock + state ---------------------------------------------------
         self.controller = controller if controller is not None else FMC4030Controller()
@@ -1782,6 +2163,17 @@ class GantryPanel(QMainWindow):
         self._sequence_in_progress = False
         # Per-axis Move Abs is in progress for at least one axis.
         self._per_axis_busy: set[int] = set()
+
+        # Experiment runner (wired up in _build_experiment_tab).
+        self._experiment_runner: Any = None
+        self._experiment_in_progress = False
+        # Camera test result cache (None = untested, True = OK, False = FAIL)
+        self._camera_test_result: bool | None = None
+        self._exp_fisheye_calib_path: Path | None = None
+        # Whether the panel was launched with --mock-camera
+        self._is_mock_camera = getattr(self, "_cli_mock_camera", False)
+        # Panel-level persistent camera session (shared with experiment runner).
+        self._camera: Any = None  # FisheyeCameraSession | None
 
         # Build UI. ------------------------------------------------------------
         self._build_menu()
@@ -1868,8 +2260,8 @@ class GantryPanel(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         outer = QVBoxLayout(central)
-        outer.setContentsMargins(12, 12, 12, 12)
-        outer.setSpacing(12)
+        outer.setContentsMargins(12, 8, 12, 8)
+        outer.setSpacing(6)
 
         # Top: connection bar.
         outer.addWidget(self._build_connection_bar())
@@ -1888,9 +2280,6 @@ class GantryPanel(QMainWindow):
         splitter.setStretchFactor(1, 1)
         outer.addWidget(splitter, stretch=1)
 
-        # Bottom: global controls bar (Emergency Stop visible at all times).
-        outer.addLayout(self._build_global_controls())
-
     @staticmethod
     def _make_h_rule() -> QFrame:
         """Thin horizontal rule used as a visual separator between pane sections."""
@@ -1902,13 +2291,16 @@ class GantryPanel(QMainWindow):
         return rule
 
     def _build_left_pane(self) -> QWidget:
-        pane = QWidget()
-        pane.setMinimumWidth(420)
-        v = QVBoxLayout(pane)
+        # Inner widget holds the splitter; QScrollArea wraps it so the left
+        # pane can scroll vertically when the window is shorter than the content.
+        inner = QWidget()
+        inner.setMinimumWidth(440)
+        inner.setMinimumHeight(400)   # sum of section minimums — triggers scrollbar
+        v = QVBoxLayout(inner)
         v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(10)
+        v.setSpacing(4)
 
-        # Polling freshness indicator at the very top of the left pane.
+        # Polling freshness indicator sits above the splitter (not resizable).
         self.poll_indicator = QLabel("Polling: — (no data)")
         self.poll_indicator.setStyleSheet(
             "color: #8a8a8a; font-size: 11px; padding: 2px 4px;"
@@ -1917,20 +2309,45 @@ class GantryPanel(QMainWindow):
         v.addWidget(self.poll_indicator)
         v.addWidget(self._make_h_rule())
 
-        # Live Status section wraps the three AxisStatusCards in a card frame
-        # so the section blends with the rest of the GroupBox-styled UI.
-        live_section = SectionFrame("Live Status")
-        live_inner = QVBoxLayout(live_section.content())
-        live_inner.setContentsMargins(0, 0, 0, 0)
-        live_inner.setSpacing(8)
-        live_inner.addLayout(self._build_status_cards())
-        v.addWidget(live_section)
-        v.addWidget(self._make_h_rule())
+        # axis_cards no longer maps to a visible table; kept as empty dict so
+        # legacy call-sites that iterate over .values() are safe no-ops.
+        self.axis_cards = {}
 
-        # Workspace Map.
+        # Vertical splitter: Fisheye Preview | Workspace Map.
+        self._left_splitter = QtWidgets.QSplitter(Qt.Vertical)
+        self._left_splitter.setChildrenCollapsible(False)
+
+        # ── section 1: fisheye preview ─────────────────────────────────────────
+        self._fisheye_preview = FisheyePreviewWidget()
+        self._fisheye_preview.setMinimumHeight(160)
+        self._left_splitter.addWidget(self._fisheye_preview)
+
+        # ── section 2: workspace map ───────────────────────────────────────────
         self.workspace_map = WorkspaceMap()
-        v.addWidget(self.workspace_map, stretch=1)
-        return pane
+        self.workspace_map.setMinimumHeight(200)
+        self._left_splitter.addWidget(self.workspace_map)
+
+        # Restore splitter sizes from last session.
+        saved_sizes = _gp_load_settings().get("gantry_panel", {}).get(
+            "left_splitter_sizes"
+        )
+        if saved_sizes and len(saved_sizes) == 2:
+            self._left_splitter.setSizes([int(s) for s in saved_sizes])
+        else:
+            self._left_splitter.setSizes([380, 400])
+
+        self._left_splitter.splitterMoved.connect(self._on_left_splitter_moved)
+
+        v.addWidget(self._left_splitter, stretch=1)
+
+        # Scroll wrapper — horizontal scroll disabled; vertical scroll auto.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(inner)
+        return scroll
 
     def _build_right_tabs(self) -> QtWidgets.QTabWidget:
         tabs = QtWidgets.QTabWidget()
@@ -1961,6 +2378,8 @@ class GantryPanel(QMainWindow):
                                  self._build_homing_group()), "Setup")
         # Recording tab: start/stop + CSV path + live 30s plot.
         tabs.addTab(_wrap_scroll(self._build_recording_panel()), "Recording")
+        # Experiment tab: end-to-end orchestration.
+        tabs.addTab(_wrap_scroll(self._build_experiment_tab()), "Experiment")
         self.tabs = tabs
         return tabs
 
@@ -1992,28 +2411,37 @@ class GantryPanel(QMainWindow):
         return banner
 
     def _build_connection_bar(self) -> QWidget:
-        frame = SectionFrame("Connection")
-        h = QHBoxLayout(frame.content())
-        h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(8)
+        frame = QFrame()
+        frame.setObjectName("SectionCard")
+        frame.setStyleSheet("QFrame#SectionCard { padding: 6px; }")
+        v = QVBoxLayout(frame)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(3)
 
-        h.addWidget(QLabel("IP"))
+        # ── Row 1: Gantry ─────────────────────────────────────────────────────
+        gantry_row = QHBoxLayout()
+        gantry_row.setSpacing(8)
+
+        gantry_lbl = QLabel("Gantry")
+        gantry_lbl.setStyleSheet("font-weight: 600; color: #aaa; min-width: 52px;")
+        gantry_row.addWidget(gantry_lbl)
+
+        gantry_row.addWidget(QLabel("IP"))
         self.ip_edit = QLineEdit("192.168.0.30")
-        h.addWidget(self.ip_edit)
+        gantry_row.addWidget(self.ip_edit)
 
-        h.addWidget(QLabel("Port"))
+        gantry_row.addWidget(QLabel("Port"))
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1, 65535)
         self.port_spin.setValue(8088)
-        h.addWidget(self.port_spin)
+        gantry_row.addWidget(self.port_spin)
 
-        h.addWidget(QLabel("ID"))
+        gantry_row.addWidget(QLabel("ID"))
         self.id_spin = QSpinBox()
         self.id_spin.setRange(0, 31)
         self.id_spin.setValue(1)
-        h.addWidget(self.id_spin)
+        gantry_row.addWidget(self.id_spin)
 
-        # Set minimum widths using font metrics so worst-case values never clip.
         for widget, sample in [
             (self.ip_edit,   "192.168.000.000"),
             (self.port_spin, "65535"),
@@ -2021,40 +2449,109 @@ class GantryPanel(QMainWindow):
         ]:
             fm = QtGui.QFontMetrics(widget.font())
             widget.setMinimumWidth(fm.horizontalAdvance(sample) + 32)
-            widget.setMinimumHeight(28)
+            widget.setMinimumHeight(24)
 
         self.connect_btn = QPushButton("Connect")
         ic = _icon("fa5s.plug")
         if ic is not None:
             self.connect_btn.setIcon(ic)
         self.connect_btn.clicked.connect(self._toggle_connection)
-        h.addWidget(self.connect_btn)
+        gantry_row.addWidget(self.connect_btn)
 
-        h.addSpacing(20)
-        h.addWidget(QLabel("Enabled axes:"))
+        gantry_row.addSpacing(16)
+        gantry_row.addWidget(QLabel("Enabled axes:"))
         self.axis_enable_checks: dict[Axis, QCheckBox] = {}
         for axis in AXES:
             cb = QCheckBox(axis.name)
             cb.setChecked(True)
             self.axis_enable_checks[axis] = cb
-            h.addWidget(cb)
+            gantry_row.addWidget(cb)
 
-        h.addStretch()
+        gantry_row.addStretch()
+        self.estop_btn = QPushButton("⚠  EMERGENCY STOP ALL")
+        self.estop_btn.setObjectName("EmergencyButton")
+        _size_button(self.estop_btn)
+        ic_stop = _icon("fa5s.stop-circle")
+        if ic_stop is not None:
+            self.estop_btn.setIcon(ic_stop)
+        self.estop_btn.clicked.connect(self._emergency_stop_all)
+        self.estop_btn.setEnabled(False)
+        gantry_row.addWidget(self.estop_btn)
+
         self.conn_status_label = QLabel("● Disconnected")
         self.conn_status_label.setStyleSheet("color: #ef5350; font-weight: bold;")
-        h.addWidget(self.conn_status_label)
+        gantry_row.addWidget(self.conn_status_label)
+
+        v.addLayout(gantry_row)
+
+        # ── Row 2: Camera ─────────────────────────────────────────────────────
+        cam_row = QHBoxLayout()
+        cam_row.setSpacing(8)
+
+        cam_lbl = QLabel("Camera")
+        cam_lbl.setStyleSheet("font-weight: 600; color: #aaa; min-width: 52px;")
+        cam_row.addWidget(cam_lbl)
+
+        cam_row.addWidget(QLabel("Device"))
+        self._cam_device_spin = QSpinBox()
+        self._cam_device_spin.setRange(0, 10)
+        self._cam_device_spin.setValue(0)
+        fm_d = QtGui.QFontMetrics(self._cam_device_spin.font())
+        self._cam_device_spin.setMinimumWidth(fm_d.horizontalAdvance("99") + 32)
+        self._cam_device_spin.setMinimumHeight(24)
+        cam_row.addWidget(self._cam_device_spin)
+
+        self._cam_res_combo = QComboBox()
+        for res in ["1280×720", "1920×1080", "640×480"]:
+            self._cam_res_combo.addItem(res)
+        cam_row.addWidget(self._cam_res_combo)
+
+        cam_row.addWidget(QLabel("FPS"))
+        self._cam_fps_spin = QSpinBox()
+        self._cam_fps_spin.setRange(1, 120)
+        self._cam_fps_spin.setValue(30)
+        fm_f = QtGui.QFontMetrics(self._cam_fps_spin.font())
+        self._cam_fps_spin.setMinimumWidth(fm_f.horizontalAdvance("120") + 32)
+        self._cam_fps_spin.setMinimumHeight(24)
+        cam_row.addWidget(self._cam_fps_spin)
+
+        cam_row.addWidget(QLabel("Calib:"))
+        self._cam_calib_edit = QLineEdit()
+        self._cam_calib_edit.setPlaceholderText("fisheye_calibration.yaml")
+        self._cam_calib_edit.setMinimumWidth(180)
+        self._cam_calib_edit.setMinimumHeight(24)
+        cam_row.addWidget(self._cam_calib_edit, stretch=1)
+        _cam_browse_btn = QPushButton("…")
+        _cam_browse_btn.setFixedWidth(30)
+        _cam_browse_btn.setMinimumHeight(24)
+        _cam_browse_btn.clicked.connect(self._cam_browse_calib)
+        cam_row.addWidget(_cam_browse_btn)
+
+        self._cam_connect_btn = QPushButton("Connect Camera")
+        self._cam_connect_btn.clicked.connect(self._toggle_camera)
+        cam_row.addWidget(self._cam_connect_btn)
+
+        cam_row.addStretch()
+        self._cam_status_label = QLabel("● Disconnected")
+        self._cam_status_label.setStyleSheet("color: #ef5350; font-weight: bold;")
+        cam_row.addWidget(self._cam_status_label)
+
+        v.addLayout(cam_row)
+
+        # Restore camera settings from last session.
+        saved_cam = _gp_load_settings().get("gantry_panel", {}).get("camera", {})
+        if saved_cam.get("device") is not None:
+            self._cam_device_spin.setValue(int(saved_cam["device"]))
+        if saved_cam.get("resolution"):
+            idx = self._cam_res_combo.findText(saved_cam["resolution"])
+            if idx >= 0:
+                self._cam_res_combo.setCurrentIndex(idx)
+        if saved_cam.get("fps"):
+            self._cam_fps_spin.setValue(int(saved_cam["fps"]))
+        if saved_cam.get("calib_path"):
+            self._cam_calib_edit.setText(saved_cam["calib_path"])
 
         return frame
-
-    def _build_status_cards(self) -> QHBoxLayout:
-        h = QHBoxLayout()
-        h.setSpacing(10)
-        self.axis_cards: dict[Axis, AxisStatusCard] = {}
-        for axis in AXES:
-            card = AxisStatusCard(axis)
-            h.addWidget(card, stretch=1)
-            self.axis_cards[axis] = card
-        return h
 
     def _build_soft_limits_group(self) -> SectionFrame:
         frame = SectionFrame("Software Limits (mm)")
@@ -2260,6 +2757,11 @@ class GantryPanel(QMainWindow):
         self.jog_dec_spin.setValue(5.0)
         params_row.addWidget(self.jog_dec_spin)
         params_row.addStretch()
+        self.refresh_btn = QPushButton("🔄 Refresh Position")
+        _size_button(self.refresh_btn)
+        self.refresh_btn.clicked.connect(self._refresh_position)
+        self.refresh_btn.setEnabled(False)
+        params_row.addWidget(self.refresh_btn)
         v.addLayout(params_row)
 
         # Ensure spinboxes are wide enough for the largest expected value.
@@ -2290,12 +2792,17 @@ class GantryPanel(QMainWindow):
         letter.setAlignment(Qt.AlignCenter)
         v.addWidget(letter)
 
-        # Position readout in mm. Controller units removed — not meaningful to users.
+        # Position readout — shows home-relative mm when a home is set.
         pos_mm = QLabel("--")
         pos_mm.setObjectName("PositionReadout")
         pos_mm.setMinimumHeight(48)
         _fit_label(pos_mm, "-9999.999")
         v.addWidget(pos_mm)
+
+        home_label = QLabel("⚠ no home")
+        home_label.setStyleSheet("color: #ffa726; font-size: 11px;")
+        home_label.setAlignment(Qt.AlignCenter)
+        v.addWidget(home_label)
 
         # Velocity.
         vel = QLabel("Vel: -- cm/s")
@@ -2352,6 +2859,7 @@ class GantryPanel(QMainWindow):
         self.per_axis_cards[axis] = {
             "card": card,
             "pos_mm": pos_mm,
+            "home_label": home_label,
             "vel": vel,
             "target_spin": target_spin,
             "move_btn": move_btn,
@@ -2486,6 +2994,552 @@ class GantryPanel(QMainWindow):
         v.addWidget(self.plot_widget)
         return frame
 
+    # ------------------------------------------------------------------
+    # Experiment tab
+    # ------------------------------------------------------------------
+    def _build_experiment_tab(self) -> QWidget:
+        """Build the Experiment orchestration tab."""
+        container = QWidget()
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(10)
+
+        # ── (a) Pre-flight checklist ──────────────────────────────────────────
+        chk_frame = SectionFrame("Pre-flight Checklist")
+        chk_layout = QVBoxLayout(chk_frame.content())
+        chk_layout.setContentsMargins(0, 0, 0, 0)
+        chk_layout.setSpacing(4)
+
+        def _chk_row(label: str) -> tuple[QLabel, QLabel]:
+            row = QHBoxLayout()
+            status = QLabel("●")
+            status.setFixedWidth(18)
+            status.setStyleSheet("color: #ef5350; font-weight: bold;")
+            lbl = QLabel(label)
+            row.addWidget(status)
+            row.addWidget(lbl, stretch=1)
+            chk_layout.addLayout(row)
+            return status, lbl
+
+        self._exp_chk_connected,   _ = _chk_row("Controller connected")
+        self._exp_chk_homed,       _ = _chk_row("Home reference set (X, Y, Z)")
+        self._exp_chk_soft_limits, _ = _chk_row("Soft limits loaded")
+        self._exp_chk_path,        _ = _chk_row("Path defined: 0 waypoints")
+        self._exp_chk_camera,      _ = _chk_row("Camera connected (see connection bar)")
+        self._exp_chk_calib,       _ = _chk_row("Fisheye calibration loaded")
+        self._exp_chk_tagsize,     _ = _chk_row("Tag size configured")
+
+        # Camera summary — read-only label showing what the experiment will use.
+        self._exp_camera_summary = QLabel("Camera: not connected — use top connection bar")
+        self._exp_camera_summary.setStyleSheet(
+            "color: #888; font-size: 11px; padding: 2px 4px;"
+        )
+        self._exp_camera_summary.setWordWrap(True)
+        chk_layout.addWidget(self._exp_camera_summary)
+
+        self._exp_start_btn = QPushButton("▶  Start Experiment")
+        self._exp_start_btn.setObjectName("PrimaryButton")
+        _size_button(self._exp_start_btn, "primary")
+        self._exp_start_btn.setEnabled(False)
+        self._exp_start_btn.setToolTip("All checklist items must be green to start.")
+        self._exp_start_btn.clicked.connect(self._exp_start)
+        chk_layout.addWidget(self._exp_start_btn)
+
+        outer.addWidget(chk_frame)
+
+        # ── (b) Path source ───────────────────────────────────────────────────
+        path_frame = SectionFrame("Path Source")
+        path_layout = QVBoxLayout(path_frame.content())
+        path_layout.setContentsMargins(0, 0, 0, 0)
+        path_layout.setSpacing(6)
+
+        from PyQt5.QtWidgets import QRadioButton, QButtonGroup
+        self._exp_path_seq_radio = QRadioButton("Use Sequences tab waypoints (current)")
+        self._exp_path_csv_radio = QRadioButton("Use CSV file")
+        self._exp_path_seq_radio.setChecked(True)
+        path_bg = QButtonGroup(self)
+        path_bg.addButton(self._exp_path_seq_radio)
+        path_bg.addButton(self._exp_path_csv_radio)
+        path_layout.addWidget(self._exp_path_seq_radio)
+
+        csv_row = QHBoxLayout()
+        csv_row.addWidget(self._exp_path_csv_radio)
+        self._exp_path_csv_edit = QLineEdit()
+        self._exp_path_csv_edit.setPlaceholderText("x_mm,y_mm,z_mm,speed_cm_s,dwell_s")
+        self._exp_path_csv_edit.setEnabled(False)
+        csv_row.addWidget(self._exp_path_csv_edit, stretch=1)
+        browse_btn = QPushButton("Browse…")
+        _size_button(browse_btn)
+        browse_btn.clicked.connect(self._exp_browse_csv)
+        csv_row.addWidget(browse_btn)
+        path_layout.addLayout(csv_row)
+        self._exp_path_csv_radio.toggled.connect(
+            lambda checked: self._exp_path_csv_edit.setEnabled(checked)
+        )
+        outer.addWidget(path_frame)
+
+        # ── (c) Experiment parameters ─────────────────────────────────────────
+        param_frame = SectionFrame("Experiment Parameters")
+        param_grid = QGridLayout(param_frame.content())
+        param_grid.setContentsMargins(0, 0, 0, 0)
+        param_grid.setSpacing(6)
+
+        def _param_row(row: int, label: str, widget: QWidget) -> None:
+            param_grid.addWidget(QLabel(label), row, 0)
+            param_grid.addWidget(widget, row, 1)
+
+        self._exp_countdown_spin = QDoubleSpinBox()
+        self._exp_countdown_spin.setRange(0.0, 10.0)
+        self._exp_countdown_spin.setValue(2.0)
+        self._exp_countdown_spin.setSuffix(" s")
+        _param_row(0, "Pre-motion countdown:", self._exp_countdown_spin)
+
+        self._exp_settle_spin = QDoubleSpinBox()
+        self._exp_settle_spin.setRange(0.0, 30.0)
+        self._exp_settle_spin.setValue(2.0)
+        self._exp_settle_spin.setSuffix(" s")
+        _param_row(1, "Post-motion settle time:", self._exp_settle_spin)
+
+        self._exp_idle_detect_chk = QCheckBox("Tag detection during countdown (pre-idle)")
+        self._exp_idle_detect_chk.setChecked(True)
+        param_grid.addWidget(self._exp_idle_detect_chk, 2, 0, 1, 2)
+
+        self._exp_name_edit = QLineEdit()
+        self._exp_name_edit.setPlaceholderText("auto-generated timestamp")
+        _param_row(3, "Output folder name:", self._exp_name_edit)
+
+        outer.addWidget(param_frame)
+
+        # ── (d) TagSLAM settings ──────────────────────────────────────────────
+        # Camera hardware (device/resolution/FPS/calib) is now in the top
+        # connection bar.  Only experiment-specific SLAM knobs live here.
+        cam_frame = SectionFrame("TagSLAM Settings")
+        cam_grid = QGridLayout(cam_frame.content())
+        cam_grid.setContentsMargins(0, 0, 0, 0)
+        cam_grid.setSpacing(6)
+
+        def _cam_row(row: int, label: str, widget: QWidget) -> None:
+            cam_grid.addWidget(QLabel(label), row, 0)
+            cam_grid.addWidget(widget, row, 1)
+
+        self._exp_tag_family_edit = QLineEdit("tag36h11")
+        _cam_row(0, "Tag family:", self._exp_tag_family_edit)
+
+        self._exp_tag_size_spin = QDoubleSpinBox()
+        self._exp_tag_size_spin.setRange(0.01, 1.0)
+        self._exp_tag_size_spin.setValue(0.170)
+        self._exp_tag_size_spin.setDecimals(3)
+        self._exp_tag_size_spin.setSuffix(" m")
+        _cam_row(1, "Tag size:", self._exp_tag_size_spin)
+
+        self._exp_anchor_spin = QSpinBox()
+        self._exp_anchor_spin.setRange(0, 255)
+        self._exp_anchor_spin.setValue(1)
+        _cam_row(2, "Anchor tag ID:", self._exp_anchor_spin)
+
+        self._exp_water_combo = QComboBox()
+        for mode in ["none", "scalar", "refractive"]:
+            self._exp_water_combo.addItem(mode)
+        _cam_row(3, "Water correction mode:", self._exp_water_combo)
+
+        outer.addWidget(cam_frame)
+
+        # ── (e) Live experiment status ────────────────────────────────────────
+        live_frame = SectionFrame("Live Status")
+        live_layout = QVBoxLayout(live_frame.content())
+        live_layout.setContentsMargins(0, 0, 0, 0)
+        live_layout.setSpacing(6)
+
+        self._exp_state_label = QLabel("IDLE")
+        self._exp_state_label.setStyleSheet(
+            "font-size: 20px; font-weight: 700; color: #4ea1ff;"
+        )
+        live_layout.addWidget(self._exp_state_label)
+
+        prog_row = QHBoxLayout()
+        self._exp_wp_bar = QProgressBar()
+        self._exp_wp_bar.setRange(0, 1)
+        self._exp_wp_bar.setValue(0)
+        self._exp_wp_bar.setFormat("Waypoint %v / %m")
+        prog_row.addWidget(self._exp_wp_bar, stretch=1)
+        self._exp_time_bar = QProgressBar()
+        self._exp_time_bar.setRange(0, 100)
+        self._exp_time_bar.setValue(0)
+        self._exp_time_bar.setFormat("Elapsed %p%")
+        prog_row.addWidget(self._exp_time_bar, stretch=1)
+        live_layout.addLayout(prog_row)
+
+        stats_row = QHBoxLayout()
+        self._exp_tags_frame_lbl = QLabel("Tags/frame: —")
+        self._exp_tags_graph_lbl = QLabel("Tags/graph: —")
+        self._exp_updates_lbl    = QLabel("Updates: —")
+        self._exp_drift_lbl      = QLabel("Drift: — mm")
+        for lbl in (self._exp_tags_frame_lbl, self._exp_tags_graph_lbl,
+                    self._exp_updates_lbl, self._exp_drift_lbl):
+            lbl.setStyleSheet("color: #aaa; font-size: 12px;")
+            stats_row.addWidget(lbl)
+        stats_row.addStretch()
+        live_layout.addLayout(stats_row)
+
+        stop_row = QHBoxLayout()
+        self._exp_stop_btn = QPushButton("■  Stop Experiment")
+        self._exp_stop_btn.setEnabled(False)
+        self._exp_stop_btn.setStyleSheet(
+            "QPushButton { background-color:#8b1a1a; color:white; border:1px solid #c04040;"
+            " border-radius:5px; padding:6px 14px; font-weight:600; }"
+            "QPushButton:hover { background-color:#b02222; }"
+            "QPushButton:disabled { background-color:#2a2a2e; color:#666; }"
+        )
+        self._exp_stop_btn.clicked.connect(self._exp_stop)
+        stop_row.addWidget(self._exp_stop_btn)
+
+        self._exp_result_label = QLabel("")
+        self._exp_result_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        self._exp_result_label.setWordWrap(True)
+        stop_row.addWidget(self._exp_result_label, stretch=1)
+        live_layout.addLayout(stop_row)
+
+        outer.addWidget(live_frame)
+        outer.addStretch()
+
+        # Wire experiment runner if available
+        if HAVE_EXPERIMENT_RUNNER:
+            self._experiment_runner = ExperimentRunner(self)
+            self._experiment_runner.state_changed.connect(self._exp_on_state_changed)
+            self._experiment_runner.countdown_tick.connect(self._exp_on_countdown)
+            self._experiment_runner.waypoint_progress.connect(self._exp_on_wp_progress)
+            self._experiment_runner.fisheye_stats.connect(self._exp_on_fisheye_stats)
+            self._experiment_runner.error.connect(
+                lambda msg: self._exp_result_label.setText(f"⚠ {msg}")
+            )
+            self._experiment_runner.finished.connect(self._exp_on_finished)
+
+        # Refresh checklist once UI is built
+        QTimer.singleShot(200, self._exp_refresh_checklist)
+        return container
+
+    # ── Experiment helpers ────────────────────────────────────────────────────
+
+    def _exp_refresh_checklist(self) -> None:
+        """Update the checklist indicators and enable/disable Start."""
+        def _set(indicator: QLabel, ok: bool, text: str = "") -> None:
+            indicator.setText("●")
+            indicator.setStyleSheet(
+                "color: #34d058; font-weight: bold;" if ok
+                else "color: #ef5350; font-weight: bold;"
+            )
+
+        connected = self.connected
+        _set(self._exp_chk_connected, connected)
+
+        homed = all(self._home_position_mm.get(a) is not None for a in AXES)
+        _set(self._exp_chk_homed, homed)
+
+        limits_ok = all(v is not None for v in self._soft_min_mm + self._soft_max_mm)
+        _set(self._exp_chk_soft_limits, limits_ok)
+
+        n_wp = self._exp_count_waypoints()
+        path_ok = n_wp > 0
+        self._exp_chk_path.parentWidget()  # just in case
+        _set(self._exp_chk_path, path_ok)
+        # Update label text to show count
+        try:
+            self._exp_chk_path.setText("●")
+            # Find the sibling QLabel
+            for lbl in self._exp_chk_path.parentWidget().findChildren(QLabel):
+                if "waypoints" in lbl.text():
+                    lbl.setText(f"Path defined: {n_wp} waypoints")
+                    break
+        except Exception:
+            pass
+
+        cam_ok = (
+            (self._camera is not None and self._camera.is_open)
+            or self._is_mock_camera
+        )
+        _set(self._exp_chk_camera, cam_ok)
+
+        # Calib: check the path stored in the active camera session.
+        if self._is_mock_camera:
+            calib_ok = True
+        elif self._camera is not None and self._camera.calib_path is not None:
+            calib_ok = self._camera.calib_path.exists()
+        else:
+            calib_ok = False
+        _set(self._exp_chk_calib, calib_ok)
+
+        tag_size_ok = self._exp_tag_size_spin.value() > 0
+        _set(self._exp_chk_tagsize, tag_size_ok)
+
+        all_ok = all([connected, homed, limits_ok, path_ok, cam_ok, calib_ok, tag_size_ok])
+        self._exp_start_btn.setEnabled(all_ok and not self._experiment_in_progress
+                                       and HAVE_EXPERIMENT_RUNNER)
+        missing = []
+        if not connected:   missing.append("connect controller")
+        if not homed:       missing.append("home all axes")
+        if not limits_ok:   missing.append("load soft limits")
+        if not path_ok:     missing.append("add waypoints")
+        if not cam_ok:      missing.append("connect camera (top bar)")
+        if not calib_ok:    missing.append("set calib path (top bar)")
+        self._exp_start_btn.setToolTip(
+            "Start experiment" if all_ok
+            else "Missing: " + ", ".join(missing)
+        )
+
+    def _exp_count_waypoints(self) -> int:
+        if self._exp_path_seq_radio.isChecked():
+            return self.waypoint_table.rowCount()
+        csv_path = Path(self._exp_path_csv_edit.text().strip())
+        if not csv_path.exists():
+            return 0
+        try:
+            import csv as _csv
+            with csv_path.open(newline="") as fh:
+                return sum(1 for _ in _csv.DictReader(fh))
+        except Exception:
+            return 0
+
+    def _exp_browse_csv(self) -> None:
+        p, _ = QFileDialog.getOpenFileName(
+            self, "Select Waypoint CSV", "", "CSV Files (*.csv)"
+        )
+        if p:
+            self._exp_path_csv_edit.setText(p)
+
+    def _send_waypoints_to_experiment(self) -> None:
+        """Copy Sequences tab waypoints to Experiment tab path source, switch tab."""
+        self._exp_path_seq_radio.setChecked(True)
+        # Switch to Experiment tab (index 4)
+        if hasattr(self, "tabs"):
+            self.tabs.setCurrentIndex(4)
+        self._exp_refresh_checklist()
+
+    def _exp_build_fisheye_args(self):
+        """Construct an argparse.Namespace for the fisheye pipeline from the UI fields."""
+        import argparse
+        args = argparse.Namespace()
+        # Camera hardware comes from the top connection bar.
+        args.camera_device = str(self._cam_device_spin.value())
+        res_text = self._cam_res_combo.currentText().replace("×", "x")
+        try:
+            w, h = (int(v) for v in res_text.split("x"))
+            args.camera_resolution = [w, h]
+        except ValueError:
+            args.camera_resolution = None
+        args.camera_fps = float(self._cam_fps_spin.value())
+        # Calibration from active session; fall back to the edit text (mock/no-op path).
+        _calib = (
+            self._camera.calib_path
+            if self._camera is not None and self._camera.calib_path is not None
+            else Path(self._cam_calib_edit.text().strip())
+        )
+        args.fisheye_calib = _calib
+        args.fisheye_balance = 0.0
+        # TagSLAM
+        args.tag_family = self._exp_tag_family_edit.text().strip() or "tag36h11"
+        args.tag_size   = float(self._exp_tag_size_spin.value())
+        args.anchor_tag_id = int(self._exp_anchor_spin.value())
+        args.max_tag_id = -1
+        args.water_correction_mode = self._exp_water_combo.currentText()
+        args.water_scale = 3.6
+        args.surface_distance_m = 0.20
+        args.water_refractive_index = 1.333
+        args.refractive_max_iterations = 8
+        args.refractive_convergence_tol_m = 1e-5
+        args.refractive_convergence_tol_deg = 0.01
+        args.refractive_ray_max_iterations = 10
+        args.refractive_ray_tol = 1e-11
+        args.min_tag_area_px = 120.0
+        args.max_off_nadir_deg = 25.0
+        args.max_image_eccentricity = 0.65
+        args.max_tag_tilt_deg = 35.0
+        args.max_reprojection_error_px = 5.0
+        args.nthreads = 2
+        args.quad_decimate = 1.0
+        args.quad_sigma = 0.0
+        args.decode_sharpening = 0.25
+        args.min_decision_margin = 30.0
+        args.max_hamming = 0
+        args.tag_rot_sigma = 0.08
+        args.tag_trans_sigma = 0.04
+        args.tag_robust_kernel = "huber"
+        args.tag_robust_threshold = 1.345
+        args.tag_init_min_observations = 3
+        args.pose_std_window = 30
+        args.odom_rot_sigma = 0.35
+        args.odom_trans_sigma = 0.30
+        args.prior_rot_sigma = 1e-6
+        args.prior_trans_sigma = 1e-6
+        args.floor_prior_enabled = True
+        args.floor_z_sigma = 0.02
+        args.floor_plane_min_tags = 4
+        args.floor_normal_sigma_deg = 8.0
+        args.strict_coplanar = False
+        args.floor_prior_refresh_frames = 0
+        args.floor_plane_outlier_threshold = 0.10
+        args.use_imu_gravity = False
+        args.gravity_align_world = False
+        args.imu_gravity_smoothing_n = 5
+        args.init_min_observations = 3
+        args.init_min_decision_margin = 45.0
+        args.init_min_tag_area_px = 250.0
+        args.init_max_off_nadir_deg = 20.0
+        args.init_max_image_eccentricity = 0.45
+        args.init_max_tag_tilt_deg = 25.0
+        args.plot_z_scale = 1.0
+        args.trajectory_image_width = 960
+        args.config = "config/config.yaml"
+        args.max_frames = None
+        return args
+
+    def _exp_load_waypoints(self) -> list[Waypoint]:
+        if self._exp_path_seq_radio.isChecked():
+            return self._collect_waypoints()
+        # CSV file
+        csv_path = Path(self._exp_path_csv_edit.text().strip())
+        if not csv_path.exists():
+            return []
+        import csv as _csv
+        out: list[Waypoint] = []
+        with csv_path.open(newline="") as fh:
+            for row in _csv.DictReader(fh):
+                try:
+                    # Support both mm/s and cm/s columns
+                    speed_raw = float(row.get("speed_mm_s", row.get("speed_cm_s", 20.0)))
+                    if "speed_cm_s" in row and "speed_mm_s" not in row:
+                        speed_raw *= 10.0  # cm/s → mm/s
+                    out.append(Waypoint(
+                        x_mm=float(row["x_mm"]),
+                        y_mm=float(row["y_mm"]),
+                        z_mm=float(row["z_mm"]),
+                        speed_mm_s=speed_raw,
+                        dwell_s=float(row.get("dwell_s", 0.0)),
+                    ))
+                except (KeyError, ValueError):
+                    continue
+        return out
+
+    def _exp_start(self) -> None:
+        if not HAVE_EXPERIMENT_RUNNER:
+            QMessageBox.critical(self, "Missing Module",
+                "experiment_runner.py not found. Place it in the src/ directory.")
+            return
+        if self._experiment_in_progress:
+            return
+
+        # Collect waypoints
+        try:
+            waypoints = self._exp_load_waypoints()
+        except SystemExit as exc:
+            QMessageBox.warning(self, "Bad waypoints", str(exc))
+            return
+        if not waypoints:
+            QMessageBox.warning(self, "No waypoints", "Define at least one waypoint first.")
+            return
+
+        # Validate soft limits
+        try:
+            _validate_soft_limits(waypoints, self._soft_min_mm, self._soft_max_mm)
+        except SystemExit as exc:
+            QMessageBox.warning(self, "Soft limit violation", str(exc))
+            return
+
+        # Load calibration from the active camera session (or skip for mock).
+        calib_path = (
+            self._camera.calib_path
+            if self._camera is not None and self._camera.calib_path is not None
+            else None
+        )
+        fisheye_calib = None
+        if not self._is_mock_camera and calib_path is not None:
+            try:
+                from fisheye_gantry_tagslam import load_fisheye_calibration
+                fisheye_calib = load_fisheye_calibration(calib_path)
+            except SystemExit as exc:
+                QMessageBox.warning(self, "Calibration error", str(exc))
+                return
+            except ImportError:
+                pass  # fisheye module optional
+
+        EMERGENCY_STOP.clear()
+        self._abort_event.clear()
+
+        run_name = self._exp_name_edit.text().strip()
+        fisheye_args = self._exp_build_fisheye_args()
+
+        config = ExperimentConfig(
+            controller=self.controller,
+            controller_lock=self._controller_lock,
+            waypoints=waypoints,
+            soft_min_mm=list(self._soft_min_mm),
+            soft_max_mm=list(self._soft_max_mm),
+            move_mode=getattr(self, "_move_mode", "line"),
+            countdown_s=self._exp_countdown_spin.value(),
+            settle_s=self._exp_settle_spin.value(),
+            tag_detection_while_idle=self._exp_idle_detect_chk.isChecked(),
+            output_root=Path("data"),
+            run_name=run_name,
+            fisheye_args=fisheye_args,
+            fisheye_calib=fisheye_calib,
+            abort_event=self._abort_event,
+            mock_camera=self._is_mock_camera,
+            camera_session=self._camera,
+        )
+        self._experiment_in_progress = True
+        self._exp_start_btn.setEnabled(False)
+        self._exp_stop_btn.setEnabled(True)
+        self._exp_wp_bar.setValue(0)
+        self._exp_time_bar.setValue(0)
+        self._exp_result_label.setText("")
+        self._experiment_runner.start_experiment(config)
+
+    def _exp_stop(self) -> None:
+        if self._experiment_runner is not None:
+            self._experiment_runner.stop_experiment()
+        self._abort_event.set()
+
+    def _exp_on_state_changed(self, phase: str, msg: str) -> None:
+        self._exp_state_label.setText(f"{phase}  {msg}")
+        color = {
+            "IDLE":        "#4ea1ff",
+            "COUNTDOWN":   "#ffd54f",
+            "MOTION":      "#66bb6a",
+            "SETTLE":      "#ff9800",
+            "POSTPROCESS": "#ab47bc",
+            "DONE":        "#34d058",
+        }.get(phase, "#aaa")
+        self._exp_state_label.setStyleSheet(
+            f"font-size: 18px; font-weight: 700; color: {color};"
+        )
+        if phase == "DONE":
+            self._experiment_in_progress = False
+            self._exp_stop_btn.setEnabled(False)
+            self._exp_refresh_checklist()
+
+    def _exp_on_countdown(self, remaining: float) -> None:
+        self._exp_state_label.setText(f"COUNTDOWN  T−{remaining:.1f}s")
+
+    def _exp_on_wp_progress(self, current: int, total: int) -> None:
+        self._exp_wp_bar.setRange(0, total)
+        self._exp_wp_bar.setValue(current)
+        self._exp_wp_bar.setFormat(f"Waypoint {current} / {total}")
+
+    def _exp_on_fisheye_stats(self, sample) -> None:
+        drift = f"{sample.drift_mm:.1f} mm" if sample.drift_mm == sample.drift_mm else "N/A"
+        self._exp_tags_frame_lbl.setText(f"Tags/frame: {sample.tags_this_frame}")
+        self._exp_tags_graph_lbl.setText(f"Tags/graph: {sample.tags_in_graph}")
+        self._exp_updates_lbl.setText(f"Updates: {sample.backend_updates}")
+        self._exp_drift_lbl.setText(f"Drift: {drift}")
+
+    def _exp_on_finished(self, result: dict) -> None:
+        self._experiment_in_progress = False
+        self._exp_stop_btn.setEnabled(False)
+        run_dir = result.get("run_dir", "")
+        aborted = result.get("aborted", False)
+        tag = " (aborted)" if aborted else ""
+        self._exp_result_label.setText(f"Done{tag} → {run_dir}")
+        self._exp_refresh_checklist()
+
     def _build_waypoint_panel(self) -> SectionFrame:
         frame = SectionFrame("Waypoint Sequence")
         v = QVBoxLayout(frame.content())
@@ -2494,7 +3548,7 @@ class GantryPanel(QMainWindow):
 
         self.waypoint_table = QTableWidget(0, 5)
         self.waypoint_table.setHorizontalHeaderLabels(
-            ["X (mm)", "Y (mm)", "Z (mm)", "Speed (mm/s)", "Dwell (s)"]
+            ["X (mm, from home)", "Y (mm, from home)", "Z (mm, from home)", "Speed (mm/s)", "Dwell (s)"]
         )
         hdr = self.waypoint_table.horizontalHeader()
         for i in range(5):
@@ -2532,42 +3586,38 @@ class GantryPanel(QMainWindow):
         self.stop_seq_btn.clicked.connect(self._stop_sequence)
         self.stop_seq_btn.setEnabled(False)
         btn_row.addWidget(self.stop_seq_btn)
+        send_exp_btn = QPushButton("→ Experiment")
+        _size_button(send_exp_btn)
+        send_exp_btn.setToolTip(
+            "Copy these waypoints to the Experiment tab as the motion path, "
+            "then switch to the Experiment tab."
+        )
+        send_exp_btn.clicked.connect(self._send_waypoints_to_experiment)
+        btn_row.addWidget(send_exp_btn)
         v.addLayout(btn_row)
-        return frame
 
-    def _build_global_controls(self) -> QHBoxLayout:
-        h = QHBoxLayout()
-        h.setSpacing(8)
-        h.setContentsMargins(8, 8, 8, 8)
-        self.refresh_btn = QPushButton("🔄 Refresh Position")
-        _size_button(self.refresh_btn)
-        self.refresh_btn.clicked.connect(self._refresh_position)
-        h.addWidget(self.refresh_btn)
-
+        # Run control row — low-level controller pause/resume/stop.
+        run_ctrl_row = QHBoxLayout()
+        run_ctrl_row.setSpacing(8)
+        run_ctrl_row.addWidget(QLabel("Run Control:"))
         self.pause_btn = QPushButton("Pause Run")
         _size_button(self.pause_btn)
         self.pause_btn.clicked.connect(lambda: self._run_global_command("pause"))
-        h.addWidget(self.pause_btn)
+        self.pause_btn.setEnabled(False)
+        run_ctrl_row.addWidget(self.pause_btn)
         self.resume_btn = QPushButton("Resume Run")
         _size_button(self.resume_btn)
         self.resume_btn.clicked.connect(lambda: self._run_global_command("resume"))
-        h.addWidget(self.resume_btn)
+        self.resume_btn.setEnabled(False)
+        run_ctrl_row.addWidget(self.resume_btn)
         self.stop_run_btn = QPushButton("Stop Run")
         _size_button(self.stop_run_btn)
         self.stop_run_btn.clicked.connect(lambda: self._run_global_command("stop"))
-        h.addWidget(self.stop_run_btn)
-
-        h.addStretch()
-        self.estop_btn = QPushButton("⚠  EMERGENCY STOP ALL")
-        self.estop_btn.setObjectName("EmergencyButton")
-        _size_button(self.estop_btn, "emergency")
-        self.estop_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        ic_stop = _icon("fa5s.stop-circle")
-        if ic_stop is not None:
-            self.estop_btn.setIcon(ic_stop)
-        self.estop_btn.clicked.connect(self._emergency_stop_all)
-        h.addWidget(self.estop_btn, stretch=2)
-        return h
+        self.stop_run_btn.setEnabled(False)
+        run_ctrl_row.addWidget(self.stop_run_btn)
+        run_ctrl_row.addStretch()
+        v.addLayout(run_ctrl_row)
+        return frame
 
     def _build_status_bar(self) -> None:
         sb: QStatusBar = self.statusBar()
@@ -2635,10 +3685,15 @@ class GantryPanel(QMainWindow):
         self.connected = False
         self.connect_btn.setText("Connect")
         self._set_connection_status("Disconnected", "#ef5350")
-        # Clear axis cards.
-        for card in self.axis_cards.values():
-            card.update_state(0.0, 0.0, 0.0, 0.0)
-            card.set_soft_limits(None, None)
+        # Reset per-axis readouts on disconnect.
+        for info in self.per_axis_cards.values():
+            info["pos_mm"].setText("--")
+            info["pos_mm"].setToolTip("")
+            info["vel"].setText("Vel: -- cm/s")
+            lbl = info.get("home_label")
+            if lbl:
+                lbl.setText("⚠ no home")
+                lbl.setStyleSheet("color: #ffa726; font-size: 11px;")
         self.sb_op_label.setText("Idle")
         self._update_all_button_states()
         self._status_timer.start()
@@ -2693,17 +3748,28 @@ class GantryPanel(QMainWindow):
         self._last_pos_mm = tuple(pos_mm)
         self._last_pos_units = tuple(pos_units)
 
-        # Update cards (now passing per-axis home reference).
+        # Update per-axis Control card readouts (home-relative when home is set).
         for i, axis in enumerate(AXES):
             home_mm = self._home_position_mm[axis]
-            self.axis_cards[axis].update_state(
-                pos_units[i], pos_mm[i], vel_mm[i], acc_mm[i],
-                home_mm=home_mm,
-            )
-            # Mirror onto the Per-Axis Control card readouts.
             info = self.per_axis_cards.get(axis)
             if info is not None:
-                info["pos_mm"].setText(f"{pos_mm[i]:+8.3f}")
+                if home_mm is not None:
+                    rel = pos_mm[i] - home_mm
+                    info["pos_mm"].setText(f"{rel:+8.3f}")
+                    info["pos_mm"].setToolTip(
+                        f"From home  ·  abs {pos_mm[i]:+.3f} mm"
+                    )
+                    lbl = info.get("home_label")
+                    if lbl:
+                        lbl.setText("⌂ from home")
+                        lbl.setStyleSheet("color: #4ea1ff; font-size: 11px;")
+                else:
+                    info["pos_mm"].setText(f"{pos_mm[i]:+8.3f}")
+                    info["pos_mm"].setToolTip("No home set — raw machine position")
+                    lbl = info.get("home_label")
+                    if lbl:
+                        lbl.setText("⚠ no home")
+                        lbl.setStyleSheet("color: #ffa726; font-size: 11px;")
                 info["vel"].setText(f"Vel: {vel_mm[i] / 10.0:+.2f} cm/s")
 
         # Update plot history.
@@ -2864,7 +3930,6 @@ class GantryPanel(QMainWindow):
             sp["max"].setValue(hi_mm if hi_mm is not None else 0.0)
             sp["min"].blockSignals(False)
             sp["max"].blockSignals(False)
-            self.axis_cards[axis].set_soft_limits(lo_mm, hi_mm)
             # Clamp BOTH the combined Move-to-Target spinbox AND the per-axis
             # card's Move Abs spinbox to the loaded range.
             for target_sp in (self.target_spins[axis],
@@ -2999,16 +4064,31 @@ class GantryPanel(QMainWindow):
         _gp_save_section("gantry_panel", payload)
 
     def _refresh_home_displays(self) -> None:
-        # Re-render the Δ-home line on each card using the latest position
-        # snapshot, and update the workspace map's home marker.
+        # Re-render per-axis position readouts using the latest snapshot,
+        # and update the workspace map's home marker.
         snap = getattr(self, "_last_pos_mm", None)
         for i, axis in enumerate(AXES):
-            card = self.axis_cards.get(axis)
-            if card is None:
-                continue
             home_mm = self._home_position_mm[axis]
             cur = snap[i] if snap is not None else None
-            card.set_home_reference(home_mm, cur)
+            info = self.per_axis_cards.get(axis)
+            if info is not None:
+                if home_mm is not None and cur is not None:
+                    rel = cur - home_mm
+                    info["pos_mm"].setText(f"{rel:+8.3f}")
+                    info["pos_mm"].setToolTip(
+                        f"From home  ·  abs {cur:+.3f} mm"
+                    )
+                    lbl = info.get("home_label")
+                    if lbl:
+                        lbl.setText("⌂ from home")
+                        lbl.setStyleSheet("color: #4ea1ff; font-size: 11px;")
+                elif cur is not None:
+                    info["pos_mm"].setText(f"{cur:+8.3f}")
+                    info["pos_mm"].setToolTip("No home set — raw machine position")
+                    lbl = info.get("home_label")
+                    if lbl:
+                        lbl.setText("⚠ no home")
+                        lbl.setStyleSheet("color: #ffa726; font-size: 11px;")
         if getattr(self, "workspace_map", None) is not None:
             home_xyz = tuple(self._home_position_mm[a] for a in AXES)
             self.workspace_map.update_home(home_xyz)
@@ -3119,13 +4199,12 @@ class GantryPanel(QMainWindow):
         self._move_thread.start()
 
     def _use_current_as_target(self) -> None:
-        # Pull the last polled position from the cards' displays.
-        for axis in AXES:
-            label_text = self.axis_cards[axis].pos_display.text().strip()
-            try:
-                self.target_spins[axis].setValue(float(label_text))
-            except ValueError:
-                pass
+        # Use the cached absolute position (target spinboxes are in machine mm).
+        snap = getattr(self, "_last_pos_mm", None)
+        if snap is None:
+            return
+        for i, axis in enumerate(AXES):
+            self.target_spins[axis].setValue(snap[i])
 
     def _cancel_move(self) -> None:
         # Soft-cancel: stop_run halts coordinated motion. The move thread will
@@ -3346,14 +4425,19 @@ class GantryPanel(QMainWindow):
             self.waypoint_table.removeRow(r)
 
     def _collect_waypoints(self) -> list[Waypoint]:
+        # Waypoints are entered in home-relative mm; convert to absolute here.
+        # If home has not been captured for an axis, offset is 0 (absolute passthrough).
+        hx = float(self._home_position_mm.get(Axis.X) or 0.0)
+        hy = float(self._home_position_mm.get(Axis.Y) or 0.0)
+        hz = float(self._home_position_mm.get(Axis.Z) or 0.0)
         out: list[Waypoint] = []
         for r in range(self.waypoint_table.rowCount()):
             try:
                 cells = [self.waypoint_table.item(r, c).text() if self.waypoint_table.item(r, c) else "" for c in range(5)]
                 wp = Waypoint(
-                    x_mm=float(cells[0]),
-                    y_mm=float(cells[1]),
-                    z_mm=float(cells[2]),
+                    x_mm=float(cells[0]) + hx,
+                    y_mm=float(cells[1]) + hy,
+                    z_mm=float(cells[2]) + hz,
                     speed_mm_s=float(cells[3]) if cells[3].strip() else self.move_speed_spin.value(),
                     dwell_s=float(cells[4]) if cells[4].strip() else 0.0,
                 )
@@ -3470,6 +4554,13 @@ class GantryPanel(QMainWindow):
         # the instant they wake up.
         EMERGENCY_STOP.set()
         self._abort_event.set()
+
+        # Abort any running experiment immediately.
+        if self._experiment_runner is not None:
+            try:
+                self._experiment_runner.stop_experiment()
+            except Exception:
+                pass
 
         if not self.connected:
             self._show_estop_banner(t0, [], lock_acquired=False, note="not connected")
@@ -3719,6 +4810,149 @@ class GantryPanel(QMainWindow):
         self.estop_btn.setEnabled(connected)
 
     # ------------------------------------------------------------------
+    # Left-pane splitter persistence
+    # ------------------------------------------------------------------
+    def _on_left_splitter_moved(self, pos: int, index: int) -> None:
+        sizes = self._left_splitter.sizes()
+        payload = _gp_load_settings().get("gantry_panel", {})
+        payload["left_splitter_sizes"] = sizes
+        _gp_save_section("gantry_panel", payload)
+
+    # ------------------------------------------------------------------
+    # Camera session (persistent connection, shared with experiment runner)
+    # ------------------------------------------------------------------
+    def _toggle_camera(self) -> None:
+        if self._camera is not None and self._camera.is_open:
+            self._disconnect_camera()
+        else:
+            self._connect_camera()
+
+    def _connect_camera(self) -> None:
+        if not HAVE_FISHEYE_CAMERA:
+            QMessageBox.warning(
+                self, "fisheye_camera.py missing",
+                "Place fisheye_camera.py in src/ to enable the panel camera session.",
+            )
+            return
+        # Persist current settings.
+        payload = _gp_load_settings().get("gantry_panel", {})
+        payload["camera"] = {
+            "device":      self._cam_device_spin.value(),
+            "resolution":  self._cam_res_combo.currentText(),
+            "fps":         self._cam_fps_spin.value(),
+            "calib_path":  self._cam_calib_edit.text().strip(),
+        }
+        _gp_save_section("gantry_panel", payload)
+
+        if self._camera is None:
+            self._camera = FisheyeCameraSession(self)
+            self._camera.state_changed.connect(self._on_camera_state_changed)
+            self._camera.frame_ready.connect(self._fisheye_preview.on_frame)
+            self._camera.stats.connect(self._on_camera_stats)
+            self._camera.error.connect(self._on_camera_error)
+
+        res_text = self._cam_res_combo.currentText().replace("×", "x")
+        try:
+            w, h = (int(v) for v in res_text.split("x"))
+        except ValueError:
+            w, h = 1280, 720
+
+        calib_raw = self._cam_calib_edit.text().strip()
+        calib_path = Path(calib_raw) if calib_raw else None
+        mock = self._is_mock_camera
+
+        self._cam_connect_btn.setEnabled(False)
+        self._cam_connect_btn.setText("Connecting…")
+
+        self._camera.open(
+            device=self._cam_device_spin.value(),
+            width=w, height=h,
+            fps=self._cam_fps_spin.value(),
+            calib_path=calib_path,
+            mock=mock,
+        )
+
+    def _disconnect_camera(self) -> None:
+        if self._camera is not None:
+            self._camera.close()
+
+    def _on_camera_state_changed(self, state: str) -> None:
+        if state == "disconnected":
+            self._cam_connect_btn.setText("Connect Camera")
+            self._cam_connect_btn.setEnabled(True)
+            self._cam_status_label.setText("● Disconnected")
+            self._cam_status_label.setStyleSheet("color: #ef5350; font-weight: bold;")
+            if hasattr(self, "_fisheye_preview"):
+                self._fisheye_preview.set_state("disconnected")
+        elif state == "connecting":
+            self._cam_connect_btn.setText("Connecting…")
+            self._cam_connect_btn.setEnabled(False)
+            self._cam_status_label.setText("● Connecting…")
+            self._cam_status_label.setStyleSheet("color: #ffa726; font-weight: bold;")
+            if hasattr(self, "_fisheye_preview"):
+                self._fisheye_preview.set_state("connecting")
+        elif state in ("connected", "connected_mock"):
+            mock_tag = " (mock)" if state == "connected_mock" else ""
+            self._cam_connect_btn.setText("Disconnect Camera")
+            self._cam_connect_btn.setEnabled(True)
+            color = "#ffd54f" if state == "connected_mock" else "#66bb6a"
+            self._cam_status_label.setText(f"● Connected{mock_tag}")
+            self._cam_status_label.setStyleSheet(
+                f"color: {color}; font-weight: bold;"
+            )
+            if hasattr(self, "_fisheye_preview"):
+                self._fisheye_preview.set_state(state)
+            self._update_exp_camera_summary()
+        elif state == "error":
+            self._cam_connect_btn.setText("Connect Camera")
+            self._cam_connect_btn.setEnabled(True)
+            self._cam_status_label.setText("● Error")
+            self._cam_status_label.setStyleSheet("color: #ef5350; font-weight: bold;")
+            if hasattr(self, "_fisheye_preview"):
+                self._fisheye_preview.set_state("error")
+        self._exp_refresh_checklist()
+
+    def _on_camera_stats(self, fps: int, grab_ms: float) -> None:
+        if hasattr(self, "_fisheye_preview") and self._camera is not None:
+            self._fisheye_preview.update_stats(fps, grab_ms, self._camera.device_config)
+
+    def _on_camera_error(self, msg: str) -> None:
+        print(f"[camera-session] {msg}", file=sys.stderr)
+        self.sb_op_label.setText(f"Camera error: {msg[:80]}")
+        self.sb_op_label.setStyleSheet("color: #ef5350;")
+
+    def _cam_browse_calib(self) -> None:
+        p, _ = QFileDialog.getOpenFileName(
+            self, "Select Fisheye Calibration YAML", "", "YAML Files (*.yaml *.yml)"
+        )
+        if p:
+            self._cam_calib_edit.setText(p)
+
+    def _update_exp_camera_summary(self) -> None:
+        """Refresh the read-only camera summary label in the Experiment tab."""
+        if not hasattr(self, "_exp_camera_summary"):
+            return
+        if self._camera is None or not self._camera.is_open:
+            self._exp_camera_summary.setText(
+                "Camera: not connected — use top connection bar"
+            )
+            return
+        cfg = self._camera.device_config
+        w = cfg.get("width", "?")
+        h = cfg.get("height", "?")
+        fps = cfg.get("fps", "?")
+        dev = cfg.get("device", "?")
+        mock = cfg.get("mock", False)
+        calib_name = ""
+        cp = self._camera.calib_path
+        if cp:
+            calib_name = f" · calib={cp.name}"
+        mock_tag = " (mock)" if mock else ""
+        self._exp_camera_summary.setText(
+            f"Camera: Device {dev} · {w}×{h} · {fps} FPS{calib_name}{mock_tag}"
+        )
+
+    # ------------------------------------------------------------------
     # Tab persistence + clipping audit
     # ------------------------------------------------------------------
     def _on_tab_changed(self, idx: int) -> None:
@@ -3774,6 +5008,18 @@ class GantryPanel(QMainWindow):
             except RuntimeError:
                 return
 
+        if self._experiment_runner is not None:
+            try:
+                self._experiment_runner.stop_experiment()
+            except Exception:
+                pass
+
+        if self._camera is not None:
+            try:
+                self._camera.close()
+            except Exception:
+                pass
+
         for thread_attr in ("_status_thread", "_move_thread",
                             "_home_thread", "_sequence_thread"):
             _safe_wait(getattr(self, thread_attr, None))
@@ -3795,6 +5041,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="FMC4030 live control panel (PyQt5).")
     p.add_argument("--mock", action="store_true",
                    help="Use an in-process MockFMC4030Controller (smoke tests).")
+    p.add_argument("--mock-camera", action="store_true",
+                   help="Inject a synthetic fisheye stream for the Experiment tab "
+                        "(no real camera needed; useful with --mock).")
     p.add_argument("--light", action="store_true",
                    help="Skip the dark theme.")
     return p.parse_args(argv)
@@ -3834,6 +5083,8 @@ def main(argv: list[str] | None = None) -> int:
         controller = FMC4030Controller()
 
     window = GantryPanel(controller=controller, is_mock=args.mock)
+    window._cli_mock_camera = args.mock_camera       # picked up in __init__
+    window._is_mock_camera  = args.mock_camera       # applied immediately
     window.show()
 
     # Keep a reference to the heartbeat so it doesn't get GC'd.

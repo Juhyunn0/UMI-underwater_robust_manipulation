@@ -107,6 +107,191 @@ EMERGENCY_STOP = threading.Event()
 
 
 # =============================================================================
+# FisheyeGantryWorker — callable API for ExperimentRunner
+# =============================================================================
+class FisheyeGantryWorker:
+    """Encapsulates the camera + TagSLAM run loop so it can be invoked from
+    both ``main()`` (CLI) and ``ExperimentRunner`` (GUI experiment tab).
+
+    Usage::
+
+        worker = FisheyeGantryWorker(
+            args, calib, t0_monotonic=t0,
+            run_dir=run_dir,
+            gantry_logger=logger,
+            abort_event=stop_event,
+            sample_queue=queue,   # optional: FisheyeStatsSample emitted ~5 Hz
+        )
+        worker.run()  # blocking; returns when done or abort_event is set
+
+    After ``run()`` returns:
+        ``worker.trajectory_recorder``  — TrajectoryRecorder (call stop_and_save)
+        ``worker.backend``              — TagSlamBackend
+        ``worker.frame_count``          — int
+    """
+
+    def __init__(
+        self,
+        args,
+        calib: "FisheyeCalibration",
+        *,
+        t0_monotonic: float,
+        run_dir: Path,
+        gantry_logger: "GantryTelemetryLogger | None" = None,
+        abort_event: "threading.Event | None" = None,
+        sample_queue: "Any | None" = None,  # Queue[FisheyeStatsSample]
+        mock_camera: bool = False,
+    ) -> None:
+        self._args = args
+        self._calib = calib
+        self._t0 = t0_monotonic
+        self._run_dir = run_dir
+        self._gantry_logger = gantry_logger
+        self._abort = abort_event or threading.Event()
+        self._sample_queue = sample_queue
+        self._mock_camera = mock_camera
+
+        self.trajectory_recorder = None
+        self.backend = None
+        self.frame_count = 0
+
+    def run(self) -> None:
+        """Blocking camera + TagSLAM loop. Returns when done or aborted."""
+        try:
+            self._run_inner()
+        except Exception as exc:
+            print(f"[FisheyeGantryWorker] error: {exc}", file=sys.stderr)
+
+    def _run_inner(self) -> None:
+        args = self._args
+        calib = self._calib
+
+        runtime_config: dict = {}
+        try:
+            config_path = Path(args.config)
+            if config_path.exists():
+                with config_path.open("r") as fh:
+                    runtime_config_text = fh.read()
+                runtime_config = parse_simple_yaml(runtime_config_text)
+        except Exception:
+            pass
+        pool_cfg = normalize_pool_config(runtime_config.get("pool", {}))
+        water_cfg = normalize_water_config(runtime_config.get("water"), pool_cfg)
+
+        if self._mock_camera:
+            from experiment_runner import _MockCamera
+            cap = _MockCamera(calib.image_size[0], calib.image_size[1])
+        else:
+            cap = open_camera(
+                args.camera_device,
+                tuple(args.camera_resolution) if args.camera_resolution else None,
+                args.camera_fps,
+            )
+
+        cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        map1, map2, new_K = build_fisheye_undistort_maps(
+            calib.K, calib.D, (cam_w, cam_h), args.fisheye_balance,
+        )
+        intrinsics = rectified_camera_intrinsics(new_K)
+
+        backend = TagSlamBackend(args)
+        self.backend = backend
+        detector = make_detector(args)
+        object_points = tag_object_points(args.tag_size)
+        refractive_context = None
+        if args.water_correction_mode == "refractive":
+            refractive_context = RefractiveContext(water_cfg=water_cfg, backend=backend)
+
+        trajectory_recorder = TrajectoryRecorder(
+            output_root=self._run_dir.parent,
+            image_width=args.trajectory_image_width,
+            pool_cfg=pool_cfg,
+            tag_size_m=args.tag_size,
+            plot_z_scale=args.plot_z_scale,
+            anchor_tag_id=args.anchor_tag_id,
+            suffix="fisheye_gantry",
+            frames_subdir="frames",
+        )
+        trajectory_recorder.output_dir = self._run_dir
+        trajectory_recorder.frames_dir = self._run_dir / "frames"
+        trajectory_recorder.active = True
+        trajectory_recorder.start_monotonic_s = self._t0
+        trajectory_recorder.samples = []
+        self.trajectory_recorder = trajectory_recorder
+
+        last_stats_t = 0.0
+        backend_updates = 0
+
+        try:
+            while not self._abort.is_set() and not EMERGENCY_STOP.is_set():
+                ok, raw_frame = cap.read()
+                if not ok:
+                    break
+
+                frame_t_unix = time.time()
+                frame_t_mono = time.monotonic()
+
+                frame = cv2.remap(raw_frame, map1, map2, interpolation=cv2.INTER_LINEAR)
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+                observations = detect_observations(
+                    gray, detector, intrinsics, object_points, args, refractive_context,
+                )
+                update = backend.update(observations)
+                if update.camera_pose is not None:
+                    backend_updates += 1
+
+                gantry_sample = (
+                    self._gantry_logger.latest_sample()
+                    if self._gantry_logger is not None else None
+                )
+                extra: dict | None = None
+                drift_mm = float("nan")
+                if gantry_sample is not None and update.camera_pose is not None:
+                    cam_est = np.array(pose_translation(update.camera_pose), dtype=np.float64)
+                    cam_gt = gantry_to_world_translation_m(gantry_sample, calib.T_gantry_camera)
+                    drift_mm = float(np.linalg.norm(cam_est - cam_gt)) * 1000.0
+                    gx, gy, gz = gantry_sample.pos_mm
+                    extra = {
+                        "gantry_x_mm": float(gx),
+                        "gantry_y_mm": float(gy),
+                        "gantry_z_mm": float(gz),
+                        "translation_error_mm": drift_mm,
+                    }
+
+                trajectory_recorder.append(
+                    update, observations, frame_t_mono, frame,
+                    timestamp_unix=frame_t_unix,
+                    timestamp_monotonic=frame_t_mono,
+                    extra=extra,
+                )
+                self.frame_count += 1
+
+                # Push stats to queue at ~5 Hz
+                now = time.monotonic()
+                if self._sample_queue is not None and now - last_stats_t >= 0.2:
+                    last_stats_t = now
+                    try:
+                        from experiment_runner import FisheyeStatsSample
+                        self._sample_queue.put_nowait(FisheyeStatsSample(
+                            tags_this_frame=len(observations),
+                            tags_in_graph=len(backend.optimized_tag_poses()),
+                            backend_updates=backend_updates,
+                            drift_mm=drift_mm,
+                        ))
+                    except Exception:
+                        pass
+
+                if args.max_frames is not None and self.frame_count >= args.max_frames:
+                    break
+        finally:
+            if hasattr(cap, "release"):
+                cap.release()
+
+
+# =============================================================================
 # Calibration loading
 # =============================================================================
 @dataclass(frozen=True)
