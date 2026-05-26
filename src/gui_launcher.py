@@ -377,73 +377,11 @@ def _launch_form(
 
 
 # =============================================================================
-# Form: gantry_runner.py
+# Note: the gantry GUI form was retired. The PyQt5 panel in src/gantry_panel.py
+# is the new home for the gantry tool; running ``python src/gantry_runner.py``
+# (no args) launches it directly. The fisheye launcher below is the only
+# Tkinter form that remains.
 # =============================================================================
-def _gantry_sections() -> list[Section]:
-    return [
-        Section("Target", [
-            Field("target_mode", "Target mode", "choice", default="Single XYZ",
-                  choices=("Single XYZ", "Waypoints CSV"),
-                  cli_flag=None,  # consumed below
-                  tooltip="Choose single point or CSV file."),
-            Field("x_mm", "X (mm)", "float", default=0.0, cli_flag="--x-mm", width=12),
-            Field("y_mm", "Y (mm)", "float", default=0.0, cli_flag="--y-mm", width=12),
-            Field("z_mm", "Z (mm)", "float", default=0.0, cli_flag="--z-mm", width=12),
-            Field("waypoints_csv", "Waypoints CSV", "file", default="",
-                  cli_flag="--waypoints-csv", width=40),
-        ]),
-        Section("Motion", [
-            Field("speed_mm_s", "Speed (mm/s)", "float", default=20.0, cli_flag="--speed-mm-s", width=12),
-            Field("acc_mm_s2", "Acceleration (mm/s²)", "float", default=50.0, cli_flag="--acc-mm-s2", width=12),
-            Field("dec_mm_s2", "Deceleration (mm/s²)", "float", default=50.0, cli_flag="--dec-mm-s2", width=12),
-            Field("mode", "Mode", "choice", default="line",
-                  choices=("line", "sequential"), cli_flag="--mode", width=14),
-        ]),
-        Section("Logging", [
-            Field("log_hz", "Log rate (Hz)", "float", default=100.0, cli_flag="--log-hz", width=10),
-            Field("trajectory_dir", "Trajectory dir", "dir", default="data",
-                  cli_flag="--trajectory-dir", width=40),
-        ]),
-        Section("Controller (FMC4030)", [
-            Field("gantry_ip", "IP", "str", default="192.168.0.30", cli_flag="--gantry-ip", width=18),
-            Field("gantry_port", "Port", "int", default=8088, cli_flag="--gantry-port", width=10),
-            Field("gantry_id", "Controller ID", "int", default=1, cli_flag="--gantry-id", width=6),
-        ]),
-        Section("Soft limits (mm) — leave blank to use device values", [
-            Field("soft_limit_min_mm", "Min  X Y Z", "str", default="",
-                  cli_flag="--soft-limit-min-mm", width=24,
-                  tooltip='Three numbers separated by spaces, e.g. "-200 -200 -100"'),
-            Field("soft_limit_max_mm", "Max  X Y Z", "str", default="",
-                  cli_flag="--soft-limit-max-mm", width=24),
-        ]),
-        Section("Run mode", [
-            Field("dry_run", "Dry run (validate, no motion)", "bool", default=True,
-                  cli_flag="--dry-run", cli_store_true=True),
-        ]),
-    ]
-
-
-def launch_gantry_gui(script_path: Path) -> int:
-    """Open the gantry_runner.py configuration form and return its exit code.
-
-    Adds a "Connect" button that runs ``gantry_runner.py --connect-test`` with
-    just the current IP/port/id values, so the user can verify the controller
-    link without committing to a motion run.
-    """
-    sections = _gantry_sections()
-    return _launch_form_with_target_pruning(
-        title="Gantry Runner",
-        form_name="gantry_runner",
-        sections=sections,
-        script_path=script_path,
-        target_choice_key="target_mode",
-        single_keys=("x_mm", "y_mm", "z_mm"),
-        csv_keys=("waypoints_csv",),
-        connect_test_script=script_path,
-        connect_test_arg_keys=("gantry_ip", "gantry_port", "gantry_id"),
-    )
-
-
 def _launch_form_with_target_pruning(
     *,
     title: str,

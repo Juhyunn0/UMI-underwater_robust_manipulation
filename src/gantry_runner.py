@@ -491,7 +491,10 @@ def _validate_soft_limits(
                 )
 
 
-def _make_run_dir(root: Path, suffix: str) -> Path:
+def make_gantry_run_dir(root: Path, suffix: str = "gantry_run") -> Path:
+    """Return a fresh ``<root>/YYYYMMDD/YYYYMMDD_HHMMSS_<suffix>/`` directory,
+    auto-suffixed with ``_NN`` if it collides. Public helper shared by the
+    headless CLI and the live PyQt panel."""
     now = datetime.now()
     day_dir = root / now.strftime("%Y%m%d")
     stem = now.strftime("%Y%m%d_%H%M%S") + "_" + suffix
@@ -502,6 +505,10 @@ def _make_run_dir(root: Path, suffix: str) -> Path:
         candidate = day_dir / f"{stem}_{n:02d}"
     candidate.mkdir(parents=True)
     return candidate
+
+
+# Backwards-compat alias used inside this file before the rename.
+_make_run_dir = make_gantry_run_dir
 
 
 def _install_sigint_handler(
@@ -796,10 +803,11 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    # No CLI args -> launch the Tkinter GUI launcher; otherwise behave as the
-    # CLI tool we've always been. The GUI builds an argv list and re-invokes
-    # this same script as a subprocess, so the CLI path stays authoritative.
+    # No CLI args -> launch the PyQt5 live control panel from gantry_panel.py.
+    # Any CLI args -> headless CLI mode (authoritative). This way the gantry
+    # tool has one obvious "double-click" entry point while preserving the
+    # scriptable interface intact.
     if len(sys.argv) == 1:
-        from gui_launcher import launch_gantry_gui
-        sys.exit(launch_gantry_gui(Path(__file__).resolve()))
+        from gantry_panel import main as _panel_main
+        sys.exit(_panel_main([]))
     sys.exit(main())
