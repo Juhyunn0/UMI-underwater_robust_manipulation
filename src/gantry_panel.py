@@ -42,6 +42,11 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+try:
+    import yaml as _yaml
+except ImportError:
+    _yaml = None  # type: ignore[assignment]
+
 # sys.path shim: import sibling modules from src/ regardless of cwd.
 _THIS_FILE = Path(__file__).resolve()
 _SRC_DIR = _THIS_FILE.parent
@@ -56,11 +61,11 @@ from PyQt5.QtGui import (  # noqa: E402
     QColor, QDesktopServices, QFont, QKeySequence,
 )
 from PyQt5.QtWidgets import (  # noqa: E402
-    QAction, QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
-    QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMainWindow, QMenuBar, QMessageBox, QProgressBar, QPushButton, QScrollArea,
-    QShortcut, QSizePolicy, QSpinBox, QStatusBar, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QAction, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
+    QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QMainWindow, QMenuBar, QMessageBox, QProgressBar, QPushButton,
+    QScrollArea, QSizePolicy, QSpinBox, QStatusBar, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 # Optional dependencies — degrade gracefully if missing.
@@ -101,6 +106,26 @@ from gantry_runner import (  # noqa: E402
 # =============================================================================
 HOME_SPEED_LIMIT_UNITS = 20.0       # hard upper bound on home speed (units/s)
 STATUS_POLL_MS = 100                # 10 Hz live readout
+
+# --- Unit conversion helpers (centralized — single source of truth) ---
+# SCALE_MM_PER_UNIT imported from gantry_runner (mm per controller unit, per axis).
+
+def cm_s_to_units_s(cm_per_s: float, axis: "Axis") -> float:
+    """cm/s → controller units/s for `axis`."""
+    return (cm_per_s * 10.0) / SCALE_MM_PER_UNIT[axis]
+
+def units_s_to_cm_s(units_per_s: float, axis: "Axis") -> float:
+    """controller units/s → cm/s for `axis`."""
+    return (units_per_s * SCALE_MM_PER_UNIT[axis]) / 10.0
+
+def cm_s2_to_units_s2(cm_per_s2: float, axis: "Axis") -> float:
+    """cm/s² → controller units/s² for `axis`."""
+    return (cm_per_s2 * 10.0) / SCALE_MM_PER_UNIT[axis]
+
+def units_s2_to_cm_s2(units_per_s2: float, axis: "Axis") -> float:
+    """controller units/s² → cm/s² for `axis`."""
+    return (units_per_s2 * SCALE_MM_PER_UNIT[axis]) / 10.0
+# (mm_to_units / units_to_mm already imported from gantry_runner)
 PROGRESS_NEAR_LIMIT_PCT = 10.0      # within X% of either soft limit -> yellow
 LIVE_PLOT_WINDOW_S = 30.0
 FINITE_DIFF_WINDOW = 5              # 5-sample SMA central diff for live accel
@@ -126,16 +151,21 @@ QSplitter::handle { background-color: #2f2f33; }
 QSplitter::handle:horizontal { width: 4px; }
 QSplitter::handle:vertical { height: 4px; }
 
-/* ---- card-style group boxes (every section uses one) ---- */
+/* ---- card-style sections (label+frame replaces QGroupBox — no title clipping) ---- */
+QFrame#SectionCard {
+    background-color: #2b2b2b;
+    border: 1px solid #3f3f46;
+    border-radius: 10px;
+    padding: 12px;
+}
+
+/* ---- legacy QGroupBox (kept for any external widgets; not used in panel sections) ---- */
 QGroupBox {
     background-color: #2b2b2b;
     border: 1px solid #3f3f46;
     border-radius: 10px;
     margin-top: 18px;
-    padding-top: 22px;
-    padding-left: 12px;
-    padding-right: 12px;
-    padding-bottom: 12px;
+    padding-top: 28px;
     font-weight: 600;
     font-size: 14px;
     color: #e6e6e6;
@@ -143,10 +173,13 @@ QGroupBox {
 QGroupBox::title {
     subcontrol-origin: margin;
     subcontrol-position: top left;
+    top: -10px;
     left: 12px;
-    padding: 0 6px;
+    padding: 0 8px;
     background-color: #2b2b2b;
     color: #4ea1ff;
+    font-size: 14px;
+    font-weight: 600;
 }
 
 /* ---- tabs ---- */
@@ -235,12 +268,12 @@ QDoubleSpinBox:focus, QSpinBox:focus, QLineEdit:focus, QComboBox:focus {
 /* ---- position readouts (the big green-on-black numbers) ---- */
 QLabel#PositionReadout {
     font-family: "DejaVu Sans Mono", "Courier New", monospace;
-    font-size: 26px;
+    font-size: 22px;
     color: #34d058;
     background-color: #0d0d0d;
     border: 1px solid #2a2a2a;
     border-radius: 6px;
-    padding: 10px 14px;
+    padding: 8px 10px;
     qproperty-alignment: AlignRight;
 }
 QLabel#UnitsHint { color: #8a8a8a; font-size: 10px; }
@@ -594,23 +627,23 @@ class MoveToTargetThread(QThread):
 
 
 class HomingThread(QThread):
-    """Sequentially homes one or more axes. Defense-in-depth speed clamping
-    is repeated here even though the UI already clamps."""
+    """Sequentially homes one or more axes. Converts cm/s inputs to per-axis
+    controller units/s at run time, clamping to HOME_SPEED_LIMIT_UNITS."""
 
     axis_started = pyqtSignal(object)
     axis_done = pyqtSignal(object, str)
     all_done = pyqtSignal(str)
 
-    def __init__(self, controller, axes, speed_units: float, acc_dec_units: float,
-                 fall_step_units: float, positive_limits: dict[int, bool],
+    def __init__(self, controller, axes, speed_cm_s: float, acc_dec_cm_s2: float,
+                 fall_step_mm: float, positive_limits: dict[int, bool],
                  lock: threading.RLock,
                  abort_event: threading.Event | None = None) -> None:
         super().__init__()
         self._controller = controller
         self._axes = list(axes)
-        self._speed = min(float(speed_units), HOME_SPEED_LIMIT_UNITS)
-        self._acc = float(acc_dec_units)
-        self._fall = float(fall_step_units)
+        self._speed_cm_s = float(speed_cm_s)
+        self._acc_cm_s2 = float(acc_dec_cm_s2)
+        self._fall_mm = float(fall_step_mm)
         # Per-axis direction map, axis index -> True/False (True = positive limit).
         self._positive_limits = dict(positive_limits)
         self._lock = lock
@@ -627,11 +660,16 @@ class HomingThread(QThread):
                     return
                 self.axis_started.emit(axis)
                 try:
+                    # Convert cm/s → per-axis units/s; clamp to safety limit.
+                    speed_u = min(cm_s_to_units_s(self._speed_cm_s, axis),
+                                  HOME_SPEED_LIMIT_UNITS)
+                    acc_u   = cm_s2_to_units_s2(self._acc_cm_s2, axis)
+                    fall_u  = mm_to_units(self._fall_mm, axis)
                     with self._lock:
                         self._controller.home_axis(
                             axis,
-                            speed=self._speed, acc_dec=self._acc,
-                            fall_step=self._fall,
+                            speed=speed_u, acc_dec=acc_u,
+                            fall_step=fall_u,
                             positive_limit=self._positive_limits.get(
                                 int(axis), True),
                         )
@@ -817,19 +855,32 @@ class AxisAbsMoveThread(QThread):
 # =============================================================================
 # Custom widgets
 # =============================================================================
-class SectionFrame(QtWidgets.QGroupBox):
-    """Card-style section. Subclasses QGroupBox so the global stylesheet's
-    rounded-card look (``QGroupBox`` + ``QGroupBox::title``) applies uniformly.
+class SectionFrame(QWidget):
+    """Card-style section using a standalone QLabel title above a QFrame#SectionCard.
+    This avoids the QGroupBox::title clipping bug (title rendered inside the border)
+    by making the title an ordinary widget ABOVE the card border.
 
-    Backwards-compat: callers do ``QHBoxLayout(frame.content())``; ``content()``
-    returns ``self`` because QGroupBox accepts a layout directly.
+    Callers do ``QLayout(frame.content())``; ``content()`` returns the inner card.
+    The outer QWidget (= ``frame`` itself) is what callers pass to parent layouts.
     """
 
     def __init__(self, title: str, parent: QWidget | None = None) -> None:
-        super().__init__(title, parent)
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+        lbl = QLabel(title)
+        lbl.setStyleSheet(
+            "font-size: 14px; font-weight: 600; color: #4ea1ff; padding: 0 4px;"
+        )
+        self._card = QFrame()
+        self._card.setObjectName("SectionCard")
+        outer.addWidget(lbl)
+        outer.addWidget(self._card)
 
     def content(self) -> QWidget:
-        return self
+        """Return the inner card frame. Callers set their layout on this widget."""
+        return self._card
 
 
 class AxisStatusCard(QFrame):
@@ -858,29 +909,20 @@ class AxisStatusCard(QFrame):
         self.pos_display = QLabel("--")
         self.pos_display.setObjectName("PositionReadout")
         self.pos_display.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.pos_display.setMinimumHeight(56)
-        _fit_label(self.pos_display, "-9999.999")
+        self.pos_display.setMinimumHeight(46)
+        _fit_label(self.pos_display, "-9999.99")
         layout.addWidget(self.pos_display)
 
-        self.units_label = QLabel("raw: -- units")
-        self.units_label.setObjectName("UnitsHint")
-        self.units_label.setAlignment(Qt.AlignRight)
-        _fit_label(self.units_label, "raw: -99999.99 units")
-        layout.addWidget(self.units_label)
-
-        big_font = QFont()
-        big_font.setPointSize(13)
-        self.vel_label = QLabel("Velocity: -- mm/s")
-        self.vel_label.setFont(big_font)
-        _fit_label(self.vel_label, "Velocity: -99999.99 mm/s")
-        layout.addWidget(self.vel_label)
-        self.acc_label = QLabel("Accel: -- mm/s²")
-        self.acc_label.setFont(big_font)
-        self.acc_label.setToolTip(
+        self.vel_acc_label = QLabel("Vel: -- cm/s\nAcc: -- cm/s²")
+        self.vel_acc_label.setToolTip(
+            "Velocity and acceleration in cm/s and cm/s².\n"
             "Derived via 5-sample central difference, not an SDK readout."
         )
-        _fit_label(self.acc_label, "Accel: -99999.99 mm/s²")
-        layout.addWidget(self.acc_label)
+        _fit_label(self.vel_acc_label, "Acc: 9999.99 cm/s²")
+        self.vel_acc_label.setMinimumWidth(
+            QtGui.QFontMetrics(self.vel_acc_label.font()).horizontalAdvance("Acc: 9999.99 cm/s²") + 16
+        )
+        layout.addWidget(self.vel_acc_label)
 
         # Δ-home line. Gray "—" until a home reference is captured.
         self.home_delta_label = QLabel("Δ home: —")
@@ -903,7 +945,7 @@ class AxisStatusCard(QFrame):
         self.progress.setMinimumHeight(20)
         layout.addWidget(self.progress)
 
-        self.setMinimumWidth(220)
+        self.setMinimumWidth(180)
 
     def set_soft_limits(self, lo_mm: float | None, hi_mm: float | None) -> None:
         self._soft_min_mm = lo_mm
@@ -932,10 +974,10 @@ class AxisStatusCard(QFrame):
     def update_state(self, pos_units: float, pos_mm: float,
                      vel_mm_s: float, acc_mm_s2: float,
                      *, home_mm: float | None = None) -> None:
-        self.pos_display.setText(f"{pos_mm:+8.3f}")
-        self.units_label.setText(f"raw: {pos_units:+.2f} units")
-        self.vel_label.setText(f"Velocity: {vel_mm_s:+.2f} mm/s")
-        self.acc_label.setText(f"Accel: {acc_mm_s2:+.2f} mm/s²")
+        self.pos_display.setText(f"{pos_mm:+.2f}")
+        self.vel_acc_label.setText(
+            f"Vel: {vel_mm_s / 10.0:.2f} cm/s\nAcc: {acc_mm_s2 / 10.0:.2f} cm/s²"
+        )
         # Δ-home is recomputed every tick from the latest mm + the stored ref.
         self.set_home_reference(home_mm, pos_mm)
         lo, hi = self._soft_min_mm, self._soft_max_mm
@@ -1004,10 +1046,47 @@ class LivePlotWidget(QWidget):
                 curve.setData(t_visible, y)
 
 
+def _load_pool_config(repo_root: Path) -> dict:
+    """Load pool dimensions from config/config.yaml.
+    Returns dict with mm-converted dimensions and long-axis assignment.
+    Falls back to hardcoded defaults if the file is missing or yaml unavailable."""
+    defaults: dict = {
+        "length_mm": 4877.0, "width_mm": 1800.0, "depth_mm": 1143.0, "long_axis": "y",
+    }
+    if _yaml is None:
+        return defaults
+    cfg_path = repo_root / "config" / "config.yaml"
+    if not cfg_path.exists():
+        print(f"[gantry_panel] {cfg_path} not found — using default pool size", file=sys.stderr)
+        return defaults
+    with cfg_path.open() as f:
+        cfg = _yaml.safe_load(f) or {}
+    pool = cfg.get("pool", {}) or {}
+    return {
+        "length_mm": float(pool.get("length_m", 4.877)) * 1000.0,
+        "width_mm":  float(pool.get("width_m",  1.8))   * 1000.0,
+        "depth_mm":  float(pool.get("depth_m",  1.143)) * 1000.0,
+        "long_axis": (pool.get("pool_long_axis") or "y").lower(),
+    }
+
+
+def _pick_tick_spacing(span_mm: float) -> float:
+    """Return major tick spacing in mm targeting ~5-8 labeled ticks in the span.
+    Only major ticks are labelled; no minor level is emitted."""
+    if span_mm <= 300:    return 50.0
+    if span_mm <= 700:    return 100.0
+    if span_mm <= 1500:   return 200.0
+    if span_mm <= 3500:   return 500.0
+    if span_mm <= 7500:   return 1000.0
+    if span_mm <= 15000:  return 2000.0
+    if span_mm <= 35000:  return 5000.0
+    return 10000.0
+
+
 # =============================================================================
 # Workspace Map (top-down XY + side XZ; pyqtgraph preferred, QPainter fallback)
 # =============================================================================
-class WorkspaceMap(QtWidgets.QGroupBox):
+class WorkspaceMap(QWidget):
     """Two stacked 2D plots showing live position, optional target marker,
     a trailing path, and the soft-limit bounding box.
 
@@ -1015,7 +1094,7 @@ class WorkspaceMap(QtWidgets.QGroupBox):
       * update_position(x_mm, y_mm, z_mm)
       * update_target(x_mm, y_mm, z_mm)  /  clear_target()
       * update_soft_limits(min_mm, max_mm)  # each is (x, y, z) of floats|None
-      * set_show_trail(bool) / set_show_target(bool) / set_auto_fit(bool)
+      * set_show_trail(bool) / set_show_target(bool)
 
     Implementation: pyqtgraph if installed (Option A), QPainter fallback
     otherwise (Option B). Both backends share this exact API so callers don't
@@ -1027,7 +1106,7 @@ class WorkspaceMap(QtWidgets.QGroupBox):
     AUTO_FIT_MARGIN_MM = 50.0
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__("Workspace Map", parent)
+        super().__init__(parent)
         self.setMinimumSize(*self.MIN_GROUP_SIZE)
 
         self._trail: deque = deque(maxlen=self.TRAIL_MAXLEN)
@@ -1038,9 +1117,25 @@ class WorkspaceMap(QtWidgets.QGroupBox):
         self._soft_max: tuple[float | None, float | None, float | None] = (None, None, None)
         self._show_trail = True
         self._show_target = True
-        self._auto_fit = True
 
-        v = QVBoxLayout(self)
+        # Load pool dimensions from config.yaml (falls back to defaults gracefully).
+        self._pool_cfg = _load_pool_config(_THIS_FILE.parent.parent)
+
+        # Outer layout: standalone title label above a QFrame#SectionCard.
+        # Title is outside the card border → physically impossible to clip.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+        map_title = QLabel("Workspace Map")
+        map_title.setStyleSheet(
+            "font-size: 14px; font-weight: 600; color: #4ea1ff; padding: 0 4px;"
+        )
+        outer.addWidget(map_title)
+        _map_card = QFrame()
+        _map_card.setObjectName("SectionCard")
+        outer.addWidget(_map_card, stretch=1)
+
+        v = QVBoxLayout(_map_card)
         v.setContentsMargins(8, 8, 8, 8)
         v.setSpacing(8)
 
@@ -1051,7 +1146,7 @@ class WorkspaceMap(QtWidgets.QGroupBox):
         )
         v.addWidget(self.home_header)
 
-        # Toolbar: three toggles.
+        # Toolbar: trail/target toggles + 3-mode fit dropdown.
         bar = QHBoxLayout()
         bar.setSpacing(8)
         self.trail_chk = QCheckBox("Show Trail")
@@ -1062,10 +1157,20 @@ class WorkspaceMap(QtWidgets.QGroupBox):
         self.target_chk.setChecked(True)
         self.target_chk.toggled.connect(self.set_show_target)
         bar.addWidget(self.target_chk)
-        self.fit_chk = QCheckBox("Auto-fit to Soft Limits")
-        self.fit_chk.setChecked(True)
-        self.fit_chk.toggled.connect(self.set_auto_fit)
-        bar.addWidget(self.fit_chk)
+        self.fit_combo = QComboBox()
+        self.fit_combo.addItem("Fit: Pool",           "pool")
+        self.fit_combo.addItem("Fit: Soft Limits",    "soft_limits")
+        self.fit_combo.addItem("Fit: Trail + Target", "trail_target")
+        saved_mode = _gp_load_settings().get("gantry_panel", {}).get("map_fit_mode", "pool")
+        idx = self.fit_combo.findData(saved_mode)
+        self.fit_combo.setCurrentIndex(max(0, idx))
+        self.fit_combo.currentIndexChanged.connect(self._on_fit_mode_changed)
+        self.fit_combo.setToolTip(
+            "Fit: Pool — sets view to pool dimensions from config/config.yaml\n"
+            "Fit: Soft Limits — sets view to the gantry's configured soft-limit envelope\n"
+            "Fit: Trail + Target — auto-fits to the current trail and target position"
+        )
+        bar.addWidget(self.fit_combo)
         bar.addStretch()
         v.addLayout(bar)
 
@@ -1090,12 +1195,16 @@ class WorkspaceMap(QtWidgets.QGroupBox):
     def update_soft_limits(self, mn: tuple, mx: tuple) -> None:
         self._soft_min = tuple(mn)
         self._soft_max = tuple(mx)
+        if hasattr(self._backend, 'reset_view'):
+            self._backend.reset_view()
         self._refresh()
 
     def update_home(self, home_xyz: tuple) -> None:
         """Set the home-reference triplet (Nones allowed per axis)."""
-        self._home = tuple(home_xyz)
-        # Update header text.
+        new_home = tuple(home_xyz)
+        home_changed = new_home != self._home
+        self._home = new_home
+        # Update header text (runs every poll to keep Δ distance fresh).
         if all(v is not None for v in self._home):
             hx, hy, hz = self._home
             if self._cur_pos is not None:
@@ -1117,6 +1226,9 @@ class WorkspaceMap(QtWidgets.QGroupBox):
         else:
             self.home_header.setText("Home: not set")
             self.home_header.setToolTip("")
+        # Only reset the map view when home actually changes (not every poll).
+        if home_changed and hasattr(self._backend, 'reset_view'):
+            self._backend.reset_view()
         self._refresh()
 
     def set_show_trail(self, on: bool) -> None:
@@ -1127,13 +1239,38 @@ class WorkspaceMap(QtWidgets.QGroupBox):
         self._show_target = bool(on)
         self._refresh()
 
-    def set_auto_fit(self, on: bool) -> None:
-        self._auto_fit = bool(on)
+    # ---- internal ------------------------------------------------------
+    def _on_fit_mode_changed(self) -> None:
+        mode = self.fit_combo.currentData()
+        payload = _gp_load_settings().get("gantry_panel", {})
+        payload["map_fit_mode"] = mode
+        _gp_save_section("gantry_panel", payload)
+        if hasattr(self._backend, 'reset_view'):
+            self._backend.reset_view()
         self._refresh()
 
-    # ---- internal ------------------------------------------------------
+    def _pool_bounds(self) -> dict[str, tuple[float, float]]:
+        """Compute pool rectangle bounds from config.
+
+        Pool long axis (4.877 m) is always along gantry X; width (1.8 m) along Y.
+        When a home reference is set, home is the pool's bottom-left (min X, min Y)
+        corner so the pool extends in the +X/+Y direction from home.
+        Before homing, corner defaults to (0, 0, 0)."""
+        p = self._pool_cfg
+        hx = float(self._home[0]) if self._home[0] is not None else 0.0
+        hy = float(self._home[1]) if self._home[1] is not None else 0.0
+        hz = float(self._home[2]) if self._home[2] is not None else 0.0
+        return {
+            "x": (hx, hx + p["length_mm"]),
+            "y": (hy, hy + p["width_mm"]),
+            "z": (hz - p["depth_mm"], hz),
+        }
+
     def _refresh(self) -> None:
         view_bounds = self._compute_view_bounds()
+        pool_bounds = self._pool_bounds()
+        print(f"[map] mode={self.fit_combo.currentData()}  view_bounds={view_bounds}",
+              file=sys.stderr, flush=True)
         self._backend.render(
             cur_pos=self._cur_pos,
             target=self._target if self._show_target else None,
@@ -1142,17 +1279,21 @@ class WorkspaceMap(QtWidgets.QGroupBox):
             soft_max=self._soft_max,
             home=self._home,
             view_bounds=view_bounds,
+            pool_bounds=pool_bounds,
         )
 
     def _compute_view_bounds(self) -> dict[str, tuple[float, float]]:
         """Return dict with keys 'x', 'y', 'z' -> (lo, hi) for axes."""
-        if self._auto_fit and all(v is not None for v in (*self._soft_min, *self._soft_max)):
+        mode = self.fit_combo.currentData()
+        if mode == "pool":
+            return self._pool_bounds()
+        if mode == "soft_limits" and all(v is not None for v in (*self._soft_min, *self._soft_max)):
             return {
                 "x": (float(self._soft_min[0]), float(self._soft_max[0])),
                 "y": (float(self._soft_min[1]), float(self._soft_max[1])),
                 "z": (float(self._soft_min[2]), float(self._soft_max[2])),
             }
-        # Auto-fit OFF (or soft limits unset): bbox of trail ∪ pos ∪ target with margin.
+        # trail_target mode (or soft_limits fallback when limits unset).
         xs: list[float] = []
         ys: list[float] = []
         zs: list[float] = []
@@ -1163,7 +1304,7 @@ class WorkspaceMap(QtWidgets.QGroupBox):
         if self._target is not None:
             xs.append(self._target[0]); ys.append(self._target[1]); zs.append(self._target[2])
         if not xs:
-            return {"x": (-100.0, 100.0), "y": (-100.0, 100.0), "z": (-100.0, 100.0)}
+            return self._pool_bounds()   # sensible fallback: pool view
         m = self.AUTO_FIT_MARGIN_MM
         return {
             "x": (min(xs) - m, max(xs) + m),
@@ -1181,9 +1322,8 @@ class _PyQtGraphMap(QWidget):
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(6)
 
-        # XY (top-down). Aspect locked so a 1:1 motion looks square.
+        # XY (top-down). No aspect lock — lock fights with setRange() on narrow widgets.
         self._xy = pg.PlotWidget(background="#101013")
-        self._xy.setAspectLocked(True)
         self._xy.showGrid(x=True, y=True, alpha=0.18)
         self._xy.setLabel("left", "Y (mm)", color="#888")
         self._xy.setLabel("bottom", "X (mm)", color="#888")
@@ -1198,8 +1338,18 @@ class _PyQtGraphMap(QWidget):
             symbol="o",
         )
         self._xy.addItem(self._xy_target)
-        self._xy_box = pg.PlotCurveItem(pen=pg.mkPen(120, 120, 120, 180, width=1))
-        self._xy.addItem(self._xy_box)
+        # Soft-limit envelope (gray, dotted).
+        self._xy_sl_box = pg.PlotCurveItem(
+            pen=pg.mkPen(120, 120, 120, 180, width=1, style=Qt.DotLine))
+        self._xy.addItem(self._xy_sl_box)
+        # Pool outline (light blue, dashed).
+        self._xy_pool = pg.PlotCurveItem(
+            pen=pg.mkPen((0, 180, 216, 200), width=1, style=Qt.DashLine))
+        self._xy.addItem(self._xy_pool)
+        # Tick label style — suppress auto-text-expansion to prevent label overlap.
+        for _ax in (self._xy.getAxis("bottom"), self._xy.getAxis("left")):
+            _ax.setStyle(autoExpandTextSpace=False, tickTextOffset=4)
+            _ax.setTextPen(QtGui.QPen(QtGui.QColor("#bbb")))
         v.addWidget(self._xy, stretch=1)
 
         # XZ (side).
@@ -1219,8 +1369,18 @@ class _PyQtGraphMap(QWidget):
             symbol="o",
         )
         self._xz.addItem(self._xz_target)
-        self._xz_box = pg.PlotCurveItem(pen=pg.mkPen(120, 120, 120, 180, width=1))
-        self._xz.addItem(self._xz_box)
+        # Soft-limit envelope (gray, dotted).
+        self._xz_sl_box = pg.PlotCurveItem(
+            pen=pg.mkPen(120, 120, 120, 180, width=1, style=Qt.DotLine))
+        self._xz.addItem(self._xz_sl_box)
+        # Pool outline (light blue, dashed).
+        self._xz_pool = pg.PlotCurveItem(
+            pen=pg.mkPen((0, 180, 216, 200), width=1, style=Qt.DashLine))
+        self._xz.addItem(self._xz_pool)
+        # Tick label style for XZ axes.
+        for _ax in (self._xz.getAxis("bottom"), self._xz.getAxis("left")):
+            _ax.setStyle(autoExpandTextSpace=False, tickTextOffset=4)
+            _ax.setTextPen(QtGui.QPen(QtGui.QColor("#bbb")))
         # Home marker (yellow star) + dashed line from home to current dot.
         home_pen = pg.mkPen(255, 213, 79, width=2)
         self._xy_home = pg.ScatterPlotItem(
@@ -1241,20 +1401,46 @@ class _PyQtGraphMap(QWidget):
             255, 213, 79, width=1, style=Qt.DashLine,
         ))
         self._xz.addItem(self._xz_homeline)
+        # One-time init: disable auto-range and SI-prefix scaling on all axes.
+        # Range is driven exclusively by render() via _last_view_bounds tracking.
+        self._xy.enableAutoRange(False)
+        self._xz.enableAutoRange(False)
+        for _a in (self._xy.getAxis("bottom"), self._xy.getAxis("left"),
+                   self._xz.getAxis("bottom"), self._xz.getAxis("left")):
+            _a.enableAutoSIPrefix(False)
+        self._last_view_bounds: dict | None = None
         v.addWidget(self._xz, stretch=1)
 
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        # Widget was resized (including first show when it goes from 0×0 to real
+        # pixel dimensions).  Invalidate the cache so the next render() reapplies
+        # the range correctly with the actual widget size.
+        self._last_view_bounds = None
+
+    def reset_view(self) -> None:
+        """Invalidate cached bounds so next render() reapplies range + ticks."""
+        self._last_view_bounds = None
+
     def render(self, *, cur_pos, target, trail, soft_min, soft_max, home,
-               view_bounds) -> None:
-        # Soft-limit rectangle.
+               view_bounds, pool_bounds) -> None:
+        # Soft-limit envelope (gray dotted).
         if all(v is not None for v in (*soft_min, *soft_max)):
             x0, x1 = float(soft_min[0]), float(soft_max[0])
             y0, y1 = float(soft_min[1]), float(soft_max[1])
             z0, z1 = float(soft_min[2]), float(soft_max[2])
-            self._xy_box.setData([x0, x1, x1, x0, x0], [y0, y0, y1, y1, y0])
-            self._xz_box.setData([x0, x1, x1, x0, x0], [z0, z0, z1, z1, z0])
+            self._xy_sl_box.setData([x0, x1, x1, x0, x0], [y0, y0, y1, y1, y0])
+            self._xz_sl_box.setData([x0, x1, x1, x0, x0], [z0, z0, z1, z1, z0])
         else:
-            self._xy_box.setData([], [])
-            self._xz_box.setData([], [])
+            self._xy_sl_box.setData([], [])
+            self._xz_sl_box.setData([], [])
+
+        # Pool outline (light blue dashed).
+        xp0, xp1 = pool_bounds["x"]
+        yp0, yp1 = pool_bounds["y"]
+        zp0, zp1 = pool_bounds["z"]
+        self._xy_pool.setData([xp0, xp1, xp1, xp0, xp0], [yp0, yp0, yp1, yp1, yp0])
+        self._xz_pool.setData([xp0, xp1, xp1, xp0, xp0], [zp0, zp0, zp1, zp1, zp0])
 
         # Trail.
         if trail:
@@ -1301,14 +1487,31 @@ class _PyQtGraphMap(QWidget):
             self._xy_homeline.setData([], [])
             self._xz_homeline.setData([], [])
 
-        # Auto-bounds: only respected when the user keeps auto-fit on; pyqtgraph
-        # otherwise handles pan/zoom interactively.
-        xr = view_bounds["x"]
-        yr = view_bounds["y"]
-        zr = view_bounds["z"]
-        self._xy.setXRange(*xr, padding=0.05)
-        self._xy.setYRange(*yr, padding=0.05)
-        self._xz.setYRange(*zr, padding=0.05)
+        # Apply range + tick spacing only when view_bounds changes.
+        # This lets the user zoom/pan freely between changes; range is only
+        # reset when fit mode, home, or soft limits are updated.
+        if view_bounds != self._last_view_bounds:
+            self._last_view_bounds = view_bounds
+            xr = view_bounds["x"]
+            yr = view_bounds["y"]
+            zr = view_bounds["z"]
+            # setRange() handles aspect-locked viewboxes correctly by computing
+            # a bounding rect that contains both axes simultaneously.
+            self._xy.plotItem.vb.setRange(
+                xRange=xr, yRange=yr, padding=0.05, disableAutoRange=True
+            )
+            self._xz.plotItem.vb.setRange(
+                yRange=zr, padding=0.05, disableAutoRange=True
+            )
+            # Adaptive tick spacing — major ticks only (no minor level) to prevent
+            # label overlap.  ~5-8 labeled ticks per axis.
+            xmaj = _pick_tick_spacing(xr[1] - xr[0])
+            ymaj = _pick_tick_spacing(yr[1] - yr[0])
+            zmaj = _pick_tick_spacing(zr[1] - zr[0])
+            self._xy.getAxis("bottom").setTickSpacing(levels=[(xmaj, 0)])
+            self._xy.getAxis("left").setTickSpacing(levels=[(ymaj, 0)])
+            self._xz.getAxis("bottom").setTickSpacing(levels=[(xmaj, 0)])
+            self._xz.getAxis("left").setTickSpacing(levels=[(zmaj, 0)])
 
 
 class _PainterMap(QWidget):
@@ -1327,7 +1530,7 @@ class _PainterMap(QWidget):
         self._warned_fallback = False
 
     def render(self, *, cur_pos, target, trail, soft_min, soft_max, home,
-               view_bounds) -> None:
+               view_bounds, pool_bounds=None) -> None:
         if not self._warned_fallback:
             print("[gantry_panel] pyqtgraph not available — using QPainter map fallback.",
                   file=sys.stderr)
@@ -1513,7 +1716,7 @@ class GantryPanel(QMainWindow):
         super().__init__()
         self.setWindowTitle(WINDOW_TITLE + (" — MOCK MODE" if is_mock else ""))
         self.resize(1500, 900)
-        self.setMinimumSize(1280, 800)
+        self.setMinimumSize(1400, 880)
 
         # SDK + lock + state ---------------------------------------------------
         self.controller = controller if controller is not None else FMC4030Controller()
@@ -1609,13 +1812,6 @@ class GantryPanel(QMainWindow):
         self._poll_indicator_timer.timeout.connect(self._update_poll_indicator)
         self._poll_indicator_timer.start()
 
-        # ESC for emergency stop — APPLICATION-wide context so it fires even
-        # when focus is in a spinbox, table cell, combobox, etc. (default
-        # context is WindowShortcut which can be intercepted by focused widgets).
-        self._estop_shortcut = QShortcut(QKeySequence("Esc"), self)
-        self._estop_shortcut.setContext(Qt.ApplicationShortcut)
-        self._estop_shortcut.activated.connect(self._emergency_stop_all)
-
         # E-Stop wiring diagnostic — PyQt5 dropped the old QtCore.SIGNAL()
         # shim, so we query receivers via the bound signal directly.
         try:
@@ -1686,8 +1882,8 @@ class GantryPanel(QMainWindow):
         splitter.setChildrenCollapsible(False)
         splitter.addWidget(self._build_left_pane())
         splitter.addWidget(self._build_right_tabs())
-        # 38/62 split at 1500 wide → roughly [560, 940].
-        splitter.setSizes([560, 940])
+        # 42/58 split at 1500 wide → roughly [630, 870].
+        splitter.setSizes([630, 870])
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         outer.addWidget(splitter, stretch=1)
@@ -1695,12 +1891,22 @@ class GantryPanel(QMainWindow):
         # Bottom: global controls bar (Emergency Stop visible at all times).
         outer.addLayout(self._build_global_controls())
 
+    @staticmethod
+    def _make_h_rule() -> QFrame:
+        """Thin horizontal rule used as a visual separator between pane sections."""
+        rule = QFrame()
+        rule.setFrameShape(QFrame.HLine)
+        rule.setFrameShadow(QFrame.Plain)
+        rule.setStyleSheet("color: #3a3a40; margin: 0 4px;")
+        rule.setFixedHeight(1)
+        return rule
+
     def _build_left_pane(self) -> QWidget:
         pane = QWidget()
-        pane.setMinimumWidth(360)
+        pane.setMinimumWidth(420)
         v = QVBoxLayout(pane)
         v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(12)
+        v.setSpacing(10)
 
         # Polling freshness indicator at the very top of the left pane.
         self.poll_indicator = QLabel("Polling: — (no data)")
@@ -1709,6 +1915,7 @@ class GantryPanel(QMainWindow):
         )
         _fit_label(self.poll_indicator, "Polling: ✗ 9999 ms ago (STALE)")
         v.addWidget(self.poll_indicator)
+        v.addWidget(self._make_h_rule())
 
         # Live Status section wraps the three AxisStatusCards in a card frame
         # so the section blends with the rest of the GroupBox-styled UI.
@@ -1718,6 +1925,7 @@ class GantryPanel(QMainWindow):
         live_inner.setSpacing(8)
         live_inner.addLayout(self._build_status_cards())
         v.addWidget(live_section)
+        v.addWidget(self._make_h_rule())
 
         # Workspace Map.
         self.workspace_map = WorkspaceMap()
@@ -1748,7 +1956,7 @@ class GantryPanel(QMainWindow):
                     "Control")
         # Sequences tab: waypoint table + its toolbar.
         tabs.addTab(_wrap_scroll(self._build_waypoint_panel()), "Sequences")
-        # Setup tab: soft limits + homing (the "rarely touched" surface).
+        # Setup tab: soft limits + homing.
         tabs.addTab(_wrap_scroll(self._build_soft_limits_group(),
                                  self._build_homing_group()), "Setup")
         # Recording tab: start/stop + CSV path + live 30s plot.
@@ -1791,22 +1999,29 @@ class GantryPanel(QMainWindow):
 
         h.addWidget(QLabel("IP"))
         self.ip_edit = QLineEdit("192.168.0.30")
-        self.ip_edit.setMaximumWidth(140)
         h.addWidget(self.ip_edit)
 
         h.addWidget(QLabel("Port"))
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1, 65535)
         self.port_spin.setValue(8088)
-        self.port_spin.setMaximumWidth(80)
         h.addWidget(self.port_spin)
 
         h.addWidget(QLabel("ID"))
         self.id_spin = QSpinBox()
         self.id_spin.setRange(0, 31)
         self.id_spin.setValue(1)
-        self.id_spin.setMaximumWidth(60)
         h.addWidget(self.id_spin)
+
+        # Set minimum widths using font metrics so worst-case values never clip.
+        for widget, sample in [
+            (self.ip_edit,   "192.168.000.000"),
+            (self.port_spin, "65535"),
+            (self.id_spin,   "999"),
+        ]:
+            fm = QtGui.QFontMetrics(widget.font())
+            widget.setMinimumWidth(fm.horizontalAdvance(sample) + 32)
+            widget.setMinimumHeight(28)
 
         self.connect_btn = QPushButton("Connect")
         ic = _icon("fa5s.plug")
@@ -1887,36 +2102,42 @@ class GantryPanel(QMainWindow):
         return frame
 
     def _build_homing_group(self) -> SectionFrame:
-        frame = SectionFrame("Homing  (UNITS — SDK speaks raw units here)")
+        frame = SectionFrame("Homing")
         v = QVBoxLayout(frame.content())
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(6)
 
         params_row = QGridLayout()
-        params_row.addWidget(QLabel("Home Speed (units/s)"), 0, 0)
+        params_row.addWidget(QLabel("Home Speed (cm/s)"), 0, 0)
         self.home_speed_spin = QDoubleSpinBox()
-        self.home_speed_spin.setRange(0.1, HOME_SPEED_LIMIT_UNITS)
+        # 5.0 cm/s → X:6.06 u/s, Y:20.0 u/s (at HOME_SPEED_LIMIT), Z:clamped in HomingThread
+        self.home_speed_spin.setRange(0.10, 5.00)
         self.home_speed_spin.setDecimals(2)
+        self.home_speed_spin.setSingleStep(0.10)
         self.home_speed_spin.setValue(5.0)
+        _hx = cm_s_to_units_s(5.0, Axis.X)
+        _hy = cm_s_to_units_s(5.0, Axis.Y)
         self.home_speed_spin.setToolTip(
-            "Homing uses raw controller units because the SDK's home_axis() "
-            "takes units directly. Other panels use mm. "
-            "Default 5.0 units/s ≈ 41 mm/s on X, 12.5 mm/s on Y, 2.5 mm/s on Z."
+            f"Converted per axis at run time: X≈{_hx:.2f} u/s, Y≈{_hy:.2f} u/s, "
+            "Z→capped at 20.0 u/s (HOME_SPEED_LIMIT).\n"
+            "Max 5.0 cm/s keeps all axes ≤ HOME_SPEED_LIMIT_UNITS (20.0).\n"
+            "Calibration: SCALE_MM_PER_UNIT from gantry_runner.py (X=8.25, Y=2.5, Z=0.5 mm/unit)."
         )
         params_row.addWidget(self.home_speed_spin, 0, 1)
 
-        params_row.addWidget(QLabel("Home Accel/Decel (units/s²)"), 0, 2)
+        params_row.addWidget(QLabel("Home Accel/Decel (cm/s²)"), 0, 2)
         self.home_acc_spin = QDoubleSpinBox()
-        self.home_acc_spin.setRange(1.0, 1000.0)
-        self.home_acc_spin.setDecimals(1)
-        self.home_acc_spin.setValue(20.0)
+        self.home_acc_spin.setRange(0.10, 500.0)
+        self.home_acc_spin.setDecimals(2)
+        self.home_acc_spin.setSingleStep(0.50)
+        self.home_acc_spin.setValue(5.0)
         params_row.addWidget(self.home_acc_spin, 0, 3)
 
-        params_row.addWidget(QLabel("Fall Step (units)"), 0, 4)
+        params_row.addWidget(QLabel("Fall Step (mm)"), 0, 4)
         self.home_fall_spin = QDoubleSpinBox()
-        self.home_fall_spin.setRange(0.1, 100.0)
-        self.home_fall_spin.setDecimals(2)
-        self.home_fall_spin.setValue(5.0)
+        self.home_fall_spin.setRange(0.1, 5000.0)
+        self.home_fall_spin.setDecimals(1)
+        self.home_fall_spin.setValue(25.0)
         params_row.addWidget(self.home_fall_spin, 0, 5)
         v.addLayout(params_row)
 
@@ -2006,30 +2227,46 @@ class GantryPanel(QMainWindow):
 
         # Shared jog/move parameter row.
         params_row = QHBoxLayout()
-        params_row.addWidget(QLabel("Jog/Move Speed (mm/s)"))
+        params_row.addWidget(QLabel("Jog/Move Speed (cm/s)"))
         self.jog_speed_spin = QDoubleSpinBox()
-        self.jog_speed_spin.setRange(0.01, 5000.0)
+        self.jog_speed_spin.setRange(0.10, 200.00)
         self.jog_speed_spin.setDecimals(2)
-        self.jog_speed_spin.setValue(20.0)
+        self.jog_speed_spin.setSingleStep(0.50)
+        self.jog_speed_spin.setValue(10.0)
+        _cx = cm_s_to_units_s(10.0, Axis.X)
+        _cy = cm_s_to_units_s(10.0, Axis.Y)
+        _cz = cm_s_to_units_s(10.0, Axis.Z)
+        self.jog_speed_spin.setToolTip(
+            f"Internally: X={_cx:.2f} units/s, Y={_cy:.2f} units/s, Z={_cz:.2f} units/s.\n"
+            "Calibration: SCALE_MM_PER_UNIT from gantry_runner.py (X=8.25, Y=2.5, Z=0.5 mm/unit)."
+        )
         params_row.addWidget(self.jog_speed_spin)
 
         params_row.addSpacing(12)
-        params_row.addWidget(QLabel("Accel (mm/s²)"))
+        params_row.addWidget(QLabel("Accel (cm/s²)"))
         self.jog_acc_spin = QDoubleSpinBox()
-        self.jog_acc_spin.setRange(0.01, 10000.0)
+        self.jog_acc_spin.setRange(0.10, 500.00)
         self.jog_acc_spin.setDecimals(2)
-        self.jog_acc_spin.setValue(50.0)
+        self.jog_acc_spin.setSingleStep(0.50)
+        self.jog_acc_spin.setValue(5.0)
         params_row.addWidget(self.jog_acc_spin)
 
         params_row.addSpacing(12)
-        params_row.addWidget(QLabel("Decel (mm/s²)"))
+        params_row.addWidget(QLabel("Decel (cm/s²)"))
         self.jog_dec_spin = QDoubleSpinBox()
-        self.jog_dec_spin.setRange(0.01, 10000.0)
+        self.jog_dec_spin.setRange(0.10, 500.00)
         self.jog_dec_spin.setDecimals(2)
-        self.jog_dec_spin.setValue(50.0)
+        self.jog_dec_spin.setSingleStep(0.50)
+        self.jog_dec_spin.setValue(5.0)
         params_row.addWidget(self.jog_dec_spin)
         params_row.addStretch()
         v.addLayout(params_row)
+
+        # Ensure spinboxes are wide enough for the largest expected value.
+        for spin in (self.jog_speed_spin, self.jog_acc_spin, self.jog_dec_spin):
+            fm = QtGui.QFontMetrics(spin.font())
+            spin.setMinimumWidth(fm.horizontalAdvance("9999.99") + 32)
+            spin.setMinimumHeight(28)
 
         # Three cards side-by-side.
         cards_row = QHBoxLayout()
@@ -2053,22 +2290,17 @@ class GantryPanel(QMainWindow):
         letter.setAlignment(Qt.AlignCenter)
         v.addWidget(letter)
 
-        # Position readouts (mm primary, units secondary).
+        # Position readout in mm. Controller units removed — not meaningful to users.
         pos_mm = QLabel("--")
         pos_mm.setObjectName("PositionReadout")
         pos_mm.setMinimumHeight(48)
         _fit_label(pos_mm, "-9999.999")
         v.addWidget(pos_mm)
-        pos_units = QLabel("-- units")
-        pos_units.setObjectName("UnitsHint")
-        pos_units.setAlignment(Qt.AlignRight)
-        _fit_label(pos_units, "-99999.99 units")
-        v.addWidget(pos_units)
 
         # Velocity.
-        vel = QLabel("Vel: -- mm/s")
+        vel = QLabel("Vel: -- cm/s")
         vel.setStyleSheet("color: #aaa; font-size: 11px;")
-        _fit_label(vel, "Vel: -99999.99 mm/s")
+        _fit_label(vel, "Vel: -9999.99 cm/s")
         v.addWidget(vel)
 
         # Jog row (hold to jog).
@@ -2120,7 +2352,6 @@ class GantryPanel(QMainWindow):
         self.per_axis_cards[axis] = {
             "card": card,
             "pos_mm": pos_mm,
-            "pos_units": pos_units,
             "vel": vel,
             "target_spin": target_spin,
             "move_btn": move_btn,
@@ -2153,29 +2384,45 @@ class GantryPanel(QMainWindow):
             grid.addWidget(sp, 1, col)
             self.target_spins[axis] = sp
 
-        grid.addWidget(QLabel("Speed (mm/s)"), 2, 0)
+        grid.addWidget(QLabel("Speed (cm/s)"), 2, 0)
         self.move_speed_spin = QDoubleSpinBox()
-        self.move_speed_spin.setRange(0.01, 5000.0)
+        self.move_speed_spin.setRange(0.10, 200.00)
         self.move_speed_spin.setDecimals(2)
-        self.move_speed_spin.setValue(20.0)
+        self.move_speed_spin.setSingleStep(0.50)
+        self.move_speed_spin.setValue(10.0)
+        _mx = cm_s_to_units_s(10.0, Axis.X)
+        _my = cm_s_to_units_s(10.0, Axis.Y)
+        _mz = cm_s_to_units_s(10.0, Axis.Z)
+        self.move_speed_spin.setToolTip(
+            f"Internally: X={_mx:.2f} units/s, Y={_my:.2f} units/s, Z={_mz:.2f} units/s.\n"
+            "Calibration: SCALE_MM_PER_UNIT from gantry_runner.py (X=8.25, Y=2.5, Z=0.5 mm/unit)."
+        )
         _size_mm_spinbox(self.move_speed_spin)
         grid.addWidget(self.move_speed_spin, 3, 0)
 
-        grid.addWidget(QLabel("Accel (mm/s²)"), 2, 1)
+        grid.addWidget(QLabel("Accel (cm/s²)"), 2, 1)
         self.move_acc_spin = QDoubleSpinBox()
-        self.move_acc_spin.setRange(0.01, 10000.0)
+        self.move_acc_spin.setRange(0.10, 500.00)
         self.move_acc_spin.setDecimals(2)
-        self.move_acc_spin.setValue(50.0)
+        self.move_acc_spin.setSingleStep(0.50)
+        self.move_acc_spin.setValue(5.0)
         _size_mm_spinbox(self.move_acc_spin)
         grid.addWidget(self.move_acc_spin, 3, 1)
 
-        grid.addWidget(QLabel("Decel (mm/s²)"), 2, 2)
+        grid.addWidget(QLabel("Decel (cm/s²)"), 2, 2)
         self.move_dec_spin = QDoubleSpinBox()
-        self.move_dec_spin.setRange(0.01, 10000.0)
+        self.move_dec_spin.setRange(0.10, 500.00)
         self.move_dec_spin.setDecimals(2)
-        self.move_dec_spin.setValue(50.0)
+        self.move_dec_spin.setSingleStep(0.50)
+        self.move_dec_spin.setValue(5.0)
         _size_mm_spinbox(self.move_dec_spin)
         grid.addWidget(self.move_dec_spin, 3, 2)
+
+        # Ensure move speed/accel/decel spinboxes are wide enough.
+        for spin in (self.move_speed_spin, self.move_acc_spin, self.move_dec_spin):
+            fm = QtGui.QFontMetrics(spin.font())
+            spin.setMinimumWidth(fm.horizontalAdvance("9999.99") + 32)
+            spin.setMinimumHeight(28)
 
         grid.addWidget(QLabel("Mode"), 4, 0)
         self.move_mode_combo = QComboBox()
@@ -2311,7 +2558,7 @@ class GantryPanel(QMainWindow):
         h.addWidget(self.stop_run_btn)
 
         h.addStretch()
-        self.estop_btn = QPushButton("⚠  EMERGENCY STOP ALL  (Esc)")
+        self.estop_btn = QPushButton("⚠  EMERGENCY STOP ALL")
         self.estop_btn.setObjectName("EmergencyButton")
         _size_button(self.estop_btn, "emergency")
         self.estop_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -2457,8 +2704,7 @@ class GantryPanel(QMainWindow):
             info = self.per_axis_cards.get(axis)
             if info is not None:
                 info["pos_mm"].setText(f"{pos_mm[i]:+8.3f}")
-                info["pos_units"].setText(f"{pos_units[i]:+.2f} units")
-                info["vel"].setText(f"Vel: {vel_mm[i]:+.2f} mm/s")
+                info["vel"].setText(f"Vel: {vel_mm[i] / 10.0:+.2f} cm/s")
 
         # Update plot history.
         self._time_history.append(now - self._t0_mono)
@@ -2651,9 +2897,11 @@ class GantryPanel(QMainWindow):
         positive = bool(self.home_dir_combos[axis].currentData())
         dir_word = "POSITIVE" if positive else "NEGATIVE"
         speed = self.home_speed_spin.value()
+        speed_u = cm_s_to_units_s(speed, axis)
         reply = QMessageBox.question(
             self, "Confirm Home",
-            f"Home {axis.name} toward {dir_word} limit at {speed:.2f} units/s.\n"
+            f"Home {axis.name} toward {dir_word} limit at {speed:.2f} cm/s "
+            f"(≈ {speed_u:.2f} units/s on {axis.name}).\n"
             f"Make sure the path is clear. Continue?",
             QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel,
         )
@@ -2675,7 +2923,7 @@ class GantryPanel(QMainWindow):
         speed = self.home_speed_spin.value()
         reply = QMessageBox.question(
             self, "Confirm Home All",
-            f"Home all axes in order {order_str} at {speed:.2f} units/s?\n"
+            f"Home all axes in order {order_str} at {speed:.2f} cm/s?\n"
             f"Per-axis direction → " + ", ".join(per_axis_dir) + "\n"
             "Make sure the entire workspace is clear. Continue?",
             QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel,
@@ -2780,9 +3028,9 @@ class GantryPanel(QMainWindow):
         }
         self._home_thread = HomingThread(
             self.controller, axes,
-            speed_units=self.home_speed_spin.value(),
-            acc_dec_units=self.home_acc_spin.value(),
-            fall_step_units=self.home_fall_spin.value(),
+            speed_cm_s=self.home_speed_spin.value(),
+            acc_dec_cm_s2=self.home_acc_spin.value(),
+            fall_step_mm=self.home_fall_spin.value(),
             positive_limits=positive_limits,
             lock=self._controller_lock,
             abort_event=self._abort_event,
@@ -2838,7 +3086,7 @@ class GantryPanel(QMainWindow):
         )
         # Soft-limit guard.
         wp = Waypoint(target_mm[0], target_mm[1], target_mm[2],
-                      self.move_speed_spin.value(), 0.0)
+                      self.move_speed_spin.value() * 10.0, 0.0)  # cm/s → mm/s for soft-limit check
         try:
             _validate_soft_limits([wp], self._soft_min_mm, self._soft_max_mm)
         except SystemExit as exc:
@@ -2859,9 +3107,9 @@ class GantryPanel(QMainWindow):
             self.workspace_map.update_target(*target_mm)
         self._move_thread = MoveToTargetThread(
             self.controller, target_mm,
-            self.move_speed_spin.value(),
-            self.move_acc_spin.value(),
-            self.move_dec_spin.value(),
+            self.move_speed_spin.value() * 10.0,   # cm/s → mm/s
+            self.move_acc_spin.value() * 10.0,
+            self.move_dec_spin.value() * 10.0,
             self.move_mode_combo.currentData(),
             self._controller_lock,
             logger=self._logger,
@@ -2916,11 +3164,10 @@ class GantryPanel(QMainWindow):
         EMERGENCY_STOP.clear()
         self._abort_event.clear()
         self._ensure_logger_started(auto=True)
-        # mm -> units conversion is exact for single-axis jog/move.
-        scale = SCALE_MM_PER_UNIT[axis]
-        speed_units = max(self.jog_speed_spin.value() / scale, 0.001)
-        acc_units = max(self.jog_acc_spin.value() / scale, 0.001)
-        dec_units = max(self.jog_dec_spin.value() / scale, 0.001)
+        # cm/s → units/s conversion for single-axis jog.
+        speed_units = max(cm_s_to_units_s(self.jog_speed_spin.value(), axis), 0.001)
+        acc_units   = max(cm_s2_to_units_s2(self.jog_acc_spin.value(), axis), 0.001)
+        dec_units   = max(cm_s2_to_units_s2(self.jog_dec_spin.value(), axis), 0.001)
         # 999999 * direction = "jog until release" sentinel, same as manual_pad.
         try:
             with self._controller_lock:
@@ -2971,10 +3218,10 @@ class GantryPanel(QMainWindow):
         EMERGENCY_STOP.clear()
         self._abort_event.clear()
         self._ensure_logger_started(auto=True)
-        scale = SCALE_MM_PER_UNIT[axis]
-        speed_units = max(self.jog_speed_spin.value() / scale, 0.001)
-        acc_units = max(self.jog_acc_spin.value() / scale, 0.001)
-        dec_units = max(self.jog_dec_spin.value() / scale, 0.001)
+        # cm/s → units/s conversion for single-axis move-abs.
+        speed_units = max(cm_s_to_units_s(self.jog_speed_spin.value(), axis), 0.001)
+        acc_units   = max(cm_s2_to_units_s2(self.jog_acc_spin.value(), axis), 0.001)
+        dec_units   = max(cm_s2_to_units_s2(self.jog_dec_spin.value(), axis), 0.001)
 
         self._per_axis_busy.add(int(axis))
         info = self.per_axis_cards[axis]
@@ -3231,21 +3478,27 @@ class GantryPanel(QMainWindow):
         acquired = self._controller_lock.acquire(timeout=0.05)
         per_axis_results: list[tuple[str, str]] = []  # (axis_name, "ok" or err)
         try:
+            # 1. stop_run FIRST — only FMC4030_Stop_Run interrupts firmware-level
+            #    homing (FMC4030_Home_Single_Axis ignores per-axis stop commands).
+            try:
+                self.controller.stop_run()
+                print("[estop] stop_run issued", file=sys.stderr, flush=True)
+            except FMC4030Error as exc:
+                print(f"[estop] stop_run FMC4030Error: {exc}", file=sys.stderr, flush=True)
+            except Exception as exc:
+                print(f"[estop] stop_run unexpected: {exc}", file=sys.stderr, flush=True)
+            # 2. Per-axis immediate stops (mode=2) for jog / move operations.
             for axis in AXES:
                 try:
                     self.controller.stop_axis(axis, mode=2)
                     per_axis_results.append((axis.name, "ok"))
+                    print(f"[estop] stop_axis {axis.name} issued", file=sys.stderr, flush=True)
                 except FMC4030Error as exc:
                     per_axis_results.append((axis.name, f"{exc}"))
+                    print(f"[estop] stop_axis {axis.name} FMC4030Error: {exc}", file=sys.stderr, flush=True)
                 except Exception as exc:
                     per_axis_results.append((axis.name, f"unexpected: {exc}"))
-            # Coordinated motion stop in addition to per-axis stops.
-            try:
-                self.controller.stop_run()
-            except FMC4030Error:
-                pass
-            except Exception:
-                pass
+                    print(f"[estop] stop_axis {axis.name} unexpected: {exc}", file=sys.stderr, flush=True)
         finally:
             if acquired:
                 self._controller_lock.release()
@@ -3255,6 +3508,8 @@ class GantryPanel(QMainWindow):
               f"(lock_acquired={acquired})", file=sys.stderr, flush=True)
 
         self._stop_logger_now()
+        # Verify all axes actually stopped ~200 ms after issuing the commands.
+        QTimer.singleShot(200, self._verify_estop_complete)
         self._show_estop_banner(t0, per_axis_results, lock_acquired=acquired)
 
     def _show_estop_banner(self, t0_mono: float, per_axis_results: list[tuple[str, str]],
@@ -3288,6 +3543,27 @@ class GantryPanel(QMainWindow):
         msg.setStandardButtons(QMessageBox.Ok)
         msg.setWindowModality(Qt.NonModal)
         msg.show()  # non-blocking
+
+    def _verify_estop_complete(self) -> None:
+        """Best-effort non-blocking verification fired 200 ms after E-Stop.
+        Queries is_axis_stopped for each axis and logs the result. A warning
+        is printed (but no action taken) if an axis is still moving — the user
+        can see this in stderr and repeat the E-Stop."""
+        if not self.connected:
+            return
+        for axis in AXES:
+            try:
+                stopped = self.controller.is_axis_stopped(axis)
+                status = "✓ stopped" if stopped else "⚠ still moving"
+                print(f"[estop-verify] {axis.name}: {status}", file=sys.stderr, flush=True)
+                if not stopped:
+                    print(
+                        f"[estop-verify] WARNING: {axis.name} did not stop within 200 ms. "
+                        "Check that stop_run() is effective on this controller.",
+                        file=sys.stderr, flush=True,
+                    )
+            except Exception as exc:
+                print(f"[estop-verify] {axis.name}: check failed: {exc}", file=sys.stderr, flush=True)
 
     def _reset_estop(self) -> None:
         EMERGENCY_STOP.clear()

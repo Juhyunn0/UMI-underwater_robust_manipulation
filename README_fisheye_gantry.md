@@ -39,6 +39,16 @@ pass any flag.
 in `gantry_runner.py` (move, log, soft limits, homing, sequence) to live
 widgets with a dark theme and a worker-per-task threading model.
 
+> **Units:** Velocities and accelerations are displayed and entered in **cm/s**
+> and **cm/s²**. Positions remain in **mm**. Calibration source:
+> `SCALE_MM_PER_UNIT` in `gantry_runner.py` (X = 8.25, Y = 2.5, Z = 0.5
+> mm/unit). The panel converts cm/s → controller units/s per axis at the
+> callsite using those constants. Pool dimensions for the workspace map are
+> read from `config/config.yaml` (`pool.length_m`, `pool.width_m`,
+> `pool.depth_m`). The physical orientation of the pool in the gantry frame
+> is set independently in the **Setup tab → Pool Orientation** group (default:
+> pool long axis = gantry X), persisted to `~/.umi_gui_state.json`.
+
 ### Launching
 
 ```bash
@@ -99,12 +109,26 @@ The right pane's four tabs are:
 |---|---|
 | **Control** | Per-Axis Control (jog + Move Abs + per-axis Home cards) + the combined Move to Target panel. |
 | **Sequences** | The waypoint `QTableWidget` plus Add Row / Remove Selected / Load CSV / Save CSV / Run Sequence / Stop Sequence. |
-| **Setup** | Software Limits group + the shared Homing group. "Rarely touched after initial setup." |
+| **Setup** | Software Limits group + the shared Homing group + **Pool Orientation** (which gantry axis is the pool's long axis). |
 | **Recording** | Start/Stop Recording, the clickable CSV path label, and the 30 s rolling per-axis position plot. |
 
 The left pane stays visible no matter which tab is active, so you always see live position and the workspace map. The splitter between left/right is draggable; default ratio 38/62, window default `1500 × 900`, minimum `1280 × 800`. The last-active tab is persisted to `~/.umi_gui_state.json` under `gantry_panel.active_tab` and restored on next launch.
 
-The **Workspace Map** renders two stacked 2D plots: top-down `XY` (aspect-locked square) and side `XZ` (shares the same X axis as the top view). Each shows the soft-limit rectangle, a faint 100 mm grid, the current-position dot (filled green) with crosshairs to the axes, the target marker (hollow blue circle) when a Move-to-Target is active, and a 200-sample trail. The map's bounding box auto-fits to the loaded soft limits by default; toggle `Auto-fit to Soft Limits` off to fit it to current position ∪ target ∪ trail with a 50 mm margin. Implementation is `pyqtgraph` when installed; falls back to a hand-painted `QPainter` widget otherwise (it logs once to stderr if the fallback engages). All map updates ride the existing 10 Hz status-poll signal — no extra SDK calls.
+The **Workspace Map** renders two stacked 2D plots: top-down `XY` (aspect-locked square) and side `XZ` (shares the same X axis as the top view). Each shows:
+- Light-blue dashed **pool outline** (dimensions from `config.yaml`, orientation from Pool Orientation setting)
+- Gray dotted **soft-limit envelope** (when limits are loaded)
+- Current-position dot (filled green) with crosshairs
+- Target marker (hollow blue circle) when a Move-to-Target is active
+- A 200-sample trail
+
+The **Fit** dropdown (top of map) has three modes:
+| Mode | Behaviour |
+|---|---|
+| **Fit: Pool** *(default)* | View locked to the pool boundary. XY shows ≈ 4877 × 1800 mm or 1800 × 4877 mm depending on Pool Orientation. |
+| **Fit: Soft Limits** | View expands to the controller's loaded soft-limit envelope. |
+| **Fit: Trail + Target** | View auto-fits to current trail ∪ target with 50 mm margin. |
+
+Tick spacing adapts to the visible range (~6–10 major ticks at any zoom). Implementation is `pyqtgraph` when installed; falls back to a hand-painted `QPainter` widget otherwise. All updates ride the 10 Hz status-poll — no extra SDK calls.
 
 ### Per-Axis Control (jog + Move Abs + per-axis Home)
 
@@ -113,11 +137,10 @@ Control** section gives you direct one-axis control of X, Y, and Z. Three
 side-by-side cards, one shared parameter row at the top:
 
 ```
-┌─ Per-Axis Control  (mm) ────────────────────────────────────────────────┐
-│  Jog/Move Speed [20.00] mm/s   Accel [50.00] mm/s²   Decel [50.00] mm/s²│
+┌─ Per-Axis Control ──────────────────────────────────────────────────────┐
+│  Jog/Move Speed [10.00] cm/s   Accel [5.00] cm/s²   Decel [5.00] cm/s² │
 │  ┌─ X ──────────┐  ┌─ Y ──────────┐  ┌─ Z ──────────┐                   │
 │  │  +123.456 mm │  │  +50.000 mm  │  │   +0.000 mm  │  ← live readout   │
-│  │  raw: +14.96 │  │  raw: +20.00 │  │  raw:  +0.00 │                   │
 │  │  Vel: +0.00  │  │  Vel: +0.00  │  │  Vel: +0.00  │                   │
 │  │  [X+]  [X-]  │  │  [Y+]  [Y-]  │  │  [Z+]  [Z-]  │  ← hold to jog    │
 │  │  [_____] Abs │  │  [_____] Abs │  │  [_____] Abs │  ← Move Abs (mm)  │
@@ -129,18 +152,18 @@ side-by-side cards, one shared parameter row at the top:
 * **Jog buttons (`X+/X-/Y+/Y-/Z+/Z-`)** — hold to jog continuously in that
   direction at the shared Jog/Move Speed; release for an SDK soft stop
   (`stop_axis(mode=1)`). Same pattern as `manual_pad.py`'s `_start_jog` /
-  `_stop_jog`, but the mm→units conversion is exact (single-axis = always uses
-  that axis's own `SCALE_MM_PER_UNIT` factor).
+  `_stop_jog`. Speed is entered in cm/s; converted to controller units/s
+  per axis via `SCALE_MM_PER_UNIT` at the callsite.
 * **Move Abs spinbox + button** — absolute move on this one axis only. The
-  spinbox range is clamped to the loaded soft limits per axis, and the click
-  re-validates against them. Runs on its own background `AxisAbsMoveThread`
-  (one per axis, never blocks the GUI).
+  spinbox range is clamped to the loaded soft limits per axis (in mm), and the
+  click re-validates against them. Runs on its own background
+  `AxisAbsMoveThread` (one per axis, never blocks the GUI).
 * **Per-axis Home button** — pure UI shortcut into the existing
   `_home_single(axis)` path. The shared homing parameters from the Homing
-  group above (Home Speed in units/s, Accel/Decel, Fall Step, Direction) are
+  group above (Home Speed in cm/s, Accel/Decel, Fall Step in mm, Direction) are
   re-used verbatim, so there's exactly one place to tune homing.
 * **Shared jog/move parameter row** — `Jog/Move Speed`, `Accel`, `Decel` in
-  mm/s and mm/s². Independent from the combined Move-to-Target panel's own
+  cm/s and cm/s². Independent from the combined Move-to-Target panel's own
   speed/accel — each panel keeps its own values.
 * **Safety**: every jog / Move Abs / per-axis Home goes through the same
   `_controller_lock` as everything else; per-axis controls disable when
@@ -156,13 +179,12 @@ side-by-side cards, one shared parameter row at the top:
 
 1. Click **Connect** — soft limits are auto-loaded into the spinboxes and into
    the per-axis progress bars.
-2. Set the Homing parameters (in **units** — the SDK's `home_axis` takes raw
-   units; the field labels and tooltip remind you):
-   - **Home Speed (units/s)**: default 5.0 (≈ 41 mm/s on X, 12.5 mm/s on Y,
-     2.5 mm/s on Z given the per-axis mm-per-unit scaling). Clamped to 20.0
-     units/s by `HOME_SPEED_LIMIT_UNITS` regardless of UI input.
-   - **Home Accel/Decel (units/s²)**: default 20.0.
-   - **Fall Step (units)**: default 5.0.
+2. Set the Homing parameters:
+   - **Home Speed (cm/s)**: default 5.0. Converted per axis to controller
+     units/s at run time (X ≈ 6.06, Y ≈ 20.0 at max 5 cm/s; Z is always
+     clamped to `HOME_SPEED_LIMIT_UNITS` = 20.0 u/s).
+   - **Home Accel/Decel (cm/s²)**: default 5.0.
+   - **Fall Step (mm)**: default 25.0.
    - **Direction**: Positive limit (default) or Negative limit.
 3. Click **Home X** / **Home Y** / **Home Z** for a single axis, or **Home
    All** with the order dropdown (default `Z → X → Y` so the tool lifts before
@@ -256,7 +278,7 @@ Selections are persisted to `~/.umi_gui_state.json` under
 confirmation dialog spells out the direction:
 
 ```
-Home Z toward NEGATIVE limit at 5.00 units/s.
+Home Z toward NEGATIVE limit at 5.00 cm/s (≈ 100.00 units/s on Z → clamped to 20.0).
 Make sure the path is clear. Continue?
 ```
 
