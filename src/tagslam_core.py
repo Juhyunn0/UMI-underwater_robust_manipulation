@@ -4779,6 +4779,94 @@ def write_pose_velocity_acceleration_plot(
     return path
 
 
+def write_gantry_only_plot(
+    path: Path,
+    gantry_csv: Path,
+) -> "Path | None":
+    """3×3 matplotlib PNG of gantry-only ground truth: rows = Pose / Velocity /
+    Acceleration, cols = X / Y / Z. No camera overlay.
+
+    Used by the Experiment runner in 'gantry_only' camera mode where the
+    fisheye pipeline is bypassed entirely. Reads gantry_telemetry.csv columns
+    written by GantryTelemetryLogger (mm / mm·s / mm·s²); displays in cm/s and
+    cm/s² to match the live panel convention.
+    """
+    try:
+        os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        path.with_suffix(".txt").write_text(
+            f"matplotlib required.\n{exc}\n", encoding="utf-8"
+        )
+        return None
+
+    import csv as _csv
+
+    def _load_csv(p: Path) -> list[dict[str, str]]:
+        if not p.exists():
+            return []
+        with p.open(newline="", encoding="utf-8") as fh:
+            return list(_csv.DictReader(fh))
+
+    g_rows = _load_csv(gantry_csv)
+    if not g_rows:
+        return None
+
+    def _col(rows: list[dict], key: str) -> "np.ndarray":
+        vals = []
+        for r in rows:
+            try:
+                vals.append(float(r[key]))
+            except (KeyError, ValueError):
+                vals.append(float("nan"))
+        return np.array(vals, dtype=np.float64)
+
+    g_t   = _col(g_rows, "elapsed_s")
+    g_pos = [_col(g_rows, "x_mm"),     _col(g_rows, "y_mm"),     _col(g_rows, "z_mm")]
+    g_vel = [_col(g_rows, "vx_mm_s"),  _col(g_rows, "vy_mm_s"),  _col(g_rows, "vz_mm_s")]
+    g_acc = [_col(g_rows, "ax_mm_s2"), _col(g_rows, "ay_mm_s2"), _col(g_rows, "az_mm_s2")]
+
+    fig, axes = plt.subplots(3, 3, figsize=(15, 9), dpi=130, sharey="row")
+    fig.patch.set_facecolor("#0f0f12")
+    for ax in axes.flatten():
+        ax.set_facecolor("#1a1a1d")
+        ax.tick_params(colors="#aaa", labelsize=8)
+        for sp in ax.spines.values():
+            sp.set_color("#333")
+
+    rows_data = [
+        ("Pose",         g_pos, "mm",     1.0),
+        ("Velocity",     g_vel, "cm/s",   0.1),
+        ("Acceleration", g_acc, "cm/s²",  0.1),
+    ]
+    col_labels = ["X", "Y", "Z"]
+    for row_idx, (_row_lbl, arrs, y_lbl, scale) in enumerate(rows_data):
+        for col_idx, (arr, col_lbl) in enumerate(zip(arrs, col_labels)):
+            ax = axes[row_idx][col_idx]
+            ax.plot(g_t, arr * scale, color="#4ea1ff", linewidth=1.2,
+                    label="Gantry GT", alpha=0.9)
+            ax.set_title(col_lbl, color="#ddd", fontsize=9, pad=4)
+            ax.set_ylabel(y_lbl, color="#aaa", fontsize=8)
+            if row_idx == 2:
+                ax.set_xlabel("elapsed [s]", color="#aaa", fontsize=8)
+            if row_idx == 0 and col_idx == 0:
+                ax.legend(facecolor="#222", edgecolor="#555",
+                          labelcolor="#ddd", fontsize=7, loc="upper left")
+
+    fig.text(0.02, 0.5, "Pose / Velocity / Acceleration",
+             va="center", rotation="vertical", color="#ccc", fontsize=10)
+    fig.suptitle(
+        "Gantry-only Ground Truth (camera disabled)",
+        color="#ddd", fontsize=10,
+    )
+    fig.tight_layout(rect=[0.03, 0, 1, 0.93])
+    fig.savefig(path, dpi=130, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return path
+
+
 def write_pose_velocity_acceleration_html(
     path: Path,
     gantry_csv: Path,

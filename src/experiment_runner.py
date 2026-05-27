@@ -101,6 +101,19 @@ class ExperimentConfig:
     # When set, FisheyeWorkerThread reads from its worker queue instead of opening cv2.
     camera_session: Any = None
 
+    # ── Experiment-mode metadata (gantry-only vs full pipeline) ──
+    # "fisheye" runs the full camera pipeline; "gantry_only" skips fisheye
+    # entirely and writes a reduced output set.
+    camera_mode: str = "fisheye"
+    # Per-axis direction sign at panel↔SDK boundary (panel field), recorded for
+    # the run_metadata.json so post-hoc analysis can reproduce user-frame.
+    axis_sign: dict | None = None
+    # Snapshot of user-frame waypoints AT START — preserves the values the user
+    # actually entered (waypoints field above is firmware-frame for the SDK).
+    waypoints_user_frame: list | None = None
+    # Soft-limit panel metadata: per-axis written/readback units + sync state.
+    soft_limit_metadata: dict | None = None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Fisheye stats sample emitted by FisheyeWorkerThread via queue
@@ -537,19 +550,22 @@ class PostprocessThread(QThread):
             self.done.emit(result, "Stopped by user")
             return
 
-        # 2) Save fisheye trajectory
-        self.progress.emit("Writing camera trajectory CSV + HTML…")
+        gantry_only = getattr(config, "camera_mode", "fisheye") == "gantry_only"
+
+        # 2) Save fisheye trajectory (skipped entirely in gantry-only mode)
         backend  = self._fisheye_backend
         recorder = self._fisheye_recorder
 
-        if recorder is not None and recorder.samples and backend is not None:
-            try:
-                recorder.stop_and_save(backend)
-                result["camera_trajectory_csv"] = str(run_dir / "camera_trajectory.csv")
-                result["tag_poses_csv"]          = str(run_dir / "tag_poses.csv")
-                result["trajectory_html"]        = str(run_dir / "trajectory_interactive.html")
-            except Exception as exc:
-                errors.append(f"recorder.stop_and_save: {exc}")
+        if not gantry_only:
+            self.progress.emit("Writing camera trajectory CSV + HTML…")
+            if recorder is not None and recorder.samples and backend is not None:
+                try:
+                    recorder.stop_and_save(backend)
+                    result["camera_trajectory_csv"] = str(run_dir / "camera_trajectory.csv")
+                    result["tag_poses_csv"]          = str(run_dir / "tag_poses.csv")
+                    result["trajectory_html"]        = str(run_dir / "trajectory_interactive.html")
+                except Exception as exc:
+                    errors.append(f"recorder.stop_and_save: {exc}")
 
         gantry_csv  = run_dir / "gantry_telemetry.csv"
         camera_csv  = run_dir / "camera_trajectory.csv"
@@ -557,12 +573,52 @@ class PostprocessThread(QThread):
 
         result["gantry_telemetry_csv"] = str(gantry_csv)
 
+        # 2b) Always write waypoints.csv (user-frame if available, otherwise
+        # firmware-frame as-fed-to-SDK). Cheap and useful for both modes; the
+        # gantry-only mode requirement also makes it a hard guarantee.
+        try:
+            waypoints_csv_path = run_dir / "waypoints.csv"
+            with waypoints_csv_path.open("w", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(["x_mm", "y_mm", "z_mm", "speed_mm_s", "dwell_s"])
+                user_wps = getattr(config, "waypoints_user_frame", None)
+                if user_wps:
+                    for wp in user_wps:
+                        w.writerow([wp["x_mm"], wp["y_mm"], wp["z_mm"],
+                                    wp["speed_mm_s"], wp["dwell_s"]])
+                else:
+                    for wp in config.waypoints:
+                        w.writerow([wp.x_mm, wp.y_mm, wp.z_mm, wp.speed_mm_s, wp.dwell_s])
+            result["waypoints_csv"] = str(waypoints_csv_path)
+        except Exception as exc:
+            errors.append(f"waypoints_csv: {exc}")
+
         if self._stop_event.is_set():
             self.done.emit(result, "Stopped by user")
             return
 
-        # 3) Overlay top-down plot
-        if gantry_csv.exists() and camera_csv.exists() and tag_csv.exists():
+        # In gantry-only mode, write the single-mode plot and skip the overlay
+        # and tag-overlay plots entirely.
+        if gantry_only:
+            if gantry_csv.exists():
+                self.progress.emit("Writing gantry pose/vel/acc plot…")
+                try:
+                    import tagslam_core as _tc
+                    png_path = run_dir / "gantry_pose_velocity_acceleration.png"
+                    if hasattr(_tc, "write_gantry_only_plot"):
+                        out = _tc.write_gantry_only_plot(png_path, gantry_csv)
+                    else:
+                        out = None
+                        errors.append(
+                            "write_gantry_only_plot helper missing in tagslam_core"
+                        )
+                    if out is not None:
+                        result["gantry_pose_velocity_acceleration_plot"] = str(out)
+                except Exception as exc:
+                    errors.append(f"gantry_only_plot: {exc}")
+
+        # 3) Overlay top-down plot (full pipeline only)
+        if not gantry_only and gantry_csv.exists() and camera_csv.exists() and tag_csv.exists():
             self.progress.emit("Writing overlay top-down plot…")
             try:
                 import tagslam_core as _tc
@@ -614,8 +670,8 @@ class PostprocessThread(QThread):
             except Exception as exc:
                 errors.append(f"overlay_topdown_plot: {exc}")
 
-        # 4) Pose/velocity/acceleration plots
-        if gantry_csv.exists() and camera_csv.exists():
+        # 4) Pose/velocity/acceleration plots (full pipeline only)
+        if not gantry_only and gantry_csv.exists() and camera_csv.exists():
             self.progress.emit("Writing pose/velocity/acceleration plot…")
             try:
                 import tagslam_core as _tc
@@ -645,10 +701,16 @@ class PostprocessThread(QThread):
                 "end_monotonic": time.monotonic(),
                 "end_unix": time.time(),
                 "run_name": config.run_name or run_dir.name,
-                "alignment": "first-sample-zeroed (calibrate gantry_anchor_offset_mm to remove this fallback)"
-                    if not self._has_anchor_offset() else "gantry_anchor_offset_mm",
+                "camera_mode": getattr(config, "camera_mode", "fisheye"),
+                "axis_sign": getattr(config, "axis_sign", None),
+                "soft_limits": getattr(config, "soft_limit_metadata", None),
                 "outputs": {k: v for k, v in result.items() if k not in ("run_dir", "aborted")},
             }
+            if not gantry_only:
+                metadata["alignment"] = (
+                    "first-sample-zeroed (calibrate gantry_anchor_offset_mm to remove this fallback)"
+                    if not self._has_anchor_offset() else "gantry_anchor_offset_mm"
+                )
             if errors:
                 metadata["postprocess_errors"] = errors
             with (run_dir / "run_metadata.json").open("w") as fh:

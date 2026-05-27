@@ -200,13 +200,57 @@ side-by-side cards, one shared parameter row at the top:
 | Action | What happens |
 |---|---|
 | **Connect** | Reads `controller.get_device_parameters()`, converts units → mm via `SCALE_MM_PER_UNIT`, populates per-axis Min/Max spinboxes, clamps Move-target spinboxes to that range, and configures each axis card's progress bar. |
-| **Apply X / Y / Z** | Worker thread reads current `DeviceParameters` under the controller lock, mutates the one axis's `soft_limit_min[idx]` / `soft_limit_max[idx]` in raw units, writes back, re-reads to confirm. No confirmation dialog — you just typed those numbers. |
+| **Apply X / Y / Z** | Worker thread reads current `DeviceParameters` under the controller lock, mutates the one axis's `soft_limit_min[idx]` / `soft_limit_max[idx]` in raw units, writes back, re-reads to confirm. **Then** compares written vs readback (1-unit threshold) and updates the per-axis Sync indicator. |
 | **Apply All** | Confirmation dialog shows a **per-axis diff** (current vs proposed in mm). On confirm, single worker writes all three axes in one read-mutate-write block. |
 | **Load from Controller** | Re-reads device state without writing — useful after homing or out-of-band controller changes. |
 
 The read-mutate-write happens entirely inside one `with self._controller_lock:`
 block. The status-polling thread uses the same RLock, so the worst that
 happens during an apply is one 100 ms status tick being delayed.
+
+#### Sync indicator (per axis)
+
+A small dot at the right of each row reports what the firmware actually
+stored after the most recent Apply:
+
+| Indicator | Meaning |
+|---|---|
+| 🟢 **Synced** | Written units = readback units **and** the user-typed mm matches the effective firmware mm within 1 µm. |
+| 🟡 **Rounding** | Either firmware readback diverged by ≥1 unit (firmware glitch), or the user-typed mm doesn't land exactly on the `SCALE_MM_PER_UNIT[axis]` grid. Hover the dot for the exact gap in user-frame mm. |
+| ⚪ **Unknown** | Not applied this session yet. |
+
+The gray sub-row beneath each spinbox shows `1 unit = K mm → effective min/max: A / B mm`
+live — what the firmware will actually store after `int(round(mm/scale))`,
+sign-flipped for the current axis direction. Enable **Snap to unit grid**
+(default ON) and the spinbox snaps to the nearest exact unit boundary
+on `editingFinished`, so what-you-see equals what-firmware-stores.
+
+#### Always-on panel-side enforcement
+
+Every motion entry point (jog, Move Abs, Move to Target, Run Sequence,
+Experiment) now runs a soft-limit check **before** the SDK call, against
+`self._soft_min_mm / self._soft_max_mm` (user-frame mm), independent of
+the firmware-side limit. Jog also projects ~100 ms forward at the
+requested speed and refuses if the projection would exit the envelope.
+A refused move surfaces a `Soft limit (panel-side)` dialog with the exact
+target vs limit, and no SDK call is issued.
+
+### Axis Direction (manual sign toggle)
+
+If clicking `X+` on the panel makes the gantry move in what you consider
+the negative direction, open Setup → Software Limits → **Axis Direction**
+and toggle that axis from `+1` to `-1`. The panel multiplies all
+user-entered mm values by the per-axis sign **before** `mm_to_units(...)`
+for jog / Move Abs / Move to Target / Home / soft-limit Apply / Experiment,
+**and** multiplies the SDK readback by the same sign for display. The flip
+lives entirely in the panel; firmware sees only firmware-frame units. The
+sign is persisted to `~/.umi_gui_state.json` under `gantry_panel.axis_sign`.
+
+The toggle does **not** command any test motion. After flipping, jog the
+axis a few mm manually, watch the position readout, and confirm the
+displayed sign now matches your physical intuition. Toggling sign resets
+the Sync indicator to ⚪ Unknown for that axis — re-apply soft limits to
+restore 🟢 / 🟡.
 
 ### Emergency Stop semantics
 
@@ -475,9 +519,30 @@ python src/gantry_panel.py
 python src/gantry_panel.py --mock --mock-camera
 ```
 
+### Camera mode (full pipeline vs gantry-only)
+
+The Experiment tab has a **Camera Mode** selector at the top:
+
+- 🎥 **With fisheye (full pipeline)** — default. Camera + calibration required;
+  the run writes the full output set listed below.
+- 🚫 **Gantry only (no camera)** — bypasses the fisheye pipeline entirely.
+  The Camera and Fisheye Calibration checklist rows show "— (skipped)" and
+  do not block Start. The run skips `FisheyeWorkerThread` and tag detection
+  while idle. Live experiment stats hide tag-related counters. The fisheye
+  preview panel shows "Camera not in use for this experiment". Outputs are
+  reduced to `gantry_telemetry.csv`, `waypoints.csv`,
+  `gantry_pose_velocity_acceleration.png` (3×3 grid of gantry GT pose/vel/acc),
+  and `run_metadata.json` (with `"camera_mode": "gantry_only"`). The choice
+  is persisted to `~/.umi_gui_state.json` under `gantry_panel.camera_mode`.
+
+The Start button tooltip reflects what will run:
+"Will record gantry telemetry only. Camera disabled." vs
+"Will record gantry telemetry + fisheye AprilTag SLAM."
+
 ### Checklist → Countdown → Run → Outputs
 
-1. **Pre-flight checklist** — all indicators must turn green:
+1. **Pre-flight checklist** — all indicators must turn green (or "— (skipped)"
+   in gantry-only mode):
    - Controller connected (connect from the Connection bar first)
    - Home reference set for X, Y, Z (home all axes on the Setup tab)
    - Soft limits loaded (auto-loaded on connect; reload from Setup if needed)
@@ -508,17 +573,29 @@ python src/gantry_panel.py --mock --mock-camera
 
 ### Output files in `data/YYYYMMDD/<timestamp>_experiment/`
 
+Full-pipeline mode (`camera_mode: fisheye`):
+
 | File | Content |
 |------|---------|
 | `gantry_telemetry.csv` | 100 Hz gantry pose/vel/acc (unchanged schema) |
+| `waypoints.csv` | Snapshot of the waypoints that ran (user-frame mm) |
 | `camera_trajectory.csv` | TagSLAM camera poses + `gantry_x/y/z_mm`, `translation_error_mm` |
 | `tag_poses.csv` | Optimized tag positions |
 | `trajectory_interactive.html` | 3D interactive viewer |
 | `comparison_topdown.png` | Top-down overlay: camera traj (viridis) + gantry GT (orange) |
 | `comparison_plot.png` | 3×3 grid: pose/vel/acc × X/Y/Z, gantry vs AprilTag |
 | `pose_velocity_acceleration.html` | Interactive 9-panel comparison (synchronized hover) |
-| `run_metadata.json` | CLI args, timing, output paths, alignment note |
+| `run_metadata.json` | CLI args, timing, output paths, alignment note, `camera_mode`, `axis_sign`, `soft_limits` |
 | `frames/` | Raw fisheye frames (if recording was active) |
+
+Gantry-only mode (`camera_mode: gantry_only`):
+
+| File | Content |
+|------|---------|
+| `gantry_telemetry.csv` | 100 Hz gantry pose/vel/acc |
+| `waypoints.csv` | Snapshot of the waypoints that ran |
+| `gantry_pose_velocity_acceleration.png` | 3×3 grid: pose/vel/acc × X/Y/Z, gantry GT only |
+| `run_metadata.json` | Timing, output paths, `camera_mode: gantry_only`, `axis_sign`, `soft_limits` |
 
 ### Aligning the two CSVs in pandas
 

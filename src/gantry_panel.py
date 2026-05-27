@@ -2106,8 +2106,39 @@ class GantryPanel(QMainWindow):
         self.connected = False
 
         # Soft limits (mm) — None means unset.
+        # All mm values stored here are in the USER-FACING frame (after axis_sign).
+        # Conversion to firmware units happens through mm_user_to_units / units_to_mm_user.
         self._soft_min_mm: list[float | None] = [None, None, None]
         self._soft_max_mm: list[float | None] = [None, None, None]
+
+        # Per-axis direction flip: +1 = panel matches firmware counter, -1 = inverted.
+        # Restored from settings; user toggles in Setup tab → Axis Direction.
+        # Applied at the panel↔SDK boundary only (mm_user_to_units / units_to_mm_user).
+        self._axis_sign: dict[Axis, int] = {a: 1 for a in AXES}
+        try:
+            saved_sign = (_gp_load_settings()
+                          .get("gantry_panel", {}).get("axis_sign", {}))
+            for a in AXES:
+                v = int(saved_sign.get(a.name, 1))
+                self._axis_sign[a] = 1 if v >= 0 else -1
+        except Exception:
+            pass
+
+        # Per-axis readback sync state for the soft-limit indicator.
+        #   None  -> Unknown (not applied this session)
+        #   "synced"   -> written ≈ readback (within 1 unit)
+        #   "rounding" -> readback differs by ≥1 unit (mm-rounding effect)
+        self._soft_limit_sync: dict[Axis, str | None] = {a: None for a in AXES}
+        # (written_units, readback_units) per axis — used for the indicator tooltip.
+        self._soft_limit_written_units: dict[Axis, tuple[int, int] | None] = {a: None for a in AXES}
+        self._soft_limit_readback_units: dict[Axis, tuple[int, int] | None] = {a: None for a in AXES}
+
+        # Live soft-limit watchdog: on every status snapshot, if user-frame
+        # position is outside the configured limits, the watcher fires
+        # stop_axis(axis, mode=2) ONCE per axis and latches a breach flag so
+        # we don't spam stop calls every 100 ms tick. Flag clears once pos
+        # comes back inside the envelope.
+        self._soft_limit_breached: dict[Axis, bool] = {a: False for a in AXES}
 
         # Live data for finite-diff accel + live plot.
         self._vel_buffer: deque = deque(maxlen=FINITE_DIFF_WINDOW)
@@ -2215,6 +2246,33 @@ class GantryPanel(QMainWindow):
 
         # One-shot clipping audit (runs after the window paints once).
         QTimer.singleShot(500, self._audit_clipping)
+
+    # ------------------------------------------------------------------
+    # Axis sign helpers (panel↔SDK boundary)
+    # ------------------------------------------------------------------
+    # The panel speaks USER-FACING mm everywhere. When axis_sign[axis] == -1,
+    # multiplying by the sign at the panel↔SDK boundary inverts that axis's
+    # user-facing direction without touching firmware. Helpers below are the
+    # ONLY places where the flip is applied — call them at every mm→units and
+    # units→mm transition.
+    def mm_user_to_units(self, mm_user: float, axis: Axis) -> float:
+        """User-facing mm → controller units (apply per-axis sign flip)."""
+        return mm_to_units(mm_user * self._axis_sign[axis], axis)
+
+    def units_to_mm_user(self, units: float, axis: Axis) -> float:
+        """Controller units → user-facing mm (apply per-axis sign flip)."""
+        return units_to_mm(units, axis) * self._axis_sign[axis]
+
+    def mm_user_to_mm_firmware(self, mm_user: float, axis: Axis) -> float:
+        """User-facing mm → firmware-frame mm (no unit change, just sign flip)."""
+        return mm_user * self._axis_sign[axis]
+
+    def mm_firmware_to_mm_user(self, mm_fw: float, axis: Axis) -> float:
+        return mm_fw * self._axis_sign[axis]
+
+    def jog_direction_user_to_firmware(self, direction: int, axis: Axis) -> int:
+        """User-facing +/-1 jog direction → firmware-frame +/-1."""
+        return direction * self._axis_sign[axis]
 
     # ------------------------------------------------------------------
     # UI construction
@@ -2564,8 +2622,14 @@ class GantryPanel(QMainWindow):
         grid.addWidget(QLabel("Axis"), 0, 0)
         grid.addWidget(QLabel("Min (mm)"), 0, 1)
         grid.addWidget(QLabel("Max (mm)"), 0, 2)
+        grid.addWidget(QLabel("Sync"), 0, 4)
         self.soft_limit_spins: dict[Axis, dict[str, QDoubleSpinBox]] = {}
-        for row, axis in enumerate(AXES, start=1):
+        self.soft_limit_indicators: dict[Axis, QLabel] = {}
+        self.soft_limit_resolution_labels: dict[Axis, QLabel] = {}
+        # Two rows per axis: the spinbox row and a thin gray resolution-hint row.
+        next_row = 1
+        for axis in AXES:
+            row = next_row
             grid.addWidget(QLabel(axis.name), row, 0)
             mn = QDoubleSpinBox()
             mn.setRange(-100000.0, 100000.0)
@@ -2584,13 +2648,29 @@ class GantryPanel(QMainWindow):
             mx.setToolTip(_sl_tip)
             mn.editingFinished.connect(partial(self._snap_soft_limit_spin, mn, axis))
             mx.editingFinished.connect(partial(self._snap_soft_limit_spin, mx, axis))
+            mn.valueChanged.connect(partial(self._update_soft_limit_resolution_hint, axis))
+            mx.valueChanged.connect(partial(self._update_soft_limit_resolution_hint, axis))
             apply_btn = QPushButton(f"Apply {axis.name}")
             _size_button(apply_btn)
             apply_btn.clicked.connect(partial(self._apply_soft_limits_axis, axis))
+            indicator = QLabel("⚪")
+            indicator.setToolTip("Unknown — not applied this session.")
+            indicator.setAlignment(Qt.AlignCenter)
+            indicator.setFixedWidth(28)
+            indicator.setStyleSheet("color: #888; font-size: 14px;")
             grid.addWidget(mn, row, 1)
             grid.addWidget(mx, row, 2)
             grid.addWidget(apply_btn, row, 3)
+            grid.addWidget(indicator, row, 4)
             self.soft_limit_spins[axis] = {"min": mn, "max": mx, "apply_btn": apply_btn}
+            self.soft_limit_indicators[axis] = indicator
+            # Resolution hint row directly under the spinbox row.
+            res_label = QLabel("")
+            res_label.setStyleSheet("color: #777; font-size: 10px; padding-left: 20px;")
+            grid.addWidget(res_label, row + 1, 0, 1, 5)
+            self.soft_limit_resolution_labels[axis] = res_label
+            self._update_soft_limit_resolution_hint(axis)
+            next_row += 2
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
@@ -2602,9 +2682,146 @@ class GantryPanel(QMainWindow):
         _size_button(self.apply_all_limits_btn)
         self.apply_all_limits_btn.clicked.connect(self._apply_all_soft_limits)
         btn_row.addWidget(self.apply_all_limits_btn)
+        self.snap_grid_chk = QCheckBox("Snap to unit grid")
+        self.snap_grid_chk.setChecked(True)
+        self.snap_grid_chk.setToolTip(
+            "When ON, soft-limit Min/Max spinboxes snap to the nearest exact "
+            "controller-unit boundary on edit. Turn off to enter raw mm values "
+            "that will be rounded by the firmware (indicator turns yellow)."
+        )
+        btn_row.addWidget(self.snap_grid_chk)
         btn_row.addStretch()
-        grid.addLayout(btn_row, len(AXES) + 1, 0, 1, 4)
+        grid.addLayout(btn_row, next_row, 0, 1, 5)
+
+        # ---- Axis Direction sub-group ---------------------------------------
+        # Manual sign toggle. No motion probe; user toggles and verifies by
+        # jogging. Persisted in ~/.umi_gui_state.json under axis_sign.
+        next_row += 1
+        dir_title = QLabel("Axis Direction")
+        dir_title.setStyleSheet("color: #4ea1ff; font-weight: 600; padding-top: 10px;")
+        grid.addWidget(dir_title, next_row, 0, 1, 5)
+        next_row += 1
+        dir_explain = QLabel(
+            "If clicking X+ in this panel makes the gantry move in what you "
+            "consider the negative direction, toggle that axis to -1. The panel "
+            "will invert this axis's user-facing direction. Does NOT command "
+            "any test motion — toggle, jog manually, observe."
+        )
+        dir_explain.setStyleSheet("color: #999; font-size: 10px;")
+        dir_explain.setWordWrap(True)
+        grid.addWidget(dir_explain, next_row, 0, 1, 5)
+        next_row += 1
+        self.axis_sign_combos: dict[Axis, QComboBox] = {}
+        for axis in AXES:
+            row = QHBoxLayout()
+            row.setSpacing(4)
+            row.addWidget(QLabel(f"{axis.name}:"))
+            combo = QComboBox()
+            combo.addItem("+1 (matches firmware)",  1)
+            combo.addItem("-1 (inverted)",         -1)
+            combo.setCurrentIndex(0 if self._axis_sign[axis] >= 0 else 1)
+            combo.setToolTip(
+                f"Direction multiplier for axis {axis.name}.\n"
+                "+1: panel X+ jog → firmware counter increases (normal).\n"
+                "-1: panel X+ jog → firmware counter decreases (inverted).\n"
+                "Applied to jog / Move Abs / Move to Target / Home / soft-limit Apply\n"
+                "AND to the position readback before display."
+            )
+            combo.currentIndexChanged.connect(partial(self._on_axis_sign_changed, axis))
+            row.addWidget(combo)
+            row.addStretch()
+            grid.addLayout(row, next_row, int(axis), 1, 1)
+        next_row += 1
         return frame
+
+    # ── soft-limit UI helpers ────────────────────────────────────────────────
+    def _update_soft_limit_resolution_hint(self, axis: Axis, *_: Any) -> None:
+        """Live label: '1 unit = K mm → effective min/max: A / B mm'.
+        Shows the user exactly what the firmware will actually store after
+        int(round(mm/scale))."""
+        lbl = self.soft_limit_resolution_labels.get(axis)
+        if lbl is None:
+            return
+        scale = SCALE_MM_PER_UNIT[axis]
+        spins = self.soft_limit_spins.get(axis)
+        if spins is None:
+            lbl.setText(f"1 unit = {scale:.4g} mm")
+            return
+        mn_mm = spins["min"].value()
+        mx_mm = spins["max"].value()
+        # Effective firmware-stored values, AFTER axis-sign flip and rounding.
+        sign = self._axis_sign[axis]
+        mn_fw_mm = units_to_mm(int(round(mm_to_units(mn_mm * sign, axis))), axis) * sign
+        mx_fw_mm = units_to_mm(int(round(mm_to_units(mx_mm * sign, axis))), axis) * sign
+        # When sign==-1 the user-min maps to fw-max and vice versa; show what
+        # the user will see, i.e. low and high in user-facing mm.
+        lo_user, hi_user = (mn_fw_mm, mx_fw_mm) if mn_fw_mm <= mx_fw_mm else (mx_fw_mm, mn_fw_mm)
+        lbl.setText(
+            f"{axis.name}: 1 unit = {scale:.4g} mm → effective min/max: "
+            f"{lo_user:+.2f} / {hi_user:+.2f} mm"
+        )
+
+    def _on_axis_sign_changed(self, axis: Axis, idx: int) -> None:
+        combo = self.axis_sign_combos.get(axis) if hasattr(self, "axis_sign_combos") else None
+        new_sign = int(combo.itemData(idx)) if combo is not None else 1
+        new_sign = 1 if new_sign >= 0 else -1
+        if self._axis_sign[axis] == new_sign:
+            return
+        self._axis_sign[axis] = new_sign
+        # Persist immediately.
+        payload = _gp_load_settings().get("gantry_panel", {})
+        payload["axis_sign"] = {a.name: int(self._axis_sign[a]) for a in AXES}
+        _gp_save_section("gantry_panel", payload)
+        # Refresh resolution hints (effective min/max flips with sign).
+        for a in AXES:
+            self._update_soft_limit_resolution_hint(a)
+        # Reset sync indicator — the user must re-apply now.
+        self._set_soft_limit_indicator(axis, None)
+        self.sb_op_label.setText(
+            f"Axis {axis.name} direction set to {new_sign:+d}. "
+            "Re-apply soft limits and jog manually to verify."
+        )
+
+    def _set_soft_limit_indicator(self, axis: Axis, state: str | None,
+                                  written: tuple[int, int] | None = None,
+                                  readback: tuple[int, int] | None = None) -> None:
+        ind = self.soft_limit_indicators.get(axis)
+        if ind is None:
+            return
+        self._soft_limit_sync[axis] = state
+        if written is not None:
+            self._soft_limit_written_units[axis] = written
+        if readback is not None:
+            self._soft_limit_readback_units[axis] = readback
+        scale = SCALE_MM_PER_UNIT[axis]
+        if state == "synced":
+            ind.setText("🟢")
+            ind.setStyleSheet("color: #34d058; font-size: 14px;")
+            tip = "Synced — written value matches readback within 1 unit."
+        elif state == "rounding":
+            ind.setText("🟡")
+            ind.setStyleSheet("color: #ffa726; font-size: 14px;")
+            w = self._soft_limit_written_units.get(axis)
+            r = self._soft_limit_readback_units.get(axis)
+            if w is not None and r is not None:
+                eff_lo_mm = self.units_to_mm_user(r[0], axis)
+                eff_hi_mm = self.units_to_mm_user(r[1], axis)
+                lo_mm, hi_mm = sorted((eff_lo_mm, eff_hi_mm))
+                tip = (
+                    f"Rounding — mm input doesn't land on the {scale:g} mm/unit grid.\n"
+                    f"  wrote units min/max: {w[0]} / {w[1]}\n"
+                    f"  firmware stored:     {r[0]} / {r[1]}\n"
+                    f"  effective limits in user mm: {lo_mm:+.3f} / {hi_mm:+.3f}\n"
+                    f"Enable 'Snap to unit grid' to make spinboxes snap to multiples "
+                    f"of {scale:g} mm so what-you-see equals what-firmware-stores."
+                )
+            else:
+                tip = "Rounding — readback differs by ≥1 unit."
+        else:
+            ind.setText("⚪")
+            ind.setStyleSheet("color: #888; font-size: 14px;")
+            tip = "Unknown — not applied this session."
+        ind.setToolTip(tip)
 
     def _build_homing_group(self) -> SectionFrame:
         frame = SectionFrame("Homing")
@@ -2847,13 +3064,24 @@ class GantryPanel(QMainWindow):
         move_btn = QPushButton("Move")
         move_btn.clicked.connect(partial(self._move_axis_abs, axis))
         bottom_row.addWidget(move_btn)
-        home_btn = QPushButton("Home")
-        home_btn.setToolTip(f"Home {axis.name} axis")
+        # "Go Home" — move-abs to the captured home REFERENCE on this axis.
+        # NOT a physical limit-switch homing (that's on the Setup tab → Homing
+        # group). If no home reference exists yet, the click handler shows a
+        # warning that points the user at "Set Current as Home Reference" or
+        # the Setup-tab Home buttons.
+        home_btn = QPushButton("Go Home")
+        home_btn.setToolTip(
+            f"Move {axis.name} to its captured home reference (Δ home = 0).\n"
+            "Requires a home reference to be set first (Setup → Homing →\n"
+            "'Set Current as Home Reference' or a successful Home Axis op).\n"
+            "Does NOT drive toward the physical limit switch — use the\n"
+            "Setup tab 'Home {axis.name}' button for hardware homing."
+        )
         ic = _icon("fa5s.home")
         if ic is not None:
             home_btn.setIcon(ic)
             home_btn.setObjectName("IconButton")
-        home_btn.clicked.connect(partial(self._home_single, axis))
+        home_btn.clicked.connect(partial(self._go_to_home_axis, axis))
         bottom_row.addWidget(home_btn)
         v.addLayout(bottom_row)
 
@@ -3001,6 +3229,44 @@ class GantryPanel(QMainWindow):
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(10)
 
+        from PyQt5.QtWidgets import QRadioButton, QButtonGroup
+
+        # ── (0) Camera mode selector ─────────────────────────────────────────
+        # Two operating modes:
+        #   - "fisheye": full pipeline; requires camera + calib.
+        #   - "gantry_only": telemetry-only test mode; skips fisheye entirely.
+        cam_mode_frame = SectionFrame("Camera Mode")
+        cm_layout = QVBoxLayout(cam_mode_frame.content())
+        cm_layout.setContentsMargins(0, 0, 0, 0)
+        cm_layout.setSpacing(4)
+        self._exp_cam_mode_fisheye_radio = QRadioButton(
+            "With fisheye (full pipeline)"
+        )
+        self._exp_cam_mode_gantry_radio = QRadioButton(
+            "Gantry only (no camera)"
+        )
+        self._exp_cam_mode_fisheye_radio.setToolTip(
+            "Record gantry telemetry + fisheye AprilTag SLAM. Camera + calibration required."
+        )
+        self._exp_cam_mode_gantry_radio.setToolTip(
+            "Record gantry telemetry only. Camera + calibration are not required and "
+            "are not used. Useful for motion + telemetry testing."
+        )
+        cam_mode_bg = QButtonGroup(self)
+        cam_mode_bg.addButton(self._exp_cam_mode_fisheye_radio)
+        cam_mode_bg.addButton(self._exp_cam_mode_gantry_radio)
+        cm_layout.addWidget(self._exp_cam_mode_fisheye_radio)
+        cm_layout.addWidget(self._exp_cam_mode_gantry_radio)
+        saved_cam_mode = (_gp_load_settings().get("gantry_panel", {})
+                          .get("camera_mode", "fisheye"))
+        if saved_cam_mode == "gantry_only":
+            self._exp_cam_mode_gantry_radio.setChecked(True)
+        else:
+            self._exp_cam_mode_fisheye_radio.setChecked(True)
+        self._exp_cam_mode_fisheye_radio.toggled.connect(self._on_exp_cam_mode_changed)
+        self._exp_cam_mode_gantry_radio.toggled.connect(self._on_exp_cam_mode_changed)
+        outer.addWidget(cam_mode_frame)
+
         # ── (a) Pre-flight checklist ──────────────────────────────────────────
         chk_frame = SectionFrame("Pre-flight Checklist")
         chk_layout = QVBoxLayout(chk_frame.content())
@@ -3050,7 +3316,6 @@ class GantryPanel(QMainWindow):
         path_layout.setContentsMargins(0, 0, 0, 0)
         path_layout.setSpacing(6)
 
-        from PyQt5.QtWidgets import QRadioButton, QButtonGroup
         self._exp_path_seq_radio = QRadioButton("Use Sequences tab waypoints (current)")
         self._exp_path_csv_radio = QRadioButton("Use CSV file")
         self._exp_path_seq_radio.setChecked(True)
@@ -3218,13 +3483,21 @@ class GantryPanel(QMainWindow):
     # ── Experiment helpers ────────────────────────────────────────────────────
 
     def _exp_refresh_checklist(self) -> None:
-        """Update the checklist indicators and enable/disable Start."""
+        """Update the checklist indicators and enable/disable Start.
+
+        When Camera Mode == 'gantry_only', the Camera and Calibration rows show
+        '— (skipped)' in gray and do not gate the Start button.
+        """
         def _set(indicator: QLabel, ok: bool, text: str = "") -> None:
             indicator.setText("●")
             indicator.setStyleSheet(
                 "color: #34d058; font-weight: bold;" if ok
                 else "color: #ef5350; font-weight: bold;"
             )
+
+        def _set_skipped(indicator: QLabel) -> None:
+            indicator.setText("—")
+            indicator.setStyleSheet("color: #888; font-weight: bold;")
 
         connected = self.connected
         _set(self._exp_chk_connected, connected)
@@ -3250,20 +3523,51 @@ class GantryPanel(QMainWindow):
         except Exception:
             pass
 
-        cam_ok = (
-            (self._camera is not None and self._camera.is_open)
-            or self._is_mock_camera
-        )
-        _set(self._exp_chk_camera, cam_ok)
+        gantry_only = self._exp_camera_mode() == "gantry_only"
 
-        # Calib: check the path stored in the active camera session.
-        if self._is_mock_camera:
+        if gantry_only:
+            _set_skipped(self._exp_chk_camera)
+            _set_skipped(self._exp_chk_calib)
+            cam_ok = True
             calib_ok = True
-        elif self._camera is not None and self._camera.calib_path is not None:
-            calib_ok = self._camera.calib_path.exists()
+            # Mark camera/calib labels as '(skipped)' for clarity.
+            try:
+                for indicator, key in (
+                    (self._exp_chk_camera, "Camera"),
+                    (self._exp_chk_calib,  "calibration"),
+                ):
+                    for lbl in indicator.parentWidget().findChildren(QLabel):
+                        if key in lbl.text() and "(skipped)" not in lbl.text():
+                            lbl.setText(lbl.text() + "  — (skipped)")
+                            lbl.setStyleSheet("color: #888;")
+            except Exception:
+                pass
         else:
-            calib_ok = False
-        _set(self._exp_chk_calib, calib_ok)
+            cam_ok = (
+                (self._camera is not None and self._camera.is_open)
+                or self._is_mock_camera
+            )
+            _set(self._exp_chk_camera, cam_ok)
+            if self._is_mock_camera:
+                calib_ok = True
+            elif self._camera is not None and self._camera.calib_path is not None:
+                calib_ok = self._camera.calib_path.exists()
+            else:
+                calib_ok = False
+            _set(self._exp_chk_calib, calib_ok)
+            # Restore base labels (strip any "(skipped)" suffix).
+            try:
+                for indicator, base in (
+                    (self._exp_chk_camera, "Camera connected (see connection bar)"),
+                    (self._exp_chk_calib,  "Fisheye calibration loaded"),
+                ):
+                    for lbl in indicator.parentWidget().findChildren(QLabel):
+                        if "(skipped)" in lbl.text() or lbl.text().startswith(base.split()[0]):
+                            lbl.setText(base)
+                            lbl.setStyleSheet("")
+                            break
+            except Exception:
+                pass
 
         tag_size_ok = self._exp_tag_size_spin.value() > 0
         _set(self._exp_chk_tagsize, tag_size_ok)
@@ -3276,12 +3580,49 @@ class GantryPanel(QMainWindow):
         if not homed:       missing.append("home all axes")
         if not limits_ok:   missing.append("load soft limits")
         if not path_ok:     missing.append("add waypoints")
-        if not cam_ok:      missing.append("connect camera (top bar)")
-        if not calib_ok:    missing.append("set calib path (top bar)")
-        self._exp_start_btn.setToolTip(
-            "Start experiment" if all_ok
-            else "Missing: " + ", ".join(missing)
-        )
+        if not gantry_only and not cam_ok:    missing.append("connect camera (top bar)")
+        if not gantry_only and not calib_ok:  missing.append("set calib path (top bar)")
+        if all_ok:
+            if gantry_only:
+                tip = "Will record gantry telemetry only. Camera disabled."
+            else:
+                tip = ("Will record gantry telemetry + fisheye AprilTag SLAM. "
+                       "Camera connected.")
+        else:
+            tip = "Missing: " + ", ".join(missing)
+        self._exp_start_btn.setToolTip(tip)
+
+    def _exp_camera_mode(self) -> str:
+        """'fisheye' or 'gantry_only'."""
+        if getattr(self, "_exp_cam_mode_gantry_radio", None) is not None \
+                and self._exp_cam_mode_gantry_radio.isChecked():
+            return "gantry_only"
+        return "fisheye"
+
+    def _on_exp_cam_mode_changed(self, _checked: bool = False) -> None:
+        # Persist + refresh checklist + update preview placeholder + hide tag stats.
+        mode = self._exp_camera_mode()
+        payload = _gp_load_settings().get("gantry_panel", {})
+        payload["camera_mode"] = mode
+        _gp_save_section("gantry_panel", payload)
+        gantry_only = mode == "gantry_only"
+        # Live experiment stats panel: hide tag-related counters in gantry-only.
+        for lbl in (getattr(self, "_exp_tags_frame_lbl", None),
+                    getattr(self, "_exp_tags_graph_lbl", None),
+                    getattr(self, "_exp_updates_lbl", None),
+                    getattr(self, "_exp_drift_lbl", None)):
+            if lbl is not None:
+                lbl.setVisible(not gantry_only)
+        # Fisheye preview placeholder.
+        if gantry_only and getattr(self, "_fisheye_preview", None) is not None:
+            self._fisheye_preview.preview_label.clear()
+            self._fisheye_preview.preview_label.setText(
+                "Camera not in use for this experiment"
+            )
+            self._fisheye_preview.preview_label.setStyleSheet(
+                "background-color: #0e0e0e; color: #888; border-radius: 4px;"
+            )
+        self._exp_refresh_checklist()
 
     def _exp_count_waypoints(self) -> int:
         if self._exp_path_seq_radio.isChecked():
@@ -3424,64 +3765,107 @@ class GantryPanel(QMainWindow):
         if self._experiment_in_progress:
             return
 
-        # Collect waypoints
+        # Collect waypoints (user-frame mm).
         try:
-            waypoints = self._exp_load_waypoints()
+            waypoints_user = self._exp_load_waypoints()
         except SystemExit as exc:
             QMessageBox.warning(self, "Bad waypoints", str(exc))
             return
-        if not waypoints:
+        if not waypoints_user:
             QMessageBox.warning(self, "No waypoints", "Define at least one waypoint first.")
             return
 
-        # Validate soft limits
+        # Validate soft limits (user-frame mm against user-frame limits).
         try:
-            _validate_soft_limits(waypoints, self._soft_min_mm, self._soft_max_mm)
+            _validate_soft_limits(waypoints_user, self._soft_min_mm, self._soft_max_mm)
         except SystemExit as exc:
-            QMessageBox.warning(self, "Soft limit violation", str(exc))
+            QMessageBox.warning(self, "Soft limit violation (panel-side)", str(exc))
             return
 
-        # Load calibration from the active camera session (or skip for mock).
-        calib_path = (
-            self._camera.calib_path
-            if self._camera is not None and self._camera.calib_path is not None
-            else None
-        )
+        # Convert waypoints to firmware-frame for the SDK.
+        waypoints_fw = [
+            Waypoint(
+                x_mm=self.mm_user_to_mm_firmware(w.x_mm, Axis.X),
+                y_mm=self.mm_user_to_mm_firmware(w.y_mm, Axis.Y),
+                z_mm=self.mm_user_to_mm_firmware(w.z_mm, Axis.Z),
+                speed_mm_s=w.speed_mm_s,
+                dwell_s=w.dwell_s,
+            )
+            for w in waypoints_user
+        ]
+
+        camera_mode = self._exp_camera_mode()
+        gantry_only = camera_mode == "gantry_only"
+
+        # In gantry-only mode, fisheye is bypassed entirely.
+        fisheye_args = None
         fisheye_calib = None
-        if not self._is_mock_camera and calib_path is not None:
-            try:
-                from fisheye_gantry_tagslam import load_fisheye_calibration
-                fisheye_calib = load_fisheye_calibration(calib_path)
-            except SystemExit as exc:
-                QMessageBox.warning(self, "Calibration error", str(exc))
-                return
-            except ImportError:
-                pass  # fisheye module optional
+        if not gantry_only:
+            # Load calibration from the active camera session (or skip for mock).
+            calib_path = (
+                self._camera.calib_path
+                if self._camera is not None and self._camera.calib_path is not None
+                else None
+            )
+            if not self._is_mock_camera and calib_path is not None:
+                try:
+                    from fisheye_gantry_tagslam import load_fisheye_calibration
+                    fisheye_calib = load_fisheye_calibration(calib_path)
+                except SystemExit as exc:
+                    QMessageBox.warning(self, "Calibration error", str(exc))
+                    return
+                except ImportError:
+                    pass  # fisheye module optional
+            fisheye_args = self._exp_build_fisheye_args()
 
         EMERGENCY_STOP.clear()
         self._abort_event.clear()
 
         run_name = self._exp_name_edit.text().strip()
-        fisheye_args = self._exp_build_fisheye_args()
 
+        # In gantry-only mode, do NOT pass the camera session — MotionWorker has
+        # no need for it and the fisheye worker is not started.
         config = ExperimentConfig(
             controller=self.controller,
             controller_lock=self._controller_lock,
-            waypoints=waypoints,
+            waypoints=waypoints_fw,
             soft_min_mm=list(self._soft_min_mm),
             soft_max_mm=list(self._soft_max_mm),
             move_mode=getattr(self, "_move_mode", "line"),
             countdown_s=self._exp_countdown_spin.value(),
             settle_s=self._exp_settle_spin.value(),
-            tag_detection_while_idle=self._exp_idle_detect_chk.isChecked(),
+            tag_detection_while_idle=(
+                self._exp_idle_detect_chk.isChecked() and not gantry_only
+            ),
             output_root=Path("data"),
             run_name=run_name,
             fisheye_args=fisheye_args,
             fisheye_calib=fisheye_calib,
             abort_event=self._abort_event,
-            mock_camera=self._is_mock_camera,
-            camera_session=self._camera,
+            mock_camera=(self._is_mock_camera and not gantry_only),
+            camera_session=(self._camera if not gantry_only else None),
         )
+        # Annotate the config with axis_sign + camera_mode for run_metadata.json.
+        config.camera_mode = camera_mode
+        config.axis_sign = {a.name: int(self._axis_sign[a]) for a in AXES}
+        config.waypoints_user_frame = [
+            {"x_mm": w.x_mm, "y_mm": w.y_mm, "z_mm": w.z_mm,
+             "speed_mm_s": w.speed_mm_s, "dwell_s": w.dwell_s}
+            for w in waypoints_user
+        ]
+        # Soft-limit metadata: written/readback units for every applied axis.
+        config.soft_limit_metadata = {
+            a.name: {
+                "panel_min_mm": self._soft_min_mm[int(a)],
+                "panel_max_mm": self._soft_max_mm[int(a)],
+                "written_units": list(self._soft_limit_written_units.get(a)) if self._soft_limit_written_units.get(a) is not None else None,
+                "readback_units": list(self._soft_limit_readback_units.get(a)) if self._soft_limit_readback_units.get(a) is not None else None,
+                "axis_sign": int(self._axis_sign[a]),
+                "sync_state": self._soft_limit_sync.get(a),
+                "enforcement": "panel+firmware",
+            }
+            for a in AXES
+        }
         self._experiment_in_progress = True
         self._exp_start_btn.setEnabled(False)
         self._exp_stop_btn.setEnabled(True)
@@ -3724,8 +4108,9 @@ class GantryPanel(QMainWindow):
         now = time.monotonic()
         pos_units = [float(status.realPos[i]) for i in range(3)]
         vel_units = [float(status.realSpeed[i]) for i in range(3)]
-        pos_mm = [units_to_mm(pos_units[i], AXES[i]) for i in range(3)]
-        vel_mm = [units_to_mm(vel_units[i], AXES[i]) for i in range(3)]
+        # Apply axis_sign at display: firmware-frame mm × sign = user-facing mm.
+        pos_mm = [self.units_to_mm_user(pos_units[i], AXES[i]) for i in range(3)]
+        vel_mm = [self.units_to_mm_user(vel_units[i], AXES[i]) for i in range(3)]
 
         # Acceleration: SMA-smoothed central difference over 5 samples.
         self._vel_buffer.append((now, tuple(vel_mm)))
@@ -3744,6 +4129,12 @@ class GantryPanel(QMainWindow):
         self._last_snapshot_t = now
         self._last_pos_mm = tuple(pos_mm)
         self._last_pos_units = tuple(pos_units)
+
+        # Live soft-limit watchdog — fires stop_axis the moment a user-frame
+        # position crosses the configured envelope, regardless of which motion
+        # primitive issued the move. Skipped during homing (it intentionally
+        # drives toward an end-stop) and when E-Stop is already in flight.
+        self._enforce_live_soft_limits(pos_mm)
 
         # Update per-axis Control card readouts (home-relative when home is set).
         for i, axis in enumerate(AXES):
@@ -3781,6 +4172,62 @@ class GantryPanel(QMainWindow):
             # Keep the home marker visible/updated even when no home is set.
             home_xyz = tuple(self._home_position_mm[a] for a in AXES)
             self.workspace_map.update_home(home_xyz)
+
+    def _enforce_live_soft_limits(self, pos_mm: list[float]) -> None:
+        """Per-tick watchdog. If a user-frame position is outside the panel's
+        configured soft-limit envelope, fire stop_axis(axis, mode=2) once
+        per axis and latch a breach flag so we don't re-stop every 100 ms
+        while the axis decelerates.
+
+        Skipped during homing (it intentionally seeks an end-stop) and when
+        E-Stop is already in flight.
+        """
+        # Don't override active homing — it deliberately drives toward a switch.
+        if self._homing_in_progress or EMERGENCY_STOP.is_set():
+            return
+        for i, axis in enumerate(AXES):
+            lo = self._soft_min_mm[i]
+            hi = self._soft_max_mm[i]
+            if lo is None and hi is None:
+                continue
+            pos = pos_mm[i]
+            outside = (lo is not None and pos < lo) or (hi is not None and pos > hi)
+            if outside:
+                if self._soft_limit_breached[axis]:
+                    # Already issued stop; wait until pos comes back inside.
+                    continue
+                self._soft_limit_breached[axis] = True
+                # Convert firmware-frame stop. stop_axis is axis-local and
+                # doesn't depend on user-frame direction.
+                try:
+                    with self._controller_lock:
+                        self.controller.stop_axis(axis, mode=2)
+                except FMC4030Error as exc:
+                    print(f"[soft-limit-watchdog] stop_axis({axis.name}) "
+                          f"failed: {exc}", file=sys.stderr)
+                except Exception as exc:
+                    print(f"[soft-limit-watchdog] unexpected: {exc}",
+                          file=sys.stderr)
+                # Surface the breach to the user. Status bar + console; we
+                # don't pop a modal because the watchdog runs on every tick.
+                lo_s = f"{lo:+.2f}" if lo is not None else "—"
+                hi_s = f"{hi:+.2f}" if hi is not None else "—"
+                msg = (
+                    f"Soft limit (live): {axis.name}={pos:+.2f} mm outside "
+                    f"[{lo_s}, {hi_s}] — stop_axis fired."
+                )
+                self.sb_op_label.setText(msg)
+                self.sb_op_label.setStyleSheet("color: #ef5350; font-weight: bold;")
+                print(f"[soft-limit-watchdog] {msg}", file=sys.stderr)
+                # Cancel any in-flight motion intents that would otherwise
+                # try to continue once the axis decelerates.
+                self._abort_event.set()
+            else:
+                # Auto-clear the latch once pos is back inside the envelope.
+                if self._soft_limit_breached[axis]:
+                    self._soft_limit_breached[axis] = False
+                    print(f"[soft-limit-watchdog] {axis.name} back inside "
+                          f"limits; latch cleared.", file=sys.stderr)
 
     def _on_status_error(self, msg: str) -> None:
         # Special hint for the common 664 ("machine status unavailable")
@@ -3844,7 +4291,14 @@ class GantryPanel(QMainWindow):
     # Soft limits
     # ------------------------------------------------------------------
     def _snap_soft_limit_spin(self, spin: "QDoubleSpinBox", axis: "Axis") -> None:
-        """Snap spinbox to nearest controller unit boundary so what-you-see = what-you-get."""
+        """Snap spinbox to nearest controller unit boundary so what-you-see = what-you-get.
+        Only snaps when the optional 'Snap to unit grid' checkbox is enabled.
+        Axis-sign flips the firmware grid relative to user mm, but since
+        SCALE_MM_PER_UNIT is symmetric and rounding is symmetric across zero,
+        snapping is identical with or without the sign — we compute against
+        user-facing mm directly."""
+        if getattr(self, "snap_grid_chk", None) is not None and not self.snap_grid_chk.isChecked():
+            return
         val = spin.value()
         snapped = units_to_mm(int(round(mm_to_units(val, axis))), axis)
         if abs(snapped - val) > 0.001:
@@ -3899,14 +4353,26 @@ class GantryPanel(QMainWindow):
             return
         if self._soft_limit_busy:
             return
+        # Convert user-facing mm → firmware units via axis_sign, then ensure
+        # firmware-frame min ≤ max (axis_sign == -1 swaps the two).
+        # Also remember the user-typed mm so the readback indicator can show
+        # whether mm-quantization changed the effective limit.
         updates: dict[int, tuple[int, int]] = {}
+        written_per_axis: dict[Axis, tuple[int, int]] = {}
+        typed_user_mm_per_axis: dict[Axis, tuple[float, float]] = {}
         for axis in axes:
             sp = self.soft_limit_spins[axis]
-            mn_mm = sp["min"].value()
-            mx_mm = sp["max"].value()
-            mn_units = int(round(mm_to_units(mn_mm, axis)))
-            mx_units = int(round(mm_to_units(mx_mm, axis)))
-            updates[int(axis)] = (mn_units, mx_units)
+            mn_mm_user = sp["min"].value()
+            mx_mm_user = sp["max"].value()
+            mn_units_fw = int(round(self.mm_user_to_units(mn_mm_user, axis)))
+            mx_units_fw = int(round(self.mm_user_to_units(mx_mm_user, axis)))
+            lo_fw = min(mn_units_fw, mx_units_fw)
+            hi_fw = max(mn_units_fw, mx_units_fw)
+            updates[int(axis)] = (lo_fw, hi_fw)
+            written_per_axis[axis] = (lo_fw, hi_fw)
+            typed_user_mm_per_axis[axis] = (mn_mm_user, mx_mm_user)
+        self._soft_limit_pending_written = written_per_axis
+        self._soft_limit_pending_typed_mm = typed_user_mm_per_axis
         self._soft_limit_busy = True
         self.sb_op_label.setText("Applying soft limits…")
         t = SoftLimitThread(self.controller, self._controller_lock,
@@ -3920,39 +4386,90 @@ class GantryPanel(QMainWindow):
     def _on_soft_limits_result(self, params, msg: str) -> None:
         self._soft_limit_busy = False
         self._update_all_button_states()
+        # axis_sign[axis] swaps firmware-frame min/max when displayed to the user.
+        # Per-axis: read firmware units, convert to firmware-frame mm, then flip
+        # sign for user display; if sign==-1, the user's "min" is firmware "max".
+        pending = getattr(self, "_soft_limit_pending_written", {}) or {}
+        rounding_axes: list[str] = []
         for i, axis in enumerate(AXES):
-            lo_units = float(params.soft_limit_min[i])
-            hi_units = float(params.soft_limit_max[i])
-            if lo_units == 0.0 and hi_units == 0.0:
-                lo_mm = hi_mm = None
+            lo_units_fw = int(round(float(params.soft_limit_min[i])))
+            hi_units_fw = int(round(float(params.soft_limit_max[i])))
+            if lo_units_fw == 0 and hi_units_fw == 0:
+                lo_mm_user = hi_mm_user = None
             else:
-                lo_mm = units_to_mm(lo_units, axis)
-                hi_mm = units_to_mm(hi_units, axis)
-            self._soft_min_mm[i] = lo_mm
-            self._soft_max_mm[i] = hi_mm
+                # Firmware-frame mm → user mm via sign.
+                a_mm = self.units_to_mm_user(lo_units_fw, axis)
+                b_mm = self.units_to_mm_user(hi_units_fw, axis)
+                lo_mm_user = min(a_mm, b_mm)
+                hi_mm_user = max(a_mm, b_mm)
+            self._soft_min_mm[i] = lo_mm_user
+            self._soft_max_mm[i] = hi_mm_user
             sp = self.soft_limit_spins[axis]
             sp["min"].blockSignals(True)
             sp["max"].blockSignals(True)
-            sp["min"].setValue(lo_mm if lo_mm is not None else 0.0)
-            sp["max"].setValue(hi_mm if hi_mm is not None else 0.0)
+            sp["min"].setValue(lo_mm_user if lo_mm_user is not None else 0.0)
+            sp["max"].setValue(hi_mm_user if hi_mm_user is not None else 0.0)
             sp["min"].blockSignals(False)
             sp["max"].blockSignals(False)
             # Clamp BOTH the combined Move-to-Target spinbox AND the per-axis
-            # card's Move Abs spinbox to the loaded range.
+            # card's Move Abs spinbox to the loaded user-frame range.
             for target_sp in (self.target_spins[axis],
                               self.per_axis_cards.get(axis, {}).get("target_spin")):
                 if target_sp is None:
                     continue
-                if lo_mm is not None and hi_mm is not None and hi_mm > lo_mm:
-                    target_sp.setRange(lo_mm, hi_mm)
+                if lo_mm_user is not None and hi_mm_user is not None and hi_mm_user > lo_mm_user:
+                    target_sp.setRange(lo_mm_user, hi_mm_user)
                 else:
                     target_sp.setRange(-100000.0, 100000.0)
-        # Refresh map's drawn soft-limit bounding box.
+            # Readback compare → indicator state. Two conditions trigger
+            # "rounding":
+            #   (a) firmware-stored units differ from what we wrote (≥1 unit),
+            #       which would be a firmware glitch — should be near-zero.
+            #   (b) the USER-TYPED mm differs from the effective firmware mm
+            #       by more than 0.5 unit (rounding to the nearest unit grid).
+            # Otherwise → "synced".
+            written = pending.get(axis)
+            readback = (lo_units_fw, hi_units_fw)
+            typed_pending = (getattr(self, "_soft_limit_pending_typed_mm", {}) or {}).get(axis)
+            if written is not None:
+                fw_glitch = (abs(written[0] - readback[0]) >= 1
+                             or abs(written[1] - readback[1]) >= 1)
+                mm_quantized = False
+                if typed_pending is not None:
+                    # User-frame mm that the firmware quantization effectively
+                    # produced (post round-trip): readback_units → user mm.
+                    eff_min_user = self.units_to_mm_user(readback[0], axis)
+                    eff_max_user = self.units_to_mm_user(readback[1], axis)
+                    eff_lo_user, eff_hi_user = sorted((eff_min_user, eff_max_user))
+                    typed_lo_user, typed_hi_user = sorted(typed_pending)
+                    # Tight tolerance: any user-mm divergence above 1 µm means
+                    # the user typed a value that didn't land exactly on the
+                    # firmware unit grid. The tooltip explains the gap.
+                    tol_mm = 0.001
+                    mm_quantized = (
+                        abs(typed_lo_user - eff_lo_user) > tol_mm
+                        or abs(typed_hi_user - eff_hi_user) > tol_mm
+                    )
+                if fw_glitch or mm_quantized:
+                    self._set_soft_limit_indicator(axis, "rounding", written, readback)
+                    rounding_axes.append(axis.name)
+                else:
+                    self._set_soft_limit_indicator(axis, "synced", written, readback)
+            self._update_soft_limit_resolution_hint(axis)
+        # Clear the pending caches after consumption.
+        self._soft_limit_pending_written = {}
+        self._soft_limit_pending_typed_mm = {}
+        # Refresh map's drawn soft-limit bounding box (user-frame mm).
         if getattr(self, "workspace_map", None) is not None:
             self.workspace_map.update_soft_limits(
                 tuple(self._soft_min_mm), tuple(self._soft_max_mm),
             )
-        self.sb_op_label.setText(msg)
+        if rounding_axes:
+            self.sb_op_label.setText(
+                f"{msg} — rounding on {', '.join(rounding_axes)} (see Sync tooltip)"
+            )
+        else:
+            self.sb_op_label.setText(msg)
 
     def _on_soft_limits_error(self, msg: str) -> None:
         self._soft_limit_busy = False
@@ -4036,7 +4553,7 @@ class GantryPanel(QMainWindow):
                 try:
                     with self._controller_lock:
                         u = float(self.controller.get_axis_position(axis))
-                    captured[i] = units_to_mm(u, axis)
+                    captured[i] = self.units_to_mm_user(u, axis)
                 except Exception as exc:
                     errors.append(f"{axis.name}: {exc}")
             if not any(c is not None for c in captured):
@@ -4167,19 +4684,25 @@ class GantryPanel(QMainWindow):
             return
         if self._blocked_by_estop():
             return
-        target_mm = (
+        target_mm_user = (
             self.target_spins[Axis.X].value(),
             self.target_spins[Axis.Y].value(),
             self.target_spins[Axis.Z].value(),
         )
-        # Soft-limit guard.
-        wp = Waypoint(target_mm[0], target_mm[1], target_mm[2],
-                      self.move_speed_spin.value() * 10.0, 0.0)  # cm/s → mm/s for soft-limit check
+        # Soft-limit guard — panel-side, user-frame mm, BEFORE the SDK call.
+        wp_user = Waypoint(target_mm_user[0], target_mm_user[1], target_mm_user[2],
+                           self.move_speed_spin.value() * 10.0, 0.0)
         try:
-            _validate_soft_limits([wp], self._soft_min_mm, self._soft_max_mm)
+            _validate_soft_limits([wp_user], self._soft_min_mm, self._soft_max_mm)
         except SystemExit as exc:
-            QMessageBox.warning(self, "Soft limit violation", str(exc))
+            QMessageBox.warning(self, "Soft limit violation (panel-side)", str(exc))
             return
+
+        # Convert user mm → firmware-frame mm (sign flip) for move_to_xyz_mm,
+        # which internally uses mm_to_units(...) per axis without any sign.
+        target_mm_fw = tuple(
+            self.mm_user_to_mm_firmware(target_mm_user[i], AXES[i]) for i in range(3)
+        )
 
         EMERGENCY_STOP.clear()
         self._abort_event.clear()
@@ -4189,12 +4712,13 @@ class GantryPanel(QMainWindow):
         self.move_btn.setText("Moving…")
         self.cancel_move_btn.setEnabled(True)
         self.sb_op_label.setText(
-            f"Moving to ({target_mm[0]:+.2f}, {target_mm[1]:+.2f}, {target_mm[2]:+.2f}) mm"
+            f"Moving to ({target_mm_user[0]:+.2f}, {target_mm_user[1]:+.2f}, "
+            f"{target_mm_user[2]:+.2f}) mm"
         )
         if getattr(self, "workspace_map", None) is not None:
-            self.workspace_map.update_target(*target_mm)
+            self.workspace_map.update_target(*target_mm_user)
         self._move_thread = MoveToTargetThread(
-            self.controller, target_mm,
+            self.controller, target_mm_fw,
             self.move_speed_spin.value() * 10.0,   # cm/s → mm/s
             self.move_acc_spin.value() * 10.0,
             self.move_dec_spin.value() * 10.0,
@@ -4248,6 +4772,35 @@ class GantryPanel(QMainWindow):
             return
         if self._blocked_by_estop():
             return
+        # Software soft-limit projection: refuse if a ~100 ms forward projection
+        # at the requested jog speed would exit the configured limits. This
+        # runs even if the firmware soft limit is wrong or unset.
+        lo_user = self._soft_min_mm[int(axis)]
+        hi_user = self._soft_max_mm[int(axis)]
+        cur_pos_user = None
+        snap = getattr(self, "_last_pos_mm", None)
+        if snap is not None:
+            # _last_pos_mm is cached in user-frame mm (see _on_status_snapshot).
+            cur_pos_user = float(snap[int(axis)])
+        if cur_pos_user is not None and (lo_user is not None or hi_user is not None):
+            jog_mm_s = self.jog_speed_spin.value() * 10.0
+            projection = cur_pos_user + direction * jog_mm_s * 0.10
+            if lo_user is not None and projection < lo_user:
+                QMessageBox.warning(
+                    self, "Soft limit (panel-side)",
+                    f"{axis.name}: projecting position {cur_pos_user:+.2f} mm + "
+                    f"{direction * jog_mm_s * 0.10:+.2f} mm = {projection:+.2f} mm "
+                    f"would exit min {lo_user:+.2f} mm. Jog refused.",
+                )
+                return
+            if hi_user is not None and projection > hi_user:
+                QMessageBox.warning(
+                    self, "Soft limit (panel-side)",
+                    f"{axis.name}: projecting position {cur_pos_user:+.2f} mm + "
+                    f"{direction * jog_mm_s * 0.10:+.2f} mm = {projection:+.2f} mm "
+                    f"would exit max {hi_user:+.2f} mm. Jog refused.",
+                )
+                return
         EMERGENCY_STOP.clear()
         self._abort_event.clear()
         self._ensure_logger_started(auto=True)
@@ -4255,12 +4808,15 @@ class GantryPanel(QMainWindow):
         speed_units = max(cm_s_to_units_s(self.jog_speed_spin.value(), axis), 0.001)
         acc_units   = max(cm_s2_to_units_s2(self.jog_acc_spin.value(), axis), 0.001)
         dec_units   = max(cm_s2_to_units_s2(self.jog_dec_spin.value(), axis), 0.001)
-        # 999999 * direction = "jog until release" sentinel, same as manual_pad.
+        # 999999 * fw_direction = "jog until release" sentinel, same as manual_pad.
+        # fw_direction inverts when axis_sign[axis] == -1 so the panel button's
+        # user-facing +/- agrees with what the user expects.
+        fw_direction = self.jog_direction_user_to_firmware(direction, axis)
         try:
             with self._controller_lock:
                 self.controller.jog_single_axis(
                     axis,
-                    position_units=999999.0 * direction,
+                    position_units=999999.0 * fw_direction,
                     speed_units=speed_units,
                     acc_units=acc_units,
                     dec_units=dec_units,
@@ -4281,6 +4837,37 @@ class GantryPanel(QMainWindow):
         # Tail-stop the auto logger after the ringdown.
         QTimer.singleShot(500, self._stop_logger_if_auto)
 
+    def _go_to_home_axis(self, axis: Axis) -> None:
+        """Per-axis 'Go Home' button: move-abs to the captured home reference.
+
+        Distinct from physical-limit-switch homing (Setup tab → Homing → Home X).
+        Uses the same machinery as Move Abs, so soft-limit + axis-sign + the
+        live watchdog all apply unchanged.
+        """
+        if not self.connected:
+            QMessageBox.warning(self, "Not connected", "Connect first.")
+            return
+        home_user = self._home_position_mm.get(axis)
+        if home_user is None:
+            QMessageBox.warning(
+                self,
+                "No home reference",
+                f"{axis.name} has no home reference yet.\n\n"
+                "Set one via Setup → Homing → 'Set Current as Home Reference' "
+                f"(captures current XYZ, no motion), or run Setup → Homing → "
+                f"'Home {axis.name}' to drive {axis.name} to its physical limit "
+                "switch first (that auto-captures the reference).",
+            )
+            return
+        # Populate the per-axis card's target spin so the user sees what's
+        # commanded, then call the existing move-abs path. _move_axis_abs
+        # handles soft-limit checks, sign flip, lock, abort_event, button
+        # state, and finished signal.
+        spin = self.per_axis_cards.get(axis, {}).get("target_spin")
+        if spin is not None:
+            spin.setValue(float(home_user))
+        self._move_axis_abs(axis)
+
     def _move_axis_abs(self, axis: Axis) -> None:
         if not self.connected:
             QMessageBox.warning(self, "Not connected", "Connect first.")
@@ -4290,16 +4877,17 @@ class GantryPanel(QMainWindow):
             return
         if self._blocked_by_estop():
             return
-        target_mm = self.per_axis_cards[axis]["target_spin"].value()
+        # User-facing mm target.
+        target_mm_user = self.per_axis_cards[axis]["target_spin"].value()
         lo = self._soft_min_mm[int(axis)]
         hi = self._soft_max_mm[int(axis)]
-        if lo is not None and target_mm < lo:
-            QMessageBox.warning(self, "Soft limit",
-                                f"{axis.name}={target_mm:.3f} mm < min {lo:.3f} mm")
+        if lo is not None and target_mm_user < lo:
+            QMessageBox.warning(self, "Soft limit (panel-side)",
+                                f"{axis.name}={target_mm_user:.3f} mm < min {lo:.3f} mm")
             return
-        if hi is not None and target_mm > hi:
-            QMessageBox.warning(self, "Soft limit",
-                                f"{axis.name}={target_mm:.3f} mm > max {hi:.3f} mm")
+        if hi is not None and target_mm_user > hi:
+            QMessageBox.warning(self, "Soft limit (panel-side)",
+                                f"{axis.name}={target_mm_user:.3f} mm > max {hi:.3f} mm")
             return
 
         EMERGENCY_STOP.clear()
@@ -4314,20 +4902,20 @@ class GantryPanel(QMainWindow):
         info = self.per_axis_cards[axis]
         info["move_btn"].setEnabled(False)
         info["move_btn"].setText("Moving…")
-        self.sb_op_label.setText(f"Moving {axis.name} → {target_mm:+.3f} mm")
+        self.sb_op_label.setText(f"Moving {axis.name} → {target_mm_user:+.3f} mm")
         self._update_all_button_states()
 
-        # Show target on the workspace map (the other two axes keep their
-        # current position so the marker lands at the actual destination).
+        # Show target on the workspace map (user-frame mm; the other two axes
+        # keep their current position so the marker lands at the actual destination).
         if getattr(self, "workspace_map", None) is not None and self.workspace_map is not None:
             cur = self.workspace_map._cur_pos or (0.0, 0.0, 0.0)
             full_target = list(cur)
-            full_target[int(axis)] = target_mm
+            full_target[int(axis)] = target_mm_user
             self.workspace_map.update_target(*full_target)
 
         thread = AxisAbsMoveThread(
             self.controller, axis,
-            target_units=mm_to_units(target_mm, axis),
+            target_units=self.mm_user_to_units(target_mm_user, axis),
             speed_units=speed_units,
             acc_units=acc_units,
             dec_units=dec_units,
@@ -4463,18 +5051,30 @@ class GantryPanel(QMainWindow):
         if self._blocked_by_estop():
             return
         try:
-            waypoints = self._collect_waypoints()
+            waypoints_user = self._collect_waypoints()
         except SystemExit as exc:
             QMessageBox.warning(self, "Bad waypoints", str(exc))
             return
-        if not waypoints:
+        if not waypoints_user:
             QMessageBox.information(self, "No waypoints", "Add at least one row first.")
             return
         try:
-            _validate_soft_limits(waypoints, self._soft_min_mm, self._soft_max_mm)
+            _validate_soft_limits(waypoints_user, self._soft_min_mm, self._soft_max_mm)
         except SystemExit as exc:
-            QMessageBox.warning(self, "Soft limit violation", str(exc))
+            QMessageBox.warning(self, "Soft limit violation (panel-side)", str(exc))
             return
+
+        # Convert user-frame waypoints to firmware-frame for SequenceThread.
+        waypoints_fw = [
+            Waypoint(
+                x_mm=self.mm_user_to_mm_firmware(w.x_mm, Axis.X),
+                y_mm=self.mm_user_to_mm_firmware(w.y_mm, Axis.Y),
+                z_mm=self.mm_user_to_mm_firmware(w.z_mm, Axis.Z),
+                speed_mm_s=w.speed_mm_s,
+                dwell_s=w.dwell_s,
+            )
+            for w in waypoints_user
+        ]
 
         EMERGENCY_STOP.clear()
         self._abort_event.clear()
@@ -4484,7 +5084,7 @@ class GantryPanel(QMainWindow):
         self.run_seq_btn.setEnabled(False)
         self.stop_seq_btn.setEnabled(True)
         self._sequence_thread = SequenceThread(
-            self.controller, waypoints,
+            self.controller, waypoints_fw,
             self.move_acc_spin.value(), self.move_dec_spin.value(),
             self.move_mode_combo.currentData(),
             self._controller_lock, logger=self._logger,

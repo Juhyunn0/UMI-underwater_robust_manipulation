@@ -75,8 +75,8 @@ class _FisheyeGrabThread(QThread):
     def run(self) -> None:  # type: ignore[override]
         try:
             import cv2
-        except ImportError:
-            self.error_occurred.emit("OpenCV (cv2) is not installed")
+        except ImportError as exc:
+            self.error_occurred.emit(f"OpenCV (cv2) import failed: {exc}")
             return
 
         try:
