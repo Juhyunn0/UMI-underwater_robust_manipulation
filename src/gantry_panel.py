@@ -2365,6 +2365,7 @@ class GantryPanel(QMainWindow):
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
             scroll.setWidget(holder)
             return scroll
 
@@ -2576,6 +2577,13 @@ class GantryPanel(QMainWindow):
             mx.setDecimals(2)
             mx.setValue(0.0)
             _size_mm_spinbox(mx)
+            step_mm = units_to_mm(1, axis)
+            _sl_tip = (f"Resolution: {step_mm:.4g} mm/unit. "
+                       f"Values snap to the nearest {step_mm:.4g} mm step (hardware limit).")
+            mn.setToolTip(_sl_tip)
+            mx.setToolTip(_sl_tip)
+            mn.editingFinished.connect(partial(self._snap_soft_limit_spin, mn, axis))
+            mx.editingFinished.connect(partial(self._snap_soft_limit_spin, mx, axis))
             apply_btn = QPushButton(f"Apply {axis.name}")
             _size_button(apply_btn)
             apply_btn.clicked.connect(partial(self._apply_soft_limits_axis, axis))
@@ -2720,11 +2728,11 @@ class GantryPanel(QMainWindow):
         frame = SectionFrame("Per-Axis Control  (mm)")
         v = QVBoxLayout(frame.content())
         v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(10)
+        v.setSpacing(6)
 
         # Shared jog/move parameter row.
         params_row = QHBoxLayout()
-        params_row.addWidget(QLabel("Jog/Move Speed (cm/s)"))
+        params_row.addWidget(QLabel("Speed (cm/s)"))
         self.jog_speed_spin = QDoubleSpinBox()
         self.jog_speed_spin.setRange(0.10, 200.00)
         self.jog_speed_spin.setDecimals(2)
@@ -2734,13 +2742,13 @@ class GantryPanel(QMainWindow):
         _cy = cm_s_to_units_s(10.0, Axis.Y)
         _cz = cm_s_to_units_s(10.0, Axis.Z)
         self.jog_speed_spin.setToolTip(
-            f"Internally: X={_cx:.2f} units/s, Y={_cy:.2f} units/s, Z={_cz:.2f} units/s.\n"
+            f"Jog/Move speed.\nInternally: X={_cx:.2f} units/s, Y={_cy:.2f} units/s, Z={_cz:.2f} units/s.\n"
             "Calibration: SCALE_MM_PER_UNIT from gantry_runner.py (X=8.25, Y=2.5, Z=0.5 mm/unit)."
         )
         params_row.addWidget(self.jog_speed_spin)
 
-        params_row.addSpacing(12)
-        params_row.addWidget(QLabel("Accel (cm/s²)"))
+        params_row.addSpacing(8)
+        params_row.addWidget(QLabel("Acc (cm/s²)"))
         self.jog_acc_spin = QDoubleSpinBox()
         self.jog_acc_spin.setRange(0.10, 500.00)
         self.jog_acc_spin.setDecimals(2)
@@ -2748,8 +2756,8 @@ class GantryPanel(QMainWindow):
         self.jog_acc_spin.setValue(5.0)
         params_row.addWidget(self.jog_acc_spin)
 
-        params_row.addSpacing(12)
-        params_row.addWidget(QLabel("Decel (cm/s²)"))
+        params_row.addSpacing(8)
+        params_row.addWidget(QLabel("Dec (cm/s²)"))
         self.jog_dec_spin = QDoubleSpinBox()
         self.jog_dec_spin.setRange(0.10, 500.00)
         self.jog_dec_spin.setDecimals(2)
@@ -2757,17 +2765,15 @@ class GantryPanel(QMainWindow):
         self.jog_dec_spin.setValue(5.0)
         params_row.addWidget(self.jog_dec_spin)
         params_row.addStretch()
-        self.refresh_btn = QPushButton("🔄 Refresh Position")
+        self.refresh_btn = QPushButton("🔄 Refresh")
         _size_button(self.refresh_btn)
+        self.refresh_btn.setToolTip("Refresh position readout from controller")
         self.refresh_btn.clicked.connect(self._refresh_position)
         self.refresh_btn.setEnabled(False)
         params_row.addWidget(self.refresh_btn)
         v.addLayout(params_row)
 
-        # Ensure spinboxes are wide enough for the largest expected value.
         for spin in (self.jog_speed_spin, self.jog_acc_spin, self.jog_dec_spin):
-            fm = QtGui.QFontMetrics(spin.font())
-            spin.setMinimumWidth(fm.horizontalAdvance("9999.99") + 32)
             spin.setMinimumHeight(28)
 
         # Three cards side-by-side.
@@ -2783,40 +2789,41 @@ class GantryPanel(QMainWindow):
         card.setObjectName("AxisCard")
         card.setFrameShape(QFrame.NoFrame)
         v = QVBoxLayout(card)
-        v.setContentsMargins(10, 10, 10, 10)
-        v.setSpacing(6)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(4)
 
-        # Axis letter.
+        # Row 1: axis letter + position readout side by side.
+        header_row = QHBoxLayout()
+        header_row.setSpacing(6)
         letter = QLabel(axis.name)
-        letter.setObjectName("axis-letter")
-        letter.setAlignment(Qt.AlignCenter)
-        v.addWidget(letter)
-
-        # Position readout — shows home-relative mm when a home is set.
+        letter.setStyleSheet("font-size: 16px; font-weight: 700; color: #4ea1ff;")
+        letter.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        header_row.addWidget(letter)
         pos_mm = QLabel("--")
         pos_mm.setObjectName("PositionReadout")
-        pos_mm.setMinimumHeight(48)
         _fit_label(pos_mm, "-9999.999")
-        v.addWidget(pos_mm)
+        header_row.addWidget(pos_mm, stretch=1)
+        v.addLayout(header_row)
 
+        # Row 2: home status + velocity on one line.
+        info_row = QHBoxLayout()
+        info_row.setSpacing(4)
         home_label = QLabel("⚠ no home")
         home_label.setStyleSheet("color: #ffa726; font-size: 11px;")
-        home_label.setAlignment(Qt.AlignCenter)
-        v.addWidget(home_label)
-
-        # Velocity.
+        info_row.addWidget(home_label)
+        info_row.addStretch()
         vel = QLabel("Vel: -- cm/s")
         vel.setStyleSheet("color: #aaa; font-size: 11px;")
         _fit_label(vel, "Vel: -9999.99 cm/s")
-        v.addWidget(vel)
+        info_row.addWidget(vel)
+        v.addLayout(info_row)
 
-        # Jog row (hold to jog).
+        # Row 3: hold-to-jog buttons.
         jog_row = QHBoxLayout()
-        jog_row.setSpacing(8)
+        jog_row.setSpacing(6)
         btn_pos = QPushButton(f"{axis.name}+")
         btn_neg = QPushButton(f"{axis.name}-")
         for jb in (btn_pos, btn_neg):
-            _size_button(jb)
             jb.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         btn_pos.setToolTip(f"Hold to jog {axis.name} in the positive direction")
         btn_neg.setToolTip(f"Hold to jog {axis.name} in the negative direction")
@@ -2828,33 +2835,27 @@ class GantryPanel(QMainWindow):
         jog_row.addWidget(btn_neg)
         v.addLayout(jog_row)
 
-        # Absolute move row.
-        abs_row = QHBoxLayout()
-        abs_row.setSpacing(8)
+        # Row 4: abs-move spinbox + Move + Home on one line.
+        bottom_row = QHBoxLayout()
+        bottom_row.setSpacing(6)
         target_spin = QDoubleSpinBox()
         target_spin.setRange(-100000.0, 100000.0)
         target_spin.setDecimals(3)
         target_spin.setValue(0.0)
-        _size_mm_spinbox(target_spin)
-        abs_row.addWidget(target_spin, stretch=1)
-        move_btn = QPushButton("Move Abs")
-        _size_button(move_btn)
+        target_spin.setMinimumHeight(28)
+        bottom_row.addWidget(target_spin, stretch=1)
+        move_btn = QPushButton("Move")
         move_btn.clicked.connect(partial(self._move_axis_abs, axis))
-        abs_row.addWidget(move_btn)
-        v.addLayout(abs_row)
-
-        # Per-axis Home button — reuses the existing _home_single() entry point
-        # which spawns the same HomingThread the Homing group uses, consuming
-        # the shared home_speed_spin / home_acc_spin / home_fall_spin /
-        # home_dir_combo values.
-        home_btn = QPushButton(f"Home {axis.name}")
-        _size_button(home_btn)
+        bottom_row.addWidget(move_btn)
+        home_btn = QPushButton("Home")
+        home_btn.setToolTip(f"Home {axis.name} axis")
         ic = _icon("fa5s.home")
         if ic is not None:
             home_btn.setIcon(ic)
             home_btn.setObjectName("IconButton")
         home_btn.clicked.connect(partial(self._home_single, axis))
-        v.addWidget(home_btn)
+        bottom_row.addWidget(home_btn)
+        v.addLayout(bottom_row)
 
         self.per_axis_cards[axis] = {
             "card": card,
@@ -2885,10 +2886,6 @@ class GantryPanel(QMainWindow):
             sp.setDecimals(3)
             sp.setValue(0.0)
             _size_mm_spinbox(sp)
-            sp.setMinimumHeight(36)
-            f = QFont()
-            f.setPointSize(13)
-            sp.setFont(f)
             grid.addWidget(sp, 1, col)
             self.target_spins[axis] = sp
 
@@ -3846,6 +3843,15 @@ class GantryPanel(QMainWindow):
     # ------------------------------------------------------------------
     # Soft limits
     # ------------------------------------------------------------------
+    def _snap_soft_limit_spin(self, spin: "QDoubleSpinBox", axis: "Axis") -> None:
+        """Snap spinbox to nearest controller unit boundary so what-you-see = what-you-get."""
+        val = spin.value()
+        snapped = units_to_mm(int(round(mm_to_units(val, axis))), axis)
+        if abs(snapped - val) > 0.001:
+            spin.blockSignals(True)
+            spin.setValue(snapped)
+            spin.blockSignals(False)
+
     def _load_soft_limits(self) -> None:
         if not self.connected:
             QMessageBox.warning(self, "Not connected", "Connect first.")
@@ -3913,6 +3919,7 @@ class GantryPanel(QMainWindow):
 
     def _on_soft_limits_result(self, params, msg: str) -> None:
         self._soft_limit_busy = False
+        self._update_all_button_states()
         for i, axis in enumerate(AXES):
             lo_units = float(params.soft_limit_min[i])
             hi_units = float(params.soft_limit_max[i])
@@ -3949,6 +3956,7 @@ class GantryPanel(QMainWindow):
 
     def _on_soft_limits_error(self, msg: str) -> None:
         self._soft_limit_busy = False
+        self._update_all_button_states()
         QMessageBox.critical(self, "Soft limit error", msg)
         self.sb_op_label.setText("Soft limit error")
 
@@ -4779,10 +4787,10 @@ class GantryPanel(QMainWindow):
         # and (for motion) not busy.
         for axis in AXES:
             self.home_btns[axis].setEnabled(connected and not busy)
-            self.soft_limit_spins[axis]["apply_btn"].setEnabled(connected and not self._soft_limit_busy)
+            self.soft_limit_spins[axis]["apply_btn"].setEnabled(not self._soft_limit_busy)
         self.home_all_btn.setEnabled(connected and not busy)
-        self.load_limits_btn.setEnabled(connected and not self._soft_limit_busy)
-        self.apply_all_limits_btn.setEnabled(connected and not self._soft_limit_busy)
+        self.load_limits_btn.setEnabled(not self._soft_limit_busy)
+        self.apply_all_limits_btn.setEnabled(not self._soft_limit_busy)
         self.move_btn.setEnabled(connected and not busy)
         self.use_current_btn.setEnabled(connected)
         self.run_seq_btn.setEnabled(connected and not busy)
