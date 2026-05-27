@@ -44,7 +44,6 @@ from gantry_runner import (
     AXES,
     GantryTelemetryLogger,
     Waypoint,
-    _validate_soft_limits,
     move_to_xyz_mm,
 )
 from gantry import Axis, FMC4030Error
@@ -111,8 +110,9 @@ class ExperimentConfig:
     # Snapshot of user-frame waypoints AT START — preserves the values the user
     # actually entered (waypoints field above is firmware-frame for the SDK).
     waypoints_user_frame: list | None = None
-    # Soft-limit panel metadata: per-axis written/readback units + sync state.
-    soft_limit_metadata: dict | None = None
+    # Per-axis absolute-mm home reference at experiment start. Lets post-hoc
+    # analysis reproduce user-frame coordinates without ambiguity.
+    home_reference_abs_mm: dict | None = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -703,7 +703,7 @@ class PostprocessThread(QThread):
                 "run_name": config.run_name or run_dir.name,
                 "camera_mode": getattr(config, "camera_mode", "fisheye"),
                 "axis_sign": getattr(config, "axis_sign", None),
-                "soft_limits": getattr(config, "soft_limit_metadata", None),
+                "home_reference_abs_mm": getattr(config, "home_reference_abs_mm", None),
                 "outputs": {k: v for k, v in result.items() if k not in ("run_dir", "aborted")},
             }
             if not gantry_only:

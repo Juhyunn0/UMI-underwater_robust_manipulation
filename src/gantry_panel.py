@@ -96,7 +96,7 @@ from gantry import (  # noqa: E402
 from gantry_runner import (  # noqa: E402
     AXES, AXIS_NAMES, EMERGENCY_STOP, SCALE_MM_PER_UNIT,
     GantryTelemetryLogger, Waypoint,
-    _device_soft_limits_mm, _read_current_pos_mm, _validate_soft_limits,
+    _read_current_pos_mm,
     make_gantry_run_dir, mm_to_units, move_to_xyz_mm, units_to_mm,
 )
 
@@ -642,81 +642,6 @@ class MoveToTargetThread(QThread):
             self.finished_with.emit(str(exc))
 
 
-class HomingThread(QThread):
-    """Sequentially homes one or more axes. Converts cm/s inputs to per-axis
-    controller units/s at run time, clamping to HOME_SPEED_LIMIT_UNITS."""
-
-    axis_started = pyqtSignal(object)
-    axis_done = pyqtSignal(object, str)
-    all_done = pyqtSignal(str)
-
-    def __init__(self, controller, axes, speed_cm_s: float, acc_dec_cm_s2: float,
-                 fall_step_mm: float, positive_limits: dict[int, bool],
-                 lock: threading.RLock,
-                 abort_event: threading.Event | None = None) -> None:
-        super().__init__()
-        self._controller = controller
-        self._axes = list(axes)
-        self._speed_cm_s = float(speed_cm_s)
-        self._acc_cm_s2 = float(acc_dec_cm_s2)
-        self._fall_mm = float(fall_step_mm)
-        # Per-axis direction map, axis index -> True/False (True = positive limit).
-        self._positive_limits = dict(positive_limits)
-        self._lock = lock
-        self._abort_event = abort_event or threading.Event()
-
-    def _aborted(self) -> bool:
-        return EMERGENCY_STOP.is_set() or self._abort_event.is_set()
-
-    def run(self) -> None:  # type: ignore[override]
-        try:
-            for axis in self._axes:
-                if self._aborted():
-                    self.all_done.emit("Interrupted by emergency stop")
-                    return
-                self.axis_started.emit(axis)
-                try:
-                    # Convert cm/s → per-axis units/s; clamp to safety limit.
-                    speed_u = min(cm_s_to_units_s(self._speed_cm_s, axis),
-                                  HOME_SPEED_LIMIT_UNITS)
-                    acc_u   = cm_s2_to_units_s2(self._acc_cm_s2, axis)
-                    fall_u  = mm_to_units(self._fall_mm, axis)
-                    with self._lock:
-                        self._controller.home_axis(
-                            axis,
-                            speed=speed_u, acc_dec=acc_u,
-                            fall_step=fall_u,
-                            positive_limit=self._positive_limits.get(
-                                int(axis), True),
-                        )
-                except FMC4030Error as exc:
-                    err = f"home_axis({axis.name}) failed: {exc}"
-                    self.axis_done.emit(axis, err)
-                    self.all_done.emit(err)
-                    return
-                # Wait for stop, polling at 20 Hz.
-                while not self._aborted():
-                    try:
-                        with self._lock:
-                            stopped = self._controller.is_axis_stopped(axis)
-                    except FMC4030Error as exc:
-                        err = f"is_axis_stopped({axis.name}) failed: {exc}"
-                        self.axis_done.emit(axis, err)
-                        self.all_done.emit(err)
-                        return
-                    if stopped:
-                        break
-                    time.sleep(0.05)
-                if self._aborted():
-                    self.axis_done.emit(axis, "aborted")
-                    self.all_done.emit("Interrupted by emergency stop")
-                    return
-                self.axis_done.emit(axis, "")
-            self.all_done.emit("")
-        except Exception as exc:
-            self.all_done.emit(f"Unexpected: {exc}")
-
-
 class SequenceThread(QThread):
     """Runs a waypoint list top-to-bottom on one background thread."""
 
@@ -773,43 +698,6 @@ class SequenceThread(QThread):
             self.sequence_done.emit("")
         except Exception as exc:
             self.sequence_done.emit(f"Unexpected: {exc}")
-
-
-class SoftLimitThread(QThread):
-    """Read or read-mutate-write DeviceParameters under the controller lock.
-
-    The whole read-mutate-write happens inside one ``with lock:`` block so any
-    concurrent status poll either runs to completion before this starts or
-    blocks until the entire update is done.
-    """
-
-    result = pyqtSignal(object, str)   # DeviceParameters, msg
-    error = pyqtSignal(str)
-
-    def __init__(self, controller, lock: threading.RLock, mode: str,
-                 updates_units: dict[int, tuple[int, int]] | None = None) -> None:
-        super().__init__()
-        self._controller = controller
-        self._lock = lock
-        self._mode = mode  # "load" or "apply"
-        self._updates = updates_units or {}
-
-    def run(self) -> None:  # type: ignore[override]
-        try:
-            with self._lock:
-                params = self._controller.get_device_parameters()
-                if self._mode == "apply":
-                    for idx, (lo, hi) in self._updates.items():
-                        params.soft_limit_min[idx] = int(lo)
-                        params.soft_limit_max[idx] = int(hi)
-                    self._controller.set_device_parameters(params)
-                    params = self._controller.get_device_parameters()
-            msg = "Loaded soft limits" if self._mode == "load" else "Applied soft limits"
-            self.result.emit(params, msg)
-        except FMC4030Error as exc:
-            self.error.emit(str(exc))
-        except Exception as exc:
-            self.error.emit(f"Unexpected: {exc}")
 
 
 class AxisAbsMoveThread(QThread):
@@ -2085,6 +1973,14 @@ def _size_button(btn, kind: str = "normal") -> None:
         btn.setMinimumHeight(34)
 
 
+def _make_note_label(text: str) -> QLabel:
+    """Small gray inline-help label used for in-section explanations."""
+    lbl = QLabel(text)
+    lbl.setStyleSheet("color: #888; font-size: 11px; padding: 2px 4px;")
+    lbl.setWordWrap(True)
+    return lbl
+
+
 # =============================================================================
 # Main window
 # =============================================================================
@@ -2105,12 +2001,6 @@ class GantryPanel(QMainWindow):
         self._controller_lock = threading.RLock()
         self.connected = False
 
-        # Soft limits (mm) — None means unset.
-        # All mm values stored here are in the USER-FACING frame (after axis_sign).
-        # Conversion to firmware units happens through mm_user_to_units / units_to_mm_user.
-        self._soft_min_mm: list[float | None] = [None, None, None]
-        self._soft_max_mm: list[float | None] = [None, None, None]
-
         # Per-axis direction flip: +1 = panel matches firmware counter, -1 = inverted.
         # Restored from settings; user toggles in Setup tab → Axis Direction.
         # Applied at the panel↔SDK boundary only (mm_user_to_units / units_to_mm_user).
@@ -2124,21 +2014,11 @@ class GantryPanel(QMainWindow):
         except Exception:
             pass
 
-        # Per-axis readback sync state for the soft-limit indicator.
-        #   None  -> Unknown (not applied this session)
-        #   "synced"   -> written ≈ readback (within 1 unit)
-        #   "rounding" -> readback differs by ≥1 unit (mm-rounding effect)
-        self._soft_limit_sync: dict[Axis, str | None] = {a: None for a in AXES}
-        # (written_units, readback_units) per axis — used for the indicator tooltip.
-        self._soft_limit_written_units: dict[Axis, tuple[int, int] | None] = {a: None for a in AXES}
-        self._soft_limit_readback_units: dict[Axis, tuple[int, int] | None] = {a: None for a in AXES}
-
-        # Live soft-limit watchdog: on every status snapshot, if user-frame
-        # position is outside the configured limits, the watcher fires
-        # stop_axis(axis, mode=2) ONCE per axis and latches a breach flag so
-        # we don't spam stop calls every 100 ms tick. Flag clears once pos
-        # comes back inside the envelope.
-        self._soft_limit_breached: dict[Axis, bool] = {a: False for a in AXES}
+        # Cached ABSOLUTE machine-frame mm of the latest snapshot, alongside
+        # the user-frame _last_pos_mm. Used by anything that needs the raw
+        # machine value: home-reference capture, the "Abs: …" diagnostic
+        # label, and run_metadata.json logging.
+        self._last_pos_abs_mm: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
         # Live data for finite-diff accel + live plot.
         self._vel_buffer: deque = deque(maxlen=FINITE_DIFF_WINDOW)
@@ -2160,19 +2040,17 @@ class GantryPanel(QMainWindow):
         # Worker handles.
         self._status_thread: StatusPollThread | None = None
         self._move_thread: MoveToTargetThread | None = None
-        self._home_thread: HomingThread | None = None
         self._sequence_thread: SequenceThread | None = None
-        self._soft_limit_busy = False
         # Panel-scoped abort flag, set together with the gantry_runner module's
         # EMERGENCY_STOP event whenever the E-Stop fires. Workers we own
-        # (HomingThread, SequenceThread, AxisAbsMoveThread) check this flag at
-        # every loop iteration so they exit quickly on E-Stop without waiting
-        # for the SDK lock.
+        # (SequenceThread, AxisAbsMoveThread) check this flag at every loop
+        # iteration so they exit quickly on E-Stop without waiting for the
+        # SDK lock.
         self._abort_event = threading.Event()
         # Tracks freshness of the last status snapshot for the Polling
         # indicator (set in _on_status_snapshot).
         self._last_snapshot_t: float = 0.0
-        # Home reference (mm) per axis, set by successful homing or by the
+        # Home reference (absolute machine-frame mm) per axis, set by the
         # "Set Current as Home Reference" button. Restored from settings.
         self._home_position_mm: dict[Axis, float | None] = {a: None for a in AXES}
         try:
@@ -2190,7 +2068,6 @@ class GantryPanel(QMainWindow):
 
         # In-progress flags (drive button enable/disable).
         self._move_in_progress = False
-        self._homing_in_progress = False
         self._sequence_in_progress = False
         # Per-axis Move Abs is in progress for at least one axis.
         self._per_axis_busy: set[int] = set()
@@ -2248,27 +2125,67 @@ class GantryPanel(QMainWindow):
         QTimer.singleShot(500, self._audit_clipping)
 
     # ------------------------------------------------------------------
-    # Axis sign helpers (panel↔SDK boundary)
+    # Frame-conversion helpers  (single source of truth)
     # ------------------------------------------------------------------
-    # The panel speaks USER-FACING mm everywhere. When axis_sign[axis] == -1,
-    # multiplying by the sign at the panel↔SDK boundary inverts that axis's
-    # user-facing direction without touching firmware. Helpers below are the
-    # ONLY places where the flip is applied — call them at every mm→units and
-    # units→mm transition.
+    # The panel speaks USER-FACING mm everywhere. "User-frame" means:
+    #   1. HOME-RELATIVE: zero is the captured home reference for that axis.
+    #   2. SIGN-FLIPPED: when axis_sign[axis] == -1, the user's "+" matches
+    #      the user's physical intuition (the firmware counter may decrease).
+    #
+    # Storage invariants (set in __init__; reasserted whenever updated):
+    #   - self._home_position_mm[axis]      : ABSOLUTE machine-frame mm
+    #   - self._last_pos_mm[axis]           : user-frame mm (home-relative, sign-flipped)
+    #   - self._last_pos_abs_mm[axis]       : ABSOLUTE machine-frame mm  (for diagnostics)
+    # (Soft-limit fields removed — panel no longer manages soft limits.)
+    #
+    # Conversion chain (positions):
+    #   abs_mm  = (user_mm * sign)  +  home_offset_abs
+    #   user_mm = (abs_mm - home_offset_abs) * sign
+    #   units   = abs_mm / SCALE_MM_PER_UNIT[axis]
+    #
+    # For velocities (and any other delta-quantity), the home offset does NOT
+    # apply — only the sign flip. See vel_units_to_user_mm_s below.
+    #
+    # When the user has not yet captured a home reference, home_offset_abs == 0
+    # and user-frame collapses to "raw absolute × sign" — graceful degradation.
+
+    def _home_offset_abs(self, axis: Axis) -> float:
+        """Absolute machine-frame mm of the captured home reference for `axis`.
+        Returns 0.0 when no reference has been captured yet."""
+        h = self._home_position_mm.get(axis)
+        return float(h) if h is not None else 0.0
+
+    def user_mm_to_abs_mm(self, mm_user: float, axis: Axis) -> float:
+        """User-frame (home-relative, sign-flipped) mm → absolute machine-frame mm."""
+        return (mm_user * self._axis_sign[axis]) + self._home_offset_abs(axis)
+
+    def abs_mm_to_user_mm(self, mm_abs: float, axis: Axis) -> float:
+        """Absolute machine-frame mm → user-frame mm (home-relative, sign-flipped)."""
+        return (mm_abs - self._home_offset_abs(axis)) * self._axis_sign[axis]
+
     def mm_user_to_units(self, mm_user: float, axis: Axis) -> float:
-        """User-facing mm → controller units (apply per-axis sign flip)."""
-        return mm_to_units(mm_user * self._axis_sign[axis], axis)
+        """User-frame mm → controller units. Applies sign flip AND home offset."""
+        return mm_to_units(self.user_mm_to_abs_mm(mm_user, axis), axis)
 
     def units_to_mm_user(self, units: float, axis: Axis) -> float:
-        """Controller units → user-facing mm (apply per-axis sign flip)."""
-        return units_to_mm(units, axis) * self._axis_sign[axis]
+        """Controller units → user-frame mm. Inverse of mm_user_to_units."""
+        return self.abs_mm_to_user_mm(units_to_mm(units, axis), axis)
+
+    def vel_units_to_user_mm_s(self, units_per_s: float, axis: Axis) -> float:
+        """Velocity in controller units/s → user-frame mm/s. Only the sign
+        flip applies; the home offset is a static translation that drops out
+        of any rate quantity."""
+        return units_to_mm(units_per_s, axis) * self._axis_sign[axis]
 
     def mm_user_to_mm_firmware(self, mm_user: float, axis: Axis) -> float:
-        """User-facing mm → firmware-frame mm (no unit change, just sign flip)."""
-        return mm_user * self._axis_sign[axis]
+        """User-frame mm → absolute machine-frame mm. Alias for user_mm_to_abs_mm,
+        named for use at call sites that feed mm (not units) into the SDK helpers
+        (move_to_xyz_mm uses mm and converts via mm_to_units internally)."""
+        return self.user_mm_to_abs_mm(mm_user, axis)
 
     def mm_firmware_to_mm_user(self, mm_fw: float, axis: Axis) -> float:
-        return mm_fw * self._axis_sign[axis]
+        """Absolute machine-frame mm → user-frame mm. Inverse alias."""
+        return self.abs_mm_to_user_mm(mm_fw, axis)
 
     def jog_direction_user_to_firmware(self, direction: int, axis: Axis) -> int:
         """User-facing +/-1 jog direction → firmware-frame +/-1."""
@@ -2433,8 +2350,7 @@ class GantryPanel(QMainWindow):
         # Sequences tab: waypoint table + its toolbar.
         tabs.addTab(_wrap_scroll(self._build_waypoint_panel()), "Sequences")
         # Setup tab: soft limits + homing.
-        tabs.addTab(_wrap_scroll(self._build_soft_limits_group(),
-                                 self._build_homing_group()), "Setup")
+        tabs.addTab(_wrap_scroll(self._build_home_reference_group()), "Setup")
         # Recording tab: start/stop + CSV path + live 30s plot.
         tabs.addTab(_wrap_scroll(self._build_recording_panel()), "Recording")
         # Experiment tab: end-to-end orchestration.
@@ -2612,110 +2528,56 @@ class GantryPanel(QMainWindow):
 
         return frame
 
-    def _build_soft_limits_group(self) -> SectionFrame:
-        frame = SectionFrame("Software Limits (mm)")
-        grid = QGridLayout(frame.content())
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(6)
+    def _build_home_reference_group(self) -> SectionFrame:
+        """Setup-tab section. Just two things:
+          (1) Set Current as Home Reference button — captures the current
+              absolute XYZ as the home reference; no motion is commanded.
+          (2) Axis Direction toggles — per-axis sign flip for jog/display.
+        """
+        frame = SectionFrame("Home Reference")
+        v = QVBoxLayout(frame.content())
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(10)
 
-        grid.addWidget(QLabel("Axis"), 0, 0)
-        grid.addWidget(QLabel("Min (mm)"), 0, 1)
-        grid.addWidget(QLabel("Max (mm)"), 0, 2)
-        grid.addWidget(QLabel("Sync"), 0, 4)
-        self.soft_limit_spins: dict[Axis, dict[str, QDoubleSpinBox]] = {}
-        self.soft_limit_indicators: dict[Axis, QLabel] = {}
-        self.soft_limit_resolution_labels: dict[Axis, QLabel] = {}
-        # Two rows per axis: the spinbox row and a thin gray resolution-hint row.
-        next_row = 1
-        for axis in AXES:
-            row = next_row
-            grid.addWidget(QLabel(axis.name), row, 0)
-            mn = QDoubleSpinBox()
-            mn.setRange(-100000.0, 100000.0)
-            mn.setDecimals(2)
-            mn.setValue(0.0)
-            _size_mm_spinbox(mn)
-            mx = QDoubleSpinBox()
-            mx.setRange(-100000.0, 100000.0)
-            mx.setDecimals(2)
-            mx.setValue(0.0)
-            _size_mm_spinbox(mx)
-            step_mm = units_to_mm(1, axis)
-            _sl_tip = (f"Resolution: {step_mm:.4g} mm/unit. "
-                       f"Values snap to the nearest {step_mm:.4g} mm step (hardware limit).")
-            mn.setToolTip(_sl_tip)
-            mx.setToolTip(_sl_tip)
-            mn.editingFinished.connect(partial(self._snap_soft_limit_spin, mn, axis))
-            mx.editingFinished.connect(partial(self._snap_soft_limit_spin, mx, axis))
-            mn.valueChanged.connect(partial(self._update_soft_limit_resolution_hint, axis))
-            mx.valueChanged.connect(partial(self._update_soft_limit_resolution_hint, axis))
-            apply_btn = QPushButton(f"Apply {axis.name}")
-            _size_button(apply_btn)
-            apply_btn.clicked.connect(partial(self._apply_soft_limits_axis, axis))
-            indicator = QLabel("⚪")
-            indicator.setToolTip("Unknown — not applied this session.")
-            indicator.setAlignment(Qt.AlignCenter)
-            indicator.setFixedWidth(28)
-            indicator.setStyleSheet("color: #888; font-size: 14px;")
-            grid.addWidget(mn, row, 1)
-            grid.addWidget(mx, row, 2)
-            grid.addWidget(apply_btn, row, 3)
-            grid.addWidget(indicator, row, 4)
-            self.soft_limit_spins[axis] = {"min": mn, "max": mx, "apply_btn": apply_btn}
-            self.soft_limit_indicators[axis] = indicator
-            # Resolution hint row directly under the spinbox row.
-            res_label = QLabel("")
-            res_label.setStyleSheet("color: #777; font-size: 10px; padding-left: 20px;")
-            grid.addWidget(res_label, row + 1, 0, 1, 5)
-            self.soft_limit_resolution_labels[axis] = res_label
-            self._update_soft_limit_resolution_hint(axis)
-            next_row += 2
+        v.addWidget(_make_note_label(
+            "Sets the panel's user-frame origin (0 mm) to wherever the gantry "
+            "currently is. After capture, the per-axis position readouts and "
+            "all motion targets read as 'distance from home'. No motion is "
+            "commanded — manually jog to where you want home to be, then click."
+        ))
 
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
-        self.load_limits_btn = QPushButton("Load from Controller")
-        _size_button(self.load_limits_btn)
-        self.load_limits_btn.clicked.connect(self._load_soft_limits)
-        btn_row.addWidget(self.load_limits_btn)
-        self.apply_all_limits_btn = QPushButton("Apply All")
-        _size_button(self.apply_all_limits_btn)
-        self.apply_all_limits_btn.clicked.connect(self._apply_all_soft_limits)
-        btn_row.addWidget(self.apply_all_limits_btn)
-        self.snap_grid_chk = QCheckBox("Snap to unit grid")
-        self.snap_grid_chk.setChecked(True)
-        self.snap_grid_chk.setToolTip(
-            "When ON, soft-limit Min/Max spinboxes snap to the nearest exact "
-            "controller-unit boundary on edit. Turn off to enter raw mm values "
-            "that will be rounded by the firmware (indicator turns yellow)."
+        set_home_btn = QPushButton("Set Current as Home Reference")
+        set_home_btn.setObjectName("PrimaryButton")
+        _size_button(set_home_btn, "primary")
+        set_home_btn.setToolTip(
+            "Mark the current XYZ position as the home reference (no motion).\n"
+            "User-frame readouts on each axis card snap to 0.000 mm. The blue\n"
+            "'Go Home' buttons on the Control tab return to this reference."
         )
-        btn_row.addWidget(self.snap_grid_chk)
-        btn_row.addStretch()
-        grid.addLayout(btn_row, next_row, 0, 1, 5)
+        set_home_btn.clicked.connect(self._set_current_as_home_reference)
+        v.addWidget(set_home_btn)
 
-        # ---- Axis Direction sub-group ---------------------------------------
-        # Manual sign toggle. No motion probe; user toggles and verifies by
-        # jogging. Persisted in ~/.umi_gui_state.json under axis_sign.
-        next_row += 1
+        # ---- Axis Direction sub-group --------------------------------------
+        # Persisted in ~/.umi_gui_state.json under axis_sign.
         dir_title = QLabel("Axis Direction")
-        dir_title.setStyleSheet("color: #4ea1ff; font-weight: 600; padding-top: 10px;")
-        grid.addWidget(dir_title, next_row, 0, 1, 5)
-        next_row += 1
-        dir_explain = QLabel(
-            "If clicking X+ in this panel makes the gantry move in what you "
-            "consider the negative direction, toggle that axis to -1. The panel "
-            "will invert this axis's user-facing direction. Does NOT command "
-            "any test motion — toggle, jog manually, observe."
+        dir_title.setStyleSheet(
+            "color: #4ea1ff; font-weight: 600; padding-top: 12px;"
         )
-        dir_explain.setStyleSheet("color: #999; font-size: 10px;")
-        dir_explain.setWordWrap(True)
-        grid.addWidget(dir_explain, next_row, 0, 1, 5)
-        next_row += 1
+        v.addWidget(dir_title)
+        v.addWidget(_make_note_label(
+            "If clicking X+ in this panel makes the gantry move in what you "
+            "consider the negative direction, toggle that axis to -1. The "
+            "panel will invert this axis's user-facing direction. Does NOT "
+            "command any test motion — toggle, jog manually, observe."
+        ))
+
+        dir_row = QHBoxLayout()
+        dir_row.setSpacing(16)
         self.axis_sign_combos: dict[Axis, QComboBox] = {}
         for axis in AXES:
-            row = QHBoxLayout()
-            row.setSpacing(4)
-            row.addWidget(QLabel(f"{axis.name}:"))
+            sub = QHBoxLayout()
+            sub.setSpacing(4)
+            sub.addWidget(QLabel(f"{axis.name}:"))
             combo = QComboBox()
             combo.addItem("+1 (matches firmware)",  1)
             combo.addItem("-1 (inverted)",         -1)
@@ -2724,219 +2586,31 @@ class GantryPanel(QMainWindow):
                 f"Direction multiplier for axis {axis.name}.\n"
                 "+1: panel X+ jog → firmware counter increases (normal).\n"
                 "-1: panel X+ jog → firmware counter decreases (inverted).\n"
-                "Applied to jog / Move Abs / Move to Target / Home / soft-limit Apply\n"
-                "AND to the position readback before display."
+                "Applied to jog / Move Abs / Move to Target AND to the\n"
+                "position readback before display."
             )
             combo.currentIndexChanged.connect(partial(self._on_axis_sign_changed, axis))
-            row.addWidget(combo)
-            row.addStretch()
-            grid.addLayout(row, next_row, int(axis), 1, 1)
-        next_row += 1
+            sub.addWidget(combo)
+            dir_row.addLayout(sub)
+            self.axis_sign_combos[axis] = combo
+        dir_row.addStretch()
+        v.addLayout(dir_row)
         return frame
 
-    # ── soft-limit UI helpers ────────────────────────────────────────────────
-    def _update_soft_limit_resolution_hint(self, axis: Axis, *_: Any) -> None:
-        """Live label: '1 unit = K mm → effective min/max: A / B mm'.
-        Shows the user exactly what the firmware will actually store after
-        int(round(mm/scale))."""
-        lbl = self.soft_limit_resolution_labels.get(axis)
-        if lbl is None:
-            return
-        scale = SCALE_MM_PER_UNIT[axis]
-        spins = self.soft_limit_spins.get(axis)
-        if spins is None:
-            lbl.setText(f"1 unit = {scale:.4g} mm")
-            return
-        mn_mm = spins["min"].value()
-        mx_mm = spins["max"].value()
-        # Effective firmware-stored values, AFTER axis-sign flip and rounding.
-        sign = self._axis_sign[axis]
-        mn_fw_mm = units_to_mm(int(round(mm_to_units(mn_mm * sign, axis))), axis) * sign
-        mx_fw_mm = units_to_mm(int(round(mm_to_units(mx_mm * sign, axis))), axis) * sign
-        # When sign==-1 the user-min maps to fw-max and vice versa; show what
-        # the user will see, i.e. low and high in user-facing mm.
-        lo_user, hi_user = (mn_fw_mm, mx_fw_mm) if mn_fw_mm <= mx_fw_mm else (mx_fw_mm, mn_fw_mm)
-        lbl.setText(
-            f"{axis.name}: 1 unit = {scale:.4g} mm → effective min/max: "
-            f"{lo_user:+.2f} / {hi_user:+.2f} mm"
-        )
-
     def _on_axis_sign_changed(self, axis: Axis, idx: int) -> None:
-        combo = self.axis_sign_combos.get(axis) if hasattr(self, "axis_sign_combos") else None
+        combo = self.axis_sign_combos.get(axis)
         new_sign = int(combo.itemData(idx)) if combo is not None else 1
         new_sign = 1 if new_sign >= 0 else -1
         if self._axis_sign[axis] == new_sign:
             return
         self._axis_sign[axis] = new_sign
-        # Persist immediately.
         payload = _gp_load_settings().get("gantry_panel", {})
         payload["axis_sign"] = {a.name: int(self._axis_sign[a]) for a in AXES}
         _gp_save_section("gantry_panel", payload)
-        # Refresh resolution hints (effective min/max flips with sign).
-        for a in AXES:
-            self._update_soft_limit_resolution_hint(a)
-        # Reset sync indicator — the user must re-apply now.
-        self._set_soft_limit_indicator(axis, None)
         self.sb_op_label.setText(
             f"Axis {axis.name} direction set to {new_sign:+d}. "
-            "Re-apply soft limits and jog manually to verify."
+            "Jog manually to verify."
         )
-
-    def _set_soft_limit_indicator(self, axis: Axis, state: str | None,
-                                  written: tuple[int, int] | None = None,
-                                  readback: tuple[int, int] | None = None) -> None:
-        ind = self.soft_limit_indicators.get(axis)
-        if ind is None:
-            return
-        self._soft_limit_sync[axis] = state
-        if written is not None:
-            self._soft_limit_written_units[axis] = written
-        if readback is not None:
-            self._soft_limit_readback_units[axis] = readback
-        scale = SCALE_MM_PER_UNIT[axis]
-        if state == "synced":
-            ind.setText("🟢")
-            ind.setStyleSheet("color: #34d058; font-size: 14px;")
-            tip = "Synced — written value matches readback within 1 unit."
-        elif state == "rounding":
-            ind.setText("🟡")
-            ind.setStyleSheet("color: #ffa726; font-size: 14px;")
-            w = self._soft_limit_written_units.get(axis)
-            r = self._soft_limit_readback_units.get(axis)
-            if w is not None and r is not None:
-                eff_lo_mm = self.units_to_mm_user(r[0], axis)
-                eff_hi_mm = self.units_to_mm_user(r[1], axis)
-                lo_mm, hi_mm = sorted((eff_lo_mm, eff_hi_mm))
-                tip = (
-                    f"Rounding — mm input doesn't land on the {scale:g} mm/unit grid.\n"
-                    f"  wrote units min/max: {w[0]} / {w[1]}\n"
-                    f"  firmware stored:     {r[0]} / {r[1]}\n"
-                    f"  effective limits in user mm: {lo_mm:+.3f} / {hi_mm:+.3f}\n"
-                    f"Enable 'Snap to unit grid' to make spinboxes snap to multiples "
-                    f"of {scale:g} mm so what-you-see equals what-firmware-stores."
-                )
-            else:
-                tip = "Rounding — readback differs by ≥1 unit."
-        else:
-            ind.setText("⚪")
-            ind.setStyleSheet("color: #888; font-size: 14px;")
-            tip = "Unknown — not applied this session."
-        ind.setToolTip(tip)
-
-    def _build_homing_group(self) -> SectionFrame:
-        frame = SectionFrame("Homing")
-        v = QVBoxLayout(frame.content())
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(6)
-
-        params_row = QGridLayout()
-        params_row.addWidget(QLabel("Home Speed (cm/s)"), 0, 0)
-        self.home_speed_spin = QDoubleSpinBox()
-        # 5.0 cm/s → X:6.06 u/s, Y:20.0 u/s (at HOME_SPEED_LIMIT), Z:clamped in HomingThread
-        self.home_speed_spin.setRange(0.10, 5.00)
-        self.home_speed_spin.setDecimals(2)
-        self.home_speed_spin.setSingleStep(0.10)
-        self.home_speed_spin.setValue(5.0)
-        _hx = cm_s_to_units_s(5.0, Axis.X)
-        _hy = cm_s_to_units_s(5.0, Axis.Y)
-        self.home_speed_spin.setToolTip(
-            f"Converted per axis at run time: X≈{_hx:.2f} u/s, Y≈{_hy:.2f} u/s, "
-            "Z→capped at 20.0 u/s (HOME_SPEED_LIMIT).\n"
-            "Max 5.0 cm/s keeps all axes ≤ HOME_SPEED_LIMIT_UNITS (20.0).\n"
-            "Calibration: SCALE_MM_PER_UNIT from gantry_runner.py (X=8.25, Y=2.5, Z=0.5 mm/unit)."
-        )
-        params_row.addWidget(self.home_speed_spin, 0, 1)
-
-        params_row.addWidget(QLabel("Home Accel/Decel (cm/s²)"), 0, 2)
-        self.home_acc_spin = QDoubleSpinBox()
-        self.home_acc_spin.setRange(0.10, 500.0)
-        self.home_acc_spin.setDecimals(2)
-        self.home_acc_spin.setSingleStep(0.50)
-        self.home_acc_spin.setValue(5.0)
-        params_row.addWidget(self.home_acc_spin, 0, 3)
-
-        params_row.addWidget(QLabel("Fall Step (mm)"), 0, 4)
-        self.home_fall_spin = QDoubleSpinBox()
-        self.home_fall_spin.setRange(0.1, 5000.0)
-        self.home_fall_spin.setDecimals(1)
-        self.home_fall_spin.setValue(25.0)
-        params_row.addWidget(self.home_fall_spin, 0, 5)
-        v.addLayout(params_row)
-
-        # ---- Per-axis Home Direction row (matches manual_pad.py: each combo
-        # has two items, Negative limit (data=False) and Positive limit
-        # (data=True); the chosen value is passed as home_axis(...,
-        # positive_limit=...) for that axis. Defaults: X=+, Y=+, Z=-.
-        dir_row = QHBoxLayout()
-        dir_row.setSpacing(12)
-        dir_row.addWidget(QLabel("Home Direction:"))
-        self.home_dir_combos: dict[Axis, QComboBox] = {}
-        # Restore per-axis saved direction (default to Positive for X/Y, Negative for Z).
-        saved_dir = _gp_load_settings().get("gantry_panel", {}).get("home_direction", {})
-        defaults = {Axis.X: True, Axis.Y: True, Axis.Z: False}
-        for axis in AXES:
-            sub = QHBoxLayout()
-            sub.setSpacing(4)
-            sub.addWidget(QLabel(f"{axis.name}:"))
-            combo = QComboBox()
-            combo.addItem("Negative limit", False)
-            combo.addItem("Positive limit", True)
-            saved_val = saved_dir.get(axis.name)
-            default = saved_val if saved_val is not None else defaults[axis]
-            combo.setCurrentIndex(1 if bool(default) else 0)
-            combo.setToolTip(
-                "'Positive limit' homes toward the +axis end-stop; "
-                "'Negative limit' homes toward the −axis end-stop. "
-                "Must match the physical limit-switch wiring on this axis."
-            )
-            combo.currentIndexChanged.connect(self._persist_home_direction)
-            sub.addWidget(combo)
-            dir_row.addLayout(sub)
-            self.home_dir_combos[axis] = combo
-        dir_row.addStretch()
-        v.addLayout(dir_row)
-
-        # "Set Current as Home Reference" — captures the latest snapshot's mm
-        # values for all 3 axes without commanding any motion.
-        ref_row = QHBoxLayout()
-        ref_row.setSpacing(8)
-        set_home_btn = QPushButton("Set Current as Home Reference")
-        _size_button(set_home_btn)
-        set_home_btn.setToolTip(
-            "Mark the current XYZ position as the home reference (no motion). "
-            "Used by the Δ-home readouts on each axis card."
-        )
-        set_home_btn.clicked.connect(self._set_current_as_home_reference)
-        ref_row.addWidget(set_home_btn)
-        ref_row.addStretch()
-        v.addLayout(ref_row)
-
-        btn_row = QHBoxLayout()
-        ic_home = _icon("fa5s.home")
-        self.home_btns: dict[Axis, QPushButton] = {}
-        for axis in AXES:
-            b = QPushButton(f"Home {axis.name}")
-            if ic_home is not None:
-                b.setIcon(ic_home)
-            b.clicked.connect(partial(self._home_single, axis))
-            btn_row.addWidget(b)
-            self.home_btns[axis] = b
-
-        btn_row.addSpacing(20)
-        btn_row.addWidget(QLabel("Home All order:"))
-        self.home_order_combo = QComboBox()
-        self.home_order_combo.addItem("Z → X → Y  (safest)", ("Z", "X", "Y"))
-        self.home_order_combo.addItem("X → Y → Z", ("X", "Y", "Z"))
-        self.home_order_combo.addItem("Y → X → Z", ("Y", "X", "Z"))
-        btn_row.addWidget(self.home_order_combo)
-        self.home_all_btn = QPushButton("Home All")
-        if ic_home is not None:
-            self.home_all_btn.setIcon(ic_home)
-        self.home_all_btn.clicked.connect(self._home_all)
-        btn_row.addWidget(self.home_all_btn)
-        btn_row.addStretch()
-        v.addLayout(btn_row)
-        return frame
 
     def _build_per_axis_group(self) -> SectionFrame:
         """Per-axis cards: hold-to-jog, Move Abs (mm), and per-axis Home shortcut.
@@ -3052,7 +2726,7 @@ class GantryPanel(QMainWindow):
         jog_row.addWidget(btn_neg)
         v.addLayout(jog_row)
 
-        # Row 4: abs-move spinbox + Move + Home on one line.
+        # Row 4: abs-move spinbox + Move on one line.
         bottom_row = QHBoxLayout()
         bottom_row.setSpacing(6)
         target_spin = QDoubleSpinBox()
@@ -3064,26 +2738,26 @@ class GantryPanel(QMainWindow):
         move_btn = QPushButton("Move")
         move_btn.clicked.connect(partial(self._move_axis_abs, axis))
         bottom_row.addWidget(move_btn)
-        # "Go Home" — move-abs to the captured home REFERENCE on this axis.
-        # NOT a physical limit-switch homing (that's on the Setup tab → Homing
-        # group). If no home reference exists yet, the click handler shows a
-        # warning that points the user at "Set Current as Home Reference" or
-        # the Setup-tab Home buttons.
-        home_btn = QPushButton("Go Home")
+        v.addLayout(bottom_row)
+
+        # Row 5: "Return to home reference (Δ home = 0)" — primary action,
+        # promoted with the blue PrimaryButton style + larger size.
+        v.addWidget(_make_note_label("Return to home reference (Δ home = 0)"))
+        home_btn = QPushButton(f"Go Home  {axis.name} → 0.000 mm")
+        home_btn.setObjectName("PrimaryButton")
+        _size_button(home_btn, "primary")
+        home_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         home_btn.setToolTip(
-            f"Move {axis.name} to its captured home reference (Δ home = 0).\n"
-            "Requires a home reference to be set first (Setup → Homing →\n"
-            "'Set Current as Home Reference' or a successful Home Axis op).\n"
-            "Does NOT drive toward the physical limit switch — use the\n"
-            "Setup tab 'Home {axis.name}' button for hardware homing."
+            f"Move {axis.name} back to its captured home reference (user-frame 0 mm).\n"
+            "Uses the same axis-sign rules as Move to Target.\n\n"
+            "Requires a home reference to be set first via Setup tab → "
+            "'Set Current as Home Reference'."
         )
         ic = _icon("fa5s.home")
         if ic is not None:
             home_btn.setIcon(ic)
-            home_btn.setObjectName("IconButton")
         home_btn.clicked.connect(partial(self._go_to_home_axis, axis))
-        bottom_row.addWidget(home_btn)
-        v.addLayout(bottom_row)
+        v.addWidget(home_btn)
 
         self.per_axis_cards[axis] = {
             "card": card,
@@ -3286,7 +2960,6 @@ class GantryPanel(QMainWindow):
 
         self._exp_chk_connected,   _ = _chk_row("Controller connected")
         self._exp_chk_homed,       _ = _chk_row("Home reference set (X, Y, Z)")
-        self._exp_chk_soft_limits, _ = _chk_row("Soft limits loaded")
         self._exp_chk_path,        _ = _chk_row("Path defined: 0 waypoints")
         self._exp_chk_camera,      _ = _chk_row("Camera connected (see connection bar)")
         self._exp_chk_calib,       _ = _chk_row("Fisheye calibration loaded")
@@ -3505,9 +3178,6 @@ class GantryPanel(QMainWindow):
         homed = all(self._home_position_mm.get(a) is not None for a in AXES)
         _set(self._exp_chk_homed, homed)
 
-        limits_ok = all(v is not None for v in self._soft_min_mm + self._soft_max_mm)
-        _set(self._exp_chk_soft_limits, limits_ok)
-
         n_wp = self._exp_count_waypoints()
         path_ok = n_wp > 0
         self._exp_chk_path.parentWidget()  # just in case
@@ -3572,13 +3242,12 @@ class GantryPanel(QMainWindow):
         tag_size_ok = self._exp_tag_size_spin.value() > 0
         _set(self._exp_chk_tagsize, tag_size_ok)
 
-        all_ok = all([connected, homed, limits_ok, path_ok, cam_ok, calib_ok, tag_size_ok])
+        all_ok = all([connected, homed, path_ok, cam_ok, calib_ok, tag_size_ok])
         self._exp_start_btn.setEnabled(all_ok and not self._experiment_in_progress
                                        and HAVE_EXPERIMENT_RUNNER)
         missing = []
         if not connected:   missing.append("connect controller")
-        if not homed:       missing.append("home all axes")
-        if not limits_ok:   missing.append("load soft limits")
+        if not homed:       missing.append("set home reference")
         if not path_ok:     missing.append("add waypoints")
         if not gantry_only and not cam_ok:    missing.append("connect camera (top bar)")
         if not gantry_only and not calib_ok:  missing.append("set calib path (top bar)")
@@ -3775,14 +3444,7 @@ class GantryPanel(QMainWindow):
             QMessageBox.warning(self, "No waypoints", "Define at least one waypoint first.")
             return
 
-        # Validate soft limits (user-frame mm against user-frame limits).
-        try:
-            _validate_soft_limits(waypoints_user, self._soft_min_mm, self._soft_max_mm)
-        except SystemExit as exc:
-            QMessageBox.warning(self, "Soft limit violation (panel-side)", str(exc))
-            return
-
-        # Convert waypoints to firmware-frame for the SDK.
+        # Convert waypoints to absolute machine-frame for the SDK.
         waypoints_fw = [
             Waypoint(
                 x_mm=self.mm_user_to_mm_firmware(w.x_mm, Axis.X),
@@ -3829,8 +3491,8 @@ class GantryPanel(QMainWindow):
             controller=self.controller,
             controller_lock=self._controller_lock,
             waypoints=waypoints_fw,
-            soft_min_mm=list(self._soft_min_mm),
-            soft_max_mm=list(self._soft_max_mm),
+            soft_min_mm=[None, None, None],
+            soft_max_mm=[None, None, None],
             move_mode=getattr(self, "_move_mode", "line"),
             countdown_s=self._exp_countdown_spin.value(),
             settle_s=self._exp_settle_spin.value(),
@@ -3845,7 +3507,9 @@ class GantryPanel(QMainWindow):
             mock_camera=(self._is_mock_camera and not gantry_only),
             camera_session=(self._camera if not gantry_only else None),
         )
-        # Annotate the config with axis_sign + camera_mode for run_metadata.json.
+        # Annotate the config with axis_sign + camera_mode + home offset for
+        # run_metadata.json. Soft-limit metadata is intentionally omitted —
+        # the panel no longer manages or enforces soft limits.
         config.camera_mode = camera_mode
         config.axis_sign = {a.name: int(self._axis_sign[a]) for a in AXES}
         config.waypoints_user_frame = [
@@ -3853,17 +3517,9 @@ class GantryPanel(QMainWindow):
              "speed_mm_s": w.speed_mm_s, "dwell_s": w.dwell_s}
             for w in waypoints_user
         ]
-        # Soft-limit metadata: written/readback units for every applied axis.
-        config.soft_limit_metadata = {
-            a.name: {
-                "panel_min_mm": self._soft_min_mm[int(a)],
-                "panel_max_mm": self._soft_max_mm[int(a)],
-                "written_units": list(self._soft_limit_written_units.get(a)) if self._soft_limit_written_units.get(a) is not None else None,
-                "readback_units": list(self._soft_limit_readback_units.get(a)) if self._soft_limit_readback_units.get(a) is not None else None,
-                "axis_sign": int(self._axis_sign[a]),
-                "sync_state": self._soft_limit_sync.get(a),
-                "enforcement": "panel+firmware",
-            }
+        config.home_reference_abs_mm = {
+            a.name: (None if self._home_position_mm.get(a) is None
+                     else float(self._home_position_mm[a]))
             for a in AXES
         }
         self._experiment_in_progress = True
@@ -4040,8 +3696,6 @@ class GantryPanel(QMainWindow):
         self.connected = True
         self.connect_btn.setText("Disconnect")
         self._set_connection_status("Connected", "#66bb6a")
-        # Auto-load soft limits + populate display.
-        self._load_soft_limits()
         self._update_all_button_states()
 
     def _disconnect(self) -> None:
@@ -4052,7 +3706,7 @@ class GantryPanel(QMainWindow):
                 pass
             self._logger = None
         self._status_timer.stop()
-        for thread_attr in ("_status_thread", "_move_thread", "_home_thread", "_sequence_thread"):
+        for thread_attr in ("_status_thread", "_move_thread", "_sequence_thread"):
             t = getattr(self, thread_attr, None)
             if t is not None and t.isRunning():
                 t.requestInterruption()
@@ -4108,9 +3762,14 @@ class GantryPanel(QMainWindow):
         now = time.monotonic()
         pos_units = [float(status.realPos[i]) for i in range(3)]
         vel_units = [float(status.realSpeed[i]) for i in range(3)]
-        # Apply axis_sign at display: firmware-frame mm × sign = user-facing mm.
-        pos_mm = [self.units_to_mm_user(pos_units[i], AXES[i]) for i in range(3)]
-        vel_mm = [self.units_to_mm_user(vel_units[i], AXES[i]) for i in range(3)]
+        # Absolute machine-frame mm — raw SDK readback, no sign, no offset.
+        # Kept alongside user-frame for home-reference capture and the
+        # "Abs: …" diagnostic label.
+        pos_abs_mm = [units_to_mm(pos_units[i], AXES[i]) for i in range(3)]
+        # User-frame mm — home-relative AND sign-flipped (what every UI shows).
+        pos_mm = [self.abs_mm_to_user_mm(pos_abs_mm[i], AXES[i]) for i in range(3)]
+        # Velocities: sign flip only (rate; home offset drops out).
+        vel_mm = [self.vel_units_to_user_mm_s(vel_units[i], AXES[i]) for i in range(3)]
 
         # Acceleration: SMA-smoothed central difference over 5 samples.
         self._vel_buffer.append((now, tuple(vel_mm)))
@@ -4120,42 +3779,36 @@ class GantryPanel(QMainWindow):
         if DEBUG_STATUS_POLL:
             if now - getattr(self, "_dbg_snap_t", 0.0) >= 1.0:
                 self._dbg_snap_t = now
-                print(f"[status-poll] X={pos_mm[0]:+.3f} Y={pos_mm[1]:+.3f} "
-                      f"Z={pos_mm[2]:+.3f} mm  vel(mm/s)=({vel_mm[0]:+.2f},"
-                      f"{vel_mm[1]:+.2f},{vel_mm[2]:+.2f})",
+                print(f"[status-poll] user X={pos_mm[0]:+.3f} Y={pos_mm[1]:+.3f} "
+                      f"Z={pos_mm[2]:+.3f} mm  |  abs X={pos_abs_mm[0]:+.3f} "
+                      f"Y={pos_abs_mm[1]:+.3f} Z={pos_abs_mm[2]:+.3f}  |  "
+                      f"vel(mm/s)=({vel_mm[0]:+.2f},{vel_mm[1]:+.2f},{vel_mm[2]:+.2f})",
                       file=sys.stderr, flush=True)
 
         # Cache freshness for the Polling indicator.
         self._last_snapshot_t = now
         self._last_pos_mm = tuple(pos_mm)
+        self._last_pos_abs_mm = tuple(pos_abs_mm)
         self._last_pos_units = tuple(pos_units)
 
-        # Live soft-limit watchdog — fires stop_axis the moment a user-frame
-        # position crosses the configured envelope, regardless of which motion
-        # primitive issued the move. Skipped during homing (it intentionally
-        # drives toward an end-stop) and when E-Stop is already in flight.
-        self._enforce_live_soft_limits(pos_mm)
-
-        # Update per-axis Control card readouts (home-relative when home is set).
+        # Update per-axis Control card readouts.
+        # pos_mm is already user-frame (home-relative); display it directly.
+        # The absolute machine value is exposed via the tooltip + the "Abs:"
+        # diagnostic label on the Live Status row.
         for i, axis in enumerate(AXES):
             home_mm = self._home_position_mm[axis]
             info = self.per_axis_cards.get(axis)
             if info is not None:
-                if home_mm is not None:
-                    rel = pos_mm[i] - home_mm
-                    info["pos_mm"].setText(f"{rel:+8.3f}")
-                    info["pos_mm"].setToolTip(
-                        f"From home  ·  abs {pos_mm[i]:+.3f} mm"
-                    )
-                    lbl = info.get("home_label")
-                    if lbl:
+                info["pos_mm"].setText(f"{pos_mm[i]:+8.3f}")
+                info["pos_mm"].setToolTip(
+                    f"User-frame (home-relative)  ·  abs {pos_abs_mm[i]:+.3f} mm"
+                )
+                lbl = info.get("home_label")
+                if lbl:
+                    if home_mm is not None:
                         lbl.setText("⌂ from home")
                         lbl.setStyleSheet("color: #4ea1ff; font-size: 11px;")
-                else:
-                    info["pos_mm"].setText(f"{pos_mm[i]:+8.3f}")
-                    info["pos_mm"].setToolTip("No home set — raw machine position")
-                    lbl = info.get("home_label")
-                    if lbl:
+                    else:
                         lbl.setText("⚠ no home")
                         lbl.setStyleSheet("color: #ffa726; font-size: 11px;")
                 info["vel"].setText(f"Vel: {vel_mm[i] / 10.0:+.2f} cm/s")
@@ -4166,68 +3819,15 @@ class GantryPanel(QMainWindow):
             self._pos_history[i].append(pos_mm[i])
         self.plot_widget.update_data(self._time_history, self._pos_history)
 
-        # Workspace Map: same snapshot, no extra SDK call.
+        # Workspace Map: pass user-frame (home-relative) values so the marker
+        # sits at the origin after Set Current as Home Reference.
         if getattr(self, "workspace_map", None) is not None:
             self.workspace_map.update_position(pos_mm[0], pos_mm[1], pos_mm[2])
-            # Keep the home marker visible/updated even when no home is set.
-            home_xyz = tuple(self._home_position_mm[a] for a in AXES)
-            self.workspace_map.update_home(home_xyz)
-
-    def _enforce_live_soft_limits(self, pos_mm: list[float]) -> None:
-        """Per-tick watchdog. If a user-frame position is outside the panel's
-        configured soft-limit envelope, fire stop_axis(axis, mode=2) once
-        per axis and latch a breach flag so we don't re-stop every 100 ms
-        while the axis decelerates.
-
-        Skipped during homing (it intentionally seeks an end-stop) and when
-        E-Stop is already in flight.
-        """
-        # Don't override active homing — it deliberately drives toward a switch.
-        if self._homing_in_progress or EMERGENCY_STOP.is_set():
-            return
-        for i, axis in enumerate(AXES):
-            lo = self._soft_min_mm[i]
-            hi = self._soft_max_mm[i]
-            if lo is None and hi is None:
-                continue
-            pos = pos_mm[i]
-            outside = (lo is not None and pos < lo) or (hi is not None and pos > hi)
-            if outside:
-                if self._soft_limit_breached[axis]:
-                    # Already issued stop; wait until pos comes back inside.
-                    continue
-                self._soft_limit_breached[axis] = True
-                # Convert firmware-frame stop. stop_axis is axis-local and
-                # doesn't depend on user-frame direction.
-                try:
-                    with self._controller_lock:
-                        self.controller.stop_axis(axis, mode=2)
-                except FMC4030Error as exc:
-                    print(f"[soft-limit-watchdog] stop_axis({axis.name}) "
-                          f"failed: {exc}", file=sys.stderr)
-                except Exception as exc:
-                    print(f"[soft-limit-watchdog] unexpected: {exc}",
-                          file=sys.stderr)
-                # Surface the breach to the user. Status bar + console; we
-                # don't pop a modal because the watchdog runs on every tick.
-                lo_s = f"{lo:+.2f}" if lo is not None else "—"
-                hi_s = f"{hi:+.2f}" if hi is not None else "—"
-                msg = (
-                    f"Soft limit (live): {axis.name}={pos:+.2f} mm outside "
-                    f"[{lo_s}, {hi_s}] — stop_axis fired."
-                )
-                self.sb_op_label.setText(msg)
-                self.sb_op_label.setStyleSheet("color: #ef5350; font-weight: bold;")
-                print(f"[soft-limit-watchdog] {msg}", file=sys.stderr)
-                # Cancel any in-flight motion intents that would otherwise
-                # try to continue once the axis decelerates.
-                self._abort_event.set()
-            else:
-                # Auto-clear the latch once pos is back inside the envelope.
-                if self._soft_limit_breached[axis]:
-                    self._soft_limit_breached[axis] = False
-                    print(f"[soft-limit-watchdog] {axis.name} back inside "
-                          f"limits; latch cleared.", file=sys.stderr)
+            home_xyz_user = tuple(
+                0.0 if self._home_position_mm[a] is not None else None
+                for a in AXES
+            )
+            self.workspace_map.update_home(home_xyz_user)
 
     def _on_status_error(self, msg: str) -> None:
         # Special hint for the common 664 ("machine status unavailable")
@@ -4287,254 +3887,16 @@ class GantryPanel(QMainWindow):
             return
         self._request_status_update()
 
-    # ------------------------------------------------------------------
-    # Soft limits
-    # ------------------------------------------------------------------
-    def _snap_soft_limit_spin(self, spin: "QDoubleSpinBox", axis: "Axis") -> None:
-        """Snap spinbox to nearest controller unit boundary so what-you-see = what-you-get.
-        Only snaps when the optional 'Snap to unit grid' checkbox is enabled.
-        Axis-sign flips the firmware grid relative to user mm, but since
-        SCALE_MM_PER_UNIT is symmetric and rounding is symmetric across zero,
-        snapping is identical with or without the sign — we compute against
-        user-facing mm directly."""
-        if getattr(self, "snap_grid_chk", None) is not None and not self.snap_grid_chk.isChecked():
-            return
-        val = spin.value()
-        snapped = units_to_mm(int(round(mm_to_units(val, axis))), axis)
-        if abs(snapped - val) > 0.001:
-            spin.blockSignals(True)
-            spin.setValue(snapped)
-            spin.blockSignals(False)
-
-    def _load_soft_limits(self) -> None:
-        if not self.connected:
-            QMessageBox.warning(self, "Not connected", "Connect first.")
-            return
-        if self._soft_limit_busy:
-            return
-        self._soft_limit_busy = True
-        self.sb_op_label.setText("Loading soft limits…")
-        t = SoftLimitThread(self.controller, self._controller_lock, "load")
-        t.result.connect(self._on_soft_limits_result)
-        t.error.connect(self._on_soft_limits_error)
-        t.finished.connect(t.deleteLater)
-        t.start()
-        # Keep a reference until done (Qt would otherwise GC it).
-        self._soft_limit_thread = t
-
-    def _apply_soft_limits_axis(self, axis: Axis) -> None:
-        self._apply_soft_limits_for([axis], confirm=False)
-
-    def _apply_all_soft_limits(self) -> None:
-        # Build the diff text for the confirmation dialog.
-        diff_lines = []
-        for i, axis in enumerate(AXES):
-            cur_lo = self._soft_min_mm[i]
-            cur_hi = self._soft_max_mm[i]
-            new_lo = self.soft_limit_spins[axis]["min"].value()
-            new_hi = self.soft_limit_spins[axis]["max"].value()
-            cur_lo_s = f"{cur_lo:+.2f}" if cur_lo is not None else " unset"
-            cur_hi_s = f"{cur_hi:+.2f}" if cur_hi is not None else " unset"
-            diff_lines.append(
-                f"  {axis.name}: [{cur_lo_s}, {cur_hi_s}] → [{new_lo:+.2f}, {new_hi:+.2f}] mm"
-            )
-        reply = QMessageBox.question(
-            self, "Apply All Soft Limits",
-            "Apply these soft limits to the controller?\n\n" + "\n".join(diff_lines),
-            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel,
-        )
-        if reply != QMessageBox.Yes:
-            return
-        self._apply_soft_limits_for(list(AXES), confirm=False)
-
-    def _apply_soft_limits_for(self, axes: list[Axis], confirm: bool) -> None:
-        if not self.connected:
-            QMessageBox.warning(self, "Not connected", "Connect first.")
-            return
-        if self._soft_limit_busy:
-            return
-        # Convert user-facing mm → firmware units via axis_sign, then ensure
-        # firmware-frame min ≤ max (axis_sign == -1 swaps the two).
-        # Also remember the user-typed mm so the readback indicator can show
-        # whether mm-quantization changed the effective limit.
-        updates: dict[int, tuple[int, int]] = {}
-        written_per_axis: dict[Axis, tuple[int, int]] = {}
-        typed_user_mm_per_axis: dict[Axis, tuple[float, float]] = {}
-        for axis in axes:
-            sp = self.soft_limit_spins[axis]
-            mn_mm_user = sp["min"].value()
-            mx_mm_user = sp["max"].value()
-            mn_units_fw = int(round(self.mm_user_to_units(mn_mm_user, axis)))
-            mx_units_fw = int(round(self.mm_user_to_units(mx_mm_user, axis)))
-            lo_fw = min(mn_units_fw, mx_units_fw)
-            hi_fw = max(mn_units_fw, mx_units_fw)
-            updates[int(axis)] = (lo_fw, hi_fw)
-            written_per_axis[axis] = (lo_fw, hi_fw)
-            typed_user_mm_per_axis[axis] = (mn_mm_user, mx_mm_user)
-        self._soft_limit_pending_written = written_per_axis
-        self._soft_limit_pending_typed_mm = typed_user_mm_per_axis
-        self._soft_limit_busy = True
-        self.sb_op_label.setText("Applying soft limits…")
-        t = SoftLimitThread(self.controller, self._controller_lock,
-                            "apply", updates_units=updates)
-        t.result.connect(self._on_soft_limits_result)
-        t.error.connect(self._on_soft_limits_error)
-        t.finished.connect(t.deleteLater)
-        t.start()
-        self._soft_limit_thread = t
-
-    def _on_soft_limits_result(self, params, msg: str) -> None:
-        self._soft_limit_busy = False
-        self._update_all_button_states()
-        # axis_sign[axis] swaps firmware-frame min/max when displayed to the user.
-        # Per-axis: read firmware units, convert to firmware-frame mm, then flip
-        # sign for user display; if sign==-1, the user's "min" is firmware "max".
-        pending = getattr(self, "_soft_limit_pending_written", {}) or {}
-        rounding_axes: list[str] = []
-        for i, axis in enumerate(AXES):
-            lo_units_fw = int(round(float(params.soft_limit_min[i])))
-            hi_units_fw = int(round(float(params.soft_limit_max[i])))
-            if lo_units_fw == 0 and hi_units_fw == 0:
-                lo_mm_user = hi_mm_user = None
-            else:
-                # Firmware-frame mm → user mm via sign.
-                a_mm = self.units_to_mm_user(lo_units_fw, axis)
-                b_mm = self.units_to_mm_user(hi_units_fw, axis)
-                lo_mm_user = min(a_mm, b_mm)
-                hi_mm_user = max(a_mm, b_mm)
-            self._soft_min_mm[i] = lo_mm_user
-            self._soft_max_mm[i] = hi_mm_user
-            sp = self.soft_limit_spins[axis]
-            sp["min"].blockSignals(True)
-            sp["max"].blockSignals(True)
-            sp["min"].setValue(lo_mm_user if lo_mm_user is not None else 0.0)
-            sp["max"].setValue(hi_mm_user if hi_mm_user is not None else 0.0)
-            sp["min"].blockSignals(False)
-            sp["max"].blockSignals(False)
-            # Clamp BOTH the combined Move-to-Target spinbox AND the per-axis
-            # card's Move Abs spinbox to the loaded user-frame range.
-            for target_sp in (self.target_spins[axis],
-                              self.per_axis_cards.get(axis, {}).get("target_spin")):
-                if target_sp is None:
-                    continue
-                if lo_mm_user is not None and hi_mm_user is not None and hi_mm_user > lo_mm_user:
-                    target_sp.setRange(lo_mm_user, hi_mm_user)
-                else:
-                    target_sp.setRange(-100000.0, 100000.0)
-            # Readback compare → indicator state. Two conditions trigger
-            # "rounding":
-            #   (a) firmware-stored units differ from what we wrote (≥1 unit),
-            #       which would be a firmware glitch — should be near-zero.
-            #   (b) the USER-TYPED mm differs from the effective firmware mm
-            #       by more than 0.5 unit (rounding to the nearest unit grid).
-            # Otherwise → "synced".
-            written = pending.get(axis)
-            readback = (lo_units_fw, hi_units_fw)
-            typed_pending = (getattr(self, "_soft_limit_pending_typed_mm", {}) or {}).get(axis)
-            if written is not None:
-                fw_glitch = (abs(written[0] - readback[0]) >= 1
-                             or abs(written[1] - readback[1]) >= 1)
-                mm_quantized = False
-                if typed_pending is not None:
-                    # User-frame mm that the firmware quantization effectively
-                    # produced (post round-trip): readback_units → user mm.
-                    eff_min_user = self.units_to_mm_user(readback[0], axis)
-                    eff_max_user = self.units_to_mm_user(readback[1], axis)
-                    eff_lo_user, eff_hi_user = sorted((eff_min_user, eff_max_user))
-                    typed_lo_user, typed_hi_user = sorted(typed_pending)
-                    # Tight tolerance: any user-mm divergence above 1 µm means
-                    # the user typed a value that didn't land exactly on the
-                    # firmware unit grid. The tooltip explains the gap.
-                    tol_mm = 0.001
-                    mm_quantized = (
-                        abs(typed_lo_user - eff_lo_user) > tol_mm
-                        or abs(typed_hi_user - eff_hi_user) > tol_mm
-                    )
-                if fw_glitch or mm_quantized:
-                    self._set_soft_limit_indicator(axis, "rounding", written, readback)
-                    rounding_axes.append(axis.name)
-                else:
-                    self._set_soft_limit_indicator(axis, "synced", written, readback)
-            self._update_soft_limit_resolution_hint(axis)
-        # Clear the pending caches after consumption.
-        self._soft_limit_pending_written = {}
-        self._soft_limit_pending_typed_mm = {}
-        # Refresh map's drawn soft-limit bounding box (user-frame mm).
-        if getattr(self, "workspace_map", None) is not None:
-            self.workspace_map.update_soft_limits(
-                tuple(self._soft_min_mm), tuple(self._soft_max_mm),
-            )
-        if rounding_axes:
-            self.sb_op_label.setText(
-                f"{msg} — rounding on {', '.join(rounding_axes)} (see Sync tooltip)"
-            )
-        else:
-            self.sb_op_label.setText(msg)
-
-    def _on_soft_limits_error(self, msg: str) -> None:
-        self._soft_limit_busy = False
-        self._update_all_button_states()
-        QMessageBox.critical(self, "Soft limit error", msg)
-        self.sb_op_label.setText("Soft limit error")
-
-    # ------------------------------------------------------------------
-    # Homing
-    # ------------------------------------------------------------------
-    def _home_single(self, axis: Axis) -> None:
-        if not self.connected:
-            QMessageBox.warning(self, "Not connected", "Connect first.")
-            return
-        positive = bool(self.home_dir_combos[axis].currentData())
-        dir_word = "POSITIVE" if positive else "NEGATIVE"
-        speed = self.home_speed_spin.value()
-        speed_u = cm_s_to_units_s(speed, axis)
-        reply = QMessageBox.question(
-            self, "Confirm Home",
-            f"Home {axis.name} toward {dir_word} limit at {speed:.2f} cm/s "
-            f"(≈ {speed_u:.2f} units/s on {axis.name}).\n"
-            f"Make sure the path is clear. Continue?",
-            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel,
-        )
-        if reply != QMessageBox.Yes:
-            return
-        self._start_homing([axis])
-
-    def _home_all(self) -> None:
-        if not self.connected:
-            QMessageBox.warning(self, "Not connected", "Connect first.")
-            return
-        order_letters = self.home_order_combo.currentData()
-        axes = [Axis[letter] for letter in order_letters]
-        order_str = " → ".join(a.name for a in axes)
-        per_axis_dir = []
-        for a in axes:
-            d = "POSITIVE" if bool(self.home_dir_combos[a].currentData()) else "NEGATIVE"
-            per_axis_dir.append(f"{a.name}: {d}")
-        speed = self.home_speed_spin.value()
-        reply = QMessageBox.question(
-            self, "Confirm Home All",
-            f"Home all axes in order {order_str} at {speed:.2f} cm/s?\n"
-            f"Per-axis direction → " + ", ".join(per_axis_dir) + "\n"
-            "Make sure the entire workspace is clear. Continue?",
-            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel,
-        )
-        if reply != QMessageBox.Yes:
-            return
-        self._start_homing(axes)
-
-    def _persist_home_direction(self, _idx: int = 0) -> None:
-        payload = _gp_load_settings().get("gantry_panel", {})
-        payload["home_direction"] = {
-            a.name: bool(self.home_dir_combos[a].currentData()) for a in AXES
-        }
-        _gp_save_section("gantry_panel", payload)
-
     def _set_current_as_home_reference(self) -> None:
         """Capture the current XYZ as the home reference. No motion is
         commanded.
 
+        The home reference is stored in ABSOLUTE machine-frame mm (raw SDK
+        readback, no sign flip, no offset). All UI displays then derive
+        their user-frame (home-relative, sign-flipped) values from this.
+
         Source-of-truth precedence:
-          1. The latest poll snapshot (``self._last_pos_mm``), if available.
+          1. The latest poll snapshot (``self._last_pos_abs_mm``), if available.
           2. Otherwise, a direct per-axis ``get_axis_position(axis)`` read,
              which works even when ``get_status()`` is returning the 664 error
              (axis not enabled / not homed yet).
@@ -4543,20 +3905,19 @@ class GantryPanel(QMainWindow):
         if not self.connected:
             QMessageBox.warning(self, "Not connected", "Connect first.")
             return
-        snap = getattr(self, "_last_pos_mm", None)
-        if snap is None:
-            # Fallback: read each axis directly. Captures whatever the SDK
-            # reports for axes that respond, leaves the others untouched.
-            captured: list[float | None] = [None, None, None]
+        snap_abs = getattr(self, "_last_pos_abs_mm", None)
+        if not snap_abs or all(v == 0.0 for v in snap_abs):
+            # Fallback: read each axis directly in absolute machine-frame mm.
+            captured_abs: list[float | None] = [None, None, None]
             errors: list[str] = []
             for i, axis in enumerate(AXES):
                 try:
                     with self._controller_lock:
                         u = float(self.controller.get_axis_position(axis))
-                    captured[i] = self.units_to_mm_user(u, axis)
+                    captured_abs[i] = units_to_mm(u, axis)
                 except Exception as exc:
                     errors.append(f"{axis.name}: {exc}")
-            if not any(c is not None for c in captured):
+            if not any(c is not None for c in captured_abs):
                 QMessageBox.warning(
                     self, "No position yet",
                     "Could not read the current position from the controller.\n\n"
@@ -4565,18 +3926,21 @@ class GantryPanel(QMainWindow):
                       "means an axis is not enabled / not homed).",
                 )
                 return
-            snap = tuple((c if c is not None else 0.0) for c in captured)
-            print(f"[home-ref] captured via per-axis fallback: {snap}", file=sys.stderr)
+            snap_abs = tuple((c if c is not None else 0.0) for c in captured_abs)
+            print(f"[home-ref] captured via per-axis fallback (abs mm): "
+                  f"{snap_abs}", file=sys.stderr)
 
         for i, axis in enumerate(AXES):
-            self._home_position_mm[axis] = float(snap[i])
-        # Also seed _last_pos_mm so the Δ-home line on each card updates
-        # immediately even before the next poll lands.
-        self._last_pos_mm = tuple(float(v) for v in snap)
+            self._home_position_mm[axis] = float(snap_abs[i])
+        # Seed the absolute cache AND zero the user-frame cache so the
+        # per-axis card flips to +0.000 immediately before the next poll.
+        self._last_pos_abs_mm = tuple(float(v) for v in snap_abs)
+        self._last_pos_mm = tuple(0.0 for _ in AXES)
         self._persist_home_position()
         self._refresh_home_displays()
         self.sb_op_label.setText(
-            f"Home ref captured: X={snap[0]:+.2f} Y={snap[1]:+.2f} Z={snap[2]:+.2f} mm"
+            f"Home ref captured (abs mm): X={snap_abs[0]:+.2f} "
+            f"Y={snap_abs[1]:+.2f} Z={snap_abs[2]:+.2f}. User-frame zeroed."
         )
 
     def _persist_home_position(self) -> None:
@@ -4591,87 +3955,37 @@ class GantryPanel(QMainWindow):
     def _refresh_home_displays(self) -> None:
         # Re-render per-axis position readouts using the latest snapshot,
         # and update the workspace map's home marker.
-        snap = getattr(self, "_last_pos_mm", None)
+        # _last_pos_mm is already user-frame (home-relative); no subtraction.
+        snap_user = getattr(self, "_last_pos_mm", None)
+        snap_abs = getattr(self, "_last_pos_abs_mm", None)
         for i, axis in enumerate(AXES):
-            home_mm = self._home_position_mm[axis]
-            cur = snap[i] if snap is not None else None
+            home_mm_abs = self._home_position_mm[axis]
+            cur_user = snap_user[i] if snap_user is not None else None
+            cur_abs = snap_abs[i] if snap_abs is not None else None
             info = self.per_axis_cards.get(axis)
-            if info is not None:
-                if home_mm is not None and cur is not None:
-                    rel = cur - home_mm
-                    info["pos_mm"].setText(f"{rel:+8.3f}")
-                    info["pos_mm"].setToolTip(
-                        f"From home  ·  abs {cur:+.3f} mm"
-                    )
-                    lbl = info.get("home_label")
-                    if lbl:
-                        lbl.setText("⌂ from home")
-                        lbl.setStyleSheet("color: #4ea1ff; font-size: 11px;")
-                elif cur is not None:
-                    info["pos_mm"].setText(f"{cur:+8.3f}")
-                    info["pos_mm"].setToolTip("No home set — raw machine position")
-                    lbl = info.get("home_label")
-                    if lbl:
-                        lbl.setText("⚠ no home")
-                        lbl.setStyleSheet("color: #ffa726; font-size: 11px;")
+            if info is None or cur_user is None:
+                continue
+            info["pos_mm"].setText(f"{cur_user:+8.3f}")
+            abs_str = f"{cur_abs:+.3f} mm" if cur_abs is not None else "—"
+            info["pos_mm"].setToolTip(
+                f"User-frame (home-relative)  ·  abs {abs_str}"
+            )
+            lbl = info.get("home_label")
+            if lbl:
+                if home_mm_abs is not None:
+                    lbl.setText("⌂ from home")
+                    lbl.setStyleSheet("color: #4ea1ff; font-size: 11px;")
+                else:
+                    lbl.setText("⚠ no home")
+                    lbl.setStyleSheet("color: #ffa726; font-size: 11px;")
         if getattr(self, "workspace_map", None) is not None:
-            home_xyz = tuple(self._home_position_mm[a] for a in AXES)
-            self.workspace_map.update_home(home_xyz)
-
-    def _start_homing(self, axes: list[Axis]) -> None:
-        if self._blocked_by_estop():
-            return
-        EMERGENCY_STOP.clear()
-        self._abort_event.clear()
-        self._homing_in_progress = True
-        self._update_all_button_states()
-        self.sb_op_label.setText(f"Homing {' → '.join(a.name for a in axes)}…")
-        self.sb_op_label.setStyleSheet("color: #ffa726; font-weight: bold;")
-        # Per-axis direction map: read each axis's combo.
-        positive_limits = {
-            int(a): bool(self.home_dir_combos[a].currentData()) for a in AXES
-        }
-        self._home_thread = HomingThread(
-            self.controller, axes,
-            speed_cm_s=self.home_speed_spin.value(),
-            acc_dec_cm_s2=self.home_acc_spin.value(),
-            fall_step_mm=self.home_fall_spin.value(),
-            positive_limits=positive_limits,
-            lock=self._controller_lock,
-            abort_event=self._abort_event,
-        )
-        self._home_thread.axis_started.connect(self._on_homing_axis_started)
-        self._home_thread.axis_done.connect(self._on_homing_axis_done)
-        self._home_thread.all_done.connect(self._on_homing_all_done)
-        self._home_thread.finished.connect(self._home_thread.deleteLater)
-        self._home_thread.start()
-
-    def _on_homing_axis_started(self, axis: Axis) -> None:
-        self.sb_op_label.setText(f"Homing {axis.name}…")
-
-    def _on_homing_axis_done(self, axis: Axis, err: str) -> None:
-        if err:
-            if err != "aborted":
-                QMessageBox.warning(self, "Homing error", f"{axis.name}: {err}")
-            return
-        # Capture the just-homed axis's current mm as the home reference.
-        snap = getattr(self, "_last_pos_mm", None)
-        if snap is not None:
-            self._home_position_mm[axis] = float(snap[int(axis)])
-            self._persist_home_position()
-            self._refresh_home_displays()
-
-    def _on_homing_all_done(self, err: str) -> None:
-        self._homing_in_progress = False
-        # Don't drop ref here — see _on_axis_abs_done docstring (QThread GC race).
-        self.sb_op_label.setStyleSheet("color: #ccc;")
-        if err:
-            self.sb_op_label.setText(f"Homing aborted: {err[:80]}")
-        else:
-            self.sb_op_label.setText("Homing complete")
-        # Refresh state.
-        self._load_soft_limits()
-        self._update_all_button_states()
+            # Workspace map operates in user-frame. Home shown at the origin
+            # of user-frame, so pass (0,0,0) when home is set; else None.
+            home_xyz_user = tuple(
+                0.0 if self._home_position_mm[a] is not None else None
+                for a in AXES
+            )
+            self.workspace_map.update_home(home_xyz_user)
 
     # ------------------------------------------------------------------
     # Move to target
@@ -4680,7 +3994,7 @@ class GantryPanel(QMainWindow):
         if not self.connected:
             QMessageBox.warning(self, "Not connected", "Connect first.")
             return
-        if self._move_in_progress or self._sequence_in_progress or self._homing_in_progress:
+        if self._move_in_progress or self._sequence_in_progress:
             return
         if self._blocked_by_estop():
             return
@@ -4689,16 +4003,8 @@ class GantryPanel(QMainWindow):
             self.target_spins[Axis.Y].value(),
             self.target_spins[Axis.Z].value(),
         )
-        # Soft-limit guard — panel-side, user-frame mm, BEFORE the SDK call.
-        wp_user = Waypoint(target_mm_user[0], target_mm_user[1], target_mm_user[2],
-                           self.move_speed_spin.value() * 10.0, 0.0)
-        try:
-            _validate_soft_limits([wp_user], self._soft_min_mm, self._soft_max_mm)
-        except SystemExit as exc:
-            QMessageBox.warning(self, "Soft limit violation (panel-side)", str(exc))
-            return
 
-        # Convert user mm → firmware-frame mm (sign flip) for move_to_xyz_mm,
+        # Convert user mm → absolute machine-frame mm for move_to_xyz_mm,
         # which internally uses mm_to_units(...) per axis without any sign.
         target_mm_fw = tuple(
             self.mm_user_to_mm_firmware(target_mm_user[i], AXES[i]) for i in range(3)
@@ -4767,50 +4073,17 @@ class GantryPanel(QMainWindow):
     def _start_jog(self, axis: Axis, direction: int) -> None:
         if not self.connected:
             return
-        if (self._homing_in_progress or self._sequence_in_progress
+        if (self._sequence_in_progress
                 or self._move_in_progress or int(axis) in self._per_axis_busy):
             return
         if self._blocked_by_estop():
             return
-        # Software soft-limit projection: refuse if a ~100 ms forward projection
-        # at the requested jog speed would exit the configured limits. This
-        # runs even if the firmware soft limit is wrong or unset.
-        lo_user = self._soft_min_mm[int(axis)]
-        hi_user = self._soft_max_mm[int(axis)]
-        cur_pos_user = None
-        snap = getattr(self, "_last_pos_mm", None)
-        if snap is not None:
-            # _last_pos_mm is cached in user-frame mm (see _on_status_snapshot).
-            cur_pos_user = float(snap[int(axis)])
-        if cur_pos_user is not None and (lo_user is not None or hi_user is not None):
-            jog_mm_s = self.jog_speed_spin.value() * 10.0
-            projection = cur_pos_user + direction * jog_mm_s * 0.10
-            if lo_user is not None and projection < lo_user:
-                QMessageBox.warning(
-                    self, "Soft limit (panel-side)",
-                    f"{axis.name}: projecting position {cur_pos_user:+.2f} mm + "
-                    f"{direction * jog_mm_s * 0.10:+.2f} mm = {projection:+.2f} mm "
-                    f"would exit min {lo_user:+.2f} mm. Jog refused.",
-                )
-                return
-            if hi_user is not None and projection > hi_user:
-                QMessageBox.warning(
-                    self, "Soft limit (panel-side)",
-                    f"{axis.name}: projecting position {cur_pos_user:+.2f} mm + "
-                    f"{direction * jog_mm_s * 0.10:+.2f} mm = {projection:+.2f} mm "
-                    f"would exit max {hi_user:+.2f} mm. Jog refused.",
-                )
-                return
         EMERGENCY_STOP.clear()
-        self._abort_event.clear()
         self._ensure_logger_started(auto=True)
         # cm/s → units/s conversion for single-axis jog.
         speed_units = max(cm_s_to_units_s(self.jog_speed_spin.value(), axis), 0.001)
         acc_units   = max(cm_s2_to_units_s2(self.jog_acc_spin.value(), axis), 0.001)
         dec_units   = max(cm_s2_to_units_s2(self.jog_dec_spin.value(), axis), 0.001)
-        # 999999 * fw_direction = "jog until release" sentinel, same as manual_pad.
-        # fw_direction inverts when axis_sign[axis] == -1 so the panel button's
-        # user-facing +/- agrees with what the user expects.
         fw_direction = self.jog_direction_user_to_firmware(direction, axis)
         try:
             with self._controller_lock:
@@ -4840,6 +4113,10 @@ class GantryPanel(QMainWindow):
     def _go_to_home_axis(self, axis: Axis) -> None:
         """Per-axis 'Go Home' button: move-abs to the captured home reference.
 
+        Home reference is stored in absolute machine-frame mm. In user-frame
+        the home position is, by definition, 0.0 mm — so this is a move-abs
+        to user-frame 0 on this axis.
+
         Distinct from physical-limit-switch homing (Setup tab → Homing → Home X).
         Uses the same machinery as Move Abs, so soft-limit + axis-sign + the
         live watchdog all apply unchanged.
@@ -4847,25 +4124,19 @@ class GantryPanel(QMainWindow):
         if not self.connected:
             QMessageBox.warning(self, "Not connected", "Connect first.")
             return
-        home_user = self._home_position_mm.get(axis)
-        if home_user is None:
+        if self._home_position_mm.get(axis) is None:
             QMessageBox.warning(
                 self,
                 "No home reference",
                 f"{axis.name} has no home reference yet.\n\n"
-                "Set one via Setup → Homing → 'Set Current as Home Reference' "
-                f"(captures current XYZ, no motion), or run Setup → Homing → "
-                f"'Home {axis.name}' to drive {axis.name} to its physical limit "
-                "switch first (that auto-captures the reference).",
+                "Set one via Setup tab → 'Set Current as Home Reference' "
+                "(captures the current XYZ as the user-frame origin; no motion).",
             )
             return
-        # Populate the per-axis card's target spin so the user sees what's
-        # commanded, then call the existing move-abs path. _move_axis_abs
-        # handles soft-limit checks, sign flip, lock, abort_event, button
-        # state, and finished signal.
+        # Target = user-frame 0 mm on this axis.
         spin = self.per_axis_cards.get(axis, {}).get("target_spin")
         if spin is not None:
-            spin.setValue(float(home_user))
+            spin.setValue(0.0)
         self._move_axis_abs(axis)
 
     def _move_axis_abs(self, axis: Axis) -> None:
@@ -4873,22 +4144,12 @@ class GantryPanel(QMainWindow):
             QMessageBox.warning(self, "Not connected", "Connect first.")
             return
         if (self._move_in_progress or self._sequence_in_progress
-                or self._homing_in_progress or int(axis) in self._per_axis_busy):
+                or int(axis) in self._per_axis_busy):
             return
         if self._blocked_by_estop():
             return
         # User-facing mm target.
         target_mm_user = self.per_axis_cards[axis]["target_spin"].value()
-        lo = self._soft_min_mm[int(axis)]
-        hi = self._soft_max_mm[int(axis)]
-        if lo is not None and target_mm_user < lo:
-            QMessageBox.warning(self, "Soft limit (panel-side)",
-                                f"{axis.name}={target_mm_user:.3f} mm < min {lo:.3f} mm")
-            return
-        if hi is not None and target_mm_user > hi:
-            QMessageBox.warning(self, "Soft limit (panel-side)",
-                                f"{axis.name}={target_mm_user:.3f} mm > max {hi:.3f} mm")
-            return
 
         EMERGENCY_STOP.clear()
         self._abort_event.clear()
@@ -5046,7 +4307,7 @@ class GantryPanel(QMainWindow):
         if not self.connected:
             QMessageBox.warning(self, "Not connected", "Connect first.")
             return
-        if self._move_in_progress or self._sequence_in_progress or self._homing_in_progress:
+        if self._move_in_progress or self._sequence_in_progress:
             return
         if self._blocked_by_estop():
             return
@@ -5058,13 +4319,8 @@ class GantryPanel(QMainWindow):
         if not waypoints_user:
             QMessageBox.information(self, "No waypoints", "Add at least one row first.")
             return
-        try:
-            _validate_soft_limits(waypoints_user, self._soft_min_mm, self._soft_max_mm)
-        except SystemExit as exc:
-            QMessageBox.warning(self, "Soft limit violation (panel-side)", str(exc))
-            return
 
-        # Convert user-frame waypoints to firmware-frame for SequenceThread.
+        # Convert user-frame waypoints to absolute machine-frame for SequenceThread.
         waypoints_fw = [
             Waypoint(
                 x_mm=self.mm_user_to_mm_firmware(w.x_mm, Axis.X),
@@ -5379,18 +4635,10 @@ class GantryPanel(QMainWindow):
         connected = self.connected
         busy = (
             self._move_in_progress
-            or self._homing_in_progress
             or self._sequence_in_progress
             or bool(self._per_axis_busy)
         )
-        # Motion / homing / soft-limit / record buttons enabled only if connected
-        # and (for motion) not busy.
-        for axis in AXES:
-            self.home_btns[axis].setEnabled(connected and not busy)
-            self.soft_limit_spins[axis]["apply_btn"].setEnabled(not self._soft_limit_busy)
-        self.home_all_btn.setEnabled(connected and not busy)
-        self.load_limits_btn.setEnabled(not self._soft_limit_busy)
-        self.apply_all_limits_btn.setEnabled(not self._soft_limit_busy)
+        # Motion / record buttons enabled only if connected and not busy.
         self.move_btn.setEnabled(connected and not busy)
         self.use_current_btn.setEnabled(connected)
         self.run_seq_btn.setEnabled(connected and not busy)
@@ -5399,10 +4647,8 @@ class GantryPanel(QMainWindow):
         self.pause_btn.setEnabled(connected)
         self.resume_btn.setEnabled(connected)
         self.stop_run_btn.setEnabled(connected)
-        # Per-Axis Control cards: jog buttons + Move Abs + Home — disabled when
-        # disconnected, when homing/sequence is running, or when ANY Move Abs
-        # is in flight on any axis. Self-axis is also disabled when its own
-        # Move Abs is in flight (covered by "busy" via _per_axis_busy).
+        # Per-Axis Control cards: jog + Move Abs + Go Home buttons — disabled
+        # when disconnected or when ANY Move Abs is in flight on any axis.
         for axis in AXES:
             info = self.per_axis_cards.get(axis)
             if info is None:
@@ -5628,8 +4874,7 @@ class GantryPanel(QMainWindow):
             except Exception:
                 pass
 
-        for thread_attr in ("_status_thread", "_move_thread",
-                            "_home_thread", "_sequence_thread"):
+        for thread_attr in ("_status_thread", "_move_thread", "_sequence_thread"):
             _safe_wait(getattr(self, thread_attr, None))
         for t in list(self._per_axis_threads.values()):
             _safe_wait(t)

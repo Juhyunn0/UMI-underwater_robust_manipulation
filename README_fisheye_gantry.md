@@ -35,9 +35,19 @@ pass any flag.
 
 ## Gantry Control Panel (PyQt5)
 
-`src/gantry_panel.py` is the day-to-day operator UI. It binds every primitive
-in `gantry_runner.py` (move, log, soft limits, homing, sequence) to live
-widgets with a dark theme and a worker-per-task threading model.
+`src/gantry_panel.py` is the day-to-day operator UI. It binds the move /
+log / sequence primitives in `gantry_runner.py` to live widgets with a
+dark theme and a worker-per-task threading model.
+
+> **Removed by user request:** the panel no longer exposes a soft-limit
+> editor, the live soft-limit watchdog, or physical limit-switch
+> calibration ("Calibrate X/Y/Z to Limit"). The Setup tab is now reduced
+> to **Set Current as Home Reference** + Axis Direction toggles. Whatever
+> soft limits are stored on the firmware are still enforced by the
+> controller; the panel just doesn't read/write them anymore. Use
+> `gantry_runner.py`'s CLI flags (`--soft-limit-min-mm` /
+> `--soft-limit-max-mm`) if you need to control firmware-side limits
+> from the command line.
 
 > **Units:** Velocities and accelerations are displayed and entered in **cm/s**
 > and **cm/s²**. Positions remain in **mm**. Calibration source:
@@ -107,9 +117,9 @@ The right pane's four tabs are:
 
 | Tab | Contents |
 |---|---|
-| **Control** | Per-Axis Control (jog + Move Abs + per-axis Home cards) + the combined Move to Target panel. |
+| **Control** | Per-Axis Control (jog + Move Abs + per-axis blue Go Home cards) + the combined Move to Target panel. |
 | **Sequences** | The waypoint `QTableWidget` plus Add Row / Remove Selected / Load CSV / Save CSV / Run Sequence / Stop Sequence. |
-| **Setup** | Software Limits group + the shared Homing group + **Pool Orientation** (which gantry axis is the pool's long axis). |
+| **Setup** | Home Reference group (Set Current as Home Reference + per-axis Axis Direction toggles). |
 | **Recording** | Start/Stop Recording, the clickable CSV path label, and the 30 s rolling per-axis position plot. |
 
 The left pane stays visible no matter which tab is active, so you always see live position and the workspace map. The splitter between left/right is draggable; default ratio 38/62, window default `1500 × 900`, minimum `1280 × 800`. The last-active tab is persisted to `~/.umi_gui_state.json` under `gantry_panel.active_tab` and restored on next launch.
@@ -175,82 +185,42 @@ side-by-side cards, one shared parameter row at the top:
   `GantryTelemetryLogger` and auto-stop ~500 ms after the axis reports
   stopped.
 
-### Homing procedure
+### Home reference workflow
 
-1. Click **Connect** — soft limits are auto-loaded into the spinboxes and into
-   the per-axis progress bars.
-2. Set the Homing parameters:
-   - **Home Speed (cm/s)**: default 5.0. Converted per axis to controller
-     units/s at run time (X ≈ 6.06, Y ≈ 20.0 at max 5 cm/s; Z is always
-     clamped to `HOME_SPEED_LIMIT_UNITS` = 20.0 u/s).
-   - **Home Accel/Decel (cm/s²)**: default 5.0.
-   - **Fall Step (mm)**: default 25.0.
-   - **Direction**: Positive limit (default) or Negative limit.
-3. Click **Home X** / **Home Y** / **Home Z** for a single axis, or **Home
-   All** with the order dropdown (default `Z → X → Y` so the tool lifts before
-   any XY motion).
-4. Confirmation dialog → confirm. Status bar turns yellow with `Homing …`.
-   Every motion / soft-limit / record button is disabled during homing;
-   **Emergency Stop stays enabled**.
-5. On completion the panel auto-refreshes position and re-reads soft limits
-   (homing can change the origin).
+The Setup tab now has a single section: **Home Reference**.
 
-### Soft-limit workflow
+1. Manually jog the gantry to where you want home to be.
+2. Click **Set Current as Home Reference**. The panel snapshots the current
+   absolute machine-frame XYZ from the SDK and stores it as the per-axis
+   home offset. User-frame readouts on each Control-tab axis card jump to
+   `+0.000` mm.
+3. **Axis Direction** toggles (`+1` / `-1` per axis) live in the same
+   section. If clicking X+ on the panel moves the gantry in what you
+   consider the negative direction, flip that axis to `-1`. The panel
+   inverts the user-facing direction (display + commanded jog/move) without
+   touching the firmware counter. Persisted to `~/.umi_gui_state.json`
+   under `gantry_panel.axis_sign`.
 
-| Action | What happens |
-|---|---|
-| **Connect** | Reads `controller.get_device_parameters()`, converts units → mm via `SCALE_MM_PER_UNIT`, populates per-axis Min/Max spinboxes, clamps Move-target spinboxes to that range, and configures each axis card's progress bar. |
-| **Apply X / Y / Z** | Worker thread reads current `DeviceParameters` under the controller lock, mutates the one axis's `soft_limit_min[idx]` / `soft_limit_max[idx]` in raw units, writes back, re-reads to confirm. **Then** compares written vs readback (1-unit threshold) and updates the per-axis Sync indicator. |
-| **Apply All** | Confirmation dialog shows a **per-axis diff** (current vs proposed in mm). On confirm, single worker writes all three axes in one read-mutate-write block. |
-| **Load from Controller** | Re-reads device state without writing — useful after homing or out-of-band controller changes. |
+The blue **Go Home** button on each Control-tab axis card does a Move Abs
+to user-frame 0 mm for that axis (i.e. back to the captured reference).
+This is the everyday "return to home" operation.
 
-The read-mutate-write happens entirely inside one `with self._controller_lock:`
-block. The status-polling thread uses the same RLock, so the worst that
-happens during an apply is one 100 ms status tick being delayed.
+### Frame convention (user-frame mm everywhere)
 
-#### Sync indicator (per axis)
+Every mm value you see in the panel is in **user-frame**:
 
-A small dot at the right of each row reports what the firmware actually
-stored after the most recent Apply:
+- **HOME-RELATIVE** — zero is wherever you last captured the home reference
+  via Setup → Set Current as Home Reference.
+- **SIGN-FLIPPED** — when an axis has Axis Direction = −1, the panel's `+`
+  matches your physical intuition even if the firmware counter decreases.
 
-| Indicator | Meaning |
-|---|---|
-| 🟢 **Synced** | Written units = readback units **and** the user-typed mm matches the effective firmware mm within 1 µm. |
-| 🟡 **Rounding** | Either firmware readback diverged by ≥1 unit (firmware glitch), or the user-typed mm doesn't land exactly on the `SCALE_MM_PER_UNIT[axis]` grid. Hover the dot for the exact gap in user-frame mm. |
-| ⚪ **Unknown** | Not applied this session yet. |
-
-The gray sub-row beneath each spinbox shows `1 unit = K mm → effective min/max: A / B mm`
-live — what the firmware will actually store after `int(round(mm/scale))`,
-sign-flipped for the current axis direction. Enable **Snap to unit grid**
-(default ON) and the spinbox snaps to the nearest exact unit boundary
-on `editingFinished`, so what-you-see equals what-firmware-stores.
-
-#### Always-on panel-side enforcement
-
-Every motion entry point (jog, Move Abs, Move to Target, Run Sequence,
-Experiment) now runs a soft-limit check **before** the SDK call, against
-`self._soft_min_mm / self._soft_max_mm` (user-frame mm), independent of
-the firmware-side limit. Jog also projects ~100 ms forward at the
-requested speed and refuses if the projection would exit the envelope.
-A refused move surfaces a `Soft limit (panel-side)` dialog with the exact
-target vs limit, and no SDK call is issued.
-
-### Axis Direction (manual sign toggle)
-
-If clicking `X+` on the panel makes the gantry move in what you consider
-the negative direction, open Setup → Software Limits → **Axis Direction**
-and toggle that axis from `+1` to `-1`. The panel multiplies all
-user-entered mm values by the per-axis sign **before** `mm_to_units(...)`
-for jog / Move Abs / Move to Target / Home / soft-limit Apply / Experiment,
-**and** multiplies the SDK readback by the same sign for display. The flip
-lives entirely in the panel; firmware sees only firmware-frame units. The
-sign is persisted to `~/.umi_gui_state.json` under `gantry_panel.axis_sign`.
-
-The toggle does **not** command any test motion. After flipping, jog the
-axis a few mm manually, watch the position readout, and confirm the
-displayed sign now matches your physical intuition. Toggling sign resets
-the Sync indicator to ⚪ Unknown for that axis — re-apply soft limits to
-restore 🟢 / 🟡.
+All UI fields share this frame: the per-axis position readout, the
+Move-to-Target spinboxes, the per-axis card's target spin, the waypoints
+table, the workspace map. Internal absolute machine-frame mm is only used
+at the SDK boundary and is exposed for diagnostics in the position tooltip
+(`abs +XXX.XXX mm`) and in `run_metadata.json` (the
+`home_reference_abs_mm` field lets you reconstruct user-frame from the
+absolute samples in `gantry_telemetry.csv` post-hoc).
 
 ### Emergency Stop semantics
 
