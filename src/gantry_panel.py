@@ -1756,8 +1756,6 @@ class WorkspaceMap(QWidget):
     def _refresh(self) -> None:
         view_bounds = self._compute_view_bounds()
         pool_bounds = self._pool_bounds()
-        print(f"[map] mode={self.fit_combo.currentData()}  view_bounds={view_bounds}",
-              file=sys.stderr, flush=True)
         self._backend.render(
             cur_pos=self._cur_pos,
             target=self._target if self._show_target else None,

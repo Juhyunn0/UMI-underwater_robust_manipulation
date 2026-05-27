@@ -3359,18 +3359,76 @@ function drawTrajectory() {
   );
 }
 
+function gantryAlignedPoint(row, offset) {
+  return [
+    row.gantry_x_mm / 1000 - offset[0],
+    row.gantry_y_mm / 1000 - offset[1],
+    row.gantry_z_mm / 1000 - offset[2],
+  ];
+}
+
+function gantryHasData(row) {
+  return row && Number.isFinite(row.gantry_x_mm)
+              && Number.isFinite(row.gantry_y_mm)
+              && Number.isFinite(row.gantry_z_mm);
+}
+
+function drawGantryTrajectory() {
+  if (DATA.camera.length === 0 || !gantryHasData(DATA.camera[0])) {
+    return;
+  }
+  // First-sample alignment: pin gantry start to camera (apriltag-SLAM) start
+  // so both trajectories share an origin without needing T_gantry_camera here.
+  const c0 = DATA.camera[0];
+  const offset = [
+    (c0.gantry_x_mm / 1000) - c0.x_m,
+    (c0.gantry_y_mm / 1000) - c0.y_m,
+    (c0.gantry_z_mm / 1000) - c0.z_m,
+  ];
+  const end = Math.min(currentIndex, DATA.camera.length - 1);
+  const gantryColor = "rgba(255, 165, 0, 0.92)";  // orange
+  for (let i = 1; i <= end; i++) {
+    const a = DATA.camera[i - 1];
+    const b = DATA.camera[i];
+    if (!gantryHasData(a) || !gantryHasData(b)) continue;
+    drawLine3d(
+      gantryAlignedPoint(a, offset),
+      gantryAlignedPoint(b, offset),
+      gantryColor,
+      2.0,
+      [],
+    );
+  }
+  // Dots along the gantry path (sparser than camera) + current marker.
+  for (let i = 0; i <= end; i += 8) {
+    const row = DATA.camera[i];
+    if (!gantryHasData(row)) continue;
+    drawPoint3d(gantryAlignedPoint(row, offset), "#ff8c00", 2.4);
+  }
+  const cur = DATA.camera[end];
+  if (gantryHasData(cur)) {
+    const p = gantryAlignedPoint(cur, offset);
+    drawPoint3d(
+      p, "#d97500", 7,
+      `Gantry (${(p[0] * 100).toFixed(1)}, ${(p[1] * 100).toFixed(1)}, ${(p[2] * 100).toFixed(1)}) cm`,
+    );
+  }
+}
+
 function drawLegend() {
   const width = canvas.clientWidth;
+  const hasGantry = DATA.camera.length > 0 && gantryHasData(DATA.camera[0]);
+  const boxH = hasGantry ? 140 : 112;
   const x = width - 270;
   const y = 18;
   ctx.fillStyle = "rgba(255, 255, 255, 0.88)";
   ctx.strokeStyle = "#c8d0d8";
   ctx.lineWidth = 1;
-  ctx.fillRect(x, y, 246, 112);
-  ctx.strokeRect(x, y, 246, 112);
+  ctx.fillRect(x, y, 246, boxH);
+  ctx.strokeRect(x, y, 246, boxH);
   ctx.font = "12px Arial";
   ctx.fillStyle = "#17202a";
-  ctx.fillText("Trajectory: old faint -> recent solid", x + 12, y + 22);
+  ctx.fillText("AprilTag SLAM: old faint -> recent solid", x + 12, y + 22);
   for (let i = 0; i < 96; i++) {
     ctx.fillStyle = trajectoryColor(Math.round((DATA.camera.length - 1) * i / 95));
     ctx.fillRect(x + 12 + i, y + 34, 1, 9);
@@ -3379,6 +3437,12 @@ function drawLegend() {
   ctx.fillText("Dashed/gray: no tag detection", x + 12, y + 62);
   ctx.fillText("Bright tags/lines: active constraints", x + 12, y + 82);
   ctx.fillText("Faint tags: in graph, inactive", x + 12, y + 102);
+  if (hasGantry) {
+    ctx.fillStyle = "rgba(255, 165, 0, 0.92)";
+    ctx.fillRect(x + 12, y + 120, 24, 4);
+    ctx.fillStyle = "#17202a";
+    ctx.fillText("Gantry (first-sample-zeroed)", x + 44, y + 124);
+  }
 }
 
 function drawInfoPanel() {
@@ -3683,6 +3747,7 @@ function drawScene() {
   drawTags();
   drawAnchorOrigin();
   drawTrajectory();
+  drawGantryTrajectory();
   drawLegend();
   drawInfoPanel();
   updateLabel();

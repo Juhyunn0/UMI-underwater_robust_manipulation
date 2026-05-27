@@ -293,6 +293,11 @@ class FisheyeWorkerThread(QThread):
         )
         trajectory_recorder.output_dir = self._run_dir
         trajectory_recorder.frames_dir = self._run_dir / "frames"
+        # TrajectoryRecorder.start() normally creates frames_dir, but we're
+        # bypassing it here by setting fields directly — so we must mkdir
+        # ourselves or every cv2.imwrite below silently fails and spams
+        # "Warning: could not save ZED trajectory frame ..." to stderr.
+        trajectory_recorder.frames_dir.mkdir(parents=True, exist_ok=True)
         trajectory_recorder.active = True
         trajectory_recorder.start_monotonic_s = self._t0
         trajectory_recorder.samples = []
@@ -379,8 +384,10 @@ class FisheyeWorkerThread(QThread):
                     pass
             if cap is not None and hasattr(cap, "release"):
                 cap.release()
-            if trajectory_recorder.samples:
-                trajectory_recorder.active = False
+            # NOTE: do NOT set trajectory_recorder.active = False here.
+            # stop_and_save() short-circuits on `if not self.active: return None`,
+            # so flipping it early makes the postprocess write nothing while
+            # silently filling the metadata with paths that don't exist.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -563,10 +570,23 @@ class PostprocessThread(QThread):
             self.progress.emit("Writing camera trajectory CSV + HTML…")
             if recorder is not None and recorder.samples and backend is not None:
                 try:
-                    recorder.stop_and_save(backend)
-                    result["camera_trajectory_csv"] = str(run_dir / "camera_trajectory.csv")
-                    result["tag_poses_csv"]          = str(run_dir / "tag_poses.csv")
-                    result["trajectory_html"]        = str(run_dir / "trajectory_interactive.html")
+                    out = recorder.stop_and_save(backend)
+                    if out is None:
+                        errors.append(
+                            "recorder.stop_and_save returned None — recorder "
+                            "was inactive or had no optimized camera poses; "
+                            "trajectory CSV/HTML were not written"
+                        )
+                    else:
+                        # Only advertise the outputs that actually exist on disk.
+                        for key, fname in (
+                            ("camera_trajectory_csv", "camera_trajectory.csv"),
+                            ("tag_poses_csv",          "tag_poses.csv"),
+                            ("trajectory_html",        "trajectory_interactive.html"),
+                        ):
+                            p = run_dir / fname
+                            if p.exists():
+                                result[key] = str(p)
                 except Exception as exc:
                     errors.append(f"recorder.stop_and_save: {exc}")
 
