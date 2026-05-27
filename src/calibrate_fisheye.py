@@ -712,7 +712,7 @@ class CalibrateWindow(QMainWindow):
         # Frame display state
         self._latest_frame:  Any   = None
         self._last_render_t: float = 0.0
-        self._frame_count:   int   = 0
+        self._last_detect_t: float = 0.0
         self._detected:      bool  = False
         self._current_corners: Any = None
         self._preview_fps:   float = 0.0
@@ -1329,8 +1329,8 @@ class CalibrateWindow(QMainWindow):
             self._fps_t0      = now
             self._update_status_bar()
 
-        self._frame_count += 1
-        if self._frame_count % 2 == 0 and _HAVE_CV2:
+        if _HAVE_CV2 and now - self._last_detect_t >= 0.1:
+            self._last_detect_t = now
             self._detect_corners(frame)
 
         if now - self._last_render_t >= 1.0 / _DISPLAY_FPS:
@@ -1356,20 +1356,35 @@ class CalibrateWindow(QMainWindow):
         rows  = self._rows_spin.value()
         ptype = self._pattern_combo.currentIndex()
 
+        # Live HUD detection only. RecordWorker re-detects with subpix on
+        # every saved frame, so this path can downscale + skip subpix.
+        h, w = gray.shape[:2]
+        det_w = 640
+        if w > det_w:
+            scale = det_w / w
+            det_gray = cv2.resize(
+                gray, (det_w, int(h * scale)), interpolation=cv2.INTER_AREA
+            )
+        else:
+            scale = 1.0
+            det_gray = gray
+
         if ptype == 0:
             ok, corners = cv2.findChessboardCorners(
-                gray, (cols, rows),
-                cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE,
+                det_gray, (cols, rows),
+                cv2.CALIB_CB_ADAPTIVE_THRESH
+                + cv2.CALIB_CB_NORMALIZE_IMAGE
+                + cv2.CALIB_CB_FAST_CHECK,
             )
-            if ok and corners is not None:
-                crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-                corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), crit)
         elif ptype == 1:
-            ok, corners = cv2.findCirclesGrid(gray, (cols, rows), None)
+            ok, corners = cv2.findCirclesGrid(det_gray, (cols, rows), None)
         else:
             ok, corners = cv2.findCirclesGrid(
-                gray, (cols, rows), None, cv2.CALIB_CB_ASYMMETRIC_GRID
+                det_gray, (cols, rows), None, cv2.CALIB_CB_ASYMMETRIC_GRID
             )
+
+        if ok and corners is not None and scale != 1.0:
+            corners = corners / np.float32(scale)
 
         self._detected        = bool(ok)
         self._current_corners = corners if ok else None
@@ -1415,7 +1430,7 @@ class CalibrateWindow(QMainWindow):
             qimg  = QImage(rgb.data, w_px, h_px, w_px * 3, QImage.Format_RGB888)
             pix   = QPixmap.fromImage(qimg)
             scaled = pix.scaled(
-                self._preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                self._preview.size(), Qt.KeepAspectRatio, Qt.FastTransformation
             )
             self._preview.setPixmap(scaled)
         except Exception:

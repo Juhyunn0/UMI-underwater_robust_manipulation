@@ -461,7 +461,10 @@ class MotionWorkerThread(QThread):
                         waypoint_index=i,
                     )
                 except Exception as exc:
+                    import traceback
                     err = f"waypoint[{i}]: {exc}"
+                    print(f"[motion-worker] {err}", file=sys.stderr)
+                    traceback.print_exc()
                     self.waypoint_done.emit(i, err)
                     self.motion_done.emit(err)
                     return
@@ -783,6 +786,7 @@ class ExperimentRunner(QObject):
         self._settle_timer: QTimer | None = None
         self._countdown_remaining: float = 0.0
         self._aborted = False
+        self._motion_error: str = ""
 
     # ---- public API --------------------------------------------------------
 
@@ -802,7 +806,52 @@ class ExperimentRunner(QObject):
             return
         self._config = config
         self._aborted = False
+        self._motion_error = ""
         self._enter_countdown()
+
+    def start_recording(self, config: ExperimentConfig) -> None:
+        """Manual recording session: start the gantry telemetry logger and (if
+        configured) the fisheye AprilTag SLAM worker, and sit in MOTION phase
+        until ``stop_experiment()`` is called. No countdown, no motion thread,
+        no settle. The user moves the gantry by hand from the Control tab while
+        this is running; stop triggers the standard postprocess pipeline which
+        writes the same plots/CSVs/HTML as a full experiment."""
+        if not self.is_idle():
+            self.error.emit("Cannot start: experiment already running")
+            return
+        self._config = config
+        self._aborted = False
+        self._motion_error = ""
+
+        from tagslam_core import make_run_dir
+        self._run_dir = make_run_dir(config.output_root, "recording")
+        if config.run_name:
+            new_dir = self._run_dir.parent / (self._run_dir.name + "_" + config.run_name)
+            try:
+                self._run_dir.rename(new_dir)
+                self._run_dir = new_dir
+            except Exception:
+                pass
+
+        self._t0 = time.monotonic()
+        self._gantry_logger = GantryTelemetryLogger(
+            config.controller,
+            self._run_dir / "gantry_telemetry.csv",
+            log_hz=config.log_hz,
+            lock=config.controller_lock,
+            t0_monotonic=self._t0,
+        )
+        self._gantry_logger.start()
+
+        if config.fisheye_args is not None:
+            self._start_fisheye_thread()
+
+        # Sit in MOTION until the user stops. stop_experiment() already
+        # handles MOTION → _stop_all_workers() → _enter_postprocess().
+        self._set_phase(
+            Phase.MOTION,
+            "Recording — move gantry manually, click Stop to finish",
+        )
 
     def stop_experiment(self) -> None:
         if self._phase in (Phase.IDLE, Phase.DONE):
@@ -894,7 +943,14 @@ class ExperimentRunner(QObject):
 
     def _on_motion_done(self, err: str) -> None:
         if err and err != "aborted":
+            # Motion failed (controller exception, disconnect, etc). Don't
+            # pretend everything is fine and proceed through settle — capture
+            # the error, skip settle, and surface it on the result.
+            self._motion_error = err
+            self._aborted = True
             self.error.emit(f"Motion error: {err}")
+            self._enter_postprocess()
+            return
         if self._aborted:
             self._enter_postprocess()
             return
@@ -941,7 +997,11 @@ class ExperimentRunner(QObject):
             return  # already handled by finished-signal fallback
         if err:
             self.error.emit(f"Post-process warnings: {err}")
-        self._set_phase(Phase.DONE, "Experiment complete.")
+        if self._motion_error:
+            result["motion_error"] = self._motion_error
+            self._set_phase(Phase.DONE, f"FAILED — motion error: {self._motion_error}")
+        else:
+            self._set_phase(Phase.DONE, "Experiment complete.")
         self.finished.emit(result)
         # Reset to IDLE so a new experiment can be started
         self._phase = Phase.IDLE
@@ -949,8 +1009,13 @@ class ExperimentRunner(QObject):
     def _on_postprocess_thread_finished(self) -> None:
         """Fallback: force DONE if run() exited without emitting done (e.g. crash)."""
         if self._phase == Phase.POSTPROCESS:
-            self._set_phase(Phase.DONE, "Experiment complete.")
-            self.finished.emit({"aborted": self._aborted})
+            result = {"aborted": self._aborted}
+            if self._motion_error:
+                result["motion_error"] = self._motion_error
+                self._set_phase(Phase.DONE, f"FAILED — motion error: {self._motion_error}")
+            else:
+                self._set_phase(Phase.DONE, "Experiment complete.")
+            self.finished.emit(result)
             self._phase = Phase.IDLE
 
     # ---- helpers -----------------------------------------------------------

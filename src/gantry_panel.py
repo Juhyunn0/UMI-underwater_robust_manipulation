@@ -756,6 +756,86 @@ class AxisAbsMoveThread(QThread):
             self.finished_with.emit(f"Unexpected: {exc}")
 
 
+class GoToHomeThread(QThread):
+    """Drive each axis sequentially to its saved 'home reference' position
+    using per-axis SDK calls (``jog_single_axis(..., relative=False)``).
+
+    Per-axis SDK calls succeed even when ``get_status()`` returns code 664
+    ('axis not enabled / not homed'), so this works without a physical
+    limit-switch homing pass. Axes whose home reference is None are skipped.
+
+    Emits ``progress(str)`` between axes and ``finished_with(str)`` at the
+    end ("" on success, "aborted", or an error message).
+    """
+
+    progress      = pyqtSignal(str)
+    finished_with = pyqtSignal(str)
+
+    def __init__(self, controller,
+                 targets_mm_abs: dict[Axis, float | None],
+                 speed_units_per_s: dict[Axis, float],
+                 acc_units_per_s2: dict[Axis, float],
+                 dec_units_per_s2: dict[Axis, float],
+                 lock: threading.RLock,
+                 abort_event: threading.Event | None = None) -> None:
+        super().__init__()
+        self._controller = controller
+        self._targets = dict(targets_mm_abs)
+        self._speed = dict(speed_units_per_s)
+        self._acc = dict(acc_units_per_s2)
+        self._dec = dict(dec_units_per_s2)
+        self._lock = lock
+        self._abort_event = abort_event or threading.Event()
+
+    def request_abort(self) -> None:
+        self._abort_event.set()
+
+    def _aborted(self) -> bool:
+        return EMERGENCY_STOP.is_set() or self._abort_event.is_set()
+
+    def run(self) -> None:  # type: ignore[override]
+        for axis in AXES:
+            if self._aborted():
+                self.finished_with.emit("aborted")
+                return
+            target_mm = self._targets.get(axis)
+            if target_mm is None:
+                self.progress.emit(f"Axis {axis.name}: no home reference, skipping")
+                continue
+            self.progress.emit(
+                f"Moving axis {axis.name} → home ({target_mm:+.2f} mm)…"
+            )
+            try:
+                target_units = mm_to_units(float(target_mm), axis)
+                with self._lock:
+                    self._controller.jog_single_axis(
+                        axis,
+                        position_units=target_units,
+                        speed_units=self._speed.get(axis, 5.0),
+                        acc_units=self._acc.get(axis, 20.0),
+                        dec_units=self._dec.get(axis, 20.0),
+                        relative=False,
+                    )
+            except Exception as exc:
+                self.finished_with.emit(f"axis {axis.name}: {exc}")
+                return
+            # Poll per-axis stopped state. is_axis_stopped is per-axis and
+            # works in 664; on transient errors keep polling rather than fail.
+            while not self._aborted():
+                try:
+                    with self._lock:
+                        stopped = self._controller.is_axis_stopped(axis)
+                except Exception:
+                    stopped = False
+                if stopped:
+                    break
+                time.sleep(0.1)
+        if self._aborted():
+            self.finished_with.emit("aborted")
+            return
+        self.finished_with.emit("")
+
+
 # =============================================================================
 # Custom widgets
 # =============================================================================
@@ -1066,6 +1146,72 @@ class LiveStatusTable(QWidget):
 
 
 # =============================================================================
+# Background AprilTag detector (runs on its own QThread)
+# =============================================================================
+class _TagDetectionWorker(QObject):
+    """Runs pupil_apriltags.Detector on frames in a background thread.
+
+    Drops frames when busy so the queue never backs up — we always reflect
+    the latest available frame, never a stale one.
+    """
+
+    # (list of {'id', 'center', 'corners'}, (img_w, img_h))
+    detections_ready = pyqtSignal(object, object)
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._detector: Any = None
+        self._family: str = "tag36h11"
+        self._busy: bool = False
+        self._min_decision_margin = 30.0
+
+    def set_family(self, family: str) -> None:
+        if family != self._family:
+            self._family = family
+            self._detector = None  # lazy rebuild on next detect
+
+    def on_frame(self, frame_bgr: Any, _t_mono: float) -> None:
+        if self._busy or frame_bgr is None:
+            return
+        self._busy = True
+        try:
+            try:
+                import cv2
+                from pupil_apriltags import Detector
+            except ImportError:
+                self.detections_ready.emit([], (0, 0))
+                return
+            if self._detector is None:
+                self._detector = Detector(
+                    families=self._family,
+                    nthreads=2,
+                    quad_decimate=2.0,
+                    quad_sigma=0.0,
+                    refine_edges=1,
+                    decode_sharpening=0.25,
+                    debug=0,
+                )
+            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            h, w = gray.shape[:2]
+            detections = self._detector.detect(gray, estimate_tag_pose=False)
+            tags: list[dict] = []
+            for d in detections:
+                if int(d.hamming) > 0:
+                    continue
+                if float(d.decision_margin) < self._min_decision_margin:
+                    continue
+                cx, cy = float(d.center[0]), float(d.center[1])
+                corners = [(float(c[0]), float(c[1])) for c in d.corners]
+                tags.append({"id": int(d.tag_id), "center": (cx, cy), "corners": corners})
+            self.detections_ready.emit(tags, (w, h))
+        except Exception as exc:
+            print(f"[tag-detector] {exc}", file=sys.stderr)
+            self.detections_ready.emit([], (0, 0))
+        finally:
+            self._busy = False
+
+
+# =============================================================================
 # Live fisheye preview widget
 # =============================================================================
 class FisheyePreviewWidget(QWidget):
@@ -1078,6 +1224,10 @@ class FisheyePreviewWidget(QWidget):
     """
 
     MAX_DISPLAY_FPS = 15.0
+    DETECT_HZ = 5.0    # rate at which frames are forwarded to the tag detector
+
+    # Internal signal: GUI thread → worker thread (auto-queued).
+    _forward_frame = pyqtSignal(object, float)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1086,9 +1236,16 @@ class FisheyePreviewWidget(QWidget):
         self._detector_on: bool = False
         self._current_run_dir: Path | None = None
 
-        # Restore detector toggle from settings.
+        # Tag detection state (always running; the overlay toggle only
+        # controls whether boxes are drawn on the preview).
+        self._last_detect_forward_t: float = 0.0
+        self._latest_detections: list[dict] = []
+        self._latest_detect_image_size: tuple[int, int] = (0, 0)
+
+        # Restore detector toggle from settings; default ON so newly-installed
+        # users immediately see tag boxes drawn over the preview.
         saved = _gp_load_settings().get("gantry_panel", {})
-        self._detector_on = bool(saved.get("camera_detector_overlay", False))
+        self._detector_on = bool(saved.get("camera_detector_overlay", True))
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1121,10 +1278,25 @@ class FisheyePreviewWidget(QWidget):
         )
         v.addWidget(self.preview_label, stretch=1)
 
+        # AprilTag detection status (always-on indicator).
+        self.tag_status_label = QLabel("● Tags: —")
+        self.tag_status_label.setStyleSheet(
+            "color: #888; font-size: 12px; font-weight: 600;"
+        )
+        v.addWidget(self.tag_status_label)
+
         # Stats strip.
         self.stats_label = QLabel("—")
         self.stats_label.setStyleSheet("color: #666; font-size: 11px;")
         v.addWidget(self.stats_label)
+
+        # Background tag detector worker.
+        self._det_thread = QThread(self)
+        self._det_worker = _TagDetectionWorker()
+        self._det_worker.moveToThread(self._det_thread)
+        self._forward_frame.connect(self._det_worker.on_frame)
+        self._det_worker.detections_ready.connect(self._on_detections_ready)
+        self._det_thread.start()
 
         # Buttons.
         btn_row = QHBoxLayout()
@@ -1175,10 +1347,17 @@ class FisheyePreviewWidget(QWidget):
     def on_frame(self, frame_bgr: Any, t_mono: float) -> None:
         """Slot connected to FisheyeCameraSession.frame_ready; throttled to MAX_DISPLAY_FPS."""
         now = time.monotonic()
+        # Always keep _last_frame fresh so snapshots / anchor auto-pick see
+        # the very latest frame even when we skip rendering this tick.
+        self._last_frame = frame_bgr
+        # Forward to background detector at DETECT_HZ. Worker drops anything
+        # that arrives while it's still processing the prior frame.
+        if now - self._last_detect_forward_t >= 1.0 / self.DETECT_HZ:
+            self._last_detect_forward_t = now
+            self._forward_frame.emit(frame_bgr, t_mono)
         if now - self._last_frame_t < 1.0 / self.MAX_DISPLAY_FPS:
             return
         self._last_frame_t = now
-        self._last_frame = frame_bgr
         self._render_frame(frame_bgr)
 
     def update_stats(self, fps: int, grab_ms: float, config: dict) -> None:
@@ -1204,9 +1383,23 @@ class FisheyePreviewWidget(QWidget):
     def _render_frame(self, frame_bgr: Any) -> None:
         try:
             import cv2
+            import numpy as np
             from PyQt5.QtGui import QImage
-            h_px, w_px = frame_bgr.shape[:2]
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            display = frame_bgr
+            if self._detector_on and self._latest_detections:
+                display = frame_bgr.copy()
+                for tag in self._latest_detections:
+                    pts = np.asarray(tag["corners"], dtype=np.int32).reshape(-1, 1, 2)
+                    cv2.polylines(display, [pts], True, (0, 230, 230), 2, cv2.LINE_AA)
+                    cx, cy = tag["center"]
+                    cv2.putText(
+                        display, f"ID {tag['id']}",
+                        (int(cx) - 18, int(cy) - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                        (0, 230, 230), 2, cv2.LINE_AA,
+                    )
+            h_px, w_px = display.shape[:2]
+            frame_rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
             qimg = QImage(
                 frame_rgb.data, w_px, h_px, w_px * 3, QImage.Format_RGB888
             )
@@ -1214,9 +1407,51 @@ class FisheyePreviewWidget(QWidget):
             scaled = pix.scaled(
                 self.preview_label.size(),
                 Qt.KeepAspectRatio,
-                Qt.SmoothTransformation,
+                Qt.FastTransformation,
             )
             self.preview_label.setPixmap(scaled)
+        except Exception:
+            pass
+
+    def _on_detections_ready(self, tags: list, image_size: tuple) -> None:
+        self._latest_detections = list(tags) if tags else []
+        if image_size and image_size[0] > 0:
+            self._latest_detect_image_size = (int(image_size[0]), int(image_size[1]))
+        n = len(self._latest_detections)
+        if n == 0:
+            self.tag_status_label.setText("● Tags: none")
+            self.tag_status_label.setStyleSheet(
+                "color: #888; font-size: 12px; font-weight: 600;"
+            )
+        else:
+            ids = sorted({t["id"] for t in self._latest_detections})
+            ids_str = ", ".join(str(i) for i in ids[:8])
+            if len(ids) > 8:
+                ids_str += "…"
+            self.tag_status_label.setText(f"● Tags: {n}  (IDs: {ids_str})")
+            self.tag_status_label.setStyleSheet(
+                "color: #4caf50; font-size: 12px; font-weight: 600;"
+            )
+        # If overlay is on, redraw the latest frame with fresh boxes.
+        if self._detector_on and self._last_frame is not None:
+            self._render_frame(self._last_frame)
+
+    def latest_detections(self) -> tuple[list[dict], tuple[int, int]]:
+        """Return the latest tag detections and the image size they apply to.
+
+        Returns ([], (0, 0)) if nothing detected yet.
+        """
+        return list(self._latest_detections), self._latest_detect_image_size
+
+    def set_tag_family(self, family: str) -> None:
+        if family:
+            self._det_worker.set_family(family)
+
+    def shutdown(self) -> None:
+        """Stop the detector thread cleanly. Called from MainWindow.closeEvent."""
+        try:
+            self._det_thread.quit()
+            self._det_thread.wait(1000)
         except Exception:
             pass
 
@@ -2035,6 +2270,7 @@ class GantryPanel(QMainWindow):
         self._logger: GantryTelemetryLogger | None = None
         self._recording_manual = False
         self._recording_auto = False
+        self._recording_via_runner = False
         self._current_run_dir: Path | None = None
 
         # Worker handles.
@@ -2069,6 +2305,7 @@ class GantryPanel(QMainWindow):
         # In-progress flags (drive button enable/disable).
         self._move_in_progress = False
         self._sequence_in_progress = False
+        self._home_thread: GoToHomeThread | None = None
         # Per-axis Move Abs is in progress for at least one axis.
         self._per_axis_busy: set[int] = set()
 
@@ -2556,6 +2793,29 @@ class GantryPanel(QMainWindow):
         )
         set_home_btn.clicked.connect(self._set_current_as_home_reference)
         v.addWidget(set_home_btn)
+
+        # ---- Return to Home Reference --------------------------------------
+        phys_title = QLabel("Return to Home Reference")
+        phys_title.setStyleSheet(
+            "color: #4ea1ff; font-weight: 600; padding-top: 12px;"
+        )
+        v.addWidget(phys_title)
+        v.addWidget(_make_note_label(
+            "Drives each axis sequentially (X → Y → Z) back to the home "
+            "reference set above. Uses per-axis absolute moves at the speed/"
+            "acc/dec from the Per-Axis Control card, so it works even when "
+            "the controller is in status 664. Axes with no home reference "
+            "yet are skipped."
+        ))
+
+        home_row = QHBoxLayout()
+        home_row.addStretch()
+        self._home_all_btn = QPushButton("Go to Home")
+        self._home_all_btn.setObjectName("PrimaryButton")
+        _size_button(self._home_all_btn, "primary")
+        self._home_all_btn.clicked.connect(self._start_go_home)
+        home_row.addWidget(self._home_all_btn)
+        v.addLayout(home_row)
 
         # ---- Axis Direction sub-group --------------------------------------
         # Persisted in ~/.umi_gui_state.json under axis_sign.
@@ -3059,6 +3319,16 @@ class GantryPanel(QMainWindow):
 
         self._exp_tag_family_edit = QLineEdit("tag36h11")
         _cam_row(0, "Tag family:", self._exp_tag_family_edit)
+        # Keep the live-preview detector aligned with the chosen family.
+        self._exp_tag_family_edit.editingFinished.connect(
+            lambda: self._fisheye_preview.set_tag_family(
+                self._exp_tag_family_edit.text().strip() or "tag36h11"
+            ) if hasattr(self, "_fisheye_preview") else None
+        )
+        if hasattr(self, "_fisheye_preview"):
+            self._fisheye_preview.set_tag_family(
+                self._exp_tag_family_edit.text().strip() or "tag36h11"
+            )
 
         self._exp_tag_size_spin = QDoubleSpinBox()
         self._exp_tag_size_spin.setRange(0.01, 1.0)
@@ -3321,6 +3591,42 @@ class GantryPanel(QMainWindow):
             self.tabs.setCurrentIndex(4)
         self._exp_refresh_checklist()
 
+    def _exp_autopick_anchor_tag(self) -> None:
+        """Pick the AprilTag whose center is closest to the image center and
+        write it into the anchor-tag spin box. No-op if no tags are visible
+        in the live preview — the spin value the user typed is kept."""
+        if not hasattr(self, "_fisheye_preview"):
+            return
+        tags, image_size = self._fisheye_preview.latest_detections()
+        if not tags or image_size == (0, 0):
+            self._exp_result_label.setText(
+                "⚠ Anchor auto-pick: no AprilTags visible — using manual ID "
+                f"{self._exp_anchor_spin.value()}"
+            )
+            self._exp_result_label.setStyleSheet(
+                "color: #ffa726; font-size: 11px;"
+            )
+            return
+        img_cx = image_size[0] / 2.0
+        img_cy = image_size[1] / 2.0
+        best = min(
+            tags,
+            key=lambda t: (t["center"][0] - img_cx) ** 2
+                          + (t["center"][1] - img_cy) ** 2,
+        )
+        chosen_id = int(best["id"])
+        if chosen_id != int(self._exp_anchor_spin.value()):
+            self._exp_anchor_spin.setValue(chosen_id)
+        dx = best["center"][0] - img_cx
+        dy = best["center"][1] - img_cy
+        dist_px = (dx * dx + dy * dy) ** 0.5
+        print(
+            f"[exp] anchor auto-pick: tag {chosen_id} "
+            f"at ({best['center'][0]:.0f}, {best['center'][1]:.0f}), "
+            f"{dist_px:.0f}px from center",
+            file=sys.stderr,
+        )
+
     def _exp_build_fisheye_args(self):
         """Construct an argparse.Namespace for the fisheye pipeline from the UI fields."""
         import argparse
@@ -3444,6 +3750,26 @@ class GantryPanel(QMainWindow):
             QMessageBox.warning(self, "No waypoints", "Define at least one waypoint first.")
             return
 
+        # Pre-flight: try get_status() once. If it returns code 664 ('axis
+        # not enabled / not homed') we let the experiment proceed — the
+        # motion/logger paths now fall back to per-axis reads in 664 so they
+        # work without a physical limit-switch homing pass. Only block on
+        # non-664 errors that we have no fallback for.
+        if self.connected and not self.is_mock:
+            try:
+                with self._controller_lock:
+                    self.controller.get_status()
+            except FMC4030Error as exc:
+                if "664" not in str(exc):
+                    QMessageBox.critical(self, "Controller error",
+                        f"Pre-flight get_status() failed:\n\n{exc}")
+                    return
+                # 664 is non-blocking — fall through.
+            except Exception as exc:
+                QMessageBox.critical(self, "Controller error",
+                    f"Pre-flight get_status() raised unexpectedly:\n\n{exc}")
+                return
+
         # Convert waypoints to absolute machine-frame for the SDK.
         waypoints_fw = [
             Waypoint(
@@ -3478,6 +3804,10 @@ class GantryPanel(QMainWindow):
                     return
                 except ImportError:
                     pass  # fisheye module optional
+            # Auto-pick anchor = tag closest to image center, using the live
+            # preview's last detection. Falls back to the spin value if no
+            # tags are visible. Updates the spin so the user sees the choice.
+            self._exp_autopick_anchor_tag()
             fisheye_args = self._exp_build_fisheye_args()
 
         EMERGENCY_STOP.clear()
@@ -3571,10 +3901,37 @@ class GantryPanel(QMainWindow):
     def _exp_on_finished(self, result: dict) -> None:
         self._experiment_in_progress = False
         self._exp_stop_btn.setEnabled(False)
+        was_recording = self._recording_via_runner
+        self._recording_via_runner = False
         run_dir = result.get("run_dir", "")
         aborted = result.get("aborted", False)
-        tag = " (aborted)" if aborted else ""
-        self._exp_result_label.setText(f"Done{tag} → {run_dir}")
+        motion_error = result.get("motion_error", "")
+        if motion_error:
+            self._exp_result_label.setText(
+                f"⚠ Motion FAILED: {motion_error}  (no gantry movement — "
+                f"check terminal for traceback)  → {run_dir}"
+            )
+            self._exp_result_label.setStyleSheet(
+                "color: #ef5350; font-size: 11px; font-weight: 600;"
+            )
+        else:
+            if was_recording:
+                tag = "Recording saved"
+            else:
+                tag = "Done (aborted)" if aborted else "Done"
+            self._exp_result_label.setText(f"{tag} → {run_dir}")
+            self._exp_result_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        # Reset the Recording tab's button (whether or not we got here from it).
+        if hasattr(self, "record_btn"):
+            self.record_btn.blockSignals(True)
+            self.record_btn.setChecked(False)
+            self.record_btn.setText("● Start Recording")
+            self.record_btn.setEnabled(True)
+            self.record_btn.blockSignals(False)
+            if hasattr(self, "csv_path_label") and was_recording and run_dir:
+                self.csv_path_label.setText(str(Path(run_dir) / "gantry_telemetry.csv"))
+                self.csv_path_label.setStyleSheet("color: #64b5f6; text-decoration: underline;")
+                self._current_run_dir = Path(run_dir)
         self._exp_refresh_checklist()
 
     def _build_waypoint_panel(self) -> SectionFrame:
@@ -3952,6 +4309,61 @@ class GantryPanel(QMainWindow):
         }
         _gp_save_section("gantry_panel", payload)
 
+    def _start_go_home(self) -> None:
+        """Drive each axis sequentially back to the saved home reference."""
+        if not self.connected:
+            QMessageBox.warning(self, "Not connected", "Connect first.")
+            return
+        if getattr(self, "_home_thread", None) is not None and self._home_thread.isRunning():
+            return
+        if self._move_in_progress or self._sequence_in_progress or self._experiment_in_progress:
+            QMessageBox.warning(self, "Busy",
+                "Wait for the current move/experiment to finish before going home.")
+            return
+        if not any(self._home_position_mm.get(a) is not None for a in AXES):
+            QMessageBox.warning(
+                self, "No home reference",
+                "No axis has a home reference yet.\n\n"
+                "Click 'Set Current as Home Reference' first to capture the "
+                "current position as home.",
+            )
+            return
+
+        targets = {a: self._home_position_mm.get(a) for a in AXES}
+        speed = {a: max(cm_s_to_units_s(self.jog_speed_spin.value(), a), 0.001)
+                 for a in AXES}
+        acc   = {a: max(cm_s2_to_units_s2(self.jog_acc_spin.value(), a), 0.001)
+                 for a in AXES}
+        dec   = {a: max(cm_s2_to_units_s2(self.jog_dec_spin.value(), a), 0.001)
+                 for a in AXES}
+
+        EMERGENCY_STOP.clear()
+        self._abort_event.clear()
+        self._home_all_btn.setEnabled(False)
+        self._home_all_btn.setText("Going home…")
+        self._home_thread = GoToHomeThread(
+            self.controller, targets, speed, acc, dec,
+            self._controller_lock, self._abort_event,
+        )
+        self._home_thread.progress.connect(self.sb_op_label.setText)
+        self._home_thread.finished_with.connect(self._on_go_home_done)
+        self._home_thread.finished.connect(self._home_thread.deleteLater)
+        self._home_thread.start()
+
+    def _on_go_home_done(self, err: str) -> None:
+        self._home_all_btn.setEnabled(True)
+        self._home_all_btn.setText("Go to Home")
+        if not err:
+            self.sb_op_label.setText("Gantry returned to home reference.")
+            self.sb_op_label.setStyleSheet("color: #66bb6a;")
+        elif err == "aborted":
+            self.sb_op_label.setText("Go-to-home aborted.")
+            self.sb_op_label.setStyleSheet("color: #ffa726;")
+        else:
+            self.sb_op_label.setText(f"Go-to-home failed: {err[:120]}")
+            self.sb_op_label.setStyleSheet("color: #ef5350;")
+            QMessageBox.critical(self, "Go-to-home failed", err)
+
     def _refresh_home_displays(self) -> None:
         # Re-render per-axis position readouts using the latest snapshot,
         # and update the workspace map's home marker.
@@ -4218,16 +4630,139 @@ class GantryPanel(QMainWindow):
                 self.record_btn.setChecked(False)
                 QMessageBox.warning(self, "Not connected", "Connect first.")
                 return
+            # If the ExperimentRunner is available, route through it so we get
+            # gantry telemetry + fisheye AprilTag SLAM + the same postprocess
+            # plots/CSVs/HTML produced by zed2_underwater_tagslam.py and the
+            # experiment pipeline. Fall back to the bare telemetry logger only
+            # when the runner isn't importable.
+            if HAVE_EXPERIMENT_RUNNER and self._experiment_runner is not None:
+                started = self._start_recording_via_runner()
+                if not started:
+                    self.record_btn.setChecked(False)
+                    return
+                self.record_btn.setText("■ Stop Recording")
+                return
             self._recording_manual = True
             self._ensure_logger_started(auto=False)
             self.record_btn.setText("■ Stop Recording")
         else:
+            if self._recording_via_runner:
+                # The runner's stop_experiment() drives postprocess + finished
+                # signal; UI cleanup happens in _exp_on_finished.
+                self._experiment_runner.stop_experiment()
+                self.record_btn.setText("● Stopping…")
+                self.record_btn.setEnabled(False)
+                return
             self._recording_manual = False
             self._stop_logger_now()
             self.record_btn.setText("● Start Recording")
 
+    def _start_recording_via_runner(self) -> bool:
+        """Build a recording config (empty waypoints, no motion) and hand it
+        to ExperimentRunner.start_recording. Returns True on success."""
+        if self._experiment_in_progress:
+            QMessageBox.warning(self, "Already running",
+                "An experiment is already in progress.")
+            return False
+
+        # Pre-flight: 664 is now non-blocking (telemetry + motion fall back
+        # to per-axis reads). Only block on non-664 controller errors.
+        if not self.is_mock:
+            try:
+                with self._controller_lock:
+                    self.controller.get_status()
+            except FMC4030Error as exc:
+                if "664" not in str(exc):
+                    QMessageBox.critical(self, "Controller error",
+                        f"Pre-flight get_status() failed:\n\n{exc}")
+                    return False
+            except Exception as exc:
+                QMessageBox.critical(self, "Controller error",
+                    f"Pre-flight get_status() raised unexpectedly:\n\n{exc}")
+                return False
+
+        # Decide camera_mode based on what's actually open right now.
+        camera_open = (
+            (self._camera is not None and self._camera.is_open)
+            or self._is_mock_camera
+        )
+        calib_loaded = False
+        if self._camera is not None and self._camera.calib_path is not None:
+            calib_loaded = self._camera.calib_path.exists()
+        if self._is_mock_camera:
+            calib_loaded = True
+
+        gantry_only = not (camera_open and calib_loaded)
+        camera_mode = "gantry_only" if gantry_only else "fisheye"
+
+        fisheye_args = None
+        fisheye_calib = None
+        if not gantry_only:
+            calib_path = (
+                self._camera.calib_path
+                if self._camera is not None and self._camera.calib_path is not None
+                else None
+            )
+            if not self._is_mock_camera and calib_path is not None:
+                try:
+                    from fisheye_gantry_tagslam import load_fisheye_calibration
+                    fisheye_calib = load_fisheye_calibration(calib_path)
+                except SystemExit as exc:
+                    QMessageBox.warning(self, "Calibration error", str(exc))
+                    return False
+                except ImportError:
+                    pass
+            # Auto-pick anchor before locking args.
+            self._exp_autopick_anchor_tag()
+            fisheye_args = self._exp_build_fisheye_args()
+
+        EMERGENCY_STOP.clear()
+        self._abort_event.clear()
+
+        config = ExperimentConfig(
+            controller=self.controller,
+            controller_lock=self._controller_lock,
+            waypoints=[],
+            soft_min_mm=[None, None, None],
+            soft_max_mm=[None, None, None],
+            move_mode=getattr(self, "_move_mode", "line"),
+            countdown_s=0.0,
+            settle_s=0.0,
+            tag_detection_while_idle=False,
+            output_root=Path("data"),
+            run_name=self._exp_name_edit.text().strip() if hasattr(self, "_exp_name_edit") else "",
+            fisheye_args=fisheye_args,
+            fisheye_calib=fisheye_calib,
+            abort_event=self._abort_event,
+            mock_camera=(self._is_mock_camera and not gantry_only),
+            camera_session=(self._camera if not gantry_only else None),
+        )
+        config.camera_mode = camera_mode
+        config.axis_sign = {a.name: int(self._axis_sign[a]) for a in AXES}
+        config.waypoints_user_frame = []
+        config.home_reference_abs_mm = {
+            a.name: (None if self._home_position_mm.get(a) is None
+                     else float(self._home_position_mm[a]))
+            for a in AXES
+        }
+
+        self._experiment_in_progress = True
+        self._recording_via_runner = True
+        if hasattr(self, "_exp_start_btn"):
+            self._exp_start_btn.setEnabled(False)
+        if hasattr(self, "_exp_stop_btn"):
+            self._exp_stop_btn.setEnabled(True)
+        if hasattr(self, "_exp_result_label"):
+            self._exp_result_label.setText("Recording manually — click Stop on Recording tab.")
+            self._exp_result_label.setStyleSheet("color: #4ea1ff; font-size: 11px;")
+        self._experiment_runner.start_recording(config)
+        return True
+
     def _ensure_logger_started(self, auto: bool) -> None:
         if self._logger is not None:
+            return
+        if self._recording_via_runner:
+            # The runner already owns a gantry logger; don't double-record.
             return
         run_dir = make_gantry_run_dir(Path("data"), suffix="gantry_run")
         csv_path = run_dir / "gantry_telemetry.csv"
@@ -4882,6 +5417,11 @@ class GantryPanel(QMainWindow):
             try:
                 with self._controller_lock:
                     self.controller.close()
+            except Exception:
+                pass
+        if hasattr(self, "_fisheye_preview"):
+            try:
+                self._fisheye_preview.shutdown()
             except Exception:
                 pass
         super().closeEvent(event)

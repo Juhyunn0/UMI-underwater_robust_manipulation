@@ -1,0 +1,50 @@
+D:
+- -0.00739323049279527
+- 0.06106944789900538
+- -0.6097226687761934
+- 0.9502608005369966
+K:
+- - 1074.9670057430646
+  - 0.0
+  - 651.4414505225423
+- - 0.0
+  - 1032.5772202585363
+  - 395.482364296236
+- - 0.0
+  - 0.0
+  - 1.0
+T_gantry_camera:
+- - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+- - 0.0
+  - 1.0
+  - 0.0
+  - 0.0
+- - 0.0
+  - 0.0
+  - 1.0
+  - 0.0
+- - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+image_size:
+- 1280
+- 720
+metadata:
+  created_at: '2026-05-27T15:05:53'
+  flags:
+  - RECOMPUTE_EXTRINSIC
+  - CHECK_COND
+  - FIX_SKEW
+  frames_used: 114
+  pattern: chessboard 8x6
+  rms_error_px: 0.758077
+  session_folders:
+  - /home/bdml/calib_sessions/session_20260527_145730
+  - /home/bdml/calib_sessions/session_20260527_150226
+  square_size_mm: 65.0
+  tool_version: calibrate_fisheye.py 4.0
+  workflow: disk_record_folder_select_v4

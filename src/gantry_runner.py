@@ -216,12 +216,38 @@ class GantryTelemetryLogger:
 
     # ---- internal ----------------------------------------------------------
     def _sample_status(self) -> tuple[float, float, tuple[float, float, float], tuple[float, float, float]]:
+        """Sample position + velocity (units) for all three axes.
+
+        Tries the bulk ``get_status()`` first. If it errors (typical case:
+        firmware status code 664 'axis not enabled / not homed'), falls back
+        to per-axis ``get_axis_position`` / ``get_axis_speed`` reads. The
+        per-axis SDK calls are independent of the machine-status query and
+        routinely succeed in the 664 state, which is what lets us log
+        telemetry during manual recordings on a non-physically-homed gantry.
+        """
         with self._lock:
-            status = self._controller.get_status()
+            try:
+                status = self._controller.get_status()
+                pos = (float(status.realPos[0]), float(status.realPos[1]),
+                       float(status.realPos[2]))
+                vel = (float(status.realSpeed[0]), float(status.realSpeed[1]),
+                       float(status.realSpeed[2]))
+            except Exception:
+                pos = (
+                    float(self._controller.get_axis_position(AXES[0])),
+                    float(self._controller.get_axis_position(AXES[1])),
+                    float(self._controller.get_axis_position(AXES[2])),
+                )
+                try:
+                    vel = (
+                        float(self._controller.get_axis_speed(AXES[0])),
+                        float(self._controller.get_axis_speed(AXES[1])),
+                        float(self._controller.get_axis_speed(AXES[2])),
+                    )
+                except Exception:
+                    vel = (0.0, 0.0, 0.0)
         t_mono = time.monotonic()
         t_unix = time.time()
-        pos = (float(status.realPos[0]), float(status.realPos[1]), float(status.realPos[2]))
-        vel = (float(status.realSpeed[0]), float(status.realSpeed[1]), float(status.realSpeed[2]))
         return t_unix, t_mono, pos, vel
 
     def _accel_smoothed_central_diff(self) -> tuple[float, float, float]:
@@ -329,13 +355,26 @@ def _dominant_axis_scale(displacement_mm: Sequence[float]) -> tuple[float, int]:
 
 
 def _read_current_pos_mm(controller: FMC4030Controller, lock: threading.RLock) -> tuple[float, float, float]:
+    """Return current (x, y, z) in mm.
+
+    Prefers ``get_status()`` (single SDK call, all three axes). If it errors
+    — typically code 664 'axis not enabled / not homed' — falls back to
+    per-axis ``get_axis_position()`` reads, which routinely succeed in 664.
+    """
     with lock:
-        st = controller.get_status()
-    return (
-        units_to_mm(float(st.realPos[0]), AXES[0]),
-        units_to_mm(float(st.realPos[1]), AXES[1]),
-        units_to_mm(float(st.realPos[2]), AXES[2]),
-    )
+        try:
+            st = controller.get_status()
+            return (
+                units_to_mm(float(st.realPos[0]), AXES[0]),
+                units_to_mm(float(st.realPos[1]), AXES[1]),
+                units_to_mm(float(st.realPos[2]), AXES[2]),
+            )
+        except Exception:
+            return (
+                units_to_mm(float(controller.get_axis_position(AXES[0])), AXES[0]),
+                units_to_mm(float(controller.get_axis_position(AXES[1])), AXES[1]),
+                units_to_mm(float(controller.get_axis_position(AXES[2])), AXES[2]),
+            )
 
 
 def _wait_for_all_stopped(controller: FMC4030Controller, lock: threading.RLock, poll_hz: float = 20.0) -> None:
