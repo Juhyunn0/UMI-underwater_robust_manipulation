@@ -322,6 +322,146 @@ all work end-to-end against the mock.
 
 ---
 
+## Fisheye Calibration Tool
+
+`src/calibrate_fisheye.py` is a PyQt5 GUI that walks you through fisheye
+intrinsic calibration and writes a YAML file directly loadable by
+`load_fisheye_calibration()` in `fisheye_gantry_tagslam.py`.
+
+### Launching
+
+```bash
+# Real camera (device 0, 1280×720 default)
+python -m src.calibrate_fisheye
+
+# Specific device / output path
+python -m src.calibrate_fisheye --device 1 --output config/my_calib.yaml
+
+# Mock camera — synthetic chessboard frames, no hardware needed
+python -m src.calibrate_fisheye --mock-camera
+```
+
+### Workflow (Record / Stop + automatic frame selection)
+
+1. **Connect** — choose device, resolution, FPS; click **Connect**.
+   The live preview starts immediately with corner overlay.
+   With `--mock-camera` a synthetic 9 × 6 chessboard animates so every
+   region of the image is covered automatically.
+
+2. **Pattern** — set inner corners (cols × rows), square size, and the three
+   calibration flags.  Defaults: 9 × 6, 25 mm/square.  The selection summary
+   line shows what the algorithm will do before you start recording:
+   `4×4 grid · 2 frames/cell · target ≈ 32 frames · ≥12 cells required`.
+
+3. **Record** — click **● Record** (or press **R**).
+   Move the calibration board continuously across the image.
+   Watch the **live 4 × 4 coverage grid**: cells turn green as the board
+   visits each region.  Watch **Live sharpness**: keep it green (> 150) —
+   slow, steady motion is better than fast waving.  The button changes to
+   **■ Stop & Calibrate** while recording.
+
+   **Coverage tips:**
+   - Move the board to *all four corners and all edges* of the image —
+     fisheye distortion is strongest near the edges, so edge coverage
+     matters most for `k3`/`k4`.
+   - Tilt the board ± 30–45° in multiple directions; don't stay face-on.
+     The algorithm rewards tilt diversity (30 % of the per-frame score).
+   - Vary distance: one close pass (board fills ≥ 50 % of the frame) and
+     one far pass.
+   - Record at least 10–20 seconds; 30 s gives ≥ 16 cells easily.
+   - Keep sharpness green.  If it's yellow/red, slow down or improve
+     lighting before recording.
+
+4. **Stop & Calibrate** — click **■ Stop & Calibrate** (or press **R** again).
+   A progress dialog runs the automatic selection pipeline:
+
+   | Step | What happens |
+   |------|-------------|
+   | Hard gate | Drops frames with sharpness < 50 and duplicates within 200 ms |
+   | Group by cell | Divides the image into a 4 × 4 grid; groups survivors by cell |
+   | Preliminary calibration | Runs `cv2.fisheye.calibrate` on one frame per cell |
+   | Score | Rates each survivor: sharpness 50 % + tilt 30 % + reproj 20 % |
+   | Top-K per cell | Picks the 2 highest-scoring frames from each occupied cell |
+
+5. **Coverage report** — a modal shows how many frames were picked and the
+   coverage map.  If ≥ 14 cells are covered the default action is
+   **Proceed**; if < 12 cells are covered the default is **Record again**
+   with a strong warning.  Right-click any picked thumbnail → **Why this
+   frame?** to see sharpness, tilt angle, reprojection error, and composite
+   score.
+
+6. **Results** — RMS reprojection error displayed in colour:
+   - Green  < 0.5 px — excellent
+   - Yellow  0.5–1.0 px — acceptable for most applications
+   - Red  > 1.0 px — record again with better coverage / lighting
+
+7. **Save YAML** — browse to the output path (default
+   `config/fisheye_calibration.yaml`).  Choose a **T_gantry_camera** source:
+   - *Identity* — saves a 4 × 4 identity matrix; measure and edit later.
+   - *Load from YAML…* — copies `T_gantry_camera` from an existing file.
+   - *Edit 4×4 manually…* — spin-box grid with R^T·R ≈ I validation.
+
+   After writing, the tool calls `load_fisheye_calibration()` immediately
+   to verify the round-trip, then shows a success dialog.
+
+### Frame selection scoring (for tuning)
+
+Constants at the top of `calibrate_fisheye.py` are exposed for easy tuning:
+
+```python
+MIN_SHARPNESS       = 50.0   # Laplacian-variance floor; lower in dim environments
+COVERAGE_GRID       = (4, 4) # Increase to (5, 5) for higher spatial resolution
+TARGET_PER_CELL     = 2      # Increase to 3 for more robust calibration
+MIN_CELLS_COVERED   = 12     # Minimum before showing strong re-record warning
+SCORE_WEIGHT_SHARPNESS = 0.50
+SCORE_WEIGHT_TILT      = 0.30  # Raise in underwater (diffuse light lowers sharpness)
+SCORE_WEIGHT_REPROJ    = 0.20
+```
+
+### Smoke test (mock mode)
+
+```bash
+python -m src.calibrate_fisheye --mock-camera
+```
+
+1. Click **Connect** → preview shows an animated 9×6 chessboard,
+   "Detected ✓" overlay appears within ≈ 2 frames.
+2. Click **● Record** → watch the 4 × 4 grid light up progressively as the
+   mock board sweeps across the image.
+3. After ~15 s click **■ Stop & Calibrate**.
+4. The progress dialog should show "16 / 16 cells covered, 32 frames picked".
+5. Click **Proceed** → calibration completes; RMS < 0.5 px in mock.
+6. Click **Save YAML** → verified round-trip.
+7. Drag the splitter handle (8 px wide, turns blue on hover) — both panes
+   should resize smoothly; position is saved across restarts.
+
+### Generating a static mock pattern image (optional)
+
+```bash
+python tools/make_mock_pattern.py          # writes assets/calib_pattern_mock.png
+python tools/make_mock_pattern.py --cols 9 --rows 6 --square 60
+```
+
+`calibrate_fisheye.py` does **not** require this file at runtime.
+
+### Keyboard shortcuts
+
+| Key | Action |
+|-----|--------|
+| R | Record / Stop & Calibrate toggle |
+| Ctrl+S | Save YAML |
+| Esc | Quit |
+
+### Integrating the calibration into the Experiment pipeline
+
+1. Run the calibration tool; save to `config/fisheye_calibration.yaml`.
+2. In the Gantry Control Panel → Connection bar → **Calib:** field, browse to
+   that file.
+3. Start the Experiment from the **Experiment** tab — the fisheye pipeline
+   will load `K`, `D`, and `T_gantry_camera` from the YAML automatically.
+
+---
+
 ## Fisheye calibration YAML
 
 ```yaml
