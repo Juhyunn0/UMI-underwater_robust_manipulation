@@ -3370,6 +3370,21 @@ class GantryPanel(QMainWindow):
             self._exp_water_combo.addItem(mode)
         _cam_row(3, "Water correction mode:", self._exp_water_combo)
 
+        # Tag map (PnP-only mode): lock tags to a surveyed map so the camera
+        # localizes by PnP from frame one (no per-tag init jump). Off by default.
+        self._exp_use_tag_map_check = QCheckBox("PnP-only (lock tags to surveyed map)")
+        self._exp_use_tag_map_check.setChecked(False)
+        _cam_row(4, "Use tag map:", self._exp_use_tag_map_check)
+
+        self._exp_tag_map_edit = QLineEdit("config/tag_map.yaml")
+        self._exp_tag_map_edit.setEnabled(False)
+        self._exp_tag_map_edit.setToolTip(
+            "Tag map produced by survey_tags.py. Used only when 'Use tag map' is on "
+            "AND the file exists; otherwise SLAM falls back to live bootstrap."
+        )
+        self._exp_use_tag_map_check.toggled.connect(self._exp_tag_map_edit.setEnabled)
+        _cam_row(5, "Tag map file:", self._exp_tag_map_edit)
+
         outer.addWidget(cam_frame)
 
         # ── (e) Live experiment status ────────────────────────────────────────
@@ -3744,6 +3759,17 @@ class GantryPanel(QMainWindow):
         args.trajectory_image_width = 960
         args.config = "config/config.yaml"
         args.max_frames = None
+        # Tag map (PnP-only): set only when the toggle is on AND the file exists;
+        # otherwise leave None so the backend runs the normal bootstrap flow.
+        args.tag_map = None
+        if self._exp_use_tag_map_check.isChecked():
+            tm_path = _resolve_calib_path(self._exp_tag_map_edit.text().strip())
+            if tm_path is not None and tm_path.exists():
+                args.tag_map = tm_path
+                print(f"[tag-map] PnP-only requested with {tm_path}", file=sys.stderr)
+            else:
+                print(f"[tag-map] file not found ({tm_path}); running normal "
+                      "bootstrap mode", file=sys.stderr)
         return args
 
     def _exp_load_waypoints(self) -> list[Waypoint]:

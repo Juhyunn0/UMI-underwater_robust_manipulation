@@ -650,9 +650,49 @@ so the anchor starts at the origin. Noise model matches the live pipeline
 If the anchor tag is not present in the recording the tool exits with code 2.
 Output is deterministic (re-runs are byte-identical except `created_at`).
 
-**Next step.** Inject `config/tag_map.yaml` into the SLAM backend as fixed tag
-priors → the system localizes by PnP against known tags from frame one, removing
-the tag-initialization jump at the start of each run.
+### Using the tag map — PnP-only localization (locked tags)
+
+Once you have `config/tag_map.yaml`, run SLAM in **PnP-only mode**: every tag is
+pinned to its surveyed pose (hard prior, σ=1e-6, treated as ground truth) and the
+live per-tag bootstrap is skipped, so the camera localizes by PnP against known
+tags **from frame one** — no tag-initialization jump.
+
+- **Panel:** Experiment tab → **Use tag map** checkbox + file field
+  (`config/tag_map.yaml`). Active only when the toggle is **on AND the file
+  exists**; otherwise SLAM runs the normal bootstrap flow (unchanged behavior).
+- **CLI (standalone live tool):**
+  ```bash
+  python -m src.fisheye_gantry_tagslam --fisheye-calib config/fisheye_calibration.yaml \
+                                       --tag-map config/tag_map.yaml  ...
+  ```
+
+**Runtime-anchor re-mapping.** The map is stored in the *survey* anchor frame
+(e.g. tag 70), but each experiment picks its own runtime anchor (the tag nearest
+image center at start). At startup, after the runtime anchor is chosen, every map
+pose is transformed into the runtime anchor frame:
+
+```
+T_runtime_to_X = T_map_to_runtime_anchor^-1 @ T_map_to_X
+```
+
+so the runtime anchor lands on identity and all other tags follow. Startup logs
+(stderr) confirm it:
+
+```
+[tag-map] Loaded 24 tags from tag map
+[tag-map] Survey anchor: tag 70
+[tag-map] Runtime anchor: tag 65 (selected from image center at frame 0)
+[tag-map] Transformed 24 tag poses into runtime anchor frame
+[tag-map] PnP-only mode active — tag positions locked
+```
+
+**Failure mode.** If the runtime anchor is **not in the map** (it was dropped for
+low observations, or never surveyed), the backend fails loudly:
+`Runtime anchor tag {id} is not in the loaded tag map. Either re-run survey to
+include this tag, or pre-select a known anchor via CLI.` Fix by re-surveying that
+region or forcing a known anchor with `--anchor-tag-id`. In PnP-only mode the
+floor co-planarity prior is disabled (the locked priors are the ground truth) and
+tags not present in the map are ignored.
 
 ---
 

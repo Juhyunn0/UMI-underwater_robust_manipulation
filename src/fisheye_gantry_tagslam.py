@@ -623,6 +623,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     slam.add_argument("--tag-size", type=float, default=DEFAULT_TAG_SIZE_M,
                       help="Physical AprilTag edge length in meters.")
     slam.add_argument("--anchor-tag-id", type=int, default=DEFAULT_ANCHOR_TAG_ID)
+    slam.add_argument("--tag-map", type=Path, default=None,
+                      help="Survey tag map (config/tag_map.yaml from survey_tags.py). "
+                           "When set, SLAM runs in PnP-only mode: every tag is locked "
+                           "to its mapped pose (transformed into the runtime anchor "
+                           "frame) and the live bootstrap is skipped.")
     slam.add_argument("--max-tag-id", type=int, default=-1)
     slam.add_argument("--water-scale", type=float, default=3.6)
     slam.add_argument("--water-correction-mode",

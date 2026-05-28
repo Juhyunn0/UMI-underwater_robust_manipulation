@@ -1526,6 +1526,44 @@ def target_rotation_aligned_to_plane(current_pose: Pose3, plane: FittedPlane) ->
     return Rot3(rotation_matrix.astype(np.float64))
 
 
+def load_tag_map(path: "Path | str") -> "dict | None":
+    """Load a tag map produced by ``survey_tags.py``.
+
+    Returns ``{"anchor_id": int|None, "poses": {tag_id: Pose3}}`` with poses in the
+    MAP anchor frame (exactly as stored), or ``None`` when the file is missing,
+    empty, or has no usable tags (caller then runs normal bootstrap mode). Uses
+    PyYAML (the SLAM stack already depends on it); raises only if the file exists
+    but PyYAML cannot be imported.
+    """
+    path = Path(path)
+    if not path.exists():
+        print(f"[tag-map] file not found: {path}", file=sys.stderr)
+        return None
+    try:
+        import yaml
+    except Exception as exc:  # pragma: no cover - environment-specific
+        raise RuntimeError(f"PyYAML is required to read {path}: {exc}")
+    data = yaml.safe_load(path.read_text()) or {}
+    tags = data.get("tags") or {}
+    poses: dict[int, Pose3] = {}
+    for tag_id, entry in tags.items():
+        try:
+            pos = [float(v) for v in entry["position_m"]]
+            quat = [float(v) for v in entry["quaternion_wxyz"]]  # [w, x, y, z]
+            rot = Rot3.Quaternion(quat[0], quat[1], quat[2], quat[3])
+            poses[int(tag_id)] = Pose3(rot, Point3(pos[0], pos[1], pos[2]))
+        except (KeyError, ValueError, TypeError) as exc:
+            print(f"[tag-map] skipping malformed tag entry {tag_id}: {exc}", file=sys.stderr)
+    if not poses:
+        print(f"[tag-map] {path} contained no usable tags", file=sys.stderr)
+        return None
+    anchor_id = data.get("anchor_tag_id")
+    return {
+        "anchor_id": int(anchor_id) if anchor_id is not None else None,
+        "poses": poses,
+    }
+
+
 class TagSlamBackend:
     """
     Incremental TagSLAM backend.
@@ -1611,6 +1649,60 @@ class TagSlamBackend:
         # gravity references (G2/G3/G4) and reverts to anchor-frame behavior.
         self.imu_gravity_camera: np.ndarray | None = None
 
+        # Optional locked tag map (PnP-only mode). When a survey map is supplied,
+        # every tag is pinned as a hard prior in the runtime anchor frame and the
+        # live bootstrap is skipped — the camera localizes by PnP from frame one.
+        self.pnp_only: bool = False
+        self.map_tag_poses: dict[int, Pose3] = {}  # runtime-anchor frame
+        self.locked_tag_noise = self.prior_noise   # same sigma as the anchor prior
+        self._setup_tag_map(getattr(args, "tag_map", None))
+
+    def _setup_tag_map(self, tag_map) -> None:
+        """Load (if a path) and transform a survey tag map into the runtime anchor
+        frame, pinning every tag for pure PnP-only localization.
+
+        ``tag_map`` may be a pre-parsed dict ({"anchor_id", "poses"}), a path to a
+        tag_map.yaml, or None (normal bootstrap mode). The runtime anchor is
+        ``self.anchor_tag_id`` (already chosen, e.g. nearest image center). Raises
+        loudly if that anchor is absent from the map.
+        """
+        if tag_map is None:
+            return
+        if not isinstance(tag_map, dict):
+            tag_map = load_tag_map(tag_map)
+        if not tag_map or not tag_map.get("poses"):
+            print("[tag-map] no usable map — running normal bootstrap mode", file=sys.stderr)
+            return
+
+        map_poses: dict[int, Pose3] = tag_map["poses"]
+        survey_anchor = tag_map.get("anchor_id")
+        runtime_anchor = self.anchor_tag_id
+        print(f"[tag-map] Loaded {len(map_poses)} tags from tag map", file=sys.stderr)
+        print(f"[tag-map] Survey anchor: tag {survey_anchor}", file=sys.stderr)
+        print(f"[tag-map] Runtime anchor: tag {runtime_anchor} "
+              "(selected from image center at frame 0)", file=sys.stderr)
+
+        if runtime_anchor not in map_poses:
+            msg = (f"Runtime anchor tag {runtime_anchor} is not in the loaded tag map. "
+                   "Either re-run survey to include this tag, or pre-select a known "
+                   "anchor via CLI.")
+            print(f"[tag-map] ERROR: {msg}", file=sys.stderr)
+            raise RuntimeError(msg)
+
+        # Re-express every map pose in the runtime anchor frame:
+        #   T_runtime_to_X = (T_map_to_runtime_anchor)^-1 @ T_map_to_X
+        # so the runtime anchor lands on identity and the rest follow.
+        T_runtime_to_map = map_poses[runtime_anchor].inverse()
+        for tag_id, T_map_to_tag in map_poses.items():
+            self.map_tag_poses[tag_id] = T_runtime_to_map.compose(T_map_to_tag)
+        self.pnp_only = True
+        # Hard locked priors are the ground truth; the soft floor co-planarity
+        # prior would only fight them, so it is disabled in PnP-only mode.
+        self.floor_prior_enabled = False
+        print(f"[tag-map] Transformed {len(self.map_tag_poses)} tag poses "
+              "into runtime anchor frame", file=sys.stderr)
+        print("[tag-map] PnP-only mode active — tag positions locked", file=sys.stderr)
+
     def _add_factor(self, new_graph: NonlinearFactorGraph, factor) -> None:
         new_graph.add(factor)
         self.graph.add(factor)
@@ -1693,6 +1785,9 @@ class TagSlamBackend:
             )
 
     def _ready_observations(self, observations: list[TagObservation]) -> list[TagObservation]:
+        if self.pnp_only:
+            # PnP-only: only mapped tags are usable; never bootstrap new ones.
+            return [obs for obs in observations if obs.tag_id in self.map_tag_poses]
         ready: list[TagObservation] = []
         for obs in observations:
             if obs.tag_id in self.initialized_tag_ids:
@@ -1889,6 +1984,12 @@ class TagSlamBackend:
 
     def update(self, observations: list[TagObservation]) -> BackendUpdate:
         self._record_observation_counts(observations)
+        if self.pnp_only:
+            # Locked map: skip the live bootstrap entirely. Tags are pinned in
+            # the runtime anchor frame; the camera localizes by PnP each frame.
+            if not self.initialized:
+                return self._initialize_pnp_only(observations)
+            return self._update_incremental(self._ready_observations(observations))
         if not self.initialized:
             return self._initialize_when_anchor_visible(observations)
         return self._update_incremental(self._ready_observations(observations))
@@ -2043,6 +2144,77 @@ class TagSlamBackend:
             tag_poses=self._optimized_tag_poses(),
             camera_index=camera_index,
             used_observation_count=len(graph_observations),
+            camera_position_std_cm=position_std_cm,
+            anchor_tag_id=self.anchor_tag_id,
+        )
+
+    def _pnp_camera_from_map(self, observations: list[TagObservation]) -> Pose3 | None:
+        """world_T_camera from a visible mapped tag (PnP): world_T_tag is known
+        (locked), camera_T_tag is measured, so world_T_camera = world_T_tag *
+        camera_T_tag^-1. Pick the largest in-image tag for the most stable seed."""
+        visible = [o for o in observations if o.tag_id in self.map_tag_poses]
+        if not visible:
+            return None
+        best = max(visible, key=lambda o: getattr(o, "tag_area_px", 0.0))
+        return self.map_tag_poses[best.tag_id].compose(best.camera_T_tag.inverse())
+
+    def _initialize_pnp_only(self, observations: list[TagObservation]) -> BackendUpdate:
+        """PnP-only init: pin every mapped tag as a hard prior in the runtime
+        anchor frame (all tags present from frame one) and localize the camera by
+        PnP. No waiting for the anchor, no bootstrap, no per-tag init jump."""
+        world_T_camera = self._pnp_camera_from_map(observations)
+        if world_T_camera is None:
+            return BackendUpdate(
+                optimized=False,
+                status="PnP-only: waiting for a mapped tag in view",
+                camera_pose=None,
+                tag_poses={},
+                camera_index=None,
+                anchor_tag_id=self.anchor_tag_id,
+            )
+
+        new_graph = NonlinearFactorGraph()
+        new_values = Values()
+        inserted_keys: set[int] = set()
+
+        # Hard priors on every mapped tag (sigma == anchor prior). Inserted once;
+        # iSAM retains them, so they stay locked for the whole run.
+        for tag_id, tag_pose in self.map_tag_poses.items():
+            tag_key = L(tag_id)
+            self._add_factor(new_graph, PriorFactorPose3(tag_key, tag_pose, self.locked_tag_noise))
+            self._insert_pose_once(new_values, inserted_keys, tag_key, tag_pose)
+            self.initialized_tag_ids.add(tag_id)
+
+        camera_index = self.next_camera_index
+        camera_key = X(camera_index)
+        self._insert_pose_once(new_values, inserted_keys, camera_key, world_T_camera)
+
+        visible = [o for o in observations if o.tag_id in self.map_tag_poses]
+        for obs in visible:
+            self._add_factor(
+                new_graph,
+                BetweenFactorPose3(camera_key, L(obs.tag_id), obs.camera_T_tag, self.tag_noise),
+            )
+
+        self.isam.update(new_graph, new_values)
+        self.current_estimate = self.isam.calculateEstimate()
+        self.initialized = True
+        self.last_camera_index = camera_index
+        self.last_camera_key = camera_key
+        self.next_camera_index += 1
+
+        camera_pose = self.current_estimate.atPose3(camera_key)
+        position_std_cm = self._remember_camera_pose(camera_pose)
+        return BackendUpdate(
+            optimized=True,
+            status=(
+                f"PnP-only init: {len(self.map_tag_poses)} locked tags, "
+                f"localized from {len(visible)} visible"
+            ),
+            camera_pose=camera_pose,
+            tag_poses=self._optimized_tag_poses(),
+            camera_index=camera_index,
+            used_observation_count=len(visible),
             camera_position_std_cm=position_std_cm,
             anchor_tag_id=self.anchor_tag_id,
         )
