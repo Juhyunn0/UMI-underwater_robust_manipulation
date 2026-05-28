@@ -691,10 +691,9 @@ Full-pipeline mode (`camera_mode: fisheye`):
 | `waypoints.csv` | Snapshot of the waypoints that ran (user-frame mm) |
 | `camera_trajectory.csv` | TagSLAM camera poses + `gantry_x/y/z_mm`, `translation_error_mm` |
 | `tag_poses.csv` | Optimized tag positions |
-| `trajectory_interactive.html` | 3D interactive viewer |
-| `comparison_topdown.png` | Top-down overlay: camera traj (viridis) + gantry GT (orange) |
-| `comparison_plot.png` | 3×3 grid: pose/vel/acc × X/Y/Z, gantry vs AprilTag |
-| `pose_velocity_acceleration.html` | Interactive 9-panel comparison (synchronized hover) |
+| `trajectory_interactive.html` | **★ Primary viewer — two tabs (Trajectory + Velocity)**, one self-contained HTML, no external deps. **Trajectory:** top-down camera (viridis) + gantry GT (orange dashed, rotated to the SLAM frame via `R_gantry_to_slam`) over the pool outline + tags, time slider, camera-frame card, layer toggles, dual current-time markers + Δ readout. **Velocity:** stacked Vx/Vy/Vz (cm/s), gantry derived (blue) vs camera derived (dashed red), shared time cursor, pan/zoom. Time cursor syncs across tabs. |
+| `comparison_topdown.png` | Top-down overlay: camera traj (viridis) + gantry GT (orange) — paper figure |
+| `comparison_plot.png` | 3×3 grid: pose/vel/acc × X/Y/Z, gantry vs AprilTag — paper figure |
 | `run_metadata.json` | CLI args, timing, output paths, alignment note, `camera_mode`, `axis_sign`, `soft_limits` |
 | `frames/` | Raw fisheye frames (if recording was active) |
 
@@ -702,10 +701,38 @@ Gantry-only mode (`camera_mode: gantry_only`):
 
 | File | Content |
 |------|---------|
-| `gantry_telemetry.csv` | 100 Hz gantry pose/vel/acc |
+| `gantry_telemetry.csv` | 100 Hz gantry pose + SDK/derived velocity + derived accel |
 | `waypoints.csv` | Snapshot of the waypoints that ran |
+| `trajectory_interactive.html` | **★ Primary viewer** — gantry-only: Trajectory shows pool + gantry path only, Velocity shows the gantry curves only, header carries a *Gantry-only run (no camera)* badge |
 | `gantry_pose_velocity_acceleration.png` | 3×3 grid: pose/vel/acc × X/Y/Z, gantry GT only |
 | `run_metadata.json` | Timing, output paths, `camera_mode: gantry_only`, `axis_sign`, `soft_limits` |
+
+Files no longer generated: `pose_velocity_acceleration.html` (replaced by the Velocity tab) and `run_dashboard.html` (folded into `trajectory_interactive.html`).
+
+**`gantry_telemetry.csv` velocity columns (schema change)**
+
+- `vx_mm_s_sdk` / `vy_…` / `vz_…` — firmware-reported velocity. May be zero/unreliable in the 664 "axis not enabled / not homed" state; kept for diagnostics only.
+- `vx_mm_s_derived` / … and `ax_mm_s2_derived` / … — **position-derived** via a Savitzky-Golay smooth derivative (`SMOOTHING_WINDOW_S=0.25 s`, `SMOOTHING_POLYORDER=2`), filled by a post-pass in `stop()`. Downstream visualization uses the `*_derived` columns.
+- **Backward compatibility:** old recordings (single `vx_mm_s` column) still visualize — the dashboard reads them as SDK velocity and shows a *Legacy CSV — SDK velocity only* banner.
+
+**`trajectory_interactive.html` notes**
+
+- Camera velocity is derived from `camera_trajectory.csv` positions with the **same Savitzky-Golay window/order** as `GantryTelemetryLogger` — a fair gantry-vs-camera comparison.
+- Gantry data is rotated into the SLAM frame by `R_gantry_to_slam` (calibration YAML, default identity) and offset by `gantry_anchor_offset_mm`. Header shows `Alignment: gantry_anchor_offset_mm` when the offset is present, else `first-sample-zeroed (approximate)` (only shape/drift meaningful then).
+- Self-contained; the only part needing the sibling `frames/` directory is the camera-frame thumbnail in the Trajectory card.
+
+**`R_gantry_to_slam` (optional calibration field)**
+
+3×3 rotation, gantry frame → SLAM (anchor-tag) frame. Fill it when gantry +X shows up as motion along a different SLAM axis. Example — gantry +X is SLAM +Y, gantry +Y is SLAM −X:
+
+```yaml
+R_gantry_to_slam:
+  - [0,  1, 0]    # +X_gantry -> +Y_slam
+  - [-1, 0, 0]    # +Y_gantry -> -X_slam
+  - [0,  0, 1]    # +Z_gantry -> +Z_slam
+```
+
+Absent → identity. A non-orthonormal / det≠+1 matrix logs a warning and falls back to identity.
 
 ### Aligning the two CSVs in pandas
 

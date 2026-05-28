@@ -693,7 +693,7 @@ class PostprocessThread(QThread):
             except Exception as exc:
                 errors.append(f"overlay_topdown_plot: {exc}")
 
-        # 4) Pose/velocity/acceleration plots (full pipeline only)
+        # 4) Pose/velocity/acceleration STATIC figure (paper-ready, full pipeline)
         if not gantry_only and gantry_csv.exists() and camera_csv.exists():
             self.progress.emit("Writing pose/velocity/acceleration plot…")
             try:
@@ -704,15 +704,51 @@ class PostprocessThread(QThread):
                     result["comparison_plot"] = str(out)
             except Exception as exc:
                 errors.append(f"pva_plot: {exc}")
+            # NOTE: pose_velocity_acceleration.html is no longer generated; its
+            # role is replaced by the Velocity tab of trajectory_interactive.html.
 
-            self.progress.emit("Writing interactive comparison HTML…")
+        # 4.5) Consolidated 2-tab trajectory_interactive.html (Trajectory +
+        #      Velocity), in BOTH full-pipeline and gantry-only modes. This
+        #      overwrites the gantry-less HTML written by recorder.stop_and_save.
+        if gantry_csv.exists():
+            self.progress.emit("Writing trajectory_interactive.html (2 tabs)…")
             try:
                 import tagslam_core as _tc
-                html_path = run_dir / "pose_velocity_acceleration.html"
-                out = _tc.write_pose_velocity_acceleration_html(html_path, gantry_csv, camera_csv)
-                result["comparison_html"] = str(out)
+                from tagslam.visualization import normalize_pool_config
+
+                dash_runtime_cfg: dict = {}
+                try:
+                    from tagslam_core import parse_simple_yaml
+                    _cfg_p = Path(getattr(config.fisheye_args, "config", "config/config.yaml")) \
+                        if config.fisheye_args is not None else Path("config/config.yaml")
+                    if _cfg_p.exists():
+                        dash_runtime_cfg = parse_simple_yaml(_cfg_p.read_text())
+                except Exception:
+                    pass
+                dash_pool_cfg = normalize_pool_config(dash_runtime_cfg.get("pool", {}))
+
+                dash_anchor_id = getattr(config.fisheye_args, "anchor_tag_id", 1) \
+                    if config.fisheye_args is not None else 1
+                dash_calib = config.fisheye_calib if not gantry_only else None
+                dash_rms = None
+                if not gantry_only and camera_csv.exists():
+                    dash_rms = _compute_pose_rmse(gantry_csv, camera_csv)
+
+                # camera_rows/tag_rows are ignored on the gantry path (the builder
+                # reads the CSVs); pass [] to satisfy the signature.
+                out = _tc.write_interactive_trajectory_html(
+                    run_dir, [], [], dash_pool_cfg,
+                    getattr(config.fisheye_args, "tag_size", 0.17) if config.fisheye_args else 0.17,
+                    getattr(config.fisheye_args, "plot_z_scale", 1.0) if config.fisheye_args else 1.0,
+                    dash_anchor_id,
+                    gantry_csv=gantry_csv,
+                    fisheye_calib=dash_calib,
+                    rms_summary=dash_rms,
+                )
+                if out is not None:
+                    result["trajectory_html"] = str(out)
             except Exception as exc:
-                errors.append(f"pva_html: {exc}")
+                errors.append(f"trajectory_interactive_html: {exc}")
 
         # 5) Metadata
         self.progress.emit("Writing run_metadata.json…")
@@ -764,6 +800,50 @@ class PostprocessThread(QThread):
 def _read_csv(path: Path) -> list[dict[str, str]]:
     with path.open(newline="", encoding="utf-8") as fh:
         return list(csv.DictReader(fh))
+
+
+def _compute_pose_rmse(gantry_csv: Path, camera_csv: Path) -> dict | None:
+    """Per-axis pose RMSE (mm) between gantry GT and AprilTag estimate.
+
+    Aligns the gantry trajectory's first sample to the camera's first sample
+    (so the RMSE reflects tracking drift, not the constant unknown frame
+    offset), interpolates the camera onto the gantry time grid, and returns
+    {"x_mm","y_mm","z_mm"}. Returns None if either CSV is unusable.
+    """
+    try:
+        import numpy as _np
+    except ImportError:
+        return None
+    g = _read_csv(gantry_csv) if gantry_csv.exists() else []
+    c = _read_csv(camera_csv) if camera_csv.exists() else []
+    if not g or not c:
+        return None
+
+    def col(rows, key, scale=1.0):
+        out = []
+        for r in rows:
+            try:
+                out.append(float(r[key]) * scale)
+            except (KeyError, ValueError, TypeError):
+                out.append(float("nan"))
+        return _np.array(out, dtype=_np.float64)
+
+    g_t = col(g, "elapsed_s")
+    c_t = col(c, "time_s")
+    axes = {}
+    for axis, gk, ck in (("x_mm", "x_mm", "x_m"), ("y_mm", "y_mm", "y_m"), ("z_mm", "z_mm", "z_m")):
+        g_arr = col(g, gk)
+        c_arr = col(c, ck, 1000.0)  # camera m -> mm
+        fg = _np.isfinite(g_arr) & _np.isfinite(g_t)
+        fc = _np.isfinite(c_arr) & _np.isfinite(c_t)
+        if fg.sum() < 1 or fc.sum() < 2:
+            axes[axis] = float("nan")
+            continue
+        # first-sample align gantry start to camera start
+        g_aligned = g_arr - (g_arr[fg][0] - c_arr[fc][0])
+        c_interp = _np.interp(g_t[fg], c_t[fc], c_arr[fc])
+        axes[axis] = float(_np.sqrt(_np.nanmean((g_aligned[fg] - c_interp) ** 2)))
+    return axes
 
 
 # ─────────────────────────────────────────────────────────────────────────────

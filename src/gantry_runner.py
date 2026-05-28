@@ -34,13 +34,20 @@ For exact per-axis speed control, use --mode sequential (jog_single_axis),
 which lets us convert mm/s to units/s per axis independently.
 
 ================================================================================
-Acceleration column (derived, not from SDK)
+Velocity & acceleration columns (derived, post-pass)
 ================================================================================
-The FMC4030 has no acceleration readout. We derive it as a finite difference
-on a sliding window of recent (time, velocity) samples (default window=5):
-split the window into front and back halves, average each half (SMA low-pass),
-and central-difference between the two centroids. So `a*_mm_s2` is a smoothed
-~50 ms-ish estimate, not a direct sensor value.
+The CSV carries two velocity families:
+  * v*_mm_s_sdk      — firmware-reported (FMC4030_Get_*); may be zero/unreliable
+                       in the 664 "axis not enabled / not homed" state.
+  * v*_mm_s_derived  — position-derived via a Savitzky-Golay smooth derivative
+                       (time window SMOOTHING_WINDOW_S, order SMOOTHING_POLYORDER).
+Acceleration (a*_mm_s2_derived) is the Savitzky-Golay derivative of the derived
+velocity. Because centered smoothing windows need future samples, the *_derived
+columns are written blank during the real-time loop and filled by a post-pass
+in stop() (_finalize_derived) over the complete recording. Downstream
+visualizers use the *_derived columns; the *_sdk columns are diagnostic only.
+The same SMOOTHING_WINDOW_S / SMOOTHING_POLYORDER are applied to the camera
+trajectory in tagslam_core, so gantry vs camera estimates are a fair comparison.
 ================================================================================
 """
 
@@ -81,6 +88,13 @@ AXES: tuple[Axis, Axis, Axis] = (Axis.X, Axis.Y, Axis.Z)
 
 EMERGENCY_STOP = threading.Event()
 
+# Smoothing parameters for derived velocity/acceleration. The SAME window and
+# polynomial order are used for the camera trajectory in tagslam_core, so the
+# gantry (≈100 Hz) and camera (≈30 fps) estimates share temporal smoothing
+# characteristics despite different sample counts — a fair comparison.
+SMOOTHING_WINDOW_S = 0.25
+SMOOTHING_POLYORDER = 2
+
 
 def units_to_mm(units: float, axis: Axis) -> float:
     return units * SCALE_MM_PER_UNIT[axis]
@@ -88,6 +102,77 @@ def units_to_mm(units: float, axis: Axis) -> float:
 
 def mm_to_units(mm: float, axis: Axis) -> float:
     return mm / SCALE_MM_PER_UNIT[axis]
+
+
+def compute_derivative_savgol(
+    t,
+    y,
+    window_s: float = SMOOTHING_WINDOW_S,
+    polyorder: int = SMOOTHING_POLYORDER,
+):
+    """Smooth time-derivative dy/dt at each sample via a local polynomial fit.
+
+    For each sample i, gather neighbours within ±window_s/2 of t[i], fit a
+    degree-`polyorder` polynomial to (t-t[i], y), and evaluate its first
+    derivative at t[i]. Returns NaN where the window cannot hold at least
+    polyorder+1 finite samples (typically the start/end of the recording).
+
+    Uses scipy.signal.savgol_filter as a fast path when the signal is finite
+    and uniformly sampled; otherwise (or if scipy is missing) uses the manual
+    local-polyfit, which also tolerates NaNs and non-uniform spacing.
+    """
+    import numpy as _np
+    t = _np.asarray(t, dtype=_np.float64)
+    y = _np.asarray(y, dtype=_np.float64)
+    n = len(t)
+    out = _np.full(n, _np.nan, dtype=_np.float64)
+    if n < polyorder + 1:
+        return out
+    half = window_s / 2.0
+
+    # Fast path: uniform sampling + fully finite signal -> scipy savgol.
+    try:
+        from scipy.signal import savgol_filter  # type: ignore
+        if _np.isfinite(y).all() and _np.isfinite(t).all():
+            dt = _np.diff(t)
+            good = dt[(dt > 0) & _np.isfinite(dt)]
+            if good.size:
+                med = float(_np.median(good))
+                if med > 0 and _np.allclose(good, med, rtol=0.25):
+                    win = int(round(window_s / med))
+                    if win % 2 == 0:
+                        win += 1
+                    if polyorder + 2 <= win <= n:
+                        d = savgol_filter(y, win, polyorder, deriv=1, delta=med)
+                        # NaN the edges where a full window can't be centered.
+                        k = win // 2
+                        d[:k] = _np.nan
+                        d[n - k:] = _np.nan
+                        return d
+    except Exception:
+        pass
+
+    # Manual local polynomial fit (time-window; tolerates NaN / non-uniform).
+    # Require the window to be populated on BOTH sides (otherwise the fit is a
+    # one-sided extrapolation) -> NaN near the recording start/end.
+    tol = half * 0.5
+    for i in range(n):
+        if not _np.isfinite(t[i]):
+            continue
+        lo, hi = t[i] - half, t[i] + half
+        mask = _np.isfinite(t) & _np.isfinite(y) & (t >= lo) & (t <= hi)
+        if int(mask.sum()) < polyorder + 1:
+            continue
+        tt = t[mask] - t[i]
+        if tt.min() > -tol or tt.max() < tol:
+            continue  # window not fully populated on both sides
+        yy = y[mask]
+        try:
+            coef = _np.polyfit(tt, yy, polyorder)
+            out[i] = float(_np.polyval(_np.polyder(coef), 0.0))
+        except Exception:
+            continue
+    return out
 
 
 # -----------------------------------------------------------------------------
@@ -118,13 +203,19 @@ class GantrySample:
     is_moving: bool
 
 
+# NOTE: velocity columns carry an explicit origin suffix:
+#   *_sdk     = firmware-reported velocity (may be zero/unreliable in 664 state)
+#   *_derived = position-derived via Savitzky-Golay (filled in stop()'s
+#               post-pass; always computed regardless of SDK availability)
+# Acceleration is always derived (FMC4030 has no acceleration readout).
 CSV_COLUMNS: tuple[str, ...] = (
     "timestamp_unix", "timestamp_monotonic", "elapsed_s",
     "x_units", "y_units", "z_units",
     "x_mm", "y_mm", "z_mm",
     "vx_units_s", "vy_units_s", "vz_units_s",
-    "vx_mm_s", "vy_mm_s", "vz_mm_s",
-    "ax_mm_s2", "ay_mm_s2", "az_mm_s2",
+    "vx_mm_s_sdk", "vy_mm_s_sdk", "vz_mm_s_sdk",
+    "vx_mm_s_derived", "vy_mm_s_derived", "vz_mm_s_derived",
+    "ax_mm_s2_derived", "ay_mm_s2_derived", "az_mm_s2_derived",
     "target_x_mm", "target_y_mm", "target_z_mm",
     "waypoint_index", "is_moving",
 )
@@ -171,7 +262,9 @@ class GantryTelemetryLogger:
         self._csv_fh = None
         self._csv_writer = None
 
-        self._vel_buf: deque[tuple[float, tuple[float, float, float]]] = deque(maxlen=self._fd_n)
+        # Zero-SDK-velocity diagnostic (warn once).
+        self._vel_zero_warned: bool = False
+        self._last_pos_check: tuple[float, tuple[float, float, float]] | None = None
 
     # ---- public ------------------------------------------------------------
     @property
@@ -213,6 +306,66 @@ class GantryTelemetryLogger:
             finally:
                 self._csv_fh = None
                 self._csv_writer = None
+        # Post-pass: fill *_derived velocity + acceleration columns. Centered
+        # smoothing windows need future samples, which the real-time streaming
+        # loop can't see, so we compute them here over the complete recording.
+        try:
+            self._finalize_derived()
+        except Exception as exc:  # never let finalize crash the caller
+            print(f"[gantry-logger] finalize-derived failed: {exc}", file=sys.stderr)
+
+    def _finalize_derived(self) -> None:
+        """Re-read the written CSV, compute Savitzky-Golay velocity (from
+        position) and acceleration (from derived velocity) per axis, and
+        rewrite the file with the *_derived columns populated."""
+        if not self._csv_path.exists():
+            return
+        with self._csv_path.open(newline="") as fh:
+            reader = csv.reader(fh)
+            rows = list(reader)
+        if len(rows) < 2:
+            return
+        header = rows[0]
+        body = rows[1:]
+        idx = {name: i for i, name in enumerate(header)}
+        need = ["elapsed_s", "x_mm", "y_mm", "z_mm",
+                "vx_mm_s_derived", "vy_mm_s_derived", "vz_mm_s_derived",
+                "ax_mm_s2_derived", "ay_mm_s2_derived", "az_mm_s2_derived"]
+        if any(k not in idx for k in need):
+            return
+
+        import numpy as _np
+
+        def colf(name: str) -> "_np.ndarray":
+            out = _np.empty(len(body), dtype=_np.float64)
+            j = idx[name]
+            for r, row in enumerate(body):
+                try:
+                    out[r] = float(row[j])
+                except (ValueError, IndexError):
+                    out[r] = _np.nan
+            return out
+
+        t = colf("elapsed_s")
+        vx = compute_derivative_savgol(t, colf("x_mm"))
+        vy = compute_derivative_savgol(t, colf("y_mm"))
+        vz = compute_derivative_savgol(t, colf("z_mm"))
+        ax = compute_derivative_savgol(t, vx)
+        ay = compute_derivative_savgol(t, vy)
+        az = compute_derivative_savgol(t, vz)
+
+        def put(name: str, arr: "_np.ndarray", r: int) -> None:
+            v = arr[r]
+            body[r][idx[name]] = "" if not _np.isfinite(v) else f"{v:.4f}"
+
+        for r in range(len(body)):
+            put("vx_mm_s_derived", vx, r); put("vy_mm_s_derived", vy, r); put("vz_mm_s_derived", vz, r)
+            put("ax_mm_s2_derived", ax, r); put("ay_mm_s2_derived", ay, r); put("az_mm_s2_derived", az, r)
+
+        with self._csv_path.open("w", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(header)
+            writer.writerows(body)
 
     # ---- internal ----------------------------------------------------------
     def _sample_status(self) -> tuple[float, float, tuple[float, float, float], tuple[float, float, float]]:
@@ -250,26 +403,6 @@ class GantryTelemetryLogger:
         t_unix = time.time()
         return t_unix, t_mono, pos, vel
 
-    def _accel_smoothed_central_diff(self) -> tuple[float, float, float]:
-        # SMA-smoothed central difference: average front and back halves of the
-        # window, then differentiate between the two half-centroids.
-        n = len(self._vel_buf)
-        if n < self._fd_n:
-            return (0.0, 0.0, 0.0)
-        half = self._fd_n // 2
-        items = list(self._vel_buf)
-        front = items[:half]
-        back = items[-half:]
-        t_front = sum(it[0] for it in front) / len(front)
-        t_back = sum(it[0] for it in back) / len(back)
-        dt = t_back - t_front
-        if dt <= 0:
-            return (0.0, 0.0, 0.0)
-        ax = (sum(it[1][0] for it in back) / len(back) - sum(it[1][0] for it in front) / len(front)) / dt
-        ay = (sum(it[1][1] for it in back) / len(back) - sum(it[1][1] for it in front) / len(front)) / dt
-        az = (sum(it[1][2] for it in back) / len(back) - sum(it[1][2] for it in front) / len(front)) / dt
-        return (ax, ay, az)
-
     def _run(self) -> None:
         next_tick = time.monotonic()
         while not self._stop.is_set():
@@ -290,10 +423,25 @@ class GantryTelemetryLogger:
                 units_to_mm(vel_units[1], AXES[1]),
                 units_to_mm(vel_units[2], AXES[2]),
             )
+            # Acceleration (and a derived velocity) are filled by the post-pass
+            # in stop()/_finalize_derived(); centered windows need future
+            # samples not available in this real-time loop.
+            acc_mm = (math.nan, math.nan, math.nan)
 
-            # Buffer mm-velocity so acceleration comes out in mm/s^2 directly.
-            self._vel_buf.append((t_mono, vel_mm))
-            acc_mm = self._accel_smoothed_central_diff()
+            # Diagnostic: SDK velocity reads zero while position is clearly
+            # moving (firmware 664 fallback). Warn once.
+            if not self._vel_zero_warned and all(abs(v) < 1e-9 for v in vel_mm):
+                prev = self._last_pos_check
+                if prev is not None:
+                    dt_chk = t_mono - prev[0]
+                    if 0.05 <= dt_chk <= 0.2:
+                        moved = max(abs(pos_mm[k] - prev[1][k]) for k in range(3))
+                        if moved > 0.1:
+                            print("[gantry-vel] SDK velocity reported 0 while position "
+                                  "moved — using derived velocity only.", file=sys.stderr)
+                            self._vel_zero_warned = True
+            if self._last_pos_check is None or (t_mono - self._last_pos_check[0]) >= 0.1:
+                self._last_pos_check = (t_mono, pos_mm)
 
             is_moving = any(abs(v) > 1e-6 for v in vel_units)
 
@@ -319,6 +467,8 @@ class GantryTelemetryLogger:
                 self._latest = sample
 
             if self._csv_writer is not None:
+                # vx/vy/vz_mm_s_sdk written live; *_derived + accel left blank
+                # for the stop() post-pass to fill.
                 self._csv_writer.writerow([
                     f"{sample.timestamp_unix:.6f}",
                     f"{sample.timestamp_monotonic:.6f}",
@@ -327,7 +477,8 @@ class GantryTelemetryLogger:
                     f"{pos_mm[0]:.4f}", f"{pos_mm[1]:.4f}", f"{pos_mm[2]:.4f}",
                     f"{vel_units[0]:.6f}", f"{vel_units[1]:.6f}", f"{vel_units[2]:.6f}",
                     f"{vel_mm[0]:.4f}", f"{vel_mm[1]:.4f}", f"{vel_mm[2]:.4f}",
-                    f"{acc_mm[0]:.4f}", f"{acc_mm[1]:.4f}", f"{acc_mm[2]:.4f}",
+                    "", "", "",   # vx/vy/vz_mm_s_derived (post-pass)
+                    "", "", "",   # ax/ay/az_mm_s2_derived (post-pass)
                     f"{target_mm[0]:.4f}", f"{target_mm[1]:.4f}", f"{target_mm[2]:.4f}",
                     wp_idx,
                     int(is_moving),

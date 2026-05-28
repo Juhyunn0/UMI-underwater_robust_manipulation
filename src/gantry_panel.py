@@ -50,8 +50,25 @@ except ImportError:
 # sys.path shim: import sibling modules from src/ regardless of cwd.
 _THIS_FILE = Path(__file__).resolve()
 _SRC_DIR = _THIS_FILE.parent
+_REPO_ROOT = _SRC_DIR.parent
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
+
+
+def _resolve_calib_path(text: str) -> "Path | None":
+    """Resolve a calibration-path string to a Path.
+
+    Absolute paths are used as-is. Relative paths resolve against the repo root
+    (parent of src/), so the default 'config/fisheye_calibration.yaml' works
+    whether the panel is launched from src/, the repo root, or elsewhere.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    p = Path(text)
+    if p.is_absolute():
+        return p
+    return (_REPO_ROOT / p)
 
 from PyQt5 import QtCore, QtGui, QtWidgets  # noqa: E402
 from PyQt5.QtCore import (  # noqa: E402
@@ -2269,6 +2286,10 @@ class GantryPanel(QMainWindow):
         self._recording_manual = False
         self._recording_auto = False
         self._recording_via_runner = False
+        # True while the ExperimentRunner owns the gantry logger; blocks the
+        # panel's auto-logger from spawning parallel <ts>_gantry_run folders.
+        self._runner_owns_logger = False
+        self._autologger_suppress_warned = False
         self._current_run_dir: Path | None = None
 
         # Worker handles.
@@ -2760,6 +2781,10 @@ class GantryPanel(QMainWindow):
             self._cam_fps_spin.setValue(int(saved_cam["fps"]))
         if saved_cam.get("calib_path"):
             self._cam_calib_edit.setText(saved_cam["calib_path"])
+        else:
+            # No saved value: default to the repo's standard calibration file
+            # (relative path; resolved against the repo root at use sites).
+            self._cam_calib_edit.setText("config/fisheye_calibration.yaml")
 
         return frame
 
@@ -3486,13 +3511,31 @@ class GantryPanel(QMainWindow):
                 or self._is_mock_camera
             )
             _set(self._exp_chk_camera, cam_ok)
+            # Effective calib path: the connected session's path if available,
+            # else the (repo-root-resolved) Experiment/connection-bar edit text.
+            _calib_eff = (
+                self._camera.calib_path
+                if (self._camera is not None and self._camera.calib_path is not None)
+                else _resolve_calib_path(self._cam_calib_edit.text())
+            )
             if self._is_mock_camera:
                 calib_ok = True
-            elif self._camera is not None and self._camera.calib_path is not None:
-                calib_ok = self._camera.calib_path.exists()
+            elif _calib_eff is not None and _calib_eff.exists():
+                calib_ok = True
             else:
                 calib_ok = False
             _set(self._exp_chk_calib, calib_ok)
+            # Clear file-not-found hint when the path is set but missing.
+            if not calib_ok and not self._is_mock_camera:
+                try:
+                    for lbl in self._exp_chk_calib.parentWidget().findChildren(QLabel):
+                        if "calibration" in lbl.text().lower():
+                            miss = "" if _calib_eff is None else f" — not found: {_calib_eff}"
+                            lbl.setText(f"Fisheye calibration{miss}  (run calibrate_fisheye.py)")
+                            lbl.setStyleSheet("color: #ef5350;")
+                            break
+                except Exception:
+                    pass
             # Restore base labels (strip any "(skipped)" suffix).
             try:
                 for indicator, base in (
@@ -3899,8 +3942,10 @@ class GantryPanel(QMainWindow):
     def _exp_on_finished(self, result: dict) -> None:
         self._experiment_in_progress = False
         self._exp_stop_btn.setEnabled(False)
-        was_recording = self._recording_via_runner
+        was_recording = self._recording_via_runner or self._runner_owns_logger
         self._recording_via_runner = False
+        self._runner_owns_logger = False
+        self._autologger_suppress_warned = False
         run_dir = result.get("run_dir", "")
         aborted = result.get("aborted", False)
         motion_error = result.get("motion_error", "")
@@ -4663,6 +4708,18 @@ class GantryPanel(QMainWindow):
                 "An experiment is already in progress.")
             return False
 
+        # Claim logger ownership SYNCHRONOUSLY, before any motion handler can
+        # fire, so the panel's auto-logger never spawns a parallel
+        # <ts>_gantry_run folder during this recording. Cleared in
+        # _exp_on_finished (or below if we bail out early).
+        self._recording_via_runner = True
+        self._runner_owns_logger = True
+        self._autologger_suppress_warned = False
+
+        def _release_ownership() -> None:
+            self._recording_via_runner = False
+            self._runner_owns_logger = False
+
         # Pre-flight: 664 is now non-blocking (telemetry + motion fall back
         # to per-axis reads). Only block on non-664 controller errors.
         if not self.is_mock:
@@ -4673,10 +4730,12 @@ class GantryPanel(QMainWindow):
                 if "664" not in str(exc):
                     QMessageBox.critical(self, "Controller error",
                         f"Pre-flight get_status() failed:\n\n{exc}")
+                    _release_ownership()
                     return False
             except Exception as exc:
                 QMessageBox.critical(self, "Controller error",
                     f"Pre-flight get_status() raised unexpectedly:\n\n{exc}")
+                _release_ownership()
                 return False
 
         # Decide camera_mode based on what's actually open right now.
@@ -4707,6 +4766,7 @@ class GantryPanel(QMainWindow):
                     fisheye_calib = load_fisheye_calibration(calib_path)
                 except SystemExit as exc:
                     QMessageBox.warning(self, "Calibration error", str(exc))
+                    _release_ownership()
                     return False
                 except ImportError:
                     pass
@@ -4745,7 +4805,7 @@ class GantryPanel(QMainWindow):
         }
 
         self._experiment_in_progress = True
-        self._recording_via_runner = True
+        # _recording_via_runner / _runner_owns_logger already set at top.
         if hasattr(self, "_exp_start_btn"):
             self._exp_start_btn.setEnabled(False)
         if hasattr(self, "_exp_stop_btn"):
@@ -4757,10 +4817,15 @@ class GantryPanel(QMainWindow):
         return True
 
     def _ensure_logger_started(self, auto: bool) -> None:
-        if self._logger is not None:
+        if self._recording_via_runner or self._runner_owns_logger:
+            # The runner owns the gantry logger for this recording; do not spawn
+            # a parallel <ts>_gantry_run logger from jog/move handlers.
+            if not self._autologger_suppress_warned:
+                print("[recording-folder] suppressed auto-logger spawn while "
+                      "runner owns recording", file=sys.stderr)
+                self._autologger_suppress_warned = True
             return
-        if self._recording_via_runner:
-            # The runner already owns a gantry logger; don't double-record.
+        if self._logger is not None:
             return
         run_dir = make_gantry_run_dir(Path("data"), suffix="gantry_run")
         csv_path = run_dir / "gantry_telemetry.csv"
@@ -5244,8 +5309,7 @@ class GantryPanel(QMainWindow):
         except ValueError:
             w, h = 1280, 720
 
-        calib_raw = self._cam_calib_edit.text().strip()
-        calib_path = Path(calib_raw) if calib_raw else None
+        calib_path = _resolve_calib_path(self._cam_calib_edit.text())
         mock = self._is_mock_camera
 
         self._cam_connect_btn.setEnabled(False)

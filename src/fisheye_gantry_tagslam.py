@@ -300,6 +300,8 @@ class FisheyeCalibration:
     D: np.ndarray              # 4x1 fisheye distortion
     image_size: tuple[int, int]  # (width, height)
     T_gantry_camera: np.ndarray  # 4x4, camera-frame point -> gantry-frame point
+    gantry_anchor_offset_mm: np.ndarray | None = None  # 3-vec, gantry-frame origin offset
+    R_gantry_to_slam: np.ndarray | None = None  # 3x3, gantry frame -> SLAM world frame (default identity)
 
 
 def load_fisheye_calibration(path: Path) -> FisheyeCalibration:
@@ -328,7 +330,41 @@ def load_fisheye_calibration(path: Path) -> FisheyeCalibration:
         raise SystemExit(f"Fisheye calibration in {path} contains non-finite values.")
     if abs(T[3, 0]) + abs(T[3, 1]) + abs(T[3, 2]) > 1e-9 or abs(T[3, 3] - 1.0) > 1e-9:
         raise SystemExit(f"T_gantry_camera last row must be [0,0,0,1]; got {T[3].tolist()}")
-    return FisheyeCalibration(K=K, D=D, image_size=(w, h), T_gantry_camera=T)
+
+    # Optional gantry_anchor_offset_mm (3-vector). Absent -> None.
+    offset = None
+    if data.get("gantry_anchor_offset_mm") is not None:
+        try:
+            offset = np.asarray(data["gantry_anchor_offset_mm"], dtype=np.float64).reshape(3)
+        except (ValueError, TypeError):
+            print(f"[calib] gantry_anchor_offset_mm malformed in {path}; ignoring.",
+                  file=sys.stderr)
+            offset = None
+
+    # Optional R_gantry_to_slam (3x3 rotation, gantry frame -> SLAM world frame).
+    # Absent -> None (callers treat as identity). On a malformed / non-orthonormal
+    # matrix we warn and fall back to None rather than crashing the pipeline.
+    R = None
+    if data.get("R_gantry_to_slam") is not None:
+        try:
+            R = np.asarray(data["R_gantry_to_slam"], dtype=np.float64).reshape(3, 3)
+        except (ValueError, TypeError):
+            print(f"[calib] R_gantry_to_slam malformed in {path}; using identity.",
+                  file=sys.stderr)
+            R = None
+        if R is not None:
+            ortho = np.allclose(R @ R.T, np.eye(3), atol=1e-3)
+            det_ok = abs(float(np.linalg.det(R)) - 1.0) < 1e-3
+            if not (ortho and det_ok):
+                print(f"[calib] R_gantry_to_slam in {path} is not a proper rotation "
+                      f"(R@R.T==I: {ortho}, det==+1: {det_ok}); using identity.",
+                      file=sys.stderr)
+                R = None
+
+    return FisheyeCalibration(
+        K=K, D=D, image_size=(w, h), T_gantry_camera=T,
+        gantry_anchor_offset_mm=offset, R_gantry_to_slam=R,
+    )
 
 
 def build_fisheye_undistort_maps(

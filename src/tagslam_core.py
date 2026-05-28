@@ -21,6 +21,7 @@ from pathlib import Path
 import sys
 import time
 from typing import Iterable
+import warnings
 
 import cv2
 import gtsam
@@ -2402,7 +2403,35 @@ def write_interactive_trajectory_html(
     tag_size_m: float,
     plot_z_scale: float,
     anchor_tag_id: int,
+    *,
+    gantry_csv: "Path | None" = None,
+    fisheye_calib: "object | None" = None,
+    rms_summary: dict | None = None,
 ) -> Path:
+    # When gantry data is supplied (experiment pipeline), emit the consolidated
+    # 2-tab dashboard (Trajectory + Velocity) to trajectory_interactive.html.
+    # When gantry_csv is None (standalone zed2 pipeline), fall through to the
+    # original rich single-tab 3D viewer below, unchanged.
+    if gantry_csv is not None:
+        R = getattr(fisheye_calib, "R_gantry_to_slam", None)
+        T_gc = getattr(fisheye_calib, "T_gantry_camera", None)
+        offset = getattr(fisheye_calib, "gantry_anchor_offset_mm", None)
+        cam_csv = output_dir / "camera_trajectory.csv"
+        tag_csv = output_dir / "tag_poses.csv"
+        return write_experiment_dashboard_html(
+            output_dir / "trajectory_interactive.html",
+            gantry_csv=gantry_csv,
+            camera_csv=(cam_csv if cam_csv.exists() else None),
+            tag_poses_csv=(tag_csv if tag_csv.exists() else None),
+            pool_cfg=pool_cfg,
+            anchor_id=anchor_tag_id,
+            T_gantry_camera=T_gc,
+            gantry_anchor_offset_mm=(list(offset) if offset is not None else None),
+            R_gantry_to_slam=R,
+            run_name=str(output_dir.name),
+            rms_summary=rms_summary,
+        ) or (output_dir / "trajectory_interactive.html")
+
     html_path = output_dir / "trajectory_interactive.html"
     pool_cfg = normalize_pool_config(pool_cfg)
     if anchor_tag_id == 1:
@@ -5224,5 +5253,775 @@ renderAll();
 </body>
 </html>"""
 
+    path.write_text(html, encoding="utf-8")
+    return path
+
+
+# =============================================================================
+# Unified experiment dashboard (single self-contained HTML, three tabs)
+# =============================================================================
+_DASHBOARD_TEMPLATE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Experiment Dashboard</title>
+<style>
+  :root { --bg:#0f0f12; --panel:#1a1a1d; --card:#232327; --line:#33333a;
+          --text:#e6e6e6; --muted:#9aa3ad; --accent:#4ea1ff;
+          --gantry:#ff8c42; --gt:#4ea1ff; --est:#ff5d5d; --cyan:#26d0e0; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text);
+               font-family: Arial, Helvetica, sans-serif; }
+  body { display:flex; flex-direction:column; overflow:hidden; }
+  #header { padding:10px 16px; border-bottom:1px solid var(--line); background:var(--panel); }
+  #header h1 { margin:0 0 4px 0; font-size:16px; }
+  #meta { font-size:12px; color:var(--muted); line-height:1.6; }
+  #meta b { color:var(--text); font-weight:600; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px;
+           font-weight:700; margin-left:8px; }
+  .badge-gantry { background:#5a3a18; color:#ffb774; border:1px solid #ff8c42; }
+  #tabs { display:flex; gap:2px; padding:8px 16px 0 16px; background:var(--panel);
+          border-bottom:1px solid var(--line); }
+  .tabbtn { padding:8px 18px; border:1px solid var(--line); border-bottom:none;
+            border-radius:6px 6px 0 0; background:var(--card); color:var(--muted);
+            cursor:pointer; font-size:13px; font-weight:600; }
+  .tabbtn.active { background:var(--bg); color:var(--accent); border-color:var(--accent); }
+  #content { flex:1; min-height:0; position:relative; }
+  .tabpane { position:absolute; inset:0; display:none; }
+  .tabpane.active { display:block; }
+  .toolbar { padding:8px 16px; display:flex; flex-wrap:wrap; gap:14px; align-items:center;
+             font-size:12px; color:var(--muted); border-bottom:1px solid var(--line); }
+  .toolbar label { cursor:pointer; user-select:none; }
+  .toolbar input { vertical-align:middle; margin-right:4px; }
+  .hint { color:#6b7682; font-size:11px; }
+  /* Trajectory tab layout */
+  #trajPane .body { position:absolute; top:42px; left:0; right:0; bottom:0;
+                    display:grid; grid-template-columns: minmax(0,1fr) 320px; }
+  #trajLeft { position:relative; min-width:0; display:flex; flex-direction:column; }
+  #trajCanvasWrap { flex:1; min-height:0; position:relative; }
+  #trajCanvas { width:100%; height:100%; display:block; cursor:crosshair; }
+  #sliderRow { padding:8px 12px; display:flex; gap:10px; align-items:center;
+               border-top:1px solid var(--line); background:var(--panel); }
+  #slider { flex:1; }
+  #sliderLabel { font-size:12px; color:var(--muted); white-space:nowrap; min-width:90px; }
+  #zedCard { border-left:1px solid var(--line); background:var(--panel); padding:10px;
+             display:flex; flex-direction:column; gap:8px; min-width:0; }
+  #zedCard .title { font-size:13px; font-weight:700; }
+  #zedImgWrap { flex:1; min-height:0; display:grid; place-items:center; background:#0a0d11;
+                border:1px solid var(--line); }
+  #zedImg { max-width:100%; max-height:100%; object-fit:contain; display:none; }
+  #zedPlaceholder { color:var(--muted); font-size:12px; text-align:center; padding:10px; }
+  #zedMeta { font-size:11px; color:var(--muted); line-height:1.5; }
+  /* time-series tabs */
+  .seriesBody { position:absolute; top:42px; left:0; right:0; bottom:0;
+                display:flex; flex-direction:column; }
+  .seriesCanvasWrap { flex:1; min-height:0; position:relative; }
+  .seriesCanvasWrap canvas { width:100%; height:100%; display:block; cursor:crosshair; }
+  .tooltip { position:fixed; pointer-events:none; background:rgba(20,24,30,0.95);
+             border:1px solid var(--accent); border-radius:5px; padding:7px 9px;
+             font-size:12px; line-height:1.5; color:var(--text); display:none;
+             white-space:pre; z-index:50; font-family: "DejaVu Sans Mono", monospace; }
+</style>
+</head>
+<body>
+  <div id="header">
+    <h1 id="runName">Run</h1>
+    <div id="meta"></div>
+  </div>
+  <div id="tabs">
+    <div class="tabbtn active" data-tab="trajectory" onclick="switchTab('trajectory')">Trajectory</div>
+    <div class="tabbtn" data-tab="velocity" onclick="switchTab('velocity')">Velocity</div>
+  </div>
+  <div id="content">
+    <!-- Trajectory -->
+    <div class="tabpane active" id="trajPane">
+      <div class="toolbar">
+        <label><input type="checkbox" id="tgCam" checked> Camera trajectory</label>
+        <label><input type="checkbox" id="tgGantry" checked> Gantry GT</label>
+        <label><input type="checkbox" id="tgTags" checked> Tags</label>
+        <label><input type="checkbox" id="tgPool" checked> Pool outline</label>
+        <label><input type="checkbox" id="tgCursor" checked> Time-cursor markers</label>
+        <span class="hint">top-down (X,Y) · hover for nearest-sample readout</span>
+      </div>
+      <div class="body">
+        <div id="trajLeft">
+          <div id="trajCanvasWrap"><canvas id="trajCanvas"></canvas></div>
+          <div id="sliderRow">
+            <span id="sliderLabel">t = 0.00 s</span>
+            <input type="range" id="slider" min="0" max="1000" value="0">
+          </div>
+        </div>
+        <div id="zedCard">
+          <div class="title">Camera view</div>
+          <div id="zedImgWrap"><img id="zedImg"><div id="zedPlaceholder">No camera frame</div></div>
+          <div id="zedMeta"></div>
+        </div>
+      </div>
+    </div>
+    <!-- Velocity -->
+    <div class="tabpane" id="velPane">
+      <div class="toolbar">
+        <label><input type="checkbox" id="vgGantry" checked> Gantry GT</label>
+        <label><input type="checkbox" id="vgCam" checked> Camera estimate</label>
+        <span class="hint">wheel = zoom X · drag = pan X · double-click = reset</span>
+      </div>
+      <div class="seriesBody">
+        <div class="seriesCanvasWrap"><canvas id="velCanvas0"></canvas></div>
+        <div class="seriesCanvasWrap"><canvas id="velCanvas1"></canvas></div>
+        <div class="seriesCanvasWrap"><canvas id="velCanvas2"></canvas></div>
+      </div>
+    </div>
+  </div>
+  <div class="tooltip" id="tooltip"></div>
+
+<script>
+"use strict";
+const DASH = __DASHBOARD_JSON__;
+
+// Shared time cursor across all tabs (seconds).
+let currentT = 0;
+let activeTab = "trajectory";
+
+const tooltip = document.getElementById("tooltip");
+function showTip(px, py, text){ tooltip.textContent = text; tooltip.style.display = "block";
+  tooltip.style.left = (px + 14) + "px"; tooltip.style.top = (py + 10) + "px"; }
+function hideTip(){ tooltip.style.display = "none"; }
+function fmt(v, d){ return (v===null||v===undefined||!isFinite(v)) ? "n/a" : v.toFixed(d===undefined?1:d); }
+
+// ── viridis colormap (approx control points) ────────────────────────────────
+const VIRIDIS = [[68,1,84],[72,40,120],[62,74,137],[49,104,142],[38,130,142],
+  [31,158,137],[53,183,121],[110,206,88],[181,222,43],[253,231,37]];
+function viridis(f){ f=Math.max(0,Math.min(1,f)); const x=f*(VIRIDIS.length-1);
+  const i=Math.floor(x), t=x-i, a=VIRIDIS[i], b=VIRIDIS[Math.min(i+1,VIRIDIS.length-1)];
+  return `rgb(${Math.round(a[0]+(b[0]-a[0])*t)},${Math.round(a[1]+(b[1]-a[1])*t)},${Math.round(a[2]+(b[2]-a[2])*t)})`; }
+
+// ── header ──────────────────────────────────────────────────────────────────
+(function fillHeader(){
+  document.getElementById("runName").textContent = "Run: " + DASH.run_name;
+  let rms = "RMSE: n/a";
+  if (DASH.rms) rms = `RMSE: X=${fmt(DASH.rms.x_mm)}mm  Y=${fmt(DASH.rms.y_mm)}mm  Z=${fmt(DASH.rms.z_mm)}mm`;
+  const badge = DASH.gantry_only ? `<span class="badge badge-gantry">Gantry-only run (no camera)</span>` : "";
+  const legacy = DASH.legacy_csv ? `<span class="badge badge-gantry">Legacy CSV — SDK velocity only</span>` : "";
+  document.getElementById("meta").innerHTML =
+    `<b>Duration:</b> ${DASH.duration_s}s &middot; <b>${DASH.n_gantry}</b> gantry samples &middot; ` +
+    `<b>${DASH.n_camera}</b> camera samples${badge}${legacy}<br>` +
+    `${rms}<br>` +
+    `<b>Alignment:</b> ${DASH.alignment} &middot; <b>Anchor tag:</b> ${DASH.anchor_id}`;
+})();
+
+// ── tab switching (pure class toggle) ────────────────────────────────────────
+function switchTab(name){
+  activeTab = name;
+  document.querySelectorAll(".tabbtn").forEach(b => b.classList.toggle("active", b.dataset.tab===name));
+  document.getElementById("trajPane").classList.toggle("active", name==="trajectory");
+  document.getElementById("velPane").classList.toggle("active", name==="velocity");
+  hideTip();
+  if (name==="trajectory"){ syncSliderToCurrentT(); resizeTraj(); drawTraj(); }
+  else { velTab.resizeAll(); velTab.render(); }
+}
+
+function setupCanvas(cv){
+  const dpr = Math.max(1, window.devicePixelRatio||1);
+  const r = cv.getBoundingClientRect();
+  cv.width = Math.max(1, Math.floor(r.width*dpr));
+  cv.height = Math.max(1, Math.floor(r.height*dpr));
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  return {ctx, w:r.width, h:r.height};
+}
+
+/* =========================================================================
+ * TAB 1 — Trajectory (top-down X,Y)
+ * ========================================================================= */
+const GANTRY = DASH.traj.gantry.filter(p => p.x_m!==null && p.y_m!==null);
+const CAMERA = DASH.traj.camera.filter(p => p.x_m!==null && p.y_m!==null);
+const trajCanvas = document.getElementById("trajCanvas");
+let trajView = null;  // {ctx,w,h}
+const layers = { cam:true, gantry:true, tags:true, pool:true, cursor:true };
+
+function trajBounds(){
+  let minx=1e9,maxx=-1e9,miny=1e9,maxy=-1e9;
+  const acc = (x,y)=>{ if(x<minx)minx=x; if(x>maxx)maxx=x; if(y<miny)miny=y; if(y>maxy)maxy=y; };
+  GANTRY.forEach(p=>acc(p.x_m,p.y_m));
+  CAMERA.forEach(p=>acc(p.x_m,p.y_m));
+  DASH.tags.forEach(t=>acc(t.x_m,t.y_m));
+  // pool centered on data centroid (placement is approximate context only)
+  const cx=(minx+maxx)/2||0, cy=(miny+maxy)/2||0;
+  const L=DASH.pool.length_m, W=DASH.pool.width_m;
+  let px, py;
+  if (DASH.pool.long_axis==="x"){ px=L/2; py=W/2; } else { px=W/2; py=L/2; }
+  pool_rect = {x0:cx-px, x1:cx+px, y0:cy-py, y1:cy+py};
+  acc(pool_rect.x0,pool_rect.y0); acc(pool_rect.x1,pool_rect.y1);
+  if(minx>maxx){ minx=-1;maxx=1;miny=-1;maxy=1; }
+  const padx=(maxx-minx)*0.08+0.05, pady=(maxy-miny)*0.08+0.05;
+  return {minx:minx-padx,maxx:maxx+padx,miny:miny-pady,maxy:maxy+pady};
+}
+let pool_rect = null;
+let trajBnd = null;
+function w2s(x,y){
+  const b=trajBnd, m=24, w=trajView.w, h=trajView.h;
+  const sx=(w-2*m)/(b.maxx-b.minx), sy=(h-2*m)/(b.maxy-b.miny);
+  const s=Math.min(sx,sy);
+  const ox=m+((w-2*m)-(b.maxx-b.minx)*s)/2, oy=m+((h-2*m)-(b.maxy-b.miny)*s)/2;
+  return { x: ox+(x-b.minx)*s, y: h-(oy+(y-b.miny)*s) };  // flip Y up
+}
+function resizeTraj(){ trajView = setupCanvas(trajCanvas); trajBnd = trajBounds(); }
+
+function nearestByTime(arr, t){
+  if(!arr.length) return -1;
+  let best=0, bd=1e18;
+  for(let i=0;i<arr.length;i++){ const ti=arr[i].t; if(ti===null) continue;
+    const d=Math.abs(ti-t); if(d<bd){bd=d;best=i;} }
+  return best;
+}
+
+function drawTraj(){
+  if(!trajView) resizeTraj();
+  const ctx=trajView.ctx, w=trajView.w, h=trajView.h;
+  ctx.clearRect(0,0,w,h); ctx.fillStyle="#0f0f12"; ctx.fillRect(0,0,w,h);
+  // pool
+  if(layers.pool && pool_rect){
+    const a=w2s(pool_rect.x0,pool_rect.y0), b=w2s(pool_rect.x1,pool_rect.y1);
+    ctx.save(); ctx.strokeStyle="#5a6470"; ctx.lineWidth=1.2; ctx.setLineDash([7,5]);
+    ctx.strokeRect(Math.min(a.x,b.x),Math.min(a.y,b.y),Math.abs(b.x-a.x),Math.abs(b.y-a.y));
+    ctx.restore();
+    ctx.fillStyle="#5a6470"; ctx.font="11px Arial";
+    ctx.fillText(`pool ${DASH.pool.length_m}x${DASH.pool.width_m} m (approx)`, Math.min(a.x,b.x)+4, Math.min(a.y,b.y)+14);
+  }
+  // tags
+  if(layers.tags){
+    DASH.tags.forEach(t=>{
+      const p=w2s(t.x_m,t.y_m); const anchor=(t.id===DASH.anchor_id);
+      ctx.fillStyle=anchor?"#26d0e0":"#888c93";
+      ctx.beginPath(); ctx.arc(p.x,p.y,anchor?6:4,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle=anchor?"#26d0e0":"#aeb4bb"; ctx.font=(anchor?"bold ":"")+"11px Arial";
+      ctx.fillText(""+t.id, p.x+7, p.y-6);
+    });
+  }
+  // gantry GT (orange dashed) — drawn under camera
+  if(layers.gantry && GANTRY.length>1){
+    ctx.save(); ctx.strokeStyle="#ff8c42"; ctx.lineWidth=2; ctx.setLineDash([6,4]);
+    ctx.beginPath();
+    for(let i=0;i<GANTRY.length;i++){ const p=w2s(GANTRY[i].x_m,GANTRY[i].y_m);
+      if(i===0)ctx.moveTo(p.x,p.y); else ctx.lineTo(p.x,p.y); }
+    ctx.stroke(); ctx.restore();
+  }
+  // camera (viridis, time-coded)
+  if(layers.cam && CAMERA.length>1){
+    for(let i=1;i<CAMERA.length;i++){
+      const a=w2s(CAMERA[i-1].x_m,CAMERA[i-1].y_m), b=w2s(CAMERA[i].x_m,CAMERA[i].y_m);
+      ctx.strokeStyle=viridis(i/(CAMERA.length-1)); ctx.lineWidth=CAMERA[i].has_tag?2.4:1.4;
+      ctx.setLineDash(CAMERA[i].has_tag?[]:[5,4]);
+      ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+    }
+    ctx.setLineDash([]);
+  }
+  // current-time markers
+  if(layers.cursor){
+    const gi=nearestByTime(GANTRY,currentT), ci=nearestByTime(CAMERA,currentT);
+    let gp=null, cp=null;
+    if(layers.gantry && gi>=0){ const g=GANTRY[gi]; gp=w2s(g.x_m,g.y_m);
+      ctx.fillStyle="#2ecc71"; ctx.beginPath(); ctx.arc(gp.x,gp.y,6,0,Math.PI*2); ctx.fill(); }
+    if(layers.cam && ci>=0 && CAMERA.length){ const c=CAMERA[ci]; cp=w2s(c.x_m,c.y_m);
+      ctx.strokeStyle="#2ecc71"; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(cp.x,cp.y,6,0,Math.PI*2); ctx.stroke(); }
+    if(gp&&cp){
+      ctx.strokeStyle="#888"; ctx.lineWidth=1; ctx.setLineDash([3,3]);
+      ctx.beginPath(); ctx.moveTo(gp.x,gp.y); ctx.lineTo(cp.x,cp.y); ctx.stroke(); ctx.setLineDash([]);
+      const g=GANTRY[gi], c=CAMERA[ci];
+      const dd=Math.hypot((g.x_m-c.x_m),(g.y_m-c.y_m),(g.z_m||0)-(c.z_m||0))*1000;
+      ctx.fillStyle="#cfd6dd"; ctx.font="11px Arial";
+      ctx.fillText(`|Δ|=${dd.toFixed(1)} mm`, (gp.x+cp.x)/2+6, (gp.y+cp.y)/2);
+    }
+  }
+  // legend
+  ctx.fillStyle="rgba(20,24,30,0.85)"; ctx.fillRect(w-188,10,178,GANTRY.length&&CAMERA.length?72:54);
+  ctx.strokeStyle="#33333a"; ctx.strokeRect(w-188,10,178,GANTRY.length&&CAMERA.length?72:54);
+  ctx.font="11px Arial"; let ly=28;
+  if(CAMERA.length){ ctx.strokeStyle=viridis(0.7); ctx.lineWidth=3; ctx.beginPath();
+    ctx.moveTo(w-180,ly-4); ctx.lineTo(w-156,ly-4); ctx.stroke();
+    ctx.fillStyle="#cfd6dd"; ctx.fillText("Camera (AprilTag SLAM)", w-150, ly); ly+=20; }
+  if(GANTRY.length){ ctx.strokeStyle="#ff8c42"; ctx.lineWidth=2; ctx.setLineDash([6,4]); ctx.beginPath();
+    ctx.moveTo(w-180,ly-4); ctx.lineTo(w-156,ly-4); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle="#cfd6dd"; ctx.fillText("Gantry GT", w-150, ly); ly+=20; }
+  ctx.fillStyle="#26d0e0"; ctx.beginPath(); ctx.arc(w-172,ly-4,4,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="#cfd6dd"; ctx.fillText("Anchor tag "+DASH.anchor_id, w-150, ly);
+}
+
+// slider <-> currentT
+const slider=document.getElementById("slider"), sliderLabel=document.getElementById("sliderLabel");
+function tRange(){
+  let lo=1e18, hi=-1e18;
+  GANTRY.concat(CAMERA).forEach(p=>{ if(p.t!==null){ if(p.t<lo)lo=p.t; if(p.t>hi)hi=p.t; } });
+  if(lo>hi){ lo=0; hi=Math.max(1,DASH.duration_s); }
+  return [lo,hi];
+}
+const TR = tRange();
+function syncSliderToCurrentT(){
+  const f=(currentT-TR[0])/Math.max(1e-6,(TR[1]-TR[0]));
+  slider.value = Math.round(Math.max(0,Math.min(1,f))*1000);
+  sliderLabel.textContent = `t = ${currentT.toFixed(2)} s`;
+  updateZed();
+}
+slider.addEventListener("input", ()=>{
+  const f=slider.value/1000; currentT = TR[0]+f*(TR[1]-TR[0]);
+  sliderLabel.textContent = `t = ${currentT.toFixed(2)} s`;
+  updateZed(); drawTraj();
+});
+function updateZed(){
+  const img=document.getElementById("zedImg"), ph=document.getElementById("zedPlaceholder"),
+        meta=document.getElementById("zedMeta");
+  if(!CAMERA.length){ img.style.display="none"; ph.style.display="block";
+    ph.textContent = DASH.gantry_only?"Gantry-only run (no camera)":"No camera frame"; meta.textContent=""; return; }
+  const ci=nearestByTime(CAMERA,currentT); const c=CAMERA[ci];
+  if(c.image){ img.src=c.image; img.style.display="block"; ph.style.display="none";
+    img.onerror=()=>{ img.style.display="none"; ph.style.display="block"; ph.textContent="frame not found (HTML moved from run folder)"; }; }
+  else { img.style.display="none"; ph.style.display="block"; ph.textContent="no frame for this sample"; }
+  meta.textContent = `t = ${(c.t||0).toFixed(2)} s   tags: ${c.has_tag?"yes":"no"}\n`+
+    `cam X=${(c.x_m*100).toFixed(1)} Y=${(c.y_m*100).toFixed(1)} Z=${(c.z_m*100).toFixed(1)} cm`;
+}
+["tgCam","tgGantry","tgTags","tgPool","tgCursor"].forEach((id,k)=>{
+  document.getElementById(id).addEventListener("change",e=>{
+    layers[["cam","gantry","tags","pool","cursor"][k]] = e.target.checked; drawTraj();
+  });
+});
+trajCanvas.addEventListener("mousemove", e=>{
+  if(!trajView) return;
+  const r=trajCanvas.getBoundingClientRect(), mx=e.clientX-r.left, my=e.clientY-r.top;
+  // nearest sample by screen distance over the union of gantry+camera
+  let best=null, bd=1e18, bt=currentT;
+  function scan(arr){ for(let i=0;i<arr.length;i++){ const p=w2s(arr[i].x_m,arr[i].y_m);
+    const d=Math.hypot(p.x-mx,p.y-my); if(d<bd){bd=d; best=arr[i]; bt=arr[i].t;} } }
+  if(layers.gantry) scan(GANTRY); if(layers.cam) scan(CAMERA);
+  if(best===null || bd>40){ hideTip(); return; }
+  const gi=nearestByTime(GANTRY,bt), ci=nearestByTime(CAMERA,bt);
+  const g=gi>=0?GANTRY[gi]:null, c=ci>=0&&CAMERA.length?CAMERA[ci]:null;
+  let txt=`t = ${bt!==null?bt.toFixed(2):"n/a"} s`;
+  if(g) txt+=`\nGantry:  X=${(g.x_m*1000).toFixed(1)}  Y=${(g.y_m*1000).toFixed(1)}  Z=${(g.z_m*1000).toFixed(1)}  mm`;
+  if(c) txt+=`\nCamera:  X=${(c.x_m*1000).toFixed(1)}  Y=${(c.y_m*1000).toFixed(1)}  Z=${(c.z_m*1000).toFixed(1)}  mm`;
+  if(g&&c){ const dd=Math.hypot(g.x_m-c.x_m,g.y_m-c.y_m,(g.z_m||0)-(c.z_m||0))*1000;
+    txt+=`\nΔ:       ${((g.x_m-c.x_m)*1000).toFixed(1)}     ${((g.y_m-c.y_m)*1000).toFixed(1)}     ${((g.z_m-c.z_m)*1000).toFixed(1)}      mm  (|Δ|=${dd.toFixed(1)} mm)`; }
+  showTip(e.clientX, e.clientY, txt);
+});
+trajCanvas.addEventListener("mouseleave", hideTip);
+
+/* =========================================================================
+ * TABS 2 & 3 — shared time-series renderer
+ * ========================================================================= */
+function makeSeriesTab(prefix, axisKeys, unit, gantryToggleId, camToggleId){
+  // axisKeys: ['vx','vy','vz'] or ['ax','ay','az']; unit: 'cm/s' | 'cm/s²'
+  const labels = axisKeys.map(k => k[0].toUpperCase()+k.slice(1).replace(/^./, s=>s.toUpperCase()));
+  const niceLabels = (unit.indexOf("s²")>=0)
+    ? ["Ax ("+unit+")","Ay ("+unit+")","Az ("+unit+")"]
+    : ["Vx ("+unit+")","Vy ("+unit+")","Vz ("+unit+")"];
+  const canvases = [0,1,2].map(i=>document.getElementById(prefix+"Canvas"+i));
+  const views = [null,null,null];
+  const gT = DASH.series.t_gantry, cT = DASH.series.t_camera;
+  const gS = axisKeys.map(k => DASH.series.gantry[k]);
+  const cS = DASH.series.camera ? axisKeys.map(k => DASH.series.camera[k]) : null;
+  const fullRange = (()=>{ let lo=1e18,hi=-1e18;
+    [gT, cT].forEach(arr=>{ if(arr) arr.forEach(t=>{ if(t!==null){ if(t<lo)lo=t; if(t>hi)hi=t; } }); });
+    if(lo>hi){ lo=0; hi=Math.max(1,DASH.duration_s); } return [lo,hi]; })();
+  const st = { xRange:[fullRange[0],fullRange[1]], showG:true, showC:true,
+               dragging:false, dragX0:0, range0:null };
+  const M = {l:58, r:14, t:10, b:24};
+
+  function resizeAll(){ for(let i=0;i<3;i++) views[i]=setupCanvas(canvases[i]); }
+  function yfit(i){
+    let lo=1e18, hi=-1e18; const x0=st.xRange[0], x1=st.xRange[1];
+    function scan(T,S){ if(!T||!S) return; for(let k=0;k<T.length;k++){ const t=T[k];
+      if(t===null||t<x0||t>x1) continue; const v=S[i][k]; if(v===null) continue;
+      if(v<lo)lo=v; if(v>hi)hi=v; } }
+    if(st.showG) scan(gT,gS); if(st.showC&&cS) scan(cT,cS);
+    if(lo>hi){ lo=-1; hi=1; }
+    if(hi-lo<1e-6){ lo-=1; hi+=1; }
+    const pad=(hi-lo)*0.1; return [lo-pad, hi+pad];
+  }
+  function ticks(lo,hi,n){ const span=hi-lo; let step=Math.pow(10,Math.floor(Math.log10(span/n)));
+    const err=span/(n*step); if(err>5)step*=10; else if(err>2)step*=5; else if(err>1)step*=2;
+    const out=[]; for(let v=Math.ceil(lo/step)*step; v<=hi; v+=step) out.push(v); return out; }
+  function plot2screen(i, t, v, yr){ const view=views[i];
+    const x0=st.xRange[0], x1=st.xRange[1];
+    const px=M.l+(t-x0)/(x1-x0)*(view.w-M.l-M.r);
+    const py=M.t+(yr[1]-v)/(yr[1]-yr[0])*(view.h-M.t-M.b);
+    return {x:px,y:py}; }
+
+  function renderOne(i){
+    const view=views[i]; if(!view) return; const ctx=view.ctx, w=view.w, h=view.h;
+    ctx.clearRect(0,0,w,h); ctx.fillStyle="#1a1a1d"; ctx.fillRect(0,0,w,h);
+    const yr=yfit(i), x0=st.xRange[0], x1=st.xRange[1];
+    // grid + axes
+    ctx.strokeStyle="#2a2a30"; ctx.fillStyle="#9aa3ad"; ctx.font="10px Arial"; ctx.lineWidth=1;
+    ticks(yr[0],yr[1],6).forEach(v=>{ const p=plot2screen(i,x0,v,yr);
+      ctx.beginPath(); ctx.moveTo(M.l,p.y); ctx.lineTo(w-M.r,p.y); ctx.stroke();
+      ctx.fillText(v.toFixed(Math.abs(v)<10?1:0), 6, p.y+3); });
+    ticks(x0,x1,8).forEach(t=>{ const p=plot2screen(i,t,yr[1],yr);
+      ctx.strokeStyle="#23232a"; ctx.beginPath(); ctx.moveTo(p.x,M.t); ctx.lineTo(p.x,h-M.b); ctx.stroke();
+      if(i===2){ ctx.fillStyle="#9aa3ad"; ctx.fillText(t.toFixed(1), p.x-8, h-8); } });
+    // y label
+    ctx.save(); ctx.translate(12,h/2); ctx.rotate(-Math.PI/2); ctx.fillStyle="#cfd6dd";
+    ctx.font="11px Arial"; ctx.textAlign="center"; ctx.fillText(niceLabels[i],0,0); ctx.restore();
+    // line drawer
+    function line(T,S,color,dash){ if(!T||!S) return; ctx.strokeStyle=color; ctx.lineWidth=1.4;
+      ctx.setLineDash(dash); ctx.beginPath(); let pen=false;
+      for(let k=0;k<T.length;k++){ const t=T[k], v=S[i][k];
+        if(t===null||v===null||t<x0||t>x1){ pen=false; continue; }
+        const p=plot2screen(i,t,v,yr); if(!pen){ctx.moveTo(p.x,p.y);pen=true;} else ctx.lineTo(p.x,p.y); }
+      ctx.stroke(); ctx.setLineDash([]); }
+    if(st.showG) line(gT,gS,"#4ea1ff",[]);
+    if(st.showC&&cS) line(cT,cS,"#ff5d5d",[6,4]);
+    // time cursor
+    if(currentT>=x0 && currentT<=x1){ const p=plot2screen(i,currentT,yr[1],yr);
+      ctx.strokeStyle="#8a929c"; ctx.lineWidth=1; ctx.setLineDash([4,3]);
+      ctx.beginPath(); ctx.moveTo(p.x,M.t); ctx.lineTo(p.x,h-M.b); ctx.stroke(); ctx.setLineDash([]); }
+    // axis frame
+    ctx.strokeStyle="#3a3a42"; ctx.strokeRect(M.l,M.t,w-M.l-M.r,h-M.t-M.b);
+  }
+  function render(){ for(let i=0;i<3;i++) renderOne(i); }
+
+  function valAt(T,S,i,t){ if(!T||!S) return null; let best=null,bd=1e18;
+    for(let k=0;k<T.length;k++){ if(T[k]===null||S[i][k]===null) continue;
+      const d=Math.abs(T[k]-t); if(d<bd){bd=d;best=S[i][k];} } return best; }
+
+  // interaction (attach to each canvas)
+  canvases.forEach((cv,idx)=>{
+    cv.addEventListener("mousemove", e=>{
+      const view=views[idx]; if(!view) return;
+      const r=cv.getBoundingClientRect(), mx=e.clientX-r.left;
+      if(st.dragging){ const x0=st.xRange[0], x1=st.xRange[1];
+        const dpx=(mx-st.dragX0)/(view.w-M.l-M.r)*(st.range0[1]-st.range0[0]);
+        st.xRange=[st.range0[0]-dpx, st.range0[1]-dpx]; render(); return; }
+      const x0=st.xRange[0], x1=st.xRange[1];
+      const t=x0+(mx-M.l)/(view.w-M.l-M.r)*(x1-x0);
+      if(t<x0||t>x1){ hideTip(); return; }
+      currentT=t; render();
+      // tooltip
+      let txt=`t = ${t.toFixed(2)} s`;
+      for(let i=0;i<3;i++){ const gv=valAt(gT,gS,i,t), cv2=cS?valAt(cT,cS,i,t):null;
+        txt+=`\n${labels[i]}:  Gantry ${gv===null?"n/a":(gv>=0?"+":"")+gv.toFixed(1)} ${unit}`+
+             (cS?`   Camera ${cv2===null?"n/a":(cv2>=0?"+":"")+cv2.toFixed(1)} ${unit}`:""); }
+      showTip(e.clientX, e.clientY, txt);
+    });
+    cv.addEventListener("mouseleave", ()=>{ hideTip(); });
+    cv.addEventListener("mousedown", e=>{ const r=cv.getBoundingClientRect();
+      st.dragging=true; st.dragX0=e.clientX-r.left; st.range0=[st.xRange[0],st.xRange[1]]; });
+    window.addEventListener("mouseup", ()=>{ st.dragging=false; });
+    cv.addEventListener("wheel", e=>{ e.preventDefault(); const view=views[idx]; if(!view) return;
+      const r=cv.getBoundingClientRect(), mx=e.clientX-r.left;
+      const x0=st.xRange[0], x1=st.xRange[1];
+      const t=x0+(mx-M.l)/(view.w-M.l-M.r)*(x1-x0);
+      const f=e.deltaY<0?0.85:1.18;
+      st.xRange=[t-(t-x0)*f, t+(x1-t)*f]; render(); }, {passive:false});
+    cv.addEventListener("dblclick", ()=>{ st.xRange=[fullRange[0],fullRange[1]]; render(); });
+  });
+
+  function setG(v){ st.showG=v; render(); }
+  function setC(v){ st.showC=v; render(); }
+  document.getElementById(gantryToggleId).addEventListener("change",e=>setG(e.target.checked));
+  document.getElementById(camToggleId).addEventListener("change",e=>setC(e.target.checked));
+  return { render, resizeAll, st };
+}
+
+const velTab = makeSeriesTab("vel", ["vx","vy","vz"], "cm/s", "vgGantry", "vgCam");
+
+// ── init ─────────────────────────────────────────────────────────────────────
+window.addEventListener("resize", ()=>{
+  if(activeTab==="trajectory"){ resizeTraj(); drawTraj(); }
+  else { velTab.resizeAll(); velTab.render(); }
+});
+currentT = TR[0];
+requestAnimationFrame(()=>{ resizeTraj(); syncSliderToCurrentT(); drawTraj(); });
+</script>
+</body>
+</html>"""
+
+
+# Camera-velocity smoothing parameters. Kept identical to gantry_runner's
+# SMOOTHING_WINDOW_S / SMOOTHING_POLYORDER so the camera estimate and the gantry
+# ground truth share the same temporal smoothing (a fair comparison).
+SMOOTHING_WINDOW_S = 0.25
+SMOOTHING_POLYORDER = 2
+
+
+def _savgol_deriv(t: "np.ndarray", y: "np.ndarray") -> "np.ndarray":
+    """Savitzky-Golay smooth time-derivative for the camera trajectory.
+
+    Delegates to gantry_runner.compute_derivative_savgol with the SAME window
+    and polynomial order the gantry logger uses, so camera-derived velocity and
+    gantry-derived velocity are computed identically (fair comparison). Falls
+    back to a local copy if gantry_runner can't be imported (keeps tagslam_core
+    importable on a camera-only checkout).
+    """
+    try:
+        from gantry_runner import compute_derivative_savgol as _cds
+        return _cds(t, y, SMOOTHING_WINDOW_S, SMOOTHING_POLYORDER)
+    except Exception:
+        pass
+    t = np.asarray(t, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    n = len(t)
+    out = np.full(n, np.nan, dtype=np.float64)
+    if n < SMOOTHING_POLYORDER + 1:
+        return out
+    half = SMOOTHING_WINDOW_S / 2.0
+    tol = half * 0.5
+    for i in range(n):
+        if not np.isfinite(t[i]):
+            continue
+        mask = np.isfinite(t) & np.isfinite(y) & (t >= t[i] - half) & (t <= t[i] + half)
+        if int(mask.sum()) < SMOOTHING_POLYORDER + 1:
+            continue
+        tt = t[mask] - t[i]
+        if tt.min() > -tol or tt.max() < tol:
+            continue
+        try:
+            coef = np.polyfit(tt, y[mask], SMOOTHING_POLYORDER)
+            out[i] = float(np.polyval(np.polyder(coef), 0.0))
+        except Exception:
+            continue
+    return out
+
+
+def write_experiment_dashboard_html(
+    path: Path,
+    gantry_csv: Path,
+    camera_csv: "Path | None",
+    tag_poses_csv: "Path | None",
+    pool_cfg: dict,
+    *,
+    anchor_id: int = 1,
+    T_gantry_camera: "np.ndarray | None" = None,
+    gantry_anchor_offset_mm: "list[float] | None" = None,
+    R_gantry_to_slam: "np.ndarray | None" = None,
+    run_name: str = "",
+    rms_summary: dict | None = None,
+    zed_view_image_paths: "list[Path] | None" = None,
+) -> "Path | None":
+    """Write a single self-contained HTML dashboard with two tabs:
+    Trajectory and Velocity.
+
+    The Trajectory tab reuses the visual language of
+    write_interactive_trajectory_html (dark theme, dashed pool outline, numbered
+    AprilTag markers with the anchor highlighted in cyan, a viridis time-coded
+    camera trajectory, a time slider and a camera-frame card) rendered as a
+    top-down (X, Y) 2D canvas, and overlays the gantry ground-truth trajectory
+    as an orange dashed polyline.
+
+    The Velocity tab shows three stacked subplots (Vx, Vy, Vz in cm/s) over
+    elapsed_s, each overlaying gantry GT (solid blue) and camera estimate
+    (dashed red). The Acceleration tab is identical in structure, in cm/s².
+
+    Pure HTML + CSS + vanilla JS using <canvas>. No CDN, no external libraries;
+    the file renders when copied to any folder/machine (camera-frame thumbnails
+    in the Trajectory card are referenced by relative path and are the only part
+    that needs the sibling frames/ directory).
+
+    Gantry-only mode (camera_csv is None): Trajectory shows pool + gantry only;
+    Velocity/Acceleration show gantry curves only; header shows a gantry-only
+    badge.
+    """
+    import csv as _csv
+    import json as _json
+
+    def _load(p: "Path | None") -> list[dict]:
+        if p is None or not Path(p).exists():
+            return []
+        with open(p, newline="", encoding="utf-8") as fh:
+            return list(_csv.DictReader(fh))
+
+    def _fcol(rows: list[dict], key: str) -> "np.ndarray":
+        out = []
+        for r in rows:
+            try:
+                out.append(float(r[key]))
+            except (KeyError, ValueError, TypeError):
+                out.append(float("nan"))
+        return np.array(out, dtype=np.float64)
+
+    g_rows = _load(gantry_csv)
+    c_rows = _load(camera_csv) if camera_csv is not None else []
+    if not g_rows and not c_rows:
+        return None
+    gantry_only = not c_rows
+
+    # ── shared time base: elapsed = timestamp_monotonic - t0, t0 = min across
+    #    both CSVs. Falls back to each CSV's own elapsed column when monotonic
+    #    timestamps are absent. ───────────────────────────────────────────────
+    g_tmono = _fcol(g_rows, "timestamp_monotonic") if g_rows else np.array([])
+    c_tmono = _fcol(c_rows, "timestamp_monotonic") if c_rows else np.array([])
+    t0_candidates = []
+    for arr in (g_tmono, c_tmono):
+        finite = arr[np.isfinite(arr)] if arr.size else arr
+        if finite.size:
+            t0_candidates.append(float(finite.min()))
+    t0 = min(t0_candidates) if t0_candidates else None
+
+    def _elapsed(rows: list[dict], tmono: "np.ndarray", fallback_key: str) -> "np.ndarray":
+        if t0 is not None and tmono.size == len(rows) and np.isfinite(tmono).any():
+            return tmono - t0
+        return _fcol(rows, fallback_key)
+
+    g_t = _elapsed(g_rows, g_tmono, "elapsed_s") if g_rows else np.array([])
+    c_t = _elapsed(c_rows, c_tmono, "time_s") if c_rows else np.array([])
+
+    # ── gantry position (mm) + derived velocity (mm/s) ────────────────────────
+    g_x = _fcol(g_rows, "x_mm");  g_y = _fcol(g_rows, "y_mm");  g_z = _fcol(g_rows, "z_mm")
+
+    # Velocity source: prefer the new *_derived columns; fall back to the legacy
+    # vx_mm_s (SDK) for old recordings (legacy flag drives a banner in the HTML).
+    g_cols = set(g_rows[0].keys()) if g_rows else set()
+    legacy_csv = ("vx_mm_s_derived" not in g_cols) and ("vx_mm_s" in g_cols)
+    if "vx_mm_s_derived" in g_cols:
+        g_vx = _fcol(g_rows, "vx_mm_s_derived"); g_vy = _fcol(g_rows, "vy_mm_s_derived"); g_vz = _fcol(g_rows, "vz_mm_s_derived")
+    elif "vx_mm_s" in g_cols:  # legacy schema
+        g_vx = _fcol(g_rows, "vx_mm_s"); g_vy = _fcol(g_rows, "vy_mm_s"); g_vz = _fcol(g_rows, "vz_mm_s")
+    else:
+        g_vx = g_vy = g_vz = np.full(len(g_rows), np.nan)
+
+    # ── camera arrays: positions m → mm, derive velocity via Savitzky-Golay,
+    #    the SAME window/order as GantryTelemetryLogger (fair comparison). ──────
+    c_xm = _fcol(c_rows, "x_m"); c_ym = _fcol(c_rows, "y_m"); c_zm = _fcol(c_rows, "z_m")
+    c_x = c_xm * 1000.0; c_y = c_ym * 1000.0; c_z = c_zm * 1000.0
+    if c_rows:
+        c_vx = _savgol_deriv(c_t, c_x); c_vy = _savgol_deriv(c_t, c_y); c_vz = _savgol_deriv(c_t, c_z)
+    else:
+        c_vx = c_vy = c_vz = np.array([])
+
+    # ── gantry → SLAM frame transform: rotate by R_gantry_to_slam (default
+    #    identity), subtract gantry_anchor_offset_mm. Positions get R+offset;
+    #    velocities get R only (no translation). See transform_gantry_to_slam.
+    R3 = np.asarray(R_gantry_to_slam, dtype=np.float64).reshape(3, 3) \
+        if R_gantry_to_slam is not None else np.eye(3)
+    if gantry_anchor_offset_mm is not None and len(gantry_anchor_offset_mm) >= 3:
+        off3 = np.array([float(gantry_anchor_offset_mm[0]),
+                         float(gantry_anchor_offset_mm[1]),
+                         float(gantry_anchor_offset_mm[2])], dtype=np.float64)
+    else:
+        off3 = np.zeros(3, dtype=np.float64)
+
+    if len(g_rows):
+        P = np.stack([g_x, g_y, g_z], axis=1)              # mm, gantry frame
+        P_slam_mm = (R3 @ (P - off3).T).T                  # mm, SLAM orientation
+        g_xa = P_slam_mm[:, 0] / 1000.0
+        g_ya = P_slam_mm[:, 1] / 1000.0
+        g_za = P_slam_mm[:, 2] / 1000.0
+        V = np.stack([g_vx, g_vy, g_vz], axis=1)           # mm/s, gantry frame
+        V_slam = (R3 @ V.T).T                              # mm/s, SLAM orientation
+        g_vx, g_vy, g_vz = V_slam[:, 0], V_slam[:, 1], V_slam[:, 2]
+    else:
+        g_xa = g_ya = g_za = np.array([])
+
+    if gantry_anchor_offset_mm is not None and len(gantry_anchor_offset_mm) >= 2:
+        alignment = "gantry_anchor_offset_mm"
+    elif (not gantry_only and g_xa.size and c_xm.size
+          and np.isfinite(g_xa[0]) and np.isfinite(c_xm[0])):
+        # Pin gantry first sample to camera first sample (approximate).
+        g_xa = g_xa - (g_xa[0] - c_xm[0])
+        g_ya = g_ya - (g_ya[0] - c_ym[0])
+        g_za = g_za - (g_za[0] - c_zm[0])
+        alignment = "first-sample-zeroed (approximate)"
+    elif g_xa.size:
+        # Gantry-only: zero to the gantry's own first sample.
+        g_xa = g_xa - g_xa[0]; g_ya = g_ya - g_ya[0]; g_za = g_za - g_za[0]
+        alignment = "first-sample-zeroed (approximate)"
+    else:
+        alignment = "none"
+
+    # ── pose RMSE (mm): interpolate camera onto gantry time grid, on the
+    #    aligned positions, so the number reflects tracking drift rather than a
+    #    constant frame offset. rms_summary (if provided) overrides. ───────────
+    def _rmse(gar: "np.ndarray", gt: "np.ndarray", car: "np.ndarray", ct: "np.ndarray") -> float:
+        fg = np.isfinite(gar) & np.isfinite(gt)
+        fc = np.isfinite(car) & np.isfinite(ct)
+        if fg.sum() < 1 or fc.sum() < 2:
+            return float("nan")
+        ci = np.interp(gt[fg], ct[fc], car[fc])
+        return float(np.sqrt(np.nanmean((gar[fg] - ci) ** 2)))
+
+    rms = rms_summary
+    if rms is None and not gantry_only and c_xm.size:
+        rms = {
+            "x_mm": _rmse(g_xa * 1000.0, g_t, c_x, c_t),
+            "y_mm": _rmse(g_ya * 1000.0, g_t, c_y, c_t),
+            "z_mm": _rmse(g_za * 1000.0, g_t, c_z, c_t),
+        }
+
+    # ── tag markers ───────────────────────────────────────────────────────────
+    tag_rows = _load(tag_poses_csv) if tag_poses_csv is not None else []
+    tags = []
+    for r in tag_rows:
+        try:
+            tags.append({"id": int(r["tag_id"]), "x_m": float(r["x_m"]), "y_m": float(r["y_m"])})
+        except (KeyError, ValueError, TypeError):
+            pass
+
+    # ── duration ──────────────────────────────────────────────────────────────
+    all_t = [a for a in (g_t, c_t) if a.size]
+    duration_s = 0.0
+    if all_t:
+        finite_max = [np.nanmax(a) for a in all_t if np.isfinite(a).any()]
+        duration_s = float(max(finite_max)) if finite_max else 0.0
+
+    # ── camera image paths (relative, for the ZED-view card) ─────────────────
+    cam_images = [str(r.get("image_path", "") or "") for r in c_rows]
+
+    def _clean(arr: "np.ndarray") -> list:
+        # JSON-safe: NaN/inf -> None
+        return [None if not np.isfinite(v) else round(float(v), 5) for v in arr]
+
+    pool = normalize_pool_config(dict(pool_cfg) if pool_cfg else {})
+
+    traj_gantry = []
+    for i in range(len(g_rows)):
+        traj_gantry.append({
+            "t": None if not np.isfinite(g_t[i]) else round(float(g_t[i]), 4),
+            "x_m": None if not np.isfinite(g_xa[i]) else round(float(g_xa[i]), 5),
+            "y_m": None if not np.isfinite(g_ya[i]) else round(float(g_ya[i]), 5),
+            "z_m": None if not np.isfinite(g_za[i]) else round(float(g_za[i]), 5),
+        })
+    traj_camera = []
+    for i in range(len(c_rows)):
+        has_tag = str(c_rows[i].get("has_tag_update", "")).strip().lower() in ("true", "1", "yes")
+        traj_camera.append({
+            "t": None if not np.isfinite(c_t[i]) else round(float(c_t[i]), 4),
+            "x_m": None if not np.isfinite(c_xm[i]) else round(float(c_xm[i]), 5),
+            "y_m": None if not np.isfinite(c_ym[i]) else round(float(c_ym[i]), 5),
+            "z_m": None if not np.isfinite(c_zm[i]) else round(float(c_zm[i]), 5),
+            "has_tag": has_tag,
+            "image": cam_images[i] if i < len(cam_images) else "",
+        })
+
+    payload = {
+        "run_name": run_name or (Path(gantry_csv).parent.name if gantry_csv else "run"),
+        "alignment": alignment,
+        "gantry_only": bool(gantry_only),
+        "duration_s": round(duration_s, 2),
+        "n_gantry": len(g_rows),
+        "n_camera": len(c_rows),
+        "anchor_id": int(anchor_id),
+        "legacy_csv": bool(legacy_csv),
+        "rms": (None if rms is None else {k: (None if (v is None or not np.isfinite(v)) else round(float(v), 1))
+                                          for k, v in rms.items()}),
+        "pool": {
+            "length_m": float(pool.get("length_m", 4.877)),
+            "width_m": float(pool.get("width_m", 2.438)),
+            "depth_m": float(pool.get("depth_m", 1.143)),
+            "long_axis": str(pool.get("pool_long_axis", "x")),
+        },
+        "tags": tags,
+        "traj": {"gantry": traj_gantry, "camera": traj_camera},
+        "series": {
+            "t_gantry": _clean(g_t),
+            "t_camera": _clean(c_t),
+            # cm/s for display (mm/s -> cm/s == / 10). Velocity tab only.
+            "gantry": {
+                "vx": _clean(g_vx / 10.0), "vy": _clean(g_vy / 10.0), "vz": _clean(g_vz / 10.0),
+            },
+            "camera": (None if gantry_only else {
+                "vx": _clean(c_vx / 10.0), "vy": _clean(c_vy / 10.0), "vz": _clean(c_vz / 10.0),
+            }),
+        },
+    }
+
+    html = _DASHBOARD_TEMPLATE.replace("__DASHBOARD_JSON__", _json.dumps(payload))
     path.write_text(html, encoding="utf-8")
     return path
