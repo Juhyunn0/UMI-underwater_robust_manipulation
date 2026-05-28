@@ -2430,9 +2430,39 @@ def write_interactive_trajectory_html(
             R_gantry_to_slam=R,
             run_name=str(output_dir.name),
             rms_summary=rms_summary,
+            tag_size_m=tag_size_m,
+            plot_z_scale=plot_z_scale,
         ) or (output_dir / "trajectory_interactive.html")
 
     html_path = output_dir / "trajectory_interactive.html"
+    html_path.write_text(
+        _build_trajectory_viewer_html(
+            camera_rows, tag_rows, pool_cfg, tag_size_m, plot_z_scale, anchor_tag_id
+        ),
+        encoding="utf-8",
+    )
+    return html_path
+
+
+def _build_trajectory_viewer_html(
+    camera_rows: list,
+    tag_rows: list,
+    pool_cfg: dict,
+    tag_size_m: float,
+    plot_z_scale: float,
+    anchor_tag_id: int,
+    *,
+    gantry_traj: "list | None" = None,
+) -> str:
+    """Return the self-contained rich 3D-viewer HTML as a string.
+
+    Shared by the standalone zed2 path (write_interactive_trajectory_html) and
+    the experiment dashboard (which embeds the returned string in an <iframe>
+    srcdoc as the Trajectory tab). ``gantry_traj`` is an optional list of
+    ``{x_m, y_m, z_m, t}`` samples in the SLAM frame (already aligned to the
+    camera frame); when supplied the viewer overlays it as a plasma time-coded
+    trajectory via DATA.gantry.
+    """
     pool_cfg = normalize_pool_config(pool_cfg)
     if anchor_tag_id == 1:
         # In the Tag-1 world frame the physical Tag 1 location is the origin.
@@ -2443,6 +2473,7 @@ def write_interactive_trajectory_html(
         {
             "camera": camera_rows,
             "tags": tag_rows,
+            "gantry": list(gantry_traj or []),
             "pool": {
                 "config": pool_cfg,
                 "geometry": pool_geometry_json(pool_cfg),
@@ -2492,9 +2523,9 @@ def write_interactive_trajectory_html(
       padding: 10px 14px;
       border-bottom: 1px solid #c8d0d8;
       background: #ffffff;
-      display: grid;
-      grid-template-columns: repeat(11, auto) minmax(180px, 1fr) minmax(300px, auto) auto;
-      gap: 10px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
       align-items: center;
     }
     button, select {
@@ -2508,8 +2539,11 @@ def write_interactive_trajectory_html(
       font-size: 13px;
     }
     button:hover, select:hover { background: #eef3f7; }
+    /* Layer-toggle buttons: solid when the layer is shown, faded when hidden. */
+    button.toggle { border-color: #6c8aa6; }
+    button.toggle.off { opacity: 0.45; background: #eceff2; }
     #slider {
-      width: 100%;
+      flex: 1 1 220px;
       min-width: 180px;
     }
     #frameLabel {
@@ -2518,7 +2552,7 @@ def write_interactive_trajectory_html(
       color: #34495e;
     }
     #hint {
-      grid-column: 1 / -1;
+      flex-basis: 100%;
       font-size: 12px;
       color: #5d6d7e;
     }
@@ -2606,6 +2640,13 @@ def write_interactive_trajectory_html(
     <button id="play">Play</button>
     <button id="restart">Restart</button>
     <button id="full">Show Full</button>
+    <input id="slider" type="range" min="0" value="0">
+    <select id="speed" title="Playback speed (real-time = 1x)">
+      <option value="0.5">0.5x</option>
+      <option value="1" selected>1x (real-time)</option>
+      <option value="2">2x</option>
+      <option value="4">4x</option>
+    </select>
     <button id="top">Top</button>
     <button id="front">Front</button>
     <button id="side">Side</button>
@@ -2614,13 +2655,11 @@ def write_interactive_trajectory_html(
     <button id="fit">Fit Data</button>
     <button id="ids">Show IDs</button>
     <button id="zscale">Z 1:1</button>
-    <input id="slider" type="range" min="0" value="0">
-    <select id="speed">
-      <option value="4">4 samples/s</option>
-      <option value="10" selected>10 samples/s</option>
-      <option value="20">20 samples/s</option>
-      <option value="40">40 samples/s</option>
-    </select>
+    <button id="tgCam" class="toggle">Camera</button>
+    <button id="tgGantry" class="toggle">Gantry</button>
+    <button id="tgTags" class="toggle">Tags</button>
+    <button id="tgPool" class="toggle">Pool</button>
+    <button id="tgMarkers" class="toggle">Markers</button>
     <div id="hint"></div>
   </div>
   <div id="content">
@@ -2665,9 +2704,18 @@ const frameLabel = document.createElement("div");
 frameLabel.id = "frameLabel";
 document.getElementById("toolbar").insertBefore(frameLabel, speedSelect);
 
+// Parallel gantry trajectory (SLAM frame, already aligned to the camera frame).
+// Empty for the standalone zed2 path; populated by the experiment dashboard.
+const GANTRY_TRAJ = Array.isArray(DATA.gantry) ? DATA.gantry : [];
+
+// Layer-visibility flags driven by the toolbar toggle buttons.
+const layerShow = { camera: true, gantry: true, tags: true, pool: true, markers: true };
+
 let currentIndex = 0;
 let playing = false;
 let lastStepMs = 0;
+let playAnchorMs = null;   // wall-clock anchor for real-time playback
+let playAnchorT = 0.0;     // camera time_s at the playback anchor
 let rotX = 0.52;
 let rotY = 0.0;
 let zoom = 1.0;
@@ -2705,7 +2753,7 @@ const POOL_WATER = "#6FB3D9";
 const POOL_FLOOR = "#315C78";
 const POOL_GRID = "#CBD5DD";
 
-slider.max = Math.max(0, DATA.camera.length - 1);
+slider.max = Math.max(0, (DATA.camera.length || (Array.isArray(DATA.gantry) ? DATA.gantry.length : 0)) - 1);
 
 function allPoints() {
   const points = [[0, 0, 0]];
@@ -2867,6 +2915,33 @@ function viridisRgbAt(u) {
 
 function viridisColorAt(u) {
   const rgb = viridisRgbAt(u);
+  return `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
+}
+
+// Plasma colormap — used for the gantry trajectory so it is time-coded like the
+// camera (viridis) yet visually distinct (warm vs. cool ramp).
+const PLASMA = [
+  [13, 8, 135],
+  [84, 2, 163],
+  [139, 10, 165],
+  [185, 50, 137],
+  [219, 92, 104],
+  [244, 136, 73],
+  [254, 188, 43],
+  [240, 249, 33],
+];
+
+function plasmaRgbAt(u) {
+  const clamped = Math.max(0, Math.min(1, u));
+  const scaled = clamped * (PLASMA.length - 1);
+  const lo = Math.floor(scaled);
+  const hi = Math.min(PLASMA.length - 1, lo + 1);
+  const t = scaled - lo;
+  return PLASMA[lo].map((v, i) => Math.round(v + (PLASMA[hi][i] - v) * t));
+}
+
+function plasmaColorAt(u) {
+  const rgb = plasmaRgbAt(u);
   return `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
 }
 
@@ -3098,7 +3173,7 @@ function drawLoop3d(points, color, width = 1.5, dash = [], alpha = 1.0) {
 }
 
 function drawPool() {
-  if (!POOL_GEOM) {
+  if (!layerShow.pool || !POOL_GEOM) {
     return;
   }
   const floor = POOL_GEOM.floor;
@@ -3302,6 +3377,9 @@ function drawAxes() {
 }
 
 function drawTags() {
+  if (!layerShow.tags) {
+    return;
+  }
   const sortedTags = [...DATA.tags].sort((a, b) => a.tag_id - b.tag_id);
   const activeIds = activeTagIdSet();
   const row = currentCameraRow();
@@ -3344,7 +3422,7 @@ function drawTagTriad(tag, alpha = 1.0) {
 }
 
 function drawTrajectory() {
-  if (DATA.camera.length === 0) {
+  if (!layerShow.camera || DATA.camera.length === 0) {
     return;
   }
   const end = Math.min(currentIndex, DATA.camera.length - 1);
@@ -3402,12 +3480,91 @@ function gantryHasData(row) {
               && Number.isFinite(row.gantry_z_mm);
 }
 
+function hasGantryOverlay() {
+  return GANTRY_TRAJ.length > 1
+      || (DATA.camera.length > 0 && gantryHasData(DATA.camera[0]));
+}
+
+// Elapsed time (s) at the current slider position. Driven by the camera sample
+// when present, else (gantry-only) by the gantry sample itself.
+function currentTimeS() {
+  const row = currentCameraRow();
+  if (row && Number.isFinite(row.time_s)) {
+    return row.time_s;
+  }
+  if (GANTRY_TRAJ.length) {
+    const g = GANTRY_TRAJ[Math.min(currentIndex, GANTRY_TRAJ.length - 1)];
+    return Number.isFinite(g.t) ? g.t : 0;
+  }
+  return 0;
+}
+
+// Largest GANTRY_TRAJ index whose timestamp is <= tNow (i.e. revealed so far).
+function gantryEndIndex(tNow) {
+  let end = 0;
+  for (let i = 0; i < GANTRY_TRAJ.length; i++) {
+    if (Number.isFinite(GANTRY_TRAJ[i].t) && GANTRY_TRAJ[i].t <= tNow) {
+      end = i;
+    }
+  }
+  return end;
+}
+
 function drawGantryTrajectory() {
+  if (!layerShow.gantry) {
+    return;
+  }
+  // Preferred path: full-rate, SLAM-frame gantry trajectory (DATA.gantry),
+  // time-coded with the plasma colormap and revealed up to the slider time.
+  if (GANTRY_TRAJ.length > 1) {
+    const tNow = currentTimeS();
+    const end = gantryEndIndex(tNow);
+    const denom = Math.max(1, GANTRY_TRAJ.length - 1);
+    for (let i = 1; i <= end; i++) {
+      const a = GANTRY_TRAJ[i - 1];
+      const b = GANTRY_TRAJ[i];
+      drawLine3d(
+        [a.x_m, a.y_m, a.z_m],
+        [b.x_m, b.y_m, b.z_m],
+        plasmaColorAt(i / denom),
+        3.4,
+        [],
+      );
+    }
+    const step = Math.max(1, Math.round(GANTRY_TRAJ.length / 60));
+    for (let i = 0; i <= end; i += step) {
+      const g = GANTRY_TRAJ[i];
+      drawPoint3d([g.x_m, g.y_m, g.z_m], plasmaColorAt(i / denom), 2.4);
+    }
+    const cur = GANTRY_TRAJ[end];
+    drawPoint3d(
+      [cur.x_m, cur.y_m, cur.z_m], "#f0f921", 7,
+      `Gantry (${(cur.x_m * 100).toFixed(1)}, ${(cur.y_m * 100).toFixed(1)}, ${(cur.z_m * 100).toFixed(1)}) cm`,
+    );
+    // Dashed delta line + |Δ| label between the camera and gantry at this time.
+    if (layerShow.markers && layerShow.camera) {
+      const crow = currentCameraRow();
+      if (crow) {
+        const cp = [crow.x_m, crow.y_m, crow.z_m];
+        const gp = [cur.x_m, cur.y_m, cur.z_m];
+        drawLine3d(cp, gp, "rgba(80, 88, 96, 0.85)", 1.3, [4, 3]);
+        const dd = Math.hypot(cp[0] - gp[0], cp[1] - gp[1], cp[2] - gp[2]) * 1000;
+        const mid = project([(cp[0] + gp[0]) / 2, (cp[1] + gp[1]) / 2, (cp[2] + gp[2]) / 2]);
+        ctx.save();
+        ctx.fillStyle = "#17202a";
+        ctx.font = "11px Arial";
+        ctx.fillText(`|Δ|=${dd.toFixed(1)} mm`, mid.x + 6, mid.y - 4);
+        ctx.restore();
+      }
+    }
+    return;
+  }
+
+  // Legacy fallback: gantry pose carried on each camera row (older runs);
+  // first-sample-zeroed to the camera start, solid orange.
   if (DATA.camera.length === 0 || !gantryHasData(DATA.camera[0])) {
     return;
   }
-  // First-sample alignment: pin gantry start to camera (apriltag-SLAM) start
-  // so both trajectories share an origin without needing T_gantry_camera here.
   const c0 = DATA.camera[0];
   const offset = [
     (c0.gantry_x_mm / 1000) - c0.x_m,
@@ -3415,39 +3572,26 @@ function drawGantryTrajectory() {
     (c0.gantry_z_mm / 1000) - c0.z_m,
   ];
   const end = Math.min(currentIndex, DATA.camera.length - 1);
-  const gantryColor = "rgba(255, 165, 0, 0.92)";  // orange
   for (let i = 1; i <= end; i++) {
     const a = DATA.camera[i - 1];
     const b = DATA.camera[i];
     if (!gantryHasData(a) || !gantryHasData(b)) continue;
-    drawLine3d(
-      gantryAlignedPoint(a, offset),
-      gantryAlignedPoint(b, offset),
-      gantryColor,
-      2.0,
-      [],
-    );
-  }
-  // Dots along the gantry path (sparser than camera) + current marker.
-  for (let i = 0; i <= end; i += 8) {
-    const row = DATA.camera[i];
-    if (!gantryHasData(row)) continue;
-    drawPoint3d(gantryAlignedPoint(row, offset), "#ff8c00", 2.4);
+    drawLine3d(gantryAlignedPoint(a, offset), gantryAlignedPoint(b, offset),
+               "rgba(255, 165, 0, 0.92)", 2.0, []);
   }
   const cur = DATA.camera[end];
   if (gantryHasData(cur)) {
     const p = gantryAlignedPoint(cur, offset);
-    drawPoint3d(
-      p, "#d97500", 7,
-      `Gantry (${(p[0] * 100).toFixed(1)}, ${(p[1] * 100).toFixed(1)}, ${(p[2] * 100).toFixed(1)}) cm`,
-    );
+    drawPoint3d(p, "#d97500", 7,
+      `Gantry (${(p[0] * 100).toFixed(1)}, ${(p[1] * 100).toFixed(1)}, ${(p[2] * 100).toFixed(1)}) cm`);
   }
 }
 
 function drawLegend() {
   const width = canvas.clientWidth;
-  const hasGantry = DATA.camera.length > 0 && gantryHasData(DATA.camera[0]);
-  const boxH = hasGantry ? 140 : 112;
+  const hasGantry = hasGantryOverlay();
+  const usesPlasmaGantry = GANTRY_TRAJ.length > 1;
+  const boxH = hasGantry ? 150 : 112;
   const x = width - 270;
   const y = 18;
   ctx.fillStyle = "rgba(255, 255, 255, 0.88)";
@@ -3457,9 +3601,9 @@ function drawLegend() {
   ctx.strokeRect(x, y, 246, boxH);
   ctx.font = "12px Arial";
   ctx.fillStyle = "#17202a";
-  ctx.fillText("AprilTag SLAM: old faint -> recent solid", x + 12, y + 22);
+  ctx.fillText("Camera (AprilTag SLAM, viridis by time)", x + 12, y + 22);
   for (let i = 0; i < 96; i++) {
-    ctx.fillStyle = trajectoryColor(Math.round((DATA.camera.length - 1) * i / 95));
+    ctx.fillStyle = viridisColorAt(i / 95);
     ctx.fillRect(x + 12 + i, y + 34, 1, 9);
   }
   ctx.fillStyle = "#17202a";
@@ -3467,10 +3611,19 @@ function drawLegend() {
   ctx.fillText("Bright tags/lines: active constraints", x + 12, y + 82);
   ctx.fillText("Faint tags: in graph, inactive", x + 12, y + 102);
   if (hasGantry) {
-    ctx.fillStyle = "rgba(255, 165, 0, 0.92)";
-    ctx.fillRect(x + 12, y + 120, 24, 4);
-    ctx.fillStyle = "#17202a";
-    ctx.fillText("Gantry (first-sample-zeroed)", x + 44, y + 124);
+    if (usesPlasmaGantry) {
+      ctx.fillStyle = "#17202a";
+      ctx.fillText("Gantry GT (plasma by time)", x + 12, y + 122);
+      for (let i = 0; i < 96; i++) {
+        ctx.fillStyle = plasmaColorAt(i / 95);
+        ctx.fillRect(x + 12 + i, y + 132, 1, 9);
+      }
+    } else {
+      ctx.fillStyle = "rgba(255, 165, 0, 0.92)";
+      ctx.fillRect(x + 12, y + 130, 24, 4);
+      ctx.fillStyle = "#17202a";
+      ctx.fillText("Gantry (first-sample-zeroed)", x + 44, y + 134);
+    }
   }
 }
 
@@ -3855,24 +4008,31 @@ function stepDamping() {
   return before.some((value, index) => Math.abs(value - [rotX, rotY, zoom, panX, panY][index]) > 1e-5);
 }
 
+function playLength() {
+  return DATA.camera.length > 0 ? DATA.camera.length : GANTRY_TRAJ.length;
+}
+
 playButton.addEventListener("click", () => {
-  if (DATA.camera.length === 0) {
+  if (playLength() === 0) {
     return;
   }
   playing = !playing;
+  playAnchorMs = null;  // re-anchor real-time clock on (re)start
   playButton.textContent = playing ? "Pause" : "Play";
 });
 
 restartButton.addEventListener("click", () => {
   currentIndex = 0;
   playing = false;
+  playAnchorMs = null;
   playButton.textContent = "Play";
   draw();
 });
 
 fullButton.addEventListener("click", () => {
-  currentIndex = Math.max(0, DATA.camera.length - 1);
+  currentIndex = Math.max(0, playLength() - 1);
   playing = false;
+  playAnchorMs = null;
   playButton.textContent = "Play";
   draw();
 });
@@ -3911,9 +4071,30 @@ zScaleButton.addEventListener("click", () => {
 slider.addEventListener("input", event => {
   currentIndex = Number(event.target.value);
   playing = false;
+  playAnchorMs = null;
   playButton.textContent = "Play";
   draw();
 });
+
+// Layer-visibility toggle buttons (camera / gantry / tags / pool / markers).
+function wireToggle(id, key) {
+  const btn = document.getElementById(id);
+  if (!btn) {
+    return;
+  }
+  const sync = () => btn.classList.toggle("off", !layerShow[key]);
+  sync();
+  btn.addEventListener("click", () => {
+    layerShow[key] = !layerShow[key];
+    sync();
+    draw();
+  });
+}
+wireToggle("tgCam", "camera");
+wireToggle("tgGantry", "gantry");
+wireToggle("tgTags", "tags");
+wireToggle("tgPool", "pool");
+wireToggle("tgMarkers", "markers");
 
 canvas.addEventListener("pointerdown", event => {
   event.preventDefault();
@@ -3964,20 +4145,47 @@ canvas.addEventListener("wheel", event => {
   targetZoom = Math.max(0.12, Math.min(10.0, targetZoom));
 }, {passive: false});
 
+// Elapsed time (s) for the playback timeline at a given index — camera time
+// when available, else the gantry sample time (gantry-only runs).
+function timelineTimeAt(index) {
+  if (DATA.camera.length > 0) {
+    const row = DATA.camera[Math.min(index, DATA.camera.length - 1)];
+    return Number.isFinite(row.time_s) ? row.time_s : index;
+  }
+  if (GANTRY_TRAJ.length > 0) {
+    const g = GANTRY_TRAJ[Math.min(index, GANTRY_TRAJ.length - 1)];
+    return Number.isFinite(g.t) ? g.t : index;
+  }
+  return index;
+}
+
 function animate(timestampMs) {
   let needsDraw = stepDamping();
-  if (playing && DATA.camera.length > 0) {
-    const hz = Number(speedSelect.value);
-    if (timestampMs - lastStepMs >= 1000 / hz) {
-      currentIndex += 1;
-      if (currentIndex >= DATA.camera.length) {
-        currentIndex = DATA.camera.length - 1;
-        playing = false;
-        playButton.textContent = "Play";
-      }
-      lastStepMs = timestampMs;
+  const n = playLength();
+  if (playing && n > 0) {
+    const speed = Number(speedSelect.value) || 1.0;  // real-time multiplier
+    if (playAnchorMs === null) {
+      playAnchorMs = timestampMs;
+      playAnchorT = timelineTimeAt(currentIndex);
+    }
+    // Advance currentIndex so its sample time matches real elapsed wall-clock
+    // time (1 s of recording == 1 s of playback at 1x).
+    const targetT = playAnchorT + (timestampMs - playAnchorMs) / 1000 * speed;
+    let idx = currentIndex;
+    while (idx + 1 < n && timelineTimeAt(idx + 1) <= targetT) {
+      idx += 1;
+    }
+    if (idx !== currentIndex) {
+      currentIndex = idx;
       needsDraw = true;
     }
+    if (currentIndex >= n - 1) {
+      currentIndex = n - 1;
+      playing = false;
+      playAnchorMs = null;
+      playButton.textContent = "Play";
+    }
+    lastStepMs = timestampMs;
   }
   if (needsDraw) {
     draw();
@@ -3993,11 +4201,7 @@ requestAnimationFrame(animate);
 </body>
 </html>
 """
-    html_path.write_text(
-        html_template.replace("__DATA_JSON__", data_json),
-        encoding="utf-8",
-    )
-    return html_path
+    return html_template.replace("__DATA_JSON__", data_json)
 
 
 def set_axes_equal_3d(ax, points: np.ndarray) -> None:
@@ -5295,6 +5499,13 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
   .toolbar input { vertical-align:middle; margin-right:4px; }
   .hint { color:#6b7682; font-size:11px; }
   /* Trajectory tab layout */
+  /* 3D-viewer mode: the rich interactive viewer fills the pane via an iframe,
+     and the classic 2D toolbar/body are hidden. */
+  #trajFrame { position:absolute; inset:0; width:100%; height:100%; border:0;
+               display:none; background:#f4f6f8; }
+  #trajPane.viewer3d #trajToolbar { display:none; }
+  #trajPane.viewer3d .body { display:none; }
+  #trajPane.viewer3d #trajFrame { display:block; }
   #trajPane .body { position:absolute; top:42px; left:0; right:0; bottom:0;
                     display:grid; grid-template-columns: minmax(0,1fr) 320px; }
   #trajLeft { position:relative; min-width:0; display:flex; flex-direction:column; }
@@ -5335,7 +5546,11 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
   <div id="content">
     <!-- Trajectory -->
     <div class="tabpane active" id="trajPane">
-      <div class="toolbar">
+      <!-- 3D interactive viewer (camera + gantry + tags + pool + play/slider on
+           top); injected via srcdoc when DASH.traj_viewer_html is present. -->
+      <iframe id="trajFrame" title="Interactive 3D trajectory viewer"></iframe>
+      <!-- Classic 2D top-down fallback (gantry-only runs / viewer build failed). -->
+      <div class="toolbar" id="trajToolbar">
         <label><input type="checkbox" id="tgCam" checked> Camera trajectory</label>
         <label><input type="checkbox" id="tgGantry" checked> Gantry GT</label>
         <label><input type="checkbox" id="tgTags" checked> Tags</label>
@@ -5378,6 +5593,10 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
 "use strict";
 const DASH = __DASHBOARD_JSON__;
 
+// When the experiment pipeline supplied the rich 3D viewer HTML, the Trajectory
+// tab is that viewer (in an iframe) and the classic 2D top-down code is dormant.
+const USE_VIEWER3D = !!(DASH.traj_viewer_html && DASH.traj_viewer_html.length);
+
 // Shared time cursor across all tabs (seconds).
 let currentT = 0;
 let activeTab = "trajectory";
@@ -5416,7 +5635,7 @@ function switchTab(name){
   document.getElementById("trajPane").classList.toggle("active", name==="trajectory");
   document.getElementById("velPane").classList.toggle("active", name==="velocity");
   hideTip();
-  if (name==="trajectory"){ syncSliderToCurrentT(); resizeTraj(); drawTraj(); }
+  if (name==="trajectory"){ if(!USE_VIEWER3D){ syncSliderToCurrentT(); resizeTraj(); drawTraj(); } }
   else { velTab.resizeAll(); velTab.render(); }
 }
 
@@ -5725,11 +5944,17 @@ const velTab = makeSeriesTab("vel", ["vx","vy","vz"], "cm/s", "vgGantry", "vgCam
 
 // ── init ─────────────────────────────────────────────────────────────────────
 window.addEventListener("resize", ()=>{
-  if(activeTab==="trajectory"){ resizeTraj(); drawTraj(); }
+  if(activeTab==="trajectory"){ if(!USE_VIEWER3D){ resizeTraj(); drawTraj(); } }
   else { velTab.resizeAll(); velTab.render(); }
 });
 currentT = TR[0];
-requestAnimationFrame(()=>{ resizeTraj(); syncSliderToCurrentT(); drawTraj(); });
+if (USE_VIEWER3D) {
+  // Mount the rich 3D viewer; the classic 2D toolbar/body stay hidden.
+  document.getElementById("trajPane").classList.add("viewer3d");
+  document.getElementById("trajFrame").srcdoc = DASH.traj_viewer_html;
+} else {
+  requestAnimationFrame(()=>{ resizeTraj(); syncSliderToCurrentT(); drawTraj(); });
+}
 </script>
 </body>
 </html>"""
@@ -5781,6 +6006,74 @@ def _savgol_deriv(t: "np.ndarray", y: "np.ndarray") -> "np.ndarray":
     return out
 
 
+def _dash_velocity_diagnostics(g_t, V_gantry, V_slam, c_t, V_cam, R3, legacy_csv):
+    """Stderr diagnostics for the dashboard Velocity tab (Issue #2).
+
+    Traces one sample through the gantry-velocity transform chain, reports the
+    per-axis camera-vs-gantry RMS divergence, warns when it is gross (>50 cm/s),
+    and — crucially — warns when applying R's transpose would align the curves
+    far better (the classic "R_gantry_to_slam stored transposed" mistake).
+
+    Args (all mm/s unless noted):
+      g_t        (N,)   gantry elapsed time [s]
+      V_gantry   (N,3)  gantry-frame velocity (before R)
+      V_slam     (N,3)  gantry velocity rotated into the SLAM frame (plotted)
+      c_t        (M,)   camera elapsed time [s]
+      V_cam      (M,3)  camera-derived velocity, or None when no camera
+      R3         (3,3)  rotation applied to the gantry velocity
+      legacy_csv bool   True when only the legacy SDK velocity column existed
+    """
+    axes = ("X", "Y", "Z")
+    if legacy_csv:
+        for a in axes:
+            print(f"[dashboard] using legacy SDK velocity column for {a} axis — "
+                  "derived not available", file=sys.stderr)
+
+    try:
+        speeds = np.linalg.norm(np.nan_to_num(V_gantry), axis=1)
+        i = int(np.argmax(speeds)) if speeds.size else 0
+        vg, vs = V_gantry[i], V_slam[i]
+        print("[dashboard] velocity transform (sample %d): gantry (%.2f, %.2f, %.2f) mm/s "
+              "--R--> slam (%.2f, %.2f, %.2f) mm/s --/10--> (%.2f, %.2f, %.2f) cm/s"
+              % (i, vg[0], vg[1], vg[2], vs[0], vs[1], vs[2],
+                 vs[0] / 10, vs[1] / 10, vs[2] / 10), file=sys.stderr)
+    except Exception:
+        pass
+
+    if V_cam is None or not getattr(V_cam, "size", 0):
+        return
+
+    def _div(gv_mm, cv_mm):
+        mc = np.isfinite(c_t) & np.isfinite(cv_mm)
+        if int(mc.sum()) < 2:
+            return float("nan")
+        ci = np.interp(g_t, c_t[mc], cv_mm[mc])
+        f = np.isfinite(gv_mm) & np.isfinite(ci) & np.isfinite(g_t)
+        if int(f.sum()) < 1:
+            return float("nan")
+        return float(np.sqrt(np.nanmean(((gv_mm[f] - ci[f]) / 10.0) ** 2)))
+
+    div = [_div(V_slam[:, k], V_cam[:, k]) for k in range(3)]
+    print("[dashboard] velocity RMS divergence (camera vs gantry): "
+          "Vx=%.1f Vy=%.1f Vz=%.1f cm/s" % (div[0], div[1], div[2]), file=sys.stderr)
+    worst = max([d for d in div if np.isfinite(d)], default=0.0)
+    if worst > 50.0:
+        print("[dashboard] WARNING: velocity RMS divergence %.1f cm/s exceeds 50 cm/s — "
+              "camera/gantry frames likely misaligned (check R_gantry_to_slam)."
+              % worst, file=sys.stderr)
+
+    # Transpose hint: would R.T align the curves substantially better?
+    if R3 is not None and not np.allclose(R3, np.eye(3), atol=1e-6):
+        V_slam_T = (np.asarray(R3).T @ V_gantry.T).T
+        div_T = [_div(V_slam_T[:, k], V_cam[:, k]) for k in range(3)]
+        tot, tot_T = float(np.nansum(div)), float(np.nansum(div_T))
+        if np.isfinite(tot) and np.isfinite(tot_T) and tot > 3.0 and tot_T < 0.6 * tot:
+            print("[dashboard] WARNING: R_gantry_to_slam may be TRANSPOSED — current total "
+                  "velocity divergence %.1f cm/s, transpose gives %.1f cm/s. Consider "
+                  "replacing R with its transpose in the calibration." % (tot, tot_T),
+                  file=sys.stderr)
+
+
 def write_experiment_dashboard_html(
     path: Path,
     gantry_csv: Path,
@@ -5795,6 +6088,8 @@ def write_experiment_dashboard_html(
     run_name: str = "",
     rms_summary: dict | None = None,
     zed_view_image_paths: "list[Path] | None" = None,
+    tag_size_m: float = 0.085,
+    plot_z_scale: float = 0.5,
 ) -> "Path | None":
     """Write a single self-contained HTML dashboard with two tabs:
     Trajectory and Velocity.
@@ -5907,6 +6202,12 @@ def write_experiment_dashboard_html(
         V = np.stack([g_vx, g_vy, g_vz], axis=1)           # mm/s, gantry frame
         V_slam = (R3 @ V.T).T                              # mm/s, SLAM orientation
         g_vx, g_vy, g_vz = V_slam[:, 0], V_slam[:, 1], V_slam[:, 2]
+        # Issue #2: trace the velocity transform + flag frame/transpose problems.
+        _dash_velocity_diagnostics(
+            g_t, V, V_slam, c_t,
+            (np.stack([c_vx, c_vy, c_vz], axis=1) if (not gantry_only and c_vx.size) else None),
+            R3, legacy_csv,
+        )
     else:
         g_xa = g_ya = g_za = np.array([])
 
@@ -5990,9 +6291,76 @@ def write_experiment_dashboard_html(
             "image": cam_images[i] if i < len(cam_images) else "",
         })
 
+    # ── rich 3D viewer (Trajectory tab) ───────────────────────────────────────
+    #    The Trajectory tab embeds the full interactive 3D viewer (the same one
+    #    the standalone zed2 pipeline produces) via an <iframe srcdoc>. We build
+    #    camera_rows in the viewer's dict schema, a parallel DATA.gantry array in
+    #    the (already camera-aligned) SLAM frame, and full tag rows. Gantry-only
+    #    runs (no camera) leave this empty and fall back to the 2D top-down.
+    def _f(r, k, default=0.0):
+        try:
+            return float(r[k])
+        except (KeyError, ValueError, TypeError):
+            return default
+
+    viewer_gantry = []
+    for i in range(len(g_rows)):
+        if not (np.isfinite(g_xa[i]) and np.isfinite(g_ya[i]) and np.isfinite(g_za[i])):
+            continue
+        viewer_gantry.append({
+            "x_m": round(float(g_xa[i]), 5),
+            "y_m": round(float(g_ya[i]), 5),
+            "z_m": round(float(g_za[i]), 5),
+            "t": (round(float(g_t[i]), 4) if np.isfinite(g_t[i]) else None),
+        })
+
+    viewer_camera_rows = []
+    for i, r in enumerate(c_rows):
+        htu = str(r.get("has_tag_update", "")).strip().lower() in ("true", "1", "yes")
+        viewer_camera_rows.append({
+            "camera_index": int(_f(r, "camera_index", i)),
+            "time_s": (round(float(c_t[i]), 4) if np.isfinite(c_t[i]) else 0.0),
+            "x_m": round(float(c_xm[i]), 5) if np.isfinite(c_xm[i]) else 0.0,
+            "y_m": round(float(c_ym[i]), 5) if np.isfinite(c_ym[i]) else 0.0,
+            "z_m": round(float(c_zm[i]), 5) if np.isfinite(c_zm[i]) else 0.0,
+            "roll_deg": _f(r, "roll_deg"), "pitch_deg": _f(r, "pitch_deg"),
+            "yaw_deg": _f(r, "yaw_deg"),
+            "detected_tags": str(r.get("detected_tags", "") or ""),
+            "has_tag_update": htu,
+            "image_path": str(r.get("image_path", "") or ""),
+        })
+
+    viewer_tag_rows = []
+    for r in tag_rows:
+        try:
+            viewer_tag_rows.append({
+                "tag_id": int(float(r["tag_id"])),
+                "x_m": float(r["x_m"]), "y_m": float(r["y_m"]),
+                "z_m": float(r.get("z_m", 0.0) or 0.0),
+                "roll_deg": float(r.get("roll_deg", 0.0) or 0.0),
+                "pitch_deg": float(r.get("pitch_deg", 0.0) or 0.0),
+                "yaw_deg": float(r.get("yaw_deg", 0.0) or 0.0),
+            })
+        except (KeyError, ValueError, TypeError):
+            pass
+
+    viewer_html = ""
+    if not gantry_only and viewer_camera_rows:
+        try:
+            viewer_html = _build_trajectory_viewer_html(
+                viewer_camera_rows, viewer_tag_rows, pool_cfg,
+                float(tag_size_m), float(plot_z_scale), int(anchor_id),
+                gantry_traj=viewer_gantry,
+            )
+        except Exception as exc:  # fall back to the 2D top-down trajectory tab
+            print(f"[dashboard] 3D viewer build failed, using 2D top-down: {exc}",
+                  file=sys.stderr)
+            viewer_html = ""
+
     payload = {
         "run_name": run_name or (Path(gantry_csv).parent.name if gantry_csv else "run"),
         "alignment": alignment,
+        "traj_viewer_html": viewer_html,
         "gantry_only": bool(gantry_only),
         "duration_s": round(duration_s, 2),
         "n_gantry": len(g_rows),
@@ -6022,6 +6390,10 @@ def write_experiment_dashboard_html(
         },
     }
 
-    html = _DASHBOARD_TEMPLATE.replace("__DASHBOARD_JSON__", _json.dumps(payload))
+    # Safe-embed: traj_viewer_html contains its own </script>; escaping "</" as
+    # "<\/" keeps the HTML tokenizer from closing the dashboard's <script> early
+    # (JSON parses \/ back to /). Standard JSON-in-<script> hardening.
+    dash_json = _json.dumps(payload).replace("</", "<\\/")
+    html = _DASHBOARD_TEMPLATE.replace("__DASHBOARD_JSON__", dash_json)
     path.write_text(html, encoding="utf-8")
     return path

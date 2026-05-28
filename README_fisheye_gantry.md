@@ -575,6 +575,87 @@ data/YYYYMMDD/YYYYMMDD_HHMMSS_fisheye_gantry/
 
 ---
 
+## Tag Survey — build a reusable tag map (`survey_tags.py`)
+
+A **two-step** workflow that turns a hand-jogged recording into
+`config/tag_map.yaml`, a refined tag layout you can later inject as a SLAM prior
+(PnP-only localization, no per-run tag-init jump).
+
+**Step 1 — record a survey (panel).** Connect the camera + gantry, click
+**● Start Recording** (Recording tab), then **manually jog** the gantry through
+the working area from the Control tab (per-axis jog / Move Abs). Recommended jog
+pattern: **move slowly with brief dwells**, view **every tag from several angles,
+distances, and heights**, and **cover all tag regions** of the board. ~3–5 min is
+plenty. Click **■ Stop Recording** — this writes
+`data/YYYYMMDD/<ts>_recording/` with `camera_trajectory.csv`, `tag_poses.csv`,
+`gantry_telemetry.csv`, and `frames/` (if frame saving was on).
+
+**Step 2 — post-process (CLI, no hardware).** Batch-optimize all observations:
+
+```bash
+python -m src.survey_tags --input-dir data/20260527/<ts>_recording \
+                          --output config/tag_map.yaml \
+                          [--anchor-tag-id 70] \
+                          [--min-observations 10] \
+                          [--max-iterations 200] \
+                          [--use-frames] [--tag-size 0.17]
+```
+
+Outputs `config/tag_map.yaml` + `config/tag_map_layout.png` and a stdout report
+(per-tag observation counts + uncertainty, dropped tags, optimizer convergence).
+
+**Observation source — two modes:**
+
+- **CSV-only (default, fast — seconds).** Reconstructs `camera_T_tag` from the
+  recorded `camera_trajectory.csv` poses + `tag_poses.csv` (the `detected_tags`
+  column says which tags were active each frame). These are consistent with the
+  recorded poses by construction, so the optimizer confirms consistency and
+  computes per-tag uncertainty from observation counts. **Scale is inherited from
+  the recording** (no `--tag-size` needed).
+- **`--use-frames` (slower — ~10–90 ms/frame; a 3-min/~5000-frame run ≈ 1–7 min).**
+  Re-detects AprilTags in the saved frames and runs solvePnP for an *independent*
+  `camera_T_tag` per detection → genuine batch refinement (large error reduction).
+  ⚠ The recorder saves **undistorted, downscaled JPEG** frames, so re-detection is
+  bounded by that resolution, and you **must pass the correct `--tag-size`** (the
+  tag edge length in metres; the recording used whatever `tag_size` was active).
+  If `frames/` is missing it falls back to CSV-only with a warning.
+
+**Map structure:**
+
+```yaml
+anchor_tag_id: 70
+tags:
+  70:
+    position_m: [0.0, 0.0, 0.0]
+    quaternion_wxyz: [1.0, 0.0, 0.0, 0.0]
+    n_observations: 343
+    uncertainty_mm: 0.0          # anchor is pinned at the origin
+  71:
+    position_m: [0.000034, 0.213834, -0.0026]
+    quaternion_wxyz: [1.0, 0.002, 0.003, 0.0126]
+    n_observations: 258
+    uncertainty_mm: 6.2          # sqrt(trace(Σ_translation)) · 1000
+metadata: { source, used_frames_redetection, n_frames_processed, n_tags_qualified,
+            n_tags_dropped, min_observations, optimizer_iterations, initial_error,
+            final_error, converged, fisheye_calib_path, tool_version, created_at }
+```
+
+The anchor is auto-detected as the tag nearest the origin in `tag_poses.csv`
+(override with `--anchor-tag-id`) and pinned at identity; all poses are reframed
+so the anchor starts at the origin. Noise model matches the live pipeline
+(`tag_rot_sigma=0.08 rad`, `tag_trans_sigma=0.04 m`); anchor prior `σ=1e-6`.
+
+**Limitations.** Tags seen **fewer than `--min-observations` times are dropped**
+(the report tells you which — drive the gantry through their region next time).
+If the anchor tag is not present in the recording the tool exits with code 2.
+Output is deterministic (re-runs are byte-identical except `created_at`).
+
+**Next step.** Inject `config/tag_map.yaml` into the SLAM backend as fixed tag
+priors → the system localizes by PnP against known tags from frame one, removing
+the tag-initialization jump at the start of each run.
+
+---
+
 ## Time sync & joining the two CSVs
 
 Both CSVs share the run-start monotonic clock and write `timestamp_monotonic`
@@ -691,7 +772,7 @@ Full-pipeline mode (`camera_mode: fisheye`):
 | `waypoints.csv` | Snapshot of the waypoints that ran (user-frame mm) |
 | `camera_trajectory.csv` | TagSLAM camera poses + `gantry_x/y/z_mm`, `translation_error_mm` |
 | `tag_poses.csv` | Optimized tag positions |
-| `trajectory_interactive.html` | **★ Primary viewer — two tabs (Trajectory + Velocity)**, one self-contained HTML, no external deps. **Trajectory:** top-down camera (viridis) + gantry GT (orange dashed, rotated to the SLAM frame via `R_gantry_to_slam`) over the pool outline + tags, time slider, camera-frame card, layer toggles, dual current-time markers + Δ readout. **Velocity:** stacked Vx/Vy/Vz (cm/s), gantry derived (blue) vs camera derived (dashed red), shared time cursor, pan/zoom. Time cursor syncs across tabs. |
+| `trajectory_interactive.html` | **★ Primary viewer — two tabs (Trajectory + Velocity)**, one self-contained HTML, no external deps. **Trajectory:** the full interactive **3D viewer** (mouse orbit / wheel zoom / shift-drag pan), embedded as an `<iframe srcdoc>`, with play/pause + time slider **on top** (real-time playback, 1×/2×/4×), reference **X/Y/Z axes** (red/green/blue, labeled), translucent pool floor, AprilTag markers + triads, camera trajectory (viridis, time-coded) **and** gantry GT (plasma, time-coded, rotated to the SLAM frame via `R_gantry_to_slam`), current-time camera/gantry markers + dashed Δ line with `|Δ| mm` label, and layer-toggle buttons (Camera / Gantry / Tags / Pool / Markers). The left card shows the live fisheye/ZED frame. **Velocity:** stacked Vx/Vy/Vz (cm/s), gantry derived (blue) vs camera derived (dashed red), shared time cursor, pan/zoom. |
 | `comparison_topdown.png` | Top-down overlay: camera traj (viridis) + gantry GT (orange) — paper figure |
 | `comparison_plot.png` | 3×3 grid: pose/vel/acc × X/Y/Z, gantry vs AprilTag — paper figure |
 | `run_metadata.json` | CLI args, timing, output paths, alignment note, `camera_mode`, `axis_sign`, `soft_limits` |
@@ -703,7 +784,7 @@ Gantry-only mode (`camera_mode: gantry_only`):
 |------|---------|
 | `gantry_telemetry.csv` | 100 Hz gantry pose + SDK/derived velocity + derived accel |
 | `waypoints.csv` | Snapshot of the waypoints that ran |
-| `trajectory_interactive.html` | **★ Primary viewer** — gantry-only: Trajectory shows pool + gantry path only, Velocity shows the gantry curves only, header carries a *Gantry-only run (no camera)* badge |
+| `trajectory_interactive.html` | **★ Primary viewer** — gantry-only: the Trajectory tab falls back to the 2D top-down canvas (pool + gantry path only; the 3D viewer needs a camera trajectory), Velocity shows the gantry curves only, header carries a *Gantry-only run (no camera)* badge |
 | `gantry_pose_velocity_acceleration.png` | 3×3 grid: pose/vel/acc × X/Y/Z, gantry GT only |
 | `run_metadata.json` | Timing, output paths, `camera_mode: gantry_only`, `axis_sign`, `soft_limits` |
 
@@ -717,9 +798,10 @@ Files no longer generated: `pose_velocity_acceleration.html` (replaced by the Ve
 
 **`trajectory_interactive.html` notes**
 
-- Camera velocity is derived from `camera_trajectory.csv` positions with the **same Savitzky-Golay window/order** as `GantryTelemetryLogger` — a fair gantry-vs-camera comparison.
-- Gantry data is rotated into the SLAM frame by `R_gantry_to_slam` (calibration YAML, default identity) and offset by `gantry_anchor_offset_mm`. Header shows `Alignment: gantry_anchor_offset_mm` when the offset is present, else `first-sample-zeroed (approximate)` (only shape/drift meaningful then).
-- Self-contained; the only part needing the sibling `frames/` directory is the camera-frame thumbnail in the Trajectory card.
+- The Trajectory tab reuses the **same 3D viewer** the standalone zed2 pipeline produces (`_build_trajectory_viewer_html`), embedded via `<iframe srcdoc>`. The viewer reads camera rows + a parallel `DATA.gantry` array (SLAM-frame, camera-aligned). Camera = viridis, gantry = plasma, both time-coded; play advances the slider in real time (1 s recording = 1 s playback at 1×).
+- Camera **and** gantry velocity are both rotated by `R_gantry_to_slam` (velocity is a vector — rotation only, no translation offset) and derived/smoothed with the **same Savitzky-Golay window/order** (`SMOOTHING_WINDOW_S=0.25 s`, `SMOOTHING_POLYORDER=2`) — a fair comparison. Gantry positions get `R` + `gantry_anchor_offset_mm`; header shows `Alignment: gantry_anchor_offset_mm` when the offset is present, else `first-sample-zeroed (approximate)`.
+- **Velocity diagnostics (stderr).** On generation the dashboard prints: a one-sample velocity transform trace (`gantry mm/s --R--> slam mm/s --/10--> cm/s`), the per-axis camera-vs-gantry RMS divergence, a *legacy SDK velocity column* note when `*_derived` is missing, a **warning** if divergence exceeds 50 cm/s, and — most useful — a **`R_gantry_to_slam may be TRANSPOSED`** warning when applying `Rᵀ` would align the curves substantially better. The latter catches the classic mistake of storing `R` the wrong way round.
+- Self-contained; the only part needing the sibling `frames/` directory is the live fisheye/ZED frame in the viewer's left card. (`srcdoc` resolves relative frame paths against the parent HTML's folder, so frames render in-place and degrade to a placeholder when the file is moved.)
 
 **`R_gantry_to_slam` (optional calibration field)**
 
@@ -733,6 +815,8 @@ R_gantry_to_slam:
 ```
 
 Absent → identity. A non-orthonormal / det≠+1 matrix logs a warning and falls back to identity.
+
+> **Verifying R.** Generate a run's `trajectory_interactive.html` and watch stderr. If the Velocity tab's camera (red) does not track the gantry (blue) and you see `R_gantry_to_slam may be TRANSPOSED`, replace `R` with its transpose (swap the off-diagonal signs / transpose the 3×3). The known-good value for this rig is the example above (`[[0,1,0],[-1,0,0],[0,0,1]]`); its transpose `[[0,-1,0],[1,0,0],[0,0,1]]` flips Vx and makes the curves diverge.
 
 ### Aligning the two CSVs in pandas
 

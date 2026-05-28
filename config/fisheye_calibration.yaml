@@ -33,6 +33,18 @@ T_gantry_camera:
 image_size:
 - 1280
 - 720
+
+R_gantry_to_slam:
+- - 0.0
+  - 1.0
+  - 0.0
+- - 1.0
+  - 0.0
+  - 0.0
+- - 0.0
+  - 0.0
+  - -1.0
+
 metadata:
   created_at: '2026-05-27T15:05:53'
   flags:
