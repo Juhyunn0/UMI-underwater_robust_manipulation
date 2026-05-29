@@ -1016,6 +1016,38 @@ gantry_anchor_offset_mm: [1250.0, 800.0, 0.0]   # X, Y, Z from gantry home to an
 When this key is present, the overlay plot and `run_metadata.json` report
 `"alignment": "gantry_anchor_offset_mm"` instead of the fallback warning.
 
+### Refining `R_gantry_to_slam`
+
+`R_gantry_to_slam` rotates the gantry trajectory into the camera/SLAM frame. A
+hand-set matrix is usually a clean 90° permutation, but if the anchor tag is a
+few degrees off, the gantry GT and camera curves bow apart (a residual yaw/tilt).
+`src/tools/refine_R_gantry_to_slam.py` solves the optimal rotation **from a
+recording** via orthogonal Procrustes (the best rotation mapping the gantry path
+onto the camera path) and composes it with the current R.
+
+1. **Record** a few hundred mm of gantry motion with the dashboard's current R
+   (full pipeline — needs `camera_trajectory.csv` + `gantry_telemetry.csv`).
+2. **Preview** the fit (no changes written):
+   ```bash
+   python -m src.tools.refine_R_gantry_to_slam --input-dir data/<...>_recording
+   ```
+   Reads the before/after RMS and the refinement angle (typically 2–5°). Writes a
+   `R_refinement_check.png` (gantry-before gray, gantry-after orange, camera green).
+3. **Apply** when the report looks good:
+   ```bash
+   python -m src.tools.refine_R_gantry_to_slam --input-dir data/<...>_recording --write
+   ```
+   This block-edits only `R_gantry_to_slam` in `config/fisheye_calibration.yaml`
+   (K/D/T_gantry_camera/etc. preserved), adds `metadata.R_refined_at`, and saves a
+   timestamped `config/fisheye_calibration.backup_*.yaml`.
+
+Safety: refuses on a reflection (det = −1), on a refinement angle >
+`--max-angle-deg` (default 15°, sanity bound), or when RMS doesn't improve by >
+`--rms-threshold-mm` (default 5 mm) — so re-running on the same recording is a
+no-op once R is already optimal. With < 100 post-warmup samples it aborts; with <
+200 mm path traveled it warns (rotation weakly constrained). Regenerate the
+dashboard after `--write` to see the gantry GT and camera curves overlap.
+
 ---
 
 ## Safety notes

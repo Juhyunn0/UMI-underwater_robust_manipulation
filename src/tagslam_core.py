@@ -2628,8 +2628,13 @@ def _build_trajectory_viewer_html(
     anchor_tag_id: int,
     *,
     gantry_traj: "list | None" = None,
+    show_pool: bool = True,
 ) -> str:
     """Return the self-contained rich 3D-viewer HTML as a string.
+
+    ``show_pool`` controls the dashed pool overlay + its toggle button: True for
+    the standalone zed2 path (unchanged), False for the experiment dashboard
+    embed (the gantry GT/camera overlap is the focus there, the pool only clutters).
 
     Shared by the standalone zed2 path (write_interactive_trajectory_html) and
     the experiment dashboard (which embeds the returned string in an <iframe>
@@ -2649,6 +2654,7 @@ def _build_trajectory_viewer_html(
             "camera": camera_rows,
             "tags": tag_rows,
             "gantry": list(gantry_traj or []),
+            "show_pool": bool(show_pool),
             "pool": {
                 "config": pool_cfg,
                 "geometry": pool_geometry_json(pool_cfg),
@@ -2833,7 +2839,7 @@ def _build_trajectory_viewer_html(
     <button id="tgCam" class="toggle">Camera</button>
     <button id="tgGantry" class="toggle">Gantry</button>
     <button id="tgTags" class="toggle">Tags</button>
-    <button id="tgPool" class="toggle">Pool</button>
+    __POOL_BTN__
     <button id="tgMarkers" class="toggle">Markers</button>
     <div id="hint"></div>
   </div>
@@ -2884,7 +2890,7 @@ document.getElementById("toolbar").insertBefore(frameLabel, speedSelect);
 const GANTRY_TRAJ = Array.isArray(DATA.gantry) ? DATA.gantry : [];
 
 // Layer-visibility flags driven by the toolbar toggle buttons.
-const layerShow = { camera: true, gantry: true, tags: true, pool: true, markers: true };
+const layerShow = { camera: true, gantry: true, tags: true, pool: (DATA.show_pool !== false), markers: true };
 
 let currentIndex = 0;
 let playing = false;
@@ -4376,7 +4382,10 @@ requestAnimationFrame(animate);
 </body>
 </html>
 """
-    return html_template.replace("__DATA_JSON__", data_json)
+    pool_btn = '<button id="tgPool" class="toggle">Pool</button>' if show_pool else ""
+    return (html_template
+            .replace("__DATA_JSON__", data_json)
+            .replace("__POOL_BTN__", pool_btn))
 
 
 def set_axes_equal_3d(ax, points: np.ndarray) -> None:
@@ -5729,7 +5738,6 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
         <label><input type="checkbox" id="tgCam" checked> Camera trajectory</label>
         <label><input type="checkbox" id="tgGantry" checked> Gantry GT</label>
         <label><input type="checkbox" id="tgTags" checked> Tags</label>
-        <label><input type="checkbox" id="tgPool" checked> Pool outline</label>
         <label><input type="checkbox" id="tgCursor" checked> Time-cursor markers</label>
         <span class="hint">top-down (X,Y) · hover for nearest-sample readout</span>
       </div>
@@ -5831,7 +5839,7 @@ const GANTRY = DASH.traj.gantry.filter(p => p.x_m!==null && p.y_m!==null);
 const CAMERA = DASH.traj.camera.filter(p => p.x_m!==null && p.y_m!==null);
 const trajCanvas = document.getElementById("trajCanvas");
 let trajView = null;  // {ctx,w,h}
-const layers = { cam:true, gantry:true, tags:true, pool:true, cursor:true };
+const layers = { cam:true, gantry:true, tags:true, cursor:true };
 
 function trajBounds(){
   let minx=1e9,maxx=-1e9,miny=1e9,maxy=-1e9;
@@ -5839,18 +5847,10 @@ function trajBounds(){
   GANTRY.forEach(p=>acc(p.x_m,p.y_m));
   CAMERA.forEach(p=>acc(p.x_m,p.y_m));
   DASH.tags.forEach(t=>acc(t.x_m,t.y_m));
-  // pool centered on data centroid (placement is approximate context only)
-  const cx=(minx+maxx)/2||0, cy=(miny+maxy)/2||0;
-  const L=DASH.pool.length_m, W=DASH.pool.width_m;
-  let px, py;
-  if (DASH.pool.long_axis==="x"){ px=L/2; py=W/2; } else { px=W/2; py=L/2; }
-  pool_rect = {x0:cx-px, x1:cx+px, y0:cy-py, y1:cy+py};
-  acc(pool_rect.x0,pool_rect.y0); acc(pool_rect.x1,pool_rect.y1);
   if(minx>maxx){ minx=-1;maxx=1;miny=-1;maxy=1; }
   const padx=(maxx-minx)*0.08+0.05, pady=(maxy-miny)*0.08+0.05;
   return {minx:minx-padx,maxx:maxx+padx,miny:miny-pady,maxy:maxy+pady};
 }
-let pool_rect = null;
 let trajBnd = null;
 function w2s(x,y){
   const b=trajBnd, m=24, w=trajView.w, h=trajView.h;
@@ -5873,15 +5873,6 @@ function drawTraj(){
   if(!trajView) resizeTraj();
   const ctx=trajView.ctx, w=trajView.w, h=trajView.h;
   ctx.clearRect(0,0,w,h); ctx.fillStyle="#0f0f12"; ctx.fillRect(0,0,w,h);
-  // pool
-  if(layers.pool && pool_rect){
-    const a=w2s(pool_rect.x0,pool_rect.y0), b=w2s(pool_rect.x1,pool_rect.y1);
-    ctx.save(); ctx.strokeStyle="#5a6470"; ctx.lineWidth=1.2; ctx.setLineDash([7,5]);
-    ctx.strokeRect(Math.min(a.x,b.x),Math.min(a.y,b.y),Math.abs(b.x-a.x),Math.abs(b.y-a.y));
-    ctx.restore();
-    ctx.fillStyle="#5a6470"; ctx.font="11px Arial";
-    ctx.fillText(`pool ${DASH.pool.length_m}x${DASH.pool.width_m} m (approx)`, Math.min(a.x,b.x)+4, Math.min(a.y,b.y)+14);
-  }
   // tags
   if(layers.tags){
     DASH.tags.forEach(t=>{
@@ -5973,9 +5964,9 @@ function updateZed(){
   meta.textContent = `t = ${(c.t||0).toFixed(2)} s   tags: ${c.has_tag?"yes":"no"}\n`+
     `cam X=${(c.x_m*100).toFixed(1)} Y=${(c.y_m*100).toFixed(1)} Z=${(c.z_m*100).toFixed(1)} cm`;
 }
-["tgCam","tgGantry","tgTags","tgPool","tgCursor"].forEach((id,k)=>{
+["tgCam","tgGantry","tgTags","tgCursor"].forEach((id,k)=>{
   document.getElementById(id).addEventListener("change",e=>{
-    layers[["cam","gantry","tags","pool","cursor"][k]] = e.target.checked; drawTraj();
+    layers[["cam","gantry","tags","cursor"][k]] = e.target.checked; drawTraj();
   });
 });
 trajCanvas.addEventListener("mousemove", e=>{
@@ -6525,7 +6516,7 @@ def write_experiment_dashboard_html(
             viewer_html = _build_trajectory_viewer_html(
                 viewer_camera_rows, viewer_tag_rows, pool_cfg,
                 float(tag_size_m), float(plot_z_scale), int(anchor_id),
-                gantry_traj=viewer_gantry,
+                gantry_traj=viewer_gantry, show_pool=False,
             )
         except Exception as exc:  # fall back to the 2D top-down trajectory tab
             print(f"[dashboard] 3D viewer build failed, using 2D top-down: {exc}",
