@@ -68,7 +68,7 @@ OPTIMIZER_ABSOLUTE_TOL = 1e-8
 ANCHOR_PRIOR_SIGMA = 1e-6
 TAG_BETWEEN_ROT_SIGMA_RAD = 0.08
 TAG_BETWEEN_TRANS_SIGMA_M = 0.04
-FLOOR_Z_SIGMA_M = 0.05  # only used when --floor-coplanar is set
+FLOOR_Z_SIGMA_M = 0.005  # z=0 co-planarity prior sigma (5 mm); used with --floor-coplanar
 
 TOOL_VERSION = "survey_tags.py 1.0"
 EXIT_OK = 0
@@ -182,21 +182,30 @@ def build_observations_csv(camera_rows, tag_poses):
     observations = []
     frame_init: dict[int, Pose3] = {}
     used_frames = set()
+    rejected_single = 0
     for row in camera_rows:
         if not row["has_tag_update"]:
             continue
         wTc = row["pose"]
-        n_here = 0
+        per_frame = []
         for tag_id in row["tags"]:
             wTt = tag_poses.get(tag_id)
             if wTt is None:
                 continue
-            cTt = wTc.between(wTt)  # inverse(wTc) * wTt
+            per_frame.append((tag_id, wTc.between(wTt)))  # inverse(wTc) * wTt
+        # Reject single-tag frames: with only one tag there is no simultaneous
+        # triangulation constraint, so the frame would just re-assert the prior.
+        if len(per_frame) < 2:
+            if len(per_frame) == 1:
+                rejected_single += 1
+            continue
+        for tag_id, cTt in per_frame:
             observations.append((row["frame"], tag_id, cTt))
-            n_here += 1
-        if n_here > 0:
-            frame_init[row["frame"]] = wTc
-            used_frames.add(row["frame"])
+        frame_init[row["frame"]] = wTc
+        used_frames.add(row["frame"])
+    if rejected_single:
+        _log(f"[survey] rejected {rejected_single} single-tag frames "
+             "(no triangulation constraint)")
     return observations, frame_init, dict(tag_poses), len(used_frames)
 
 
@@ -206,13 +215,15 @@ def _detection_args(tag_size: float, tag_family: str, area_scale: float) -> argp
     minimum-tag-area gate to the saved (downscaled) frame resolution so the same
     physical tags pass. Decoupled from the fisheye tool's gantry-coupled parser.
     """
+    # Tightened survey gates: reject far/small (>=200 px²), high-reprojection
+    # (>3 px), and steeply off-nadir (>30°) detections before they reach the graph.
     return argparse.Namespace(
         tag_family=str(tag_family),
         nthreads=2, quad_decimate=1.0, quad_sigma=0.0, decode_sharpening=0.25,
         max_tag_id=-1, max_hamming=0, min_decision_margin=30.0,
-        min_tag_area_px=120.0 * max(0.05, float(area_scale)),
+        min_tag_area_px=200.0 * max(0.05, float(area_scale)),
         water_correction_mode="none", water_scale=3.6,
-        max_reprojection_error_px=5.0, max_off_nadir_deg=25.0,
+        max_reprojection_error_px=3.0, max_off_nadir_deg=30.0,
         max_image_eccentricity=0.65, max_tag_tilt_deg=35.0,
         tag_size=float(tag_size),
     )
@@ -244,6 +255,7 @@ def build_observations_frames(camera_rows, tag_poses, calib, tag_size, tag_famil
     frame_init: dict[int, Pose3] = {}
     tag_init: dict[int, Pose3] = dict(tag_poses)
     n_processed = 0
+    rejected_single = 0
     run_dir = input_dir_global
 
     detector = None
@@ -273,17 +285,22 @@ def build_observations_frames(camera_rows, tag_poses, calib, tag_size, tag_famil
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         obs_list = detect_observations(gray, detector, intrinsics, object_points, det_args, None)
         wTc = row["pose"]
-        frame_used = False
+        # Reject single-tag frames (no simultaneous triangulation constraint).
+        if len(obs_list) < 2:
+            if len(obs_list) == 1:
+                rejected_single += 1
+            continue
         for obs in obs_list:
             tag_id = int(obs.tag_id)
             observations.append((row["frame"], tag_id, obs.camera_T_tag))
-            frame_used = True
             if tag_id not in tag_init:  # bootstrap a tag first seen here
                 tag_init[tag_id] = wTc.compose(obs.camera_T_tag)
-        if frame_used:
-            frame_init[row["frame"]] = wTc
+        frame_init[row["frame"]] = wTc
         if n_processed % 50 == 0:
             _log(f"[survey] re-detected {n_processed} frames…")
+    if rejected_single:
+        _log(f"[survey] rejected {rejected_single} single-tag frames "
+             "(no triangulation constraint)")
     return observations, frame_init, tag_init, n_processed
 
 

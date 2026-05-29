@@ -91,6 +91,18 @@ MIN_OBSERVATIONS_PER_TAG = st.MIN_OBSERVATIONS_PER_TAG  # 10
 
 JUMP_WARNING_THRESHOLD_MM = 20.0
 JUMP_CRITICAL_THRESHOLD_MM = 100.0
+JUMP_SUSPECT_THRESHOLD_MM = 10.0   # a tag whose addition jumped the camera > this is flagged suspect
+
+# Frames with fewer than this many simultaneously detected tags give no
+# triangulation constraint and are rejected from the graph.
+MIN_SIMULTANEOUS_TAGS = 2
+
+# Warmup: for the first WARMUP_DURATION_S, only let a tag enter the graph once it
+# has been confirmed by >= WARMUP_MIN_CONFIRM_FRAMES frames that each saw
+# >= WARMUP_MIN_SIMULTANEOUS_TAGS tags (prevents bad early triangulation).
+WARMUP_DURATION_S = 30.0
+WARMUP_MIN_CONFIRM_FRAMES = 5
+WARMUP_MIN_SIMULTANEOUS_TAGS = 3
 
 OPTIMIZER_MAX_ITERATIONS = st.OPTIMIZER_MAX_ITERATIONS
 OPTIMIZER_RELATIVE_TOL = st.OPTIMIZER_RELATIVE_TOL
@@ -183,11 +195,12 @@ def build_slam_args(anchor_tag_id: int, tag_size: float, tag_family: str):
     a.max_tag_id = -1
     a.water_correction_mode = "none"
     a.water_scale = 3.6
-    a.min_tag_area_px = 120.0
-    a.max_off_nadir_deg = 25.0
+    # Tightened survey gates (reject far/small, high-reprojection, steep detections).
+    a.min_tag_area_px = 200.0
+    a.max_off_nadir_deg = 30.0
     a.max_image_eccentricity = 0.65
     a.max_tag_tilt_deg = 35.0
-    a.max_reprojection_error_px = 5.0
+    a.max_reprojection_error_px = 3.0
     a.nthreads = 2
     a.quad_decimate = 1.0
     a.quad_sigma = 0.0
@@ -204,11 +217,13 @@ def build_slam_args(anchor_tag_id: int, tag_size: float, tag_family: str):
     a.odom_trans_sigma = 0.30
     a.prior_rot_sigma = ANCHOR_PRIOR_SIGMA
     a.prior_trans_sigma = ANCHOR_PRIOR_SIGMA
+    # Floor co-planarity prior ON by default in survey mode: all tags pinned to
+    # the z=0 plane (strict = plane through the anchor with +z normal) at sigma 5 mm.
     a.floor_prior_enabled = True
-    a.floor_z_sigma = 0.02
+    a.floor_z_sigma = 0.005
     a.floor_plane_min_tags = 4
     a.floor_normal_sigma_deg = 8.0
-    a.strict_coplanar = False
+    a.strict_coplanar = True
     a.floor_prior_refresh_frames = 0
     a.floor_plane_outlier_threshold = 0.10
     a.use_imu_gravity = False
@@ -274,6 +289,13 @@ class DetectionSlamWorker(QThread):
         self._t_prev2 = None
         self._last_jump_mm = 0.0
 
+        # robustness state
+        self._rejected_single = 0                       # frames dropped for < 2 tags
+        self._confirm: dict[int, int] = {}              # tag -> #frames seen with >=3 tags (warmup)
+        self._suspect: set[int] = set()                 # tags that caused a > 10 mm jump on add
+        self._excluded: set[int] = set()                # tags the user manually excluded
+        self._excl_lock = threading.Lock()
+
         # metrics / coalescing
         self._frame_idx = -1
         self._frames_processed = 0
@@ -297,6 +319,17 @@ class DetectionSlamWorker(QThread):
     def set_fps(self, fps: int) -> None:
         self._last_fps = int(fps)
 
+    def toggle_exclude(self, tag_id: int) -> bool:
+        """User-driven exclusion of a suspect tag. Excluded tags stop receiving
+        new constraints live and are dropped from the finalize observation set.
+        Returns the new excluded state."""
+        with self._excl_lock:
+            if tag_id in self._excluded:
+                self._excluded.discard(tag_id)
+                return False
+            self._excluded.add(tag_id)
+            return True
+
     def stop(self) -> None:
         self._stop.set()
 
@@ -305,8 +338,21 @@ class DetectionSlamWorker(QThread):
         if self._map1 is not None:
             return
         h, w = frame.shape[:2]
+        # calib.K is in CALIBRATION-resolution pixels. If the camera delivers a
+        # different resolution than the calibration (cameras often ignore the
+        # requested size and keep their native one), K must be rescaled or the
+        # fisheye undistortion is geometrically wrong and the image stays curved.
+        cal_w, cal_h = int(self._calib.image_size[0]), int(self._calib.image_size[1])
+        K = np.asarray(self._calib.K, dtype=np.float64).copy()
+        if (w, h) != (cal_w, cal_h):
+            sx, sy = w / float(cal_w), h / float(cal_h)
+            K[0, 0] *= sx; K[1, 1] *= sy; K[0, 2] *= sx; K[1, 2] *= sy
+            print(f"[survey-gui] WARNING: camera delivered {w}x{h} but calibration is "
+                  f"{cal_w}x{cal_h}; rescaled K by ({sx:.3f}, {sy:.3f}). For best "
+                  "undistortion, capture at the calibration resolution or recalibrate.",
+                  file=sys.stderr)
         self._map1, self._map2, new_K = build_fisheye_undistort_maps(
-            self._calib.K, self._calib.D, (w, h), 0.0)
+            K, self._calib.D, (w, h), 0.0)
         self._intrinsics = rectified_camera_intrinsics(new_K)
         anchor_seed = self._anchor_mode if self._anchor_mode is not None else 1
         self._args = build_slam_args(anchor_seed, self._tag_size, self._tag_family)
@@ -364,6 +410,9 @@ class DetectionSlamWorker(QThread):
                 self._process(frame, t_mono)
             except Exception as exc:  # never let the worker die silently
                 print(f"[survey-gui] detection/SLAM error: {exc}", file=sys.stderr)
+        if self._rejected_single:
+            print(f"[survey] rejected {self._rejected_single} single-tag frames "
+                  "(no triangulation constraint)", file=sys.stderr)
         self._close_csv()
 
     def _process(self, frame: np.ndarray, t_mono: float) -> None:
@@ -374,10 +423,12 @@ class DetectionSlamWorker(QThread):
         obs_list = detect_observations(gray, self._detector, self._intrinsics,
                                        self._object_points, self._args, None)
         self._frames_processed += 1
-        if len(obs_list) >= 2:
+        n_simul = len(obs_list)
+        if n_simul >= 2:
             self._frames_with_2tags += 1
 
-        # Backend creation deferred until the anchor is known.
+        # Backend creation deferred until the anchor is known (auto = nearest the
+        # image center on the first frame with any detection).
         if self.backend is None:
             anchor = self._select_anchor(obs_list, w, h, self._frames_processed)
             if anchor is None:
@@ -393,10 +444,44 @@ class DetectionSlamWorker(QThread):
             self.backend = TagSlamBackend(self._args)
             self.anchor_selected.emit(anchor, self._frames_processed)
 
-        update = self.backend.update(obs_list)
+        # (1) Reject single-tag frames: one tag gives no simultaneous triangulation
+        # constraint, so it would only re-assert the existing solution.
+        if n_simul < MIN_SIMULTANEOUS_TAGS:
+            if n_simul == 1:
+                self._rejected_single += 1
+            self._emit_overlay(und, obs_list, t_mono)
+            return
+
+        # (5) Warmup: count confirmations on rich (>=3 tag) frames; during the first
+        # WARMUP_DURATION_S only confirmed tags (>= 5 such frames) + the anchor may
+        # enter the graph, so bad early triangulation never gets baked in.
+        if n_simul >= WARMUP_MIN_SIMULTANEOUS_TAGS:
+            for o in obs_list:
+                tid = int(o.tag_id)
+                self._confirm[tid] = self._confirm.get(tid, 0) + 1
+        in_warmup = (time.monotonic() - self._t0) < WARMUP_DURATION_S
+        with self._excl_lock:
+            excluded = set(self._excluded)
+
+        def _allowed(tid: int) -> bool:
+            if tid in excluded:                      # (6) user-excluded suspect tags
+                return False
+            if (in_warmup and tid != self.anchor_tag_id
+                    and self._confirm.get(tid, 0) < WARMUP_MIN_CONFIRM_FRAMES):
+                return False
+            return True
+
+        obs_used = [o for o in obs_list if _allowed(int(o.tag_id))]
+        if len(obs_used) < MIN_SIMULTANEOUS_TAGS:
+            # Not enough confirmed/un-excluded tags this frame to constrain anything.
+            self._emit_overlay(und, obs_list, t_mono)
+            return
+
+        prev_init = set(self.backend.initialized_tag_ids)
+        update = self.backend.update(obs_used)
         self._frame_idx += 1
-        # median reprojection residual this frame
-        res = [float(getattr(o, "reprojection_error_px", float("nan"))) for o in obs_list]
+        new_tags = set(self.backend.initialized_tag_ids) - prev_init
+        res = [float(getattr(o, "reprojection_error_px", float("nan"))) for o in obs_used]
         res = [r for r in res if math.isfinite(r)]
         self._last_residual_px = float(np.median(res)) if res else float("nan")
 
@@ -404,14 +489,14 @@ class DetectionSlamWorker(QThread):
             p = np.asarray(update.camera_pose.translation(), dtype=np.float64).reshape(3)
             self.camera_position.emit((float(p[0]), float(p[1]), float(p[2])))
             self.frame_init[self._frame_idx] = update.camera_pose
-            for o in obs_list:
+            for o in obs_used:
                 self.observations.append((self._frame_idx, int(o.tag_id), o.camera_T_tag))
-            self._detect_jump(p, t_mono, obs_list)
-            self._write_csv_row(update, obs_list, p, t_mono)
+            self._detect_jump(p, t_mono, obs_used, new_tags)
+            self._write_csv_row(update, obs_used, p, t_mono)
 
         self._maybe_emit(und, obs_list, t_mono, update)
 
-    def _detect_jump(self, p_curr: np.ndarray, t_curr: float, obs_list) -> None:
+    def _detect_jump(self, p_curr: np.ndarray, t_curr: float, obs_list, new_tags) -> None:
         if self._p_prev is not None and self._t_prev is not None:
             dt = max(1e-3, t_curr - self._t_prev)
             actual = float(np.linalg.norm(p_curr - self._p_prev)) * 1000.0  # mm
@@ -423,9 +508,13 @@ class DetectionSlamWorker(QThread):
             expected = v_prev * dt
             residual = actual - expected
             self._last_jump_mm = residual
+            # (6) A newly-added tag that jumped the camera > 10 mm is likely a bad
+            # triangulation — flag it suspect so the UI highlights it for exclusion.
+            if residual > JUMP_SUSPECT_THRESHOLD_MM and new_tags:
+                self._suspect |= {int(t) for t in new_tags}
             if residual > JUMP_WARNING_THRESHOLD_MM:
-                # Attribute to the newest in-graph tag this frame, if any.
-                newest = obs_list[-1].tag_id if obs_list else -1
+                newest = (next(iter(new_tags)) if new_tags
+                          else (obs_list[-1].tag_id if obs_list else -1))
                 self.jump_detected.emit(int(newest), float(residual), self._frame_idx)
         self._p_prev2, self._t_prev2 = self._p_prev, self._t_prev
         self._p_prev, self._t_prev = p_curr, t_curr
@@ -486,17 +575,32 @@ class DetectionSlamWorker(QThread):
         if self.backend is None:
             return {}
         counts = self.backend.tag_observation_counts
+        with self._excl_lock:
+            excluded = set(self._excluded)
+        suspect = set(self._suspect)
         out = {}
         for tid, pose in self.backend.optimized_tag_poses().items():
+            tid = int(tid)
             t = pose_translation(pose)
             q = st._quat_wxyz(pose.rotation())
-            out[int(tid)] = {
+            out[tid] = {
                 "position_m": [float(t[0]), float(t[1]), float(t[2])],
                 "quaternion_wxyz": q,
                 "n_observations": int(counts.get(tid, 0)),
                 "uncertainty_mm": float("nan"),  # live: no marginals (cost); batch fills it
+                "suspect": tid in suspect,
+                "excluded": tid in excluded,
             }
         return out
+
+    def finalize_observations(self):
+        """Observations / inits for finalize, with user-excluded tags removed."""
+        with self._excl_lock:
+            excluded = set(self._excluded)
+        obs = [(f, t, p) for (f, t, p) in self.observations if t not in excluded]
+        tag_init = {t: p for t, p in self.backend.optimized_tag_poses().items()
+                    if int(t) not in excluded}
+        return obs, dict(self.frame_init), tag_init, excluded
 
     def _emit_overlay(self, und, obs_list, t_mono) -> None:
         tags_in_graph = len(self.backend.optimized_tag_poses()) if self.backend else 0
@@ -520,6 +624,9 @@ class DetectionSlamWorker(QThread):
             "median_residual_px": self._last_residual_px,
             "anchor_tag_id": self.anchor_tag_id,
             "elapsed_s": time.monotonic() - self._t0,
+            "rejected_single": self._rejected_single,
+            "suspect": len(self._suspect),
+            "in_warmup": (time.monotonic() - self._t0) < WARMUP_DURATION_S,
         })
 
     def _draw_overlay(self, und: np.ndarray, obs_list) -> np.ndarray:
@@ -575,6 +682,8 @@ class CameraPreview(QWidget):
 # TagMapWidget — center pane (custom QPainter top-down 2D map)
 # ══════════════════════════════════════════════════════════════════════════════
 class TagMapWidget(QWidget):
+    tag_right_clicked = pyqtSignal(int)  # right-click a tag -> toggle exclude
+
     def __init__(self, pool_cfg: dict, parent=None):
         super().__init__(parent)
         self.setMinimumSize(360, 360)
@@ -690,8 +799,12 @@ class TagMapWidget(QWidget):
         for tid, s in self._tags.items():
             pt = self._w2s(s["position_m"][0], s["position_m"][1])
             is_anchor = (tid == self._anchor_id)
+            excluded = s.get("excluded", False)
+            suspect = s.get("suspect", False)
             col = QColor(_color_for_uncertainty(s.get("uncertainty_mm", float("nan")),
                                                 s.get("n_observations", 0)))
+            if excluded:
+                col = QColor("#555555")
             r = 11 if is_anchor else 8
             dropped = s.get("n_observations", 0) < MIN_OBSERVATIONS_PER_TAG
             pen = QPen(QColor("#0a0d11"), 1.5)
@@ -699,6 +812,17 @@ class TagMapWidget(QWidget):
                 pen = QPen(QColor("#aaaaaa"), 1.2); pen.setStyle(Qt.DashLine)
             p.setPen(pen); p.setBrush(col)
             p.drawEllipse(pt, r, r)
+            # (6) suspect: magenta ring (likely-bad triangulation; right-click to exclude)
+            if suspect and not excluded:
+                ring = QPen(QColor("#ff37ff"), 2.5); ring.setStyle(Qt.DashLine)
+                p.setPen(ring); p.setBrush(Qt.NoBrush)
+                p.drawEllipse(pt, r + 5, r + 5)
+                p.setPen(QColor("#ff37ff"))
+                p.drawText(QPointF(pt.x() - r - 10, pt.y() - r - 6), "!")
+            if excluded:  # crossed out
+                p.setPen(QPen(QColor("#ff5555"), 2))
+                p.drawLine(QPointF(pt.x() - r, pt.y() - r), QPointF(pt.x() + r, pt.y() + r))
+                p.drawLine(QPointF(pt.x() - r, pt.y() + r), QPointF(pt.x() + r, pt.y() - r))
             if is_anchor:
                 self._draw_star(p, pt, r + 7, QColor(_COL_ANCHOR))
             p.setPen(QColor("#e6e6e6"))
@@ -723,7 +847,8 @@ class TagMapWidget(QWidget):
     def _draw_legend(self, p: QPainter):
         p.setFont(QFont("Arial", 8))
         items = [("< 5 mm", _COL_GREEN), ("5-15 mm", _COL_YELLOW),
-                 (">= 15 mm", _COL_RED), ("dropped", _COL_GRAY)]
+                 (">= 15 mm", _COL_RED), ("dropped", _COL_GRAY),
+                 ("suspect (right-click to exclude)", "#ff37ff")]
         x, y = 8, self.height() - 8 - 16 * len(items)
         for label, col in items:
             p.setBrush(QColor(col)); p.setPen(Qt.NoPen)
@@ -737,6 +862,10 @@ class TagMapWidget(QWidget):
         if ev.button() == Qt.LeftButton:
             self._panning = True
             self._last_mouse = ev.pos()
+        elif ev.button() == Qt.RightButton:
+            hit = self._tag_at(ev.pos())
+            if hit is not None:
+                self.tag_right_clicked.emit(int(hit[0]))
 
     def mouseReleaseEvent(self, ev):
         self._panning = False
@@ -867,9 +996,10 @@ class BatchOptimizerThread(QThread):
                 return
             frame_init, tag_init = st.reframe_to_anchor(
                 anchor_init, dict(self._frame_init), dict(self._tag_init))
+            # Survey tags sit on the pool floor: pin them to z=0 in the batch too.
             result = st.optimize(self._obs, frame_init, tag_init, self._anchor,
                                  MIN_OBSERVATIONS_PER_TAG, OPTIMIZER_MAX_ITERATIONS,
-                                 floor_coplanar=False)
+                                 floor_coplanar=True)
             # st.optimize's dict has no anchor_id; the GUI needs it for YAML/plot.
             result["anchor_id"] = self._anchor
             self.done.emit(result)
@@ -948,6 +1078,7 @@ class SurveyWindow(QMainWindow):
             "QSplitter::handle{background:#2a2f37;} QSplitter::handle:hover{background:#4ea1ff;}")
         self._camera_preview = CameraPreview()
         self._tag_map = TagMapWidget(self._pool_cfg)
+        self._tag_map.tag_right_clicked.connect(self._on_tag_right_clicked)
         self._splitter.addWidget(self._wrap("Live Camera", self._camera_preview))
         self._splitter.addWidget(self._wrap("Live Tag Map (top-down)", self._tag_map))
         self._splitter.addWidget(self._build_gantry_pane())
@@ -1326,9 +1457,11 @@ class SurveyWindow(QMainWindow):
             self._set_banner("No observations captured — nothing to finalize.", "warn")
             self._set_state("IDLE"); return
         self._live_tag_states = self._worker.live_tag_states()
-        obs = list(self._worker.observations)
-        frame_init = dict(self._worker.frame_init)
-        tag_init = dict(self._worker.backend.optimized_tag_poses())
+        # User-excluded suspect tags are dropped from the finalize observation set.
+        obs, frame_init, tag_init, excluded = self._worker.finalize_observations()
+        if excluded:
+            print(f"[survey] finalize excludes user-flagged tags: "
+                  f"{sorted(excluded)}", file=sys.stderr)
         anchor = self._worker.anchor_tag_id
         self._batch = BatchOptimizerThread(obs, frame_init, tag_init, anchor, self)
         self._batch.progress.connect(lambda m: self._set_banner(m, "info"))
@@ -1403,13 +1536,26 @@ class SurveyWindow(QMainWindow):
     def _on_camera_position(self, pos):
         self._last_cam_pos = pos
 
+    def _on_tag_right_clicked(self, tag_id: int):
+        """Right-click a (suspect) tag in the map to exclude/include it."""
+        if self._worker is None:
+            return
+        excluded = self._worker.toggle_exclude(int(tag_id))
+        self._set_banner(
+            f"tag {tag_id} {'EXCLUDED' if excluded else 're-included'} "
+            f"({'dropped from' if excluded else 'restored to'} the graph + final map).",
+            "warn" if excluded else "info")
+
     def _on_metrics(self, m: dict):
         elapsed = int(m.get("elapsed_s", 0))
-        self._state_label.setText(f"State: {self._state}   Elapsed: {elapsed // 60:02d}:{elapsed % 60:02d}")
+        warm = "  [WARMUP]" if m.get("in_warmup") else ""
+        self._state_label.setText(
+            f"State: {self._state}{warm}   Elapsed: {elapsed // 60:02d}:{elapsed % 60:02d}")
         self._counts_label.setText(
             f"Frames processed: {m['frames_processed']}   With ≥2 tags: {m['frames_with_2tags']}   "
             f"Tags in graph: {m['tags_in_graph']} / {m['tags_qualified']} qualified   "
-            f"Dropped: {m['dropped']}")
+            f"Dropped: {m['dropped']}   Single-tag rejected: {m.get('rejected_single', 0)}   "
+            f"Suspect: {m.get('suspect', 0)}")
         jm = m.get("last_jump_mm", 0.0)
         jcol = "#ef5350" if jm > JUMP_CRITICAL_THRESHOLD_MM else "#e6e6e6"
         res = m.get("median_residual_px", float("nan"))

@@ -615,6 +615,24 @@ constant-velocity prediction; `residual = ‖p_curr−p_prev‖ − ‖v_prev‖
 re-recording this region more slowly"). These flag the moments a newly added tag
 yanked the solution — exactly where the live map is least trustworthy.
 
+**Survey robustness (graph hygiene).**
+- **Single-tag frames are rejected** from the graph (need ≥2 simultaneous tags
+  for a triangulation constraint); the count is logged
+  `[survey] rejected N single-tag frames (no triangulation constraint)`.
+- **Tightened detection gates** before the backend: reprojection ≤ 3 px,
+  tag area ≥ 200 px², off-nadir ≤ 30°. AprilTag PnP uses
+  `cv2.SOLVEPNP_IPPE_SQUARE` (planar 180°-ambiguity-aware).
+- **Floor co-planarity prior ON by default** in survey mode: every tag is pinned
+  to the z = 0 plane (through the anchor, +z normal) at σ = 5 mm — live
+  (`TagSlamBackend`, strict co-planar) and in the batch finalize.
+- **Warmup (first 30 s):** a tag may only enter the graph once it has been
+  confirmed by ≥ 5 frames that each saw ≥ 3 simultaneous tags (the anchor is
+  exempt). This keeps bad early triangulation from being baked in.
+- **Suspect tags:** a newly-added tag whose addition jumped the camera > 10 mm is
+  ringed in **magenta** with a `!`. **Right-click** any tag to exclude/include it
+  — excluded tags (red ✕) stop receiving constraints live and are dropped from the
+  final batch map.
+
 **Gantry control has no soft-limit validation** (per rig preference): jog and Move
 Abs commands are sent as-is. All SDK calls share one `RLock` with the 10 Hz status
 poll, the 100 Hz telemetry logger, and the motion worker.
