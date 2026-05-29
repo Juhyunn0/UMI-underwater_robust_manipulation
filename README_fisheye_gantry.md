@@ -575,9 +575,60 @@ data/YYYYMMDD/YYYYMMDD_HHMMSS_fisheye_gantry/
 
 ---
 
-## Tag Survey — build a reusable tag map (`survey_tags.py`)
+## Tag Survey GUI — one-stop interactive surveying (`python -m src.survey_tags`)
 
-A **two-step** workflow that turns a hand-jogged recording into
+Run **`python -m src.survey_tags`** with **no arguments** to open the interactive
+survey GUI (1500×950): connect camera + gantry, jog the gantry around the working
+area by hand, and watch the tag map build itself live — then finalize to
+`config/tag_map.yaml` without ever leaving the window. (Any argument, e.g.
+`--input-dir …`, runs the headless CLI below instead; the CLI imports no PyQt.)
+
+**Window layout** — top connection bar (camera / gantry / calib / anchor), then a
+3-pane splitter: **left** live undistorted camera with AprilTag-corner overlay;
+**center** a top-down **live tag map** (custom `QPainter`: pool outline, numbered
+tag circles, viridis camera-trail, anchor ★, drag-pan / wheel-zoom / double-click
+fit / hover tooltips); **right** a gantry mini-panel (speed/accel/decel, hold-to-jog
+X±/Y±/Z±, Move Abs, live position + velocity). Below: a quality-metrics panel
+(state, frame counts, last backend jump, median residual, worst tag, scrollable
+tag-observation table) and a global control bar (Start / Pause / Stop & Finalize /
+Save / **EMERGENCY STOP (Esc)** / Reset E-Stop). Splitter sizes and connection
+settings persist in `~/.umi_gui_state.json`.
+
+**Two-stage SLAM.** During the survey, a `DetectionSlamWorker` runs **live
+incremental iSAM2** (≤15 fps, drop-oldest frame queue) so you get immediate
+feedback; on **Stop & Finalize** the exact CLI **batch** optimization
+(`survey_tags.optimize`, Levenberg-Marquardt) re-solves all observations at once
+for the accurate, low-uncertainty final map — the live map is fast but greedy, the
+batch pass is globally consistent.
+
+**Tag-map colors** (by translational uncertainty): green `< 5 mm`, yellow
+`5–15 mm`, red `≥ 15 mm`, gray (dashed) = fewer than `MIN_OBSERVATIONS_PER_TAG`
+observations → will be dropped. The anchor is a cyan ★.
+
+**Anchor** — `auto` (default) picks the tag nearest the image center on the first
+frame with a detection; or type a specific tag id. If the chosen anchor is not
+seen within 30 s the survey aborts with a clear message.
+
+**Jump warnings.** Every backend update compares the camera's actual motion to a
+constant-velocity prediction; `residual = ‖p_curr−p_prev‖ − ‖v_prev‖·dt`. Residual
+> 20 mm → 3 s yellow banner; > 100 mm → red persistent banner ("consider
+re-recording this region more slowly"). These flag the moments a newly added tag
+yanked the solution — exactly where the live map is least trustworthy.
+
+**Gantry control has no soft-limit validation** (per rig preference): jog and Move
+Abs commands are sent as-is. All SDK calls share one `RLock` with the 10 Hz status
+poll, the 100 Hz telemetry logger, and the motion worker.
+
+When finalized, the tag map switches to the **batch-refined** positions with the
+**live positions ghosted** semi-transparent, plus a per-tag Δ (mm) table, then
+**Save** writes `config/tag_map.yaml` + `config/tag_map_layout.png`.
+
+---
+
+## Tag Survey — build a reusable tag map (`survey_tags.py` CLI)
+
+The headless post-processing path (used by the GUI's Finalize step and available
+standalone). A **two-step** workflow that turns a hand-jogged recording into
 `config/tag_map.yaml`, a refined tag layout you can later inject as a SLAM prior
 (PnP-only localization, no per-run tag-init jump).
 

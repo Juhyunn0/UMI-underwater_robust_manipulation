@@ -712,5 +712,21 @@ def _load_calib(path: Path):
     return load_fisheye_calibration(path)
 
 
+# CLI entry point (unchanged behavior). Aliased so the GUI module can call it.
+cli_main = main
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # Dispatch (mirrors gantry_runner.py): no args -> GUI, any args -> CLI.
+    # PyQt is imported only inside the GUI module, so the CLI path stays
+    # headless-safe.
+    _argv = sys.argv[1:]
+    if not _argv:
+        try:
+            from survey_tags_gui import gui_main
+        except Exception as exc:  # pragma: no cover - missing PyQt/display
+            print(f"GUI mode unavailable ({exc}). Use --input-dir for CLI mode.",
+                  file=sys.stderr)
+            raise SystemExit(2)
+        raise SystemExit(gui_main())
+    raise SystemExit(cli_main(_argv))
