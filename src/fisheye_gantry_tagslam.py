@@ -332,6 +332,7 @@ class FisheyeCalibration:
     T_gantry_camera: np.ndarray  # 4x4, camera-frame point -> gantry-frame point
     gantry_anchor_offset_mm: np.ndarray | None = None  # 3-vec, gantry-frame origin offset
     R_gantry_to_slam: np.ndarray | None = None  # 3x3, gantry frame -> SLAM world frame (default identity)
+    gantry_to_slam_scale: float = 1.0  # uniform Sim(3) scale applied after R (default 1.0 = none)
 
 
 def load_fisheye_calibration(path: Path) -> FisheyeCalibration:
@@ -391,9 +392,25 @@ def load_fisheye_calibration(path: Path) -> FisheyeCalibration:
                       file=sys.stderr)
                 R = None
 
+    # Optional gantry_to_slam_scale (uniform Sim(3) scale applied after R). The
+    # rotation alone cannot absorb a metric-scale mismatch between gantry and
+    # SLAM; this scalar carries it (set by tools/refine_R_gantry_to_slam.py).
+    # A malformed / non-positive / non-finite value falls back to 1.0 (no scale).
+    scale = 1.0
+    if data.get("gantry_to_slam_scale") is not None:
+        try:
+            scale = float(data["gantry_to_slam_scale"])
+            if not np.isfinite(scale) or scale <= 0.0:
+                raise ValueError
+        except (ValueError, TypeError):
+            print(f"[calib] gantry_to_slam_scale malformed in {path}; using 1.0.",
+                  file=sys.stderr)
+            scale = 1.0
+
     return FisheyeCalibration(
         K=K, D=D, image_size=(w, h), T_gantry_camera=T,
         gantry_anchor_offset_mm=offset, R_gantry_to_slam=R,
+        gantry_to_slam_scale=scale,
     )
 
 

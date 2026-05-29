@@ -2591,6 +2591,7 @@ def write_interactive_trajectory_html(
         R = getattr(fisheye_calib, "R_gantry_to_slam", None)
         T_gc = getattr(fisheye_calib, "T_gantry_camera", None)
         offset = getattr(fisheye_calib, "gantry_anchor_offset_mm", None)
+        scale = float(getattr(fisheye_calib, "gantry_to_slam_scale", 1.0) or 1.0)
         cam_csv = output_dir / "camera_trajectory.csv"
         tag_csv = output_dir / "tag_poses.csv"
         return write_experiment_dashboard_html(
@@ -2603,6 +2604,7 @@ def write_interactive_trajectory_html(
             T_gantry_camera=T_gc,
             gantry_anchor_offset_mm=(list(offset) if offset is not None else None),
             R_gantry_to_slam=R,
+            gantry_to_slam_scale=scale,
             run_name=str(output_dir.name),
             rms_summary=rms_summary,
             tag_size_m=tag_size_m,
@@ -6251,6 +6253,7 @@ def write_experiment_dashboard_html(
     T_gantry_camera: "np.ndarray | None" = None,
     gantry_anchor_offset_mm: "list[float] | None" = None,
     R_gantry_to_slam: "np.ndarray | None" = None,
+    gantry_to_slam_scale: float = 1.0,
     run_name: str = "",
     rms_summary: dict | None = None,
     zed_view_image_paths: "list[Path] | None" = None,
@@ -6348,10 +6351,17 @@ def write_experiment_dashboard_html(
         c_vx = c_vy = c_vz = np.array([])
 
     # ── gantry → SLAM frame transform: rotate by R_gantry_to_slam (default
-    #    identity), subtract gantry_anchor_offset_mm. Positions get R+offset;
-    #    velocities get R only (no translation). See transform_gantry_to_slam.
+    #    identity), apply the uniform gantry_to_slam_scale (default 1.0), subtract
+    #    gantry_anchor_offset_mm. Positions get scale·R+offset; velocities get
+    #    scale·R only (no translation). See transform_gantry_to_slam.
     R3 = np.asarray(R_gantry_to_slam, dtype=np.float64).reshape(3, 3) \
         if R_gantry_to_slam is not None else np.eye(3)
+    try:
+        s_gs = float(gantry_to_slam_scale)
+        if not np.isfinite(s_gs) or s_gs <= 0.0:
+            s_gs = 1.0
+    except (TypeError, ValueError):
+        s_gs = 1.0
     if gantry_anchor_offset_mm is not None and len(gantry_anchor_offset_mm) >= 3:
         off3 = np.array([float(gantry_anchor_offset_mm[0]),
                          float(gantry_anchor_offset_mm[1]),
@@ -6361,12 +6371,12 @@ def write_experiment_dashboard_html(
 
     if len(g_rows):
         P = np.stack([g_x, g_y, g_z], axis=1)              # mm, gantry frame
-        P_slam_mm = (R3 @ (P - off3).T).T                  # mm, SLAM orientation
+        P_slam_mm = s_gs * (R3 @ (P - off3).T).T           # mm, SLAM orientation+scale
         g_xa = P_slam_mm[:, 0] / 1000.0
         g_ya = P_slam_mm[:, 1] / 1000.0
         g_za = P_slam_mm[:, 2] / 1000.0
         V = np.stack([g_vx, g_vy, g_vz], axis=1)           # mm/s, gantry frame
-        V_slam = (R3 @ V.T).T                              # mm/s, SLAM orientation
+        V_slam = s_gs * (R3 @ V.T).T                       # mm/s, SLAM orientation+scale
         g_vx, g_vy, g_vz = V_slam[:, 0], V_slam[:, 1], V_slam[:, 2]
         # Issue #2: trace the velocity transform + flag frame/transpose problems.
         _dash_velocity_diagnostics(
