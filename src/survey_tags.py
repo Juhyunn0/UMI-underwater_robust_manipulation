@@ -610,9 +610,60 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="AprilTag family, for --use-frames detection.")
     p.add_argument("--floor-coplanar", action="store_true",
                    help="Add a soft Z=0 co-planarity prior on every tag.")
+    p.add_argument("--exclude-tags", default="",
+                   help="Comma-separated tag IDs to drop entirely (e.g. duplicated "
+                        "IDs that warp the map): --exclude-tags 64,65,68,69")
     p.add_argument("--no-plot", action="store_true",
                    help="Skip the tag_map_layout.png plot.")
     return p.parse_args(argv)
+
+
+def _parse_id_list(text: str) -> set:
+    out = set()
+    for tok in str(text or "").replace(";", ",").split(","):
+        tok = tok.strip()
+        if tok:
+            try:
+                out.add(int(tok))
+            except ValueError:
+                pass
+    return out
+
+
+def detect_duplicate_ids(observations, dist_gap_m: float = 0.10):
+    """Heuristic scan for physically duplicated tag IDs (two tags share one ID).
+
+    Inter-tag distances are rigid-scene invariants, so for a normal pair the
+    per-frame distance barely moves. If one tag of a pair is a duplicate, its
+    distance to a fixed neighbor is bimodal (instance-A vs instance-B), giving a
+    large range. A duplicate shows this against MANY neighbors, so we flag tag IDs
+    with >= 2 high-range neighbors. Meaningful only when ``observations`` carry the
+    raw per-frame camera_T_tag (i.e. --use-frames); CSV-reconstructed observations
+    collapse to a single pose per tag and produce no spread.
+
+    Returns {tag_id: n_inconsistent_neighbors}, descending.
+    """
+    from collections import defaultdict
+    frames: dict = defaultdict(dict)
+    for frame, tag_id, cTt in observations:
+        frames[frame][tag_id] = pose_translation_np(cTt)
+    pair_dists: dict = defaultdict(list)
+    for tags in frames.values():
+        ids = sorted(tags)
+        for a in range(len(ids)):
+            for b in range(a + 1, len(ids)):
+                i, j = ids[a], ids[b]
+                pair_dists[(i, j)].append(
+                    float(np.linalg.norm(tags[i] - tags[j])))
+    bad_neighbors: dict = defaultdict(set)
+    for (i, j), ds in pair_dists.items():
+        if len(ds) < 3:
+            continue
+        if (max(ds) - min(ds)) > dist_gap_m:
+            bad_neighbors[i].add(j)
+            bad_neighbors[j].add(i)
+    suspects = {tid: len(nb) for tid, nb in bad_neighbors.items() if len(nb) >= 2}
+    return dict(sorted(suspects.items(), key=lambda kv: -kv[1]))
 
 
 def main(argv=None) -> int:
@@ -675,6 +726,33 @@ def main(argv=None) -> int:
     if not observations:
         _log("error: no tag observations could be built from this recording")
         return EXIT_USAGE
+
+    # ── duplicate-ID scan + blacklist ─────────────────────────────────────────
+    # Two physical tags sharing one ID give a single landmark L(id) two locations,
+    # which warps the whole map. Report suspects (best signal with --use-frames),
+    # then drop any user-blacklisted IDs entirely.
+    suspects = detect_duplicate_ids(observations)
+    if suspects:
+        _log("[survey] WARNING: possible DUPLICATE tag IDs (inconsistent inter-tag "
+             "geometry — two physical tags may share an ID): "
+             + ", ".join(f"{tid} ({n} bad neighbors)" for tid, n in suspects.items()))
+        _log("[survey]          re-run with --exclude-tags <ids> to drop them, "
+             "or fix the physical tags.")
+    exclude_ids = _parse_id_list(args.exclude_tags)
+    if exclude_ids:
+        before = len(observations)
+        observations = [(f, t, c) for (f, t, c) in observations if t not in exclude_ids]
+        for t in exclude_ids:
+            tag_init.pop(t, None)
+        if anchor_id in exclude_ids:
+            _log(f"error: anchor tag {anchor_id} is in --exclude-tags; choose a "
+                 "different --anchor-tag-id")
+            return EXIT_USAGE
+        _log(f"[survey] excluded tag IDs {sorted(exclude_ids)}: dropped "
+             f"{before - len(observations)} observations")
+        if not observations:
+            _log("error: no observations left after --exclude-tags")
+            return EXIT_USAGE
 
     # ── reframe so anchor starts at identity, then optimize ───────────────────
     anchor_init = tag_init.get(anchor_id, Pose3())

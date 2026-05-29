@@ -106,6 +106,31 @@ WINDOW_NAME = "Fisheye+Gantry TagSLAM"
 EMERGENCY_STOP = threading.Event()
 
 
+def _parse_exclude_ids(value) -> set:
+    """Parse args.exclude_tags into a set of ints. Accepts a set/list (from the
+    GUI), a comma/space/semicolon-separated string (from the CLI), or None."""
+    if value is None:
+        return set()
+    if isinstance(value, (set, list, tuple)):
+        return {int(v) for v in value}
+    out: set = set()
+    for tok in str(value).replace(";", ",").replace(" ", ",").split(","):
+        tok = tok.strip()
+        if tok:
+            try:
+                out.add(int(tok))
+            except ValueError:
+                pass
+    return out
+
+
+def _filter_excluded(observations, exclude_ids: set):
+    """Drop observations of blacklisted tag IDs before they reach the backend."""
+    if not exclude_ids:
+        return observations
+    return [o for o in observations if int(o.tag_id) not in exclude_ids]
+
+
 # =============================================================================
 # FisheyeGantryWorker — callable API for ExperimentRunner
 # =============================================================================
@@ -200,6 +225,10 @@ class FisheyeGantryWorker:
         self.backend = backend
         detector = make_detector(args)
         object_points = tag_object_points(args.tag_size)
+        exclude_ids = _parse_exclude_ids(getattr(args, "exclude_tags", ""))
+        if exclude_ids:
+            print(f"[exclude] dropping tag IDs {sorted(exclude_ids)} from SLAM "
+                  "(blacklisted — e.g. physically duplicated IDs)", file=sys.stderr)
         refractive_context = None
         if args.water_correction_mode == "refractive":
             refractive_context = RefractiveContext(water_cfg=water_cfg, backend=backend)
@@ -239,6 +268,7 @@ class FisheyeGantryWorker:
                 observations = detect_observations(
                     gray, detector, intrinsics, object_points, args, refractive_context,
                 )
+                observations = _filter_excluded(observations, exclude_ids)
                 update = backend.update(observations)
                 if update.camera_pose is not None:
                     backend_updates += 1
@@ -628,6 +658,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                            "When set, SLAM runs in PnP-only mode: every tag is locked "
                            "to its mapped pose (transformed into the runtime anchor "
                            "frame) and the live bootstrap is skipped.")
+    slam.add_argument("--exclude-tags", default="",
+                      help="Comma-separated tag IDs to drop before SLAM (e.g. physically "
+                           "duplicated IDs that warp the map): --exclude-tags 64,65,68,69. "
+                           "Applied in both PnP-only and bootstrap modes.")
     slam.add_argument("--max-tag-id", type=int, default=-1)
     slam.add_argument("--water-scale", type=float, default=3.6)
     slam.add_argument("--water-correction-mode",
@@ -953,6 +987,10 @@ def main(argv: list[str] | None = None) -> int:
     # Backend, detector.
     backend = TagSlamBackend(args)
     detector = make_detector(args)
+    exclude_ids = _parse_exclude_ids(getattr(args, "exclude_tags", ""))
+    if exclude_ids:
+        print(f"[exclude] dropping tag IDs {sorted(exclude_ids)} from SLAM "
+              "(blacklisted — e.g. physically duplicated IDs)", file=sys.stderr)
     object_points = tag_object_points(args.tag_size)
     refractive_context: RefractiveContext | None = None
     if args.water_correction_mode == "refractive":
@@ -1023,6 +1061,7 @@ def main(argv: list[str] | None = None) -> int:
             observations = detect_observations(
                 gray, detector, intrinsics, object_points, args, refractive_context,
             )
+            observations = _filter_excluded(observations, exclude_ids)
             update = backend.update(observations)
 
             # FPS.

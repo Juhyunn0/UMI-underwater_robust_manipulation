@@ -1,168 +1,253 @@
-anchor_tag_id: 47
+anchor_tag_id: 25
 
 tags:
-  47:
-    position_m: [0.000000, -0.000000, -0.000000]
-    quaternion_wxyz: [1.000000, 0.000000, 0.000000, 0.000000]
-    n_observations: 489
-    uncertainty_mm: 0.0
-  8:
-    position_m: [0.242041, -0.400885, -0.013588]
-    quaternion_wxyz: [0.999459, -0.030500, 0.012272, -0.000282]
-    n_observations: 180
-    uncertainty_mm: 8.0
-  9:
-    position_m: [0.123754, -0.362006, -0.010991]
-    quaternion_wxyz: [0.999718, -0.019931, 0.010319, -0.007774]
-    n_observations: 215
-    uncertainty_mm: 7.4
-  24:
-    position_m: [0.001165, -0.425343, -0.013615]
-    quaternion_wxyz: [0.030005, 0.004787, 0.029361, 0.999107]
-    n_observations: 361
-    uncertainty_mm: 6.9
   25:
-    position_m: [0.029160, -0.404591, -0.014518]
-    quaternion_wxyz: [0.026505, 0.002986, 0.017485, 0.999491]
-    n_observations: 239
-    uncertainty_mm: 7.2
-  26:
-    position_m: [-0.291388, -0.526120, -0.007109]
-    quaternion_wxyz: [0.028773, 0.000779, 0.016316, 0.999453]
-    n_observations: 353
-    uncertainty_mm: 7.3
-  27:
-    position_m: [-0.280021, -0.562589, -0.006863]
-    quaternion_wxyz: [0.027839, -0.001835, 0.012733, 0.999530]
-    n_observations: 357
-    uncertainty_mm: 7.4
-  36:
-    position_m: [0.276620, -0.000328, 0.002608]
-    quaternion_wxyz: [0.000381, 0.006009, -0.002155, 0.999980]
-    n_observations: 339
-    uncertainty_mm: 5.0
-  37:
-    position_m: [0.275238, -0.208891, 0.000488]
-    quaternion_wxyz: [0.003218, 0.000955, -0.001331, 0.999993]
-    n_observations: 343
-    uncertainty_mm: 5.7
-  46:
-    position_m: [-0.002182, -0.205337, -0.004447]
-    quaternion_wxyz: [0.999985, 0.003622, 0.003204, -0.002586]
-    n_observations: 509
-    uncertainty_mm: 4.8
-  60:
-    position_m: [0.144317, -0.795534, -0.001423]
-    quaternion_wxyz: [0.032689, -0.006341, 0.036085, 0.998794]
-    n_observations: 283
-    uncertainty_mm: 11.0
-  61:
-    position_m: [0.130196, -1.009333, 0.011258]
-    quaternion_wxyz: [0.031642, -0.004901, 0.034736, 0.998883]
-    n_observations: 230
-    uncertainty_mm: 12.7
-  64:
-    position_m: [0.161443, -0.455000, -0.000240]
-    quaternion_wxyz: [0.008263, 0.000037, 0.016736, 0.999826]
-    n_observations: 489
-    uncertainty_mm: 6.3
-  65:
-    position_m: [0.212061, -0.508595, -0.002025]
-    quaternion_wxyz: [0.030171, -0.001116, 0.021724, 0.999308]
-    n_observations: 299
-    uncertainty_mm: 7.4
-  66:
-    position_m: [-0.004570, -0.383541, -0.011540]
-    quaternion_wxyz: [0.999398, -0.019768, 0.005057, -0.028047]
-    n_observations: 364
-    uncertainty_mm: 6.7
-  67:
-    position_m: [-0.009465, -0.372852, -0.006863]
-    quaternion_wxyz: [0.999790, -0.013453, 0.001368, -0.015405]
-    n_observations: 398
-    uncertainty_mm: 5.9
-  68:
-    position_m: [-0.227998, -0.528450, -0.002686]
-    quaternion_wxyz: [0.999804, -0.016850, -0.002426, -0.010153]
-    n_observations: 597
-    uncertainty_mm: 6.3
-  69:
-    position_m: [-0.270716, -0.452087, -0.004715]
-    quaternion_wxyz: [0.999889, -0.011779, 0.000123, -0.009152]
-    n_observations: 702
+    position_m: [-0.000000, -0.000000, -0.000000]
+    quaternion_wxyz: [1.000000, -0.000000, 0.000000, 0.000000]
+    n_observations: 397
+    uncertainty_mm: 0.0
+  4:
+    position_m: [-0.518370, -0.645682, -0.007816]
+    quaternion_wxyz: [0.998420, -0.012234, -0.054565, 0.005554]
+    n_observations: 183
+    uncertainty_mm: 10.6
+  5:
+    position_m: [-0.519821, -0.431181, -0.004482]
+    quaternion_wxyz: [0.998863, -0.008025, -0.046846, 0.003579]
+    n_observations: 82
+    uncertainty_mm: 10.7
+  6:
+    position_m: [0.231157, 1.697755, 0.002897]
+    quaternion_wxyz: [-0.010077, 0.011220, 0.009536, 0.999841]
+    n_observations: 203
+    uncertainty_mm: 15.8
+  7:
+    position_m: [0.234225, 1.484206, -0.004560]
+    quaternion_wxyz: [-0.008158, 0.026321, -0.005845, 0.999603]
+    n_observations: 140
+    uncertainty_mm: 14.5
+  8:
+    position_m: [-0.004907, 0.413668, -0.003313]
+    quaternion_wxyz: [-0.004436, 0.000880, 0.000870, 0.999989]
+    n_observations: 1459
     uncertainty_mm: 5.5
-  70:
-    position_m: [0.280590, -0.423646, -0.006983]
-    quaternion_wxyz: [0.030983, 0.002575, 0.022176, 0.999271]
-    n_observations: 295
-    uncertainty_mm: 7.7
-  71:
-    position_m: [0.310789, -0.394295, -0.009391]
-    quaternion_wxyz: [0.027999, 0.007061, 0.010638, 0.999526]
-    n_observations: 188
-    uncertainty_mm: 8.1
-  78:
-    position_m: [-0.278160, 0.006779, -0.002001]
-    quaternion_wxyz: [-0.001069, 0.010607, -0.014361, 0.999840]
-    n_observations: 331
+  9:
+    position_m: [-0.003302, 0.199453, -0.001129]
+    quaternion_wxyz: [-0.002982, -0.000898, 0.009762, 0.999947]
+    n_observations: 1146
     uncertainty_mm: 5.0
+  24:
+    position_m: [-0.000401, -0.215044, -0.001531]
+    quaternion_wxyz: [0.999996, -0.002507, -0.001484, -0.000687]
+    n_observations: 508
+    uncertainty_mm: 5.1
+  26:
+    position_m: [0.277389, -0.222355, -0.000343]
+    quaternion_wxyz: [0.999937, -0.010894, -0.002517, 0.000079]
+    n_observations: 349
+    uncertainty_mm: 6.4
+  27:
+    position_m: [0.277801, -0.006984, -0.002071]
+    quaternion_wxyz: [0.999938, -0.010102, 0.004636, -0.000102]
+    n_observations: 283
+    uncertainty_mm: 5.6
+  37:
+    position_m: [-0.280353, -0.858953, 0.007294]
+    quaternion_wxyz: [0.999026, -0.040333, -0.017739, -0.002283]
+    n_observations: 243
+    uncertainty_mm: 10.4
+  46:
+    position_m: [-0.005384, -0.860642, 0.010566]
+    quaternion_wxyz: [0.000523, -0.016171, 0.047228, 0.998753]
+    n_observations: 289
+    uncertainty_mm: 10.5
+  60:
+    position_m: [0.247246, 1.058001, -0.006010]
+    quaternion_wxyz: [0.999631, 0.016278, 0.014197, 0.016482]
+    n_observations: 360
+    uncertainty_mm: 10.6
+  61:
+    position_m: [0.239962, 1.272928, -0.004175]
+    quaternion_wxyz: [0.999666, 0.016579, 0.010493, 0.016843]
+    n_observations: 485
+    uncertainty_mm: 11.8
+  66:
+    position_m: [-0.003231, -0.431836, -0.002224]
+    quaternion_wxyz: [0.000413, -0.008570, 0.013916, 0.999866]
+    n_observations: 617
+    uncertainty_mm: 6.6
+  67:
+    position_m: [-0.003548, -0.646827, -0.002195]
+    quaternion_wxyz: [0.001712, -0.010581, 0.028618, 0.999533]
+    n_observations: 724
+    uncertainty_mm: 8.2
+  70:
+    position_m: [-0.278231, -0.214568, 0.003393]
+    quaternion_wxyz: [0.999963, -0.002414, -0.008147, -0.001407]
+    n_observations: 362
+    uncertainty_mm: 5.2
+  71:
+    position_m: [-0.277614, -0.000335, 0.002946]
+    quaternion_wxyz: [0.999860, -0.013458, -0.009977, -0.000570]
+    n_observations: 788
+    uncertainty_mm: 4.8
   79:
-    position_m: [-0.278410, -0.207779, -0.002826]
-    quaternion_wxyz: [-0.001260, 0.003588, -0.009687, 0.999946]
-    n_observations: 556
-    uncertainty_mm: 4.3
+    position_m: [0.275215, -0.867006, 0.009540]
+    quaternion_wxyz: [0.998548, -0.049726, -0.020674, -0.001293]
+    n_observations: 97
+    uncertainty_mm: 12.6
+  86:
+    position_m: [0.554178, -0.443875, -0.002463]
+    quaternion_wxyz: [0.001878, -0.016380, 0.020247, 0.999659]
+    n_observations: 120
+    uncertainty_mm: 12.4
+  87:
+    position_m: [0.552601, -0.657958, 0.004991]
+    quaternion_wxyz: [0.003051, -0.019841, 0.038401, 0.999061]
+    n_observations: 132
+    uncertainty_mm: 12.5
   110:
-    position_m: [0.670010, -0.841839, 0.004974]
-    quaternion_wxyz: [0.038506, -0.004142, 0.028958, 0.998830]
-    n_observations: 228
-    uncertainty_mm: 12.9
+    position_m: [-0.281426, 1.052957, 0.000734]
+    quaternion_wxyz: [0.999919, 0.008126, 0.002954, 0.009342]
+    n_observations: 533
+    uncertainty_mm: 10.1
+  111:
+    position_m: [-0.285092, 1.267150, 0.002676]
+    quaternion_wxyz: [0.999813, 0.012989, 0.011164, 0.008927]
+    n_observations: 422
+    uncertainty_mm: 11.7
   114:
-    position_m: [0.670943, -0.454911, -0.000484]
-    quaternion_wxyz: [0.022804, 0.012606, 0.023774, 0.999378]
-    n_observations: 92
-    uncertainty_mm: 11.1
+    position_m: [-0.277827, 0.625382, -0.000517]
+    quaternion_wxyz: [0.999889, 0.005951, -0.008434, 0.010705]
+    n_observations: 524
+    uncertainty_mm: 7.2
   115:
-    position_m: [0.693424, -0.629055, -0.001746]
-    quaternion_wxyz: [0.037810, 0.002808, 0.033329, 0.998725]
-    n_observations: 282
-    uncertainty_mm: 12.0
-  131:
-    position_m: [0.399672, -0.818708, 0.000875]
-    quaternion_wxyz: [0.998817, -0.034624, 0.002854, -0.034010]
-    n_observations: 256
-    uncertainty_mm: 11.5
-  136:
-    position_m: [0.421261, -0.321029, -0.009286]
-    quaternion_wxyz: [0.012088, 0.011529, 0.019374, 0.999673]
-    n_observations: 172
-    uncertainty_mm: 8.4
-  137:
-    position_m: [0.528879, -0.389208, -0.010602]
-    quaternion_wxyz: [0.005946, 0.015693, 0.026953, 0.999496]
-    n_observations: 163
-    uncertainty_mm: 9.0
-  140:
-    position_m: [0.413720, -0.609605, -0.008217]
-    quaternion_wxyz: [0.998804, -0.024462, 0.003515, -0.042183]
+    position_m: [-0.282920, 0.839377, 0.000190]
+    quaternion_wxyz: [0.999889, 0.010092, -0.001589, 0.010830]
+    n_observations: 495
+    uncertainty_mm: 8.9
+  124:
+    position_m: [-0.027437, 1.902769, 0.004579]
+    quaternion_wxyz: [0.999531, 0.010526, 0.014818, 0.024640]
+    n_observations: 32
+    uncertainty_mm: 20.2
+  126:
+    position_m: [-0.022636, 1.702069, 0.005343]
+    quaternion_wxyz: [-0.015595, 0.017821, -0.027778, 0.999334]
     n_observations: 309
-    uncertainty_mm: 10.3
+    uncertainty_mm: 15.2
+  127:
+    position_m: [-0.016660, 1.487980, -0.000955]
+    quaternion_wxyz: [-0.013938, 0.008587, -0.022965, 0.999602]
+    n_observations: 559
+    uncertainty_mm: 13.1
+  129:
+    position_m: [0.226507, 1.912293, 0.007847]
+    quaternion_wxyz: [-0.018758, 0.016910, -0.018530, 0.999509]
+    n_observations: 153
+    uncertainty_mm: 17.8
+  130:
+    position_m: [-0.015619, 1.271950, -0.001489]
+    quaternion_wxyz: [-0.015730, -0.000021, -0.020676, 0.999662]
+    n_observations: 555
+    uncertainty_mm: 11.4
+  131:
+    position_m: [-0.009222, 1.057413, -0.004440]
+    quaternion_wxyz: [-0.014553, 0.002506, -0.005852, 0.999874]
+    n_observations: 582
+    uncertainty_mm: 9.9
+  134:
+    position_m: [-0.523247, 1.042761, -0.001972]
+    quaternion_wxyz: [0.999597, 0.002252, -0.026691, 0.009403]
+    n_observations: 176
+    uncertainty_mm: 11.6
+  135:
+    position_m: [-0.527779, 1.256533, 0.000168]
+    quaternion_wxyz: [0.999175, 0.029103, -0.026013, 0.011243]
+    n_observations: 116
+    uncertainty_mm: 13.6
+  136:
+    position_m: [-0.278302, 0.199158, 0.000730]
+    quaternion_wxyz: [0.999940, -0.003817, -0.010063, -0.002078]
+    n_observations: 1335
+    uncertainty_mm: 5.2
+  137:
+    position_m: [-0.277604, 0.413098, -0.001148]
+    quaternion_wxyz: [0.999925, 0.002707, -0.011829, -0.001690]
+    n_observations: 1083
+    uncertainty_mm: 5.9
+  138:
+    position_m: [-0.516754, 0.840220, -0.001771]
+    quaternion_wxyz: [-0.011398, -0.024789, -0.015582, 0.999506]
+    n_observations: 112
+    uncertainty_mm: 11.1
+  139:
+    position_m: [-0.512398, 0.626631, -0.002273]
+    quaternion_wxyz: [-0.009468, -0.026917, -0.007971, 0.999561]
+    n_observations: 75
+    uncertainty_mm: 10.9
+  140:
+    position_m: [-0.004413, 0.843197, -0.004406]
+    quaternion_wxyz: [-0.005654, 0.005767, -0.005750, 0.999951]
+    n_observations: 529
+    uncertainty_mm: 8.4
   141:
-    position_m: [0.357576, -0.475983, -0.003676]
-    quaternion_wxyz: [0.999395, -0.027321, 0.010142, -0.019008]
-    n_observations: 125
-    uncertainty_mm: 9.3
+    position_m: [-0.002313, 0.628018, -0.003303]
+    quaternion_wxyz: [-0.003900, 0.005778, -0.002192, 0.999973]
+    n_observations: 724
+    uncertainty_mm: 6.8
+  142:
+    position_m: [-0.509157, 0.410353, -0.002209]
+    quaternion_wxyz: [0.001382, -0.031064, -0.001549, 0.999515]
+    n_observations: 82
+    uncertainty_mm: 9.9
+  143:
+    position_m: [-0.509654, 0.197250, -0.002548]
+    quaternion_wxyz: [0.004093, -0.040148, 0.011206, 0.999123]
+    n_observations: 57
+    uncertainty_mm: 10.6
+  144:
+    position_m: [-0.538197, 1.684523, 0.003876]
+    quaternion_wxyz: [-0.010694, -0.015962, -0.027525, 0.999436]
+    n_observations: 33
+    uncertainty_mm: 19.3
+  145:
+    position_m: [-0.535591, 1.470357, 0.003910]
+    quaternion_wxyz: [-0.006452, -0.014313, -0.019523, 0.999686]
+    n_observations: 107
+    uncertainty_mm: 15.3
+  146:
+    position_m: [-0.289896, 1.692991, 0.008554]
+    quaternion_wxyz: [-0.011913, 0.011076, -0.029032, 0.999446]
+    n_observations: 199
+    uncertainty_mm: 15.6
+  147:
+    position_m: [-0.286181, 1.478839, 0.003434]
+    quaternion_wxyz: [-0.010463, 0.005291, -0.026533, 0.999579]
+    n_observations: 373
+    uncertainty_mm: 13.6
+  148:
+    position_m: [-0.517039, -0.005323, -0.001800]
+    quaternion_wxyz: [0.001935, -0.042416, 0.007256, 0.999072]
+    n_observations: 74
+    uncertainty_mm: 9.1
+  149:
+    position_m: [-0.518234, -0.218484, -0.001942]
+    quaternion_wxyz: [0.005015, -0.044624, 0.005215, 0.998978]
+    n_observations: 47
+    uncertainty_mm: 11.2
 
 metadata:
-  source: "/home/bdml/Desktop/umi_underwater_robust_control/data/20260528/20260528_173823_survey"
+  source: "/home/bdml/Desktop/umi_underwater_robust_control/data/20260528/20260528_202333_survey"
   used_frames_redetection: false
-  n_frames_processed: 1867
-  n_tags_qualified: 30
+  n_frames_processed: 4266
+  n_tags_qualified: 47
   n_tags_dropped: 0
   min_observations: 10
-  optimizer_iterations: 6
-  initial_error: 133902
-  final_error: 26092.4
+  optimizer_iterations: 3
+  initial_error: 3388.34
+  final_error: 1165.64
   converged: true
   fisheye_calib_path: "/home/bdml/Desktop/umi_underwater_robust_control/config/fisheye_calibration.yaml"
   tool_version: "survey_tags.py 1.0 (gui)"
-  created_at: "2026-05-29T00:41:29+00:00"
+  created_at: "2026-05-29T03:31:07+00:00"

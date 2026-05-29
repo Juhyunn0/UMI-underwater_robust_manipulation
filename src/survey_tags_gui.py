@@ -48,8 +48,11 @@ from PyQt5.QtWidgets import (
 )
 
 import cv2  # noqa: E402
+import gtsam  # noqa: E402 — periodic batch re-optimization + iSAM2 rebuild
+from gtsam.symbol_shorthand import L, X  # noqa: E402
 
 import survey_tags as st  # noqa: E402 — reuse the CLI's optimize / YAML / plot
+from survey_diagnostics import SurveyDiagnosticsRecorder  # noqa: E402
 from fisheye_camera import FisheyeCameraSession  # noqa: E402
 from fisheye_gantry_tagslam import (  # noqa: E402
     build_fisheye_undistort_maps,
@@ -64,6 +67,7 @@ from tagslam_core import (  # noqa: E402
     parse_simple_yaml,
     pose_rpy,
     pose_translation,
+    set_isam2_param,
     tag_object_points,
 )
 
@@ -115,6 +119,40 @@ TRAIL_LENGTH = 500
 UI_UPDATE_HZ = 5.0
 DEFAULT_WINDOW_SIZE = (1500, 950)
 MIN_WINDOW_SIZE = (1300, 800)
+
+# Periodic batch re-optimization (drift fix). Between frame processing the worker
+# re-balances the whole graph with Levenberg-Marquardt so well-observed early tags
+# can't lock in and warp the map as the camera travels away from the anchor.
+PERIODIC_BATCH_INTERVAL_FRAMES = 200
+PERIODIC_BATCH_INTERVAL_S = 30.0
+PERIODIC_BATCH_MIN_SHIFT_MM_TO_REBUILD = 5.0   # rebuild iSAM2 only if it actually moved tags
+PERIODIC_BATCH_MAX_ITERATIONS = 50
+PERIODIC_BATCH_REL_ERROR_TOL = 1e-5
+
+# Duplicate-tag guard. If two physical tags share one AprilTag ID, the backend has
+# a single landmark L(id) but two real locations, so every frame drags L(id)
+# between them and warps the whole rigid graph (residuals can stay low per-frame).
+# Detection is pose-independent: inter-tag DISTANCES are invariant for a rigid
+# scene, so a duplicate's observed distance to its established neighbors stops
+# matching the map. A tag that disagrees with the majority of its co-observed,
+# already-mapped neighbors over several frames is flagged + auto-excluded.
+DUPLICATE_DIST_ABS_TOL_M = 0.05         # base tolerance on one inter-tag distance
+DUPLICATE_DIST_REL_TOL = 0.05           # + 5 % of that distance
+DUPLICATE_MIN_NEIGHBORS = 3             # need >=3 established co-observed tags to vote
+DUPLICATE_INCONSISTENT_FRAC = 0.5       # tag disagrees with > this fraction of them
+DUPLICATE_CONFIRM_HITS = 5              # this many inconsistent frames -> confirmed
+
+# Loop-closure analysis (revisit detection + a non-blocking "go back" hint).
+LOOP_CLOSURE_REVISIT_DISTANCE_M = 0.30
+LOOP_CLOSURE_MIN_AGE_S = 30.0
+LOOP_HINT_IDLE_S = 60.0          # no revisit within this long -> suggest closing a loop
+LOOP_HINT_REEMIT_S = 30.0        # re-surface the (dismissible) hint this often while idle
+
+# Diagnostic recording cadence (see survey_diagnostics.py).
+DIAGNOSTICS_FLUSH_INTERVAL_S = 1.0
+SNAPSHOT_INTERVAL_S = 30.0
+TAG_HISTORY_OBSERVATION_LOG_EVERY_NTH = 50
+SLAM_INTERNALS_SAMPLE_EVERY_NTH_FRAME = 60
 
 ANCHOR_TIMEOUT_S = 30.0
 _STATE_FILE = Path.home() / ".umi_gui_state.json"
@@ -254,10 +292,15 @@ class DetectionSlamWorker(QThread):
     anchor_selected = pyqtSignal(int, int)              # (tag_id, frame_idx)
     error = pyqtSignal(str)
     camera_position = pyqtSignal(object)                # (x,y,z) m or None
+    batch_completed = pyqtSignal(object)                # BatchEvent dict (periodic re-opt)
+    loop_hint = pyqtSignal(bool)                        # show/hide the revisit hint
+    duplicate_detected = pyqtSignal(int, int)           # (tag_id, frame_idx) — duplicate ID
 
     def __init__(self, frame_queue: Queue, calib, anchor_mode,
                  tag_size: float, tag_family: str, run_dir: Path,
-                 telemetry_logger=None, parent: QObject | None = None) -> None:
+                 telemetry_logger=None, t0_monotonic: float | None = None,
+                 diagnostics=None, exclude_tag_ids=None,
+                 parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._q = frame_queue
         self._calib = calib
@@ -266,6 +309,7 @@ class DetectionSlamWorker(QThread):
         self._tag_family = tag_family
         self._run_dir = run_dir
         self._telemetry = telemetry_logger
+        self._diag = diagnostics  # SurveyDiagnosticsRecorder | None (black-box logging)
 
         self._stop = threading.Event()
         self._paused = threading.Event()
@@ -293,8 +337,15 @@ class DetectionSlamWorker(QThread):
         self._rejected_single = 0                       # frames dropped for < 2 tags
         self._confirm: dict[int, int] = {}              # tag -> #frames seen with >=3 tags (warmup)
         self._suspect: set[int] = set()                 # tags that caused a > 10 mm jump on add
-        self._excluded: set[int] = set()                # tags the user manually excluded
+        # User-blacklisted IDs are pre-excluded so they never enter the graph (live
+        # or batch). Auto-detected duplicate IDs get added here at runtime too.
+        self._excluded: set[int] = set(int(t) for t in (exclude_tag_ids or set()))
+        self._blacklist: set[int] = set(self._excluded)  # the static, user-supplied set
         self._excl_lock = threading.Lock()
+
+        # duplicate-ID guard state
+        self._dup_hits: dict[int, int] = {}             # tag -> #frames inconsistent with neighbors
+        self._duplicate_ids: set[int] = set()           # auto-confirmed duplicate IDs
 
         # metrics / coalescing
         self._frame_idx = -1
@@ -304,10 +355,45 @@ class DetectionSlamWorker(QThread):
         self._last_proc_t = 0.0
         self._last_emit_t = 0.0
         self._last_residual_px = float("nan")
-        self._t0 = time.monotonic()
+        self._worst_residual_px = float("nan")
+        self._last_jump_residual_mm = 0.0
+        self._last_actual_jump_mm = 0.0
+        self._t0 = time.monotonic() if t0_monotonic is None else float(t0_monotonic)
         self._cam_csv_fh = None
         self._cam_csv_writer = None
         self._last_fps = 0
+        self._last_backend_ms = 0.0
+        self._anchor_observed = False
+
+        # periodic-batch drift fix
+        self._frames_since_batch = 0
+        self._t_last_batch = self._t0
+        self._batch_max_iters = PERIODIC_BATCH_MAX_ITERATIONS
+        self._n_batch_events = 0
+        self._n_isam_rebuilds = 0
+        self._last_batch_info = None
+
+        # loop-closure tracking (downsampled camera history with co-visible tags)
+        self._cam_hist: list[tuple] = []     # (elapsed_s, x, y, z, frozenset(tag_ids))
+        self._last_cam_hist_t = -1.0
+        self._last_near_old_t = 0.0
+        self._last_revisit_log_t = -1e9
+        self._loop_hint_active = False
+        self._last_hint_emit_t = -1e9
+
+        # iSAM2 health sampling (rolling per-update wallclock for p50/p95)
+        self._isam_ms_window: list[float] = []
+        self._relin_count = 0
+
+        # tag-event bookkeeping for tag_history.csv
+        self._tag_first_seen: dict[int, float] = {}
+        self._tag_promoted: dict[int, float] = {}
+        self._tag_last_logged_pos: dict[int, np.ndarray] = {}
+        self._tag_obs_logged: dict[int, int] = {}
+        self._suspect_logged: set[int] = set()
+        self._excluded_logged: set[int] = set()
+        self._anchor_t0_pose = None          # anchor Pose3 at first optimized frame
+        self._t_last_snapshot = -1e9
 
     # — control —
     def set_paused(self, paused: bool) -> None:
@@ -326,9 +412,18 @@ class DetectionSlamWorker(QThread):
         with self._excl_lock:
             if tag_id in self._excluded:
                 self._excluded.discard(tag_id)
-                return False
-            self._excluded.add(tag_id)
-            return True
+                state = False
+            else:
+                self._excluded.add(tag_id)
+                state = True
+        if self._diag:
+            poses = self.backend.optimized_tag_poses() if self.backend else {}
+            counts = self.backend.tag_observation_counts if self.backend else {}
+            self._diag.log_tag_event("excluded" if state else "suspect_cleared",
+                                     int(tag_id), time.monotonic(), self._frame_idx,
+                                     pose=poses.get(int(tag_id)),
+                                     n_obs=int(counts.get(int(tag_id), 0)))
+        return state
 
     def stop(self) -> None:
         self._stop.set()
@@ -408,12 +503,287 @@ class DetectionSlamWorker(QThread):
             self._last_proc_t = t_mono
             try:
                 self._process(frame, t_mono)
+                if self.backend is not None and not self._paused.is_set():
+                    self._maybe_periodic_batch(t_mono)
             except Exception as exc:  # never let the worker die silently
                 print(f"[survey-gui] detection/SLAM error: {exc}", file=sys.stderr)
         if self._rejected_single:
             print(f"[survey] rejected {self._rejected_single} single-tag frames "
                   "(no triangulation constraint)", file=sys.stderr)
+        self._write_final_diagnostics()
         self._close_csv()
+
+    # — periodic batch re-optimization (drift fix) ——————————————————————————————
+    def _maybe_periodic_batch(self, t_mono: float) -> None:
+        due_frames = self._frames_since_batch >= PERIODIC_BATCH_INTERVAL_FRAMES
+        due_time = (t_mono - self._t_last_batch) >= PERIODIC_BATCH_INTERVAL_S
+        if not (due_frames or due_time):
+            return
+        if len(self.backend.initialized_tag_ids) < 2:
+            self._frames_since_batch = 0
+            self._t_last_batch = t_mono
+            return
+        self._run_periodic_batch("frame_count" if due_frames else "time", t_mono)
+
+    def _run_periodic_batch(self, reason: str, t_mono: float) -> None:
+        t_start = time.monotonic()
+        graph = self.backend.graph
+        init = self.backend.current_estimate
+        params = gtsam.LevenbergMarquardtParams()
+        params.setMaxIterations(int(self._batch_max_iters))
+        params.setRelativeErrorTol(PERIODIC_BATCH_REL_ERROR_TOL)
+        optimizer = gtsam.LevenbergMarquardtOptimizer(graph, init, params)
+        e0 = float(graph.error(init))
+        result = optimizer.optimize()
+        e1 = float(graph.error(result))
+        try:
+            iters = int(optimizer.iterations())
+        except Exception:
+            iters = -1
+
+        shift_by_id: dict[int, float] = {}
+        new_pose_by_id: dict[int, object] = {}
+        anchor_drift_mm = 0.0
+        for tid in list(self.backend.initialized_tag_ids):
+            tid = int(tid)
+            key = L(tid)
+            try:
+                old = np.asarray(init.atPose3(key).translation(), dtype=np.float64)
+                new_pose = result.atPose3(key)
+                new = np.asarray(new_pose.translation(), dtype=np.float64)
+            except Exception:
+                continue
+            d = float(np.linalg.norm(new - old)) * 1000.0
+            shift_by_id[tid] = d
+            new_pose_by_id[tid] = new_pose
+            if tid == self.anchor_tag_id:
+                anchor_drift_mm = float(np.linalg.norm(new)) * 1000.0
+        shifts = list(shift_by_id.values())
+        n_shifted = sum(1 for d in shifts if d > 1.0)
+        max_shift = max(shifts) if shifts else 0.0
+        median_shift = float(np.median(shifts)) if shifts else 0.0
+
+        rebuilt = False
+        if max_shift >= PERIODIC_BATCH_MIN_SHIFT_MM_TO_REBUILD:
+            p = gtsam.ISAM2Params()
+            set_isam2_param(p, "setRelinearizeThreshold", "relinearizeThreshold", 0.001)
+            set_isam2_param(p, "setRelinearizeSkip", "relinearizeSkip", 1)
+            new_isam = gtsam.ISAM2(p)
+            new_isam.update(graph, result)
+            self.backend.isam = new_isam
+            self.backend.current_estimate = new_isam.calculateEstimate()
+            rebuilt = True
+            self._n_isam_rebuilds += 1
+
+        wall_ms = (time.monotonic() - t_start) * 1000.0
+        mmss = f"{int(t_mono - self._t0) // 60:02d}:{int(t_mono - self._t0) % 60:02d}"
+        if rebuilt:
+            print(f"[periodic-batch] frame={self._frame_idx}, t={mmss}, optimized in "
+                  f"{iters} iterations, max shift {max_shift:.1f} mm, median shift "
+                  f"{median_shift:.1f} mm, iSAM2 rebuilt", file=sys.stderr)
+        else:
+            print(f"[periodic-batch] frame={self._frame_idx}, max shift only "
+                  f"{max_shift:.1f} mm, kept iSAM2 state", file=sys.stderr)
+        if wall_ms > 2000.0:
+            self._batch_max_iters = max(10, self._batch_max_iters // 2)
+            print(f"[periodic-batch] WARNING: took {wall_ms:.0f} ms (>2s); reducing "
+                  f"max iterations to {self._batch_max_iters} for next time",
+                  file=sys.stderr)
+            if self._diag:
+                self._diag.log_warning(f"periodic batch took {wall_ms:.0f} ms")
+
+        self._n_batch_events += 1
+        self._frames_since_batch = 0
+        self._t_last_batch = t_mono
+        ev = {
+            "elapsed_s": t_mono - self._t0,
+            "frame_idx": self._frame_idx,
+            "trigger_reason": reason,
+            "n_tags_in_graph": len(self.backend.initialized_tag_ids),
+            "n_camera_poses_in_graph": int(self.backend.next_camera_index),
+            "batch_iterations": iters,
+            "batch_initial_error": e0,
+            "batch_final_error": e1,
+            "max_tag_shift_mm": max_shift,
+            "median_tag_shift_mm": median_shift,
+            "n_shifted": n_shifted,
+            "isam2_rebuilt": rebuilt,
+            "batch_wallclock_ms": wall_ms,
+            "anchor_drifted_mm": anchor_drift_mm,
+        }
+        self._last_batch_info = ev
+        self.batch_completed.emit(ev)
+        if self._diag:
+            self._diag.log_batch_event(ev)
+            self._log_anchor_stability(t_mono)
+            if rebuilt:
+                counts = self.backend.tag_observation_counts
+                for tid, d in shift_by_id.items():
+                    if d > 1.0:
+                        self._diag.log_tag_event(
+                            "shifted", tid, t_mono, self._frame_idx,
+                            pose=new_pose_by_id.get(tid),
+                            n_obs=int(counts.get(tid, 0)), shift_mm=d)
+
+    # — loop-closure tracking (revisit detection + go-back hint) ————————————————
+    def _update_loop_tracking(self, p: np.ndarray, t_mono: float, obs_used) -> None:
+        elapsed = t_mono - self._t0
+        cur_tags = frozenset(int(o.tag_id) for o in obs_used)
+        if (elapsed - self._last_cam_hist_t) >= 0.5:
+            self._cam_hist.append((elapsed, float(p[0]), float(p[1]), float(p[2]), cur_tags))
+            self._last_cam_hist_t = elapsed
+        near_old = False
+        for (te, x, y, z, old_tags) in self._cam_hist:
+            if (elapsed - te) < LOOP_CLOSURE_MIN_AGE_S:
+                continue
+            d = math.sqrt((p[0] - x) ** 2 + (p[1] - y) ** 2 + (p[2] - z) ** 2)
+            if d <= LOOP_CLOSURE_REVISIT_DISTANCE_M:
+                near_old = True
+                if (elapsed - self._last_revisit_log_t) > 5.0:
+                    self._last_revisit_log_t = elapsed
+                    if self._diag:
+                        self._diag.log_loop_closure(
+                            elapsed, self._frame_idx, revisit_target_t_s=te,
+                            distance_m=d, n_tags_co_observed=len(cur_tags & old_tags))
+                break
+        if near_old:
+            self._last_near_old_t = elapsed
+            if self._loop_hint_active:
+                self._loop_hint_active = False
+                self.loop_hint.emit(False)
+        elif (elapsed - self._last_near_old_t) > LOOP_HINT_IDLE_S:
+            if (elapsed - self._last_hint_emit_t) > LOOP_HINT_REEMIT_S:
+                self._last_hint_emit_t = elapsed
+                self._loop_hint_active = True
+                self.loop_hint.emit(True)
+
+    # — diagnostics helpers (all no-op when self._diag is None) ————————————————
+    def _log_anchor_stability(self, t_mono: float) -> None:
+        if not self._diag or self.backend is None or self.anchor_tag_id is None:
+            return
+        poses = self.backend.optimized_tag_poses()
+        ap = poses.get(self.anchor_tag_id)
+        if ap is None:
+            return
+        if self._anchor_t0_pose is None:
+            self._anchor_t0_pose = ap
+        t = pose_translation(ap)
+        rel = self._anchor_t0_pose.between(ap)
+        drift_mm = float(np.linalg.norm(pose_translation(rel))) * 1000.0
+        rot_deg = float(np.degrees(np.linalg.norm(np.asarray(rel.rotation().rpy(),
+                                                              dtype=np.float64))))
+        self._diag.log_anchor_stability(
+            t_mono - self._t0, int(self.anchor_tag_id),
+            [float(t[0]), float(t[1]), float(t[2])], drift_mm, rot_deg, float("nan"))
+
+    def _maybe_snapshot(self, t_mono: float) -> None:
+        if not self._diag or self.backend is None:
+            return
+        elapsed = t_mono - self._t0
+        if (elapsed - self._t_last_snapshot) < SNAPSHOT_INTERVAL_S:
+            return
+        self._t_last_snapshot = elapsed
+        recent_batch = bool(self._last_batch_info
+                            and (elapsed - self._last_batch_info["elapsed_s"]) <= 5.0)
+        self._diag.log_snapshot(elapsed, self._frame_idx, self.anchor_tag_id,
+                                self._tag_states(), recent_batch)
+
+    def _write_final_diagnostics(self) -> None:
+        if not self._diag or self.backend is None:
+            return
+        try:
+            self._log_anchor_stability(time.monotonic())
+            self._maybe_snapshot(time.monotonic() + SNAPSHOT_INTERVAL_S)  # force one last
+        except Exception as exc:  # pragma: no cover
+            print(f"[survey-gui] final diagnostics failed: {exc}", file=sys.stderr)
+
+    def _note_first_seen(self, obs_list, t_mono: float) -> None:
+        for o in obs_list:
+            tid = int(o.tag_id)
+            if tid not in self._tag_first_seen:
+                self._tag_first_seen[tid] = t_mono - self._t0
+                self._diag.log_tag_event("first_seen", tid, t_mono, self._frame_idx,
+                                         pose=None, n_obs=0)
+
+    def _log_tag_lifecycle(self, obs_used, new_tags, suspect_before, t_mono: float) -> None:
+        counts = self.backend.tag_observation_counts
+        poses = self.backend.optimized_tag_poses()
+        for tid in new_tags:
+            tid = int(tid)
+            self._tag_promoted.setdefault(tid, t_mono - self._t0)
+            self._diag.log_tag_event("promoted", tid, t_mono, self._frame_idx,
+                                     pose=poses.get(tid), n_obs=int(counts.get(tid, 0)))
+        for o in obs_used:
+            tid = int(o.tag_id)
+            n = int(counts.get(tid, 0))
+            if n - self._tag_obs_logged.get(tid, 0) >= TAG_HISTORY_OBSERVATION_LOG_EVERY_NTH:
+                self._tag_obs_logged[tid] = n
+                self._diag.log_tag_event("observation", tid, t_mono, self._frame_idx,
+                                         pose=poses.get(tid), n_obs=n)
+        for tid in (self._suspect - suspect_before):
+            self._diag.log_tag_event("suspect_set", int(tid), t_mono, self._frame_idx,
+                                     pose=poses.get(int(tid)),
+                                     n_obs=int(counts.get(int(tid), 0)))
+
+    def _log_frame_diag(self, tags_detected: int, tags_used: int, t_mono: float,
+                        optimized: bool, p=None, update=None) -> None:
+        if not self._diag:
+            return
+        cam = [float("nan")] * 3
+        quat = [float("nan")] * 4
+        if optimized and update is not None and update.camera_pose is not None:
+            if p is not None:
+                cam = [float(p[0]), float(p[1]), float(p[2])]
+            quat = st._quat_wxyz(update.camera_pose.rotation())
+        gs = self._gantry_sample()
+        gmm = list(gs.pos_mm) if gs is not None else [float("nan")] * 3
+        gvel = list(gs.vel_mm_s) if gs is not None else [float("nan")] * 3
+        tags_in_graph = len(self.backend.optimized_tag_poses()) if self.backend else 0
+        qualified = sum(1 for s in self._tag_states().values()
+                        if s["n_observations"] >= MIN_OBSERVATIONS_PER_TAG)
+        self._diag.log_frame({
+            "elapsed_s": t_mono - self._t0,
+            "frame_idx": self._frame_idx,
+            "state": "SURVEYING",
+            "tags_detected": tags_detected,
+            "tags_used_after_gating": tags_used,
+            "tags_in_graph": tags_in_graph,
+            "qualified_tags": qualified,
+            "single_tag_frames_rejected_total": self._rejected_single,
+            "median_residual_px": self._last_residual_px,
+            "worst_residual_px": self._worst_residual_px,
+            "last_jump_mm": self._last_actual_jump_mm,
+            "last_jump_residual_mm": self._last_jump_residual_mm,
+            "camera": cam,
+            "quat": quat,
+            "anchor_observed_this_frame": self._anchor_observed,
+            "gantry_mm": gmm,
+            "gantry_vel_mm_s": gvel,
+            "in_warmup": (t_mono - self._t0) < WARMUP_DURATION_S,
+            "backend_update_ms": self._last_backend_ms,
+        })
+
+    def _maybe_sample_slam_internals(self, t_mono: float) -> None:
+        if (self._frame_idx % SLAM_INTERNALS_SAMPLE_EVERY_NTH_FRAME) != 0:
+            return
+        w = self._isam_ms_window
+        p50 = float(np.percentile(w, 50)) if w else float("nan")
+        p95 = float(np.percentile(w, 95)) if w else float("nan")
+        n_vars = len(self.backend.initialized_tag_ids) + int(self.backend.next_camera_index)
+        due_in = max(0.0, PERIODIC_BATCH_INTERVAL_S - (t_mono - self._t_last_batch))
+        self._diag.log_slam_internals({
+            "elapsed_s": t_mono - self._t0,
+            "frame_idx": self._frame_idx,
+            "n_variables": n_vars,
+            "n_factors": int(getattr(self.backend, "factor_count", 0)),
+            # GTSAM's Python ISAM2 wrapper doesn't expose a relinearization count;
+            # reported as 0 (best-effort). p50/p95 cover per-update wallclock.
+            "n_relin": self._relin_count,
+            "p50": p50,
+            "p95": p95,
+            "relin_threshold": 0.001,
+            "batch_due_in_s": due_in,
+        })
 
     def _process(self, frame: np.ndarray, t_mono: float) -> None:
         self._ensure_pipeline(frame)
@@ -426,6 +796,10 @@ class DetectionSlamWorker(QThread):
         n_simul = len(obs_list)
         if n_simul >= 2:
             self._frames_with_2tags += 1
+        self._anchor_observed = (self.anchor_tag_id is not None
+                                 and any(int(o.tag_id) == self.anchor_tag_id for o in obs_list))
+        if self._diag:
+            self._note_first_seen(obs_list, t_mono)
 
         # Backend creation deferred until the anchor is known (auto = nearest the
         # image center on the first frame with any detection).
@@ -437,6 +811,7 @@ class DetectionSlamWorker(QThread):
                     self.error.emit(f"No usable anchor tag ({mode}) within "
                                     f"{ANCHOR_TIMEOUT_S:.0f}s — aborting survey.")
                     self._stop.set()
+                self._log_frame_diag(n_simul, 0, t_mono, optimized=False)
                 self._emit_overlay(und, obs_list, t_mono)
                 return
             self.anchor_tag_id = anchor
@@ -449,6 +824,7 @@ class DetectionSlamWorker(QThread):
         if n_simul < MIN_SIMULTANEOUS_TAGS:
             if n_simul == 1:
                 self._rejected_single += 1
+            self._log_frame_diag(n_simul, 0, t_mono, optimized=False)
             self._emit_overlay(und, obs_list, t_mono)
             return
 
@@ -472,18 +848,29 @@ class DetectionSlamWorker(QThread):
             return True
 
         obs_used = [o for o in obs_list if _allowed(int(o.tag_id))]
+        # Reject observations of duplicate-ID tags whose geometry disagrees with the
+        # established rigid scene (two physical tags sharing one ID warp the map).
+        obs_used = self._reject_duplicate_observations(obs_used, t_mono)
         if len(obs_used) < MIN_SIMULTANEOUS_TAGS:
             # Not enough confirmed/un-excluded tags this frame to constrain anything.
+            self._log_frame_diag(n_simul, len(obs_used), t_mono, optimized=False)
             self._emit_overlay(und, obs_list, t_mono)
             return
 
         prev_init = set(self.backend.initialized_tag_ids)
+        suspect_before = set(self._suspect)
+        t_upd = time.monotonic()
         update = self.backend.update(obs_used)
+        self._last_backend_ms = (time.monotonic() - t_upd) * 1000.0
+        self._isam_ms_window.append(self._last_backend_ms)
+        if len(self._isam_ms_window) > 60:
+            self._isam_ms_window = self._isam_ms_window[-60:]
         self._frame_idx += 1
         new_tags = set(self.backend.initialized_tag_ids) - prev_init
         res = [float(getattr(o, "reprojection_error_px", float("nan"))) for o in obs_used]
         res = [r for r in res if math.isfinite(r)]
         self._last_residual_px = float(np.median(res)) if res else float("nan")
+        self._worst_residual_px = float(max(res)) if res else float("nan")
 
         if update.optimized and update.camera_pose is not None:
             p = np.asarray(update.camera_pose.translation(), dtype=np.float64).reshape(3)
@@ -493,8 +880,75 @@ class DetectionSlamWorker(QThread):
                 self.observations.append((self._frame_idx, int(o.tag_id), o.camera_T_tag))
             self._detect_jump(p, t_mono, obs_used, new_tags)
             self._write_csv_row(update, obs_used, p, t_mono)
+            self._frames_since_batch += 1
+            self._update_loop_tracking(p, t_mono, obs_used)
+            if self._diag:
+                self._log_tag_lifecycle(obs_used, new_tags, suspect_before, t_mono)
+                self._log_frame_diag(n_simul, len(obs_used), t_mono,
+                                     optimized=True, p=p, update=update)
+                self._maybe_snapshot(t_mono)
+                self._maybe_sample_slam_internals(t_mono)
+        else:
+            self._log_frame_diag(n_simul, len(obs_used), t_mono, optimized=False)
 
         self._maybe_emit(und, obs_list, t_mono, update)
+
+    def _reject_duplicate_observations(self, obs_used, t_mono: float):
+        """Drop this frame's observations of tags whose inter-tag geometry is
+        inconsistent with the established map — the signature of a duplicate ID.
+
+        Distances between tags are rigid-scene invariants (independent of the
+        possibly-drifting camera pose), so for each already-mapped tag co-observed
+        this frame we compare its observed distance to every other established
+        co-observed tag against the map distance. A tag that disagrees with the
+        majority of its established neighbors is mis-associated. After
+        DUPLICATE_CONFIRM_HITS such frames the ID is confirmed a duplicate and
+        permanently excluded (added to self._excluded)."""
+        if self.backend is None or len(obs_used) < DUPLICATE_MIN_NEIGHBORS + 1:
+            return obs_used
+        est = self.backend.initialized_tag_ids
+        mp = self.backend.optimized_tag_poses()
+        obspos = {int(o.tag_id): np.asarray(o.camera_T_tag.translation(),
+                                            dtype=np.float64).reshape(3) for o in obs_used}
+        ids = [tid for tid in obspos if tid in est and tid in mp]
+        if len(ids) < DUPLICATE_MIN_NEIGHBORS:
+            return obs_used
+        mappos = {tid: pose_translation(mp[tid]) for tid in ids}
+        inconsistent: set[int] = set()
+        for i in ids:
+            bad = tot = 0
+            for j in ids:
+                if i == j:
+                    continue
+                d_obs = float(np.linalg.norm(obspos[i] - obspos[j]))
+                d_map = float(np.linalg.norm(mappos[i] - mappos[j]))
+                tol = DUPLICATE_DIST_ABS_TOL_M + DUPLICATE_DIST_REL_TOL * d_map
+                tot += 1
+                if abs(d_obs - d_map) > tol:
+                    bad += 1
+            if tot and (bad / tot) > DUPLICATE_INCONSISTENT_FRAC:
+                inconsistent.add(i)
+        # If (almost) everyone disagrees, the MAP is the problem this frame, not a
+        # single tag — don't punish anyone (avoids cascading false positives).
+        if not inconsistent or len(inconsistent) >= len(ids) - 1:
+            return obs_used
+        for tid in inconsistent:
+            self._dup_hits[tid] = self._dup_hits.get(tid, 0) + 1
+            if (self._dup_hits[tid] >= DUPLICATE_CONFIRM_HITS
+                    and tid not in self._duplicate_ids):
+                self._duplicate_ids.add(tid)
+                with self._excl_lock:
+                    self._excluded.add(tid)
+                print(f"[duplicate] tag {tid} confirmed DUPLICATE ID after "
+                      f"{self._dup_hits[tid]} inconsistent frames — auto-excluded "
+                      "(two physical tags appear to share this ID)", file=sys.stderr)
+                self.duplicate_detected.emit(int(tid), self._frame_idx)
+                if self._diag:
+                    self._diag.log_tag_event(
+                        "duplicate_detected", tid, t_mono, self._frame_idx,
+                        pose=mp.get(tid),
+                        n_obs=int(self.backend.tag_observation_counts.get(tid, 0)))
+        return [o for o in obs_used if int(o.tag_id) not in inconsistent]
 
     def _detect_jump(self, p_curr: np.ndarray, t_curr: float, obs_list, new_tags) -> None:
         if self._p_prev is not None and self._t_prev is not None:
@@ -507,7 +961,9 @@ class DetectionSlamWorker(QThread):
                 v_prev = 0.0
             expected = v_prev * dt
             residual = actual - expected
-            self._last_jump_mm = residual
+            self._last_jump_mm = residual            # velocity-residual (UI semantics)
+            self._last_actual_jump_mm = actual       # raw frame-to-frame displacement
+            self._last_jump_residual_mm = residual   # jump beyond constant-velocity predict
             # (6) A newly-added tag that jumped the camera > 10 mm is likely a bad
             # triangulation — flag it suspect so the UI highlights it for exclusion.
             if residual > JUMP_SUSPECT_THRESHOLD_MM and new_tags:
@@ -590,6 +1046,7 @@ class DetectionSlamWorker(QThread):
                 "uncertainty_mm": float("nan"),  # live: no marginals (cost); batch fills it
                 "suspect": tid in suspect,
                 "excluded": tid in excluded,
+                "duplicate": tid in self._duplicate_ids,
             }
         return out
 
@@ -626,6 +1083,7 @@ class DetectionSlamWorker(QThread):
             "elapsed_s": time.monotonic() - self._t0,
             "rejected_single": self._rejected_single,
             "suspect": len(self._suspect),
+            "duplicates": sorted(self._duplicate_ids),
             "in_warmup": (time.monotonic() - self._t0) < WARMUP_DURATION_S,
         })
 
@@ -702,6 +1160,17 @@ class TagMapWidget(QWidget):
         self._panning = False
         self._last_mouse = None
         self._fitted = False
+        self._flash_on = False     # 200 ms blue flash on a periodic-batch reopt
+
+    def flash(self):
+        """Brief blue flash to mark a periodic batch re-optimization."""
+        self._flash_on = True
+        self.update()
+        QTimer.singleShot(200, self._clear_flash)
+
+    def _clear_flash(self):
+        self._flash_on = False
+        self.update()
 
     # — data —
     def set_tags(self, tags: dict, anchor_id, cam_pos):
@@ -758,6 +1227,9 @@ class TagMapWidget(QWidget):
             self._draw_tags(p)
             self._draw_camera(p)
             self._draw_legend(p)
+            if self._flash_on:
+                flash = QColor("#4ea1ff"); flash.setAlpha(60)
+                p.fillRect(self.rect(), flash)
         finally:
             p.end()
 
@@ -801,6 +1273,7 @@ class TagMapWidget(QWidget):
             is_anchor = (tid == self._anchor_id)
             excluded = s.get("excluded", False)
             suspect = s.get("suspect", False)
+            duplicate = s.get("duplicate", False)
             col = QColor(_color_for_uncertainty(s.get("uncertainty_mm", float("nan")),
                                                 s.get("n_observations", 0)))
             if excluded:
@@ -823,6 +1296,9 @@ class TagMapWidget(QWidget):
                 p.setPen(QPen(QColor("#ff5555"), 2))
                 p.drawLine(QPointF(pt.x() - r, pt.y() - r), QPointF(pt.x() + r, pt.y() + r))
                 p.drawLine(QPointF(pt.x() - r, pt.y() + r), QPointF(pt.x() + r, pt.y() - r))
+            if duplicate:  # auto-detected duplicate ID — orange "DUP" tag
+                p.setPen(QColor("#ff9800"))
+                p.drawText(QPointF(pt.x() - r - 4, pt.y() + r + 12), "DUP")
             if is_anchor:
                 self._draw_star(p, pt, r + 7, QColor(_COL_ANCHOR))
             p.setPen(QColor("#e6e6e6"))
@@ -848,7 +1324,8 @@ class TagMapWidget(QWidget):
         p.setFont(QFont("Arial", 8))
         items = [("< 5 mm", _COL_GREEN), ("5-15 mm", _COL_YELLOW),
                  (">= 15 mm", _COL_RED), ("dropped", _COL_GRAY),
-                 ("suspect (right-click to exclude)", "#ff37ff")]
+                 ("suspect (right-click to exclude)", "#ff37ff"),
+                 ("DUP = auto-detected duplicate ID", "#ff9800")]
         x, y = 8, self.height() - 8 - 16 * len(items)
         for label, col in items:
             p.setBrush(QColor(col)); p.setPen(Qt.NoPen)
@@ -1044,10 +1521,13 @@ class SurveyWindow(QMainWindow):
         self._motion: GantryMotionThread | None = None
         self._logger: GantryTelemetryLogger | None = None
         self._batch: BatchOptimizerThread | None = None
+        self._diag = None  # SurveyDiagnosticsRecorder (set when SURVEYING begins)
         self._run_dir: Path | None = None
 
         self._batch_result = None
         self._live_tag_states = {}
+        self._last_cam_pos = None
+        self._last_gantry_mm = (float("nan"), float("nan"), float("nan"))
         self._banner_timer = QTimer(self)
         self._banner_timer.setSingleShot(True)
         self._banner_timer.timeout.connect(lambda: self._set_banner("", None))
@@ -1091,6 +1571,9 @@ class SurveyWindow(QMainWindow):
 
         QShortcut(QKeySequence(Qt.Key_Escape), self,
                   activated=self._emergency_stop, context=Qt.ApplicationShortcut)
+        QShortcut(QKeySequence("Ctrl+N"), self,
+                  activated=lambda: self._note_edit.setFocus(),
+                  context=Qt.ApplicationShortcut)
 
     def _wrap(self, title: str, w: QWidget) -> QWidget:
         box = QWidget(); lay = QVBoxLayout(box); lay.setContentsMargins(2, 2, 2, 2)
@@ -1134,7 +1617,28 @@ class SurveyWindow(QMainWindow):
         g.addWidget(QLabel("Anchor tag id"), 2, 4); g.addWidget(self._anchor_edit, 2, 5)
         g.addWidget(QLabel("Tag size"), 2, 6); g.addWidget(self._tagsize_spin, 2, 7)
         g.addWidget(self._tagfam_edit, 2, 8)
+        # Exclude-IDs blacklist: physically duplicated tag IDs (two tags share an ID)
+        # corrupt the map — drop them entirely. Auto-detected duplicates are appended
+        # here at runtime so the list is ready to reuse on the next clean run.
+        self._exclude_edit = QLineEdit()
+        self._exclude_edit.setPlaceholderText("e.g. 64,65,68,69 — duplicate / bad IDs to drop")
+        self._exclude_edit.setToolTip(
+            "Comma-separated AprilTag IDs to exclude from the graph entirely "
+            "(live + batch). Use for physically duplicated IDs that warp the map.")
+        g.addWidget(QLabel("Exclude tag IDs"), 3, 0)
+        g.addWidget(self._exclude_edit, 3, 1, 1, 8)
         return f
+
+    def _parse_exclude_ids(self) -> set:
+        out = set()
+        for tok in (self._exclude_edit.text() or "").replace(";", ",").split(","):
+            tok = tok.strip()
+            if tok:
+                try:
+                    out.add(int(tok))
+                except ValueError:
+                    pass
+        return out
 
     def _build_gantry_pane(self) -> QWidget:
         # NO soft-limit validation here by design (user preference): every jog and
@@ -1191,12 +1695,24 @@ class SurveyWindow(QMainWindow):
         self._counts_label = QLabel("Frames processed: 0   With ≥2 tags: 0   "
                                     "Tags in graph: 0 / 0 qualified")
         self._quality_label = QLabel("Last backend jump: 0.0 mm    Median residual: -- px")
+        self._batch_label = QLabel("Last batch: --")
+        self._batch_label.setStyleSheet("color:#9aa3ad;")
         self._worst_label = QLabel("Worst tag: --")
+        # Non-blocking, click-to-dismiss loop-closure suggestion.
+        self._hint_label = QPushButton(
+            "💡 Consider revisiting an earlier area to close the loop "
+            "(improves global map consistency)   ✕")
+        self._hint_label.setFlat(True)
+        self._hint_label.setStyleSheet(
+            "QPushButton{background:#5a4a18; color:#ffd970; padding:3px; "
+            "border-radius:4px; text-align:left;}")
+        self._hint_label.setVisible(False)
+        self._hint_label.clicked.connect(lambda: self._hint_label.setVisible(False))
         self._banner = QLabel("")
         self._banner.setVisible(False)
         self._banner.setWordWrap(True)
         for w in (self._state_label, self._counts_label, self._quality_label,
-                  self._worst_label, self._banner):
+                  self._batch_label, self._worst_label, self._hint_label, self._banner):
             lay.addWidget(w)
         self._table = QTableWidget(0, 4)
         self._table.setHorizontalHeaderLabels(["Tag ID", "Observations", "Uncertainty (mm)", "Color"])
@@ -1222,7 +1738,17 @@ class SurveyWindow(QMainWindow):
         self._btn_reset_estop = QPushButton("Reset E-Stop"); self._btn_reset_estop.clicked.connect(self._reset_estop)
         for b in (self._btn_start, self._btn_pause, self._btn_stop, self._btn_save):
             lay.addWidget(b)
-        lay.addStretch(1)
+        # Add-Note field: the single most valuable diagnostic annotation — lets the
+        # user mark "this is the moment it broke" (Ctrl+N focuses, Enter submits).
+        lay.addSpacing(12)
+        lay.addWidget(QLabel("Note:"))
+        self._note_edit = QLineEdit()
+        self._note_edit.setPlaceholderText("annotate the run (Ctrl+N), Enter to log…")
+        self._note_edit.setMinimumWidth(220)
+        self._note_edit.returnPressed.connect(self._add_note)
+        self._btn_note = QPushButton("Add Note"); self._btn_note.clicked.connect(self._add_note)
+        lay.addWidget(self._note_edit, 1); lay.addWidget(self._btn_note)
+        lay.addStretch(0)
         lay.addWidget(self._btn_estop); lay.addWidget(self._btn_reset_estop)
         return f
 
@@ -1240,6 +1766,7 @@ class SurveyWindow(QMainWindow):
             self._g_ip.setText(str(gan.get("ip", "192.168.0.30")))
             self._g_port.setText(str(gan.get("port", "8088")))
             self._g_id.setText(str(gan.get("id", "1")))
+        self._exclude_edit.setText(str(self._gui_state.get("survey_tags.exclude_ids", "")))
 
     def _persist_settings(self):
         self._gui_state["survey_tags.splitter_sizes"] = self._splitter.sizes()
@@ -1248,6 +1775,7 @@ class SurveyWindow(QMainWindow):
             "res": self._cam_res.currentText()}
         self._gui_state["survey_tags.gantry"] = {
             "ip": self._g_ip.text(), "port": self._g_port.text(), "id": self._g_id.text()}
+        self._gui_state["survey_tags.exclude_ids"] = self._exclude_edit.text()
         save_gui_state(self._gui_state)
 
     # ── camera ───────────────────────────────────────────────────────────────────
@@ -1344,6 +1872,7 @@ class SurveyWindow(QMainWindow):
         self._refresh_controls()
 
     def _on_gantry_status(self, pos_mm, vel_cms):
+        self._last_gantry_mm = (float(pos_mm[0]), float(pos_mm[1]), float(pos_mm[2]))
         self._pos_label.setText(
             f"Current position:\n X: {pos_mm[0]:+8.2f} mm\n Y: {pos_mm[1]:+8.2f} mm\n Z: {pos_mm[2]:+8.2f} mm")
         self._vel_label.setText(
@@ -1363,6 +1892,8 @@ class SurveyWindow(QMainWindow):
         try:
             with self._controller_lock:
                 self._controller.jog_single_axis(axis, 999999.0 * sign, spd_u, acc_u, dec_u)
+            self._log_action("jog_start", {"axis": axis.name, "direction": int(sign),
+                                           "speed_cm_s": self._spd.value()})
         except Exception as exc:
             print(f"[survey-gui] jog error: {exc}", file=sys.stderr)
             self._set_banner(f"Jog error: {exc}", "warn")
@@ -1373,6 +1904,7 @@ class SurveyWindow(QMainWindow):
         try:
             with self._controller_lock:
                 self._controller.stop_axis(axis, mode=1)  # soft stop
+            self._log_action("jog_stop", {"axis": axis.name})
         except Exception as exc:
             print(f"[survey-gui] stop_axis error: {exc}", file=sys.stderr)
 
@@ -1380,12 +1912,19 @@ class SurveyWindow(QMainWindow):
         if not self._can_drive():
             return
         target = (self._mv_x.value(), self._mv_y.value(), self._mv_z.value())
+        self._log_action("move_abs_start", {"target_xyz_mm": list(target)})
         self._motion = GantryMotionThread(
             self._controller, target, self._spd.value() * 10.0,
             self._acc.value() * 10.0, self._dec.value() * 10.0,
             self._controller_lock, self._logger, self)
-        self._motion.done.connect(lambda err: err and self._set_banner(f"Move failed: {err}", "warn"))
+        self._motion.done.connect(lambda err: self._on_move_done(err, target))
         self._motion.start()
+
+    def _on_move_done(self, err, target):
+        self._log_action("move_abs_complete",
+                         {"target_xyz_mm": list(target), "error": err or ""})
+        if err:
+            self._set_banner(f"Move failed: {err}", "warn")
 
     # ── survey lifecycle ────────────────────────────────────────────────────────
     def _start_survey(self):
@@ -1407,16 +1946,30 @@ class SurveyWindow(QMainWindow):
         except Exception as exc:
             print(f"[survey-gui] telemetry logger unavailable: {exc}", file=sys.stderr)
             self._logger = None
+        # diagnostic "black box" recorder (daemon thread; shares t0 with the logger)
+        try:
+            self._diag = SurveyDiagnosticsRecorder(
+                self._run_dir, t0_monotonic=t0,
+                flush_interval_s=DIAGNOSTICS_FLUSH_INTERVAL_S)
+            self._diag.start()
+        except Exception as exc:
+            print(f"[survey-gui] diagnostics recorder unavailable: {exc}", file=sys.stderr)
+            self._diag = None
         # anchor mode
         atext = self._anchor_edit.text().strip().lower()
         anchor_mode = None if atext in ("", "auto") else int(atext)
         # frame queue + worker
         self._frame_queue = Queue(maxsize=2)
         self._camera.attach_worker_queue(self._frame_queue)
+        exclude_ids = self._parse_exclude_ids()
+        if exclude_ids:
+            print(f"[survey-gui] excluding blacklisted tag IDs: {sorted(exclude_ids)}",
+                  file=sys.stderr)
         self._worker = DetectionSlamWorker(
             self._frame_queue, self._calib, anchor_mode,
             self._tagsize_spin.value(), self._tagfam_edit.text().strip() or "tag36h11",
-            self._run_dir, telemetry_logger=self._logger, parent=self)
+            self._run_dir, telemetry_logger=self._logger, t0_monotonic=t0,
+            diagnostics=self._diag, exclude_tag_ids=exclude_ids, parent=self)
         self._worker.frame_overlay.connect(self._camera_preview.on_frame)
         self._worker.tag_map_update.connect(self._on_tag_map)
         self._worker.metrics_update.connect(self._on_metrics)
@@ -1424,22 +1977,30 @@ class SurveyWindow(QMainWindow):
         self._worker.anchor_selected.connect(self._on_anchor_selected)
         self._worker.camera_position.connect(self._on_camera_position)
         self._worker.error.connect(self._on_worker_error)
+        self._worker.batch_completed.connect(self._on_batch_event)
+        self._worker.loop_hint.connect(self._on_loop_hint)
+        self._worker.duplicate_detected.connect(self._on_duplicate_detected)
         self._worker.start()
         self._set_state("SURVEYING")
+        self._log_action("start_survey", {"anchor_mode": atext or "auto",
+                                          "tag_size_m": self._tagsize_spin.value()})
 
     def _toggle_pause(self, force_pause: bool = False):
         if self._state == "SURVEYING" or force_pause:
             if self._worker:
                 self._worker.set_paused(True)
             self._set_state("PAUSED")
+            self._log_action("pause", {"forced": bool(force_pause)})
         elif self._state == "PAUSED":
             if self._worker:
                 self._worker.set_paused(False)
             self._set_state("SURVEYING")
+            self._log_action("resume")
 
     def _stop_finalize(self):
         if self._state not in ("SURVEYING", "PAUSED"):
             return
+        self._log_action("stop_finalize")
         self._set_state("FINALIZING")
         self._camera.detach_worker_queue()
         if self._worker:
@@ -1454,6 +2015,7 @@ class SurveyWindow(QMainWindow):
             except Exception:
                 pass
         if self._worker is None or self._worker.backend is None or not self._worker.observations:
+            self._close_diagnostics(None)
             self._set_banner("No observations captured — nothing to finalize.", "warn")
             self._set_state("IDLE"); return
         self._live_tag_states = self._worker.live_tag_states()
@@ -1471,6 +2033,7 @@ class SurveyWindow(QMainWindow):
 
     def _on_batch_done(self, result):
         self._batch_result = result
+        self._close_diagnostics(result)
         refined = result.get("tags", {})
         self._tag_map.set_refined(refined, self._live_tag_states)
         self._update_delta_table(refined, self._live_tag_states)
@@ -1480,8 +2043,79 @@ class SurveyWindow(QMainWindow):
         self._set_state("DONE")
 
     def _on_batch_failed(self, msg):
+        self._close_diagnostics(None)
         self._set_banner(f"Batch optimization failed: {msg}", "crit")
         self._set_state("ERROR")
+
+    def _log_action(self, action_type: str, detail: dict | None = None):
+        if self._diag is not None:
+            self._diag.log_user_action(action_type, detail, self._last_gantry_mm)
+
+    def _add_note(self):
+        text = self._note_edit.text().strip()
+        if not text:
+            return
+        self._note_edit.clear()
+        fi = self._worker._frame_idx if self._worker else -1
+        if self._diag is not None:
+            self._diag.log_user_note(text, fi, self._last_cam_pos, self._last_gantry_mm)
+            self._log_action("user_note_added", {"note": text})
+            self._set_banner(f"Note logged: {text}", "info")
+            self._banner_timer.start(2500)
+        else:
+            self._set_banner("Note ignored — not surveying (no recorder active).", "warn")
+            self._banner_timer.start(2500)
+
+    def _git_commit(self):
+        try:
+            import subprocess
+            return subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"], cwd=str(_REPO_ROOT),
+                stderr=subprocess.DEVNULL, text=True).strip()
+        except Exception:
+            return None
+
+    def _close_diagnostics(self, result=None):
+        """Write diagnostics_summary.json and shut the recorder down. Safe to call
+        more than once (no-op once the recorder is gone)."""
+        if self._diag is None:
+            return
+        meta = {}
+        try:
+            w = self._worker
+            anchor = w.anchor_tag_id if w else None
+            dur = (time.monotonic() - w._t0) if w else None
+            nframes = len(w.frame_init) if w else None
+            states = self._live_tag_states or (w.live_tag_states() if w else {})
+            nqual = sum(1 for s in states.values()
+                        if s.get("n_observations", 0) >= MIN_OBSERVATIONS_PER_TAG)
+            if result is not None:
+                nqual = int(result.get("n_qualified", nqual))
+                anchor = result.get("anchor_id", anchor)
+                self._diag.set_final_tag_stats(result.get("tags", {}))
+            meta = {
+                "anchor_tag_id": anchor,
+                "survey_duration_s": round(dur, 2) if dur else None,
+                "n_frames_processed": nframes,
+                "n_tags_qualified": nqual,
+                "fisheye_calib_path": str(self._resolve(self._calib_edit.text())),
+                "constants": {
+                    "PERIODIC_BATCH_INTERVAL_FRAMES": PERIODIC_BATCH_INTERVAL_FRAMES,
+                    "PERIODIC_BATCH_INTERVAL_S": PERIODIC_BATCH_INTERVAL_S,
+                    "WARMUP_DURATION_S": WARMUP_DURATION_S,
+                    "min_tag_area_px": 200.0,
+                    "max_off_nadir_deg": 30.0,
+                    "max_reprojection_error_px": 3.0,
+                },
+                "git_commit": self._git_commit(),
+                "tool_version": st.TOOL_VERSION + " (gui 2.0)",
+            }
+        except Exception as exc:
+            print(f"[survey-gui] diagnostics meta failed: {exc}", file=sys.stderr)
+        try:
+            self._diag.close(meta)
+        finally:
+            self._diag = None
 
     def _update_delta_table(self, refined: dict, live: dict):
         lines = ["Per-tag Δ (live → batch), mm:"]
@@ -1541,6 +2175,7 @@ class SurveyWindow(QMainWindow):
         if self._worker is None:
             return
         excluded = self._worker.toggle_exclude(int(tag_id))
+        self._log_action("tag_excluded", {"tag_id": int(tag_id), "excluded": bool(excluded)})
         self._set_banner(
             f"tag {tag_id} {'EXCLUDED' if excluded else 're-included'} "
             f"({'dropped from' if excluded else 'restored to'} the graph + final map).",
@@ -1551,11 +2186,13 @@ class SurveyWindow(QMainWindow):
         warm = "  [WARMUP]" if m.get("in_warmup") else ""
         self._state_label.setText(
             f"State: {self._state}{warm}   Elapsed: {elapsed // 60:02d}:{elapsed % 60:02d}")
+        dups = m.get("duplicates", [])
+        dup_s = f"   DUPLICATE IDs: {dups}" if dups else ""
         self._counts_label.setText(
             f"Frames processed: {m['frames_processed']}   With ≥2 tags: {m['frames_with_2tags']}   "
             f"Tags in graph: {m['tags_in_graph']} / {m['tags_qualified']} qualified   "
             f"Dropped: {m['dropped']}   Single-tag rejected: {m.get('rejected_single', 0)}   "
-            f"Suspect: {m.get('suspect', 0)}")
+            f"Suspect: {m.get('suspect', 0)}{dup_s}")
         jm = m.get("last_jump_mm", 0.0)
         jcol = "#ef5350" if jm > JUMP_CRITICAL_THRESHOLD_MM else "#e6e6e6"
         res = m.get("median_residual_px", float("nan"))
@@ -1574,7 +2211,34 @@ class SurveyWindow(QMainWindow):
 
     def _on_anchor_selected(self, tag_id, frame_idx):
         self._anchor_edit.setText(str(tag_id))
+        self._log_action("anchor_changed", {"tag_id": int(tag_id), "frame_idx": int(frame_idx)})
         self._set_banner(f"Anchor: tag {tag_id} (frame {frame_idx})", "info")
+
+    def _on_batch_event(self, ev: dict):
+        self._tag_map.flash()
+        s = int(ev.get("elapsed_s", 0))
+        mmss = f"{s // 60:02d}:{s % 60:02d}"
+        self._batch_label.setText(
+            f"Last batch: {mmss} · max tag shift {ev.get('max_tag_shift_mm', 0.0):.1f} mm"
+            f"{' · iSAM2 rebuilt' if ev.get('isam2_rebuilt') else ''}")
+        self._set_banner(f"Batch reoptimization at {mmss} — "
+                         f"{ev.get('n_shifted', 0)} tags shifted >1 mm", "info")
+        self._banner_timer.start(5000)
+
+    def _on_loop_hint(self, show: bool):
+        self._hint_label.setVisible(bool(show))
+
+    def _on_duplicate_detected(self, tag_id: int, frame_idx: int):
+        # Append to the Exclude-IDs field so the user can reuse the full blacklist on
+        # the next run, and warn loudly — this is the map-warp root cause.
+        cur = self._parse_exclude_ids()
+        cur.add(int(tag_id))
+        self._exclude_edit.setText(",".join(str(t) for t in sorted(cur)))
+        self._log_action("duplicate_detected", {"tag_id": int(tag_id), "frame_idx": int(frame_idx)})
+        self._set_banner(
+            f"⚠ tag {tag_id} looks like a DUPLICATE ID (two physical tags share it) — "
+            f"auto-excluded at frame {frame_idx}. It was warping the map. "
+            "Re-survey with it blacklisted for a clean map.", "crit")
 
     def _on_worker_error(self, msg):
         self._set_banner(msg, "crit")
@@ -1608,6 +2272,7 @@ class SurveyWindow(QMainWindow):
     # ── E-stop ───────────────────────────────────────────────────────────────────
     def _emergency_stop(self):
         EMERGENCY_STOP.set()
+        self._log_action("emergency_stop")
         try:
             if self._controller is not None:
                 with self._controller_lock:
@@ -1618,6 +2283,7 @@ class SurveyWindow(QMainWindow):
             print(f"[survey-gui] E-stop SDK error: {exc}", file=sys.stderr)
         if self._worker:
             self._worker.stop()
+        self._close_diagnostics(None)
         self._set_banner("⛔ EMERGENCY STOP engaged. Press 'Reset E-Stop' to clear.", "crit")
         self._set_state("ERROR")
 
@@ -1659,6 +2325,7 @@ class SurveyWindow(QMainWindow):
                 self._worker.stop(); self._worker.wait(1500)
             if self._logger:
                 self._logger.stop()
+            self._close_diagnostics(None)
             self._teardown_gantry()
             self._camera.close()
         except Exception:

@@ -641,6 +641,50 @@ When finalized, the tag map switches to the **batch-refined** positions with the
 **live positions ghosted** semi-transparent, plus a per-tag Δ (mm) table, then
 **Save** writes `config/tag_map.yaml` + `config/tag_map_layout.png`.
 
+**Drift control (long surveys).** Pure incremental iSAM2 lets well-observed early
+tags numerically "lock in," so as the camera travels >~1 m from the anchor the
+global map can squeeze/bend even while per-frame residuals stay low. Two fixes:
+- **Periodic batch re-optimization.** Every 200 frames *or* 30 s the worker runs a
+  full Levenberg-Marquardt pass over the accumulated graph between frames. If any
+  tag moves ≥ 5 mm it **rebuilds iSAM2 from scratch** with the batch-refined values
+  as the new linearization point (factors preserved, lock-in reset). A 200 ms blue
+  flash on the tag map + a status line `Last batch: MM:SS · max tag shift X mm`
+  mark each event; stderr logs `[periodic-batch] …`.
+- **Tighter relinearization:** `relinearizeThreshold 0.01 → 0.001` in
+  `tagslam_core.TagSlamBackend` (10× more eager).
+- **Loop-closure hint:** if the camera goes > 60 s without coming within 30 cm of a
+  previously-visited spot, a dismissible yellow hint suggests revisiting an earlier
+  area to close a loop. Actual revisits are logged to `loop_closure_events.csv`.
+
+### Diagnostics ("black box") — every survey run is fully reconstructable
+
+When SURVEYING begins, a daemon-thread recorder (`survey_diagnostics.py`, never
+blocks the SLAM hot path, flushes every 1 s, ~1–2 % CPU, ~50 MB/hour) writes these
+files into `data/YYYYMMDD/<ts>_survey/` alongside the usual CSVs:
+
+| file | what it captures |
+|------|------------------|
+| `survey_diagnostics.csv` | per-frame backend state (≤15 Hz): tag counts, residuals, jump, camera pose, gantry pose+velocity, warmup flag, `backend_update_ms` |
+| `tag_history.csv` | sparse per-tag events: `first_seen`/`promoted`/`observation` (every 50th)/`shifted`/`suspect_set`/`excluded` |
+| `batch_events.csv` | every periodic batch: iterations, errors, max/median tag shift, whether iSAM2 rebuilt, anchor drift |
+| `user_actions.csv` | every UI click / state transition (start, pause/resume, jog, move, exclude, e-stop, anchor change) with JSON detail + gantry pos |
+| `anchor_stability.csv` | anchor pose drift from t0 (should stay ~0) sampled at each batch + at finalize |
+| `loop_closure_events.csv` | camera revisits (within 30 cm of a ≥30 s-old position) + co-observed tag count |
+| `slam_internals.csv` | iSAM2 health every 60 frames: variable/factor counts, per-update p50/p95 ms |
+| `tag_snapshots/snapshot_tNNNs.yaml` | full tag-pose snapshot every 30 s — replay the map's evolution |
+| `user_notes.csv` | **timestamped notes you type in the UI** (the "Add Note" field / `Ctrl+N`) with camera+gantry pos |
+| `diagnostics_summary.json` | written at finalize: run metadata, summary stats, per-tag summary, and a **drift-onset estimate** (first frame where residual/jump exceeded baseline+3σ for ≥5 frames) |
+
+**Add Note** is the highest-value annotation: type "map starting to squeeze ←" the
+instant you see a problem and future debugging can jump straight to that frame.
+
+Inspect a run offline (text summary; plots are TODO):
+```bash
+python tools/replay_survey.py data/YYYYMMDD/<ts>_survey/
+```
+If the squeeze/warp reappears, share the **whole** `<ts>_survey/` folder — especially
+`user_notes.csv` + `tag_snapshots/` + `survey_diagnostics.csv`.
+
 ---
 
 ## Tag Survey — build a reusable tag map (`survey_tags.py` CLI)

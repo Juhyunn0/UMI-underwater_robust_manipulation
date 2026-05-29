@@ -1586,7 +1586,10 @@ class TagSlamBackend:
 
     def __init__(self, args: argparse.Namespace):
         isam_params = gtsam.ISAM2Params()
-        set_isam2_param(isam_params, "setRelinearizeThreshold", "relinearizeThreshold", 0.01)
+        # 0.01 -> 0.001: relinearize 10x more eagerly so well-observed early tags do
+        # not numerically lock in and prevent later constraints from propagating back
+        # (the long-survey map squeeze/warp the survey GUI periodic-batch also fights).
+        set_isam2_param(isam_params, "setRelinearizeThreshold", "relinearizeThreshold", 0.001)
         set_isam2_param(isam_params, "setRelinearizeSkip", "relinearizeSkip", 1)
         self.isam = gtsam.ISAM2(isam_params)
         self.graph = NonlinearFactorGraph()

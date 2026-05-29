@@ -7,7 +7,7 @@ pool:
   pool_corner_offset_m: 0.10
   # X axis runs along the long (4.877 m) dimension of the pool, matching the
   # physical gantry: gantry +X traverses the length, +Y traverses the width.
-  pool_long_axis: "x"
+  pool_long_axis: "y"
   # Tag 1 is the world-frame anchor. Keep this at the measured anchor location
   # used by the fixed pool overlay; for the Tag-1 frame it is normally origin.
   tag1_position_m: [0.0, 0.108, 0.0]

@@ -3385,6 +3385,17 @@ class GantryPanel(QMainWindow):
         self._exp_use_tag_map_check.toggled.connect(self._exp_tag_map_edit.setEnabled)
         _cam_row(5, "Tag map file:", self._exp_tag_map_edit)
 
+        # Exclude tag IDs: physically duplicated AprilTag IDs (two tags share an ID)
+        # warp the map; drop them from SLAM entirely. Applies in both PnP-only and
+        # bootstrap modes. Match the IDs blacklisted during the survey.
+        self._exp_exclude_edit = QLineEdit("")
+        self._exp_exclude_edit.setPlaceholderText("e.g. 64,65,68,69 — duplicate / bad IDs")
+        self._exp_exclude_edit.setToolTip(
+            "Comma-separated tag IDs to drop before SLAM. Use the same duplicate IDs "
+            "you blacklisted in the survey GUI so they cannot corrupt the run."
+        )
+        _cam_row(6, "Exclude tag IDs:", self._exp_exclude_edit)
+
         outer.addWidget(cam_frame)
 
         # ── (e) Live experiment status ────────────────────────────────────────
@@ -3647,6 +3658,58 @@ class GantryPanel(QMainWindow):
             self.tabs.setCurrentIndex(4)
         self._exp_refresh_checklist()
 
+    def _exp_parse_exclude_ids(self) -> set:
+        """Tag IDs the user blacklisted in the Exclude field (duplicate/bad IDs)."""
+        out: set = set()
+        edit = getattr(self, "_exp_exclude_edit", None)
+        if edit is None:
+            return out
+        for tok in (edit.text() or "").replace(";", ",").split(","):
+            tok = tok.strip()
+            if tok:
+                try:
+                    out.add(int(tok))
+                except ValueError:
+                    pass
+        return out
+
+    def _exp_map_tag_ids(self):
+        """Set of tag IDs present in the PnP-only tag map, or None when PnP-only is
+        off / the map file is missing or unreadable."""
+        if getattr(self, "_exp_use_tag_map_check", None) is None \
+                or not self._exp_use_tag_map_check.isChecked():
+            return None
+        tm = _resolve_calib_path(self._exp_tag_map_edit.text().strip())
+        if tm is None or not tm.exists():
+            return None
+        try:
+            from tagslam_core import load_tag_map
+            return {int(k) for k in (load_tag_map(tm).get("poses") or {}).keys()}
+        except Exception as exc:
+            print(f"[exp] could not read tag map for anchor check: {exc}", file=sys.stderr)
+            return None
+
+    def _exp_check_pnp_anchor(self, fisheye_args) -> bool:
+        """In PnP-only mode, verify the chosen anchor exists in the map. Returns
+        False (after warning) so the caller can abort, instead of letting the
+        backend raise mid-run and silently fall back to a gantry-only recording."""
+        if fisheye_args is None or getattr(fisheye_args, "tag_map", None) is None:
+            return True
+        map_ids = self._exp_map_tag_ids()
+        if map_ids is None:
+            return True
+        anchor = int(getattr(fisheye_args, "anchor_tag_id", -1))
+        if anchor in map_ids:
+            return True
+        QMessageBox.warning(
+            self, "Anchor not in tag map",
+            f"PnP-only is on but anchor tag {anchor} is not in the tag map "
+            f"(mapped IDs: {sorted(map_ids)}).\n\n"
+            "Aim the camera so a mapped tag sits near the image center, or set the "
+            "Anchor tag ID to one that is in the map. (Excluded/duplicate tags such "
+            "as 64,65,68,69 are not in the map by design.)")
+        return False
+
     def _exp_autopick_anchor_tag(self) -> None:
         """Pick the AprilTag whose center is closest to the image center and
         write it into the anchor-tag spin box. No-op if no tags are visible
@@ -3663,10 +3726,28 @@ class GantryPanel(QMainWindow):
                 "color: #ffa726; font-size: 11px;"
             )
             return
+        # Never anchor on an excluded/duplicate ID, and in PnP-only mode only anchor
+        # on a tag that exists in the map (else TagSlamBackend raises at startup).
+        exclude = self._exp_parse_exclude_ids()
+        valid_ids = self._exp_map_tag_ids()  # None unless PnP-only with a loaded map
+        def _eligible(t) -> bool:
+            tid = int(t["id"])
+            if tid in exclude:
+                return False
+            if valid_ids is not None and tid not in valid_ids:
+                return False
+            return True
+        candidates = [t for t in tags if _eligible(t)]
+        if not candidates:
+            self._exp_result_label.setText(
+                "⚠ Anchor auto-pick: no eligible tag visible (excluded, or not in the "
+                f"tag map) — using manual ID {self._exp_anchor_spin.value()}")
+            self._exp_result_label.setStyleSheet("color: #ffa726; font-size: 11px;")
+            return
         img_cx = image_size[0] / 2.0
         img_cy = image_size[1] / 2.0
         best = min(
-            tags,
+            candidates,
             key=lambda t: (t["center"][0] - img_cx) ** 2
                           + (t["center"][1] - img_cy) ** 2,
         )
@@ -3770,6 +3851,8 @@ class GantryPanel(QMainWindow):
             else:
                 print(f"[tag-map] file not found ({tm_path}); running normal "
                       "bootstrap mode", file=sys.stderr)
+        # Blacklist of tag IDs to drop before SLAM (e.g. physically duplicated IDs).
+        args.exclude_tags = self._exp_exclude_edit.text().strip()
         return args
 
     def _exp_load_waypoints(self) -> list[Waypoint]:
@@ -3876,6 +3959,8 @@ class GantryPanel(QMainWindow):
             # tags are visible. Updates the spin so the user sees the choice.
             self._exp_autopick_anchor_tag()
             fisheye_args = self._exp_build_fisheye_args()
+            if not self._exp_check_pnp_anchor(fisheye_args):
+                return
 
         EMERGENCY_STOP.clear()
         self._abort_event.clear()
@@ -4764,7 +4849,10 @@ class GantryPanel(QMainWindow):
                 _release_ownership()
                 return False
 
-        # Decide camera_mode based on what's actually open right now.
+        # Honor the user's camera-mode selection. Full-pipeline must NOT silently
+        # degrade to gantry-only when the camera isn't ready — that produced a
+        # confusing camera-less recording despite "With fisheye (full pipeline)".
+        requested_mode = self._exp_camera_mode()  # "fisheye" or "gantry_only"
         camera_open = (
             (self._camera is not None and self._camera.is_open)
             or self._is_mock_camera
@@ -4775,8 +4863,22 @@ class GantryPanel(QMainWindow):
         if self._is_mock_camera:
             calib_loaded = True
 
-        gantry_only = not (camera_open and calib_loaded)
-        camera_mode = "gantry_only" if gantry_only else "fisheye"
+        if requested_mode == "fisheye" and not (camera_open and calib_loaded):
+            reason = ("the camera is not connected — click 'Connect Camera' on the "
+                      "connection bar first"
+                      if not camera_open else
+                      "the fisheye calibration is not loaded/found — check the "
+                      "calibration path")
+            QMessageBox.warning(
+                self, "Camera not ready for full pipeline",
+                "'With fisheye (full pipeline)' is selected but " + reason + ".\n\n"
+                "Connect the camera (and load calibration) and try again, or switch "
+                "to 'Gantry only' mode if you intended a camera-less run.")
+            _release_ownership()
+            return False
+
+        gantry_only = (requested_mode == "gantry_only")
+        camera_mode = requested_mode
 
         fisheye_args = None
         fisheye_calib = None
@@ -4799,6 +4901,11 @@ class GantryPanel(QMainWindow):
             # Auto-pick anchor before locking args.
             self._exp_autopick_anchor_tag()
             fisheye_args = self._exp_build_fisheye_args()
+            # PnP-only requires the anchor to exist in the map; otherwise the backend
+            # raises at startup and the run silently degrades to gantry-only. Catch it.
+            if not self._exp_check_pnp_anchor(fisheye_args):
+                _release_ownership()
+                return False
 
         EMERGENCY_STOP.clear()
         self._abort_event.clear()
