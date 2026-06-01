@@ -2751,7 +2751,7 @@ def _build_trajectory_viewer_html(
       min-width: 0;
       min-height: 0;
       display: grid;
-      grid-template-rows: minmax(320px, 1fr) 230px;
+      grid-template-rows: 1fr;
       background: #fbfcfd;
     }
     #plot {
@@ -2762,13 +2762,6 @@ def _build_trajectory_viewer_html(
       cursor: grab;
     }
     #plot:active { cursor: grabbing; }
-    #profile {
-      display: block;
-      width: 100%;
-      height: 100%;
-      border-top: 1px solid #c8d0d8;
-      background: #ffffff;
-    }
     #zedPanel {
       box-sizing: border-box;
       height: 100%;
@@ -2856,7 +2849,6 @@ def _build_trajectory_viewer_html(
     </section>
     <section id="plotPanel">
       <canvas id="plot"></canvas>
-      <canvas id="profile"></canvas>
     </section>
   </div>
   <script>
@@ -2864,8 +2856,6 @@ const DATA = __DATA_JSON__;
 
 const canvas = document.getElementById("plot");
 const ctx = canvas.getContext("2d");
-const profileCanvas = document.getElementById("profile");
-const profileCtx = profileCanvas.getContext("2d");
 const zedImage = document.getElementById("zedImage");
 const zedPlaceholder = document.getElementById("zedPlaceholder");
 const zedMeta = document.getElementById("zedMeta");
@@ -3847,204 +3837,6 @@ function drawInfoPanel() {
   ctx.restore();
 }
 
-function profilePoint(point) {
-  return plotCoordinatePoint(point);
-}
-
-function profileDataBounds() {
-  const xs = [0], ys = [0], zs = [0];
-  DATA.camera.forEach(row => {
-    const p = profilePoint([row.x_m, row.y_m, row.z_m]);
-    xs.push(p[0]);
-    ys.push(p[1]);
-    zs.push(p[2]);
-  });
-  DATA.tags.forEach(tag => {
-    const p = profilePoint(tagPoint(tag));
-    xs.push(p[0]);
-    ys.push(p[1]);
-    zs.push(p[2]);
-  });
-  const expand = (values, padMin = 0.05) => {
-    let minValue = Math.min(...values);
-    let maxValue = Math.max(...values);
-    const pad = Math.max(padMin, (maxValue - minValue) * 0.08);
-    if (Math.abs(maxValue - minValue) < 1e-6) {
-      minValue -= padMin;
-      maxValue += padMin;
-    } else {
-      minValue -= pad;
-      maxValue += pad;
-    }
-    return [minValue, maxValue];
-  };
-  return {x: expand(xs), y: expand(ys), z: expand(zs)};
-}
-
-function drawProfileAxes(ctx2, rect, xLabel, xLimits, zLimits) {
-  const margin = {left: 46, right: 12, top: 22, bottom: 32};
-  const plot = {
-    x: rect.x + margin.left,
-    y: rect.y + margin.top,
-    w: Math.max(20, rect.w - margin.left - margin.right),
-    h: Math.max(20, rect.h - margin.top - margin.bottom),
-  };
-  const xRange = Math.max(1e-6, xLimits[1] - xLimits[0]);
-  const zRange = Math.max(1e-6, zLimits[1] - zLimits[0]);
-  const scale = Math.min(plot.w / xRange, plot.h / zRange);
-  const usedW = xRange * scale;
-  const usedH = zRange * scale;
-  const originX = plot.x + (plot.w - usedW) / 2;
-  const originY = plot.y + (plot.h - usedH) / 2;
-  const map = (x, z) => ({
-    x: originX + (x - xLimits[0]) * scale,
-    y: originY + usedH - (z - zLimits[0]) * scale,
-  });
-
-  ctx2.save();
-  ctx2.strokeStyle = "#d7dee5";
-  ctx2.lineWidth = 1;
-  ctx2.strokeRect(originX, originY, usedW, usedH);
-  const xStep = niceTickStep(xRange);
-  const zStep = niceTickStep(zRange);
-  ctx2.font = "10px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
-  ctx2.fillStyle = "#52616d";
-  ctx2.strokeStyle = "#edf1f4";
-  tickValues(xLimits[0], xLimits[1], xStep).forEach(value => {
-    const a = map(value, zLimits[0]);
-    const b = map(value, zLimits[1]);
-    ctx2.beginPath();
-    ctx2.moveTo(a.x, a.y);
-    ctx2.lineTo(b.x, b.y);
-    ctx2.stroke();
-    ctx2.fillText(value.toFixed(tickFormat(xStep)), a.x - 10, originY + usedH + 15);
-  });
-  tickValues(zLimits[0], zLimits[1], zStep).forEach(value => {
-    const a = map(xLimits[0], value);
-    const b = map(xLimits[1], value);
-    ctx2.beginPath();
-    ctx2.moveTo(a.x, a.y);
-    ctx2.lineTo(b.x, b.y);
-    ctx2.stroke();
-    ctx2.fillText(value.toFixed(tickFormat(zStep)), rect.x + 8, a.y + 4);
-  });
-  const z0a = map(xLimits[0], 0);
-  const z0b = map(xLimits[1], 0);
-  ctx2.strokeStyle = "#7b8794";
-  ctx2.setLineDash([5, 4]);
-  ctx2.beginPath();
-  ctx2.moveTo(z0a.x, z0a.y);
-  ctx2.lineTo(z0b.x, z0b.y);
-  ctx2.stroke();
-  ctx2.setLineDash([]);
-  ctx2.fillStyle = "#17202a";
-  ctx2.font = "11px Arial";
-  ctx2.fillText(`${xLabel} vs Z, true scale`, rect.x + 8, rect.y + 14);
-  ctx2.fillText(`${xLabel} (m)`, originX + usedW / 2 - 18, rect.y + rect.h - 8);
-  ctx2.save();
-  ctx2.translate(rect.x + 14, originY + usedH / 2 + 16);
-  ctx2.rotate(-Math.PI / 2);
-  ctx2.fillText("Z (m)", 0, 0);
-  ctx2.restore();
-  ctx2.restore();
-  return map;
-}
-
-function drawProfilePanel() {
-  dpr = Math.max(1, window.devicePixelRatio || 1);
-  profileCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  const width = profileCanvas.clientWidth || 1;
-  const height = profileCanvas.clientHeight || 1;
-  profileCtx.clearRect(0, 0, width, height);
-  profileCtx.fillStyle = "#ffffff";
-  profileCtx.fillRect(0, 0, width, height);
-  const bounds2 = profileDataBounds();
-  const gap = 14;
-  const colorbarW = 58;
-  const panelW = Math.max(120, (width - colorbarW - gap * 3) / 2);
-  const rectX = {x: gap, y: 8, w: panelW, h: height - 16};
-  const rectY = {x: gap * 2 + panelW, y: 8, w: panelW, h: height - 16};
-  const mapX = drawProfileAxes(profileCtx, rectX, "X", bounds2.x, bounds2.z);
-  const mapY = drawProfileAxes(profileCtx, rectY, "Y", bounds2.y, bounds2.z);
-  const activeIds = activeTagIdSet();
-  const end = Math.min(currentIndex, DATA.camera.length - 1);
-
-  function drawPath(map, coordIndex) {
-    if (DATA.camera.length < 2) {
-      return;
-    }
-    profileCtx.save();
-    profileCtx.strokeStyle = "#315C78";
-    profileCtx.lineWidth = 1.7;
-    profileCtx.beginPath();
-    for (let i = 0; i <= end; i++) {
-      const p = profilePoint([DATA.camera[i].x_m, DATA.camera[i].y_m, DATA.camera[i].z_m]);
-      const q = map(p[coordIndex], p[2]);
-      if (i === 0) {
-        profileCtx.moveTo(q.x, q.y);
-      } else {
-        profileCtx.lineTo(q.x, q.y);
-      }
-    }
-    profileCtx.stroke();
-    profileCtx.restore();
-  }
-
-  drawPath(mapX, 0);
-  drawPath(mapY, 1);
-
-  DATA.tags.forEach(tag => {
-    const p = profilePoint(tagPoint(tag));
-    const rgb = tagRgb(tag);
-    const active = activeIds.has(Number(tag.tag_id));
-    const color = active ? rgbCss(rgb) : rgbCss(desaturateRgb(rgb), 0.45);
-    const radius = active ? 5 : 3.2;
-    [mapX(p[0], p[2]), mapY(p[1], p[2])].forEach(q => {
-      profileCtx.save();
-      profileCtx.globalAlpha = active ? 1.0 : 0.35;
-      profileCtx.fillStyle = color;
-      profileCtx.strokeStyle = active ? "#111820" : "#ffffff";
-      profileCtx.lineWidth = active ? 1.4 : 0.8;
-      profileCtx.beginPath();
-      profileCtx.arc(q.x, q.y, radius, 0, Math.PI * 2);
-      profileCtx.fill();
-      profileCtx.stroke();
-      profileCtx.restore();
-    });
-  });
-
-  if (DATA.camera.length > 0) {
-    const row = DATA.camera[end];
-    const p = profilePoint([row.x_m, row.y_m, row.z_m]);
-    [mapX(p[0], p[2]), mapY(p[1], p[2])].forEach(q => {
-      profileCtx.fillStyle = "#1B2A41";
-      profileCtx.beginPath();
-      profileCtx.arc(q.x, q.y, 5.5, 0, Math.PI * 2);
-      profileCtx.fill();
-    });
-  }
-
-  const range = tagZRange();
-  const barX = width - colorbarW + 18;
-  const barY = 34;
-  const barH = Math.max(40, height - 76);
-  for (let i = 0; i < barH; i++) {
-    const u = 1 - i / Math.max(1, barH - 1);
-    profileCtx.fillStyle = viridisColorAt(u);
-    profileCtx.fillRect(barX, barY + i, 14, 1);
-  }
-  profileCtx.strokeStyle = "#9aa6b2";
-  profileCtx.strokeRect(barX, barY, 14, barH);
-  profileCtx.fillStyle = "#17202a";
-  profileCtx.font = "11px Arial";
-  profileCtx.fillText("Tag Z", barX - 6, 18);
-  profileCtx.font = "10px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
-  profileCtx.fillText(`${(range.max * 100).toFixed(1)} cm`, barX - 10, barY - 7);
-  profileCtx.fillText(`${(range.min * 100).toFixed(1)} cm`, barX - 10, barY + barH + 14);
-  profileCtx.fillStyle = "#52616d";
-  profileCtx.fillText("z=0 dashed", barX - 16, height - 8);
-}
-
 function updateLabel() {
   if (DATA.camera.length === 0) {
     frameLabel.textContent = "No camera trajectory samples";
@@ -4121,7 +3913,6 @@ function drawScene() {
 function draw() {
   try {
     drawScene();
-    drawProfilePanel();
   } catch (error) {
     console.error(error);
     drawCanvasError(error);
@@ -4132,8 +3923,6 @@ function resize() {
   dpr = Math.max(1, window.devicePixelRatio || 1);
   canvas.width = Math.max(1, Math.floor(canvas.clientWidth * dpr));
   canvas.height = Math.max(1, Math.floor(canvas.clientHeight * dpr));
-  profileCanvas.width = Math.max(1, Math.floor(profileCanvas.clientWidth * dpr));
-  profileCanvas.height = Math.max(1, Math.floor(profileCanvas.clientHeight * dpr));
   draw();
 }
 
@@ -6254,6 +6043,7 @@ def write_experiment_dashboard_html(
     gantry_anchor_offset_mm: "list[float] | None" = None,
     R_gantry_to_slam: "np.ndarray | None" = None,
     gantry_to_slam_scale: float = 1.0,
+    extra_world_transform: "np.ndarray | None" = None,
     run_name: str = "",
     rms_summary: dict | None = None,
     zed_view_image_paths: "list[Path] | None" = None,
@@ -6282,6 +6072,11 @@ def write_experiment_dashboard_html(
     Gantry-only mode (camera_csv is None): Trajectory shows pool + gantry only;
     Velocity/Acceleration show gantry curves only; header shows a gantry-only
     badge.
+
+    extra_world_transform (optional 4x4): an additional rigid transform applied
+    uniformly to camera + tags + (transformed) gantry, used by
+    tools/rebuild_trajectory_html.py to re-anchor the view to a chosen tag's
+    frame. None (default) reproduces the previous behavior exactly.
     """
     import csv as _csv
     import json as _json
@@ -6300,6 +6095,40 @@ def write_experiment_dashboard_html(
             except (KeyError, ValueError, TypeError):
                 out.append(float("nan"))
         return np.array(out, dtype=np.float64)
+
+    # Optional extra_world_transform (4x4): an additional rigid transform applied
+    # UNIFORMLY to the camera trajectory, the tag positions, and the gantry
+    # trajectory (after its own R/scale/offset). Its purpose is re-anchoring —
+    # e.g. viewing everything in a chosen tag's frame — without changing the
+    # mutual gantry↔camera alignment. None (default) = byte-for-byte old behavior.
+    # Positions transform as M·[x,y,z,1]; velocity vectors get the rotation block
+    # only. Orientations (roll/pitch/yaw columns) are NOT rotated (cosmetic only;
+    # trajectory/velocity are what matter for re-anchored plots).
+    M_world = None
+    if extra_world_transform is not None:
+        try:
+            _M = np.asarray(extra_world_transform, dtype=np.float64).reshape(4, 4)
+            if np.all(np.isfinite(_M)):
+                M_world = _M
+        except (ValueError, TypeError):
+            print("[dashboard] extra_world_transform malformed; ignoring.",
+                  file=sys.stderr)
+
+    def _apply_M_pos(xs, ys, zs):
+        """Apply M_world to position arrays (meters). Returns (xs,ys,zs)."""
+        if M_world is None:
+            return xs, ys, zs
+        P = np.stack([xs, ys, zs], axis=1)                       # (N,3)
+        Pt = (M_world[:3, :3] @ P.T).T + M_world[:3, 3]          # (N,3)
+        return Pt[:, 0], Pt[:, 1], Pt[:, 2]
+
+    def _apply_M_vec(xs, ys, zs):
+        """Apply M_world's rotation only to velocity arrays."""
+        if M_world is None:
+            return xs, ys, zs
+        V = np.stack([xs, ys, zs], axis=1)
+        Vt = (M_world[:3, :3] @ V.T).T
+        return Vt[:, 0], Vt[:, 1], Vt[:, 2]
 
     g_rows = _load(gantry_csv)
     c_rows = _load(camera_csv) if camera_csv is not None else []
@@ -6344,6 +6173,9 @@ def write_experiment_dashboard_html(
     # ── camera arrays: positions m → mm, derive velocity via Savitzky-Golay,
     #    the SAME window/order as GantryTelemetryLogger (fair comparison). ──────
     c_xm = _fcol(c_rows, "x_m"); c_ym = _fcol(c_rows, "y_m"); c_zm = _fcol(c_rows, "z_m")
+    # Re-anchor the camera trajectory (positions in meters) BEFORE deriving its
+    # velocity, so the velocity is consistent with the re-framed path.
+    c_xm, c_ym, c_zm = _apply_M_pos(c_xm, c_ym, c_zm)
     c_x = c_xm * 1000.0; c_y = c_ym * 1000.0; c_z = c_zm * 1000.0
     if c_rows:
         c_vx = _savgol_deriv(c_t, c_x); c_vy = _savgol_deriv(c_t, c_y); c_vz = _savgol_deriv(c_t, c_z)
@@ -6375,9 +6207,13 @@ def write_experiment_dashboard_html(
         g_xa = P_slam_mm[:, 0] / 1000.0
         g_ya = P_slam_mm[:, 1] / 1000.0
         g_za = P_slam_mm[:, 2] / 1000.0
+        # Re-anchor the (already SLAM-frame) gantry trajectory uniformly with the
+        # camera so their mutual alignment is preserved under re-framing.
+        g_xa, g_ya, g_za = _apply_M_pos(g_xa, g_ya, g_za)
         V = np.stack([g_vx, g_vy, g_vz], axis=1)           # mm/s, gantry frame
         V_slam = s_gs * (R3 @ V.T).T                       # mm/s, SLAM orientation+scale
         g_vx, g_vy, g_vz = V_slam[:, 0], V_slam[:, 1], V_slam[:, 2]
+        g_vx, g_vy, g_vz = _apply_M_vec(g_vx, g_vy, g_vz)
         # Issue #2: trace the velocity transform + flag frame/transpose problems.
         _dash_velocity_diagnostics(
             g_t, V, V_slam, c_t,
@@ -6424,6 +6260,13 @@ def write_experiment_dashboard_html(
 
     # ── tag markers ───────────────────────────────────────────────────────────
     tag_rows = _load(tag_poses_csv) if tag_poses_csv is not None else []
+    # Re-anchor tag positions in-place (both the 2D markers and 3D viewer read
+    # x_m/y_m/z_m from these dicts). Orientation columns are left as-is.
+    if M_world is not None and tag_rows:
+        tx = _fcol(tag_rows, "x_m"); ty = _fcol(tag_rows, "y_m"); tz = _fcol(tag_rows, "z_m")
+        tx, ty, tz = _apply_M_pos(tx, ty, tz)
+        for i, r in enumerate(tag_rows):
+            r["x_m"], r["y_m"], r["z_m"] = float(tx[i]), float(ty[i]), float(tz[i])
     tags = []
     for r in tag_rows:
         try:

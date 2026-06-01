@@ -707,6 +707,96 @@ class PostprocessThread(QThread):
             # NOTE: pose_velocity_acceleration.html is no longer generated; its
             # role is replaced by the Velocity tab of trajectory_interactive.html.
 
+        # 4.25) Consolidated single CSV (full pipeline only): one row per camera
+        #       sample, RAW values (no R/scale/anchor applied) so any calibration
+        #       can be re-applied later. Camera velocity is DERIVED (Savitzky-Golay,
+        #       the same smoothing the dashboard uses); gantry pose/vel are
+        #       interpolated onto the camera timestamps. Reads the per-stream CSVs
+        #       already on disk; never blocks. See tools/rebuild_trajectory_html.py
+        #       for re-plotting from this data with a different R/anchor.
+        if not gantry_only and gantry_csv.exists() and camera_csv.exists():
+            self.progress.emit("Writing consolidated_trajectory.csv…")
+            try:
+                import numpy as _np
+                import tagslam_core as _tc
+                g = _read_csv(gantry_csv)
+                c = _read_csv(camera_csv)
+
+                def _col(rows, key):
+                    out = []
+                    for r in rows:
+                        try:
+                            out.append(float(r[key]))
+                        except (KeyError, ValueError, TypeError):
+                            out.append(float("nan"))
+                    return _np.asarray(out, dtype=float)
+
+                c_tmono  = _col(c, "timestamp_monotonic")
+                c_time_s = _col(c, "time_s")
+                cam_x = _col(c, "x_m"); cam_y = _col(c, "y_m"); cam_z = _col(c, "z_m")
+
+                # Camera velocity (m/s): derive from positions in METERS vs camera
+                # time. _savgol_deriv returns NaN for <3 samples (acceptable).
+                if len(c) >= 3:
+                    cvx = _tc._savgol_deriv(c_time_s, cam_x)
+                    cvy = _tc._savgol_deriv(c_time_s, cam_y)
+                    cvz = _tc._savgol_deriv(c_time_s, cam_z)
+                else:
+                    cvx = cvy = cvz = _np.full(len(c), _np.nan)
+
+                # Gantry velocity source: prefer *_derived, else *_sdk.
+                g_cols = set(g[0].keys()) if g else set()
+                if "vx_mm_s_derived" in g_cols:
+                    vkx, vky, vkz = "vx_mm_s_derived", "vy_mm_s_derived", "vz_mm_s_derived"
+                else:
+                    vkx, vky, vkz = "vx_mm_s_sdk", "vy_mm_s_sdk", "vz_mm_s_sdk"
+                g_tmono = _col(g, "timestamp_monotonic")
+
+                def _interp(key):
+                    ys = _col(g, key)
+                    m = _np.isfinite(g_tmono) & _np.isfinite(ys)
+                    if int(m.sum()) < 2:
+                        return _np.full(len(c), _np.nan)
+                    xt, yv = g_tmono[m], ys[m]
+                    o = _np.argsort(xt)
+                    return _np.interp(c_tmono, xt[o], yv[o])
+
+                gx  = _interp("x_mm"); gy  = _interp("y_mm"); gz  = _interp("z_mm")
+                gvx = _interp(vkx);    gvy = _interp(vky);    gvz = _interp(vkz)
+
+                def _fmt(v):
+                    return "" if (v is None or not _np.isfinite(v)) else f"{float(v):.6f}"
+
+                header = [
+                    "timestamp_unix", "timestamp_monotonic", "time_s", "camera_index",
+                    "cam_x_m", "cam_y_m", "cam_z_m",
+                    "cam_roll_deg", "cam_pitch_deg", "cam_yaw_deg",
+                    "cam_vx_m_s", "cam_vy_m_s", "cam_vz_m_s",
+                    "gantry_x_mm", "gantry_y_mm", "gantry_z_mm",
+                    "gantry_vx_mm_s", "gantry_vy_mm_s", "gantry_vz_mm_s",
+                    "detected_tags", "image_path",
+                ]
+                consolidated_csv = run_dir / "consolidated_trajectory.csv"
+                with consolidated_csv.open("w", newline="") as fh:
+                    w = csv.writer(fh)
+                    w.writerow(header)
+                    for i, r in enumerate(c):
+                        # cam pose columns pass through RAW (full precision);
+                        # derived/interpolated columns are formatted.
+                        w.writerow([
+                            r.get("timestamp_unix", ""), r.get("timestamp_monotonic", ""),
+                            r.get("time_s", ""), r.get("camera_index", ""),
+                            r.get("x_m", ""), r.get("y_m", ""), r.get("z_m", ""),
+                            r.get("roll_deg", ""), r.get("pitch_deg", ""), r.get("yaw_deg", ""),
+                            _fmt(cvx[i]), _fmt(cvy[i]), _fmt(cvz[i]),
+                            _fmt(gx[i]), _fmt(gy[i]), _fmt(gz[i]),
+                            _fmt(gvx[i]), _fmt(gvy[i]), _fmt(gvz[i]),
+                            r.get("detected_tags", ""), r.get("image_path", ""),
+                        ])
+                result["consolidated_csv"] = str(consolidated_csv)
+            except Exception as exc:
+                errors.append(f"consolidated_csv: {exc}")
+
         # 4.5) Consolidated 2-tab trajectory_interactive.html (Trajectory +
         #      Velocity), in BOTH full-pipeline and gantry-only modes. This
         #      overwrites the gantry-less HTML written by recorder.stop_and_save.
