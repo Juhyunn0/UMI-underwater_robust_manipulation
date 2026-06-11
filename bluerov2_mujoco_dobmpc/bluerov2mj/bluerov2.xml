@@ -1,0 +1,41 @@
+<!--
+  BlueROV2 floating rigid body in a NED world.
+
+  Conventions: the MuJoCo world frame *is* the paper's inertial NED frame
+  (x north, y east, z down), so gravity points along +z.  The body frame is
+  FRD with origin at the centre of buoyancy; the CG sits ZG = 0.02 m below
+  it (inertial pos 0 0 0.02).  MuJoCo therefore reproduces M_RB (incl. the
+  m*zg coupling, Eq. 10), C_RB (Eq. 11) and the weight part of g(eta)
+  exactly.  Everything hydrodynamic (buoyancy, added mass, C_A, damping) is
+  injected each step by mujoco_env.py via xfrc_applied.
+-->
+<mujoco model="bluerov2_ned">
+  <option timestep="0.002" gravity="0 0 9.81" integrator="implicitfast"
+          density="0" viscosity="0"/>
+
+  <visual>
+    <headlight ambient="0.4 0.4 0.4" diffuse="0.6 0.6 0.6"/>
+  </visual>
+
+  <worldbody>
+    <body name="base_link" pos="0 0 -20">
+      <freejoint name="free"/>
+      <inertial pos="0 0 0.02" mass="11.26" diaginertia="0.3 0.63 0.58"/>
+      <!-- hull (visual + rough collision shape only; inertia comes from
+           the explicit <inertial> element above) -->
+      <geom name="frame" type="box" size="0.229 0.1675 0.10"
+            rgba="0.15 0.18 0.22 1" contype="0" conaffinity="0"/>
+      <geom name="enclosure" type="cylinder" size="0.06 0.16" pos="0 0 -0.06"
+            quat="0.7071 0 0.7071 0" rgba="0.85 0.85 0.2 1"
+            contype="0" conaffinity="0"/>
+      <!-- thruster markers (cosmetic; forces are applied analytically) -->
+      <site name="thr1" pos="0.156 0.111 0.072" size="0.02" rgba="0 0.8 0 1"/>
+      <site name="thr2" pos="0.156 -0.111 0.072" size="0.02" rgba="0 0.8 0 1"/>
+      <site name="thr3" pos="-0.156 0.111 0.072" size="0.02" rgba="0 0.4 0.8 1"/>
+      <site name="thr4" pos="-0.156 -0.111 0.072" size="0.02" rgba="0 0.4 0.8 1"/>
+      <site name="thr5" pos="0.0 0.1105 -0.005" size="0.02" rgba="0 0.4 0.8 1"/>
+      <site name="thr6" pos="0.0 -0.1105 -0.005" size="0.02" rgba="0 0.8 0 1"/>
+      <site name="origin_cb" pos="0 0 0" size="0.005" rgba="1 0 0 1"/>
+    </body>
+  </worldbody>
+</mujoco>
