@@ -1,12 +1,40 @@
+# =============================================================================
+# UMI Underwater Robust Control — unified dependency manifest
+#
+# This repo bundles two subprojects that share one environment:
+#   1. Refractive TagSLAM + gantry  (src/)                  — gtsam, pyzed, opencv
+#   2. BlueROV2 DOBMPC MuJoCo sim   (bluerov2_mujoco_dobmpc/) — mujoco, casadi
+#
+# NumPy is pinned <2.0 on purpose: gtsam 4.2.x is built against the NumPy 1.x
+# ABI and *requires* numpy<2.0.0. pyzed 5.2's wheel metadata declares
+# numpy>=2.0, but that is a conservative build-time pin — pyzed.sl imports and
+# runs correctly on 1.26.4 (verified). So `pip check` will print a benign
+# "pyzed ... requires numpy<3.0,>=2.0 but you have 1.26.4" warning; ignore it.
+# Do NOT bump numpy to 2.x — it breaks the gtsam SLAM backend.
+# For an exact, reproducible pin of the whole stack, use requirements-lock.txt.
+# =============================================================================
+
 # Core scientific stack
-numpy>=2.0,<3.0
+numpy>=1.26,<2.0          # <2.0 is a hard constraint from gtsam (see note above)
+scipy>=1.11
 opencv-python>=4.10
 
 # AprilTag detection
 pupil-apriltags>=1.0.4
 
 # Factor-graph SLAM
-gtsam>=4.2
+gtsam>=4.2,<4.3           # 4.2.x requires numpy<2.0
+
+# BlueROV2 DOBMPC MuJoCo simulation (bluerov2_mujoco_dobmpc/)
+mujoco>=3.0
+casadi>=3.7
+matplotlib>=3.7
+
+# Gantry control GUI (src/gantry_panel.py, src/gui_launcher.py)
+PyQt5>=5.15
+pyqtgraph>=0.13
+QDarkStyle>=3.2
+QtAwesome>=1.3
 
 # ZED SDK Python bindings (pyzed):
 # Install from the ZED SDK or the wheel in vendor/ (e.g., vendor/pyzed-5.2-cp314-cp314-linux_x86_64.whl)

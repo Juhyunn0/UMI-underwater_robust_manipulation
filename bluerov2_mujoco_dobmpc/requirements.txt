@@ -1,5 +1,12 @@
+# BlueROV2 DOBMPC MuJoCo simulation — standalone dependencies.
+#
+# numpy is pinned <2.0 so this installs cleanly inside the parent
+# umi_underwater_robust_control environment, whose gtsam SLAM backend
+# requires numpy<2.0.0. The sim itself runs fine on numpy 1.x or 2.x;
+# the upper bound only matters in the shared env. See the repo-root
+# requirements.txt for the full rationale.
 mujoco>=3.0
-casadi>=3.6
-numpy
-scipy
-matplotlib
+casadi>=3.7
+numpy>=1.26,<2.0
+scipy>=1.11
+matplotlib>=3.7
