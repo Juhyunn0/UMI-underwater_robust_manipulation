@@ -1,0 +1,3 @@
+[submodule "external/MarineGym"]
+	path = external/MarineGym
+	url = https://github.com/Juhyunn0/MarineGym.git
