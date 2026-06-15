@@ -11,7 +11,7 @@ Keys set a latched FLU body wrench -> pinv(B) -> 6 thruster forces -> data.ctrl
     G     : toggle disturbances (current + waves + kicks)
     Ctrl-C / close window : quit
 
-Two viewer modes:
+Three viewer modes:
   * DEFAULT (launch_passive): draws live color-coded FORCE ARROWS on the vehicle
     (buoyancy/drag/thrust/kick + current/wave flow). Keys come from the FOCUSED
     VIEWER WINDOW -- click the viewer, then drive.
@@ -21,6 +21,12 @@ Two viewer modes:
   * --managed: the old managed viewer (no arrows), runs with plain `python`
     anywhere; keys come from the focused TERMINAL. Handy for quick macOS checks
     without mjpython.
+  * --viser / --remote: HEADLESS web UI -- NO GLFW. Starts a viser server on
+    :8080 (host 0.0.0.0, so reachable over SSH/Tailscale from the MacBook),
+    rebuilds the model from mjModel+mjData each frame, and exposes the W/A/S/D...
+    controls as browser GUI buttons/sliders (plus the same force arrows). Use
+    this when there is no local display.
+        - `python teleop.py --viser`     then open http://<host>:8080
 
 The arrow viz only READS the forces already computed by hydro.py/disturbances.py/
 thrusters.py -- it does not change the dynamics.
@@ -28,11 +34,12 @@ thrusters.py -- it does not change the dynamics.
     python teleop.py --disturb   # start with disturbances on (toggle with G)
     python teleop.py --plot      # add console sparklines of drag/wave/kick
     python teleop.py --scale 1.5 # scale command magnitudes
+    python teleop.py --viser     # headless: drive from a browser (SSH/Tailscale)
     python teleop.py --selftest  # headless: assert each key -> correct FLU direction
 
 Gravity + hydro (Phase 3) are ON by default; --no-hydro reverts to thruster-only,
-gravity-off. Only `mujoco` + `numpy` required (`pynput` optional, --managed only).
-No mjx/jax/cuda.
+gravity-off. Only `mujoco` + `numpy` required for the local modes (`pynput`
+optional, --managed only; `viser` + `trimesh` only for --viser). No mjx/jax/cuda.
 """
 import argparse
 import collections
@@ -166,31 +173,85 @@ def _add_arrow(scn, frm, vec, scale, color, cap, label="", min_mag=0.0):
     scn.ngeom += 1
 
 
+def _draw_plan(scn, pts, color=(1.0, 0.82, 0.3, 1.0), width=0.004):
+    """Append a planned path (polyline `pts`, (N,3)) to user_scn as capsule segments."""
+    for i in range(len(pts) - 1):
+        if scn.ngeom >= scn.maxgeom:
+            return
+        g = scn.geoms[scn.ngeom]
+        mujoco.mjv_initGeom(g, mujoco.mjtGeom.mjGEOM_CAPSULE, np.zeros(3), np.zeros(3),
+                            np.zeros(9), np.asarray(color, np.float32))
+        mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_CAPSULE, width,
+                             np.asarray(pts[i], float), np.asarray(pts[i + 1], float))
+        scn.ngeom += 1
+
+
+def _plan_points(mission=None, controller=None):
+    """Planned-trajectory points (N,3) for the monitor's 2D projections, or None.
+    A mission supplies its path (e.g. the square); a goto-origin controller supplies
+    its setpoint as a single target marker; plain teleop has no plan."""
+    if mission is not None and hasattr(mission, "plan_points"):
+        return np.asarray(mission.plan_points(), float)
+    if controller is not None and hasattr(controller, "p_ref"):
+        return np.asarray(controller.p_ref, float).reshape(1, 3)
+    return None
+
+
+def force_items(hydro, teleop, data, bid):
+    """Every force/flow arrow as (name, point, vector, scale, color, cap, min_mag)
+    in world coordinates. Single source of truth shared by the local (mjv) drawer,
+    the viser drawer, and the status line. READ-ONLY: it reflects forces already
+    computed by the physics; it does not change the dynamics.
+
+    Forces use min_mag>=0.5 N (labelled in N); flows use min_mag<0.5 (m/s).
+    """
+    R = data.xmat[bid].reshape(3, 3)
+    com = data.xipos[bid].copy()
+    # net thrust (orange), computed from the live ctrl + allocation B
+    items = [("thrust", com, R @ (teleop.B[:3] @ np.array(data.ctrl)),
+              FORCE_SCALE, COLORS["thrust"], FORCE_CAP, 0.5)]
+    if hydro is not None and hydro.components:
+        for name in ("buoyancy", "drag", "kick"):          # forces (N)
+            pt, vec = hydro.components[name]
+            items.append((name, np.asarray(pt, float), np.asarray(vec, float),
+                          FORCE_SCALE, COLORS[name], FORCE_CAP, 0.5))
+        for name in ("current", "wave"):                   # water velocity (m/s)
+            pt, vel = hydro.water[name]
+            items.append((name, np.asarray(pt, float), np.asarray(vel, float),
+                          VEL_SCALE, COLORS[name], VEL_CAP, 0.01))
+    return items
+
+
 def draw_force_arrows(scn, hydro, teleop, data, bid):
     """Populate user_scn with one arrow per force component. Returns magnitudes."""
     scn.ngeom = 0
     mags = {}
-    R = data.xmat[bid].reshape(3, 3)
-    com = data.xipos[bid].copy()
-
-    # net thrust (orange), computed from the live ctrl + allocation B
-    f_thr = R @ (teleop.B[:3] @ np.array(data.ctrl))
-    mags["thrust"] = float(np.linalg.norm(f_thr))
-    _add_arrow(scn, com, f_thr, FORCE_SCALE, COLORS["thrust"], FORCE_CAP,
-               f"thrust {mags['thrust']:.0f}N", min_mag=0.5)
-
-    if hydro is not None and hydro.components:
-        for name in ("buoyancy", "drag", "kick"):          # forces (N)
-            pt, vec = hydro.components[name]
-            mags[name] = float(np.linalg.norm(vec))
-            _add_arrow(scn, pt, vec, FORCE_SCALE, COLORS[name], FORCE_CAP,
-                       f"{name} {mags[name]:.0f}N", min_mag=0.5)
-        for name in ("current", "wave"):                   # water velocity (m/s)
-            pt, vel = hydro.water[name]
-            mags[name] = float(np.linalg.norm(vel))
-            _add_arrow(scn, pt, vel, VEL_SCALE, COLORS[name], VEL_CAP,
-                       f"{name} {mags[name]:.2f}m/s", min_mag=0.01)
+    for name, pt, vec, scale, color, cap, min_mag in force_items(hydro, teleop, data, bid):
+        mags[name] = float(np.linalg.norm(vec))
+        label = (f"{name} {mags[name]:.0f}N" if min_mag >= 0.5
+                 else f"{name} {mags[name]:.2f}m/s")
+        _add_arrow(scn, pt, vec, scale, color, cap, label, min_mag=min_mag)
     return mags
+
+
+def force_magnitudes(hydro, teleop, data, bid):
+    """Just {name: |vector|} (for the viser status panel; no scene needed)."""
+    return {name: float(np.linalg.norm(vec))
+            for name, _pt, vec, *_ in force_items(hydro, teleop, data, bid)}
+
+
+def monitor_sample(hydro, data, bid):
+    """Read-only per-frame sample for the --monitor dashboard: total disturbance
+    water velocity (current + wave, m/s, world FLU) + ROV COM world position (m).
+    Zeros when hydro/disturbance is off. Plain floats so it pickles cheaply to the
+    dashboard process."""
+    pos = tuple(float(x) for x in data.xipos[bid])
+    if hydro is not None and hydro.water:
+        vtot = (np.asarray(hydro.water["current"][1], float)
+                + np.asarray(hydro.water["wave"][1], float))
+    else:
+        vtot = np.zeros(3)
+    return {"t": float(data.time), "vtot": tuple(map(float, vtot)), "pos": pos}
 
 
 _SPARK = "▁▂▃▄▅▆▇█"
@@ -220,12 +281,14 @@ def _status(teleop, mags, hist):
 # ---------------------------------------------------------------------------
 # viewer modes
 # ---------------------------------------------------------------------------
-def run_passive(model, data, teleop, hydro, args):
+def run_passive(model, data, teleop, hydro, args, monitor=None, controller=None,
+                mission=None):
     """launch_passive: own step+sync loop, live force arrows, key_callback."""
     bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "base_link")
     dt = model.opt.timestep
     n_sub = max(1, round((1.0 / 60.0) / dt))      # ~60 fps render
     hist = {k: collections.deque(maxlen=48) for k in ("drag", "wave", "kick")}
+    last_mon = [0.0]
 
     def key_cb(keycode):
         if 32 <= keycode < 127:                   # printable -> letter keys
@@ -240,8 +303,14 @@ def run_passive(model, data, teleop, hydro, args):
         while viewer.is_running():
             t0 = time.time()
             for _ in range(n_sub):
+                if mission is not None:
+                    mission.step(model, data)
+                elif controller is not None:
+                    controller.apply(model, data)
                 mujoco.mj_step(model, data)
             mags = draw_force_arrows(viewer.user_scn, hydro, teleop, data, bid)
+            if mission is not None:                   # overlay the planned square
+                _draw_plan(viewer.user_scn, mission.plan_points())
             viewer.sync()
             if args.plot:
                 for k in hist:
@@ -249,13 +318,19 @@ def run_passive(model, data, teleop, hydro, args):
             if t0 - last[0] > 0.12:
                 _status(teleop, mags, hist if args.plot else None)
                 last[0] = t0
+            if monitor is not None and t0 - last_mon[0] > 0.033:   # ~30 Hz
+                s = monitor_sample(hydro, data, bid)
+                s["rec"] = mission.rec.active if mission is not None else False
+                monitor.push(s)
+                last_mon[0] = t0
             slack = n_sub * dt - (time.time() - t0)
             if slack > 0:
                 time.sleep(slack)
     print("\nbye")
 
 
-def run_managed(model, data, teleop, args):
+def run_managed(model, data, teleop, hydro, args, monitor=None, controller=None,
+                mission=None):
     """Old managed viewer (no arrows); keys from the focused TERMINAL."""
     backend = run_pynput if args.pynput else run_stdin
     if args.pynput:
@@ -267,6 +342,19 @@ def run_managed(model, data, teleop, args):
     stop = threading.Event()
     kbd = threading.Thread(target=backend, args=(teleop, stop), daemon=True)
     kbd.start()
+    if monitor is not None:
+        # launch() owns the main thread (no per-frame hook), so feed the dashboard
+        # from a read-only thread sampling live data/hydro (async to the viewer steps).
+        bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "base_link")
+
+        def _mon_loop():
+            while not stop.is_set():
+                monitor.push(monitor_sample(hydro, data, bid))
+                time.sleep(0.033)
+        threading.Thread(target=_mon_loop, daemon=True).start()
+    # NOTE: autonomous control (--goto-origin/--square) is NOT driven here — it would
+    # race the viewer's physics thread on MjData (see the guard in main()). Those modes
+    # require the passive (default) or --viser viewer, which step + control on one thread.
     try:
         mujoco.viewer.launch(model, data)         # GUI on main thread (plain python)
     except KeyboardInterrupt:
@@ -314,6 +402,424 @@ def run_pynput(teleop, stop):
     listener.start()
     stop.wait()
     listener.stop()
+
+
+# ---------------------------------------------------------------------------
+# viser remote mode (headless: NO GLFW; browser UI over SSH/Tailscale)
+# ---------------------------------------------------------------------------
+def _mat2wxyz(xmat):
+    """MuJoCo world rotation matrix (flat 9,) -> viser wxyz quaternion."""
+    q = np.zeros(4)
+    mujoco.mju_mat2Quat(q, np.asarray(xmat, dtype=float).reshape(9))
+    return (float(q[0]), float(q[1]), float(q[2]), float(q[3]))
+
+
+def _geom_color(model, gid):
+    """(rgb 0-255, alpha) for a geom: its material, or its own rgba if set."""
+    matid = int(model.geom_matid[gid])
+    grgba = np.asarray(model.geom_rgba[gid], float)
+    rgba = grgba
+    if matid >= 0 and np.allclose(grgba, [0.5, 0.5, 0.5, 1.0]):
+        rgba = np.asarray(model.mat_rgba[matid], float)   # default geom rgba -> use material
+    rgb = tuple(int(np.clip(c, 0, 1) * 255) for c in rgba[:3])
+    return rgb, float(rgba[3])
+
+
+def _mesh_verts_faces(model, gid):
+    """Vertices/faces of a mesh geom, in the geom's local frame."""
+    mid = int(model.geom_dataid[gid])
+    va, vn = int(model.mesh_vertadr[mid]), int(model.mesh_vertnum[mid])
+    fa, fn = int(model.mesh_faceadr[mid]), int(model.mesh_facenum[mid])
+    verts = np.asarray(model.mesh_vert[va:va + vn]).reshape(-1, 3).astype(np.float32)
+    faces = np.asarray(model.mesh_face[fa:fa + fn]).reshape(-1, 3).astype(np.uint32)
+    return verts, faces
+
+
+def build_viser_scene(server, model, data):
+    """Create one viser node per visible MuJoCo geom. Returns [(gid, handle), ...];
+    each frame we set handle.position/.wxyz from data.geom_xpos/geom_xmat (this is
+    the mjModel+mjData -> Viser scene synchronization)."""
+    mujoco.mj_forward(model, data)            # populate geom_xpos / geom_xmat
+    G = mujoco.mjtGeom
+    handles = []
+    for gid in range(model.ngeom):
+        rgb, alpha = _geom_color(model, gid)
+        if alpha <= 0.02:                     # skip invisible (e.g. collision) geoms
+            continue
+        opacity = None if alpha >= 0.999 else alpha
+        gtype = int(model.geom_type[gid])
+        size = np.asarray(model.geom_size[gid], float)
+        name = f"/mj/geom_{gid}"
+        try:
+            if gtype == G.mjGEOM_MESH:
+                v, f = _mesh_verts_faces(model, gid)
+                h = server.scene.add_mesh_simple(name, v, f, color=rgb,
+                                                 opacity=opacity, flat_shading=False)
+            elif gtype == G.mjGEOM_BOX:
+                h = server.scene.add_box(name, color=rgb,
+                                         dimensions=tuple(2.0 * size), opacity=opacity)
+            elif gtype == G.mjGEOM_SPHERE:
+                h = server.scene.add_icosphere(name, radius=float(size[0]),
+                                               color=rgb, opacity=opacity)
+            elif gtype == G.mjGEOM_ELLIPSOID:
+                h = server.scene.add_icosphere(name, radius=1.0, color=rgb,
+                                               scale=tuple(size), opacity=opacity)
+            elif gtype in (G.mjGEOM_CYLINDER, G.mjGEOM_CAPSULE):
+                import trimesh
+                if gtype == G.mjGEOM_CAPSULE:
+                    tm = trimesh.creation.capsule(height=2 * float(size[1]),
+                                                  radius=float(size[0]))
+                else:
+                    tm = trimesh.creation.cylinder(radius=float(size[0]),
+                                                   height=2 * float(size[1]))
+                h = server.scene.add_mesh_simple(
+                    name, np.asarray(tm.vertices, np.float32),
+                    np.asarray(tm.faces, np.uint32), color=rgb, opacity=opacity)
+            elif gtype == G.mjGEOM_PLANE:
+                continue                      # infinite floor; skip for a free body
+            else:                             # hfield / sdf / unknown -> placeholder
+                h = server.scene.add_icosphere(name, radius=float(max(size[0], 0.05)),
+                                               color=rgb, opacity=opacity)
+        except Exception as e:
+            print(f"[viser] geom {gid} (type {gtype}) skipped: {e}")
+            continue
+        h.position = tuple(map(float, data.geom_xpos[gid]))
+        h.wxyz = _mat2wxyz(data.geom_xmat[gid])
+        handles.append((gid, h))
+    return handles
+
+
+def viser_draw_arrows(server, hydro, teleop, data, bid):
+    """Draw the same force/flow arrows as the local viewer, in viser. Re-adding
+    with the same name overwrites the previous arrows (viser scene-tree semantics)."""
+    starts, ends, cols = [], [], []
+    for _name, pt, vec, scale, color, cap, min_mag in force_items(hydro, teleop, data, bid):
+        mag = float(np.linalg.norm(vec))
+        if mag <= min_mag:
+            continue
+        pt = np.asarray(pt, float)
+        starts.append(pt)
+        ends.append(pt + (np.asarray(vec, float) / mag) * min(scale * mag, cap))
+        cols.append([int(np.clip(c, 0, 1) * 255) for c in color[:3]])
+    if not starts:                            # nothing active -> hide the arrows node
+        server.scene.add_arrows("/mj/forces", np.zeros((1, 2, 3)),
+                                (0, 0, 0), visible=False)
+        return
+    points = np.stack([np.asarray(starts), np.asarray(ends)], axis=1)  # (N, 2, 3)
+    server.scene.add_arrows("/mj/forces", points, np.asarray(cols, np.uint8),
+                            shaft_radius=0.008, head_radius=0.02, head_length=0.04)
+
+
+def _status_text(teleop, mags):
+    w = teleop.wrench
+    return (f"cmd   surge {w[0]:+.0f}  sway {w[1]:+.0f}  heave {w[2]:+.0f}  "
+            f"yaw {w[5]:+.0f}  roll {w[3]:+.0f}\n"
+            f"F(N)  thrust {mags.get('thrust', 0):.0f}  buoy {mags.get('buoyancy', 0):.0f}  "
+            f"drag {mags.get('drag', 0):.0f}  kick {mags.get('kick', 0):.0f}\n"
+            f"flow  cur {mags.get('current', 0):.2f}  wav {mags.get('wave', 0):.2f} m/s")
+
+
+def build_viser_gui(server, model, data, teleop, hydro, args, recorder=None):
+    """The browser control panel: buttons/sliders mapped onto the SAME
+    Teleop.on_key path the keyboard uses (so both backends drive identically).
+    Returns (status_handle, rec_status_handle) to refresh in the loop."""
+    field = teleop.disturbance
+    server.gui.add_markdown(
+        "**BlueROV2 teleop (FLU).** Pitch is underactuated and never commanded; "
+        "buttons latch a body wrench until changed.")
+
+    def _buttons(folder, items):
+        with server.gui.add_folder(folder):
+            for label, key in items:
+                server.gui.add_button(label).on_click(
+                    lambda _evt, k=key: teleop.on_key(k))
+
+    _buttons("Translate", [("Surge +  (W, forward)", "W"), ("Surge −  (S, back)", "S"),
+                           ("Sway +  (Q, PORT/left)", "Q"), ("Sway −  (E, right)", "E"),
+                           ("Heave +  (R, up)", "R"), ("Heave −  (F, down)", "F")])
+    _buttons("Rotate", [("Yaw +  (A, CCW)", "A"), ("Yaw −  (D, CW)", "D"),
+                        ("Roll +  (Z)", "Z"), ("Roll −  (C)", "C")])
+    server.gui.add_button("STOP  (X)  — zero thrust", color="red").on_click(
+        lambda _evt: teleop.on_key("X"))
+
+    if field is not None:
+        dist = server.gui.add_checkbox(
+            "Disturbances: current + waves + kicks (G)", bool(field.enabled))
+        dist.on_update(lambda _evt: setattr(field, "enabled", bool(dist.value)))
+
+    scale = server.gui.add_slider("Command scale", min=0.2, max=3.0, step=0.1,
+                                  initial_value=float(args.scale))
+    scale.on_update(lambda _evt: setattr(teleop, "keymap", keymap(scale.value)))
+
+    def _reset(_evt):
+        mujoco.mj_resetData(model, data)
+        if hydro is not None:
+            hydro.reset()
+        with teleop.lock:
+            teleop.wrench[:] = 0.0
+        T.set_thruster_forces(model, data, np.zeros(6))
+    server.gui.add_button("Reset pose").on_click(_reset)
+
+    rec_status = None
+    if recorder is not None:
+        with server.gui.add_folder("Recording (CSV)"):
+            rec_status = server.gui.add_text("rec", initial_value="idle", disabled=True)
+
+            def _rec_start(_evt):
+                try:
+                    p = recorder.start()
+                except Exception as e:
+                    rec_status.value = f"record FAILED: {e}"
+                    return
+                rec_status.value = f"REC -> {os.path.basename(p)}"
+
+            def _rec_stop(_evt):
+                p = recorder.stop()
+                rec_status.value = (f"saved {os.path.basename(p)} ({recorder.n} rows)"
+                                    if p else "idle")
+            server.gui.add_button("● Record", color="green").on_click(_rec_start)
+            server.gui.add_button("■ Stop", color="red").on_click(_rec_stop)
+
+    status = server.gui.add_text("status", initial_value="", multiline=True, disabled=True)
+    return status, rec_status
+
+
+class _ViserMonitor:
+    """Browser-side monitor for `--viser --monitor` (remote): a water-velocity
+    time-series uplot (NUMERIC seconds, not a date axis) and THREE separate image
+    panels -- (x,y), (x,z), (y,z) -- each a scatter coloured by time (viridis, old->now)
+    with the planned trajectory overlaid, plus the time-coloured 3D trajectory in the
+    scene. uplot can't colour points by time, so the projections are rendered off-screen
+    with matplotlib (Agg) and pushed as images. The time origin is the first sample and
+    RESETS to 0 when recording starts. push() is cheap; refresh()/image render are
+    throttled by the caller."""
+
+    def __init__(self, server, window_s=30.0, plan=None):
+        self.server = server
+        self.window_s = float(window_s)
+        self.plan = None if plan is None else np.asarray(plan, float)
+        n = int(self.window_s * 60) + 64
+        self.t = collections.deque(maxlen=n)
+        self.vx = collections.deque(maxlen=n)
+        self.vy = collections.deque(maxlen=n)
+        self.vz = collections.deque(maxlen=n)
+        self.px = collections.deque(maxlen=n)
+        self.py = collections.deque(maxlen=n)
+        self.pz = collections.deque(maxlen=n)
+        self.t0 = None                           # time axis origin (first sample / rec start)
+        self._rec = False                        # last-seen recording state (edge detect)
+        self._img_n = 0
+        # 256-entry viridis LUT for the time-colored 3D trajectory (gray fallback)
+        try:
+            from matplotlib import colormaps
+            self._lut = (colormaps["viridis"](np.linspace(0, 1, 256))[:, :3] * 255).astype(np.uint8)
+        except Exception:
+            g = np.linspace(40, 255, 256).astype(np.uint8)
+            self._lut = np.stack([g, g, g], axis=1)
+        # one reusable off-screen panel, rendered once per projection per refresh
+        import matplotlib
+        matplotlib.use("Agg")
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        self._fig = Figure(figsize=(4.6, 3.8), dpi=80, facecolor="#0e0e0e")
+        self._canvas = FigureCanvasAgg(self._fig)
+        self._ax = self._fig.add_subplot(1, 1, 1)
+        z = np.zeros(1); e = np.zeros(0)
+        with server.gui.add_folder("Monitor (water vel + path)"):
+            self.vel = server.gui.add_uplot(
+                (z, z, z, z),
+                ({"label": "t (s)"},
+                 {"label": "Vx", "stroke": "#ef5350", "width": 2},
+                 {"label": "Vy", "stroke": "#66bb6a", "width": 2},
+                 {"label": "Vz", "stroke": "#64b5f6", "width": 2}),
+                scales={"x": {"time": False}},        # NUMERIC seconds, not a date axis
+                title="Water velocity (m/s) vs time (s)", aspect=2.0)
+            self.img_xy = server.gui.add_image(self._render_one(e, e, "x", "y", 0, 1, True, e),
+                                               label="path (x, y) — top, colour = time", format="jpeg")
+            self.img_xz = server.gui.add_image(self._render_one(e, e, "x", "z", 0, 2, False, e),
+                                               label="path (x, z) — side, colour = time", format="jpeg")
+            self.img_yz = server.gui.add_image(self._render_one(e, e, "y", "z", 1, 2, False, e),
+                                               label="path (y, z) — colour = time", format="jpeg")
+
+    def push(self, t, vtot, pos, recording=False):
+        # restart the clock at 0 when recording STARTS, or when sim time jumps back (reset)
+        reset = (recording and not self._rec) or (self.t and t < self.t[-1])
+        self._rec = recording
+        if reset:
+            for d in (self.t, self.vx, self.vy, self.vz, self.px, self.py, self.pz):
+                d.clear()
+            self.t0 = None
+        if self.t0 is None:
+            self.t0 = t
+        self.t.append(t)
+        self.vx.append(vtot[0]); self.vy.append(vtot[1]); self.vz.append(vtot[2])
+        self.px.append(pos[0]); self.py.append(pos[1]); self.pz.append(pos[2])
+
+    def refresh(self):
+        if not self.t:
+            return
+        t = np.fromiter(self.t, float)
+        i0 = int(np.searchsorted(t, t[-1] - self.window_s))
+        tt = t[i0:]
+        vx = np.fromiter(self.vx, float)[i0:]
+        vy = np.fromiter(self.vy, float)[i0:]
+        vz = np.fromiter(self.vz, float)[i0:]
+        px = np.fromiter(self.px, float)[i0:]
+        py = np.fromiter(self.py, float)[i0:]
+        pz = np.fromiter(self.pz, float)[i0:]
+        self.vel.data = (tt - self.t0, vx, vy, vz)    # numeric seconds from 0
+        span = (tt[-1] - tt[0]) if tt.size >= 2 else 0.0
+        norm = np.clip((tt - tt[0]) / span, 0.0, 1.0) if span > 0 else np.zeros(tt.size)
+        # time-colored 3D trajectory (viridis: old -> now) in the same 3D scene
+        colors = self._lut[(norm * 255).astype(int)]
+        pts3 = np.column_stack([px, py, pz]).astype(np.float32)
+        self.server.scene.add_point_cloud("/monitor/traj", pts3, colors,
+                                          point_size=0.015, point_shape="circle")
+        # the three projection scatters (render is heavier -> throttle further)
+        self._img_n += 1
+        if self._img_n % 6 == 1:
+            self.img_xy.image = self._render_one(px, py, "x", "y", 0, 1, True, norm)
+            self.img_xz.image = self._render_one(px, pz, "x", "z", 0, 2, False, norm)
+            self.img_yz.image = self._render_one(py, pz, "y", "z", 1, 2, False, norm)
+
+    def _render_one(self, a, b, la, lb, ia, ib, equal, norm):
+        """Render ONE time-coloured projection (+ planned trajectory) to an RGB array.
+        (x,y) keeps equal aspect; (x,z)/(y,z) autoscale so small depth variation shows."""
+        ax = self._ax
+        ax.clear()
+        ax.set_facecolor("#0e0e0e")
+        if self.plan is not None:
+            if len(self.plan) > 1:
+                ax.plot(self.plan[:, ia], self.plan[:, ib], "--", color="#ffb300",
+                        lw=1.5, zorder=1, label="planned")
+            else:
+                ax.scatter(self.plan[:, ia], self.plan[:, ib], marker="+",
+                           color="#ffb300", s=120, zorder=1, label="target")
+        if a.size:
+            ax.scatter(a, b, c=norm, cmap="viridis", s=11, zorder=2)
+        ax.set_xlabel(f"{la} (m)", color="#dddddd", fontsize=11)
+        ax.set_ylabel(f"{lb} (m)", color="#dddddd", fontsize=11)
+        if equal:
+            ax.set_aspect("equal", "datalim")
+        ax.grid(alpha=0.25)
+        ax.tick_params(colors="#aaaaaa", labelsize=9)
+        for sp in ax.spines.values():
+            sp.set_color("#444444")
+        self._fig.tight_layout()
+        self._canvas.draw()
+        return np.asarray(self._canvas.buffer_rgba())[:, :, :3].copy()
+
+
+def run_viser(model, data, teleop, hydro, args, controller=None, mission=None):
+    """Headless remote mode: NO GLFW. Serve the scene + GUI over HTTP via viser;
+    physics / hydro / disturbances run exactly as in the local modes."""
+    import viser
+
+    server = viser.ViserServer(host="0.0.0.0", port=args.port, verbose=False)
+    try:
+        server.scene.set_up_direction("+z")    # MuJoCo FLU is z-up
+    except Exception:
+        pass
+    server.scene.add_frame("/world", axes_length=0.3, axes_radius=0.008)
+    handles = build_viser_scene(server, model, data)
+    from recorder import Recorder, record_row
+    # In a --square mission the mission OWNS the recorder (auto start/stop); otherwise
+    # offer the manual Record/Stop buttons.
+    # CSV name = <trajectory>_<model> so it says both which path and which controller ran:
+    #   --goto-origin --ctrl dobmpc -> origin_dobmpc_<ts>.csv ; plain teleop -> teleop_<ts>.csv
+    _tag = f"origin_{controller.mode}" if controller is not None else "teleop"
+    recorder = None if mission is not None else Recorder(os.path.join(HERE, "recordings"), tag=_tag)
+    status, rec_status = build_viser_gui(server, model, data, teleop, hydro, args, recorder)
+    mstatus = (server.gui.add_text("mission", initial_value="", disabled=True)
+               if mission is not None else None)
+    if mission is not None:                          # preview the planned square path
+        pts = mission.plan_points()
+        segs = np.stack([pts[:-1], pts[1:]], axis=1)              # (4, 2, 3) edges
+        server.scene.add_line_segments("/plan/square", segs, (255, 210, 80), line_width=3)
+        server.scene.add_point_cloud("/plan/corners", pts[:-1].astype(np.float32),
+                                     np.tile((255, 210, 80), (4, 1)).astype(np.uint8),
+                                     point_size=0.02, point_shape="circle")
+    vmon = None
+    if args.monitor:                              # render the monitor in the browser
+        try:
+            vmon = _ViserMonitor(server, args.monitor_window,
+                                 plan=_plan_points(mission, controller))
+            print("[monitor] browser panels added (Monitor folder + 3D trajectory).")
+        except Exception as e:
+            print(f"[monitor] viser panels disabled ({e})")
+            vmon = None
+
+    bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "base_link")
+    dt = model.opt.timestep
+    n_sub = max(1, round((1.0 / 30.0) / dt))   # ~30 fps render over the network
+    draw_arrows = not args.no_arrows
+    last = [0.0]
+    last_mon = [0.0]
+    last_rec = [0.0]
+
+    print(f"[viser] {len(handles)} geoms synced; serving on 0.0.0.0:{args.port} "
+          f"(reachable over Tailscale/SSH).")
+    print(f"Open  http://<machine-or-tailscale-ip>:{args.port}  in a browser and "
+          f"drive from the GUI panel.  Ctrl-C here to quit.")
+    try:
+        while True:
+            t0 = time.time()
+            for _ in range(n_sub):
+                if mission is not None:
+                    mission.step(model, data)
+                elif controller is not None:
+                    controller.apply(model, data)
+                mujoco.mj_step(model, data)     # hydro passive callback runs in here
+            for gid, h in handles:              # mjData -> viser scene sync
+                h.position = tuple(map(float, data.geom_xpos[gid]))
+                h.wxyz = _mat2wxyz(data.geom_xmat[gid])
+            if draw_arrows:
+                try:
+                    viser_draw_arrows(server, hydro, teleop, data, bid)
+                except Exception as e:
+                    print(f"\n[viser] force arrows disabled ({e})")
+                    draw_arrows = False
+            if t0 - last[0] > 0.15:
+                mags = force_magnitudes(hydro, teleop, data, bid)
+                status.value = _status_text(teleop, mags)
+                _status(teleop, mags, None)     # also to the SSH terminal
+                last[0] = t0
+            if vmon is not None:
+                s = monitor_sample(hydro, data, bid)
+                rec = (mission.rec.active if mission is not None
+                       else (recorder.active if recorder is not None else False))
+                vmon.push(s["t"], s["vtot"], s["pos"], recording=rec)
+                if t0 - last_mon[0] > 0.1:         # ~10 Hz network refresh
+                    try:
+                        vmon.refresh()
+                    except Exception as e:
+                        print(f"\n[monitor] viser panels disabled ({e})")
+                        vmon = None
+                    last_mon[0] = t0
+            if mission is not None:                   # mission auto-records; show status
+                if t0 - last_rec[0] > 0.3:
+                    mstatus.value = mission.status()
+                    last_rec[0] = t0
+            elif recorder.active:                     # manual CSV logging (Record/Stop)
+                recorder.log(record_row(data, bid, hydro))
+                if rec_status is not None and t0 - last_rec[0] > 0.5:
+                    rec_status.value = f"REC {recorder.n} rows -> {os.path.basename(recorder.path)}"
+                    last_rec[0] = t0
+            slack = n_sub * dt - (time.time() - t0)
+            if slack > 0:
+                time.sleep(slack)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if recorder is not None:
+            saved = recorder.stop()                   # flush manual recording
+            if saved:
+                print(f"[record] saved {saved} ({recorder.n} rows)")
+        try:
+            server.stop()
+        except Exception:
+            pass
+    print("\nbye")
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +871,13 @@ def main():
     ap = argparse.ArgumentParser(description="BlueROV2 keyboard teleop (FLU) + force arrows.")
     ap.add_argument("--managed", action="store_true",
                     help="old managed viewer (no arrows); plain python anywhere, terminal keys")
+    ap.add_argument("--viser", "--remote", dest="viser", action="store_true",
+                    help="headless remote mode: serve a viser web UI (no GLFW) instead "
+                         "of the local viewer; drive from browser GUI buttons/sliders")
+    ap.add_argument("--port", type=int, default=8080,
+                    help="(--viser) web server port (default 8080)")
+    ap.add_argument("--no-arrows", action="store_true",
+                    help="(--viser) skip the force-arrow overlay (lighter over a slow link)")
     ap.add_argument("--plot", action="store_true",
                     help="console sparklines of drag/wave/kick magnitude over time")
     ap.add_argument("--pynput", action="store_true",
@@ -377,7 +890,42 @@ def main():
                     help="disable Phase-3 hydro + gravity (thruster-only mode)")
     ap.add_argument("--disturb", action="store_true",
                     help="start with Phase-4 disturbances ON (toggle with G)")
+    ap.add_argument("--monitor", dest="monitor", action="store_true", default=True,
+                    help="live monitor (water velocity + ROV trajectory); ON by default. "
+                         "Local viewers -> pyqtgraph window; --viser -> browser")
+    ap.add_argument("--no-monitor", dest="monitor", action="store_false",
+                    help="disable the live monitor (on by default)")
+    ap.add_argument("--monitor-window", type=float, default=30.0,
+                    help="(--monitor) rolling time window in seconds (default 30)")
+    ap.add_argument("--goto-origin", dest="goto_origin", action="store_true",
+                    help="autonomous baseline controller: drive to the global origin "
+                         "(keyboard idle; G still toggles disturbances)")
+    ap.add_argument("--ctrl", choices=("pd", "pid", "mpc", "dobmpc"), default="pid",
+                    help="(--goto-origin) controller: pd/pid baseline, or mpc/dobmpc "
+                         "(NMPC without/with the EAOB disturbance observer). Default pid.")
+    ap.add_argument("--start", type=str, default="2,1.5,-1,45",
+                    help="(--goto-origin/--square) initial pose 'x,y,z,yawdeg'")
+    ap.add_argument("--square", action="store_true",
+                    help="autonomous mission: approach origin, then auto-record while "
+                         "tracking a square (x,y) trajectory N laps, then save the CSV")
+    ap.add_argument("--laps", type=int, default=10, help="(--square) number of laps")
+    ap.add_argument("--square-size", dest="square_size", type=float, default=1.0,
+                    help="(--square) side length in m (default 1.0)")
+    ap.add_argument("--square-speed", dest="square_speed", type=float, default=0.15,
+                    help="(--square) path speed in m/s (default 0.15)")
+    ap.add_argument("--waves", choices=("spectrum", "classic"), default="spectrum",
+                    help="wave model: irregular JONSWAP spectrum (default) or the 3 "
+                         "classic sinusoids")
+    ap.add_argument("--sea", type=str, default="0.20,4.0",
+                    help="(--waves spectrum) sea state 'Hs,Tp' (m,s; default 0.20,4.0)")
     args = ap.parse_args()
+    if args.managed and (args.goto_origin or args.square):
+        # --managed cedes the main thread to mujoco.viewer.launch (its own physics
+        # thread); driving the controller from another thread races MjData. The
+        # passive (default) and --viser loops have a same-thread per-step hook.
+        print("[error] --goto-origin / --square need the local viewer (default) or "
+              "--viser; --managed has no thread-safe per-step control hook.")
+        return
 
     model = mujoco.MjModel.from_xml_path(XML)
     data = mujoco.MjData(model)
@@ -391,12 +939,48 @@ def main():
         model.opt.gravity[:] = 0.0          # thruster-only mode (Phase 1/2 feel)
         hydro = None
     else:
-        field = D.DisturbanceField(seed=0)  # Phase 4: current+waves+kicks (toggle G)
+        if args.waves == "spectrum":        # irregular JONSWAP waves (default)
+            hs, tp = (float(v) for v in args.sea.split(","))
+            waves = D.jonswap_wave_specs(Hs=hs, Tp=tp, seed=0)
+        else:
+            waves = D.DEFAULT_WAVES         # 3 classic sinusoids
+        field = D.DisturbanceField(waves=waves, seed=0)  # current + waves + kicks (G)
         field.enabled = args.disturb
         hydro = H.Hydrodynamics(model, disturbance=field).install()  # gravity ON
     # --managed prints its status from on_key (terminal); passive prints from loop
     teleop = Teleop(model, data, scale=args.scale, verbose=args.managed,
                     disturbance=field)
+
+    controller = None
+    mission = None
+    if args.goto_origin or args.square:
+        from controller import PoseController
+        sx, sy, sz, syaw = (float(v) for v in args.start.split(","))
+        data.qpos[:3] = [sx, sy, sz]
+        half = np.radians(syaw) / 2.0
+        data.qpos[3:7] = [np.cos(half), 0.0, 0.0, np.sin(half)]   # yaw quaternion (wxyz)
+        mujoco.mj_forward(model, data)
+        if args.ctrl in ("mpc", "dobmpc"):
+            from dobmpc_controller import DOBMPCController
+            controller = DOBMPCController(model, hydro=hydro, mode=args.ctrl,
+                                          setpoint=(0.0, 0.0, 0.0), yaw_ref=0.0)
+        else:
+            controller = PoseController(model, mode=args.ctrl, setpoint=(0.0, 0.0, 0.0),
+                                        yaw_ref=0.0, buoyancy_ff=hydro)
+        if args.square:
+            from recorder import Recorder
+            from mission import SquareMission
+            bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "base_link")
+            recorder = Recorder(os.path.join(HERE, "recordings"), tag=f"square_{args.ctrl}")
+            mission = SquareMission(controller, recorder, hydro, bid,
+                                    size=args.square_size, laps=args.laps,
+                                    speed=args.square_speed)
+            print(f"[square] {args.ctrl.upper()} {args.laps}-lap {args.square_size:.2f}m "
+                  f"square @ {args.square_speed:.2f} m/s from "
+                  f"({sx:+.1f},{sy:+.1f},{sz:+.1f}); auto-record on origin.")
+        else:
+            print(f"[goto-origin] {args.ctrl.upper()} controller -> origin; "
+                  f"start ({sx:+.1f},{sy:+.1f},{sz:+.1f}) yaw {syaw:.0f}°. Keyboard idle.")
 
     print(HELP)
     print(("Hydro+gravity ON (in-water feel: drag stops you, buoyancy holds depth, "
@@ -407,10 +991,34 @@ def main():
               f"current |{np.linalg.norm(field.current):.2f}| m/s, waves, kicks; "
               f"depth ~{field.z_surface:.0f} m at start.")
 
-    if args.managed:
-        run_managed(model, data, teleop, args)
-    else:
-        run_passive(model, data, teleop, hydro, args)
+    # --viser renders the monitor in the browser (see run_viser); the local viewers
+    # use the separate-process pyqtgraph desktop window, which needs a display.
+    monitor = None
+    if args.monitor and not args.viser:
+        try:
+            from monitor import MonitorHandle
+            monitor = MonitorHandle(window_s=args.monitor_window,
+                                    plan=_plan_points(mission, controller))
+            print("[monitor] dashboard process started.")
+        except Exception as e:
+            print(f"[monitor] disabled ({e})")
+            monitor = None
+
+    try:
+        if args.viser:
+            run_viser(model, data, teleop, hydro, args, controller=controller,
+                      mission=mission)
+        elif args.managed:
+            run_managed(model, data, teleop, hydro, args, monitor=monitor,
+                        controller=controller, mission=mission)
+        else:
+            run_passive(model, data, teleop, hydro, args, monitor=monitor,
+                        controller=controller, mission=mission)
+    finally:
+        if monitor is not None:
+            monitor.close()
+        if mission is not None:
+            mission.close()                 # flush/save any in-progress recording
 
 
 if __name__ == "__main__":

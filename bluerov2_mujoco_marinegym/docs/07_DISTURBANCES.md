@@ -23,6 +23,20 @@ v_wave(t, depth) = Σ_i  U_i · e^(−k_i·depth) · [ dir_i·cos(ω_i t + φ_i)
 depth = max(0, z_surface − z_body)
 ```
 
+**Irregular (JONSWAP) waves — default in teleop.** The 3 fixed sinusoids above look
+too regular. `jonswap_wave_specs(Hs, Tp, n=30, gamma=3.3, heading_deg, spread_s=4, seed)`
+returns a realistic **irregular** wave field as the same `{U,T,heading_deg,phase_deg}`
+component list (so `wave_velocity` / the equation are unchanged — only the components
+differ). Method (validated, Fossen Ch.8 / DNV-RP-C205): sample N components from a
+JONSWAP spectrum using **equal-energy bins with a random frequency per bin** (this kills
+the artificial repeat period — the key to "looks random"), uniform random phases, and
+`cos^(2s)` directional spreading (matters for yaw excitation). `U_i = ω_i·a_i` with
+`a_i=(Hs/4)√(2/N)` so `4√(Σa_i²/2)=Hs`. Default sea **Hs=0.20 m, Tp=4.0 s**; teleop
+`--waves spectrum` (default) / `--waves classic` (the 3 sinusoids) / `--sea "Hs,Tp"`.
+Note: `k=ω²/g` is kept (deep-water), so for Tp≥~5 s swell the 3 m-site penetration is
+an approximation; full `ω²=g·k·tanh(kd)` is a documented upgrade. `kick` is unchanged
+(a 0.15 s impulsive gust, NOT a wave).
+
 **Wave implementation choice:** via the water velocity (not a direct wrench).
 Because `vr` also drives the added-mass finite difference, a time-varying
 `v_water` excites **both** the wave drag **and** the wave added-mass (inertia)

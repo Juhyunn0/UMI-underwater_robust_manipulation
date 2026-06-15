@@ -61,6 +61,60 @@ def _heading3(deg):
     return np.array([np.cos(a), np.sin(a), 0.0])
 
 
+# ---- irregular waves: JONSWAP spectrum (random-phase linear superposition) -----
+DEFAULT_HS = 0.20      # significant wave height [m]   (small coastal/sheltered site)
+DEFAULT_TP = 4.0       # peak period [s]
+DEFAULT_GAMMA = 3.3    # JONSWAP peak factor (gamma=1 -> Pierson-Moskowitz)
+DEFAULT_NWAVE = 30     # number of components
+DEFAULT_SPREAD_S = 4.0 # cos^(2s) directional spreading (larger = narrower)
+
+
+def jonswap_wave_specs(Hs=DEFAULT_HS, Tp=DEFAULT_TP, n=DEFAULT_NWAVE, gamma=DEFAULT_GAMMA,
+                       heading_deg=0.0, spread_s=DEFAULT_SPREAD_S, seed=0):
+    """Irregular wave field as a list of component dicts {U, T, heading_deg, phase_deg}
+    (drop-in for ``DisturbanceField(waves=...)``). Components are sampled from a JONSWAP
+    spectrum using **equal-energy bins with a random frequency per bin** (so the summed
+    field has no artificial repeat period), uniform random phases, and cos^(2s)
+    directional spreading about ``heading_deg``. U_i = omega_i * a_i is the deep-water
+    surface orbital-velocity amplitude (the model's cos-horizontal / sin-vertical sum is
+    the correct circular orbit). Reproducible via ``seed``. Validated by
+    underwater-robotics-advisor (Fossen Ch.8 / DNV-RP-C205).
+
+    Note: the field keeps deep-water dispersion k = omega^2/g; for Tp >= ~5 s the swell
+    is only intermediate-water at the ~3 m site, so penetration is an approximation.
+    """
+    rng = np.random.default_rng(seed)
+    wp = 2 * np.pi / Tp
+    w_lo, w_hi = 0.3 * wp, 3.5 * wp
+
+    def S(w):                                       # JONSWAP shape (unnormalized)
+        sig = np.where(w <= wp, 0.07, 0.09)
+        r = np.exp(-(w - wp) ** 2 / (2 * sig ** 2 * wp ** 2))
+        return w ** -5.0 * np.exp(-1.25 * (wp / w) ** 4) * gamma ** r
+
+    # equal-energy bin edges from the cumulative spectrum on a fine grid
+    wg = np.linspace(w_lo, w_hi, 4000)
+    Sg = S(wg)
+    cum = np.concatenate([[0.0], np.cumsum(0.5 * (Sg[1:] + Sg[:-1]) * np.diff(wg))])
+    cum /= cum[-1]
+    edges = np.interp(np.linspace(0, 1, n + 1), cum, wg)
+    w_i = edges[:-1] + rng.random(n) * np.diff(edges)     # one random freq per bin
+    a_i = (Hs / 4.0) * np.sqrt(2.0 / n)                   # equal-energy, Hs-normalized
+    U_i = w_i * a_i                                       # surface orbital speed amp
+    phase = rng.uniform(0.0, 2 * np.pi, n)
+    # cos^(2s) directional spreading about heading_deg (rejection sampling)
+    th = np.empty(n)
+    for i in range(n):
+        while True:
+            c = rng.uniform(-np.pi, np.pi)
+            if rng.random() <= np.cos(c / 2.0) ** (2 * spread_s):
+                th[i] = np.radians(heading_deg) + c
+                break
+    return [dict(U=float(U_i[i]), T=float(2 * np.pi / w_i[i]),
+                 heading_deg=float(np.degrees(th[i])),
+                 phase_deg=float(np.degrees(phase[i]))) for i in range(n)]
+
+
 class DisturbanceField:
     """3-layer FLU disturbance field queried by hydro each substep."""
 

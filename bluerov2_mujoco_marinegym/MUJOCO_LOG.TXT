@@ -1,0 +1,9 @@
+Sun Jun 14 18:38:48 2026
+ERROR: could not initialize GLFW
+
+Sun Jun 14 18:57:22 2026
+ERROR: Python exception raised
+
+Mon Jun 15 10:29:53 2026
+ERROR: could not initialize GLFW
+

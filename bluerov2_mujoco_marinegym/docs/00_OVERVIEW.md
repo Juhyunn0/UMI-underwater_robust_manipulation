@@ -12,11 +12,15 @@ A simulator for the **BlueROV2** underwater vehicle, built to be an **MPC testbe
 planned later. The long-term research goal is energy-efficient, robust underwater
 manipulation in dynamic currents.
 
-- **Target runtime:** Ubuntu 22.04 + NVIDIA RTX 5090 (Blackwell), conda env
-  `robust`, MuJoCo **MJX** (GPU) + JAX (cu128).
-- **Current status:** drafting on **macOS** with base `mujoco` (CPU). Everything
-  produced is portable; the MJCF + meshes carry over to Linux unchanged. See
-  [06_ENVIRONMENT.md](06_ENVIRONMENT.md).
+- **Target runtime:** Ubuntu 22.04 + NVIDIA RTX 5090 (Blackwell). **Two** conda
+  envs: **`robust`** (CPU — base `mujoco`, perception/SLAM, MPC; Python 3.14,
+  numpy<2) and **`robust-mjx`** (GPU — MuJoCo **MJX** + JAX cuda12; Python 3.12,
+  numpy 2). They are split because GPU JAX needs numpy≥2 but `robust`'s gtsam pins
+  numpy<2. See [06_ENVIRONMENT.md](06_ENVIRONMENT.md).
+- **Current status:** transferred to the Linux/RTX 5090 box; **Phase 0 done**
+  (GPU/MJX verified, 2026-06-14). The build through MPC runs on CPU `mujoco` in
+  `robust`; MJX/GPU (`robust-mjx`) is staged for the RL phase. The MJCF + meshes
+  carry over unchanged.
 
 ## Engine: MuJoCo (MJX)
 
@@ -64,7 +68,7 @@ Run anything with plain `python <script>.py` from this folder (base `mujoco` +
 
 | phase | scope | status | doc |
 |---|---|---|---|
-| **0** | GPU/runtime setup (Linux+5090, conda `robust`, JAX cu128, mujoco-mjx) | **PENDING** (on Linux) | [06_ENVIRONMENT.md](06_ENVIRONMENT.md) |
+| **0** | GPU/runtime setup (Linux+5090, env `robust-mjx`, JAX cuda12, mujoco-mjx) | **DONE** ✓ (2026-06-14) | [06_ENVIRONMENT.md](06_ENVIRONMENT.md) |
 | **1** | Rigid-body MJCF from MarineGym (mass/inertia/thruster sites, meshes) | **DONE** ✓ | [02_MODEL.md](02_MODEL.md) |
 | **2** | Thruster actuation (T200 curve, 6 actuators, allocation matrix) | **DONE** ✓ | [03_THRUSTERS.md](03_THRUSTERS.md) |
 | **—** | Keyboard teleop + live force-arrow visualization | **DONE** ✓ | [05_TELEOP.md](05_TELEOP.md) |
@@ -77,8 +81,9 @@ Run anything with plain `python <script>.py` from this folder (base `mujoco` +
 
 What's verified today: Phases 1–4 each have a passing `test_*.py` (load + stats +
 stability; thruster directions + allocation; neutral buoyancy + self-righting +
-terminal velocity; current/waves/kicks distinct + DR stable). Phase 0 is the only
-thing blocking GPU/MJX runs.
+terminal velocity; current/waves/kicks distinct + DR stable), re-verified on the
+Linux/RTX 5090 box under `robust`. Phase 0 (GPU/MJX runtime) is now **done** —
+the 5090 is detected and a tiny MJX rollout runs on GPU in `robust-mjx`.
 
 ## Going forward (doc maintenance pattern)
 

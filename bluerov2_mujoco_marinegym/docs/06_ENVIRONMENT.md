@@ -1,6 +1,11 @@
 # 06 — Environment & portability
 
-## Current: macOS drafting (CPU, base MuJoCo)
+## Historical: macOS drafting (CPU, base MuJoCo)
+
+> **Update (2026-06-14):** the project has transferred to the Linux + RTX 5090
+> machine. The runtime now lives in the conda envs described under
+> "Linux + RTX 5090 runtime (Phase 0 — DONE)" below. The macOS notes in this
+> section are kept for history only.
 
 We are drafting on a MacBook (no NVIDIA GPU). Everything here runs on CPU with
 **base `mujoco`** and stays portable to the Linux/GPU runtime.
@@ -40,18 +45,47 @@ Workarounds (in order of preference):
 General shell hygiene: quote the path, and prefer absolute paths in scripts
 (`os.path.dirname(__file__)`), which the code already does.
 
-## Planned: Linux + RTX 5090 runtime (Phase 0 — PENDING)
+## Linux + RTX 5090 runtime (Phase 0 — DONE 2026-06-14)
 
-The real runs happen on **Ubuntu 22.04 + NVIDIA RTX 5090 (Blackwell)**:
+The real runs happen on **Ubuntu 22.04 + NVIDIA RTX 5090 (Blackwell)**, driver
+**595.71.05** (CUDA 13.2). The runtime is split across **two conda envs** because
+the perception stack and GPU JAX impose contradictory numpy ranges:
 
-- conda env **`robust`** (this env lives only on the Linux machine — do not try to
-  use it on macOS).
-- **JAX with CUDA 12.8 (cu128)** — required for Blackwell/RTX 5090.
-- **`mujoco-mjx`** for GPU-accelerated, batched simulation (RL in Phase 8, fast MPC
-  rollouts in Phase 7).
+| env | Python | numpy | role | key packages |
+|---|---|---|---|---|
+| **`robust`** | 3.14 | 1.26.4 (<2) | CPU sim + perception/SLAM + MPC | base `mujoco` 3.9, gtsam 4.2.1, pyzed, casadi, opencv |
+| **`robust-mjx`** | 3.12 | 2.4.6 | GPU MJX rollouts + RL (Phases 7–8) | jax 0.10.1 + jaxlib (cuda12, bundled `nvidia-*-cu12` 12.9 wheels), mujoco-mjx 3.9 |
 
-Phase 0 = standing up this env and verifying the model loads under MJX. It is the
-only thing blocking GPU work; the model/physics are otherwise ready.
+**Why two envs:** GPU `jax[cuda12]` hard-requires `numpy>=2`, but `robust`'s
+**gtsam 4.2.1** is ABI-pinned to `numpy<2`. One env can't hold both, so GPU/MJX
+lives in its own `robust-mjx`. Do **not** `pip install jax[cuda12]` / `mujoco-mjx`
+into `robust` — it force-upgrades numpy and breaks gtsam.
+
+How it was installed (already done):
+
+```bash
+conda create -n robust-mjx python=3.12 -y
+# use the ABSOLUTE interpreter path (see gotcha below):
+/home/bdml/miniforge3/envs/robust-mjx/bin/python -m pip install -U "jax[cuda12]"
+/home/bdml/miniforge3/envs/robust-mjx/bin/python -m pip install -U mujoco mujoco-mjx
+```
+
+**Verified** by `bluerov2_mujoco_marinegym/verify_gpu_mjx.py` (run with
+`XLA_PYTHON_CLIENT_PREALLOCATE=false`): `jax.default_backend()=='gpu'`,
+`jax.devices()==[CudaDevice(id=0)]` = NVIDIA GeForce RTX 5090; a tiny MJX rollout
+**and** the canonical `bluerov.xml` both step on GPU with finite states. (Benign
+import warning `Failed to import warp/mujoco_warp` — mujoco-mjx's optional
+NVIDIA-Warp backend is absent; we use the JAX backend.)
+
+**Gotcha:** the VS Code terminal auto-activates `robust`, which shadows other envs,
+so `conda run -n robust-mjx python …` can silently resolve to robust's 3.14
+interpreter. For GPU work always invoke the **absolute** path
+`/home/bdml/miniforge3/envs/robust-mjx/bin/python`.
+
+**Still pending for MJX:** the CPU passive-callback hydro (`hydro.py`,
+`set_mjcb_passive`) does **not** run under MJX, so MJX rollouts currently move the
+rigid body + thrusters but not the Fossen hydrodynamics. Re-expressing the hydro
+in JAX is the next GPU task (Phase 3-on-GPU); the model/physics are otherwise ready.
 
 ## Portability — what carries over unchanged vs not
 
