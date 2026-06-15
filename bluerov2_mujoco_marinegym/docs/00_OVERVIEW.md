@@ -4,6 +4,11 @@
 > no chat history: **read this file, then [01_DECISIONS.md](01_DECISIONS.md)**,
 > before changing anything. The conventions and findings below prevent real bugs
 > (NED sign flips, mixed parameters, commanding the underactuated pitch DOF).
+>
+> **Control methodology journal:** the *why-narrative* of the controller development
+> (PID → MPC → DOB-MPC → …) lives in [CONTROL_METHODOLOGY.md](CONTROL_METHODOLOGY.md)
+> (Korean: [CONTROL_METHODOLOGY.ko.md](CONTROL_METHODOLOGY.ko.md)). **Append a dated
+> entry there on every major control change/decision** (keep both languages in sync).
 
 ## What this project is
 

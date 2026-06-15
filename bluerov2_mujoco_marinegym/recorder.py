@@ -83,7 +83,7 @@ class Recorder:
             day = ts.split("_")[0]                          # YYYYMMDD (same date as the file)
             day_dir = os.path.join(self.out_dir, day)       # group recordings by day
             os.makedirs(day_dir, exist_ok=True)
-            path = os.path.join(day_dir, f"{self.tag}_{ts}.csv")
+            path = os.path.join(day_dir, f"{ts}_{self.tag}.csv")   # date first: <date>_<traj>_<model>.csv
             f = open(path, "w", newline="")
             try:
                 w = csv.DictWriter(f, fieldnames=self.fieldnames)
