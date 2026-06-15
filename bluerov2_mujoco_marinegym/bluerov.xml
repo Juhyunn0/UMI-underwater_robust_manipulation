@@ -1,0 +1,121 @@
+<!--
+  BlueROV2 (heavy-config) rigid body imported from MarineGym's BlueROV asset.
+
+  Provenance
+  ----------
+  Geometry, mass, inertia and the 6 thruster mount transforms are extracted
+  verbatim from MarineGym's Isaac asset:
+      external/MarineGym/.../usd/BlueROV/BlueROV.usd
+  whose config.yaml documents its own source as
+      bluerov2_description/urdf/BlueROV.urdf
+  The visual meshes in ./meshes/ are the real MarineGym meshes (body decimated
+  307785 -> 40000 faces; T200 thruster 6135 -> 2999 faces). Hydrodynamic
+  coefficients + the T200 rotor config live in ./marinegym_assets/BlueROV.yaml
+  and are used in the NEXT phase, not here.
+
+  Frame
+  -----
+  MarineGym / URDF native frame: x forward, y left, z up (Z-up FLU).
+  World is standard MuJoCo Z-up, gravity (0 0 -9.81), ON by default.
+
+  Scope: rigid body (Phase 1) + thruster actuation (Phase 2) + hydrodynamics
+  (Phase 3). Each thruster_i site's local +X axis is the thrust direction; one
+  <general> force actuator ("thr0".."thr5") drives it. ctrl is thrust in NEWTONS
+  (throttle[-1,1] -> N via the T200 curve in thrusters.py). MarineGym zeroes
+  propeller reaction torque, so the actuators apply force only (no spin torque);
+  body torque is r x F.
+  Hydrodynamics (buoyancy/restoring/added-mass/drag) are applied at runtime by
+  hydro.py via a passive-force callback (set_mjcb_passive); MuJoCo's built-in
+  fluid stays off (density=viscosity=0). The Phase 1/2 tests zero gravity only
+  to isolate thrust.
+-->
+<mujoco model="bluerov2_marinegym">
+  <compiler angle="radian" meshdir="meshes" autolimits="true"/>
+
+  <!-- density=0 viscosity=0: MuJoCo's built-in fluid model is OFF on purpose;
+       all hydrodynamics are injected in the next phase. -->
+  <option timestep="0.002" integrator="implicitfast" density="0" viscosity="0"/>
+
+  <visual>
+    <headlight ambient="0.6 0.6 0.62" diffuse="0.85 0.85 0.88" specular="0.25 0.25 0.25"/>
+    <rgba haze="0.12 0.18 0.28 1"/>
+    <scale framelength="0.25" framewidth="0.008"/>
+    <global offwidth="1280" offheight="960"/>
+  </visual>
+
+  <asset>
+    <mesh name="bluerov_body"     file="bluerov_body.obj"/>
+    <mesh name="bluerov_thruster" file="bluerov_thruster.obj"/>
+    <material name="hull"      rgba="0.33 0.37 0.44 1" specular="0.35" shininess="0.3"/>
+    <material name="thruster"  rgba="0.12 0.13 0.16 1" specular="0.4" shininess="0.4"/>
+    <material name="collision" rgba="0.85 0.45 0.20 0.25"/>
+  </asset>
+
+  <default>
+    <default class="visual">
+      <geom type="mesh" contype="0" conaffinity="0" group="2"/>
+    </default>
+    <default class="collision">
+      <geom type="box" group="3" material="collision" contype="1" conaffinity="1"/>
+    </default>
+    <default class="thruster">
+      <site type="cylinder" size="0.012 0.004" rgba="0.1 0.7 1 1" group="4"/>
+    </default>
+    <default class="ref">
+      <site type="sphere" size="0.012" group="4"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <light name="key"  pos="0.8 0.8 2.5"  dir="-0.3 -0.3 -1" directional="true"
+           diffuse="0.55 0.55 0.6" specular="0.2 0.2 0.2"/>
+    <light name="fill" pos="-0.8 -0.6 1.2" dir="0.4 0.3 -1" directional="true"
+           diffuse="0.35 0.35 0.4" specular="0.1 0.1 0.1"/>
+    <body name="base_link" pos="0 0 0">
+      <freejoint name="free"/>
+      <!-- mass/inertia copied verbatim from MarineGym USD (base_link). The
+           explicit inertial element governs the dynamics; every geom below is
+           visual/collision only and does not alter the body inertia. -->
+      <inertial pos="0 0 0" mass="11.2" diaginertia="0.30375 0.626 0.5769"/>
+
+      <!-- ===== body visual (real MarineGym mesh, decimated) ===== -->
+      <geom class="visual" mesh="bluerov_body" material="hull"/>
+
+      <!-- ===== collision proxy (MarineGym/Isaac box collider) ===== -->
+      <geom class="collision" pos="0 0 -0.05" size="0.25 0.175 0.125"/>
+
+      <!-- ===== 6 thrusters: real T200 mesh + named mount site ===== -->
+      <!-- thruster 0 -->
+      <geom class="visual" mesh="bluerov_thruster" material="thruster" pos="0.1355 -0.1 -0.0725" quat="0.92388 0 0 0.382684"/>
+      <site name="thruster_0" class="thruster" pos="0.1355 -0.1 -0.0725" quat="0.92388 0 0 0.382684"/>
+      <!-- thruster 1 -->
+      <geom class="visual" mesh="bluerov_thruster" material="thruster" pos="0.1355 0.1 -0.0725" quat="0.92388 0 0 -0.382684"/>
+      <site name="thruster_1" class="thruster" pos="0.1355 0.1 -0.0725" quat="0.92388 0 0 -0.382684"/>
+      <!-- thruster 2 -->
+      <geom class="visual" mesh="bluerov_thruster" material="thruster" pos="-0.1475 -0.1 -0.0725" quat="0.382683 0 0 0.92388"/>
+      <site name="thruster_2" class="thruster" pos="-0.1475 -0.1 -0.0725" quat="0.382683 0 0 0.92388"/>
+      <!-- thruster 3 -->
+      <geom class="visual" mesh="bluerov_thruster" material="thruster" pos="-0.1475 0.1 -0.0725" quat="-0.382683 0 0 0.92388"/>
+      <site name="thruster_3" class="thruster" pos="-0.1475 0.1 -0.0725" quat="-0.382683 0 0 0.92388"/>
+      <!-- thruster 4 -->
+      <geom class="visual" mesh="bluerov_thruster" material="thruster" pos="0.0025 -0.1105 -0.005" quat="-0.707107 0 0.707107 0"/>
+      <site name="thruster_4" class="thruster" pos="0.0025 -0.1105 -0.005" quat="-0.707107 0 0.707107 0"/>
+      <!-- thruster 5 -->
+      <geom class="visual" mesh="bluerov_thruster" material="thruster" pos="0.0025 0.1105 -0.005" quat="-0.707107 0 0.707107 0"/>
+      <site name="thruster_5" class="thruster" pos="0.0025 0.1105 -0.005" quat="-0.707107 0 0.707107 0"/>
+
+      <!-- reference site at the base_link origin -->
+      <site name="base_origin" class="ref" pos="0 0 0" rgba="1 0.2 0.2 1"/>
+    </body>
+  </worldbody>
+
+  <!-- ===== Phase 2: thruster force actuators (ctrl = thrust in N) ===== -->
+  <actuator>
+    <general name="thr0" site="thruster_0" gear="1 0 0 0 0 0" ctrlrange="-51.5507 64.1319"/>
+    <general name="thr1" site="thruster_1" gear="1 0 0 0 0 0" ctrlrange="-51.5507 64.1319"/>
+    <general name="thr2" site="thruster_2" gear="1 0 0 0 0 0" ctrlrange="-51.5507 64.1319"/>
+    <general name="thr3" site="thruster_3" gear="1 0 0 0 0 0" ctrlrange="-51.5507 64.1319"/>
+    <general name="thr4" site="thruster_4" gear="1 0 0 0 0 0" ctrlrange="-51.5507 64.1319"/>
+    <general name="thr5" site="thruster_5" gear="1 0 0 0 0 0" ctrlrange="-51.5507 64.1319"/>
+  </actuator>
+</mujoco>
