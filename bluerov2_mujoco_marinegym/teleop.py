@@ -186,6 +186,41 @@ def _draw_plan(scn, pts, color=(1.0, 0.82, 0.3, 1.0), width=0.004):
         scn.ngeom += 1
 
 
+def _controller_meta(controller, ctrl_name=None):
+    """Compact controller descriptor for the per-run manifest. Reports the ACTUAL
+    NMPC solver in use (acados vs ipopt -- detected from the live solver object, so
+    it reflects a factory fallback), the horizon N, the control rate, and the mode."""
+    if controller is None:
+        return {"type": "teleop"}
+    m = {"type": ctrl_name or getattr(controller, "mode", "?")}
+    mode = getattr(controller, "mode", None)
+    if mode:
+        m["mode"] = mode                                    # dobmpc (w_hat on) vs mpc
+    nmpc = getattr(controller, "nmpc", None)
+    if nmpc is not None:
+        m["solver"] = "acados" if type(nmpc).__name__ == "AcadosNMPC" else "ipopt"
+        m["N"] = int(getattr(nmpc, "N", 0))
+    cd = getattr(controller, "ctrl_dt", None)
+    if cd:
+        m["ctrl_hz"] = round(1.0 / cd, 3)
+    return m
+
+
+def _run_manifest(field, controller, args, model, trajectory):
+    """Full per-run manifest (disturbance + controller/solver + trajectory + run
+    context) for the CSV sidecar. Built lazily at recording start so field.to_meta()
+    snapshots the live enabled/seed/kick state."""
+    from recorder import build_run_meta
+    return build_run_meta(
+        disturbance=field,
+        controller=_controller_meta(controller, getattr(args, "ctrl", None)),
+        trajectory=trajectory,
+        run=dict(started=time.strftime("%Y-%m-%d %H:%M:%S"),
+                 sim_dt=float(model.opt.timestep),
+                 waves=getattr(args, "waves", None)),
+    )
+
+
 def _plan_points(mission=None, controller=None):
     """Planned-trajectory points (N,3) for the monitor's 2D projections, or None.
     A mission supplies its path (e.g. the square); a goto-origin controller supplies
@@ -729,6 +764,11 @@ def run_viser(model, data, teleop, hydro, args, controller=None, mission=None):
     #   --goto-origin --ctrl dobmpc -> origin_dobmpc_<ts>.csv ; plain teleop -> teleop_<ts>.csv
     _tag = f"origin_{controller.mode}" if controller is not None else "teleop"
     recorder = None if mission is not None else Recorder(os.path.join(HERE, "recordings"), tag=_tag)
+    if recorder is not None:                                 # attach sidecar JSON manifest
+        _traj = (dict(kind="goto-origin", setpoint=list(getattr(controller, "p_ref", [0, 0, 0])),
+                      yaw_ref=float(getattr(controller, "yaw_ref", 0.0)))
+                 if controller is not None else dict(kind="teleop"))
+        recorder.set_meta(lambda: _run_manifest(teleop.disturbance, controller, args, model, _traj))
     status, rec_status = build_viser_gui(server, model, data, teleop, hydro, args, recorder)
     mstatus = (server.gui.add_text("mission", initial_value="", disabled=True)
                if mission is not None else None)
@@ -972,6 +1012,10 @@ def main():
             from mission import SquareMission
             bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "base_link")
             recorder = Recorder(os.path.join(HERE, "recordings"), tag=f"square_{args.ctrl}")
+            recorder.set_meta(lambda: _run_manifest(            # sidecar JSON manifest
+                field, controller, args, model,
+                dict(kind="square", size=args.square_size, laps=args.laps,
+                     speed=args.square_speed, depth=0.0)))
             mission = SquareMission(controller, recorder, hydro, bid,
                                     size=args.square_size, laps=args.laps,
                                     speed=args.square_speed)

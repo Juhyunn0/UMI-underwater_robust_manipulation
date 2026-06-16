@@ -7,6 +7,7 @@ One row per logged frame (FLU, z-up world frame): time; global position; orienta
 (current + wave water velocity, kick force, enabled flag); thruster forces u0..u5 (N).
 """
 import csv
+import json
 import os
 import threading
 import time
@@ -26,6 +27,24 @@ RECORD_FIELDS = [
     "u0", "u1", "u2", "u3", "u4", "u5",    # thruster forces written to actuators [N]
     "dist_on",                             # disturbances enabled (0/1)
 ]
+
+
+def build_run_meta(disturbance=None, controller=None, trajectory=None, run=None):
+    """Assemble the per-run manifest written beside each CSV (see Recorder.set_meta).
+
+    `disturbance` may be a DisturbanceField (its .to_meta() is captured) or a dict.
+    `controller`/`trajectory`/`run` are plain dicts the caller fills from its context
+    (e.g. {type, solver, ctrl_hz, N} / {kind, size, speed, laps} / {started, sim_dt,
+    log_hz}). Everything is JSON-serializable. Returns a dict; pass it to set_meta()."""
+    dist = (disturbance.to_meta() if hasattr(disturbance, "to_meta")
+            else disturbance) if disturbance is not None else None
+    return dict(
+        schema_version=1,
+        run=run or {},
+        controller=controller or {},
+        trajectory=trajectory or {},
+        disturbance=dist,
+    )
 
 
 def record_row(data, bid, hydro):
@@ -59,16 +78,23 @@ class Recorder:
     (on viser's thread) while the sim loop calls log() each frame (main thread); a
     lock guards the file handle so the two never race."""
 
-    def __init__(self, out_dir, fieldnames=RECORD_FIELDS, tag="teleop"):
+    def __init__(self, out_dir, fieldnames=RECORD_FIELDS, tag="teleop", meta=None):
         self.out_dir = out_dir
         self.fieldnames = fieldnames
         self.tag = tag
+        self.meta = meta                # run manifest dict (or callable -> dict)
+        self.meta_path = None
         self._lock = threading.Lock()
         self._f = None
         self._w = None
         self.path = None
         self.n = 0
         self.active = False
+
+    def set_meta(self, meta):
+        """Attach the per-run manifest written as a sidecar JSON at the next start().
+        `meta` may be a dict or a zero-arg callable returning one (snapshot at start)."""
+        self.meta = meta
 
     def start(self):
         """Open a new timestamped CSV under a per-day subfolder (out_dir/YYYYMMDD/)
@@ -94,7 +120,24 @@ class Recorder:
             self.path, self._f, self._w = path, f, w
             self.n = 0
             self.active = True
+            self._write_meta(path)                          # sidecar JSON manifest
             return self.path
+
+    def _write_meta(self, csv_path):
+        """Write the run manifest next to the CSV as <basename>.meta.json (snapshot
+        at recording start). No-op if no meta was attached; never aborts a recording
+        on a metadata I/O error (the CSV is the primary artifact)."""
+        if self.meta is None:
+            return
+        meta = self.meta() if callable(self.meta) else self.meta
+        self.meta_path = csv_path[:-4] + ".meta.json" if csv_path.endswith(".csv") \
+            else csv_path + ".meta.json"
+        try:
+            with open(self.meta_path, "w") as mf:
+                json.dump(meta, mf, indent=2)
+        except Exception as e:                              # don't kill the recording
+            self.meta_path = None
+            print(f"[recorder] WARN: could not write meta sidecar: {e}")
 
     def log(self, row):
         """Write one row (a dict over RECORD_FIELDS). No-op if not recording. Flushes

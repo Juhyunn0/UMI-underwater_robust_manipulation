@@ -219,6 +219,38 @@ class DisturbanceField:
         return cls(current=cfg["current"], waves=cfg["waves"], kicks=cfg["kicks"],
                    z_surface=z_surface, horizon=horizon, seed=cfg["seed"])
 
+    # ---- full serialization for the per-run metadata sidecar ----------------
+    def to_meta(self):
+        """JSON-serializable snapshot that FULLY reproduces & documents the field.
+
+        The ``waves`` list is a drop-in for ``DisturbanceField(waves=...)`` and the
+        ``kicks`` block carries the EXACT precomputed Poisson schedule (start/end/
+        force per event), not the log-rate-sampled ``kick_*`` columns -- so a run's
+        disturbance can be regenerated identically (same seed + this config) and the
+        kicks are captured completely regardless of the CSV log rate."""
+        waves = []
+        for U, omega, k, dir3, phase in self.waves:
+            waves.append(dict(U=float(U), T=float(2 * np.pi / omega),
+                              heading_deg=float(np.degrees(np.arctan2(dir3[1], dir3[0]))),
+                              phase_deg=float(np.degrees(phase) % 360.0)))
+        events = [dict(t_start=float(s), t_end=float(e),
+                       fx=float(f[0]), fy=float(f[1]), fz=float(f[2]))
+                  for s, e, f in zip(self._kick_starts, self._kick_ends,
+                                     self._kick_forces)]
+        return dict(
+            schema_version=1,
+            seed=self.seed,
+            enabled=bool(self.enabled),
+            use_current=bool(self.use_current),
+            use_waves=bool(self.use_waves),
+            use_kicks=bool(self.use_kicks),
+            z_surface=float(self.z_surface),
+            horizon=float(self.horizon),
+            current=[float(c) for c in self.current],
+            waves=waves,
+            kicks=dict(params=dict(self.kicks), n_events=len(events), events=events),
+        )
+
 
 # ---- domain randomization ----------------------------------------------------
 def _u(rng, lo, hi):

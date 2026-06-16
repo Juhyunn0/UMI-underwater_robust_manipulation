@@ -12,7 +12,61 @@ which describe *what exists and how it works*. This log records *why we decided 
 **How it's maintained:** updated on every **major** control change / milestone (not small
 bugfixes or refactors). Each update appends a dated entry below and keeps the Korean
 twin [CONTROL_METHODOLOGY.ko.md](CONTROL_METHODOLOGY.ko.md) in sync. Entry format:
-**Why → What (theory) → How (implementation + decisions) → Result**.
+**Why → What (theory, *with the governing equations*) → How (implementation + decisions) →
+Result**. Every entry includes its math.
+
+---
+
+## The setup — plant, disturbances, and what the controller controls
+
+Shared context for every entry below. (Reference: [04_HYDRO](04_HYDRO.md),
+[07_DISTURBANCES](07_DISTURBANCES.md); the plant physics is independently verified in
+[HYDRO_VERIFICATION](HYDRO_VERIFICATION.md).)
+
+**Plant (the controlled system).** BlueROV2, **FLU** body frame (x fwd, y left, z up),
+gravity (0,0,−9.81). Rigid body m=11.2 kg, inertia diag(0.30375, 0.626, 0.5769), COM at the
+body origin. State = pose η and body velocity ν; the 6-DOF Fossen model the controllers assume:
+
+```
+η = [x y z  φ θ ψ]ᵀ  (world position + roll/pitch/yaw)     ν = [u v w  p q r]ᵀ  (body lin+ang vel)
+η̇ = J(η) ν
+M ν̇ + C(ν)ν + D(ν)ν + g(η) = τ + w
+  M = M_RB + M_A                  (rigid-body + added mass; diagonal M_A here)
+  C(ν) = C_RB(ν) + C_A(ν)         (Coriolis/centripetal)
+  D(ν) = D_L + D_NL·|ν|           (linear + quadratic drag, diagonal)
+  g(η) = restoring (buoyancy B at CB = COM + coBM·ẑ_body, weight at COM; net +1.1 N up)
+  τ = control wrench,   w = disturbance wrench
+```
+(In the sim M_A is applied as an external lagged force, not in MuJoCo's mass matrix — see
+[HYDRO_VERIFICATION](HYDRO_VERIFICATION.md); the controllers still reason with M = M_RB+M_A.)
+
+**Disturbance w (the environment forcing).** Three FLU layers — current + waves enter as a
+*water velocity* through the relative velocity (so they modulate both drag and added mass,
+Morison-like); kicks are a direct external force:
+
+```
+v_water(t,d) = v_current + v_wave(t,d)
+v_r = ν_lin − Rᵀ v_water                                  → used in place of ν_lin in D(·), M_A(·)
+v_wave(t,d) = Σ_i U_i e^(−k_i d)[ dir_i cos(ω_i t+φ_i) + ẑ sin(ω_i t+φ_i) ],  k_i = ω_i²/g
+F_kick(t)  = Poisson-timed impulsive world-frame force (gusts), applied directly at the COM
+```
+So w is **DC (current) + oscillatory wave-band + impulses (kicks)** — the spectrum each
+controller is judged against. (JONSWAP spectrum: see the 2026-06-14 eval-env entry.)
+
+**What the controller controls (input → output).** Every controller below has the same I/O:
+
+```
+INPUT  (measured each step):  p (world pos), R (orientation → φ,θ,ψ), v (world lin vel),
+        ω (body ang vel);  DOB-MPC also ν̇ (finite difference, for the EAOB).
+        + reference: p_ref, ψ_ref, and v_ref for trajectories.
+OUTPUT (commanded):  body wrench  τ = [Fx Fy Fz  Mx My Mz]  with  Mx = My = 0
+        → 6 thruster forces  f = B⁺ τ   (B = 6×6 allocation, rank 5),  written to data.ctrl
+        → realized wrench  τ_real = B f   (uncommandable pitch My projected out)
+```
+**Rank-5 underactuation.** The 4 horizontal thrusters sit 0.0725 m below the COM, so surge
+couples to pitch: `My ≈ −0.0725·Fx`. Pitch is never commanded; it floats to the trim where
+buoyancy restoring balances the coupling: `sin θ* = 0.0725·Fx / (coBM·B)` (≈23° at 6 N). Every
+method below outputs τ to this same allocation and inherits this constraint.
 
 ---
 
@@ -37,6 +91,19 @@ guard. Decision: **never command pitch** — the BlueROV2 vectored-6 is rank-5 u
 all 4 horizontal thrusters sit 0.0725 m below the COM, so surge couples to pitch (My≈−0.0725·Fx);
 we leave roll/pitch to passive buoyancy restoring.
 
+**Equations.**
+```
+e = p_ref − p                                            (world position error)
+F_world = K_p e − K_d (v − v_ref) + K_i ∫e dt            (∫ gated: integrate only when |e|<e_gate)
+F_world,z += −net_buoy                                   (buoyancy feed-forward)
+F_body = Rᵀ F_world         (rotate to body; surge then slew-limited + saturated + pitch-guarded)
+M_z = k_pψ·wrap(ψ_ref−ψ) − k_dψ·r + k_iψ ∫e_ψ dt         (yaw PD+I)
+τ = [F_body,x, F_body,y, F_body,z, 0, 0, M_z]
+```
+*Why the integral rejects DC:* closed-loop sensitivity `S(jω) = 1/(1+L(jω))`; integral action makes
+`S(0) = 0` → **zero steady-state error to a constant w**. But `|S(jω)|` is only small near DC, so the
+wave-band and impulses pass through.
+
 **Result.** Holds the origin; under a 0.2 m/s current the integral nulls the DC bias to
 ~0.5 cm. But the **wave band (≈13 cm radial std), impulsive kicks (~30 cm transients), and a
 steady 9° trim pitch** remain — exactly the residual a model-based, disturbance-aware controller
@@ -59,6 +126,15 @@ relative-velocity hydro — a Morison-like model with no extra term.
 **How (implementation).** [mission.py](../mission.py) `SquareMission` (approach → track → done,
 auto-record CSV); `disturbances.jonswap_wave_specs(...)`. The square uses a continuously moving
 setpoint with velocity feed-forward into the controller's D-term.
+
+**Equations.**
+```
+JONSWAP:  S(ω) ∝ ω⁻⁵ exp(−1.25 (ω_p/ω)⁴) · γ^r,   r = exp(−(ω−ω_p)²/(2σ²ω_p²)),  ω_p = 2π/T_p
+equal-energy bins → ω_i (one random ω per bin);  a_i = (H_s/4)√(2/N);  U_i = ω_i a_i   so 4√(Σa_i²/2)=H_s
+v_wave, v_r:  as in "The setup" above (the components feed v_wave; v_r drives drag + added mass)
+square reference (origin = corner, CCW, side S, speed c):  s(t) = c·(t − t₀)
+   p_ref(s) traces the 4 edges of the S×S square;   v_ref = c · tangent(s)   (velocity feed-forward)
+```
 
 **Result.** A realistic test bed. Confirmed the PID tracks the square but with phase lag and the
 underactuated pitch transients grow under disturbance — the same limitations seen in
@@ -112,6 +188,22 @@ prediction, `w_hat` as a parameter. Design decisions and *why*:
 - **20 Hz control with zero-order hold** between physics substeps; feed the EAOB the *commanded* NED
   wrench it actually held.
 
+**Equations.**
+```
+MPC — receding-horizon OCP, solved every step, apply only u₀:
+  min_{x,u}  Σ_{k=0}^{N−1} ‖x_k − x_ref,k‖²_Q + ‖u_k‖²_R  +  ‖x_N − x_ref,N‖²_QN
+   s.t.  x_{k+1} = f_d(x_k, u_k, ŵ),   |u_k| ≤ u_max,   |ν_lin| ≤ v_max,   |φ|,|θ| ≤ 1.2 rad
+  prediction model (Fossen, ŵ a constant parameter over the horizon):
+     ẋ = [ J(η)ν ;  M⁻¹( τ(u) + ŵ − C(ν)ν − D(ν)ν − g(η) ) ],   τ(u) = [u₁,u₂,u₃, 0,0, u₄]
+  plain MPC sets ŵ = 0  → a gain-limited steady offset against a constant w.
+
+EAOB — augmented continuous-discrete EKF, state x_a = [η; ν; w], internal model  ẇ = 0:
+  predict:  ẋ_a = f(x_a, τ),   P⁺ = Φ P Φᵀ + Q,   Φ = exp(F·dt),  F = ∂f/∂x_a
+  update:   z = [η; ν; τ],   ŵ enters via   h_τ(x_a) = M ν̇ + C(ν)ν + D(ν)ν + g(η) − w
+            K = P Hᵀ(H P Hᵀ + R)⁻¹,   x_a ← x_a + K (z − h(x_a))
+DOB-MPC = MPC with ŵ = (EAOB w-estimate) injected as the prediction parameter each step.
+```
+
 **Result.** Dynamic-positioning comparison under JONSWAP+current+kicks (radial RMS / DC bias):
 **PID 13.3 cm / −0.1 · MPC 3.6 cm / +2.3 · DOB-MPC 3.7 cm / +0.3** (cm). Both MPC variants cut the
 wave-band residual ~5× vs PID; **DOB-MPC's EAOB nulls the DC bias that plain MPC leaves (+2.3→+0.3 cm)**
@@ -155,6 +247,16 @@ easy gain left on the MPC; only *how the NLP is solved* can move the median.
   validate against the IPOPT solution); codegen means edits require regeneration; weaker globalization.
   Fallback if avoiding the toolchain: hand-rolled **LTV-QP + OSQP** (~5–15 ms, lighter, less robust).
 
+**Equations.**
+```
+per tick now (IPOPT): solve the OCP above to tol 1e-5 — many interior-point iterations, each a sparse
+   KKT factorization of size ~ N·(n_x+n_u) = 60·(12+4) = 960 vars + shooting constraints  → ~83 ms.
+RTI (acados) instead: ONE Gauss-Newton SQP step per tick, warm-started from the shifted previous z:
+   linearize  x_{k+1}=f_d(x_k,u_k,ŵ)  about the previous trajectory  →  one structured QP
+   solve with HPIPM + (partial) condensing (exploits the time-banded KKT block structure)
+   → fixed 1 iteration → deterministic ~2–5 ms (no convergence loop, no freezes).
+```
+
 **Result.** Analysis only this turn (no code changed). Constraint kept: **N=60** and the DOB structure
 + correctness must be preserved. Next step when we implement: prototype acados on this exact OCP, verify
 its `u` matches the current IPOPT `u` on logged states, measure, then wire behind a `solver="acados"`
@@ -190,5 +292,116 @@ coupling (`My=−0.0725·Fx`) + restoring into the prediction model so the MPC *
 pitch — and/or an explicit **pitch (or surge-slew) constraint** in the OCP, to keep the 7× tracking win
 while taming pitch to PID levels.
 
+**Equations (the metrics + the pitch cost).**
+```
+off-path error  = min over the 4 square edges of  dist(p_xy, edge)        (geometric shape error)
+setpoint error  = ‖p_xy − p_ref(s)‖,   s = c·(t−t₀)                       (includes phase lag)
+underactuation cost:  to corner against the current the MPC raises Fx, and  My ≈ −0.0725·Fx
+   → trim pitch  sin θ* = 0.0725·Fx / (coBM·B)   (unbounded by the OCP under option (a) → 62–67°)
+```
+
 **Result.** Analysis only (no code change). Files: `recordings/20260615/square_{pid,mpc,dobmpc}_*.csv`,
 comparison plot `square_compare_*.png`.
+
+---
+
+## 2026-06-15 — Orientation error diagnosis → option (b): pitch-aware MPC
+
+**Why.** "x/y/z track well but the orientation errs" — decomposed across all three rotational
+channels: **pitch is the dominant orientation error** (RMS 10–20°, square max 62–67° = near-tumble);
+roll ≈1° (low excitation, and roll *is* controllable so it stays ~0); yaw <1° in our `yaw_ref=0`
+runs (it only blows up on *turning* trajectories — a separate issue, below). Root cause of pitch:
+the rank-5 surge→pitch coupling `My ≈ −0.0725·Fx` pitches the vehicle whenever the MPC raises surge to
+track position, and option (a) neither **models** that coupling as a function of the surge *decision*
+(DOB-MPC only saw the realized pitch moment as a frozen disturbance `ŵ[pitch]`, held constant over the
+horizon) nor **bounds** pitch.
+
+**What (theory).** Option (b): make the prediction model **anticipate its own surge's pitch and bound
+it.** The MPC now foresees `more surge → more pitch` as an explicit function of the decision variable,
+and a tightened pitch state bound implicitly caps the planned surge — the *optimal* equivalent of the
+PID's hand-tuned surge limiter, but used only when tracking actually needs it.
+
+**Equations.**
+```
+prediction model (NED): inject the coupling as a function of the surge DECISION u_surge:
+   τ_My = +κ·u_surge ,   κ = SURGE_PITCH_COUPLING = 0.0725      (NED sign +, verified by the gate)
+EAOB fed the same τ_My  ⇒  ŵ[pitch] → 0    (the coupling is now modeled, not double-counted as w)
+pitch state constraint:  |θ_k| ≤ θ_max  ∀k ,   θ_max = 0.40 rad ≈ 23°
+   ⇒ implicit optimal surge cap:  u_surge ≲ sin(θ_max)·zg·W / κ ≈ 5.9 N
+```
+
+**How (implementation, toggleable).** [dobmpc/mpc.py](../dobmpc/mpc.py) `_f_casadi` sets `τ_My=+κ·u0`
+and tightens the `|θ|` bound 1.2→`THETA_MAX`; [dobmpc_controller.py](../dobmpc_controller.py) feeds the
+EAOB the commanded wrench *with* the coupling so `w[pitch]→0` (the thruster command keeps `My=0` — the
+rank-5 allocation realizes the coupling physically); [dobmpc/params.py](../dobmpc/params.py) adds
+`PITCH_AWARE` (default on; off recovers option a) and `THETA_MAX`. The `+κ` NED sign is verified by the
+equilibrium gate in `test_dobmpc.test_pitch_aware`.
+
+**Result.** DOB-MPC option-a → option-b, disturbance ON:
+
+| run | pitch_rms | pitch_max | position | w[pitch] |
+|---|---|---|---|---|
+| DP (15 s) | 15.0 → 13.4° | 30.0 → **22.9°** | radial 4.9 → 6.1 cm | 0.22 → **0.09** |
+| square (2 laps) | 17.8 → 12.6° | 46.7 → **23.2°** | off-path 2.6 → 3.0 cm | — |
+
+**Pitch max halved (capped at θ_max; the full-lap 67° → ~23°)** while position tracking is essentially
+kept (off-path still ≪ PID's 14 cm), and `w[pitch]` drops (EAOB no longer absorbs the coupling). Cost:
+~5% more solver fallbacks (the hard pitch constraint hardens the NLP) — a *soft* pitch constraint is a
+future refinement. Remaining orientation work (deferred): **yaw on turning trajectories** = option (A)
+rotate a world-frame `ŵ` to body at each predicted heading `ψ_k` (repeals the constant-body-`w`
+Assumption 2 that goes stale at the yaw rate during turns), plus yaw weight 150→300; roll is already small.
+
+---
+
+## 2026-06-15 — acados SQP-RTI solver port (the lag fix, implemented)
+
+**Why.** The runtime diagnosis above pinned the IPOPT NMPC as the bottleneck (≈83 ms/tick, 0.47×
+real-time, 2.2 s cold-restart freezes) and recommended acados RTI. This turn **implements** that
+recommendation, keeping IPOPT as the reference/fallback. Constraint kept: **N=60**, the DOB structure,
+and correctness must be preserved (the acados `u` must match the validated IPOPT `u`).
+
+**What (theory).** Same OCP, different *solve*. Replace IPOPT's solve-to-convergence with acados
+**SQP-RTI**: one Gauss-Newton SQP iteration per tick, warm-started from the (internally shifted)
+previous solution; the linearized QP solved by **PARTIAL_CONDENSING_HPIPM** exploiting the time-banded
+KKT block structure; model/derivatives/solver compiled to **C**. The disturbance wrench `ŵ` stays an
+on-line **parameter** (DOB structure preserved). N=60, dt, Q/R/QN, and the option-(b) bounds unchanged.
+
+**Equations.** (same OCP as the MPC entry — only the solve changes)
+```
+per tick now (acados SQP-RTI):  ONE Gauss-Newton step about the previous trajectory z⁻:
+   QP:  min_Δz  ½·Δzᵀ H Δz + gᵀ Δz   s.t.  linearized dynamics + bounds        (H = Gauss-Newton)
+        H, g from the RK4(f(x,u,ŵ)) linearization;  HPIPM + partial condensing solves the banded KKT
+   u₀ ← u₀⁻ + Δu₀ ,   shift z⁻ ← z for the next tick        → fixed 1 iteration → deterministic
+integrator: ERK RK4, 2 substeps/interval (h = 25 ms) == mpc._rk4(n_int=2)
+state bounds (roll, pitch=θ_max, |v_lin|) made SOFT (L2 slack) so a transient linearization can't make
+   the RTI QP infeasible and stall the loop; control bounds stay HARD.   (IPOPT used hard state bounds.)
+```
+
+**How (implementation).** New [dobmpc/mpc_acados.py](../dobmpc/mpc_acados.py) `AcadosNMPC` reuses the
+**exact** symbolic dynamics `dobmpc.mpc._f_casadi` (single source of truth) as the acados model;
+LINEAR_LS cost `W=diag(Q,R)`, `W_e=QN` with per-stage time-varying `yref`. A factory
+[`mpc.make_nmpc()`](../dobmpc/mpc.py) returns acados (`params.SOLVER="acados"`, default) or the IPOPT
+`NMPC` (reference/fallback — and auto-fallback on any acados import/build failure);
+[dobmpc_controller.py](../dobmpc_controller.py) calls it, and the `solve(x, ŵ, xref)→u` signature is
+identical so the controller/EAOB/thruster path is unchanged.
+[dobmpc/_acados_env.py](../dobmpc/_acados_env.py) pre-loads the acados shared libs with `ctypes
+RTLD_GLOBAL` so the fast path works with **no shell `LD_LIBRARY_PATH`** (teleop users export nothing).
+Toolchain: acados built into `/home/bdml/acados` (C lib + `acados_template` 0.5.1) inside the `robust`
+env; numpy stays <2.
+
+**Result.** Verified four ways ([verify_acados.py](../verify_acados.py)):
+
+| check | IPOPT (reference) | acados SQP-RTI |
+|---|---|---|
+| solve / tick (N=60) | median **100 ms** (over the 50 ms budget) | median **0.97 ms**, max 1.1 ms |
+| equivalence (interior states) | — | worst-case max\|Δu\| = **0.107 N** vs IPOPT (same optimum) |
+| closed-loop DP (15 s, disturb) | radial 8.6 cm, pitch_max 22.9°, ŵ_x 3.19 N, **7 freezes** | radial 7.0 cm, pitch_max **22.9°**, ŵ_x 3.11 N, **0 freezes** |
+| closed-loop square (1 m, 2 laps, disturb) | ~0.5× real-time | done, pitch_rms 14°, **0 freezes**, **1.2× real-time** |
+
+**~103× median speedup**, deterministic (cold-restart freezes gone: `n_fail` 7→0), and the closed-loop
+invariants match the validated IPOPT controller (option-b pitch cap 22.9°, EAOB estimate `ŵ_x`, DC
+current rejection). Regression: `test_dobmpc.py`, `teleop --selftest`, `test_square_mission.py` all
+pass. Trade-offs (per the recommendation): ~1 s codegen build at controller start; **soft** state bounds
+(vs IPOPT hard) for RTI feasibility; RTI is a one-step approximation — validated against IPOPT here.
+IPOPT stays selectable as the reference (`params.SOLVER="ipopt"`). Deferred: port the EAOB
+finite-difference Jacobian to CasADi autodiff (≈22→4 ms).

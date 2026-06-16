@@ -26,6 +26,23 @@ from . import params as P
 NX, NU = 12, 4
 
 
+def make_nmpc(N=P.MPC_N, dt=P.DT_CTRL, solver=None):
+    """Factory: return the requested NMPC backend with a uniform .solve(x, w_hat,
+    xref) interface. `solver` defaults to params.SOLVER. "acados" yields the
+    SQP-RTI/HPIPM AcadosNMPC (fast path); anything else (or an acados import/build
+    failure) yields the IPOPT NMPC below, which is the reference & fallback."""
+    solver = (solver or getattr(P, "SOLVER", "ipopt")).lower()
+    if solver == "acados":
+        try:
+            from .mpc_acados import AcadosNMPC
+            return AcadosNMPC(N=N, dt=dt)
+        except Exception as e:                # missing build, codegen error, ...
+            import warnings
+            warnings.warn(f"acados NMPC unavailable ({type(e).__name__}: {e}); "
+                          f"falling back to IPOPT NMPC", RuntimeWarning)
+    return NMPC(N=N, dt=dt)
+
+
 def _f_casadi(x, u, w):
     """Symbolic Eq. 22; mirrors fossen.f_state (validated in
     scripts/validate_plant.py)."""
@@ -72,7 +89,11 @@ def _f_casadi(x, u, w):
                        zg * W * cth * sph,
                        zg * W * sth,
                        0.0)
-    tau = ca.vertcat(u[0], u[1], u[2], 0.0, 0.0, u[3])
+    # option (b): model the rank-5 surge->pitch coupling as an explicit function of the
+    # surge DECISION, so the MPC foresees that raising surge raises pitch. NED sign +
+    # (verified by the equilibrium-pitch gate in test_dobmpc). PITCH_AWARE=False -> 0 (option a).
+    _kappa = P.SURGE_PITCH_COUPLING if getattr(P, "PITCH_AWARE", False) else 0.0
+    tau = ca.vertcat(u[0], u[1], u[2], 0.0, _kappa * u[0], u[3])
     nu_dot = ca.DM(fossen.M_INV) @ (tau + w - crb - cad - damp - g_eta)
     return ca.vertcat(eta_dot, nu_dot)
 
@@ -148,8 +169,11 @@ class NMPC:
         for k in range(1, N + 1):                       # skip x0 (pinned)
             lbx[k * NX + 6:k * NX + 9] = -v_max
             ubx[k * NX + 6:k * NX + 9] = v_max
-            lbx[k * NX + 3:k * NX + 5] = -1.2           # |phi|,|theta| bound:
-            ubx[k * NX + 3:k * NX + 5] = 1.2            # T(eta) singularity
+            lbx[k * NX + 3] = -1.2                       # |phi| (roll): T(eta) singularity
+            ubx[k * NX + 3] = 1.2
+            _th = P.THETA_MAX if getattr(P, "PITCH_AWARE", False) else 1.2
+            lbx[k * NX + 4] = -_th                       # |theta| (pitch): option-(b) cap
+            ubx[k * NX + 4] = _th                         # (implicitly caps the planned surge)
         off = NX * (N + 1)
         for k in range(N):
             lbx[off + k * NU:off + (k + 1) * NU] = -np.asarray(u_max)

@@ -169,7 +169,8 @@ def test_casadi_matches_numpy():
     for _ in range(200):
         x = rng.standard_normal(12); x[4] = np.clip(x[4], -1.0, 1.0)   # keep theta sane
         u = rng.standard_normal(4); w = rng.standard_normal(6)
-        tau = np.array([u[0], u[1], u[2], 0.0, 0.0, u[3]])
+        kap = P.SURGE_PITCH_COUPLING if getattr(P, "PITCH_AWARE", False) else 0.0
+        tau = np.array([u[0], u[1], u[2], 0.0, kap * u[0], u[3]])   # match _f_casadi (option-b coupling)
         num = fossen.f_state(x, tau, w)
         sym = np.array(f(x, u, w)).ravel()
         maxerr = max(maxerr, np.abs(num - sym).max())
@@ -177,11 +178,32 @@ def test_casadi_matches_numpy():
     print(f"[copy] OK  CasADi model == NumPy fossen model (max |diff| {maxerr:.1e})")
 
 
+def test_pitch_aware():
+    """option (b): the MPC model includes the surge->pitch coupling with the correct
+    (+NED) sign, and the pitch state bound is tightened to THETA_MAX. (Empirically this
+    caps the square pitch ~67->23 deg while keeping position tracking; see CONTROL_METHODOLOGY.)"""
+    import casadi as ca
+    from dobmpc.mpc import _f_casadi, NMPC
+    assert getattr(P, "PITCH_AWARE", False), "PITCH_AWARE expected on by default"
+    xs = ca.SX.sym("x", 12); us = ca.SX.sym("u", 4); ws = ca.SX.sym("w", 6)
+    f = ca.Function("f", [xs, us, ws], [_f_casadi(xs, us, ws)])
+    Fx = 3.0
+    qdd = float(np.array(f(np.zeros(12), [Fx, 0, 0, 0], np.zeros(6))).ravel()[10])  # nu_dot[4]=pitch acc
+    pred = P.SURGE_PITCH_COUPLING * Fx / fossen.M_TOTAL[4, 4]                         # +kappa*Fx / M_theta
+    assert qdd > 0 and abs(qdd - pred) < 1e-6, f"coupling sign/mag wrong: {qdd:.4f} vs {pred:.4f}"
+    nmpc = NMPC(N=5)
+    th_ub = nmpc._ubx[1 * 12 + 4]                    # |theta| upper bound at a horizon step
+    assert abs(th_ub - P.THETA_MAX) < 1e-9 and th_ub < 1.2, f"theta bound not THETA_MAX: {th_ub}"
+    print(f"[option-b] OK  surge->pitch coupling +kappa (pitch acc {qdd:.4f}==pred), "
+          f"|theta|<={P.THETA_MAX} rad bound (<1.2)")
+
+
 def main():
     test_frames()
     test_predictor()
     test_eaob_no_accel_doublecount()
     test_casadi_matches_numpy()
+    test_pitch_aware()
     print("\nDOBMPC UNIT TESTS PASSED")
 
 

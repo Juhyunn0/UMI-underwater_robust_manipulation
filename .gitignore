@@ -13,6 +13,10 @@ env/
 vendor/
 *.run
 *.whl
+
+# acados generated C code (regenerated on solver construction; not a source artifact)
+**/dobmpc/_acados_gen/
+MUJOCO_LOG.TXT
 *.tar.gz
 *.zip
 

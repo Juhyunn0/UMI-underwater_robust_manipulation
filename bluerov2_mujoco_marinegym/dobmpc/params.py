@@ -72,6 +72,10 @@ DT_CTRL = 0.05               # observer/MPC sample time [s]  (= 25 * DT_SIM, ZOH
 DT_SIM = 0.002               # marinegym physics step [s]
 
 # ----------------------------------------------------------------------- MPC
+# Solver backend: "acados" (SQP-RTI + HPIPM C-codegen, ~2-5 ms/step, the fast
+# path) or "ipopt" (CasADi/Ipopt full-convergence, ~83 ms/step, the reference &
+# fallback). make_nmpc() in mpc.py falls back to ipopt if acados is unavailable.
+SOLVER = "acados"
 MPC_N = 60                   # prediction horizon
 # Stage weights over x=[x y z, phi theta psi, u v w, p q r].
 # Roll (phi) and pitch (theta) POSITIONS are zero-weighted: both are uncommanded
@@ -92,6 +96,22 @@ EAOB_R = DT_CTRL ** 4 / 4.0
 EAOB_P0 = 1.0
 
 # Surge->pitch geometric coupling in the marinegym plant (thrusters 0.0725 m below
-# COM): My ~= -SURGE_PITCH_COUPLING * Fx. Used only by the equilibrium-pitch test
-# and documented for the option-(b) upgrade (model-anticipated pitch).
+# COM): My ~= -SURGE_PITCH_COUPLING * Fx (FLU). Used by the equilibrium-pitch test and,
+# under option (b) below, injected into the MPC/EAOB prediction model.
 SURGE_PITCH_COUPLING = 0.0725
+
+# --------------------------------------------------- option (b): pitch-aware MPC
+# Diagnosis: pitch is the dominant orientation error (RMS 10-20 deg, max 62-67 deg)
+# because the rank-5 surge->pitch coupling pitches the vehicle whenever the MPC raises
+# surge to track position, and option (a) neither models that coupling as a function of
+# the surge *decision* nor bounds pitch. Option (b) fixes both:
+#   * model the coupling in the prediction:  tau_My = +SURGE_PITCH_COUPLING * u_surge
+#     (NED sign; verified by the equilibrium-pitch gate in test_dobmpc). The EAOB is fed
+#     the same tau so w[pitch] -> 0 (no double-count). The MPC now foresees that more
+#     surge => more pitch.
+#   * bound pitch with a tighter |theta| state constraint THETA_MAX, which implicitly
+#     caps the surge the MPC will plan (sin(THETA_MAX)*zg*W / kappa ~= 5.9 N at 0.40 rad)
+#     -- an *optimal* surge cap, the MPC-equivalent of the PID's surge limiter.
+# Toggle PITCH_AWARE=False to recover option (a) (coupling off, |theta|<=1.2, no cap).
+PITCH_AWARE = True
+THETA_MAX = 0.40             # |pitch| prediction bound [rad] (~23 deg) when PITCH_AWARE

@@ -32,7 +32,7 @@ from dobmpc import frames
 from dobmpc import params as P
 from dobmpc.fossen import rot_ib
 from dobmpc.eaob import EAOB
-from dobmpc.mpc import NMPC
+from dobmpc.mpc import make_nmpc
 
 
 def _Rz_flu(yaw):
@@ -63,7 +63,7 @@ class DOBMPCController:
         self.yaw_ref = float(yaw_ref)
         self.v_ref = np.zeros(3)                 # world-FLU reference velocity (DP: 0)
 
-        self.nmpc = NMPC(N=N, dt=P.DT_CTRL)
+        self.nmpc = make_nmpc(N=N, dt=P.DT_CTRL)   # acados (fast) or ipopt (ref)
         self.eaob = None                         # lazy-init at first tick (needs eta0)
         self._tau_flu = np.zeros(6)              # ZOH wrench held between ticks
         self._tau_ned_cmd = np.zeros(6)          # commanded NED wrench (fed to EAOB)
@@ -132,9 +132,15 @@ class DOBMPCController:
         x_ned = np.concatenate([eta_ned, nu_ned])
         u = self.nmpc.solve(x_ned, self.w_hat, self._xref_ned())
         self.n_fail = self.nmpc.n_fail
-        tau_ned = np.array([u[0], u[1], u[2], 0.0, 0.0, u[3]])
-        self._tau_ned_cmd = tau_ned
-        self._tau_flu = frames.ned_wrench_to_flu(tau_ned)
+        # option (b): the EAOB is fed the commanded wrench INCLUDING the modeled
+        # surge->pitch coupling (My = kappa*surge, NED), so it attributes the realized
+        # pitch moment to control and keeps w[pitch] ~ 0 (no double-count with the MPC
+        # model). The thruster command keeps My=0 -- the rank-5 allocation realizes the
+        # coupling physically.
+        kappa = P.SURGE_PITCH_COUPLING if getattr(P, "PITCH_AWARE", False) else 0.0
+        self._tau_ned_cmd = np.array([u[0], u[1], u[2], 0.0, kappa * u[0], u[3]])
+        self._tau_flu = frames.ned_wrench_to_flu(
+            np.array([u[0], u[1], u[2], 0.0, 0.0, u[3]]))
         self.commanded = self._tau_flu.copy()
 
     # --------------------------------------------------------- public step
