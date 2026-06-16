@@ -82,6 +82,51 @@ B=ρgV=**110.97 N**, W=mg=**109.87 N**, net **+1.10 N**, restoring stiffness k=c
 - [figs/hydro_T5_addedmass.png](figs/hydro_T5_addedmass.png) — effective inertia vs Ω (= m + M_A).
 - [figs/hydro_T6_energy.png](figs/hydro_T6_energy.png) — monotone energy dissipation.
 - [figs/hydro_T7_R1.png](figs/hydro_T7_R1.png) — sim vs ideal-added-mass heave rise (lag size).
+- [figs/hydro_P_convergence.png](figs/hydro_P_convergence.png) — trajectory error vs dt: slope-1 **O(dt)** convergence to the continuous Fossen model.
+- [figs/hydro_P_lagfidelity.png](figs/hydro_P_lagfidelity.png) — added-mass-lag: effective-mass fraction & transport delay vs Ω (in-band ≈ ideal).
+
+## Precision verification (`verify_hydro_precise.py`)
+A rigorous superset of the above (methodology reviewed by the control-theory advisor; grounded in Fossen
+2011, Roache 1998 *V&V*, and the Salari–Knupp method of manufactured solutions). **17/17 checks across 4
+tiers**; the simulator is again unmodified (driven through `xfrc_applied`, still water).
+
+**Tier 1 — structural Fossen identities (a gate before the expensive runs).** An *independent*
+added-mass Coriolis matrix C_A(ν), built from M_A by the skew-block construction (Fossen Eq. 6.44),
+reproduces hydro's hand-typed `_coriolis_added` to **1.4 × 10⁻¹⁴** — this breaks the "same algebra typed
+twice" risk that a force-level check alone cannot. C_A = −C_Aᵀ holds as a **full skew matrix** (numeric 0;
+CasADi-symbolic residual *exactly* 0), not merely the quadratic form νᵀC_Aν = 0. M = M_RB + M_A is SPD
+(eigenvalues 0.42–25.8); D(ν) ≻ 0 and total passivity νᵀ(C+D)ν = νᵀD(ν)ν ≥ 0 hold over 2 × 10⁶ random
+states.
+
+**Tier 2 — order of accuracy / continuum convergence.** Against a high-order continuous-Fossen reference
+(added mass *in* the mass matrix, quaternion attitude, `scipy` DOP853 at rtol/atol = 10⁻¹²), the sim's
+trajectory error under a manufactured 6-DOF forcing falls as **O(dt¹)** with observed order **p̂ = 1.000**
+across the ladder dt = 2 → 0.125 ms (position L2 0.564 → 0.035 mm; Richardson dt→0 ≈ 2.5 × 10⁻⁶ mm). This
+**proves the EMA-lagged simulator converges to the true M_A-in-mass continuous model** — the lagged-force
+trick is a *consistent* approximation, not a different model. (`implicitfast` is first-order, and the
+passive callback fires exactly **once per step**, so the EMA backward-difference uses the true dt.) The
+lag injects **zero** energy per step (kinetic energy monotone-decreasing — strictly passive in practice).
+
+**Tier 3 — frame invariance & Galilean.** Restoring torque = k·sinθ independent of tilt azimuth and yaw
+(deviation 2 × 10⁻¹⁴ %); hydro forces independent of world position (0 N); drag is an exact odd function
+of ν (0); and an unpowered neutrally-buoyant vehicle in a uniform current advects at exactly v_c with
+zero steady drag (|err| 4 × 10⁻¹⁰ m/s) — validating the relative-velocity path vr = ν − Rᵀv_water.
+
+**Tier 4 — added-mass-lag fidelity (the one approximation) + tightened estimators.** The lag's transfer
+function gives an **equivalent transport delay ≈ 5.67 ms**, essentially constant with frequency, and an
+effective added-mass error **< 0.013 %** in the ROV disturbance band (0.1–2 rad/s). Its
+in-phase-with-velocity coefficient is **≥ 0 at every frequency** — the lag only ever *adds* damping, never
+anti-damps, so it is **passive / non-destabilizing at all frequencies** (the sharpest fidelity question).
+D_L and D_NL are **recovered from the sim to 0.00 %** by regression over a force sweep (not a single
+point). Pendulum periods match the **full coupled** high-order ODE reference to **0.01 %** (roll) /
+**0.00 %** (pitch); note the naive I + M_A_rot formula is 1–8 % off because the CB offset couples rotation
+to translation (pitch↔surge, roll↔sway) — a real effect the sim captures exactly.
+
+**Honest limitation.** M_A is **diagonal** by MarineGym design; the small off-diagonal added-mass terms
+(e.g. Yṙ, Nv̇) of a full BlueROV2 identification are not modeled. This is a *modeling* choice, separate
+from the lag approximation, and acceptable for this control study.
+
+*Reproduce:* `python verify_hydro_precise.py --tier 1234` (env `robust`; ~25 s; needs `casadi`, `scipy`).
 
 ## Conclusion
 Every hydrodynamic term — **buoyancy, restoring, linear+quadratic drag, added mass, and added-mass

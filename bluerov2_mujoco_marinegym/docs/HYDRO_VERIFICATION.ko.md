@@ -70,6 +70,41 @@ D_NL=[18.18,21.66,36.99,1.55,1.55,1.55], EMA α=0.3, dt=2 ms. B=ρgV=**110.97 N*
 - [figs/hydro_T5_addedmass.png](figs/hydro_T5_addedmass.png) — 유효관성 vs Ω (= m + M_A).
 - [figs/hydro_T6_energy.png](figs/hydro_T6_energy.png) — 단조 에너지 소산.
 - [figs/hydro_T7_R1.png](figs/hydro_T7_R1.png) — sim vs 이상-added-mass heave 상승(lag 크기).
+- [figs/hydro_P_convergence.png](figs/hydro_P_convergence.png) — 궤적오차 vs dt: 기울기-1 **O(dt)** 연속 Fossen 모델 수렴.
+- [figs/hydro_P_lagfidelity.png](figs/hydro_P_lagfidelity.png) — added-mass lag: 유효질량 비율·수송지연 vs Ω(대역내 ≈ 이상).
+
+## 정밀 검증 (`verify_hydro_precise.py`)
+위 검증의 엄밀한 상위집합(방법론은 control-theory advisor 검토; Fossen 2011, Roache 1998 *V&V*,
+Salari–Knupp 제조해법(MMS) 기반). **4 tier 17/17 통과**; 시뮬레이터는 역시 무수정(`xfrc_applied` 주입, 정지수).
+
+**Tier 1 — 구조적 Fossen 항등식 (비싼 런 전 게이트).** M_A에서 skew-블록 구성(Fossen Eq. 6.44)으로 만든
+**독립** added-mass Coriolis 행렬 C_A(ν)가 hydro의 손코딩 `_coriolis_added`와 **1.4 × 10⁻¹⁴** 일치 —
+힘-레벨 검증만으로는 못 잡는 "같은 수식 두 번 타이핑" 위험을 차단. C_A = −C_Aᵀ가 **전체 skew 행렬**로 성립
+(수치 0; CasADi 심볼릭 잔차 *정확히* 0) — 단순 2차형식 νᵀC_Aν = 0이 아님. M = M_RB + M_A는 SPD(고유값
+0.42–25.8); D(ν) ≻ 0, 총 수동성 νᵀ(C+D)ν = νᵀD(ν)ν ≥ 0이 2 × 10⁶ 무작위 상태에서 성립.
+
+**Tier 2 — 정확도 차수 / 연속극한 수렴.** 고차 연속-Fossen 참조(added mass를 질량행렬에 *포함*, 쿼터니언 자세,
+`scipy` DOP853 rtol/atol = 10⁻¹²) 대비, 제조 6-DOF 가진하의 궤적오차가 **O(dt¹)**, 관측차수 **p̂ = 1.000**으로
+dt = 2 → 0.125 ms 사다리에서 감소(위치 L2 0.564 → 0.035 mm; Richardson dt→0 ≈ 2.5 × 10⁻⁶ mm). 이는
+**EMA-lag 시뮬레이터가 진짜 M_A-질량행렬 연속모델로 수렴**함을 증명 — lag 트릭은 다른 모델이 아니라 *일관된*
+근사. (`implicitfast`는 1차, passive 콜백은 step당 **정확히 1회** 호출되어 EMA 후방차분이 진짜 dt 사용.) lag는
+step당 에너지 **0** 주입(운동에너지 단조감소 — 실측상 엄격히 수동적).
+
+**Tier 3 — 프레임 불변성 & Galilean.** 복원토크 = k·sinθ가 기울임 방위·yaw에 무관(편차 2 × 10⁻¹⁴ %); hydro
+힘이 world 위치에 무관(0 N); 항력이 ν의 정확한 홀함수(0); 무동력 중립부력체가 균일류에서 정확히 v_c로
+advect, 정상 drag 0(|오차| 4 × 10⁻¹⁰ m/s) — 상대속도 경로 vr = ν − Rᵀv_water 검증.
+
+**Tier 4 — added-mass lag 충실도(유일한 근사) + 추정기 강화.** lag 전달함수가 **등가 수송지연 ≈ 5.67 ms**
+(주파수에 거의 일정), ROV 외란 대역(0.1–2 rad/s)에서 유효 added-mass 오차 **< 0.013 %**. 속도-동위상 계수가
+**모든 주파수에서 ≥ 0** — lag는 항상 감쇠를 *더할* 뿐 anti-damping 안 함, 즉 **모든 주파수에서 수동/비불안정화**
+(가장 날카로운 충실도 질문). D_L·D_NL은 힘 스윕 회귀로 sim에서 **0.00 %** 복원(단일점 아님). 진자 주기는
+**완전 커플** 고차 ODE 참조와 **0.01 %**(roll)/**0.00 %**(pitch) 일치; 단순 I + M_A_rot 공식은 1–8 % 빗나가는데
+이는 CB 오프셋이 회전↔병진을 커플(pitch↔surge, roll↔sway)하기 때문 — sim은 이 커플을 정확히 재현.
+
+**정직한 한계.** M_A는 MarineGym 설계상 **대각**; 완전한 BlueROV2 식별의 작은 비대각 added-mass 항(예: Yṙ,
+Nv̇)은 미모델링. 이는 lag 근사와 별개의 *모델링* 선택이며 본 제어 연구엔 허용 가능.
+
+*재현:* `python verify_hydro_precise.py --tier 1234` (env `robust`; ~25 s; `casadi`·`scipy` 필요).
 
 ## 결론
 모든 hydrodynamic 항 — **부력, 복원, 선형+2차 drag, added mass, added-mass Coriolis** — 이 1차원리 예측과

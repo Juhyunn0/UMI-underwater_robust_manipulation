@@ -10,3 +10,27 @@ ERROR: could not initialize GLFW
 Mon Jun 15 19:43:34 2026
 ERROR: Python exception raised
 
+Tue Jun 16 13:41:55 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 0. The simulation is unstable. Time = 0.1460.
+
+Tue Jun 16 13:41:55 2026
+WARNING: Nan, Inf or huge value in QVEL at DOF 2. The simulation is unstable. Time = 0.0020.
+
+Tue Jun 16 13:41:55 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 0. The simulation is unstable. Time = 0.0780.
+
+Tue Jun 16 13:41:55 2026
+WARNING: Nan, Inf or huge value in QVEL at DOF 2. The simulation is unstable. Time = 0.0010.
+
+Tue Jun 16 13:41:55 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 0. The simulation is unstable. Time = 0.0415.
+
+Tue Jun 16 13:41:55 2026
+WARNING: Nan, Inf or huge value in QVEL at DOF 2. The simulation is unstable. Time = 0.0005.
+
+Tue Jun 16 13:41:56 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 4. The simulation is unstable. Time = 0.0220.
+
+Tue Jun 16 13:41:56 2026
+WARNING: Nan, Inf or huge value in QVEL at DOF 2. The simulation is unstable. Time = 0.0003.
+
