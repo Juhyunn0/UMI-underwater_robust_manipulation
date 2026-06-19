@@ -568,3 +568,54 @@ blow-up. Seeds 0/1/2/4 unchanged (0.7–4.1 cm, n_fail 0). Regression: `test_dob
 `verify_acados` (equivalence 0.107 N, 102.6× speedup) all pass. Trade-off: a failed tick costs one
 ~100 ms IPOPT solve (rare; pre-build the fallback for hard real-time). The acados DOB-MPC is now robust
 across all five disturbance seeds.
+
+---
+
+## 2026-06-18 — Realistic T200 thrusters: datasheet-grounded `voltage_scale` + default-ON in teleop missions
+
+**Why.** The realistic actuator (`ThrusterModel`: deadband / fwd-rev asymmetry / motor lag / voltage) was
+**opt-in (ablation-only)**, so the autonomous teleop missions (`--square` / `--goto-origin`) — whose whole
+point is to *predict the real BlueROV2* — ran the **ideal force path** (commanded == realized), which is a
+non-physical idealisation. Separately, the `0.85` voltage loss used in the ablation was an **illustrative
+value, not derived** from any datasheet.
+
+**What.** (1) **Grounded the voltage scale** in the official datasheet; (2) made the realistic model the
+**default for the mission paths** with an `--ideal-thrusters` opt-out (manual keyboard teleop, `eval_dp`,
+and `ablation` are untouched — they use separate / explicit paths).
+
+**Grounding (provenance).** Blue Robotics *T200 Public Performance Data 10–20 V (Sep 2019)*
+(`marinegym_assets/*.xlsx`; reproduce with [analyze_t200_voltage.py](../analyze_t200_voltage.py), stdlib
+zip/XML parse — no pandas):
+
+| V | 10 | 12 | 14 | 16 | 18 | 20 |
+|---|---|---|---|---|---|---|
+| max fwd (kgf) | 2.93 | 3.71 | 4.53 | 5.25 | 6.02 | 6.72 |
+| max rev (kgf) | −2.31 | −2.92 | −3.52 | −4.07 | −4.59 | −5.04 |
+
+The MarineGym curve's max (`T200_MAX_FWD/REV` = +6.54 / −5.26 kgf) sits at the **top of the range** → its
+`voltage_scale = 1.0` models a **~20 V** thruster. A real BlueROV2 runs a **4S Li-ion pack (nominal
+14.8 V)**, where max thrust (interp 14↔16 V) is 4.81 / 3.74 kgf, so
+`voltage_scale = 14.8V/base = 4.81/6.54 = 0.74 (fwd), 3.74/5.26 = 0.71 (rev)` → a single grounded scalar
+**`NOMINAL_VOLTAGE_SCALE = 0.72`** (full-charge 16.8 V ≈ 0.83; near-empty 13 V ≈ 0.62). This **replaces the
+illustrative 0.85**.
+
+**How.** [thrusters.py](../thrusters.py): added `NOMINAL_VOLTAGE_SCALE = 0.72` (with the derivation in a
+comment); the `ThrusterModel(voltage_scale=1.0)` constructor default is **left unchanged** so the ablation's
+explicit `realistic` (V=1.0) scenario and other callers are not silently altered. [teleop.py](../teleop.py):
+new `--ideal-thrusters` (opt-out) and `--thruster-voltage` (default `0.72`) flags; the mission branch builds
+one `ThrusterModel(lag=True, voltage_scale=…)` and passes `actuator=` to both `DOBMPCController` and
+`PoseController` (the actuator wiring + `reset()` already existed); a startup line prints the active path;
+and the run manifest (`.meta.json`) now records `run.thrusters = {model, lag, voltage_scale}` so ideal vs
+realistic runs are never confused.
+
+**Result.** Closed-loop DP (dobmpc, seed 0, 20 s, disturbance ON): **ideal radial 5.02 cm / jitter 4.30 cm
+→ realistic ×0.72 radial 7.76 cm / jitter 6.17 cm**, `n_fail 0` — the realistic stage degrades station-
+keeping as expected (deadband jitter + a 28 % thrust deficit the additive DOB only partly cancels), with no
+solver trouble. `analyze_t200_voltage.py` reproduces the table and `0.72` (MATCH). Regression: `eval_dp`
+(ideal default) and `ablation_thrusters` scenarios unchanged; `teleop --selftest` passes.
+
+**Scope / honesty.** The MarineGym curve is **not refitted** to 14.8 V (that would change `T200_MAX` /
+`ctrlrange` everywhere); we keep the verbatim ~20 V curve and apply the scalar. The fwd/rev voltage ratios
+(0.74 / 0.71) are approximated by the single 0.72. Inflow-velocity dependence (advance ratio: thrust drops
+when moving), thermal, and fouling are **out of scope** — the realistic model is still the *static (bollard)*
+curve. A *moving*-trajectory (square) run stresses the deadband harder than DP and is the natural follow-up.

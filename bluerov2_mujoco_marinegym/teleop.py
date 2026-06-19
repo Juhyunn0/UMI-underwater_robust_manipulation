@@ -211,13 +211,20 @@ def _run_manifest(field, controller, args, model, trajectory):
     context) for the CSV sidecar. Built lazily at recording start so field.to_meta()
     snapshots the live enabled/seed/kick state."""
     from recorder import build_run_meta
+    if getattr(args, "ideal_thrusters", False):
+        thrusters = dict(model="ideal")                     # commanded == realized
+    else:
+        thrusters = dict(model="T200_realistic", lag=True,
+                         voltage_scale=float(getattr(args, "thruster_voltage",
+                                                     T.NOMINAL_VOLTAGE_SCALE)))
     return build_run_meta(
         disturbance=field,
         controller=_controller_meta(controller, getattr(args, "ctrl", None)),
         trajectory=trajectory,
         run=dict(started=time.strftime("%Y-%m-%d %H:%M:%S"),
                  sim_dt=float(model.opt.timestep),
-                 waves=getattr(args, "waves", None)),
+                 waves=getattr(args, "waves", None),
+                 thrusters=thrusters),
     )
 
 
@@ -958,6 +965,15 @@ def main():
                          "classic sinusoids")
     ap.add_argument("--sea", type=str, default="0.20,4.0",
                     help="(--waves spectrum) sea state 'Hs,Tp' (m,s; default 0.20,4.0)")
+    ap.add_argument("--ideal-thrusters", dest="ideal_thrusters", action="store_true",
+                    help="(--square/--goto-origin) use the ideal force path "
+                         "(commanded==realized). Default: realistic T200 model "
+                         "(deadband / fwd-rev asymmetry / motor lag / voltage).")
+    ap.add_argument("--thruster-voltage", dest="thruster_voltage", type=float,
+                    default=T.NOMINAL_VOLTAGE_SCALE,
+                    help="(realistic thrusters) battery thrust scale vs the ~20 V base "
+                         f"curve; default {T.NOMINAL_VOLTAGE_SCALE} = 4S nominal 14.8 V "
+                         "(1.0=as-fitted ~20 V, 0.85=mild sag, 0.62=near-empty 13 V).")
     args = ap.parse_args()
     if args.managed and (args.goto_origin or args.square):
         # --managed cedes the main thread to mujoco.viewer.launch (its own physics
@@ -1000,13 +1016,26 @@ def main():
         half = np.radians(syaw) / 2.0
         data.qpos[3:7] = [np.cos(half), 0.0, 0.0, np.sin(half)]   # yaw quaternion (wxyz)
         mujoco.mj_forward(model, data)
+        # Realistic T200 actuator is ON by default for autonomous missions (they
+        # exist to predict the real robot); --ideal-thrusters reverts to the
+        # commanded==realized force path. Manual keyboard teleop is a separate path
+        # (Teleop.on_key) and is unaffected.
+        actuator = None if args.ideal_thrusters else T.ThrusterModel(
+            lag=True, voltage_scale=args.thruster_voltage)
         if args.ctrl in ("mpc", "dobmpc"):
             from dobmpc_controller import DOBMPCController
             controller = DOBMPCController(model, hydro=hydro, mode=args.ctrl,
-                                          setpoint=(0.0, 0.0, 0.0), yaw_ref=0.0)
+                                          setpoint=(0.0, 0.0, 0.0), yaw_ref=0.0,
+                                          actuator=actuator)
         else:
             controller = PoseController(model, mode=args.ctrl, setpoint=(0.0, 0.0, 0.0),
-                                        yaw_ref=0.0, buoyancy_ff=hydro)
+                                        yaw_ref=0.0, buoyancy_ff=hydro, actuator=actuator)
+        if actuator is None:
+            print("[thrusters] ideal force path (commanded == realized).")
+        else:
+            print(f"[thrusters] realistic T200: deadband + fwd/rev asymmetry + motor "
+                  f"lag + voltage x{args.thruster_voltage:.2f} "
+                  f"({'nominal 14.8 V' if abs(args.thruster_voltage - T.NOMINAL_VOLTAGE_SCALE) < 1e-6 else 'custom'}).")
         if args.square:
             from recorder import Recorder
             from mission import SquareMission

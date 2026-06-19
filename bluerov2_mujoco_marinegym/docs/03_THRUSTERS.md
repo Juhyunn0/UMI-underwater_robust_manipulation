@@ -20,8 +20,37 @@ Notes: MarineGym multiplies propeller **reaction torque by 0**, so thrusters app
 **force only** (no spin torque) — all body torque is `r × F`. Its `directions` /
 `moment_constants` are therefore unused here. A first-order throttle/rpm lag exists
 in MarineGym (`T200Dynamics` reproduces it) but is not needed for the steady curve.
-These max thrusts (~64/52 N) are a bit above a nominal 16 V T200 (~50 N); they are
-MarineGym's fit, used as-is per "keep MarineGym values" ([01](01_DECISIONS.md) D2).
+These max thrusts (+64.13 / −51.55 N = +6.54 / −5.26 kgf) are MarineGym's fit, used
+as-is per "keep MarineGym values" ([01](01_DECISIONS.md) D2); they sit at the **top
+of the published T200 voltage range (~20 V)** — see voltage grounding below.
+
+## Realistic actuator model + voltage grounding
+
+`ThrusterModel` (`thrusters.py`) is an **opt-in** realistic actuator stage:
+`f_des --T200 inverse(nominal V)--> throttle --motor lag--> T200 curve --×voltage--> f_real`.
+It injects the **deadband** (small forces round-trip to 0 or the ~1.4 N min-spin
+jump), **fwd/rev asymmetry + saturation**, **motor lag** (`T200Dynamics`), and a
+**multiplicative thrust loss** (`voltage_scale`). The controller is *not* told, so
+`realized ≠ commanded` = a sim-to-real robustness test. It is **default-ON for the
+autonomous teleop missions** (`--square` / `--goto-origin`); `--ideal-thrusters`
+reverts to the ideal force path. (Manual keyboard teleop, `eval_dp`, and `ablation`
+use their own explicit paths.)
+
+**`voltage_scale` is grounded in the official datasheet** (Blue Robotics *T200
+Public Performance Data 10–20 V*, Sep 2019; reproduce with `analyze_t200_voltage.py`):
+
+| V | 10 | 12 | 14 | 16 | 18 | 20 |
+|---|---|---|---|---|---|---|
+| max fwd (kgf) | 2.93 | 3.71 | 4.53 | 5.25 | 6.02 | 6.72 |
+| max rev (kgf) | −2.31 | −2.92 | −3.52 | −4.07 | −4.59 | −5.04 |
+
+Our base curve (6.54 / 5.26 kgf) ⇒ `voltage_scale = 1.0` ≈ a **~20 V** thruster.
+A real BlueROV2 runs a **4S Li-ion pack (nominal 14.8 V)**, where max thrust is
+4.81 / 3.74 kgf ⇒ `14.8V/base` = 0.74 (fwd) / 0.71 (rev) ⇒ **`NOMINAL_VOLTAGE_SCALE
+= 0.72`** (the teleop default; `--thruster-voltage` overrides — full-charge 16.8 V
+≈ 0.83, near-empty 13 V ≈ 0.62). The curve is **not refitted** to 14.8 V (that would
+move `T200_MAX` / `ctrlrange`); only the scalar is applied. Still the *static
+(bollard)* curve — inflow-velocity (advance-ratio) dependence is out of scope.
 
 ## Actuators & command convention
 

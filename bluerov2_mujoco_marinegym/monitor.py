@@ -41,6 +41,10 @@ MAX_TRAJ_PTS = 600                       # cap plotted trajectory points (perf)
 AXIS_COLORS = ("#ef5350", "#66bb6a", "#64b5f6")   # X red, Y green, Z blue (gantry)
 ARROW_XY = "#26c6da"                     # cyan  (top-down XY disturbance arrow)
 ARROW_XZ = "#ffb300"                     # amber (side XZ disturbance arrow)
+ARROW_RANGE = 0.6                        # disturbance-vector panel half-range (m/s),
+                                         # FIXED so the scale never auto-jitters; the
+                                         # current+wave water velocity stays well within
+                                         # (default teleop peak ~0.4 m/s).
 
 _FALLBACK_QSS = "QWidget{background-color:#1a1a1d;color:#e6e6e6;}"
 
@@ -169,9 +173,18 @@ class MonitorDashboard(QtWidgets.QWidget):
         return pw
 
     def _build_arrow(self):
-        pw = pg.PlotWidget(title="② Disturbance vector — cyan XY (top), amber XZ (side)")
+        pw = pg.PlotWidget(title="② Disturbance vector (water velocity, m/s) — "
+                                 "cyan XY (top), amber XZ (side)")
         pw.setAspectLocked(True)
         pw.showGrid(x=True, y=True, alpha=0.12)
+        # axis meaning: both arrows share the horizontal Vx; the vertical axis is Vy
+        # for the cyan XY (top-down) arrow and Vz for the amber XZ (side) arrow.
+        pw.setLabel("bottom", "Vx — forward (m/s)")
+        pw.setLabel("left", "Vy cyan (left) · Vz amber (up)  (m/s)")
+        # FIXED scale: set the range once (this disables auto-range for both axes), so
+        # the frame no longer jitters as the disturbance magnitude changes.
+        pw.setXRange(-ARROW_RANGE, ARROW_RANGE, padding=0)
+        pw.setYRange(-ARROW_RANGE, ARROW_RANGE, padding=0)
         pw.addLine(x=0, pen=pg.mkPen("#444", width=1))
         pw.addLine(y=0, pen=pg.mkPen("#444", width=1))
         self.sh_xy = pg.PlotCurveItem(pen=pg.mkPen(ARROW_XY, width=3))
@@ -179,6 +192,7 @@ class MonitorDashboard(QtWidgets.QWidget):
         self.hd_xy = pg.ArrowItem(angle=0, headLen=14, tipAngle=28, pen=None, brush=ARROW_XY)
         self.hd_xz = pg.ArrowItem(angle=0, headLen=14, tipAngle=28, pen=None, brush=ARROW_XZ)
         self.arrow_txt = pg.TextItem(color="#dddddd", anchor=(0, 0))
+        self.arrow_txt.setPos(-0.97 * ARROW_RANGE, 0.97 * ARROW_RANGE)   # fixed corner
         for it in (self.sh_xy, self.sh_xz, self.hd_xy, self.hd_xz, self.arrow_txt):
             pw.addItem(it)
         self.pw_arrow = pw
@@ -281,13 +295,10 @@ class MonitorDashboard(QtWidgets.QWidget):
         self.hd_xy.setStyle(angle=180.0 - math.degrees(math.atan2(vy, vx)))
         self.hd_xz.setPos(vx, vz)
         self.hd_xz.setStyle(angle=180.0 - math.degrees(math.atan2(vz, vx)))
-        m = max(math.hypot(vx, vy), math.hypot(vx, vz), 1e-3)
-        self.pw_arrow.setRange(xRange=(-1.2 * m, 1.2 * m),
-                               yRange=(-1.2 * m, 1.2 * m), padding=0)
+        # scale is FIXED (set once in _build_arrow); don't re-range per frame.
         vmag = math.sqrt(vx * vx + vy * vy + vz * vz)
         self.arrow_txt.setText(f"|v| = {vmag:.3f} m/s\n"
                                f"({vx:+.2f}, {vy:+.2f}, {vz:+.2f})")
-        self.arrow_txt.setPos(-1.18 * m, 1.18 * m)
 
     def _update_traj(self, scatter, line, a, b, norm):
         line.setData(a, b)

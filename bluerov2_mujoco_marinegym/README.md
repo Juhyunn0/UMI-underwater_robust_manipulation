@@ -81,7 +81,8 @@ python test_disturbances.py  # current / waves / kicks distinct + domain randomi
 python test_controller.py    # PD/PID go-to-origin
 python test_dobmpc.py        # EAOB + NMPC (acados) closed loop
 python test_square_mission.py
-# or all at once:  pytest -q
+# each test file is runnable directly (python test_<name>.py); `pytest -q` also
+# works if pytest is installed (not in the base `robust` env).
 ```
 
 ### 2. Interactive teleop (needs a display)
@@ -106,9 +107,17 @@ python teleop.py --square --ctrl dobmpc --disturb
 python teleop.py --square --ctrl pid  --disturb --laps 10 --square-size 1.0 --square-speed 0.15
 ```
 
+The autonomous missions (`--square` / `--goto-origin`) use the **realistic T200
+actuator by default** (deadband / fwd-rev asymmetry / motor lag / voltage), since
+they exist to predict the real robot. Flags: `--ideal-thrusters` reverts to the
+ideal force path (commanded == realized); `--thruster-voltage 0.72` sets the
+battery thrust scale (default `0.72` = 4S nominal 14.8 V, datasheet-grounded — see
+[docs/03_THRUSTERS.md](docs/03_THRUSTERS.md) and `analyze_t200_voltage.py`).
+
 Each run writes `recordings/<timestamp>_square_<ctrl>.csv` **plus a sidecar
-`<...>.meta.json`** capturing the full run manifest — controller config,
-trajectory, and the exact disturbance schedule **including every kick event**.
+`<...>.meta.json`** capturing the full run manifest — controller config, actuator
+config (`run.thrusters`), trajectory, and the exact disturbance schedule
+**including every kick event**.
 
 ### 4. Experiments (headless, seed-controlled)
 
@@ -142,6 +151,7 @@ python verify_hydro_precise.py  # 4-tier rigorous: order-of-accuracy, MMS,
                                 #   skew/SPD identities, frame invariance, lag fidelity (slow)
 python verify_acados.py         # acados NMPC == IPOPT NMPC (equivalence + timing)
 python verify_meta.py           # the recorder sidecar manifest is complete
+python analyze_t200_voltage.py  # datasheet provenance for the thruster voltage_scale (0.72)
 ```
 
 ---
@@ -194,6 +204,7 @@ bluerov2_mujoco_marinegym/
 │
 ├── ablation_thrusters.py       # actuator-realism ablation experiment
 ├── analyze_square3.py · analyze_acados_vs_before.py   # recording analysis
+├── analyze_t200_voltage.py     # datasheet provenance for thruster voltage_scale (0.72)
 ├── verify_hydro.py · verify_hydro_precise.py · verify_acados.py · verify_meta.py
 ├── test_*.py                   # per-component tests (pytest)
 ├── generate_bluerov_xml.py · extract_meshes.py        # regenerate MJCF/meshes from USD

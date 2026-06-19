@@ -507,3 +507,46 @@ IPOPT `NMPC`를 lazy 생성; `n_fallback`이 복구 횟수 집계; `_warm=False`
 n_fail 0). 회귀: `test_dobmpc`, `teleop --selftest`, `verify_acados`(등가성 0.107 N, 102.6× 가속) 모두 통과.
 트레이드오프: 실패한 틱은 ~100 ms IPOPT 1회 비용(드묾; 하드 실시간이면 폴백을 미리 빌드). acados DOB-MPC가
 이제 5개 외란 seed 전부에서 강건.
+
+---
+
+## 2026-06-18 — 현실적 T200 추진기: datasheet 근거 `voltage_scale` + teleop 미션 기본 ON
+
+**Why.** 현실 actuator(`ThrusterModel`: 데드밴드 / 정·역 비대칭 / 모터 지연 / 전압)는 **opt-in(ablation 전용)**
+이라, 실로봇(BlueROV2) 거동 예측이 목적인 자율 미션(`--square` / `--goto-origin`)이 **ideal force path**
+(commanded == realized)로 돌고 있었음 — 비물리적 이상화. 또한 ablation에서 쓰던 전압 손실 `0.85`는 datasheet
+근거 없는 **임의값**이었음.
+
+**What.** (1) 전압 스케일을 공식 datasheet로 **근거화**, (2) 미션 경로에서 현실 모델을 **기본값**으로 하고
+`--ideal-thrusters` opt-out 제공(수동 키보드 teleop·`eval_dp`·`ablation`은 별도/명시적 경로라 불변).
+
+**근거(provenance).** Blue Robotics *T200 Public Performance Data 10–20 V (Sep 2019)*
+(`marinegym_assets/*.xlsx`; [analyze_t200_voltage.py](../analyze_t200_voltage.py)로 재현 — stdlib zip/XML
+파싱, pandas 불필요):
+
+| V | 10 | 12 | 14 | 16 | 18 | 20 |
+|---|---|---|---|---|---|---|
+| max fwd (kgf) | 2.93 | 3.71 | 4.53 | 5.25 | 6.02 | 6.72 |
+| max rev (kgf) | −2.31 | −2.92 | −3.52 | −4.07 | −4.59 | −5.04 |
+
+MarineGym 곡선의 최대(`T200_MAX_FWD/REV` = +6.54 / −5.26 kgf)가 **범위 최상단** → 그 `voltage_scale = 1.0`은
+사실상 **~20 V** 추진기. 실제 BlueROV2는 **4S Li-ion(공칭 14.8 V)** 운용이고, 14.8 V 최대 추력(14↔16 V 보간)은
+4.81 / 3.74 kgf → `voltage_scale = 14.8V/베이스 = 4.81/6.54 = 0.74(fwd), 3.74/5.26 = 0.71(rev)` → 단일 스칼라
+**`NOMINAL_VOLTAGE_SCALE = 0.72`** (만충 16.8 V ≈ 0.83, 방전 13 V ≈ 0.62). **0.85를 대체.**
+
+**How.** [thrusters.py](../thrusters.py): `NOMINAL_VOLTAGE_SCALE = 0.72` 추가(주석에 산정 근거). `ThrusterModel
+(voltage_scale=1.0)` 생성자 기본값은 **그대로 둠** — ablation의 명시적 `realistic`(V=1.0) 시나리오·다른 호출부를
+조용히 바꾸지 않기 위해. [teleop.py](../teleop.py): `--ideal-thrusters`(opt-out)·`--thruster-voltage`(기본
+`0.72`) 플래그 추가; 미션 분기에서 `ThrusterModel(lag=True, voltage_scale=…)` 1개를 만들어 `DOBMPCController`·
+`PoseController` 양쪽에 `actuator=` 주입(배선·`reset()`은 이미 존재); 시작 로그로 활성 경로 출력; 기록
+매니페스트(`.meta.json`)에 `run.thrusters = {model, lag, voltage_scale}` 기록해 ideal/realistic 혼동 방지.
+
+**Result.** 폐루프 DP(dobmpc, seed 0, 20 s, 외란 ON): **ideal radial 5.02 cm / jitter 4.30 cm → realistic
+×0.72 radial 7.76 cm / jitter 6.17 cm**, `n_fail 0` — 현실 단계가 예상대로 station-keeping을 악화(데드밴드
+jitter + 가산형 DOB가 부분만 잡는 28 % 추력 부족), solver 문제 없음. `analyze_t200_voltage.py`가 표와 `0.72`를
+재현(MATCH). 회귀: `eval_dp`(ideal 기본)·`ablation_thrusters` 시나리오 불변; `teleop --selftest` 통과.
+
+**범위/정직성.** MarineGym 곡선을 14.8 V로 **재적합하지 않음**(그러면 `T200_MAX`/`ctrlrange`가 전부 바뀜) —
+verbatim ~20 V 곡선을 두고 스칼라만 적용. fwd/rev 전압비(0.74 / 0.71)는 단일 0.72로 근사. 유입속도 의존
+(advance ratio: 움직이면 추력 감소)·열·파울링은 **범위 밖** — 현실 모델도 여전히 *정수(bollard)* 곡선. 데드밴드를
+DP보다 더 자극하는 *이동* 궤적(square) 실행이 자연스러운 후속.
