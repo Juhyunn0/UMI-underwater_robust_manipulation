@@ -53,20 +53,111 @@ F_kick(t)  = Poisson-timed impulsive world-frame force (gusts), applied directly
 So w is **DC (current) + oscillatory wave-band + impulses (kicks)** — the spectrum each
 controller is judged against. (JONSWAP spectrum: see the 2026-06-14 eval-env entry.)
 
-**What the controller controls (input → output).** Every controller below has the same I/O:
+**Two boundaries — "input" means different things for the *plant* and the *controller*.**
+The **BlueROV2 plant's input is the thrust** `τ` — the body wrench produced by the 6 thrusters
+(the `τ` on the RHS of the Fossen equation); its output is the state (η, ν). The **controller's
+input** is the measured state + reference, and its **output is the wrench command**, which — after
+allocation + the T200 thrust curve — *becomes* that thrust. So **controller output = plant input =
+thrust.** The closed loop:
 
 ```
-INPUT  (measured each step):  p (world pos), R (orientation → φ,θ,ψ), v (world lin vel),
-        ω (body ang vel);  DOB-MPC also ν̇ (finite difference, for the EAOB).
+ p_ref, ψ_ref, v_ref ┐
+                     ├──►[ controller ]──► wrench cmd  τ_c = [Fx Fy Fz 0 0 Mz]
+ measured η, ν ──────┘                            │ allocate:  f = B⁺ τ_c   (6 thruster forces, N)
+        ▲                                         │ T200:      throttle = curve⁻¹(f) → data.ctrl
+        │                                         ▼
+        │                                [ thrusters → MuJoCo + hydro ]
+        │     plant input = thrust τ = B·f ─►  M ν̇ + C(ν)ν + D(ν)ν + g(η) = τ + w  ─► new η, ν
+        └─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Controller I/O** (what each method below reads/writes — its input is *measurements*, not the thrust):
+
+```
+controller INPUT  (measured each step):  p (world pos), R (orientation → φ,θ,ψ),
+        v (world lin vel), ω (body ang vel);  DOB-MPC also ν̇ (finite difference, for the EAOB).
         + reference: p_ref, ψ_ref, and v_ref for trajectories.
-OUTPUT (commanded):  body wrench  τ = [Fx Fy Fz  Mx My Mz]  with  Mx = My = 0
-        → 6 thruster forces  f = B⁺ τ   (B = 6×6 allocation, rank 5),  written to data.ctrl
-        → realized wrench  τ_real = B f   (uncommandable pitch My projected out)
+controller OUTPUT (= the plant input):  body wrench  τ_c = [Fx Fy Fz  Mx My Mz],  Mx = My = 0
+        → 6 thruster forces  f = B⁺ τ_c   (B = 6×6 allocation, rank 5),  → data.ctrl (via T200)
+        → realized thrust into the plant:  τ = B f   (uncommandable pitch My projected out)
 ```
 **Rank-5 underactuation.** The 4 horizontal thrusters sit 0.0725 m below the COM, so surge
 couples to pitch: `My ≈ −0.0725·Fx`. Pitch is never commanded; it floats to the trim where
 buoyancy restoring balances the coupling: `sin θ* = 0.0725·Fx / (coBM·B)` (≈23° at 6 N). Every
-method below outputs τ to this same allocation and inherits this constraint.
+method below outputs τ_c to this same allocation and inherits this constraint.
+
+### The matrices — values, structure, and provenance
+
+**Where the numbers actually come from (verified upstream, not just our files).**
+- **Hydrodynamic coefficients — added mass M_A and damping D_L, D_NL:** identified experimentally
+  (tow-tank static + dynamic tests) in **Wu, C-J. (2018), *6-DoF Modelling and Control of a Remotely
+  Operated Vehicle*, MEng thesis, Flinders University — Tables 5.2 (added mass) & 5.3 (linear &
+  quadratic damping)**. Every value below matches that thesis *exactly* (checked against the document).
+  The same set is re-used by the peer-reviewed BlueROV2 benchmark **von Benzon et al. (2022, *J. Mar.
+  Sci. Eng.* 10(12):1898)** and adopted into **MarineGym** (Chu et al., IROS 2025) → our
+  [`BlueROV.yaml`](../marinegym_assets/BlueROV.yaml).
+- **Rigid-body mass & inertia M_RB, geometry, the 6 thruster mounts:** the **`bluerov2_description` ROS
+  URDF** (`BlueROV.urdf`) via MarineGym's Isaac asset → our [`bluerov.xml`](../bluerov.xml). *Note:*
+  m = 11.2 kg comes from this CAD/URDF; **Wu's thesis used 11.5 kg** — the rigid-body and the hydro
+  parameters have *different origins*, which is why we cite them separately.
+- **volume (0.0113459 m³), coBM (0.01 m):** CAD-derived, in MarineGym's `BlueROV.yaml`.
+- **T200 thrust curve & rotor config:** **Blue Robotics' published T200 performance data**, fit in
+  MarineGym's `actuators/t200.py`.
+
+**The matrices** (each 6-vector ordered **[surge, sway, heave, roll, pitch, yaw]**; units kg / kg·m²):
+
+```
+            surge  sway  heave    roll     pitch     yaw
+          ┌ 11.2    0     0        0         0        0      ┐ Fx-axis
+          │   0   11.2    0        0         0        0      │
+M_RB  =   │   0     0   11.2       0         0        0      │   rigid body  (bluerov2_description URDF)
+          │   0     0     0      0.30375     0        0      │   COM at body origin ⇒ diagonal,
+          │   0     0     0        0       0.626      0      │   no m·z_g surge–pitch coupling
+          └   0     0     0        0         0      0.5769   ┘
+
+          ┌ 5.5    0      0      0      0      0    ┐   added mass  (Wu 2018, Table 5.2)
+          │  0   12.7     0      0      0      0    │   (Xu̇,Yv̇,Zẇ,Kṗ,Mq̇,Nṙ), diagonal —
+M_A   =   │  0     0    14.57    0      0      0    │   off-diag (e.g. Yṙ, Nv̇) dropped (MarineGym).
+          │  0     0      0    0.12     0      0    │   heave 14.57 > m 11.2 ⇒ applied as the
+          │  0     0      0      0    0.12     0    │   EMA-lagged external force, NOT in MuJoCo's
+          └  0     0      0      0      0    0.12   ┘   mass matrix (see HYDRO_VERIFICATION)
+
+M = M_RB + M_A = diag(16.70, 23.90, 25.77, 0.42375, 0.746, 0.6969)          — SPD (verified, T1.3)
+
+D_L   = diag( 4.03,  6.22,  5.18, 0.07, 0.07, 0.07)   linear drag      (Wu 2018, Table 5.3)
+D_NL  = diag(18.18, 21.66, 36.99, 1.55, 1.55, 1.55)   quadratic drag   (Wu 2018, Table 5.3)
+   D(ν) = D_L + D_NL·|ν|  →  applied as the dissipative force  −(D_L·ν + D_NL·|ν|·ν)
+   (both coefficient sets recovered back out of the sim to 0.00 %, T4.3)
+
+C_RB(ν)·ν = [ m(qw−rv),  m(ru−pw),  m(pv−qu),  (I_z−I_y)qr,  (Iₓ−I_z)pr,  (I_y−Iₓ)pq ]ᵀ   (from M_RB)
+
+            ┌  0     0     0      0    −a₃w   a₂v ┐   a = (a₁…a₆) = M_A diagonal
+            │  0     0     0    a₃w     0    −a₁u │     = (5.5, 12.7, 14.57, 0.12, 0.12, 0.12)
+C_A(ν)  =   │  0     0     0   −a₂v   a₁u     0   │   ν = [u v w  p q r]
+            │  0   −a₃w   a₂v    0    −a₆r   a₅q │   skew-symmetric (Fossen 2011 Eq. 6.44);
+            │ a₃w    0   −a₁u   a₆r     0    −a₄p │   verified C_A = −C_Aᵀ and == sim to
+            └−a₂v   a₁u    0   −a₅q   a₄p     0   ┘   1e-14 (T1.1–1.2)
+
+g(η)  restoring (FLU):  B = ρgV = 997·9.81·0.0113459 = 110.97 N  (up, at CB)
+                        W = mg  = 11.2·9.81           = 109.87 N  (down, at COM)
+                        net = B − W = +1.10 N up ;  CB = COM + coBM·ẑ_body,  coBM = 0.01 m
+                        restoring moment = k·sinθ_tilt ,  k = coBM·B = 1.110 N·m/rad
+   (volume, coBM from BlueROV.yaml; ρ = 997 fresh water; m, g from the URDF / model.opt.gravity)
+
+τ = B · f   (plant input: body wrench from the 6 thruster forces f [N])
+        thr0    thr1    thr2    thr3    thr4    thr5
+      ┌ 0.707   0.707  −0.707  −0.707   0       0     ┐ Fx
+      │ 0.707  −0.707   0.707  −0.707   0       0     │ Fy
+B  =  │ 0       0       0       0       1       1     │ Fz
+      │ 0.051  −0.051   0.051  −0.051  −0.110   0.110 │ Mx
+      │−0.051  −0.051   0.051   0.051  −0.002  −0.002 │ My  ← only ±0.002 from the verticals
+      └ 0.167  −0.167  −0.175   0.175   0       0     ┘ Mz     ⇒ rank 5, pitch ~uncommandable
+   column i = [ d_i ; r_i × d_i ],  d_i = thruster axis (site +X),  r_i = pos − COM.
+   4 horizontal thrusters at z = −0.0725 m (vectored ±45°) ⇒ the surge→pitch coupling; 2 vertical.
+   (bluerov.xml sites)  ·  T200 curve (force ↔ throttle, the real driver layer): u∈[−1,1] → rpm
+   (0.075 deadband, ±3900 rpm) → thrust via Blue Robotics' asymmetric T200 fit, t200_thrust(+1)=
+   +64.13 N, t200_thrust(−1)=−51.55 N (~1.24 fwd/rev asymmetry). Allocation/curve: thrusters.py.
+```
 
 ---
 
@@ -405,3 +496,75 @@ pass. Trade-offs (per the recommendation): ~1 s codegen build at controller star
 (vs IPOPT hard) for RTI feasibility; RTI is a one-step approximation — validated against IPOPT here.
 IPOPT stays selectable as the reference (`params.SOLVER="ipopt"`). Deferred: port the EAOB
 finite-difference Jacobian to CasADi autodiff (≈22→4 ms).
+
+---
+
+## 2026-06-16 — Actuator-realism ablation (realistic T200 thrusters) + a discovered acados fragility
+
+**Why.** All prior experiments command per-thruster force in N and assume it is realized exactly
+(ideal force path). On the real BlueROV2 the low-level input is a normalized throttle/PWM; the T200
+curve turns it into thrust, with a **deadband** (sub-~0.7 N lost, then a ~1.44 N minimum-spin jump),
+**fwd/rev asymmetry**, **saturation**, **motor lag**, and a **voltage/wear gain error**. We asked
+whether modelling these makes the sim meaningfully more realistic, and which controller is most robust.
+
+**What (implementation, opt-in).** New `thrusters.ThrusterModel` (the real driver chain: T200 inverse →
+motor lag → forward curve → `voltage_scale`), passed optionally through `set_wrench_command(actuator=)`
+and the controllers (`actuator=None` default — the ideal path is unchanged). `ablation_thrusters.py`
+runs DP (origin, disturbance ON, mean over 5 seeds) for PID / MPC / DOB-MPC under **ideal /
+realistic / realistic-LV** (LV = ×0.85 thrust from battery sag).
+
+**Result — actuator realism is a MODEST effect on DP (clean controllers).** PID and MPC (no solver
+failures) station-keeping radial RMS [cm], mean over 5 seeds:
+
+| ctrl | ideal | realistic | realistic-LV | jitter (std) ideal→LV |
+|---|---|---|---|---|
+| PID | 14.86 | 14.74 | 15.16 | 10.4 → 12.4 cm |
+| MPC | 5.11 | 4.30 | 5.12 | 2.9 → 3.5 cm |
+
+Radial RMS barely moves (within the ±7–9 cm seed scatter); the visible signature is **jitter
+(position std) rising ~15–20 %** — the deadband limit-cycle. So adding realistic thrusters makes the
+sim a bit more faithful (captures deadband chatter) **but does not change the DP controller ranking** —
+the hold forces sit near/above the ~1.44 N deadband floor and the ~10 ms motor lag is well inside the
+50 ms control tick. (A *moving* trajectory, where small per-thruster commands cross the deadband more
+often, would stress it harder — a follow-up.)
+
+**Result — the ablation incidentally exposed an acados DOB-MPC robustness bug.** Seed-averaging (which
+the noise demanded) revealed that **on seed 3 the acados SQP-RTI cascades into `ACADOS_NAN_DETECTED` /
+`MINSTEP` (n_fail 116) and blows up to 39 cm**, *independently of the actuator* (it happens on the ideal
+path). Per-seed, ideal DOB-MPC: seeds 0/1/2/4 = 4.1 / 0.7 / 0.9 / 1.4 cm, n_fail 0 (excellent); **seed 3
+= 39 cm, n_fail 116**. The single-seed acados verification (seed 0) missed this: a specific
+wave/kick realization drives the EAOB `ŵ` into a regime where the RTI QP goes indefinite and, doing one
+iteration, cannot recover (it holds a stale `u` → diverges → more failures). The IPOPT reference (full
+convergence) is robust here. **Open fix (recommended): on repeated acados NaN, fall back to one IPOPT
+solve for that tick** (IPOPT is already built as the reference), plus tighter `ŵ` clamping / QP
+regularization. Until fixed, the DOB-MPC ablation numbers on seed 3 are a solver artifact, not an
+actuator effect.
+
+**Takeaway.** Modelling realistic thrusters is worth keeping as an opt-in sim-to-real stress test (it
+adds the deadband jitter and the multiplicative-thrust robustness axis the additive DOB can't fully
+cancel), but for DP it does not overturn the ideal-path comparison. The more urgent finding is the
+acados DOB-MPC seed-3 NaN fragility — to be fixed with an IPOPT fallback.
+
+---
+
+## 2026-06-16 — Fix: acados DOB-MPC NaN fragility → IPOPT fallback + iterate re-init
+
+**Why.** The ablation above found the acados SQP-RTI cascading into NaN and diverging on seed 3
+(n_fail 116, 39 cm): a single failure leaves the RTI warm-started from a *corrupted* iterate, so every
+later tick also fails and the held-stale `u` lets the vehicle drift away.
+
+**What.** On any acados failure (NaN / min-step / non-finite u₀) `AcadosNMPC` now (1) **re-initialises
+the acados iterate** (flat trajectory at the current x) so the next RTI restarts clean, and (2)
+**recovers THIS tick with one IPOPT solve** — the validated full-convergence reference, built lazily on
+the first failure. Previously it returned the stale `u₀` → divergence.
+
+**How.** [dobmpc/mpc_acados.py](../dobmpc/mpc_acados.py): `fallback_ipopt=True` (default);
+`_ipopt_fallback()` lazily builds the IPOPT `NMPC`; `n_fallback` counts recoveries; `_warm=False` forces
+the clean acados restart. The no-failure path is untouched (same 0.97 ms RTI, same equivalence).
+
+**Result.** Seed-3 ideal DOB-MPC: **39.04 cm / n_fail 116 → 12.82 cm / n_fail 1** — one fallback breaks
+the cascade; the residual is now the genuine large-kick transient (bounded, recovered), not a solver
+blow-up. Seeds 0/1/2/4 unchanged (0.7–4.1 cm, n_fail 0). Regression: `test_dobmpc`, `teleop --selftest`,
+`verify_acados` (equivalence 0.107 N, 102.6× speedup) all pass. Trade-off: a failed tick costs one
+~100 ms IPOPT solve (rare; pre-build the fallback for hard real-time). The acados DOB-MPC is now robust
+across all five disturbance seeds.

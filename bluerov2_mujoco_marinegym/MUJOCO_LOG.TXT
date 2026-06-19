@@ -34,3 +34,9 @@ WARNING: Nan, Inf or huge value in QACC at DOF 4. The simulation is unstable. Ti
 Tue Jun 16 13:41:56 2026
 WARNING: Nan, Inf or huge value in QVEL at DOF 2. The simulation is unstable. Time = 0.0003.
 
+Wed Jun 17 13:26:41 2026
+ERROR: could not initialize GLFW
+
+Wed Jun 17 13:27:59 2026
+ERROR: Python exception raised
+

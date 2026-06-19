@@ -46,12 +46,12 @@ def _build(seed):
     return model, data, hydro, field, bid
 
 
-def run_one(mode, T, seed, start, log_hz=20.0):
+def run_one(mode, T, seed, start, log_hz=20.0, actuator=None):
     model, data, hydro, field, bid = _build(seed)
     if mode == "pid":
-        ctrl = PoseController(model, mode="pid", buoyancy_ff=hydro)
+        ctrl = PoseController(model, mode="pid", buoyancy_ff=hydro, actuator=actuator)
     else:
-        ctrl = DOBMPCController(model, hydro=hydro, mode=mode)
+        ctrl = DOBMPCController(model, hydro=hydro, mode=mode, actuator=actuator)
     ctrl.set_target((0.0, 0.0, 0.0), yaw_ref=0.0)
     data.qpos[:3] = list(start)
     mujoco.mj_forward(model, data)

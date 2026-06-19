@@ -42,9 +42,10 @@ def _Rz_flu(yaw):
 
 class DOBMPCController:
     def __init__(self, model, hydro=None, mode="dobmpc", setpoint=(0.0, 0.0, 0.0),
-                 yaw_ref=0.0, body="base_link", ctrl_hz=20.0, N=P.MPC_N):
+                 yaw_ref=0.0, body="base_link", ctrl_hz=20.0, N=P.MPC_N, actuator=None):
         assert mode in ("dobmpc", "mpc"), mode
         self.model = model
+        self.actuator = actuator                 # optional realistic thrusters (opt-in)
         self.hydro = hydro                       # only for parity with PoseController
         self.mode = mode
         self.bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body)
@@ -92,6 +93,8 @@ class DOBMPCController:
         self._nu_prev_ned = None
         self._k = 0
         self.nmpc.reset()
+        if self.actuator is not None:
+            self.actuator.reset()
 
     # ------------------------------------------------------------- state I/O
     def _read_state(self, data):
@@ -154,7 +157,8 @@ class DOBMPCController:
         if self._k % self.decim == 0:
             self._control_step(data)
         self._k += 1
-        forces, realized = T.set_wrench_command(model, data, self._tau_flu, self.B)
+        forces, realized = T.set_wrench_command(model, data, self._tau_flu, self.B,
+                                                actuator=self.actuator)
         self.realized = np.asarray(realized, float)
         return forces, self.realized
 

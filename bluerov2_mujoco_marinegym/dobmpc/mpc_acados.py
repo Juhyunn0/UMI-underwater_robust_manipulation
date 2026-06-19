@@ -61,7 +61,8 @@ def _build_model(name="dobmpc_bluerov"):
 
 class AcadosNMPC:
     def __init__(self, N=P.MPC_N, dt=P.DT_CTRL, Q=P.MPC_Q, R=P.MPC_R, QN=P.MPC_QN,
-                 u_max=P.U_MAX, v_max=P.V_MAX, rti=True, soft=True, build=True):
+                 u_max=P.U_MAX, v_max=P.V_MAX, rti=True, soft=True, build=True,
+                 fallback_ipopt=True):
         self.N, self.dt = int(N), float(dt)
         nx, nu = NX, NU
         ny, ny_e = nx + nu, nx
@@ -140,7 +141,16 @@ class AcadosNMPC:
         self._u_prev = np.zeros(nu)
         self._warm = False
         self.n_fail = 0
+        self.n_fallback = 0
         self.last_status = 0
+        # robustness: on a (rare) acados NaN/min-step failure, recover with one IPOPT
+        # solve for that tick (IPOPT = the validated full-convergence reference) AND
+        # re-init the acados iterate so it restarts clean -- without this, a single
+        # NaN cascades (RTI warm-starts from the corrupted iterate and diverges; see
+        # the 2026-06-16 seed-3 finding). Built lazily so the IPOPT cost is paid only
+        # if a failure ever happens.
+        self._fallback_enabled = bool(fallback_ipopt)
+        self._fallback = None
 
     # ----------------------------------------------------------------- solve
     def solve(self, x, w_hat, xref_traj):
@@ -168,15 +178,33 @@ class AcadosNMPC:
 
         status = self.solver.solve()
         self.last_status = int(status)
-        if status not in (0, 2):                # 0 ok; 2 = max_iter (still usable)
-            self.n_fail += 1
-            return self._u_prev.copy()
         u = np.asarray(self.solver.get(0, "u"), float)
-        if not np.isfinite(u).all():
-            self.n_fail += 1
-            return self._u_prev.copy()
-        self._u_prev = u.copy()
-        return u.copy()
+        if status in (0, 2) and np.isfinite(u).all():   # 0 ok; 2 = max_iter (usable)
+            self._u_prev = u.copy()
+            return u.copy()
+
+        # ---- acados failed (NaN / min-step): recover, don't hold a stale u (->diverge)
+        self.n_fail += 1
+        self._warm = False                              # re-init the acados iterate next tick
+        if self._fallback_enabled:
+            uf = self._ipopt_fallback(x, w_hat, xref)
+            if uf is not None and np.isfinite(uf).all():
+                self.n_fallback += 1
+                self._u_prev = np.asarray(uf, float).copy()
+                return self._u_prev.copy()
+        return self._u_prev.copy()
+
+    def _ipopt_fallback(self, x, w_hat, xref):
+        """One IPOPT (full-convergence) solve to recover from an acados failure.
+        Built lazily on first use; returns None if even IPOPT can't solve."""
+        try:
+            if self._fallback is None:
+                from .mpc import NMPC
+                self._fallback = NMPC(N=self.N, dt=self.dt)
+                self._fallback.reset()
+            return self._fallback.solve(x, w_hat, xref)
+        except Exception:
+            return None
 
     def solve_ms(self):
         """Last solve wall time [ms] as reported by acados."""
@@ -189,3 +217,6 @@ class AcadosNMPC:
         self._u_prev = np.zeros(NU)
         self._warm = False
         self.n_fail = 0
+        self.n_fallback = 0
+        if self._fallback is not None:
+            self._fallback.reset()

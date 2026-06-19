@@ -48,19 +48,105 @@ F_kick(t)  = Poisson 충격 world-frame 외력(gust), COM에 직접 적용
 즉 w는 **DC(current) + 진동 파도대역 + 충격(kick)** — 각 컨트롤러가 평가받는 스펙트럼. (JONSWAP
 스펙트럼은 2026-06-14 평가환경 항목.)
 
-**컨트롤러가 제어하는 것(입력 → 출력).** 아래 모든 컨트롤러가 같은 I/O:
+**두 경계 — "입력"은 *플랜트*와 *컨트롤러*에서 뜻이 다름.**
+**BlueROV2 플랜트의 입력은 추력(thrust) `τ`** — 6개 추진기가 만드는 body wrench(Fossen 식 우변의 `τ`)이고,
+출력은 상태(η, ν). **컨트롤러의 입력**은 측정 상태 + 기준이고, **출력은 wrench 명령**인데, 이게 할당 + T200
+추력곡선을 거쳐 그 추력이 *된다*. 즉 **컨트롤러 출력 = 플랜트 입력 = 추력.** 폐루프:
 
 ```
-INPUT  (매 스텝 측정):  p(world 위치), R(자세 → φ,θ,ψ), v(world 선속도),
+ p_ref, ψ_ref, v_ref ┐
+                     ├──►[ 컨트롤러 ]──► wrench 명령  τ_c = [Fx Fy Fz 0 0 Mz]
+ 측정 η, ν ──────────┘                          │ 할당:  f = B⁺ τ_c   (6 추진기 힘, N)
+        ▲                                       │ T200:  throttle = curve⁻¹(f) → data.ctrl
+        │                                       ▼
+        │                              [ 추진기 → MuJoCo + hydro ]
+        │   플랜트 입력 = 추력 τ = B·f ─►  M ν̇ + C(ν)ν + D(ν)ν + g(η) = τ + w  ─► 새 η, ν
+        └────────────────────────────────────────────────────────────────────────────┘
+```
+
+**컨트롤러 I/O** (아래 각 방법이 읽고/쓰는 것 — 입력은 *측정*이지 추력이 아님):
+
+```
+컨트롤러 INPUT  (매 스텝 측정):  p(world 위치), R(자세 → φ,θ,ψ), v(world 선속도),
         ω(body 각속도);  DOB-MPC는 추가로 ν̇(유한차분, EAOB용).
         + 기준: p_ref, ψ_ref, 궤적이면 v_ref.
-OUTPUT (명령):  body wrench  τ = [Fx Fy Fz  Mx My Mz]  단  Mx = My = 0
-        → 6 추진기 힘  f = B⁺ τ   (B = 6×6 할당, rank 5),  data.ctrl에 기록
-        → 실현 wrench  τ_real = B f   (명령 불가한 pitch My는 투영 제거)
+컨트롤러 OUTPUT (= 플랜트 입력):  body wrench  τ_c = [Fx Fy Fz  Mx My Mz],  Mx = My = 0
+        → 6 추진기 힘  f = B⁺ τ_c   (B = 6×6 할당, rank 5),  → data.ctrl (T200 경유)
+        → 플랜트로 들어가는 실현 추력  τ = B f   (명령 불가한 pitch My는 투영 제거)
 ```
 **Rank-5 underactuation.** 수평 추진기 4개가 COM보다 0.0725 m 아래라 surge가 pitch에 커플링:
 `My ≈ −0.0725·Fx`. pitch는 명령하지 않고, 부력 복원이 커플링을 상쇄하는 트림으로 부유:
-`sin θ* = 0.0725·Fx / (coBM·B)` (6 N서 ≈23°). 아래 모든 방법이 같은 할당에 τ를 내보내고 이 제약을 물려받음.
+`sin θ* = 0.0725·Fx / (coBM·B)` (6 N서 ≈23°). 아래 모든 방법이 같은 할당에 τ_c를 내보내고 이 제약을 물려받음.
+
+### 행렬 — 값·구조·출처
+
+**값의 진짜 출처 (우리 파일이 아니라 학술 1차 출처, 검증함).**
+- **유체계수 — added mass M_A, 댐핑 D_L, D_NL:** **Wu, C-J. (2018), *6-DoF Modelling and Control of a
+  Remotely Operated Vehicle*, MEng 학위논문, Flinders University — Table 5.2(added mass)·5.3(linear &
+  quadratic damping)**에서 tow-tank 정·동적 실험으로 식별. 아래 값들은 그 논문과 *정확히* 일치(원문 대조
+  확인). 동일 세트가 peer-review 벤치마크 **von Benzon et al. (2022, *J. Mar. Sci. Eng.* 10(12):1898)**에
+  재사용되고 **MarineGym**(Chu et al., IROS 2025)으로 채택 → 우리
+  [`BlueROV.yaml`](../marinegym_assets/BlueROV.yaml).
+- **강체 질량·관성 M_RB, 기하, 6 추진기 마운트:** **`bluerov2_description` ROS URDF**(`BlueROV.urdf`)가
+  MarineGym Isaac asset 거쳐 우리 [`bluerov.xml`](../bluerov.xml). *주의:* 여기 m = 11.2 kg은 이 CAD/URDF
+  출처이고 **Wu 논문은 11.5 kg** 사용 — 강체와 유체 파라미터는 *출처가 다름*(그래서 따로 인용).
+- **volume(0.0113459 m³)·coBM(0.01 m):** CAD 유래, MarineGym `BlueROV.yaml`.
+- **T200 추력곡선·rotor config:** **Blue Robotics 공개 T200 성능 데이터**, MarineGym `actuators/t200.py`에 피팅.
+
+**행렬** (각 6-벡터 순서 **[surge, sway, heave, roll, pitch, yaw]**; 단위 kg / kg·m²):
+
+```
+            surge  sway  heave    roll     pitch     yaw
+          ┌ 11.2    0     0        0         0        0      ┐
+          │   0   11.2    0        0         0        0      │
+M_RB  =   │   0     0   11.2       0         0        0      │   강체 (bluerov2_description URDF)
+          │   0     0     0      0.30375     0        0      │   COM이 body 원점 ⇒ 대각,
+          │   0     0     0        0       0.626      0      │   m·z_g surge–pitch 커플 없음
+          └   0     0     0        0         0      0.5769   ┘
+
+          ┌ 5.5    0      0      0      0      0    ┐   added mass (Wu 2018, Table 5.2)
+          │  0   12.7     0      0      0      0    │   (Xu̇,Yv̇,Zẇ,Kṗ,Mq̇,Nṙ), 대각 —
+M_A   =   │  0     0    14.57    0      0      0    │   비대각(예: Yṙ,Nv̇) 누락(MarineGym).
+          │  0     0      0    0.12     0      0    │   heave 14.57 > m 11.2 ⇒ 질량행렬이 아닌
+          │  0     0      0      0    0.12     0    │   EMA-lag 외력으로 적용 (HYDRO_VERIFICATION)
+          └  0     0      0      0      0    0.12   ┘
+
+M = M_RB + M_A = diag(16.70, 23.90, 25.77, 0.42375, 0.746, 0.6969)          — SPD (검증, T1.3)
+
+D_L   = diag( 4.03,  6.22,  5.18, 0.07, 0.07, 0.07)   선형 drag    (Wu 2018, Table 5.3)
+D_NL  = diag(18.18, 21.66, 36.99, 1.55, 1.55, 1.55)   2차 drag     (Wu 2018, Table 5.3)
+   D(ν) = D_L + D_NL·|ν|  →  소산 힘으로 적용  −(D_L·ν + D_NL·|ν|·ν)
+   (두 계수 세트 모두 sim에서 0.00 % 복원, T4.3)
+
+C_RB(ν)·ν = [ m(qw−rv),  m(ru−pw),  m(pv−qu),  (I_z−I_y)qr,  (Iₓ−I_z)pr,  (I_y−Iₓ)pq ]ᵀ   (M_RB에서)
+
+            ┌  0     0     0      0    −a₃w   a₂v ┐   a = (a₁…a₆) = M_A 대각
+            │  0     0     0    a₃w     0    −a₁u │     = (5.5, 12.7, 14.57, 0.12, 0.12, 0.12)
+C_A(ν)  =   │  0     0     0   −a₂v   a₁u     0   │   ν = [u v w  p q r]
+            │  0   −a₃w   a₂v    0    −a₆r   a₅q │   skew 대칭 (Fossen 2011 Eq. 6.44);
+            │ a₃w    0   −a₁u   a₆r     0    −a₄p │   C_A = −C_Aᵀ 및 sim과 1e-14 일치
+            └−a₂v   a₁u    0   −a₅q   a₄p     0   ┘   검증 (T1.1–1.2)
+
+g(η)  복원력 (FLU):  B = ρgV = 997·9.81·0.0113459 = 110.97 N  (상향, CB에)
+                     W = mg  = 11.2·9.81           = 109.87 N  (하향, COM에)
+                     순 = B − W = +1.10 N 상향 ;  CB = COM + coBM·ẑ_body,  coBM = 0.01 m
+                     복원 모멘트 = k·sinθ_tilt ,  k = coBM·B = 1.110 N·m/rad
+   (volume·coBM은 BlueROV.yaml; ρ = 997 담수; m, g는 URDF / model.opt.gravity)
+
+τ = B · f   (플랜트 입력: 6 추진기 힘 f [N]로부터 body wrench)
+        thr0    thr1    thr2    thr3    thr4    thr5
+      ┌ 0.707   0.707  −0.707  −0.707   0       0     ┐ Fx
+      │ 0.707  −0.707   0.707  −0.707   0       0     │ Fy
+B  =  │ 0       0       0       0       1       1     │ Fz
+      │ 0.051  −0.051   0.051  −0.051  −0.110   0.110 │ Mx
+      │−0.051  −0.051   0.051   0.051  −0.002  −0.002 │ My  ← 수직 추진기에서 ±0.002뿐
+      └ 0.167  −0.167  −0.175   0.175   0       0     ┘ Mz     ⇒ rank 5, pitch 거의 명령 불가
+   열 i = [ d_i ; r_i × d_i ],  d_i = 추진기 축(site +X),  r_i = 위치 − COM.
+   수평 4개 z = −0.0725 m(±45° 벡터드) ⇒ surge→pitch 커플; 수직 2개. (bluerov.xml sites)
+   ·  T200 곡선(힘 ↔ throttle, 실제 드라이버 층): u∈[−1,1] → rpm(0.075 deadband, ±3900 rpm) →
+   Blue Robotics 비대칭 T200 피팅으로 추력, t200_thrust(+1)=+64.13 N, t200_thrust(−1)=−51.55 N
+   (~1.24 전/후진 비대칭). 할당/곡선: thrusters.py.
+```
 
 ---
 
@@ -360,3 +446,64 @@ pitch 상태 제약:  |θ_k| ≤ θ_max  ∀k ,   θ_max = 0.40 rad ≈ 23°
 코드생성 빌드; RTI feasibility 위해 **소프트** 상태 제약(IPOPT는 하드); RTI는 1스텝 근사 — 여기서 IPOPT로
 검증함. IPOPT는 레퍼런스로 선택 가능(`params.SOLVER="ipopt"`). 보류: EAOB 유한차분 Jacobian을 CasADi
 autodiff로 이식(≈22→4 ms).
+
+---
+
+## 2026-06-16 — Actuator 현실성 ablation(현실 T200 추진기) + 발견된 acados 취약성
+
+**Why.** 기존 실험은 추진기 힘을 N으로 명령하고 정확히 실현된다고 가정(이상 force 경로). 실물 BlueROV2의
+저수준 입력은 정규화 throttle/PWM이고, T200 곡선이 추력으로 바꾸며 **deadband**(~0.7 N 이하 소실 후 ~1.44 N
+최소회전 점프), **정/역 비대칭**, **포화**, **모터 lag**, **전압/마모 게인오차**가 있다. 이를 모델하면 sim이
+유의미하게 더 현실적이 되는지, 어느 컨트롤러가 가장 강건한지 확인.
+
+**What (구현, opt-in).** 신규 `thrusters.ThrusterModel`(실제 드라이버 체인: T200 역산 → 모터 lag → 정방향
+곡선 → `voltage_scale`)을 `set_wrench_command(actuator=)`와 컨트롤러에 옵션 전달(`actuator=None` 기본 —
+이상 경로 불변). `ablation_thrusters.py`가 DP(원점, 외란 ON, 5 seed 평균)를 PID/MPC/DOB-MPC에 대해
+**ideal / realistic / realistic-LV**(LV=전압 강하 ×0.85)로 실행.
+
+**Result — actuator 현실성은 DP에 MODEST(정상 컨트롤러).** PID·MPC(solver 실패 0) 원점유지 radial RMS [cm],
+5 seed 평균:
+
+| ctrl | ideal | realistic | realistic-LV | jitter(std) ideal→LV |
+|---|---|---|---|---|
+| PID | 14.86 | 14.74 | 15.16 | 10.4 → 12.4 cm |
+| MPC | 5.11 | 4.30 | 5.12 | 2.9 → 3.5 cm |
+
+radial RMS는 거의 안 움직임(±7–9 cm seed 산포 내); 보이는 신호는 **jitter(위치 std)가 ~15–20 % 상승** =
+deadband 한계진동. 즉 현실 추진기를 넣으면 sim이 조금 더 충실(deadband 채터 포착)하지만 **DP 컨트롤러 순위는
+안 바뀜** — 유지 힘이 ~1.44 N deadband floor 근처/이상이고 ~10 ms 모터 lag이 50 ms 제어주기 안쪽이라. (작은
+추진기 명령이 deadband를 더 자주 넘는 *이동* 궤적은 더 큰 스트레스 — 후속.)
+
+**Result — ablation이 우연히 acados DOB-MPC 버그를 노출.** seed 평균(노이즈 때문에 필요)이 **seed 3에서
+acados SQP-RTI가 `ACADOS_NAN_DETECTED`/`MINSTEP` 폭주(n_fail 116) → 39 cm 발산**, *actuator와 무관*(이상
+경로에서도 발생)함을 드러냄. seed별 ideal DOB-MPC: seed 0/1/2/4 = 4.1 / 0.7 / 0.9 / 1.4 cm, n_fail 0(우수);
+**seed 3 = 39 cm, n_fail 116**. 단일 seed(0) acados 검증이 놓침: 특정 wave/kick 실현이 EAOB `ŵ`를 RTI QP가
+indefinite해지는 영역으로 몰고, 1 iteration이라 회복 불가(stale `u` 유지 → 발산 → 추가 실패). IPOPT 레퍼런스
+(완전수렴)는 강건. **오픈 수정(권장): acados NaN 반복 시 해당 틱만 IPOPT 1회로 폴백**(IPOPT는 이미 레퍼런스로
+빌드됨) + `ŵ` 강한 clamp / QP 정규화. 수정 전까지 seed 3의 DOB-MPC 수치는 actuator 효과가 아니라 solver 아티팩트.
+
+**Takeaway.** 현실 추진기 모델은 opt-in sim-to-real 스트레스 테스트로 유지 가치 있음(deadband jitter + 가산형
+DOB가 못 잡는 곱셈형 추력 강건성 축 추가). 단 DP에선 이상 경로 비교를 뒤집지 않음. 더 시급한 건 acados
+DOB-MPC seed-3 NaN 취약성 — IPOPT 폴백으로 수정 예정.
+
+---
+
+## 2026-06-16 — 수정: acados DOB-MPC NaN 취약성 → IPOPT 폴백 + iterate 재초기화
+
+**Why.** 위 ablation이 acados SQP-RTI가 seed 3에서 NaN 폭주·발산함을 발견(n_fail 116, 39 cm): 한 번의
+실패가 RTI를 *오염된* iterate에서 warm-start하게 만들어 이후 모든 틱이 실패하고, 붙들린 stale `u`가 차체를
+표류시킴.
+
+**What.** acados 실패(NaN / min-step / 비유한 u₀) 시 `AcadosNMPC`가 이제 (1) **acados iterate 재초기화**
+(현재 x로 평탄 궤적) → 다음 RTI가 깨끗하게 재시작, (2) **이번 틱을 IPOPT 1회로 복구**(검증된 완전수렴
+레퍼런스, 첫 실패 시 lazy 생성). 이전엔 stale `u₀`를 반환 → 발산.
+
+**How.** [dobmpc/mpc_acados.py](../dobmpc/mpc_acados.py): `fallback_ipopt=True`(기본); `_ipopt_fallback()`이
+IPOPT `NMPC`를 lazy 생성; `n_fallback`이 복구 횟수 집계; `_warm=False`로 acados 깨끗한 재시작 강제. 무실패
+경로는 불변(동일 0.97 ms RTI, 동일 등가성).
+
+**Result.** seed 3 ideal DOB-MPC: **39.04 cm / n_fail 116 → 12.82 cm / n_fail 1** — 폴백 1회가 cascade를
+끊음; 잔여는 이제 solver 발산이 아니라 진짜 큰 kick 과도(bounded, 복구됨). seed 0/1/2/4 불변(0.7–4.1 cm,
+n_fail 0). 회귀: `test_dobmpc`, `teleop --selftest`, `verify_acados`(등가성 0.107 N, 102.6× 가속) 모두 통과.
+트레이드오프: 실패한 틱은 ~100 ms IPOPT 1회 비용(드묾; 하드 실시간이면 폴백을 미리 빌드). acados DOB-MPC가
+이제 5개 외란 seed 전부에서 강건.

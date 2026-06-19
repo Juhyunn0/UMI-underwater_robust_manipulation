@@ -50,9 +50,10 @@ DEFAULT_GAINS = dict(
 
 class PoseController:
     def __init__(self, model, mode="pid", setpoint=(0.0, 0.0, 0.0), yaw_ref=0.0,
-                 buoyancy_ff=None, body="base_link", gains=None, dt=None):
+                 buoyancy_ff=None, body="base_link", gains=None, dt=None, actuator=None):
         self.model = model
         self.mode = mode
+        self.actuator = actuator                         # optional realistic thrusters
         self.use_i = (mode == "pid")
         self.p_ref = np.asarray(setpoint, float)
         self.yaw_ref = float(yaw_ref)
@@ -81,6 +82,8 @@ class PoseController:
         self.v_ref = np.zeros(3)             # world reference velocity (trajectory FF)
         self.commanded = np.zeros(6)
         self.realized = np.zeros(6)
+        if getattr(self, "actuator", None) is not None:
+            self.actuator.reset()
 
     def set_target(self, p_ref=None, yaw_ref=None, v_ref=None):
         """Update the (possibly moving) setpoint. v_ref is the reference world velocity
@@ -158,7 +161,8 @@ class PoseController:
     def apply(self, model, data):
         """Compute the wrench and write thruster forces. Returns (forces, realized)."""
         wrench = self.compute(data)
-        forces, realized = T.set_wrench_command(model, data, wrench, self.B)
+        forces, realized = T.set_wrench_command(model, data, wrench, self.B,
+                                                actuator=self.actuator)
         self.realized = np.asarray(realized, float)
         return forces, self.realized
 

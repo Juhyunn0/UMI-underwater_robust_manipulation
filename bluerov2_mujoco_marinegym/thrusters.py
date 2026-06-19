@@ -120,6 +120,38 @@ class T200Dynamics:
         return _rpm_to_thrust(self.rpm)
 
 
+class ThrusterModel:
+    """Realistic per-thruster actuator stage (OPT-IN; default path is ideal force).
+
+    The controller still emits a desired per-thruster force `f_des` [N] from the
+    allocation; on the real robot the low-level driver inverts the T200 curve to a
+    throttle (at the *nominal* voltage), the ESC/motor realize it with a lag, and
+    the actual thrust depends on the *actual* voltage. This stage reproduces that:
+
+        f_des --T200 inverse(nominal V)--> throttle --(motor lag)--> T200 curve --> f
+        f_real = voltage_scale * f                         (battery sag / wear / load)
+
+    So it injects the **deadband** (small forces round-trip to 0 or the ~1.4 N
+    minimum-spin jump), the **fwd/rev asymmetry + saturation** (the curve), the
+    **motor lag** (T200Dynamics), and a **multiplicative thrust error** (voltage_
+    scale) -- exactly the imperfections the ideal force path skips. The controller
+    is NOT told about any of this, so realized != commanded == a robustness test."""
+
+    def __init__(self, n=6, lag=True, voltage_scale=1.0):
+        self.voltage_scale = float(voltage_scale)
+        self.dyn = T200Dynamics(n=n) if lag else None
+
+    def reset(self):
+        if self.dyn is not None:
+            self.dyn.reset()
+
+    def realize(self, forces_des, dt):
+        """Desired per-thruster force [N] -> actually-realized force [N]."""
+        u = np.atleast_1d(t200_throttle_for_thrust(forces_des))   # driver inverse
+        f = self.dyn.step(u, dt) if self.dyn is not None else t200_thrust(u)
+        return self.voltage_scale * np.asarray(f, float)
+
+
 # ----------------------------------------------------------------------------
 # Geometry: thrust allocation matrix B  (wrench = B @ thrust_forces)
 # ----------------------------------------------------------------------------
@@ -198,14 +230,20 @@ def step(model, data, throttles=None, forces_N=None, n=1):
     return data
 
 
-def set_wrench_command(model, data, wrench_des, B=None):
+def set_wrench_command(model, data, wrench_des, B=None, actuator=None):
     """Allocate a desired body wrench (FLU) to thruster forces and apply it.
 
     Returns the forces applied and the wrench actually realized (B @ forces),
     which differs from `wrench_des` by the unreachable (pitch) component.
-    """
+
+    `actuator` (optional ThrusterModel): when given, the desired per-thruster
+    forces are passed through the realistic T200 inverse/lag/voltage stage before
+    being written -- so the returned `forces`/`realized` are what the plant truly
+    got. Default None keeps the ideal force path (commanded == realized)."""
     if B is None:
         B, _ = allocation_matrix(model, data)
     forces = allocate(B, wrench_des)
+    if actuator is not None:
+        forces = actuator.realize(forces, float(model.opt.timestep))
     set_thruster_forces(model, data, forces)
     return forces, B @ forces
