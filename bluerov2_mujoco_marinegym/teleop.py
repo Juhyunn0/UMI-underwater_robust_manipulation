@@ -56,9 +56,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import thrusters as T
 import hydro as H
 import disturbances as D
+import rov_model as RM     # which BlueROV variant (env ROV_MODEL): bluerov2 | heavy
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-XML = os.path.join(HERE, "bluerov.xml")
+XML = RM.XML_PATH          # bluerov.xml (6 thr) or bluerov_heavy.xml (8 thr)
 
 # Fixed command magnitudes per DOF (scaled by --scale). Surge is kept gentle on
 # purpose: with hydro ON, a strong surge force (applied 0.0725 m below the COM)
@@ -71,12 +72,15 @@ YAW_NM = 6.0        # Mz
 ROLL_NM = 3.0       # Mx
 
 # ---- force-arrow visualization constants ----
-# Arrow length = scale * magnitude, capped, so big forces don't make giant arrows.
-FORCE_SCALE = 0.003   # m per N   (buoyancy 111 N -> 0.33 m, ~ vehicle size)
-FORCE_CAP = 0.6       # m         (cap so e.g. a 180 N net thrust stays readable)
-VEL_SCALE = 0.5       # m per m/s (current 0.2 m/s -> 0.10 m)
+# Arrow length = scale * magnitude, capped (big forces don't make giant arrows) and
+# floored (small forces stay visible). Thick shaft + a tip marker carrying the label.
+FORCE_SCALE = 0.006   # m per N   (2x: mid forces like thrust/kick now clearly sized)
+FORCE_CAP = 0.6       # m         (cap so e.g. buoyancy 111 N stays ~ vehicle size)
+VEL_SCALE = 0.8       # m per m/s (current 0.2 m/s -> 0.16 m)
 VEL_CAP = 0.4         # m
-ARROW_W = 0.012       # m         (shaft half-width)
+ARROW_W = 0.02        # m         (shaft half-width; thicker = easier to see)
+MIN_LEN = 0.06        # m         (length floor so small-but-present forces show)
+LABEL_DOT_R = 0.012   # m         (tiny tip marker that carries the arrow's label)
 COLORS = {            # color code (rgba); documented in the legend
     "buoyancy": (0.10, 0.80, 0.20, 1.0),   # green
     "drag":     (0.65, 0.65, 0.65, 1.0),   # gray
@@ -84,6 +88,10 @@ COLORS = {            # color code (rgba); documented in the legend
     "kick":     (0.95, 0.10, 0.10, 1.0),   # red
     "current":  (0.20, 0.45, 1.00, 1.0),   # blue
     "wave":     (0.10, 0.85, 0.90, 1.0),   # cyan
+}
+SHORT = {             # compact label names (the color legend carries the full name)
+    "buoyancy": "buoy", "drag": "drag", "thrust": "thr",
+    "kick": "kick", "current": "cur", "wave": "wav",
 }
 LEGEND = "buoyancy=green  drag=gray  thrust=orange  kick=red  current=blue  wave=cyan"
 
@@ -163,14 +171,22 @@ def _add_arrow(scn, frm, vec, scale, color, cap, label="", min_mag=0.0):
     if mag <= min_mag or scn.ngeom >= scn.maxgeom:
         return
     frm = np.asarray(frm, dtype=float)
-    to = frm + (np.asarray(vec, dtype=float) / mag) * min(scale * mag, cap)
+    length = max(min(scale * mag, cap), MIN_LEN)   # cap big, floor small -> all visible
+    to = frm + (np.asarray(vec, dtype=float) / mag) * length
     g = scn.geoms[scn.ngeom]
     mujoco.mjv_initGeom(g, mujoco.mjtGeom.mjGEOM_ARROW, np.zeros(3), np.zeros(3),
                         np.zeros(9), np.asarray(color, dtype=np.float32))
     mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_ARROW, ARROW_W, frm, to)
-    if label:
-        g.label = label
     scn.ngeom += 1
+    # Attach the label to a tiny marker at the arrow TIP, not to the arrow geom (whose
+    # text renders back at the shared COM start point, so every label piles up there).
+    # The tips fan out with the arrows, so the labels separate instead of overlapping.
+    if label and scn.ngeom < scn.maxgeom:
+        gd = scn.geoms[scn.ngeom]
+        mujoco.mjv_initGeom(gd, mujoco.mjtGeom.mjGEOM_SPHERE, np.full(3, LABEL_DOT_R),
+                            to, np.eye(3).flatten(), np.asarray(color, dtype=np.float32))
+        gd.label = label
+        scn.ngeom += 1
 
 
 def _draw_plan(scn, pts, color=(1.0, 0.82, 0.3, 1.0), width=0.004):
@@ -270,8 +286,9 @@ def draw_force_arrows(scn, hydro, teleop, data, bid):
     mags = {}
     for name, pt, vec, scale, color, cap, min_mag in force_items(hydro, teleop, data, bid):
         mags[name] = float(np.linalg.norm(vec))
-        label = (f"{name} {mags[name]:.0f}N" if min_mag >= 0.5
-                 else f"{name} {mags[name]:.2f}m/s")
+        sn = SHORT.get(name, name)
+        label = (f"{sn} {mags[name]:.0f}N" if min_mag >= 0.5
+                 else f"{sn} {mags[name]:.2f}m/s")
         _add_arrow(scn, pt, vec, scale, color, cap, label, min_mag=min_mag)
     return mags
 
@@ -1021,7 +1038,7 @@ def main():
         # commanded==realized force path. Manual keyboard teleop is a separate path
         # (Teleop.on_key) and is unaffected.
         actuator = None if args.ideal_thrusters else T.ThrusterModel(
-            lag=True, voltage_scale=args.thruster_voltage)
+            n=RM.N_THRUSTERS, lag=True, voltage_scale=args.thruster_voltage)
         if args.ctrl in ("mpc", "dobmpc"):
             from dobmpc_controller import DOBMPCController
             controller = DOBMPCController(model, hydro=hydro, mode=args.ctrl,

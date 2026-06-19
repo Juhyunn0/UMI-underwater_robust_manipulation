@@ -12,12 +12,23 @@ need to match marinegym -- with one sign subtlety on damping (see DL/DNL).
 """
 import numpy as np
 
+import rov_model as RM     # which BlueROV variant (env ROV_MODEL); see rov_model.py
+
 GRAVITY = 9.81
 
+# ---------------------------------------------------------------- model select
+# bluerov2 (6 thr, rank-5, NU=4) vs heavy (8 thr, rank-6 fully actuated, NU=6).
+MODEL = RM.MODEL
+FULLY_ACTUATED = RM.FULLY_ACTUATED
+
 # ---------------------------------------------------------------- rigid body
-# bluerov.xml: <inertial mass="11.2" diaginertia="0.30375 0.626 0.5769"/>
-MASS = 11.2
-IX, IY, IZ = 0.30375, 0.626, 0.5769
+# mass (bluerov2 11.2 / heavy 11.5) from the MarineGym USD. Inertia: bluerov2
+# [0.30375,0.626,0.5769]; heavy [0.3291,0.6347,0.6109] DERIVED from it by parallel-axis
+# of the vertical-thruster layout change (compute_heavy_inertia.py) -- the farol Heavy
+# USD's [0.21,0.245,0.245] is a Gazebo-stability hand-tune, not physical (see rov_model.py
+# / CONTROL_METHODOLOGY.md 2026-06-18).
+MASS = RM.MASS
+IX, IY, IZ = RM.INERTIA
 
 # CB is coBM = 0.01 m ABOVE the COM (BlueROV.yaml coBM). In the NED restoring
 # g(eta) (fossen.restoring), ZG>0 gives a RIGHTING moment, matching marinegym's
@@ -33,8 +44,9 @@ ZG = 0.01
 # the model trims ~11 deg at 6 N surge; without it, ~23 deg -- matching the plant.
 ZG_MASS = 0.0
 
-# BlueROV.yaml: volume 0.0113459 m^3, rho 997 (fresh water). Net buoyancy ~ +1.1 N up.
-VOLUME = 0.0113459
+# volume from the variant's yaml (bluerov2 0.0113459, heavy 0.0116499 m^3), rho 997
+# (fresh water). Net buoyancy ~ +1.1 N up. Added mass / damping are identical for both.
+VOLUME = RM.VOLUME
 RHO = 997.0
 WEIGHT = MASS * GRAVITY                       # 109.872 N
 BUOYANCY = RHO * GRAVITY * VOLUME             # ~110.97 N
@@ -58,13 +70,21 @@ DL = -_LINEAR_DAMPING
 DNL = -_QUADRATIC_DAMPING
 
 # --------------------------------------------------------------- propulsion
-# marinegym uses its OWN rank-5 allocation (thrusters.py); the NED model is 4-DOF
-# tau=[X,Y,Z,0,0,N], so no K_PROP here. U_MAX bounds the MPC's u=[X,Y,Z,N] wrench.
-# Surge is bounded for safety, NOT to penalize pitch (option a): the surge->pitch
-# coupling My=-0.0725*Fx tumbles past sin(theta)=1 at Fx~15 N (Fx=0.0725^-1*ZG*WEIGHT),
-# so cap surge at 8 N (~32 deg max trim, safe). Sway/heave 30 N (= PID f_max), yaw 10 Nm
-# (= PID mz_max). DP at 0.2 m/s current needs only ~2 N surge, so 8 N is non-binding there.
-U_MAX = np.array([8.0, 30.0, 30.0, 10.0])     # [X, Y, Z, N]  (N, N, N, Nm)
+# The MPC input u is the BODY WRENCH it asks the allocation (thrusters.py) to realize.
+#   * bluerov2 (rank-5):  NU=4, u=[X,Y,Z,N]; pitch/roll moments are NOT commandable
+#     (the vectored-6 allocation projects them out), so they are absent from u.
+#   * heavy (rank-6, fully actuated):  NU=6, u=[X,Y,Z,K,M,N]; roll K and pitch M are
+#     now directly realizable by the 4 vertical thrusters.
+# Surge is bounded for safety: on bluerov2 the surge->pitch coupling My=-0.0725*Fx
+# tumbles past sin(theta)=1 at Fx~15 N, so 8 N (~32 deg trim) is safe; on heavy the
+# vertical thrusters cancel that coupling, but we keep 8 N for a like-for-like compare.
+# Sway/heave 30 N (= PID f_max); yaw 10 Nm; roll/pitch 8 Nm (heavy only).
+if FULLY_ACTUATED:
+    NU = 6
+    U_MAX = np.array([8.0, 30.0, 30.0, 8.0, 8.0, 10.0])   # [X, Y, Z, K, M, N]
+else:
+    NU = 4
+    U_MAX = np.array([8.0, 30.0, 30.0, 10.0])             # [X, Y, Z, N]
 V_MAX = 1.5                                    # |linear velocity| bound [m/s]
 
 # ------------------------------------------------------------------- timing
@@ -78,13 +98,19 @@ DT_SIM = 0.002               # marinegym physics step [s]
 SOLVER = "acados"
 MPC_N = 60                   # prediction horizon
 # Stage weights over x=[x y z, phi theta psi, u v w, p q r].
-# Roll (phi) and pitch (theta) POSITIONS are zero-weighted: both are uncommanded
-# (tau has Mx=My=0, rank-5 plant), so penalizing them is futile and only confuses
-# the optimizer. pitch floats to its physical trim; the full J(eta) handles geometry
-# and the EAOB absorbs the steady surge->pitch coupling into w (option a).
-MPC_Q = np.array([300.0, 300.0, 150.0,   0.0, 0.0, 150.0,
-                  10.0, 10.0, 10.0,      10.0, 10.0, 10.0])
-MPC_R = np.array([0.05, 0.05, 0.05, 0.005])   # control penalty (paper-tuned regime)
+#   * bluerov2 (rank-5): roll (phi) and pitch (theta) POSITIONS are zero-weighted --
+#     both are uncommanded (tau has Mx=My=0), so penalizing them is futile; pitch
+#     floats to its trim and the EAOB absorbs the steady surge->pitch coupling.
+#   * heavy (fully actuated): roll AND pitch are now controllable, so they get a
+#     real position weight and the MPC actively levels the vehicle.
+if FULLY_ACTUATED:
+    MPC_Q = np.array([300.0, 300.0, 150.0,   80.0, 80.0, 150.0,
+                      10.0, 10.0, 10.0,      10.0, 10.0, 10.0])
+    MPC_R = np.array([0.05, 0.05, 0.05, 0.01, 0.01, 0.005])   # [X,Y,Z,K,M,N]
+else:
+    MPC_Q = np.array([300.0, 300.0, 150.0,   0.0, 0.0, 150.0,
+                      10.0, 10.0, 10.0,      10.0, 10.0, 10.0])
+    MPC_R = np.array([0.05, 0.05, 0.05, 0.005])               # [X,Y,Z,N]
 MPC_QN = MPC_Q.copy()
 
 # ---------------------------------------------------------------------- EAOB
@@ -113,5 +139,7 @@ SURGE_PITCH_COUPLING = 0.0725
 #     caps the surge the MPC will plan (sin(THETA_MAX)*zg*W / kappa ~= 5.9 N at 0.40 rad)
 #     -- an *optimal* surge cap, the MPC-equivalent of the PID's surge limiter.
 # Toggle PITCH_AWARE=False to recover option (a) (coupling off, |theta|<=1.2, no cap).
-PITCH_AWARE = True
+# HEAVY is fully actuated -> pitch is a *commanded* DOF, so option-(b) (a rank-5
+# workaround) is OFF and pitch is bounded only by the |theta|<=1.2 singularity margin.
+PITCH_AWARE = (not FULLY_ACTUATED)
 THETA_MAX = 0.40             # |pitch| prediction bound [rad] (~23 deg) when PITCH_AWARE

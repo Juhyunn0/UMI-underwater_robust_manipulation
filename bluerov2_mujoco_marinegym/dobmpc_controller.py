@@ -135,15 +135,21 @@ class DOBMPCController:
         x_ned = np.concatenate([eta_ned, nu_ned])
         u = self.nmpc.solve(x_ned, self.w_hat, self._xref_ned())
         self.n_fail = self.nmpc.n_fail
-        # option (b): the EAOB is fed the commanded wrench INCLUDING the modeled
-        # surge->pitch coupling (My = kappa*surge, NED), so it attributes the realized
-        # pitch moment to control and keeps w[pitch] ~ 0 (no double-count with the MPC
-        # model). The thruster command keeps My=0 -- the rank-5 allocation realizes the
-        # coupling physically.
-        kappa = P.SURGE_PITCH_COUPLING if getattr(P, "PITCH_AWARE", False) else 0.0
-        self._tau_ned_cmd = np.array([u[0], u[1], u[2], 0.0, kappa * u[0], u[3]])
-        self._tau_flu = frames.ned_wrench_to_flu(
-            np.array([u[0], u[1], u[2], 0.0, 0.0, u[3]]))
+        if getattr(P, "FULLY_ACTUATED", False):
+            # heavy: NU=6, the full wrench [X,Y,Z,K,M,N] is commanded and realized.
+            tau_ned = np.array([u[0], u[1], u[2], u[3], u[4], u[5]])
+            self._tau_ned_cmd = tau_ned                       # EAOB sees the full wrench
+            self._tau_flu = frames.ned_wrench_to_flu(tau_ned)
+        else:
+            # bluerov2 (rank-5, option b): the EAOB is fed the commanded wrench INCLUDING
+            # the modeled surge->pitch coupling (My = kappa*surge, NED), so it attributes
+            # the realized pitch moment to control and keeps w[pitch] ~ 0 (no double-count
+            # with the MPC model). The thruster command keeps My=0 -- the rank-5 allocation
+            # realizes the coupling physically.
+            kappa = P.SURGE_PITCH_COUPLING if getattr(P, "PITCH_AWARE", False) else 0.0
+            self._tau_ned_cmd = np.array([u[0], u[1], u[2], 0.0, kappa * u[0], u[3]])
+            self._tau_flu = frames.ned_wrench_to_flu(
+                np.array([u[0], u[1], u[2], 0.0, 0.0, u[3]]))
         self.commanded = self._tau_flu.copy()
 
     # --------------------------------------------------------- public step

@@ -619,3 +619,125 @@ solver trouble. `analyze_t200_voltage.py` reproduces the table and `0.72` (MATCH
 (0.74 / 0.71) are approximated by the single 0.72. Inflow-velocity dependence (advance ratio: thrust drops
 when moving), thermal, and fouling are **out of scope** — the realistic model is still the *static (bollard)*
 curve. A *moving*-trajectory (square) run stresses the deadband harder than DP and is the natural follow-up.
+
+---
+
+## 2026-06-18 — BlueROV2 → BlueROV2 **Heavy**: 8 thrusters, fully actuated, 6-DOF MPC
+
+**Why.** Moving from the standard vectored-6 BlueROV2 to the **Heavy** configuration. The headline is
+actuation: Heavy adds **two more vertical thrusters** (4 total, at the corners), which makes the allocation
+**rank 6 = fully actuated** — roll AND pitch become directly controllable, eliminating the rank-5
+under-actuation that forced the whole option-(a)/(b) pitch workaround. Both variants are kept and selected
+by the env var **`ROV_MODEL`** (`bluerov2` default | `heavy`); a new [rov_model.py](../rov_model.py) is the
+single source of truth so the plant (MJCF/hydro) and the controller (params/NMPC) can never disagree.
+
+**Provenance.** All values verified directly from the MarineGym USD
+(`external/MarineGym/.../usd/BlueROVHeavy/BlueROVHeavy.usd`, parsed with `pxr`). Heavy keeps the SAME hydro
+coefficients (added mass, linear/quadratic damping) and the SAME T200 thrusters as BlueROV2 — only mass,
+inertia, buoyant volume, and the thruster layout differ. (The Heavy yaml lists a weaker `force_constants`
+0.8e-7 which would scale thrust to ~18 %; we keep the validated T200 curve since the physical thruster is
+unchanged — see [03_THRUSTERS.md](03_THRUSTERS.md).)
+
+### What changed — values (기존 → 수정)
+
+**Rigid-body mass matrix M_RB = diag(m, m, m, Ix, Iy, Iz):**
+```
+BlueROV2:  diag( 11.2, 11.2, 11.2,   0.30375, 0.626,  0.5769 )
+Heavy:     diag( 11.5, 11.5, 11.5,   0.3291,  0.6347, 0.6109 )   (inertia derived — see below)
+```
+
+**Inertia I (diagonal):  bluerov2 → Heavy, DERIVED by parallel-axis:**
+```
+[ 0.30375                ]        [ 0.3291                ]
+[         0.626          ]   →    [        0.6347         ]   I_heavy = I_bluerov2 + Δ
+[                 0.5769 ]        [                0.6109 ]   Δ = [+0.0254, +0.0086, +0.0340]
+```
+
+> **⚠ Why NOT the Heavy USD's inertia — and how we derived this one.** The MarineGym/farol
+> Heavy USD ships `[0.21, 0.245, 0.245]`, *smaller* than BlueROV2's despite Heavy being
+> heavier — physically backwards. It is a **hand-tuned Gazebo-stability literal**: the farol
+> source `bluerov_heavy_vehicle/urdf/base.xacro` hardcodes it with the comment *"... otherwise
+> your model will become unstable on Gazebo"* (the physical ellipsoid formula right below is
+> commented OUT; another dsor source even lists `[0.26, 0.23, 0.37]`, so it's inconsistent
+> across sources too). BlueROV2's `[0.30375, 0.626, 0.5769]` comes from a different URDF
+> (`bluerov2_description`).
+>
+> So instead of trusting the farol literal, we **derive a Heavy-specific tensor** from the
+> BlueROV2 one. The 4 **horizontal** thrusters are at identical positions in both models, so
+> they cancel exactly in the BlueROV2→Heavy inertia *difference*; the only change is the
+> **vertical** layout — BlueROV2's 2 near-centre verticals (`±0.1105` y) → Heavy's 4 corner
+> verticals (`±0.12` x, `±0.22` y). Treating each thruster as a **point mass of 0.15 kg**
+> (model-consistent: the +0.3 kg / +2-thruster budget, 11.2→11.5), the difference is exactly
+> the parallel-axis term `Δ = Σ_heavy m·(par-axis) − Σ_bluerov2 m·(par-axis)`:
+> `I_heavy = I_bluerov2 + [+0.0254, +0.0086, +0.0340] = [0.3291, 0.6347, 0.6109]`. This holds
+> whether or not the BlueROV2 base value includes its own thrusters (the hull + 4 horizontals
+> cancel). Reproduce / change the thruster-mass assumption with
+> [compute_heavy_inertia.py](../compute_heavy_inertia.py) (sensitivity: m_v 0.10→0.344 kg gives
+> Ixx 0.321→0.362).
+>
+> **Honest limits:** this is a physically-motivated *estimate* (point-mass thrusters; the
+> BlueROV2 base value's own CAD-vs-formula origin is itself unverified — its config.yaml names
+> `bluerov2_description` upstream but a web search did not surface the exact tensor), **not** a
+> Heavy CAD measurement. But it is Heavy-specific and strictly **≥ BlueROV2**, as physics
+> requires — strictly better-founded than either the farol literal or a flat BlueROV2-reuse.
+
+**Added mass M_A = diag(Xu̇, Yv̇, Zẇ, Kṗ, Mq̇, Nṙ):  UNCHANGED**
+```
+diag( 5.5, 12.7, 14.57, 0.12, 0.12, 0.12 )      (both variants)
+```
+
+**Total mass matrix M = M_RB + M_A:**
+```
+BlueROV2:  diag( 16.70, 23.90, 25.77,  0.42375, 0.746,  0.6969 )
+Heavy:     diag( 17.00, 24.20, 26.07,  0.4491,  0.7547, 0.7309 )
+```
+
+**Damping D_L, D_NL:  UNCHANGED** — D_L = −diag(4.03, 6.22, 5.18, 0.07, 0.07, 0.07),
+D_NL = −diag(18.18, 21.66, 36.99, 1.55, 1.55, 1.55).
+
+**Buoyancy:** volume 0.0113459 → **0.0116499** m³ ⇒ B = ρgV 110.97 → **113.94** N. Heavy is both heavier
+(W 109.87 → 112.82 N) and bigger, so **net buoyancy stays ~+1.1 N** (B−W = +1.10 → +1.13 N).
+
+**Allocation B (wrench = B·thruster_forces):**
+```
+BlueROV2:  6×6,  rank 5   — pitch My is NOT independently controllable (under-actuated)
+Heavy:     6×8,  rank 6   — FULLY ACTUATED (verified: a pure pitch wrench realizes My=1.000)
+```
+Thrusters: the 4 horizontal (thruster_0..3) are identical; the verticals change:
+```
+BlueROV2:  2 vertical at ( 0.0025, ±0.1105, −0.005)
+Heavy:     4 vertical at (±0.12,   ±0.22,   −0.005)   (+Z, four corners → indep. Fz/roll/pitch)
+```
+
+**Controller (NMPC) — exploiting full actuation:**
+```
+NU (control dim):  4  [X,Y,Z,N]        →  6  [X,Y,Z,K,M,N]
+tau mapping:       [X,Y,Z, 0, κ·X, N]  →  [X,Y,Z, K, M, N]   (κ = surge→pitch coupling, gone)
+PITCH_AWARE (opt-b surge cap):  True   →  False   (pitch is a commanded DOF now)
+MPC_Q roll/pitch position weight:  0,0 →  80,80   (the MPC actively levels the vehicle)
+```
+
+**Result (DP, dobmpc, seed 0, 20 s, disturbance ON):**
+| variant | radial RMS | pitch mean | pitch max |
+|---|---|---|---|
+| BlueROV2 (rank-5) | 5.0 cm | **+11.8°** | 22.9° |
+| Heavy (full 6-DOF, inertia derived) | **3.3 cm** | **+0.4°** | 5.4° |
+
+Full actuation **actively levels pitch** (11.8° trim → 0.8°) and tightens station-keeping (5.0 → 3.3 cm).
+
+**How / blast radius.** [rov_model.py](../rov_model.py) (registry); [bluerov_heavy.xml](../bluerov_heavy.xml)
++ [marinegym_assets/BlueROVHeavy.yaml](../marinegym_assets/BlueROVHeavy.yaml); [params.py](../dobmpc/params.py)
+(per-model MASS/I/VOL, NU, U_MAX, MPC_Q/R, PITCH_AWARE); [mpc.py](../dobmpc/mpc.py) (NU + NU-aware tau);
+[mpc_acados.py](../dobmpc/mpc_acados.py) (per-model codegen dir); [thrusters.py](../thrusters.py) (allocation
+discovers 6/8 thrusters from the model); [hydro.py](../hydro.py) (per-model yaml/volume);
+[dobmpc_controller.py](../dobmpc_controller.py) (NU-aware wrench); [teleop.py](../teleop.py) /
+[eval_dp.py](../dobmpc/eval_dp.py) (XML + ThrusterModel n from the model). BlueROV2 path is numerically
+unchanged (regression: dobmpc DP 5.0 cm, test_thrusters/test_dobmpc/test_controller, `teleop --selftest` all
+pass on both variants).
+
+**Scope / follow-ups.** The PID baseline ([controller.py](../controller.py)) still commands only
+surge/sway/heave/yaw on both variants (on Heavy the rank-6 allocation passively cancels the surge→pitch
+coupling, so PID also levels better) — a full 6-DOF PID is a follow-up. The Heavy MJCF reuses the BlueROV2
+visual meshes (visual only; dynamics are the Heavy inertial + 8 sites). Roll/pitch U_MAX (8 Nm) and Q
+weights (80) are initial values, open to tuning. The actuator-realism ablation / verify_hydro suites still
+target BlueROV2; extending them to Heavy is a follow-up.

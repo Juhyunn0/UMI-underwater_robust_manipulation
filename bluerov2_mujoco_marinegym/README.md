@@ -40,8 +40,11 @@ solver.
 | Experiments: station-keeping comparison, actuator-realism ablation | `dobmpc/eval_dp.py`, `ablation_thrusters.py` | ✅ |
 | Verification: hydro (smoke + precision), acados equivalence, run-meta | `verify_*.py` | ✅ |
 
-Underactuated in pitch (`rank(allocation) = 5`): the controllers command
-surge/sway/heave/yaw/roll — **never pitch**.
+Two model variants, selected by `ROV_MODEL` (see below): **bluerov2** (default,
+6 thrusters, `rank(allocation) = 5` — under-actuated in pitch, command
+surge/sway/heave/yaw/roll, **never pitch**) and **heavy** (8 thrusters,
+`rank = 6` — **fully actuated**, the NMPC commands the full 6-DOF wrench incl.
+roll and pitch).
 
 ---
 
@@ -59,6 +62,32 @@ Two conda envs on the Ubuntu + RTX 5090 box (see
 conda activate robust
 cd bluerov2_mujoco_marinegym
 ```
+
+### Model variant: BlueROV2 vs BlueROV2 Heavy
+
+Pick the vehicle with the **`ROV_MODEL`** env var (default `bluerov2`); a single
+[rov_model.py](rov_model.py) registry keeps the plant and the controller in sync:
+
+```bash
+                  python teleop.py --square --ctrl dobmpc --disturb   # bluerov2 (default)
+ROV_MODEL=heavy   python teleop.py --square --ctrl dobmpc --disturb   # BlueROV2 Heavy
+ROV_MODEL=heavy   python -m dobmpc.eval_dp --ctrls pid,mpc,dobmpc     # Heavy, headless
+```
+
+| | bluerov2 | heavy |
+|---|---|---|
+| thrusters | 6 (rank 5) | 8 (rank 6, **fully actuated**) |
+| mass / inertia | 11.2 kg / [0.30375, 0.626, 0.5769] | 11.5 kg / [0.3291, 0.6347, 0.6109]† |
+| NMPC input | `u=[X,Y,Z,N]` (NU 4) | `u=[X,Y,Z,K,M,N]` (NU 6) |
+| pitch | floats to trim (~12°) | actively leveled (~0.8°) |
+
+Same T200 thrusters and hydro coefficients; only mass/volume/thruster layout
+differ. **†** Heavy's inertia is *derived* from the bluerov2 tensor by adding the
+parallel-axis term of the vertical-thruster layout change
+([compute_heavy_inertia.py](compute_heavy_inertia.py)) — the farol Heavy USD's own
+[0.21, 0.245, 0.245] is a hand-tuned Gazebo-stability literal, not physical. It's a
+physically-motivated estimate (not a Heavy CAD measurement) but Heavy-specific and
+≥ BlueROV2. See [docs/CONTROL_METHODOLOGY.md](docs/CONTROL_METHODOLOGY.md) (2026-06-18).
 
 **Dependencies.** Running the *plant* needs only `mujoco` + `numpy`. The DOB-MPC
 adds `casadi` (symbolic dynamics + IPOPT) and `acados_template` (the fast SQP-RTI
@@ -180,9 +209,11 @@ bluerov2_mujoco_marinegym/
 │   ├── 00_OVERVIEW.md … 07_DISTURBANCES.md   # per-phase design docs
 │   ├── CONTROL_METHODOLOGY.md / .ko.md        # controller why-journal (EN/KO)
 │   └── HYDRO_VERIFICATION.md / .ko.md         # hydro V&V writeup (EN/KO)
-├── bluerov.xml                 # the MJCF (rigid body + 6 thruster sites + 6 actuators)
+├── rov_model.py                # variant registry (ROV_MODEL: bluerov2 | heavy) — single source of truth
+├── bluerov.xml                 # bluerov2 MJCF (rigid body + 6 thruster sites + 6 actuators)
+├── bluerov_heavy.xml           # heavy MJCF (8 thrusters, mass 11.5, fully actuated)
 ├── meshes/                     # real MarineGym meshes (body + T200), from the USD
-├── marinegym_assets/           # MarineGym BlueROV.yaml (hydro/rotor coeffs) + config
+├── marinegym_assets/           # MarineGym BlueROV.yaml / BlueROVHeavy.yaml (hydro/rotor coeffs) + config
 │
 ├── thrusters.py                # T200 curve, allocation B/pinv(B), realistic ThrusterModel
 ├── hydro.py                    # Fossen buoyancy/restoring/added-mass/drag (passive callback)
@@ -205,6 +236,7 @@ bluerov2_mujoco_marinegym/
 ├── ablation_thrusters.py       # actuator-realism ablation experiment
 ├── analyze_square3.py · analyze_acados_vs_before.py   # recording analysis
 ├── analyze_t200_voltage.py     # datasheet provenance for thruster voltage_scale (0.72)
+├── compute_heavy_inertia.py    # derive the Heavy inertia from bluerov2 (parallel-axis)
 ├── verify_hydro.py · verify_hydro_precise.py · verify_acados.py · verify_meta.py
 ├── test_*.py                   # per-component tests (pytest)
 ├── generate_bluerov_xml.py · extract_meshes.py        # regenerate MJCF/meshes from USD
@@ -220,8 +252,10 @@ bluerov2_mujoco_marinegym/
   written in NED). Mislabelling a frame = silent sign-flip bug.
 - **The MarineGym-derived model is canonical** — don't mix parameters with the
   separate hand-built `bluerov2_mujoco_dobmpc/` model.
-- **Pitch is underactuated** (`rank(allocation) = 5`) — command surge/sway/heave/
-  yaw/roll, never pitch.
+- **Pitch is underactuated on `bluerov2`** (`rank(allocation) = 5`) — command
+  surge/sway/heave/yaw/roll, never pitch. (On `heavy` the 8-thruster allocation is
+  rank 6 / fully actuated, so pitch IS commanded — keep the variants' assumptions
+  straight via `rov_model.py`.)
 - **Append to the methodology journal** on every major control change, and keep
   this README's run instructions current when entry points change.
 

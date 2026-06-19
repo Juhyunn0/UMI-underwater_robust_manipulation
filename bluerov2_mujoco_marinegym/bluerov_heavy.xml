@@ -1,0 +1,132 @@
+<!--
+  BlueROV2 HEAVY rigid body imported from MarineGym's BlueROVHeavy asset.
+
+  Provenance
+  ----------
+  Mass, inertia and the 8 thruster mount transforms are extracted verbatim from
+  MarineGym's Isaac asset (values verified directly from the USD):
+      external/MarineGym/.../usd/BlueROVHeavy/BlueROVHeavy.usd
+  Hydrodynamic coefficients + the T200 rotor config live in
+  ./marinegym_assets/BlueROVHeavy.yaml.
+
+  Difference vs the standard BlueROV2 (bluerov.xml)
+  -------------------------------------------------
+    * mass 11.2 -> 11.5 kg;  inertia [0.30375 0.626 0.5769] -> [0.3291 0.6347 0.6109]
+      DERIVED from the BlueROV2 tensor by parallel-axis of the vertical-thruster layout
+      change (compute_heavy_inertia.py); the farol Heavy USD's own [0.21 0.245 0.245] is
+      a non-physical Gazebo-stability hand-tune -- see docs/CONTROL_METHODOLOGY.md
+    * buoyant volume 0.0113459 -> 0.0116499 m^3 (in BlueROVHeavy.yaml)
+    * 6 thrusters -> 8: the same 4 horizontal (thruster_0..3) PLUS 4 vertical
+      (thruster_4..7) at the four corners (+-0.12, +-0.22, -0.005), all +Z.
+      -> the allocation is now rank 6 (FULLY ACTUATED): roll AND pitch are
+         directly controllable (the standard BlueROV2 is rank-5, no pitch).
+    * SAME T200 thrusters (ctrlrange -51.55..64.13 N), SAME added mass / drag.
+
+  The visual meshes in ./meshes/ are reused from the standard BlueROV2 (the body
+  hull + the T200 thruster); they are visual/collision only and do not affect the
+  dynamics, which are governed entirely by the <inertial> + thruster sites below.
+
+  Frame: x forward, y left, z up (FLU). World Z-up, gravity (0 0 -9.81) ON.
+  Each thruster_i site's local +X is the thrust direction; one <general> force
+  actuator ("thr0".."thr7") drives it (ctrl = thrust in NEWTONS via the T200 curve
+  in thrusters.py). Hydrodynamics are injected at runtime by hydro.py.
+-->
+<mujoco model="bluerov2_heavy_marinegym">
+  <compiler angle="radian" meshdir="meshes" autolimits="true"/>
+
+  <!-- density=0 viscosity=0: MuJoCo's built-in fluid model is OFF on purpose;
+       all hydrodynamics are injected by hydro.py. -->
+  <option timestep="0.002" integrator="implicitfast" density="0" viscosity="0"/>
+
+  <visual>
+    <headlight ambient="0.6 0.6 0.62" diffuse="0.85 0.85 0.88" specular="0.25 0.25 0.25"/>
+    <rgba haze="0.12 0.18 0.28 1"/>
+    <scale framelength="0.25" framewidth="0.008"/>
+    <global offwidth="1280" offheight="960"/>
+  </visual>
+
+  <asset>
+    <mesh name="bluerov_body"     file="bluerov_body.obj"/>
+    <mesh name="bluerov_thruster" file="bluerov_thruster.obj"/>
+    <material name="hull"      rgba="0.33 0.37 0.44 1" specular="0.35" shininess="0.3"/>
+    <material name="thruster"  rgba="0.12 0.13 0.16 1" specular="0.4" shininess="0.4"/>
+    <material name="collision" rgba="0.85 0.45 0.20 0.25"/>
+  </asset>
+
+  <default>
+    <default class="visual">
+      <geom type="mesh" contype="0" conaffinity="0" group="2"/>
+    </default>
+    <default class="collision">
+      <geom type="box" group="3" material="collision" contype="1" conaffinity="1"/>
+    </default>
+    <default class="thruster">
+      <site type="cylinder" size="0.012 0.004" rgba="0.1 0.7 1 1" group="4"/>
+    </default>
+    <default class="ref">
+      <site type="sphere" size="0.012" group="4"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <light name="key"  pos="0.8 0.8 2.5"  dir="-0.3 -0.3 -1" directional="true"
+           diffuse="0.55 0.55 0.6" specular="0.2 0.2 0.2"/>
+    <light name="fill" pos="-0.8 -0.6 1.2" dir="0.4 0.3 -1" directional="true"
+           diffuse="0.35 0.35 0.4" specular="0.1 0.1 0.1"/>
+    <body name="base_link" pos="0 0 0">
+      <freejoint name="free"/>
+      <!-- mass 11.5 from the MarineGym BlueROVHeavy USD; inertia DERIVED from the
+           BlueROV2 tensor + parallel-axis of the vertical-thruster layout change
+           (compute_heavy_inertia.py). The USD/farol [0.21 0.245 0.245] is a non-physical
+           Gazebo-stability hand-tune -- see docs/CONTROL_METHODOLOGY.md / rov_model.py. -->
+      <inertial pos="0 0 0" mass="11.5" diaginertia="0.3291 0.6347 0.6109"/>
+
+      <!-- ===== body visual (reused BlueROV2 mesh) ===== -->
+      <geom class="visual" mesh="bluerov_body" material="hull"/>
+
+      <!-- ===== collision proxy ===== -->
+      <geom class="collision" pos="0 0 -0.05" size="0.25 0.175 0.125"/>
+
+      <!-- ===== 8 thrusters: 4 horizontal (0..3) + 4 vertical (4..7) ===== -->
+      <!-- thruster 0  (front-right, horizontal +45 yaw) -->
+      <geom class="visual" mesh="bluerov_thruster" material="thruster" pos="0.1355 -0.1 -0.0725" quat="0.92388 0 0 0.382684"/>
+      <site name="thruster_0" class="thruster" pos="0.1355 -0.1 -0.0725" quat="0.92388 0 0 0.382684"/>
+      <!-- thruster 1  (front-left, horizontal -45 yaw) -->
+      <geom class="visual" mesh="bluerov_thruster" material="thruster" pos="0.1355 0.1 -0.0725" quat="0.92388 0 0 -0.382684"/>
+      <site name="thruster_1" class="thruster" pos="0.1355 0.1 -0.0725" quat="0.92388 0 0 -0.382684"/>
+      <!-- thruster 2  (rear-right, horizontal) -->
+      <geom class="visual" mesh="bluerov_thruster" material="thruster" pos="-0.1475 -0.1 -0.0725" quat="0.382683 0 0 0.92388"/>
+      <site name="thruster_2" class="thruster" pos="-0.1475 -0.1 -0.0725" quat="0.382683 0 0 0.92388"/>
+      <!-- thruster 3  (rear-left, horizontal) -->
+      <geom class="visual" mesh="bluerov_thruster" material="thruster" pos="-0.1475 0.1 -0.0725" quat="-0.382683 0 0 0.92388"/>
+      <site name="thruster_3" class="thruster" pos="-0.1475 0.1 -0.0725" quat="-0.382683 0 0 0.92388"/>
+      <!-- thruster 4  (front-right, vertical +Z) -->
+      <geom class="visual" mesh="bluerov_thruster" material="thruster" pos="0.12 -0.22 -0.005" quat="-0.707107 0 0.707107 0"/>
+      <site name="thruster_4" class="thruster" pos="0.12 -0.22 -0.005" quat="-0.707107 0 0.707107 0"/>
+      <!-- thruster 5  (front-left, vertical +Z) -->
+      <geom class="visual" mesh="bluerov_thruster" material="thruster" pos="0.12 0.22 -0.005" quat="-0.707107 0 0.707107 0"/>
+      <site name="thruster_5" class="thruster" pos="0.12 0.22 -0.005" quat="-0.707107 0 0.707107 0"/>
+      <!-- thruster 6  (rear-right, vertical +Z) -->
+      <geom class="visual" mesh="bluerov_thruster" material="thruster" pos="-0.12 -0.22 -0.005" quat="-0.707107 0 0.707107 0"/>
+      <site name="thruster_6" class="thruster" pos="-0.12 -0.22 -0.005" quat="-0.707107 0 0.707107 0"/>
+      <!-- thruster 7  (rear-left, vertical +Z) -->
+      <geom class="visual" mesh="bluerov_thruster" material="thruster" pos="-0.12 0.22 -0.005" quat="-0.707107 0 0.707107 0"/>
+      <site name="thruster_7" class="thruster" pos="-0.12 0.22 -0.005" quat="-0.707107 0 0.707107 0"/>
+
+      <!-- reference site at the base_link origin -->
+      <site name="base_origin" class="ref" pos="0 0 0" rgba="1 0.2 0.2 1"/>
+    </body>
+  </worldbody>
+
+  <!-- ===== 8 thruster force actuators (ctrl = thrust in N, T200 curve) ===== -->
+  <actuator>
+    <general name="thr0" site="thruster_0" gear="1 0 0 0 0 0" ctrlrange="-51.5507 64.1319"/>
+    <general name="thr1" site="thruster_1" gear="1 0 0 0 0 0" ctrlrange="-51.5507 64.1319"/>
+    <general name="thr2" site="thruster_2" gear="1 0 0 0 0 0" ctrlrange="-51.5507 64.1319"/>
+    <general name="thr3" site="thruster_3" gear="1 0 0 0 0 0" ctrlrange="-51.5507 64.1319"/>
+    <general name="thr4" site="thruster_4" gear="1 0 0 0 0 0" ctrlrange="-51.5507 64.1319"/>
+    <general name="thr5" site="thruster_5" gear="1 0 0 0 0 0" ctrlrange="-51.5507 64.1319"/>
+    <general name="thr6" site="thruster_6" gear="1 0 0 0 0 0" ctrlrange="-51.5507 64.1319"/>
+    <general name="thr7" site="thruster_7" gear="1 0 0 0 0 0" ctrlrange="-51.5507 64.1319"/>
+  </actuator>
+</mujoco>

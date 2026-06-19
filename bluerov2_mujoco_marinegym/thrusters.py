@@ -167,40 +167,56 @@ class ThrusterModel:
 # ----------------------------------------------------------------------------
 # Geometry: thrust allocation matrix B  (wrench = B @ thrust_forces)
 # ----------------------------------------------------------------------------
+# Thruster sites/actuators are discovered from the model (thruster_0.., thr0..) so
+# the same code serves the vectored-6 BlueROV2 (rank-5) and the 8-thruster Heavy
+# (rank-6). The 6-name lists are kept only as the documented default count.
 THRUSTER_SITES = [f"thruster_{i}" for i in range(6)]
 ACTUATOR_NAMES = [f"thr{i}" for i in range(6)]
 
 
+def thruster_sites(model):
+    """The thruster_0, thruster_1, ... site names present in the model (6 or 8)."""
+    names = []
+    i = 0
+    while mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, f"thruster_{i}") >= 0:
+        names.append(f"thruster_{i}")
+        i += 1
+    return names
+
+
 def allocation_matrix(model, data=None):
-    """6x6 allocation B mapping the 6 thruster forces [N] to the body wrench
-    [Fx,Fy,Fz,Mx,My,Mz] in the FLU body frame about the COM.
+    """6xn allocation B mapping the n thruster forces [N] to the body wrench
+    [Fx,Fy,Fz,Mx,My,Mz] in the FLU body frame about the COM (n=6 BlueROV2, 8 Heavy).
 
     Column i = [ d_i ; r_i x d_i ], with d_i the thruster's thrust axis (site
     local +X, in world == body frame at identity pose) and r_i its position
-    relative to the body COM. Returns (B, site_names).
+    relative to the body COM. rank(B) is 5 for the vectored-6 (pitch unreachable),
+    6 for the Heavy 8-thruster layout (fully actuated). Returns (B, site_names).
     """
     if data is None:
         data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
     bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "base_link")
     com = np.array(data.subtree_com[bid])
-    B = np.zeros((6, 6))
-    for i, sname in enumerate(THRUSTER_SITES):
+    sites = thruster_sites(model)
+    B = np.zeros((6, len(sites)))
+    for i, sname in enumerate(sites):
         sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, sname)
         pos = np.array(data.site_xpos[sid])
         axis = np.array(data.site_xmat[sid]).reshape(3, 3)[:, 0]  # local +X
         r = pos - com
         B[:3, i] = axis
         B[3:, i] = np.cross(r, axis)
-    return B, list(THRUSTER_SITES)
+    return B, sites
 
 
 def allocate(B, wrench_des):
     """Least-squares thruster forces [N] for a desired body wrench (FLU).
 
-    Uses the pseudo-inverse, so unreachable wrench components (the vectored-6
-    layout is rank-5: pitch My is not independently controllable) are projected
-    out — you get the closest achievable wrench.
+    Uses the pseudo-inverse: unreachable wrench components are projected out (you
+    get the closest achievable wrench). For the vectored-6 BlueROV2 that is pitch
+    My (rank 5); the Heavy 8-thruster layout is full rank 6, so every wrench --
+    including roll/pitch -- is realizable up to the per-thruster force limits.
     """
     return np.linalg.pinv(B) @ np.asarray(wrench_des, dtype=float)
 
@@ -209,8 +225,14 @@ def allocate(B, wrench_des):
 # Applying commands to a MuJoCo model (actuator ctrl = thrust in N)
 # ----------------------------------------------------------------------------
 def _ctrl_index(model):
-    return [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, n)
-            for n in ACTUATOR_NAMES]
+    idx, i = [], 0
+    while True:
+        aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, f"thr{i}")
+        if aid < 0:
+            break
+        idx.append(aid)
+        i += 1
+    return idx
 
 
 def set_thruster_forces(model, data, forces_N):

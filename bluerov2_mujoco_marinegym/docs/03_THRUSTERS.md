@@ -108,6 +108,17 @@ proportional to Fx), and the 2 vertical thrusters share nearly the same x.
   attitude during vigorous surge requires active control — this is a core reason
   the project needs the DOB-MPC.
 
+> **This rank-5 finding is `bluerov2`-specific.** The **`ROV_MODEL=heavy`** variant
+> ([bluerov_heavy.xml](../bluerov_heavy.xml)) adds 2 more vertical thrusters (4 at the
+> corners `(±0.12, ±0.22, −0.005)`, all +Z), making **`rank(B) = 6` — fully actuated**:
+> pitch (and roll) ARE directly controllable (verified: a pure pitch wrench realizes
+> `My = 1.000`). The DOB-MPC then commands the full 6-DOF wrench `u=[X,Y,Z,K,M,N]`
+> (NU 6) and actively levels the vehicle. Select via `rov_model.py` /
+> `ROV_MODEL`. **Same T200 thrusters and ctrlrange** (the MarineGym Heavy yaml's
+> `force_constants` 0.8e-7 would scale thrust to ~18 %, which is unphysical for the
+> same T200, so we keep the validated 64 N curve). See
+> [CONTROL_METHODOLOGY.md](CONTROL_METHODOLOGY.md) (2026-06-18).
+
 ## Verified (Phase 2)
 
 `python test_thrusters.py` (gravity off, to isolate thrust):

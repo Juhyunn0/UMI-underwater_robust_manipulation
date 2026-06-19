@@ -31,8 +31,12 @@ import os
 import numpy as np
 import mujoco
 
+import rov_model as RM     # which variant's yaml (BlueROV vs BlueROVHeavy); env ROV_MODEL
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-YAML = os.path.join(HERE, "marinegym_assets", "BlueROV.yaml")
+# default coeffs track the selected ROV variant (heavy only differs in buoyant
+# volume; added mass / drag are identical). Override per-call via coeff_path.
+YAML = RM.YAML_PATH
 RHO_FRESHWATER = 997.0   # kg/m^3 — MarineGym calculate_buoyancy uses 997
 
 

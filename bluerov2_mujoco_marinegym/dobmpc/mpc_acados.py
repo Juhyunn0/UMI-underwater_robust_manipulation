@@ -67,12 +67,12 @@ class AcadosNMPC:
         nx, nu = NX, NU
         ny, ny_e = nx + nu, nx
 
-        # distinct model name / export dir per variant so RTI and full-SQP
-        # (used only by the equivalence test) can coexist without overwriting
-        # each other's generated C code
-        variant = "rti" if rti else "sqp"
+        # distinct model name / export dir per (rov model, solver variant) so the
+        # bluerov2 (NU=4) and heavy (NU=6) C code -- and RTI vs full-SQP -- coexist
+        # without overwriting each other (switching ROV_MODEL won't need a rebuild)
+        variant = f"{P.MODEL}_{'rti' if rti else 'sqp'}"
         ocp = AcadosOcp()
-        ocp.model = _build_model(name=f"dobmpc_bluerov_{variant}")
+        ocp.model = _build_model(name=f"dobmpc_{variant}")
         ocp.solver_options.N_horizon = self.N
         ocp.solver_options.tf = self.N * self.dt
 

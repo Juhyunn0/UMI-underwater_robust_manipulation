@@ -44,6 +44,15 @@ To regenerate from the USD: `python extract_meshes.py && python generate_bluerov
 | bodies / geoms / sites / meshes | 2 / 8 / 7 / 2 |
 | DoF | 6 (one free joint `free`) |
 | actuators (added in Phase 2) | 6 (`thr0..thr5`) |
+
+> The table above is the **`bluerov2`** variant (`bluerov.xml`). The
+> **`ROV_MODEL=heavy`** variant (`bluerov_heavy.xml`) is the same import pipeline
+> with mass **11.5 kg** and **8** thruster sites/actuators (`thr0..thr7`) — see
+> [03_THRUSTERS.md](03_THRUSTERS.md) and `rov_model.py`. Its inertia **[0.3291, 0.6347,
+> 0.6109]** is *derived* from the bluerov2 tensor by adding the parallel-axis term of
+> the vertical-thruster layout change (`compute_heavy_inertia.py`): the farol Heavy USD's
+> own [0.21, 0.245, 0.245] is a hand-tuned Gazebo-stability literal, not physical. See the
+> 2026-06-18 entry in [CONTROL_METHODOLOGY.md](CONTROL_METHODOLOGY.md).
 | collision | one box: center (0,0,−0.05), half-size (0.25,0.175,0.125) m |
 
 The body inertia is set by an explicit `<inertial>`; every geom is

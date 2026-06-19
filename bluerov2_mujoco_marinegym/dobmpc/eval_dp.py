@@ -30,10 +30,11 @@ sys.path.insert(0, HERE)
 
 import hydro as H
 import disturbances as D
+import rov_model as RM
 from controller import PoseController
 from dobmpc_controller import DOBMPCController
 
-XML = os.path.join(HERE, "bluerov.xml")
+XML = RM.XML_PATH          # bluerov.xml (6 thr) or bluerov_heavy.xml (8 thr) per ROV_MODEL
 
 
 def _build(seed):

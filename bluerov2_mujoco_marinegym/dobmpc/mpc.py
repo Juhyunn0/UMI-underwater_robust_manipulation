@@ -23,7 +23,8 @@ import numpy as np
 from . import fossen
 from . import params as P
 
-NX, NU = 12, 4
+NX = 12
+NU = P.NU                    # 4 for bluerov2 (rank-5), 6 for heavy (fully actuated)
 
 
 def make_nmpc(N=P.MPC_N, dt=P.DT_CTRL, solver=None):
@@ -89,11 +90,17 @@ def _f_casadi(x, u, w):
                        zg * W * cth * sph,
                        zg * W * sth,
                        0.0)
-    # option (b): model the rank-5 surge->pitch coupling as an explicit function of the
-    # surge DECISION, so the MPC foresees that raising surge raises pitch. NED sign +
-    # (verified by the equilibrium-pitch gate in test_dobmpc). PITCH_AWARE=False -> 0 (option a).
-    _kappa = P.SURGE_PITCH_COUPLING if getattr(P, "PITCH_AWARE", False) else 0.0
-    tau = ca.vertcat(u[0], u[1], u[2], 0.0, _kappa * u[0], u[3])
+    # map the control u to the body wrench tau:
+    #   * heavy (NU=6, fully actuated): the full wrench is realizable -> tau = u.
+    #   * bluerov2 (NU=4, rank-5): only [X,Y,Z,N] are commandable; option (b) models
+    #     the surge->pitch coupling as an explicit function of the surge DECISION, so
+    #     the MPC foresees that raising surge raises pitch (NED sign +, verified by the
+    #     equilibrium-pitch gate in test_dobmpc). PITCH_AWARE=False -> 0 (option a).
+    if getattr(P, "FULLY_ACTUATED", False):
+        tau = ca.vertcat(u[0], u[1], u[2], u[3], u[4], u[5])
+    else:
+        _kappa = P.SURGE_PITCH_COUPLING if getattr(P, "PITCH_AWARE", False) else 0.0
+        tau = ca.vertcat(u[0], u[1], u[2], 0.0, _kappa * u[0], u[3])
     nu_dot = ca.DM(fossen.M_INV) @ (tau + w - crb - cad - damp - g_eta)
     return ca.vertcat(eta_dot, nu_dot)
 
