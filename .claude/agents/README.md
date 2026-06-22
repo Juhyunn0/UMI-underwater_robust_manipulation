@@ -24,6 +24,7 @@ They never:
 |---|---|
 | `research-plan-reviewer` | Before committing to a 1-4 week research direction |
 | `control-theory-advisor` | Questions on MPC, RL, robust control, disturbance observers |
+| `simulation-advisor` | Questions on the BlueROV2 MuJoCo sim (`bluerov2_mujoco_marinegym/`): plant/variants, hydro, thrusters, disturbances, the controllers, verification, how to run/extend |
 | `slam-perception-advisor` | Questions on SLAM, AprilTag, fisheye calibration, GTSAM |
 | `umi-manipulation-advisor` | Questions on UMI, imitation learning, manipulation policies |
 | `safety-code-reviewer` | After writing or modifying gantry/ROV motion code |
