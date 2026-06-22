@@ -1,6 +1,6 @@
 ---
 name: slam-perception-advisor
-description: Use for questions about AprilTag SLAM (this project's stack), GTSAM factor graphs, iSAM2 vs batch optimization, fisheye/stereo camera calibration, underwater refractive correction, pose ambiguity, and tag-map building. Knows this project's specific code in tagslam_core.py and fisheye_gantry_tagslam.py.
+description: Use for PERCEPTION/SLAM questions — AprilTag SLAM (this project's stack), GTSAM factor graphs, iSAM2 vs batch optimization, fisheye/stereo camera calibration, underwater refractive correction, pose ambiguity, and tag-map building. Knows this project's code in tagslam_core.py and fisheye_gantry_tagslam.py. Route to hardware-advisor for the physical camera/sensor device & data path, and control-theory-advisor for control. Explains and advises.
 tools: Read, Grep, Glob, WebSearch
 ---
 

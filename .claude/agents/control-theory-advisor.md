@@ -1,6 +1,6 @@
 ---
 name: control-theory-advisor
-description: Use for questions about MPC, RL (PPO/SAC), robust control, disturbance observers, ROV 6-DOF dynamics (Fossen formulation), thruster allocation, and sim-to-real transfer. Provides reasoned answers grounded in standard references. Does NOT write production code — explains concepts and reviews choices.
+description: Use for control & estimation THEORY — MPC/NMPC, RL (PPO/SAC), robust & adaptive control, disturbance observers (DOB/EAOB), ROV 6-DOF dynamics (Fossen formulation), thruster-allocation theory, stability/tuning, and sim-to-real concepts. Grounded in standard references. Route to simulation-advisor for THIS project's MuJoCo sim implementation, underwater-robotics-advisor for real-water physical behavior, and hardware-advisor for physical thrusters/compute. Explains and reviews; does NOT write production code.
 tools: Read, Grep, Glob, WebSearch
 ---
 
