@@ -660,3 +660,37 @@ MASS/I/VOL, NU, U_MAX, MPC_Q/R, PITCH_AWARE); [mpc.py](../dobmpc/mpc.py)(NU + NU
 (Heavy에선 rank-6 allocation이 surge→pitch 커플링을 수동 상쇄해 PID도 더 평평) — 완전 6-DOF PID는 후속. Heavy
 MJCF는 BlueROV2 시각 메시 재사용(시각만; 동역학은 Heavy inertial + 8 site). roll/pitch U_MAX(8 Nm)·Q
 가중치(80)는 초기값, 튜닝 여지. actuator 현실성 ablation / verify_hydro는 아직 BlueROV2 대상 — Heavy 확장은 후속.
+
+## 2026-06-29 — 유한수심 외란 환경 + 12-run 제어기 비교 (current/drift/waves)
+
+얕은 수심(h=4 m) Monterey Bay·너울 우세 환경에서 PID/MPC/DOB-MPC 외란 제거를 공정 비교하기 위해
+**유한수심 방향불규칙파 + 해류(평균+표류) + Froude-Krylov 관성력** 외란 환경을 추가. 기존
+`disturbances.py`(deep-water, k=ω²/g)는 천해 타깃(kh≈0.34)에 부적합 → 신규 `disturbance/` 패키지.
+
+**물리 분해 (underwater-robotics·control-theory 자문 검증).**
+- Drag: hull 감쇠 D(nu_r)(상대속도)가 이미 Morison drag와 동치 → fluid 속도를 `water_velocity`로만 주입,
+  별도 `0.5ρC_D A v_rel|v_rel|`는 **추가 안 함**(이중계산 방지).
+- Inertia: hydro의 `−M_A·d(nu_r)/dt`가 added-mass(C_a) 부분을 이미 공급 → 누락분인 **Froude-Krylov
+  ρ∀·a_wave (C_M=1)만** 외력으로 주입. (슬라이드의 평탄 C_M=1.5는 surge에만 맞아 폐기; 축별 C_a=[0.49,1.12,1.29].)
+- 유한수심: `ω²=g·k·tanh(k·h)`(뉴턴해) + cosh/sinh 깊이 프로파일 → kh≈0.34에서 k 3배 오차/해저 수직속도 미소멸 해소.
+
+**4 모드** (같은 seed → 파동 위상·GM 표류 비트동일, 레이어만 토글): C / CD / CW / CDW. **kick 제외**.
+
+**결과 (smoke, DP, seed 0, 8 s — 정성 검증):**
+| mode | PID | MPC | DOB-MPC | DRR=MPC/DOB |
+|---|---|---|---|---|
+| C (current) | 16.5 | 2.9 | **0.39 cm** | 7.4 |
+| CDW (+drift+waves) | 13.3 | 3.2 | **0.47 cm** | 6.8 |
+
+DOB-MPC가 DC 해류/표류를 거의 완전 제거(EAOB w_x≈1.5 N 추정 = 0.2 m/s drag, est_err 0.01–0.06 N),
+wave-band 잔류만 증가(band_wave 0.21→0.44 cm). square(추종)에선 nu_ref=0 구조적 lag가 지배 → DOB≈MPC(11 cm).
+
+**How / blast radius.** 신규 [disturbance/](../disturbance/){waves,current,env,config,test_*}.py,
+[experiments/run_compare.py](../experiments/run_compare.py), config/{base,scenario_square}.yaml. 기존 동역학
+수정은 [hydro.py](../hydro.py)의 read-only `diag_wtrue` 진단 1곳(`w_true_world` = plant힘−still-water모델힘+FK,
+힘 불변)뿐 — hydro의 duck-typed disturbance 인터페이스에 drop-in. 단위검증 34 assert + smoke 통과.
+실행: `python -m experiments.run_compare --config config/base.yaml`.
+
+**범위/후속.** 슬라이드(von Benzon) M_RB/M_A는 현 MarineGym 동정값과 달라(질량 11.2 vs 13.5 등) 별도 변종
+`ROV_MODEL=bluerov2_vonbenzon`으로 일관 채택 예정(질량·관성·부피/부력·부가질량 + params + 재튜닝 + 재검증).
+`fk_mode=morison_ca`(축별 완전 Morison)는 검증 sweep용으로 보존(기본 froude_krylov).

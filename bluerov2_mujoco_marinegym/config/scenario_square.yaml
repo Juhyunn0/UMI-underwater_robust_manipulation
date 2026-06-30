@@ -1,0 +1,27 @@
+# Focused square-trajectory study (tracking robustness). Same physics as base.yaml
+# but runs ONLY the square scenario, across all 4 modes with more seeds.
+# Run: python -m experiments.run_compare --config config/scenario_square.yaml
+
+site:    {h: 4.0, z_ROV: -3.0}
+waves:   {Hs: 0.75, Tp: 12.0, gamma: 5.0, s: 30, beta_bar_deg: 0.0,
+          N_omega: 60, N_beta: 21, omega_min: 0.2, omega_max: 1.6}
+current: {V_bar_c: 0.20, theta_c_deg: 0.0, tau: 300.0, sigma_inf_frac: 0.1,
+          v_z_range: [-0.03, 0.03]}
+inertia: {rho: 1025.0, vol: 0.0113459, fk_mode: froude_krylov, C_M: 1.0,
+          C_D: 1.2, A_x: 0.10, A_z: 0.15, added_mass_xyz: [5.5, 12.7, 14.57]}
+sim:     {dt: 0.002, T_sim: 120.0, log_hz: 20.0}
+
+experiment:
+  controllers: [pid, mpc, dobmpc]
+  record_runs: false
+  settle_s: 10.0
+  settle_band_cm: 5.0
+  primary:
+    scenario: square
+    modes: [C, CD, CW, CDW]
+    seeds: [0, 1, 2]
+    size: 1.0
+    laps: 10           # each square run = exactly 10 laps (~267 s at 0.15 m/s)
+    speed: 0.15
+    depth: 0.0
+  secondary: null

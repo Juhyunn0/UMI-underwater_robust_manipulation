@@ -32,12 +32,14 @@ solver.
 | T200 thruster curve, allocation `B` (rank 5), realistic actuator model | `thrusters.py` | ✅ |
 | Fossen hydrodynamics: buoyancy/restoring + added mass + drag (passive callback) | `hydro.py` | ✅ verified |
 | Disturbances: current + irregular waves + kicks + domain randomization | `disturbances.py` | ✅ verified |
+| **Finite-depth** disturbance env: directional JONSWAP + current+drift + Froude-Krylov inertia (4 modes) | `disturbance/` | ✅ verified |
 | Keyboard teleop + live force-arrow viz + live dashboard | `teleop.py`, `monitor.py` | ✅ |
 | Baseline **PD/PID** setpoint controller | `controller.py` | ✅ |
 | **DOB-MPC** = Extended Active Observer (EAOB) + NMPC | `dobmpc_controller.py`, `dobmpc/` | ✅ |
 | NMPC solved by **acados SQP-RTI** (~1 ms, default) with IPOPT fallback | `dobmpc/mpc_acados.py`, `dobmpc/mpc.py` | ✅ verified |
 | Autonomous square-tracking mission + CSV recorder + run manifest (incl. kicks) | `mission.py`, `recorder.py` | ✅ |
 | Experiments: station-keeping comparison, actuator-realism ablation | `dobmpc/eval_dp.py`, `ablation_thrusters.py` | ✅ |
+| Experiment: 3 controllers × 4 disturbance modes × N seeds (DP + square), metrics + figures | `experiments/run_compare.py`, `config/*.yaml` | ✅ |
 | Verification: hydro (smoke + precision), acados equivalence, run-meta | `verify_*.py` | ✅ |
 
 Two model variants, selected by `ROV_MODEL` (see below): **bluerov2** (default,
@@ -158,10 +160,22 @@ python -m dobmpc.eval_dp --ctrls pid,mpc,dobmpc --seed 0 --T 60
 # Actuator-realism ablation: ideal force path vs realistic T200 (deadband /
 # asymmetry / lag / voltage sag), PID/MPC/DOB-MPC averaged over 5 seeds
 python ablation_thrusters.py
+
+# Disturbance-mode comparison: 3 controllers × 4 finite-depth modes × N seeds.
+# Finite-depth directional waves + current(+drift) + Froude-Krylov inertia, shared
+# seed per (mode,seed) for a fair comparison. DP (rejection) + square (tracking).
+python -m disturbance.test_waves && python -m disturbance.test_env   # 34 unit asserts
+python -m experiments.run_compare --config config/base.yaml --smoke  # tiny pipeline check
+python -m experiments.run_compare --config config/base.yaml          # full matrix
 ```
 
 `eval_dp` prints a metrics table (radial RMS, DC bias, jitter, pitch, ŵ_x) and
-saves a plot; `ablation_thrusters` writes `docs/figs/ablation_thrusters.png`.
+saves a plot; `ablation_thrusters` writes `docs/figs/ablation_thrusters.png`;
+`run_compare` writes `recordings/<date>/compare_<ts>/` with `results.csv` (mean±std
++ DRR), `results_raw.csv`, and `figures/` (per-mode time-histories, metric bars, and
+a controller-independent disturbance self-check). Modes/params/seeds are all in the
+YAML — no code edit needed. Config knobs: `inertia.fk_mode` (froude_krylov | morison_ca
+| off), `experiment.{primary,secondary}`.
 
 ### 5. Analysis of recordings
 

@@ -741,3 +741,44 @@ coupling, so PID also levels better) — a full 6-DOF PID is a follow-up. The He
 visual meshes (visual only; dynamics are the Heavy inertial + 8 sites). Roll/pitch U_MAX (8 Nm) and Q
 weights (80) are initial values, open to tuning. The actuator-realism ablation / verify_hydro suites still
 target BlueROV2; extending them to Heavy is a follow-up.
+
+## 2026-06-29 — Finite-depth disturbance environment + 12-run controller comparison
+
+To fairly compare PID/MPC/DOB-MPC disturbance rejection at a shallow (h=4 m), swell-dominated Monterey Bay
+site, added a **finite-depth directional irregular wave + ocean current (mean + drift) + Froude-Krylov inertia**
+disturbance environment. The legacy `disturbances.py` (deep-water, k=ω²/g) is unfit for the shallow target
+(kh≈0.34) → new `disturbance/` package.
+
+**Physics decomposition (verified by the underwater-robotics & control-theory advisors).**
+- Drag: the hull damping D(nu_r) (on relative velocity) is already the Fossen-equivalent of Morison drag →
+  feed the fluid velocity through `water_velocity` ONLY; do **not** add `0.5ρC_D A v_rel|v_rel|` (double-count).
+- Inertia: hydro's `−M_A·d(nu_r)/dt` already supplies the added-mass (C_a) part → inject only the missing
+  **Froude-Krylov ρ∀·a_wave (C_M=1)** as an external force. (The slide's flat C_M=1.5 is right only on surge;
+  per-axis C_a=[0.49,1.12,1.29].)
+- Finite depth: `ω²=g·k·tanh(k·h)` (Newton-solved) + cosh/sinh depth profiles — fixes the ~3× k error and the
+  non-vanishing seabed vertical velocity of deep-water at kh≈0.34.
+
+**4 modes** (same seed → wave phases + GM drift bit-identical across modes, only the layer toggles differ):
+C / CD / CW / CDW. **Kicks excluded.**
+
+**Result (smoke, DP, seed 0, 8 s — qualitative validation):**
+| mode | PID | MPC | DOB-MPC | DRR=MPC/DOB |
+|---|---|---|---|---|
+| C (current) | 16.5 | 2.9 | **0.39 cm** | 7.4 |
+| CDW (+drift+waves) | 13.3 | 3.2 | **0.47 cm** | 6.8 |
+
+DOB-MPC nearly fully rejects the DC current/drift (EAOB estimates w_x≈1.5 N = the 0.2 m/s drag, est_err
+0.01–0.06 N); only the wave-band residual grows (band_wave 0.21→0.44 cm). On square (tracking) the nu_ref=0
+structural lag dominates → DOB≈MPC (11 cm).
+
+**How / blast radius.** New [disturbance/](../disturbance/){waves,current,env,config,test_*}.py,
+[experiments/run_compare.py](../experiments/run_compare.py), config/{base,scenario_square}.yaml. The only edit
+to existing dynamics is a read-only `diag_wtrue` diagnostic in [hydro.py](../hydro.py) (`w_true_world` =
+plant force − still-water model force + FK; forces unchanged) — the env is a drop-in for hydro's duck-typed
+disturbance interface. 34 unit asserts + smoke pass. Run:
+`python -m experiments.run_compare --config config/base.yaml`.
+
+**Scope / follow-ups.** The slide's (von Benzon) M_RB/M_A differ from the current MarineGym-identified set
+(mass 11.2 vs 13.5, etc.) → to be adopted consistently as a separate variant `ROV_MODEL=bluerov2_vonbenzon`
+(mass/inertia/volume-buoyancy/added-mass + params + re-tune + re-verify). `fk_mode=morison_ca` (per-axis full
+Morison) is kept for the verification sweep (default froude_krylov).

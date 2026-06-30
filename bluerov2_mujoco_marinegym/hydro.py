@@ -71,7 +71,8 @@ def load_coeffs(path=YAML):
 
 class Hydrodynamics:
     def __init__(self, model, coeff_path=YAML, rho=RHO_FRESHWATER,
-                 acc_filter=0.3, buoyancy=None, body="base_link", disturbance=None):
+                 acc_filter=0.3, buoyancy=None, body="base_link", disturbance=None,
+                 diag_wtrue=False):
         self.model = model
         self.bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body)
         # Phase 4: optional environmental disturbance field (current/waves/kicks).
@@ -79,6 +80,12 @@ class Hydrodynamics:
         # Coriolis/added-mass (so the flow carries an unpowered vehicle) and adds
         # the kick external force. None -> still water (Phase-3 behaviour).
         self.disturbance = disturbance
+        # Read-only EAOB ground-truth diagnostic (does NOT change the applied forces):
+        # when enabled, also evaluate the still-water (nu) wrench and store the lumped
+        # disturbance w_true_world = (plant force - still-water model force) + FK ext,
+        # in FLU world, for comparison vs DOBMPCController.w_world_flu(). Off by default.
+        self.diag_wtrue = bool(diag_wtrue)
+        self.w_true_world = np.zeros(6)
         c = load_coeffs(coeff_path)
         self.volume = c["volume"]
         self.coBM = c["coBM"]
@@ -101,6 +108,10 @@ class Hydrodynamics:
     def reset(self):
         self._nu_prev = None
         self._nudot_f = np.zeros(6)
+        # parallel filter state for the read-only still-water diagnostic (diag_wtrue)
+        self._nu_prev_still = None
+        self._nudot_f_still = np.zeros(6)
+        self._wb_still = np.zeros(6)
 
     # body-frame velocity nu = [v(3); omega(3)] at the COM (== body origin)
     def nu(self, data):
@@ -150,7 +161,26 @@ class Hydrodynamics:
         f_cor = -self._coriolis_added(nu_r)
         self._last_drag = f_drag      # stored (read-only) for visualization
         self._last_added = f_added
+        if self.diag_wtrue:
+            self._update_wb_still(nu)
         return f_drag + f_added + f_cor
+
+    def _update_wb_still(self, nu):
+        """Read-only diagnostic: the hydro wrench the controller's STILL-WATER internal
+        model expects (drag+added+Coriolis at the absolute velocity nu, no flow), with
+        its OWN added-mass filter state. self._wb_still is subtracted from the realised
+        (nu_r) wrench to form the lumped disturbance the EAOB estimates. No force change."""
+        if self._nu_prev_still is None:
+            nudot = np.zeros(6)
+        else:
+            nudot = (nu - self._nu_prev_still) / self.dt
+        self._nudot_f_still = (self.acc_filter * nudot
+                               + (1 - self.acc_filter) * self._nudot_f_still)
+        self._nu_prev_still = nu
+        f_drag = -(self.D_L * nu + self.D_NL * np.abs(nu) * nu)
+        f_added = -self.M_A * self._nudot_f_still
+        f_cor = -self._coriolis_added(nu)
+        self._wb_still = f_drag + f_added + f_cor
 
     def __call__(self, model, data):
         """Passive-force callback: add the hydro wrench to qfrc_passive."""
@@ -175,6 +205,12 @@ class Hydrodynamics:
             Fk, Tk = self.disturbance.external_wrench(data.time, com)
             if Fk.any() or Tk.any():
                 mujoco.mj_applyFT(model, data, Fk, Tk, com, bid, data.qfrc_passive)
+
+        # read-only lumped-disturbance ground truth (FLU world): drag/added/cor
+        # difference (nu_r vs still-water nu) rotated to world + the FK external force.
+        if self.diag_wtrue:
+            dwb = wb - self._wb_still
+            self.w_true_world = np.concatenate([R @ dwb[:3] + Fk, R @ dwb[3:]])
 
         # ---- expose per-component forces for visualization (READ-ONLY: this
         #      records what was already applied; it does not change dynamics) ----
