@@ -18,10 +18,12 @@ experiment:
   settle_band_cm: 5.0
   primary:
     scenario: square
-    modes: [C, CD, CW, CDW]
+    modes: [NONE, C, CD, CW, CDW]   # NONE = still water baseline (no current/waves)
     seeds: [0, 1, 2]
     size: 1.0
     laps: 10           # each square run = exactly 10 laps (~267 s at 0.15 m/s)
     speed: 0.15
     depth: 0.0
+    heading_follow: true   # face travel direction (yaw -> path tangent)
+    yaw_rate_deg_s: 60     # heading slew-rate limit for smooth corner turns
   secondary: null

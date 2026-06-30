@@ -64,6 +64,10 @@ class AcadosNMPC:
                  u_max=P.U_MAX, v_max=P.V_MAX, rti=True, soft=True, build=True,
                  fallback_ipopt=True):
         self.N, self.dt = int(N), float(dt)
+        # parallel run_compare pre-builds the solver once in the parent, then sets this
+        # so forked workers LOAD the compiled solver instead of racing to recompile.
+        if os.environ.get("DOBMPC_ACADOS_BUILD") == "0":
+            build = False
         nx, nu = NX, NU
         ny, ny_e = nx + nu, nx
 

@@ -758,8 +758,9 @@ disturbance environment. The legacy `disturbances.py` (deep-water, k=ω²/g) is 
 - Finite depth: `ω²=g·k·tanh(k·h)` (Newton-solved) + cosh/sinh depth profiles — fixes the ~3× k error and the
   non-vanishing seabed vertical velocity of deep-water at kh≈0.34.
 
-**4 modes** (same seed → wave phases + GM drift bit-identical across modes, only the layer toggles differ):
-C / CD / CW / CDW. **Kicks excluded.**
+**5 modes** (same seed → wave phases + GM drift bit-identical across modes, only the layer toggles differ):
+NONE / C / CD / CW / CDW, where **NONE = still water** (current+drift+waves all off) is the disturbance-free
+baseline, and C/CD/CW/CDW add current / +drift / +waves / +drift+waves. **Kicks excluded.**
 
 **Result (smoke, DP, seed 0, 8 s — qualitative validation):**
 | mode | PID | MPC | DOB-MPC | DRR=MPC/DOB |
@@ -782,3 +783,79 @@ disturbance interface. 34 unit asserts + smoke pass. Run:
 (mass 11.2 vs 13.5, etc.) → to be adopted consistently as a separate variant `ROV_MODEL=bluerov2_vonbenzon`
 (mass/inertia/volume-buoyancy/added-mass + params + re-tune + re-verify). `fk_mode=morison_ca` (per-axis full
 Morison) is kept for the verification sweep (default froude_krylov).
+
+## 2026-06-29 — Heavy = default + DOB-MPC trajectory reference (velocity FF + heading-follow)
+
+Three coupled changes, motivated by watching the square mission live (`experiments/run_viewer.py`): make the
+fully-actuated **Heavy** the standard vehicle, make the ROV **face its travel direction** on the square, and
+fix the **large DOB-MPC square tracking error**.
+
+**1. Heavy is now the project-wide default.** [rov_model.py](../rov_model.py): `ROV_MODEL` default `bluerov2`
+→ **`heavy`** (8 thrusters, rank-6 fully actuated, NU=6). Everything downstream (hydro YAML, `dobmpc/params`,
+allocation, per-variant acados codegen) reads `RM.*` so it follows automatically — verified end-to-end
+(`heavy 8 True`, allocation 6×8 rank 6, heavy acados RTI solver already built). `test_load.py` hardcodes
+`bluerov.xml` (a bluerov2-specific phase-1 check) so it is unaffected. Override with `ROV_MODEL=bluerov2`.
+
+**2. Heading-follow + corner smoothing** (`experiments/run_compare.py` square branch + `run_viewer.py`).
+On the square the yaw reference now tracks the path tangent `atan2(ty,tx)` (the ROV faces where it's going),
+**slew-rate-limited** so the 90° corner change ramps smoothly (`slew_heading`, default **60 °/s** ≈ 1.5 s/corner)
+instead of stepping — the POSITION path stays the sharp square (heading only). Config knobs in the square block:
+`heading_follow: true`, `yaw_rate_deg_s: 60`; viewer flags `--heading {follow,fixed}`, `--yaw-rate`. Verified:
+the logged `yaw_deg` ramps at ≤3.1°/log (no 90° jump), progresses 0→90→±180→−90 through all four corners.
+
+**3. DOB-MPC `_xref_ned`: constant-pose DP tile → horizon trajectory reference** (the load-bearing fix).
+Root cause of the big square error: the NMPC reference set `nu_ref = 0` always and **ignored `v_ref`** — a pure
+DP (station-keeping) regulator structurally lags a moving target (the code comment named it "a follow-up").
+[dobmpc_controller.py](../dobmpc_controller.py) `_xref_ned()` now builds, per horizon step, all as **runtime
+reference data (model + cost unchanged → no acados rebuild)**:
+- **velocity feed-forward**: `nu_ref = [ S·(R(yaw_ref)ᵀ·v_ref) ; 0 ]` (world-FLU path velocity → reference body
+  velocity, FRD) — the MPC stops fighting the motion;
+- **position preview**: `p_k = p_ref + v_ref·(k·DT_CTRL)` extrapolated over the horizon (position & velocity
+  references consistent = a point moving at `v_ref`);
+- **yaw unwrap**: `psi_ref ← psi_now + wrap(psi_ref − psi_now)` so the NMPC cost (no angle wrapping) always turns
+  the short way across ±π — required for heading-follow on the MPC (else a ~270° wrong-way spin at one corner).
+
+`v_ref = 0` reduces `_xref_ned` **exactly** to the old constant-pose tile (unit-asserted `allclose 1e-12`) →
+**DP / station-keeping results are unchanged** (regression-safe). Frame care: `nu` is body (FRD), `v_ref` is
+world (FLU); the rotation is mandatory. EAOB is unaffected (it sees the actual commanded wrench).
+
+**Result (heavy, DP T=20 s / square 2 laps, mode C, seed 0):**
+| run | radial RMS |
+|---|---|
+| DP dobmpc (regression) | **0.00 cm** (fully-actuated + DOB rejects the current) |
+| square dobmpc (FF + heading) | **1.87 cm** |
+| square mpc (FF) | 3.63 cm |
+| square pid (baseline) | 25.1 cm |
+
+The DOB-MPC square error drops from lag-dominated (tens of cm pre-FF) to **~1.9 cm**; the remaining error is the
+corner transient (linear preview overshoots past corners) + the wave/current disturbance residual (EAOB's job,
+separate from the reference FF).
+
+## 2026-06-29 — NONE (still-water) baseline mode + comparison-figure polish
+
+Added a **5th disturbance mode `NONE` = still water** (current + drift + waves all off) as the disturbance-free
+baseline, via a new `use_current` flag in [disturbance/env.py](../disturbance/env.py):
+`MODES = ("NONE", "C", "CD", "CW", "CDW")`. `water_velocity` / `external_wrench` now return exactly zero in
+NONE. The mode codes go through PyYAML `safe_load`, so they must avoid YAML-1.1 bool/null words
+(`N` / `n` / `off` / `yes` / …) — hence the spelled-out `NONE`. Wired into `config/base.yaml`,
+`config/scenario_square.yaml`, and the `--mode` argparse choices of `run_viewer.py` / `plot_trajectories.py`.
+
+**Why:** every other mode bundles a controller's *intrinsic* tracking lag with its *disturbance rejection*. NONE
+isolates the first — it anchors the bar chart with the best each controller can do when nothing pushes the ROV.
+
+**Result (square, 10 current headings, seed 0; recording `compare_20260629_113356`) — radial RMS [cm]:**
+| mode | PID | MPC | DOB-MPC |
+|---|---|---|---|
+| **NONE (still water)** | **19.0** | **1.9** | **1.9** (std 0 — deterministic) |
+| C (current) | 29.5 | 16.4 | 14.6 |
+| CDW (+drift+waves) | 67.5 | 31.1 | 21.4 |
+
+NONE ≤ C for every controller (as it must). In still water MPC ≈ DOB-MPC (the EAOB has nothing to estimate,
+`est_err ≈ 0.04 N`, DRR 0.99); the PID's 19 cm is its pure corner-tracking lag with no disturbance at all. NONE is
+deterministic (no current to rotate, fixed seed) → identical across all 10 headings, so its bar has no error bar.
+
+**Figure:** `fig_bars()` in [experiments/run_compare.py](../experiments/run_compare.py) rewritten for a
+publication-quality look — refined palette, per-bar value labels, two-line x-labels that spell out each mode
+(`NONE (still water)`, `C (current)`, …), top/right spines off, horizontal legend, 200 dpi. The recording's
+`bar_square_radial_rms.png` + `results.csv` / `results_raw.csv` were regenerated to include NONE (the existing
+4-mode data was preserved, NONE appended).

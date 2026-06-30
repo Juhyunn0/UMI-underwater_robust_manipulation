@@ -1,9 +1,9 @@
 """Single source of truth for WHICH BlueROV variant the whole stack uses.
 
-Select with the env var `ROV_MODEL` (default "bluerov2"):
+Select with the env var `ROV_MODEL` (default "heavy"):
 
-    ROV_MODEL=heavy    python teleop.py --square --ctrl dobmpc --disturb
-    ROV_MODEL=bluerov2 python -m dobmpc.eval_dp        # (default)
+    python teleop.py --square --ctrl dobmpc --disturb   # heavy (default, rank-6)
+    ROV_MODEL=bluerov2 python -m dobmpc.eval_dp         # vectored-6 (rank-5)
 
 Two variants, both from the MarineGym assets (values verified directly from the
 USD: external/MarineGym/.../usd/{BlueROV,BlueROVHeavy}/):
@@ -58,7 +58,7 @@ _MODELS = {
     ),
 }
 
-MODEL = os.environ.get("ROV_MODEL", "bluerov2").strip().lower()
+MODEL = os.environ.get("ROV_MODEL", "heavy").strip().lower()
 if MODEL not in _MODELS:
     raise ValueError(f"ROV_MODEL={MODEL!r} not in {list(_MODELS)}")
 

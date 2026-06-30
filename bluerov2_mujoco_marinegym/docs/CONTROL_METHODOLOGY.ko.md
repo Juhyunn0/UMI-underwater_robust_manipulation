@@ -674,7 +674,9 @@ MJCF는 BlueROV2 시각 메시 재사용(시각만; 동역학은 Heavy inertial 
   ρ∀·a_wave (C_M=1)만** 외력으로 주입. (슬라이드의 평탄 C_M=1.5는 surge에만 맞아 폐기; 축별 C_a=[0.49,1.12,1.29].)
 - 유한수심: `ω²=g·k·tanh(k·h)`(뉴턴해) + cosh/sinh 깊이 프로파일 → kh≈0.34에서 k 3배 오차/해저 수직속도 미소멸 해소.
 
-**4 모드** (같은 seed → 파동 위상·GM 표류 비트동일, 레이어만 토글): C / CD / CW / CDW. **kick 제외**.
+**5 모드** (같은 seed → 파동 위상·GM 표류 비트동일, 레이어만 토글): NONE / C / CD / CW / CDW.
+**NONE = still water** (current·drift·waves 모두 off) = 외란 없는 baseline, 나머지는 current / +drift /
++waves / +drift+waves. **kick 제외**.
 
 **결과 (smoke, DP, seed 0, 8 s — 정성 검증):**
 | mode | PID | MPC | DOB-MPC | DRR=MPC/DOB |
@@ -694,3 +696,74 @@ wave-band 잔류만 증가(band_wave 0.21→0.44 cm). square(추종)에선 nu_re
 **범위/후속.** 슬라이드(von Benzon) M_RB/M_A는 현 MarineGym 동정값과 달라(질량 11.2 vs 13.5 등) 별도 변종
 `ROV_MODEL=bluerov2_vonbenzon`으로 일관 채택 예정(질량·관성·부피/부력·부가질량 + params + 재튜닝 + 재검증).
 `fk_mode=morison_ca`(축별 완전 Morison)는 검증 sweep용으로 보존(기본 froude_krylov).
+
+## 2026-06-29 — Heavy 기본 전환 + DOB-MPC 궤적 레퍼런스(속도 FF + heading-follow)
+
+square 임무를 실시간(`experiments/run_viewer.py`)으로 보다가 나온 3개의 연동 변경: 완전구동 **Heavy**를 표준
+기체로, square에서 ROV가 **진행방향을 바라보게**, 그리고 **DOB-MPC의 큰 square 추종오차**를 해결.
+
+**1. Heavy를 프로젝트 전역 기본으로.** [rov_model.py](../rov_model.py): `ROV_MODEL` 기본값 `bluerov2`
+→ **`heavy`**(8추진기, rank-6 완전구동, NU=6). 하위(hydro YAML, `dobmpc/params`, allocation, 변종별 acados
+codegen)는 전부 `RM.*` 경유라 자동 추종 — end-to-end 확인(`heavy 8 True`, allocation 6×8 rank 6, heavy acados
+RTI solver 기빌드). `test_load.py`는 `bluerov.xml` 하드코딩(bluerov2 전용 phase-1 점검)이라 영향 없음.
+`ROV_MODEL=bluerov2`로 되돌림.
+
+**2. heading-follow + 코너 스무딩**(`experiments/run_compare.py` square 분기 + `run_viewer.py`).
+square에서 yaw 레퍼런스를 경로 접선 `atan2(ty,tx)`로 추종(진행방향 바라봄), **슬루-레이트 제한**으로 90° 코너
+전환을 부드럽게 램프(`slew_heading`, 기본 **60 °/s** ≈ 1.5 s/코너) — 위치 경로는 날카로운 square 유지(각도만).
+square 블록 config: `heading_follow: true`, `yaw_rate_deg_s: 60`; 뷰어 플래그 `--heading {follow,fixed}`,
+`--yaw-rate`. 검증: 기록된 `yaw_deg`가 ≤3.1°/log로 램프(90° 도약 없음), 네 코너에서 0→90→±180→−90 진행.
+
+**3. DOB-MPC `_xref_ned`: 정점 타일 → 수평선 궤적 레퍼런스**(핵심 수정).
+큰 square 오차의 원인: NMPC 레퍼런스가 `nu_ref = 0`을 늘 두고 **`v_ref`를 무시** → 순수 DP(정점유지) 제어라
+움직이는 목표를 구조적으로 lag(코드 주석이 "a follow-up"으로 보류해둔 부분).
+[dobmpc_controller.py](../dobmpc_controller.py) `_xref_ned()`가 horizon step마다, 전부 **런타임 레퍼런스만
+(모델·코스트 불변 → acados 재빌드 없음)**:
+- **속도 FF**: `nu_ref = [ S·(R(yaw_ref)ᵀ·v_ref) ; 0 ]`(world-FLU 경로속도 → 레퍼런스 body 속도, FRD) — MPC가
+  움직임을 더는 억누르지 않음;
+- **위치 미리보기**: `p_k = p_ref + v_ref·(k·DT_CTRL)` 외삽(위치·속도 레퍼런스 자기일관 = v_ref로 움직이는 점);
+- **yaw unwrap**: `psi_ref ← psi_now + wrap(psi_ref − psi_now)`로 NMPC 코스트(각도 wrap 없음)가 ±π를 짧은 쪽으로
+  통과 — heading-follow를 MPC에서 정상화(없으면 한 코너에서 ~270° 헛돔).
+
+`v_ref = 0`이면 `_xref_ned`가 **정확히** 기존 정점 타일로 환원(unit-assert `allclose 1e-12`) →
+**DP/정점유지 결과 불변**(회귀 안전). 프레임 주의: `nu`는 body(FRD), `v_ref`는 world(FLU) → 회전 필수.
+EAOB는 실제 명령 wrench를 보므로 무관.
+
+**결과 (heavy, DP T=20 s / square 2바퀴, mode C, seed 0):**
+| run | radial RMS |
+|---|---|
+| DP dobmpc (회귀) | **0.00 cm** (완전구동 + DOB가 해류 제거) |
+| square dobmpc (FF + heading) | **1.87 cm** |
+| square mpc (FF) | 3.63 cm |
+| square pid (기준) | 25.1 cm |
+
+DOB-MPC square 오차가 lag 지배(FF 전 수십 cm)에서 **~1.9 cm**로 감소; 남은 오차는 코너 transient(직선 미리보기가
+코너 너머 과대예측) + 파동/해류 외란 잔차(EAOB 몫, 레퍼런스 FF와 별개).
+
+## 2026-06-29 — NONE(잔잔한 물) baseline 모드 추가 + 비교 그림 정비
+
+**5번째 외란 모드 `NONE` = still water**(current·drift·waves 전부 off)를 외란 없는 baseline으로 추가.
+[disturbance/env.py](../disturbance/env.py)에 `use_current` 플래그를 신설:
+`MODES = ("NONE", "C", "CD", "CW", "CDW")`. NONE에서 `water_velocity`/`external_wrench`는 정확히 0.
+모드 코드는 PyYAML `safe_load`를 거치므로 YAML-1.1 bool/null 단어(`N`/`n`/`off`/`yes` 등)를 피해야 함 → 그래서
+풀어 쓴 `NONE`. `config/base.yaml`, `config/scenario_square.yaml`, `run_viewer.py`/`plot_trajectories.py`의
+`--mode` choices에 모두 반영.
+
+**이유:** 다른 모드들은 제어기의 *고유 추종 지연*과 *외란 제거*를 한데 묶음. NONE은 전자를 분리 — 아무것도
+밀지 않을 때 각 제어기가 낼 수 있는 최선을 막대그래프의 기준점으로 제공.
+
+**결과 (square, current heading 10개, seed 0; recording `compare_20260629_113356`) — radial RMS [cm]:**
+| mode | PID | MPC | DOB-MPC |
+|---|---|---|---|
+| **NONE (still water)** | **19.0** | **1.9** | **1.9** (std 0 — 결정론적) |
+| C (current) | 29.5 | 16.4 | 14.6 |
+| CDW (+drift+waves) | 67.5 | 31.1 | 21.4 |
+
+모든 제어기에서 NONE ≤ C (당연). 잔잔한 물에선 MPC ≈ DOB-MPC(EAOB가 추정할 외란 없음, `est_err ≈ 0.04 N`,
+DRR 0.99); PID의 19 cm는 외란이 전혀 없을 때의 순수 코너 추종 지연. NONE은 결정론적(돌릴 해류 없음, seed 고정)
+→ 10개 heading에서 동일하므로 막대에 오차막대가 없음.
+
+**그림:** [experiments/run_compare.py](../experiments/run_compare.py)의 `fig_bars()`를 논문용으로 재작성 —
+팔레트 정비, 막대별 값 라벨, 각 모드 의미를 적은 2줄 x축 라벨(`NONE (still water)`, `C (current)`, …),
+상·우 축선 제거, 가로 범례, 200 dpi. recording의 `bar_square_radial_rms.png` + `results.csv`/`results_raw.csv`를
+NONE 포함해 재생성(기존 4모드 데이터는 보존, NONE 추가).

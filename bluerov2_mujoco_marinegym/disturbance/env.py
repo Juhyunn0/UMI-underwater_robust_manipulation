@@ -22,8 +22,9 @@ Physics split (no double-count, verified by advisors):
     i.e. the undisturbed-pressure term hydro does not model. NO separate Morison
     drag (would double-count the D-matrix). Legacy Poisson kicks are excluded.
 
-4 modes (same seed -> wave phases + GM drift sequence are bit-identical across modes;
+5 modes (same seed -> wave phases + GM drift sequence are bit-identical across modes;
 only the layer toggles differ, for a fair mode-by-mode comparison):
+    NONE: still water                  (current off, drift off, waves off) -- baseline
     C   : mean current only            (drift off, waves off)
     CD  : mean current + drift         (waves off)
     CW  : mean current + waves         (drift off)
@@ -34,7 +35,7 @@ import numpy as np
 from .waves import DirectionalWaveField
 from .current import CurrentField
 
-MODES = ("C", "CD", "CW", "CDW")
+MODES = ("NONE", "C", "CD", "CW", "CDW")
 
 
 class DisturbanceEnv:
@@ -45,6 +46,7 @@ class DisturbanceEnv:
         self.seed = int(seed)
         self.dt = float(dt)
         self.T_sim = float(T_sim)
+        self.use_current = mode in ("C", "CD", "CW", "CDW")   # NONE -> still water
         self.use_drift = mode in ("CD", "CDW")
         self.use_waves = mode in ("CW", "CDW")
         self.enabled = True
@@ -79,14 +81,18 @@ class DisturbanceEnv:
     # ----------------------------------------------------- hydro duck-type
     def water_velocity(self, t, pos):
         self._t_last = float(t)
-        v = (self.current.current_velocity(t) if self.use_drift
-             else self.current.mean_velocity(t))
+        v = np.zeros(3)
+        if self.use_current:
+            v = (self.current.current_velocity(t) if self.use_drift
+                 else self.current.mean_velocity(t))
         if self.use_waves:
             v = v + self.waves.velocity(t, pos)
         return v
 
     def current_velocity(self):
         """No-arg diagnostic (hydro viz + recorder): current at the last seen time."""
+        if not self.use_current:
+            return np.zeros(3)
         return (self.current.current_velocity(self._t_last) if self.use_drift
                 else self.current.mean_velocity(self._t_last))
 
@@ -114,13 +120,15 @@ class DisturbanceEnv:
 
     def summary(self):
         return (f"DisturbanceEnv mode={self.mode} seed={self.seed} "
-                f"(drift={self.use_drift}, waves={self.use_waves}, "
-                f"fk={self.fk_mode}, C_M={self._Cm_axis.round(2).tolist()})")
+                f"(current={self.use_current}, drift={self.use_drift}, "
+                f"waves={self.use_waves}, fk={self.fk_mode}, "
+                f"C_M={self._Cm_axis.round(2).tolist()})")
 
     def to_meta(self):
         return dict(
             schema_version=1, kind="finite_depth_env", mode=self.mode,
             seed=self.seed, enabled=bool(self.enabled), dt=self.dt, T_sim=self.T_sim,
+            use_current=bool(self.use_current),
             use_drift=bool(self.use_drift), use_waves=bool(self.use_waves),
             current=self.current.to_meta(),
             waves=self.waves.to_meta(),

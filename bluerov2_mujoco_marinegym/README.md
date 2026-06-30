@@ -32,7 +32,7 @@ solver.
 | T200 thruster curve, allocation `B` (rank 5), realistic actuator model | `thrusters.py` | ✅ |
 | Fossen hydrodynamics: buoyancy/restoring + added mass + drag (passive callback) | `hydro.py` | ✅ verified |
 | Disturbances: current + irregular waves + kicks + domain randomization | `disturbances.py` | ✅ verified |
-| **Finite-depth** disturbance env: directional JONSWAP + current+drift + Froude-Krylov inertia (4 modes) | `disturbance/` | ✅ verified |
+| **Finite-depth** disturbance env: directional JONSWAP + current+drift + Froude-Krylov inertia (5 modes: NONE/C/CD/CW/CDW, NONE=still-water baseline) | `disturbance/` | ✅ verified |
 | Keyboard teleop + live force-arrow viz + live dashboard | `teleop.py`, `monitor.py` | ✅ |
 | Baseline **PD/PID** setpoint controller | `controller.py` | ✅ |
 | **DOB-MPC** = Extended Active Observer (EAOB) + NMPC | `dobmpc_controller.py`, `dobmpc/` | ✅ |
@@ -40,13 +40,14 @@ solver.
 | Autonomous square-tracking mission + CSV recorder + run manifest (incl. kicks) | `mission.py`, `recorder.py` | ✅ |
 | Experiments: station-keeping comparison, actuator-realism ablation | `dobmpc/eval_dp.py`, `ablation_thrusters.py` | ✅ |
 | Experiment: 3 controllers × 4 disturbance modes × N seeds (DP + square), metrics + figures | `experiments/run_compare.py`, `config/*.yaml` | ✅ |
+| **Live viewer**: watch ONE controller × mode run the square in real-time MuJoCo + save trajectory CSV + 1-lap mp4 | `experiments/run_viewer.py` | ✅ |
 | Verification: hydro (smoke + precision), acados equivalence, run-meta | `verify_*.py` | ✅ |
 
-Two model variants, selected by `ROV_MODEL` (see below): **bluerov2** (default,
-6 thrusters, `rank(allocation) = 5` — under-actuated in pitch, command
-surge/sway/heave/yaw/roll, **never pitch**) and **heavy** (8 thrusters,
-`rank = 6` — **fully actuated**, the NMPC commands the full 6-DOF wrench incl.
-roll and pitch).
+Two model variants, selected by `ROV_MODEL` (see below): **heavy** (default,
+8 thrusters, `rank = 6` — **fully actuated**, the NMPC commands the full 6-DOF
+wrench incl. roll and pitch) and **bluerov2** (6 thrusters,
+`rank(allocation) = 5` — under-actuated in pitch, command
+surge/sway/heave/yaw/roll, **never pitch**).
 
 ---
 
@@ -67,13 +68,13 @@ cd bluerov2_mujoco_marinegym
 
 ### Model variant: BlueROV2 vs BlueROV2 Heavy
 
-Pick the vehicle with the **`ROV_MODEL`** env var (default `bluerov2`); a single
+Pick the vehicle with the **`ROV_MODEL`** env var (default **`heavy`**); a single
 [rov_model.py](rov_model.py) registry keeps the plant and the controller in sync:
 
 ```bash
-                  python teleop.py --square --ctrl dobmpc --disturb   # bluerov2 (default)
-ROV_MODEL=heavy   python teleop.py --square --ctrl dobmpc --disturb   # BlueROV2 Heavy
-ROV_MODEL=heavy   python -m dobmpc.eval_dp --ctrls pid,mpc,dobmpc     # Heavy, headless
+                   python teleop.py --square --ctrl dobmpc --disturb   # heavy (default)
+ROV_MODEL=bluerov2 python teleop.py --square --ctrl dobmpc --disturb   # vectored-6 (rank-5)
+                   python -m dobmpc.eval_dp --ctrls pid,mpc,dobmpc     # heavy, headless
 ```
 
 | | bluerov2 | heavy |
@@ -166,7 +167,17 @@ python ablation_thrusters.py
 # seed per (mode,seed) for a fair comparison. DP (rejection) + square (tracking).
 python -m disturbance.test_waves && python -m disturbance.test_env   # 34 unit asserts
 python -m experiments.run_compare --config config/base.yaml --smoke  # tiny pipeline check
-python -m experiments.run_compare --config config/base.yaml          # full matrix
+python -m experiments.run_compare --config config/base.yaml          # full matrix (parallel)
+# Runs are independent and run in parallel by default (min(cpu,16) procs); the acados
+# solver is pre-built once, workers load it. `--jobs 1` forces serial; `--jobs N` caps it.
+python -m experiments.run_compare --config config/base.yaml --jobs 8
+
+# Live MuJoCo viewer for ONE (controller, mode) on the square — fix one seed + one
+# current direction and WATCH it run in real time. Saves the full-run trajectory CSV
+# and an mp4 of just ONE lap (the last, settled lap; full-run video would be huge).
+# Same plant/hydro/DisturbanceEnv as run_compare, so the trajectory matches the batch.
+python -m experiments.run_viewer --config config/base.yaml --ctrl dobmpc --mode CDW
+python -m experiments.run_viewer --config config/base.yaml --ctrl pid --mode C --headless  # no window (CSV+mp4 only)
 ```
 
 `eval_dp` prints a metrics table (radial RMS, DC bias, jitter, pitch, ŵ_x) and
@@ -176,6 +187,17 @@ saves a plot; `ablation_thrusters` writes `docs/figs/ablation_thrusters.png`;
 a controller-independent disturbance self-check). Modes/params/seeds are all in the
 YAML — no code edit needed. Config knobs: `inertia.fk_mode` (froude_krylov | morison_ca
 | off), `experiment.{primary,secondary}`.
+
+`run_viewer` runs exactly one `--ctrl {pid,mpc,dobmpc}` × `--mode {NONE,C,CD,CW,CDW}`
+(call it once per combination) and accumulates outputs in
+`recordings/<date>/square_view/`: `traj_*.csv` (full run, position + reference),
+`lap_*.mp4` (one lap), and `meta_*.json`. Flags: `--seed`, `--dir-deg` (fixes the
+single current heading), `--laps`, `--record-lap last|first|middle|<int>`,
+`--heading follow|fixed` (face the travel direction; default follow),
+`--yaw-rate <deg/s>` (corner-turn smoothing, default 60),
+`--video-hz`, `--video-size WxH`, `--no-arrows`, `--no-video`, `--headless` (no
+on-screen window; offscreen render only — use on a display-less host, or if the live
+window and recorder clash, with `MUJOCO_GL=egl` auto-selected when there is no display).
 
 ### 5. Analysis of recordings
 

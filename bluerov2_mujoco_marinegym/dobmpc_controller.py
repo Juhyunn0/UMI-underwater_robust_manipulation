@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import thrusters as T
 from dobmpc import frames
 from dobmpc import params as P
-from dobmpc.fossen import rot_ib
+from dobmpc.fossen import rot_ib, wrap_angle
 from dobmpc.eaob import EAOB
 from dobmpc.mpc import make_nmpc
 
@@ -70,6 +70,8 @@ class DOBMPCController:
         self._tau_ned_cmd = np.zeros(6)          # commanded NED wrench (fed to EAOB)
         self._nu_prev_ned = None
         self._k = 0                              # substep counter
+        self._psi_ned_now = 0.0                  # current NED yaw, refreshed each tick
+                                                 # (used to unwrap the yaw reference)
 
         self.commanded = np.zeros(6)
         self.realized = np.zeros(6)
@@ -107,17 +109,43 @@ class DOBMPCController:
         return p, R, nu_flu
 
     def _xref_ned(self):
-        """Constant-pose DP reference as (12, N+1). (v_ref handling for moving
-        trajectories is a follow-up; DP holds nu_ref = 0.)"""
-        eta_ref = frames.flu_to_ned_eta(self.p_ref, _Rz_flu(self.yaw_ref))
-        x_ref = np.concatenate([eta_ref, np.zeros(6)])
-        return np.tile(x_ref.reshape(12, 1), (1, self.nmpc.N + 1))
+        """Horizon trajectory reference (12, N+1) in NED.
+
+        Over the original constant-pose DP tile this adds, all as RUNTIME reference
+        data (model + cost untouched -> NO acados rebuild):
+          * velocity feed-forward: the path velocity self.v_ref (world FLU) becomes
+            the reference body velocity nu_ref (so the MPC stops fighting motion);
+          * position preview: the setpoint is extrapolated forward over the horizon
+            p_ref + v_ref*(k*dt), so position and velocity references are consistent;
+          * yaw unwrap: the reference yaw is expressed relative to the current
+            measured yaw (psi_now + wrap(psi_ref - psi_now)) so the NMPC cost -- which
+            has no angle wrapping -- always turns the short way across +-pi.
+        v_ref = 0 reduces it EXACTLY to the old constant-pose tile (the unwrap is a
+        no-op when |psi_ref - psi_now| < pi), so DP / station-keeping is unchanged.
+        """
+        N = self.nmpc.N
+        dt = P.DT_CTRL
+        R_ref = _Rz_flu(self.yaw_ref)
+        # orientation (constant over horizon): NED euler with yaw unwrapped vs now
+        eta0 = frames.flu_to_ned_eta(self.p_ref, R_ref)
+        eta0[5] = self._psi_ned_now + wrap_angle(eta0[5] - self._psi_ned_now)
+        # velocity feed-forward: world-FLU v_ref -> reference body-FLU lin vel -> FRD
+        nu_ned = np.concatenate([frames.S @ (R_ref.T @ self.v_ref), np.zeros(3)])
+        # position preview: p_ref + v_ref*(k*dt) (world FLU) -> NED via S
+        ks = np.arange(N + 1)
+        pos_world = self.p_ref[:, None] + np.outer(self.v_ref, ks * dt)   # (3, N+1)
+        xref = np.zeros((12, N + 1))
+        xref[0:3, :] = frames.S @ pos_world
+        xref[3:6, :] = eta0[3:6][:, None]
+        xref[6:12, :] = nu_ned[:, None]
+        return xref
 
     # --------------------------------------------------------- control tick
     def _control_step(self, data):
         p, R, nu_flu = self._read_state(data)
         eta_ned = frames.flu_to_ned_eta(p, R)
         nu_ned = frames.flu_to_ned_nu(nu_flu)
+        self._psi_ned_now = float(eta_ned[5])     # for the yaw-ref unwrap in _xref_ned
 
         if self.eaob is None:                     # lazy init at the measured pose
             self.eaob = EAOB(eta0=eta_ned, nu0=nu_ned)
