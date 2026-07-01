@@ -48,6 +48,7 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # marinegym
 sys.path.insert(0, HERE)
 
 import hydro as H
+import water_viz as WV     # animated pool water surface (VISUAL ONLY; POOL_TAGS scene)
 import thrusters as Tt
 from disturbance.config import load_config
 from .run_compare import build, make_controller, square_setpoint, slew_heading
@@ -112,6 +113,8 @@ class LapVideo:
         self.writer = None
         self.renderer = None
         self.cam = None
+        self._surf = None          # animated water surface (VISUAL ONLY), injected by run()
+        self._field = None
         try:
             import cv2
             self._cv2 = cv2
@@ -147,6 +150,10 @@ class LapVideo:
         try:
             self.renderer.update_scene(data, self.cam)
             _draw_plan(self.renderer.scene, self.corners)      # draw the square in-frame
+            if self._surf is not None and self._field is not None:  # animate water (VISUAL ONLY)
+                self._surf.update(self._field, data.time,
+                                  enabled=getattr(self._field, "enabled", False),
+                                  renderer=self.renderer)
             frame = self.renderer.render()                     # (H,W,3) uint8 RGB
             self.writer.write(self._cv2.cvtColor(frame, self._cv2.COLOR_RGB2BGR))
             self.n += 1
@@ -182,6 +189,10 @@ def run(model, data, hydro, ctrl, bid, *, size, speed, depth, laps, T_run,
     dt = float(model.opt.timestep)
     n_sub = max(1, round((1.0 / 60.0) / dt))      # ~60 fps render cadence
     shim = _ArrowShim(model) if arrows else None
+    surf = WV.make_surface_from_env(model)         # live animated water (None unless hfield scene)
+    if video is not None:                          # give the offscreen recorder its own surface
+        video._surf = WV.make_surface_from_env(model)
+        video._field = hydro.disturbance
     corners = _square_corners(size, depth)
     log_dt = 1.0 / float(log_hz)
     yaw_rate = np.radians(60.0) if yaw_rate is None else float(yaw_rate)
@@ -240,6 +251,10 @@ def run(model, data, hydro, ctrl, bid, *, size, speed, depth, laps, T_run,
                 else:
                     viewer.user_scn.ngeom = 0
                 _draw_plan(viewer.user_scn, corners)           # yellow square path
+                if surf is not None and hydro.disturbance is not None:  # animate water (VISUAL ONLY)
+                    surf.update(hydro.disturbance, data.time,
+                                enabled=getattr(hydro.disturbance, "enabled", False),
+                                viewer=viewer)
                 viewer.sync()
                 slack = n_sub * dt - (time.time() - t0)
                 if slack > 0:

@@ -57,6 +57,7 @@ import thrusters as T
 import hydro as H
 import disturbances as D
 import rov_model as RM     # which BlueROV variant (env ROV_MODEL): bluerov2 | heavy
+import water_viz as WV     # animated pool water surface (VISUAL ONLY; POOL_TAGS scene)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 XML = RM.XML_PATH          # bluerov.xml (6 thr) or bluerov_heavy.xml (8 thr)
@@ -348,6 +349,10 @@ def run_passive(model, data, teleop, hydro, args, monitor=None, controller=None,
     n_sub = max(1, round((1.0 / 60.0) / dt))      # ~60 fps render
     hist = {k: collections.deque(maxlen=48) for k in ("drag", "wave", "kick")}
     last_mon = [0.0]
+    surf = WV.make_surface_from_env(model)        # animated water (None unless POOL_TAGS hfield scene)
+    if surf is not None:
+        print("Animated water surface ON (VISUAL ONLY; waves+current from the disturbance field; "
+              "flat when disturbances are off).")
 
     def key_cb(keycode):
         if 32 <= keycode < 127:                   # printable -> letter keys
@@ -370,6 +375,11 @@ def run_passive(model, data, teleop, hydro, args, monitor=None, controller=None,
             mags = draw_force_arrows(viewer.user_scn, hydro, teleop, data, bid)
             if mission is not None:                   # overlay the planned square
                 _draw_plan(viewer.user_scn, mission.plan_points())
+            if surf is not None:                      # animate the water (VISUAL ONLY)
+                field = teleop.disturbance
+                surf.update(field, data.time,
+                            enabled=(field is not None and getattr(field, "enabled", False)),
+                            viewer=viewer)
             viewer.sync()
             if args.plot:
                 for k in hist:

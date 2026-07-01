@@ -65,7 +65,17 @@ if MODEL not in _MODELS:
 _CFG = _MODELS[MODEL]
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
-XML_NAME = _CFG["xml"]
+# Opt-in real-pool AprilTag floor (VISUAL ONLY; built by gen_pool_apriltags.py).
+# POOL_TAGS=1 swaps XML_PATH to a wrapper scene = the SAME ROV + the tag_floor.xml
+# fragment (seabed + tag36h11 grid + a translucent water surface). The added geoms
+# are contype=0 conaffinity=0 and MuJoCo's fluid model is OFF, so dynamics are
+# byte-for-byte unchanged. Unset -> the plain model loads exactly as before, and
+# every loader that reads RM.XML_PATH (teleop.py, eval_dp, run_compare, test_*/verify_*)
+# picks this up for free.
+_POOL_TAGS = os.environ.get("POOL_TAGS", "0").strip().lower() in ("1", "true", "yes", "on")
+_POOL_WRAP = {"bluerov2": "scene_bluerov_tags.xml", "heavy": "scene_bluerov_heavy_tags.xml"}
+
+XML_NAME = _POOL_WRAP[MODEL] if _POOL_TAGS else _CFG["xml"]
 YAML_NAME = _CFG["yaml"]
 XML_PATH = os.path.join(_HERE, XML_NAME)
 YAML_PATH = os.path.join(_HERE, "marinegym_assets", YAML_NAME)

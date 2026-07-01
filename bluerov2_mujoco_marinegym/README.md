@@ -99,6 +99,66 @@ solver). Verification/analysis add `scipy` + `matplotlib`. acados is built at
 shared libs are pre-loaded via `ctypes RTLD_GLOBAL` in `dobmpc/_acados_env.py`).
 If acados is unavailable it auto-falls back to the IPOPT NMPC.
 
+### Pool AprilTag floor (visual, opt-in): `POOL_TAGS`
+
+Set **`POOL_TAGS=1`** to load a **visual replica of the real test pool's floor** — a
+dense grid of tag36h11 AprilTags (0.170 m black edge, the real spec from
+[../config/config.yaml](../config/config.yaml) + [../config/tag_map.yaml](../config/tag_map.yaml)),
+a seabed, and a single translucent water volume filled to the seabed with a wavy
+animated surface (~2 m visual column; the tags read as submerged). It works with either
+`ROV_MODEL`, and picks up automatically in every entry point that reads
+`rov_model.XML_PATH` (teleop, `eval_dp`, `run_compare`, tests):
+
+```bash
+POOL_TAGS=1                    python teleop.py            # heavy + pool floor
+POOL_TAGS=1 ROV_MODEL=bluerov2 python teleop.py            # bluerov2 + pool floor
+```
+
+The floor is built once by [gen_pool_apriltags.py](gen_pool_apriltags.py) (survey
+tags at their real ids/poses + a grid fill; every PNG is round-trip verified with
+`pupil_apriltags` so sim tag ids provably match the real family). It is **VISUAL
+ONLY** — all added geoms are `contype=0 conaffinity=0` (group 1) and MuJoCo's fluid
+model is off, so **dynamics are byte-for-byte identical** with `POOL_TAGS` set or
+unset (verified: 3000-step rollout Δ=0, incl. `--disturb`). Regenerate / retune with:
+
+```bash
+python gen_pool_apriltags.py --selftest      # render a couple tiles + detect them
+python gen_pool_apriltags.py                 # full build (default hybrid layout)
+# knobs: --layout {survey,grid,hybrid} --pool-width (visual X, default 2.6 m vs real 1.8)
+#        --pool-length --seabed-z --water-depth --pitch-x/--pitch-y ...
+```
+
+The **visual** water column (default **2 m**: seabed z=-0.5 → surface z=+1.5) is ONE
+translucent geom — the animated heightfield's skirt is extruded down to the seabed, so
+the wavy surface and the submerged column are a single unified body (no seam). It is fully
+decoupled from the disturbance model's **physics** depth (`disturbances.py z_surface`=3,
+`disturbance/waves.py h`=4) — cosmetic, never touches dynamics. Knobs: `--water-depth`,
+`--water-alpha` (0.18), `--no-water-body` (thin sheet only), `--no-water-anim` (flat box).
+
+#### Animated waves + current on the water surface
+
+Under `POOL_TAGS=1` the water surface is a **heightfield** ([water_viz.py](water_viz.py))
+that undulates like real waves and drifts with the current, reconstructed live from the
+**same disturbance field the physics uses** (`eta(x,y,t)=Σ aᵢ cos(kᵢ·x − ωᵢt + φᵢ)`,
+advected by the current so waves+current read as one surface). It animates in both the
+live `teleop.py` viewer (`viewer.update_hfield`) and the `run_viewer.py` mp4
+(`mjr_uploadHField`), and flattens when disturbances are off (`G`). Still **VISUAL ONLY**
+— animating the hfield every step leaves dynamics byte-identical (verified Δ=0, both
+variants, faithful + stylized).
+
+```bash
+POOL_TAGS=1 python teleop.py --disturb                    # waves undulate + drift (G toggles)
+POOL_TAGS=1 WATER_WAVE_LAMBDA=0.9 python teleop.py --disturb   # exaggerated, clearly-sloshing
+```
+
+Real ocean wavelengths (6–76 m) dwarf the pool (~1.8×4.9 m), so the **default is
+physically faithful** — a gentle heave/tilt, barely-rippled. `WATER_WAVE_LAMBDA=<m>`
+shrinks the *visual* wavelength for dramatic ripples; `WATER_WAVE_AMP=<gain>` scales the
+swing. Both are render-only (physics wavenumber/amplitude untouched). Grid/headroom knobs
+live on the generator (`--water-hf-rows/-cols/-elev`, `--no-water-anim` for the old flat
+box). Previews: [assets/screenshots/pool_waves_stylized.mp4](../assets/screenshots/pool_waves_stylized.mp4),
+[pool_waves_faithful.mp4](../assets/screenshots/pool_waves_faithful.mp4).
+
 ---
 
 ## How to run
@@ -248,6 +308,11 @@ bluerov2_mujoco_marinegym/
 ├── rov_model.py                # variant registry (ROV_MODEL: bluerov2 | heavy) — single source of truth
 ├── bluerov.xml                 # bluerov2 MJCF (rigid body + 6 thruster sites + 6 actuators)
 ├── bluerov_heavy.xml           # heavy MJCF (8 thrusters, mass 11.5, fully actuated)
+├── gen_pool_apriltags.py       # build the opt-in pool AprilTag floor (POOL_TAGS=1); VISUAL ONLY
+├── water_viz.py                #   animated waves+current water surface (hfield); VISUAL ONLY
+├── tag_floor.xml               #   generated <mujocoinclude>: seabed + tag36h11 grid + water hfield
+├── scene_bluerov_tags.xml · scene_bluerov_heavy_tags.xml   # generated opt-in wrappers (ROV + tag_floor)
+├── apriltags/                  # generated tag36h11 PNGs (one per tag id), round-trip verified
 ├── meshes/                     # real MarineGym meshes (body + T200), from the USD
 ├── marinegym_assets/           # MarineGym BlueROV.yaml / BlueROVHeavy.yaml (hydro/rotor coeffs) + config
 │
