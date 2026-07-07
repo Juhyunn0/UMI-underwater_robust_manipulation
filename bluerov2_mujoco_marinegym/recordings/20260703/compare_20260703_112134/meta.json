@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "rov_model": "bluerov2",
+  "run": {
+    "started": "2026-07-03 11:21:34",
+    "xml": "bluerov.xml",
+    "n_thrusters": 6,
+    "fully_actuated": false,
+    "config": "/home/bdml/Desktop/umi_underwater_robust_control/bluerov2_mujoco_marinegym/config/base.yaml",
+    "T_sim": 5.0,
+    "smoke": true,
+    "jobs": 1
+  },
+  "controller": {
+    "controllers": [
+      "pid"
+    ],
+    "pid_gains": {
+      "kp": [
+        6.0,
+        12.0,
+        20.0
+      ],
+      "kd": [
+        8.0,
+        12.0,
+        22.0
+      ],
+      "ki": [
+        1.0,
+        1.5,
+        1.2
+      ],
+      "i_max": [
+        4.0,
+        5.0,
+        5.0
+      ],
+      "f_max": [
+        6.0,
+        30.0,
+        30.0
+      ],
+      "surge_slew": 30.0,
+      "yaw_kp": 5.0,
+      "yaw_kd": 3.0,
+      "yaw_ki": 0.5,
+      "yaw_i_max": 2.0,
+      "mz_max": 10.0,
+      "e_gate": 0.5,
+      "yaw_gate": 0.2,
+      "pitch_guard_deg": 15.0
+    }
+  },
+  "trajectory": {},
+  "disturbance": null
+}

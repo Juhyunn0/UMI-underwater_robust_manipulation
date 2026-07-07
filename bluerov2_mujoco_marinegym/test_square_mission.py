@@ -60,7 +60,10 @@ def test_square_mission():
     field.enabled = False                                  # clean tracking assertions
     hydro = H.Hydrodynamics(model, disturbance=field).install()
     bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "base_link")
-    ctrl = C.PoseController(model, mode="pid", buoyancy_ff=hydro)
+    # Pin the rank-5 gain set: this test's plant is the hard-coded bluerov.xml,
+    # while DEFAULT_GAINS follows ROV_MODEL (default heavy).
+    ctrl = C.PoseController(model, mode="pid", buoyancy_ff=hydro,
+                            gains=C.GAINS_BLUEROV2)
     rec = Recorder("/tmp/sqtest", tag="sq")
     S, laps, speed = 0.25, 2, 0.12
     mission = SquareMission(ctrl, rec, hydro, bid, size=S, laps=laps, speed=speed, log_hz=50)

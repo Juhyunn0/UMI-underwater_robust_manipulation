@@ -205,10 +205,13 @@ def run(model, data, hydro, ctrl, bid, *, size, speed, depth, laps, T_run,
 
     def step_once():
         (rx, ry), (tx, ty) = square_setpoint(data.time, size, speed)
+        r_cmd = 0.0
         if heading_follow:
-            yaw_cmd[0] = slew_heading(yaw_cmd[0], tx, ty, yaw_rate, dt)
+            yaw_new = slew_heading(yaw_cmd[0], tx, ty, yaw_rate, dt)
+            r_cmd = (yaw_new - yaw_cmd[0]) / dt        # slew rate = yaw-rate ref
+            yaw_cmd[0] = yaw_new
         ctrl.set_target((rx, ry, depth), yaw_ref=(yaw_cmd[0] if heading_follow else 0.0),
-                        v_ref=(speed * tx, speed * ty, 0.0))
+                        v_ref=(speed * tx, speed * ty, 0.0), r_ref=r_cmd)
         ctrl.apply(model, data)
         mujoco.mj_step(model, data)
         return rx, ry

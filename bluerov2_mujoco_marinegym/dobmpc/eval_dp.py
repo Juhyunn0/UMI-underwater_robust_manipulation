@@ -128,7 +128,7 @@ def main():
     print("(c = cm, deg for pitch, N for w_x)")
 
     # ---- plot
-    col = {"pid": "tab:red", "mpc": "tab:orange", "dobmpc": "tab:green"}
+    col = {"pid": "tab:red", "mpc": "tab:blue", "dobmpc": "tab:green"}
     fig = plt.figure(figsize=(15, 9))
     # 1 XY scatter
     ax = fig.add_subplot(2, 3, 1)

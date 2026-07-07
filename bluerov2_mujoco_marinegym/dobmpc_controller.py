@@ -80,16 +80,20 @@ class DOBMPCController:
         self.n_fail = 0
 
     # ----------------------------------------------------- interface parity
-    def set_target(self, p_ref=None, yaw_ref=None, v_ref=None):
+    def set_target(self, p_ref=None, yaw_ref=None, v_ref=None, r_ref=None):
         if p_ref is not None:
             self.p_ref = np.asarray(p_ref, float)
         if yaw_ref is not None:
             self.yaw_ref = float(yaw_ref)
         if v_ref is not None:
             self.v_ref = np.asarray(v_ref, float)
+        if r_ref is not None:
+            self.r_ref = float(r_ref)    # accepted for PoseController interface
+                                         # parity; the NMPC tracks yaw_ref only
 
     def reset(self):
         self.eaob = None
+        self.r_ref = 0.0
         self._tau_flu = np.zeros(6)
         self._tau_ned_cmd = np.zeros(6)
         self._nu_prev_ned = None

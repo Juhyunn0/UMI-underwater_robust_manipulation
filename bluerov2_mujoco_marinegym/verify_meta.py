@@ -3,8 +3,10 @@
 
 1. DisturbanceField.to_meta() carries seed/config + the exact kick event schedule.
 2. Reproduction round-trip: rebuild a field from the meta -> identical kicks + waves.
-3. Recorder writes <run>.meta.json beside the CSV, CSV format unchanged.
-4. teleop._controller_meta detects the live solver (acados/ipopt).
+3. Recorder writes <run>.meta.json beside the CSV, CSV format unchanged; every
+   manifest is stamped with the plant variant (rov_model).
+4. teleop._controller_meta detects the live solver (acados/ipopt) and captures the
+   effective PID gain set for a PoseController.
 """
 import json
 import os
@@ -55,6 +57,7 @@ def test_recorder_sidecar():
         mp = p[:-4] + ".meta.json"
         assert os.path.exists(mp), "sidecar not written"
         meta = json.load(open(mp))
+        assert meta["rov_model"] in ("bluerov2", "heavy"), meta
         assert meta["controller"]["solver"] == "acados"
         assert meta["trajectory"]["kind"] == "square" and meta["trajectory"]["laps"] == 2
         assert meta["disturbance"]["seed"] == 0
@@ -80,7 +83,11 @@ def test_controller_meta_detects_solver():
     ctrl = DOBMPCController(model, hydro=hydro, mode="dobmpc")
     m = _controller_meta(ctrl, "dobmpc")
     assert m["solver"] == "acados" and m["N"] == P.MPC_N and m["mode"] == "dobmpc", m
-    print(f"[4] controller meta OK  {m}")
+    from controller import PoseController, DEFAULT_GAINS
+    pid = PoseController(model, mode="pid")
+    mp_ = _controller_meta(pid, "pid")
+    assert mp_["gains"] == dict(DEFAULT_GAINS), mp_
+    print(f"[4] controller meta OK  {m} | pid gains captured ({len(mp_['gains'])} keys)")
     H.Hydrodynamics.uninstall()
 
 

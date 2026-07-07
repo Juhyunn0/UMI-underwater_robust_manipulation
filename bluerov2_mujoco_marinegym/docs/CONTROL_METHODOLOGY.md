@@ -859,3 +859,36 @@ publication-quality look — refined palette, per-bar value labels, two-line x-l
 (`NONE (still water)`, `C (current)`, …), top/right spines off, horizontal legend, 200 dpi. The recording's
 `bar_square_radial_rms.png` + `results.csv` / `results_raw.csv` were regenerated to include NONE (the existing
 4-mode data was preserved, NONE appended).
+
+## 2026-07-03 — PID retuned by analytic pole placement (heavy) + yaw-rate reference FF
+
+Applied the adversarially-verified 2026-07-02 pole-placement design to [controller.py](../controller.py).
+`DEFAULT_GAINS` is now **per-variant**: `GAINS_HEAVY` (new) vs `GAINS_BLUEROV2` (the 2026-06-14 hand-tuned set,
+unchanged), selected by `rov_model.FULLY_ACTUATED` — the property that motivated the split, since the old 6 N
+surge cap is a rank-5 pitch-coupling artifact that heavy (rank-6) does not need but bluerov2 still does.
+
+**Design (heavy):** per-axis hover linearization `m_eff·a = F − d_lin·v`; match the closed-loop char poly
+`m·s³ + (d+Kd)·s² + Kp·s + Ki` to `(s² + 2ζωn·s + ωn²)(s + αωn)`:
+
+```
+Kp = m_eff·(1+2ζα)·ωn²   Kd = m_eff·(2ζ+α)·ωn − d_lin   Ki = m_eff·α·ωn³
+ωn = 2.0 rad/s translation (above the JONSWAP energy band 0.45–1.2), 3.0 yaw; ζ = 0.9, α = 0.2
+```
+
+→ horizontal **isotropic** kp/kd/ki = 131.6/90.6/38.7 (designed on the sway m_eff = 24.2 kg; body-x realizes
+ωn ≈ 2.78, ζ ≈ 1.0), heave 141.8/99.1/41.7, yaw 8.95/4.32/3.95. Isotropy is a validity condition, not polish:
+world-frame PD only commutes with yaw when kp_x = kp_y, and the primary scenario is square + heading_follow.
+Companion changes shipped with the gains (the design does not hold without them): surge `f_max` 6→30 N,
+`e_gate` 0.5→0.15 m, `surge_slew` 30→120 N/s, and a **yaw-rate reference feed-forward** — `set_target()` on
+both controllers now takes `r_ref` and the PID yaw law is `mz = kp·e_yaw − kd·(r − r_ref)`;
+[run_compare.py](../experiments/run_compare.py) / [run_viewer.py](../experiments/run_viewer.py) pass the
+heading-slew rate (60°/s at corners, 0 on straights) so the D term no longer fights the commanded turn.
+`DOBMPCController.set_target` accepts `r_ref` for interface parity (the NMPC tracks `yaw_ref` and ignores it).
+
+**Result (heavy):** `--smoke` DP radial 1.4–1.5 cm (NONE/C/CD; wave modes 25 cm are 5 s-transient numbers);
+1-lap square NONE via run_viewer: **radial RMS 1.34 cm** (t>5 s) vs **17.8 cm** with the old gains in
+`compare_20260702_222150` — ~13× — max 4.0 cm (corner transient), |pitch| 0.0°, no saturation chatter.
+`verify_meta.py` passes; `meta.json` sidecars stamp the new gain set. bluerov2 `--smoke` unchanged (legacy path).
+
+**Validity:** sim-only (ideal thrusters, perfect 500 Hz state). For hardware derate ωn to 1.0–1.5 rad/s and
+filter the D term. Beyond the |S(1.6)| ≈ 0.41 wave-band residual, the answer is DOB-MPC, not more PID gain.

@@ -51,6 +51,20 @@
     <material name="hull"      rgba="0.33 0.37 0.44 1" specular="0.35" shininess="0.3"/>
     <material name="thruster"  rgba="0.12 0.13 0.16 1" specular="0.4" shininess="0.4"/>
     <material name="collision" rgba="0.85 0.45 0.20 0.25"/>
+    <!-- Colored BlueROV2 Heavy skin (VISUAL ONLY): body split by GeomSubset out of the
+         MarineGym BlueROVHeavy USD into cyan foam / white tube / black frame / silver
+         hardware (extract_meshes.py --colored). Frame + thruster shrouds are in this mesh
+         set, so the plain gray body+thruster geoms are replaced by these. Dynamics use the
+         explicit <inertial>, the collision box, and the thruster sites/actuators below —
+         all UNCHANGED — so this is purely cosmetic (verified Delta=0). -->
+    <mesh name="rovc_cyan"   file="rov_body_cyan.obj"/>
+    <mesh name="rovc_white"  file="rov_body_white.obj"/>
+    <mesh name="rovc_black"  file="rov_body_black.obj"/>
+    <mesh name="rovc_silver" file="rov_body_silver.obj"/>
+    <material name="rovc_cyan"   rgba="0.16 0.55 0.78 1" specular="0.3" shininess="0.35"/>
+    <material name="rovc_white"  rgba="0.90 0.90 0.88 1" specular="0.3" shininess="0.35"/>
+    <material name="rovc_black"  rgba="0.10 0.10 0.11 1" specular="0.3" shininess="0.35"/>
+    <material name="rovc_silver" rgba="0.60 0.62 0.65 1" specular="0.4" shininess="0.4"/>
   </asset>
 
   <default>
@@ -81,36 +95,27 @@
            Gazebo-stability hand-tune -- see docs/CONTROL_METHODOLOGY.md / rov_model.py. -->
       <inertial pos="0 0 0" mass="11.5" diaginertia="0.3291 0.6347 0.6109"/>
 
-      <!-- ===== body visual (reused BlueROV2 mesh) ===== -->
-      <geom class="visual" mesh="bluerov_body" material="hull"/>
+      <!-- ===== body visual: colored BlueROV2 Heavy skin (frame + thruster shrouds/props
+           are all in this mesh set) — replaces the single gray body + 8 gray thruster geoms.
+           VISUAL ONLY (contype=0 conaffinity=0 via class="visual"); dynamics unchanged. ===== -->
+      <geom class="visual" mesh="rovc_cyan"   material="rovc_cyan"/>
+      <geom class="visual" mesh="rovc_white"  material="rovc_white"/>
+      <geom class="visual" mesh="rovc_black"  material="rovc_black"/>
+      <geom class="visual" mesh="rovc_silver" material="rovc_silver"/>
 
       <!-- ===== collision proxy ===== -->
       <geom class="collision" pos="0 0 -0.05" size="0.25 0.175 0.125"/>
 
-      <!-- ===== 8 thrusters: 4 horizontal (0..3) + 4 vertical (4..7) ===== -->
-      <!-- thruster 0  (front-right, horizontal +45 yaw) -->
-      <geom class="visual" mesh="bluerov_thruster" material="thruster" pos="0.1355 -0.1 -0.0725" quat="0.92388 0 0 0.382684"/>
+      <!-- ===== 8 thruster force sites (0..3 horizontal, 4..7 vertical). The shroud/prop
+           VISUALS live in the colored body mesh above, so only the force sites remain — pos/
+           quat are byte-identical to before, so allocation/thrust directions are unchanged. -->
       <site name="thruster_0" class="thruster" pos="0.1355 -0.1 -0.0725" quat="0.92388 0 0 0.382684"/>
-      <!-- thruster 1  (front-left, horizontal -45 yaw) -->
-      <geom class="visual" mesh="bluerov_thruster" material="thruster" pos="0.1355 0.1 -0.0725" quat="0.92388 0 0 -0.382684"/>
       <site name="thruster_1" class="thruster" pos="0.1355 0.1 -0.0725" quat="0.92388 0 0 -0.382684"/>
-      <!-- thruster 2  (rear-right, horizontal) -->
-      <geom class="visual" mesh="bluerov_thruster" material="thruster" pos="-0.1475 -0.1 -0.0725" quat="0.382683 0 0 0.92388"/>
       <site name="thruster_2" class="thruster" pos="-0.1475 -0.1 -0.0725" quat="0.382683 0 0 0.92388"/>
-      <!-- thruster 3  (rear-left, horizontal) -->
-      <geom class="visual" mesh="bluerov_thruster" material="thruster" pos="-0.1475 0.1 -0.0725" quat="-0.382683 0 0 0.92388"/>
       <site name="thruster_3" class="thruster" pos="-0.1475 0.1 -0.0725" quat="-0.382683 0 0 0.92388"/>
-      <!-- thruster 4  (front-right, vertical +Z) -->
-      <geom class="visual" mesh="bluerov_thruster" material="thruster" pos="0.12 -0.22 -0.005" quat="-0.707107 0 0.707107 0"/>
       <site name="thruster_4" class="thruster" pos="0.12 -0.22 -0.005" quat="-0.707107 0 0.707107 0"/>
-      <!-- thruster 5  (front-left, vertical +Z) -->
-      <geom class="visual" mesh="bluerov_thruster" material="thruster" pos="0.12 0.22 -0.005" quat="-0.707107 0 0.707107 0"/>
       <site name="thruster_5" class="thruster" pos="0.12 0.22 -0.005" quat="-0.707107 0 0.707107 0"/>
-      <!-- thruster 6  (rear-right, vertical +Z) -->
-      <geom class="visual" mesh="bluerov_thruster" material="thruster" pos="-0.12 -0.22 -0.005" quat="-0.707107 0 0.707107 0"/>
       <site name="thruster_6" class="thruster" pos="-0.12 -0.22 -0.005" quat="-0.707107 0 0.707107 0"/>
-      <!-- thruster 7  (rear-left, vertical +Z) -->
-      <geom class="visual" mesh="bluerov_thruster" material="thruster" pos="-0.12 0.22 -0.005" quat="-0.707107 0 0.707107 0"/>
       <site name="thruster_7" class="thruster" pos="-0.12 0.22 -0.005" quat="-0.707107 0 0.707107 0"/>
 
       <!-- reference site at the base_link origin -->

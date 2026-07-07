@@ -52,6 +52,9 @@ def test_animation_renders():
     mean_z = pz + 0.5 * float(m.hfield_size[hfid][2])       # surface z is data-driven, not hardcoded
     r = mujoco.Renderer(m, 480, 720)
     cam = mujoco.MjvCamera(); cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+    # Fixed close-ish oblique framing (sees a ~few-metre patch around the centre) + a SHORT
+    # synthetic wavelength (~nc/4 cycles, i.e. a few cells per crest) + near-full amplitude, so
+    # several crests are always in view whether the pool is 2.6 m or the 48 m "infinite" floor.
     cam.lookat[:] = [cx, cy, mean_z]; cam.distance = 4.2; cam.azimuth = 56; cam.elevation = -22
 
     def render(vals):
@@ -60,10 +63,10 @@ def test_animation_renders():
         r.update_scene(d, cam)
         return r.render().astype(np.int16)
 
-    c = np.linspace(0, 6 * np.pi, nc)
+    c = np.linspace(0, 2 * np.pi * max(3, nc // 4), nc)     # ~nc/4 cycles -> a few cells per crest
     flat = np.full((nr, nc), 0.5)
-    w1 = 0.5 + 0.35 * np.sin(c)[None, :].repeat(nr, 0)
-    w2 = 0.5 + 0.35 * np.sin(c + 1.5)[None, :].repeat(nr, 0)
+    w1 = 0.5 + 0.45 * np.sin(c)[None, :].repeat(nr, 0)
+    w2 = 0.5 + 0.45 * np.sin(c + 1.5)[None, :].repeat(nr, 0)
     img_flat, img_w1, img_w2 = render(flat), render(w1), render(w2)
     r.close()
     d_fw = float(np.abs(img_w1 - img_flat).mean())

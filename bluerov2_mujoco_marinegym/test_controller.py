@@ -33,8 +33,11 @@ def run_episode(mode, disturb, start=START, T_sec=40.0, seed=0):
         field.use_waves = False       # waves/kicks are oscillatory/impulsive and would
         field.use_kicks = False       # swamp the steady-state offset both share.
     hydro = H.Hydrodynamics(model, disturbance=field).install()
+    # This test drives the hard-coded rank-5 bluerov.xml plant, so pin its matching
+    # gain set: DEFAULT_GAINS follows ROV_MODEL (default heavy) and GAINS_HEAVY's
+    # 30 N surge on rank-5 would nose the vehicle over (the 6 N cap is load-bearing).
     ctrl = C.PoseController(model, mode=mode, setpoint=(0, 0, 0), yaw_ref=0.0,
-                            buoyancy_ff=hydro)
+                            buoyancy_ff=hydro, gains=C.GAINS_BLUEROV2)
     sx, sy, sz, syaw = start
     data.qpos[:3] = [sx, sy, sz]
     half = np.radians(syaw) / 2.0

@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "rov_model": "heavy",
+  "run": {
+    "started": "2026-07-07 12:24:22",
+    "xml": "bluerov_heavy.xml",
+    "n_thrusters": 8,
+    "fully_actuated": true,
+    "config": "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/d0292c49-0183-4022-abde-dbbacb3a7568/scratchpad/random_test.yaml",
+    "T_sim": 1000.0,
+    "smoke": false,
+    "jobs": 16
+  },
+  "controller": {
+    "controllers": [
+      "pid"
+    ],
+    "pid_gains": {
+      "kp": [
+        131.6,
+        131.6,
+        141.8
+      ],
+      "kd": [
+        90.6,
+        90.6,
+        99.1
+      ],
+      "ki": [
+        38.7,
+        38.7,
+        41.7
+      ],
+      "i_max": [
+        4.0,
+        5.0,
+        5.0
+      ],
+      "f_max": [
+        30.0,
+        30.0,
+        30.0
+      ],
+      "surge_slew": 120.0,
+      "yaw_kp": 8.95,
+      "yaw_kd": 4.32,
+      "yaw_ki": 3.95,
+      "yaw_i_max": 2.0,
+      "mz_max": 10.0,
+      "e_gate": 0.15,
+      "yaw_gate": 0.2,
+      "pitch_guard_deg": 15.0
+    }
+  },
+  "trajectory": {},
+  "disturbance": null
+}

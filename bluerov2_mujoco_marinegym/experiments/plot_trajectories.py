@@ -22,10 +22,10 @@ from matplotlib.lines import Line2D
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# distinct red / blue / green (PID-vs-MPC were both warm hues before); ordered
-# worst->best so DOB-MPC draws on top.
+# distinct red / blue / green; ordered worst->best so DOB-MPC draws on top.
+# (keep in sync with TRAJ_COLOR in experiments/run_compare.py)
 CTRLS = ["pid", "mpc", "dobmpc"]
-COLOR = {"pid": "#9E2B36", "mpc": "#C9A227", "dobmpc": "#2E8B57"}
+COLOR = {"pid": "#9E2B36", "mpc": "#2B5F9E", "dobmpc": "#2E8B57"}
 LABEL = {"pid": "PID", "mpc": "MPC", "dobmpc": "DOB-MPC"}
 ZORDER = {"pid": 3, "mpc": 4, "dobmpc": 5}
 ALPHA = {"pid": 0.7, "mpc": 0.85, "dobmpc": 0.95}     # de-emphasise the cluttered PID
@@ -41,9 +41,21 @@ def _latest_square_view():
 
 
 def _find(d, mode, ctrl, seed, ddeg):
-    pat = os.path.join(d, f"traj_square_{mode}_{ctrl}_seed{seed}_dir{ddeg}.csv")
-    m = glob.glob(pat) or glob.glob(os.path.join(d, f"traj_square_{mode}_{ctrl}_*.csv"))
-    return sorted(m)[-1] if m else None
+    """Locate a run CSV: run_viewer naming (_dir<deg>), then run_compare runs/
+    naming (_c<ddd>_w*, respecting seed + current heading), then a last-resort
+    wildcard -- with a WARN, since it ignores the requested seed/heading."""
+    for pat in (f"traj_square_{mode}_{ctrl}_seed{seed}_dir{ddeg}.csv",
+                f"traj_square_{mode}_{ctrl}_seed{seed}_c{int(round(ddeg)):03d}_w*.csv"):
+        m = glob.glob(os.path.join(d, pat))
+        if m:
+            return sorted(m)[-1]
+    m = glob.glob(os.path.join(d, f"traj_square_{mode}_{ctrl}_*.csv"))
+    if not m:
+        return None
+    f = sorted(m)[-1]
+    print(f"[plot] WARN: no CSV for seed{seed}/dir{ddeg}; falling back to "
+          f"{os.path.basename(f)} (figure labels keep the requested values)")
+    return f
 
 
 def _plot_all_modes(d, seed, ddeg, ctrls, S, out):

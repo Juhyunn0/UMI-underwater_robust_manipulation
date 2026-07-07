@@ -25,6 +25,7 @@ import mujoco
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import thrusters as T
+import rov_model as RM
 
 
 def wrap_angle(a):
@@ -32,20 +33,55 @@ def wrap_angle(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
 
 
-# Starting gains (tune from here). Translational gains are WORLD-frame.
-DEFAULT_GAINS = dict(
+# Gains are per-variant (rov_model). Translational gains are WORLD-frame.
+#
+# heavy — analytic pole placement (designed 2026-07-02, applied 2026-07-03; see
+# docs/CONTROL_METHODOLOGY.md). Per-axis hover linearization m_eff·a = F − d_lin·v;
+# closed-loop char poly m·s³ + (d+Kd)·s² + Kp·s + Ki matched to the target
+# (s² + 2ζωn·s + ωn²)(s + αωn):
+#   Kp = m_eff·(1+2ζα)·ωn²,  Kd = m_eff·(2ζ+α)·ωn − d_lin,  Ki = m_eff·α·ωn³
+# Design point: ωn=2.0 rad/s translation (above the JONSWAP energy band
+# 0.45–1.2 rad/s), ωn=3.0 yaw, ζ=0.9, α=0.2. Horizontal gains are ISOTROPIC
+# (designed on the sway m_eff=24.2 kg; body-x then realizes ωn≈2.78, ζ≈1.0):
+# world-frame PD only commutes with yaw when kp_x=kp_y, and the primary compare
+# scenario is square + heading_follow. Companion values (NOT optional): surge
+# f_max 30 N (the old 6 N cap was a rank-5 pitch-coupling relic and would bind
+# ωn to ≤0.54), e_gate 0.15 m, surge_slew 120 N/s, and the yaw rate reference
+# feed-forward r_ref in compute(). Sim-only validity (ideal thrusters, perfect
+# state, 500 Hz) — derate ωn to 1.0–1.5 and filter D for hardware.
+GAINS_HEAVY = dict(
+    kp=(131.6, 131.6, 141.8),   # surge, sway, heave  [N/m]
+    kd=(90.6, 90.6, 99.1),      #                     [N·s/m]
+    ki=(38.7, 38.7, 41.7),      #                     [N/(m·s)]
+    i_max=(4.0, 5.0, 5.0),      # |Ki*integral| clamp [N]
+    f_max=(30.0, 30.0, 30.0),   # wrench-space force saturation [N] (rank-6: no
+                                # surge-pitch coupling, so no surge derate)
+    surge_slew=120.0,           # surge force slew-rate limit [N/s]
+    yaw_kp=8.95, yaw_kd=4.32, yaw_ki=3.95, yaw_i_max=2.0, mz_max=10.0,  # yaw [N·m]
+    e_gate=0.15, yaw_gate=0.2,  # integrate only when |error| < gate (m, rad)
+    pitch_guard_deg=15.0,       # soft-scale surge above this |pitch| (deg)
+)
+
+# bluerov2 (vectored-6, rank-5) — legacy hand-tuned set (2026-06-14), kept as-is:
+# the pole-placement design above was derived and verified for heavy only, and
+# the 6 N surge cap here is load-bearing on rank-5 (a steady Fx balances the weak
+# pitch restoring 1.11 N·m at sin(theta)=0.0725·Fx/1.11, so 6 N -> ~23°).
+GAINS_BLUEROV2 = dict(
     kp=(6.0, 12.0, 20.0),       # surge, sway, heave  [N/m]
-    kd=(8.0, 12.0, 22.0),       #                     [N·s/m]  (heave Kd=22 -> zeta~0.65)
+    kd=(8.0, 12.0, 22.0),       #                     [N·s/m]  (heave: true still-
+                                # water zeta≈0.60 with the full m_eff=26.07 kg)
     ki=(1.0, 1.5, 1.2),         #                     [N/(m·s)]
     i_max=(4.0, 5.0, 5.0),      # |Ki*integral| clamp [N]
-    f_max=(6.0, 30.0, 30.0),    # surge/sway/heave force saturation [N]. Surge kept
-                                # low: a steady Fx balances the weak pitch restoring
-                                # (1.11 N·m) at sin(theta)=0.0725·Fx/1.11, so 6 N -> ~23°.
+    f_max=(6.0, 30.0, 30.0),    # surge kept low — see rank-5 note above
     surge_slew=30.0,            # surge force slew-rate limit [N/s] (softens pitch kick)
     yaw_kp=5.0, yaw_kd=3.0, yaw_ki=0.5, yaw_i_max=2.0, mz_max=10.0,  # yaw [N·m]
     e_gate=0.5, yaw_gate=0.2,   # integrate only when |error| < gate (m, rad)
     pitch_guard_deg=15.0,       # soft-scale surge above this |pitch| (deg)
 )
+
+# Selected by the structural property that motivated the split (the surge cap is a
+# rank-5/under-actuation artifact), so a future variant fails safe, not silently.
+DEFAULT_GAINS = GAINS_HEAVY if RM.FULLY_ACTUATED else GAINS_BLUEROV2
 
 
 class PoseController:
@@ -80,20 +116,24 @@ class PoseController:
         self._I_yaw = 0.0
         self._fx_prev = 0.0
         self.v_ref = np.zeros(3)             # world reference velocity (trajectory FF)
+        self.r_ref = 0.0                     # reference yaw rate (heading-follow FF)
         self.commanded = np.zeros(6)
         self.realized = np.zeros(6)
         if getattr(self, "actuator", None) is not None:
             self.actuator.reset()
 
-    def set_target(self, p_ref=None, yaw_ref=None, v_ref=None):
+    def set_target(self, p_ref=None, yaw_ref=None, v_ref=None, r_ref=None):
         """Update the (possibly moving) setpoint. v_ref is the reference world velocity
-        used as a feed-forward in the derivative term, for trajectory tracking."""
+        used as a feed-forward in the derivative term, for trajectory tracking; r_ref
+        is the reference yaw RATE (heading-follow slew FF) used the same way in yaw."""
         if p_ref is not None:
             self.p_ref = np.asarray(p_ref, float)
         if yaw_ref is not None:
             self.yaw_ref = float(yaw_ref)
         if v_ref is not None:
             self.v_ref = np.asarray(v_ref, float)
+        if r_ref is not None:
+            self.r_ref = float(r_ref)
 
     @staticmethod
     def _yaw_from_R(R):
@@ -149,7 +189,7 @@ class PoseController:
         if self.use_i and abs(e_yaw) < g["yaw_gate"]:
             cap = g["yaw_i_max"] / max(g["yaw_ki"], 1e-9)
             self._I_yaw = float(np.clip(self._I_yaw + e_yaw * self.dt, -cap, cap))
-        mz = g["yaw_kp"] * e_yaw - g["yaw_kd"] * r
+        mz = g["yaw_kp"] * e_yaw - g["yaw_kd"] * (r - self.r_ref)
         if self.use_i:
             mz += g["yaw_ki"] * self._I_yaw
         mz = float(np.clip(mz, -g["mz_max"], g["mz_max"]))

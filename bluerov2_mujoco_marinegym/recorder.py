@@ -35,11 +35,16 @@ def build_run_meta(disturbance=None, controller=None, trajectory=None, run=None)
     `disturbance` may be a DisturbanceField (its .to_meta() is captured) or a dict.
     `controller`/`trajectory`/`run` are plain dicts the caller fills from its context
     (e.g. {type, solver, ctrl_hz, N} / {kind, size, speed, laps} / {started, sim_dt,
-    log_hz}). Everything is JSON-serializable. Returns a dict; pass it to set_meta()."""
+    log_hz}). Everything is JSON-serializable. Returns a dict; pass it to set_meta().
+
+    `rov_model` (bluerov2 | heavy) is stamped here so EVERY manifest records which
+    plant variant produced the run — callers cannot forget it."""
+    import rov_model as RM
     dist = (disturbance.to_meta() if hasattr(disturbance, "to_meta")
             else disturbance) if disturbance is not None else None
     return dict(
         schema_version=1,
+        rov_model=RM.MODEL,
         run=run or {},
         controller=controller or {},
         trajectory=trajectory or {},

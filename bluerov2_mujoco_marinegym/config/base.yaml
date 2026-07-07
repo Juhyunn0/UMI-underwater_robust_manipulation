@@ -41,22 +41,26 @@ sim:
 
 experiment:
   controllers: [pid, mpc, dobmpc]   # all 3 controllers
-  record_runs: false    # also write per-run CSV+meta via Recorder (large; off by default)
+  record_runs: true     # per-run trajectory CSV + meta under runs/ + the
+                        # trajectory_compare figures (~0.4 MB/run; false for huge sweeps)
   settle_s: 10.0        # steady-state window start [s]
   settle_band_cm: 5.0   # settling-time band (radial error) [cm]
-  directions:           # heading sweep: theta_c (current) and optionally beta (wave)
-    n_random: 20         # K random current headings (omit this block -> single 0 deg = legacy)
-    direction_seed: 100 # reproducible draw of the K current headings
-    # headings_deg: [0, 45, 90, 135]   # alternative: explicit current headings (overrides n_random)
-    sweep_wave_heading: true   # ALSO randomize the WAVE heading beta per run (independent
-    wave_heading_seed: 200     #   seed -> random (current, wave) pairs, same K runs).
-    #                            beta only affects wave-active modes (CW, CDW).
-    # wave_headings_deg: [0, 45, 90]   # alternative: explicit wave headings (cycled to K)
+  directions:           # heading sweep: theta_c (current) x beta (wave)
+    n_random: 100               # <-- THE knob: sample N random (current, wave) heading
+    #                           pairs; current AND wave headings drawn independently
+    direction_seed: 100       # reproducible draw of the current headings
+    sweep_wave_heading: true  # wave heading beta randomized per point too
+    wave_heading_seed: 200    #   (beta only affects wave-active modes CW/CDW)
+    # -- explicit-grid alternative: run EVERY current x wave combination --
+    # pairing: grid
+    # headings_deg: [0, 90, 180, 270]    # 4 current headings
+    # wave_headings_deg: [0, 90]         # 2 wave headings -> 4x2 = 8 sweep points
+    #   (grid + random: n_random current headings x n_random_wave wave headings)
   # PRELIMINARY: run SQUARE now (1 seed x 10 directions, all 3 controllers); DP deferred.
   primary:              # NOW running: square trajectory sweep
     scenario: square
     modes: [NONE, C, CD, CW, CDW]   # NONE = still water baseline (no current/waves)
-    seeds: [0,1,2,3,4]                # 1 seed (the 10 directions provide the variety)
+    seeds: [0]                # 1 seed (the 10 directions provide the variety)
     size: 1.0
     laps: 10            # each square run = exactly 10 laps (perimeter 4 m / 0.15 m/s -> ~267 s)
     speed: 0.15
@@ -67,6 +71,6 @@ experiment:
   secondary:             # DP deferred — to run it later, RENAME this key to `primary` (or `secondary`)
     scenario: dp
     modes: [NONE, C, CD, CW, CDW]   # NONE = still water baseline (no current/waves)
-    seeds: [0,1,2,3,4]                # bump to [0,1,2,3,4] for the full DP run
+    seeds: [0]                # bump to [0,1,2,3,4] for the full DP run
     start: [0.1, 0.05, 0.0]   # initial offset from the origin setpoint [m]
     depth: 0.0                # DP hold depth (FLU body z)
