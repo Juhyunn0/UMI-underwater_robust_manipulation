@@ -63,6 +63,8 @@ class DOBMPCController:
         self.p_ref = np.asarray(setpoint, float)
         self.yaw_ref = float(yaw_ref)
         self.v_ref = np.zeros(3)                 # world-FLU reference velocity (DP: 0)
+        self.r_ref = 0.0                         # reference yaw rate (heading-follow FF)
+        self.yaw_target = float(yaw_ref)         # final edge heading for the yaw preview
 
         self.nmpc = make_nmpc(N=N, dt=P.DT_CTRL)   # acados (fast) or ipopt (ref)
         self.eaob = None                         # lazy-init at first tick (needs eta0)
@@ -80,7 +82,8 @@ class DOBMPCController:
         self.n_fail = 0
 
     # ----------------------------------------------------- interface parity
-    def set_target(self, p_ref=None, yaw_ref=None, v_ref=None, r_ref=None):
+    def set_target(self, p_ref=None, yaw_ref=None, v_ref=None, r_ref=None,
+                   yaw_target=None):
         if p_ref is not None:
             self.p_ref = np.asarray(p_ref, float)
         if yaw_ref is not None:
@@ -88,8 +91,11 @@ class DOBMPCController:
         if v_ref is not None:
             self.v_ref = np.asarray(v_ref, float)
         if r_ref is not None:
-            self.r_ref = float(r_ref)    # accepted for PoseController interface
-                                         # parity; the NMPC tracks yaw_ref only
+            self.r_ref = float(r_ref)              # reference yaw rate (heading-follow FF)
+        # final edge heading for the horizon yaw preview in _xref_ned; defaults to the
+        # current yaw command so a caller that omits it -- or a straight leg -- gets no
+        # preview (delta == 0). The NMPC uses yaw_ref + r_ref + yaw_target on turns.
+        self.yaw_target = float(yaw_target) if yaw_target is not None else self.yaw_ref
 
     def reset(self):
         self.eaob = None
@@ -124,8 +130,13 @@ class DOBMPCController:
           * yaw unwrap: the reference yaw is expressed relative to the current
             measured yaw (psi_now + wrap(psi_ref - psi_now)) so the NMPC cost -- which
             has no angle wrapping -- always turns the short way across +-pi.
-        v_ref = 0 reduces it EXACTLY to the old constant-pose tile (the unwrap is a
-        no-op when |psi_ref - psi_now| < pi), so DP / station-keeping is unchanged.
+          * yaw preview + yaw-rate FF (heading-follow turns): the yaw reference ramps
+            over the horizon at r_ref toward the final edge heading yaw_target and is
+            clamped there, so the NMPC anticipates the ongoing rotation instead of
+            chasing a frozen target (see the block below).
+        v_ref = 0 AND r_ref = 0 reduces it EXACTLY to the old constant-pose tile (the
+        unwrap is a no-op when |psi_ref - psi_now| < pi), so DP / station-keeping is
+        unchanged.
         """
         N = self.nmpc.N
         dt = P.DT_CTRL
@@ -142,6 +153,21 @@ class DOBMPCController:
         xref[0:3, :] = frames.S @ pos_world
         xref[3:6, :] = eta0[3:6][:, None]
         xref[6:12, :] = nu_ned[:, None]
+
+        # yaw preview + yaw-rate feed-forward (heading-follow TURNS only). During a
+        # corner the yaw command slews at r_ref (world-FLU, ~+1.047 rad/s); a frozen
+        # yaw target makes the NMPC lag and overshoot the turn. Extrapolate the future
+        # command yaw over the horizon and CLAMP it at the final edge heading so it
+        # never predicts past the corner. r_ref == 0 (straights / DP) -> exact no-op.
+        if self.r_ref != 0.0:
+            r_ned = -self.r_ref                     # world +yaw-rate -> NED/FRD r (S sign flip)
+            psi0 = eta0[5]                          # current unwrapped NED command yaw
+            eta_t = frames.flu_to_ned_eta(self.p_ref, _Rz_flu(self.yaw_target))
+            psi_t = psi0 + wrap_angle(eta_t[5] - psi0)   # NED target, unwrapped vs psi0
+            delta = psi_t - psi0                    # remaining rotation (small, unwrapped)
+            step = np.clip(r_ned * ks * dt, min(0.0, delta), max(0.0, delta))
+            xref[5, :] = psi0 + step                # yaw-angle preview  (Q weight 150)
+            xref[11, :] = np.where(np.abs(step) < abs(delta) - 1e-12, r_ned, 0.0)  # rate FF (Q 10)
         return xref
 
     # --------------------------------------------------------- control tick

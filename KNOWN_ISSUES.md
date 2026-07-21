@@ -51,6 +51,28 @@
   steady-state RMS(마지막 2랩)는 내부에서 계산만 하고 어디에도 표시하지 않음.
 - **제대로 고치려면**: docstring 정리, 또는 패널/범례에 SS-RMS 추가.
 
+### `verify_acados.py` 게이트가 heavy_gripper에서 근소 초과 (0.2717 > 0.25 N)
+- **발견**: 2026-07-12 (heavy_gripper 변종 검증 중)
+- **증상**: acados RTI vs IPOPT worst-case |Δu| 게이트 0.25 N은 heavy 기준 캘리브레이션;
+  heavy_gripper(13.7 kg)에서 0.2717 N — 30 N sway authority의 ~0.9%라 실효 동일 최적해,
+  폐루프도 검증됨(DP hold 1.3 cm). heavy/bluerov2는 여전히 PASS.
+- **제대로 고치려면**: 게이트를 변종별 스케일 또는 ‖u‖ 상대비로.
+
+### hydro.py는 body_iquat=identity(대각 관성)를 암묵 전제
+- **발견**: 2026-07-12 (heavy_gripper NMPC 발산 근본원인 추적으로 발견)
+- **증상**: `mj_objectVelocity(mjOBJ_BODY, local=1)`은 **inertial(주축) 프레임** 기준인데
+  hydro는 body 프레임으로 간주해 drag를 `xmat`으로 적용. `fullinertia`로 주축이
+  정렬·순열되면(Iyy>Izz>Ixx 등) drag 축이 뒤엉켜 **에너지 주입 → 폭발**(torque-free
+  kick 0.5 rad/s → 1.5 s 만에 |q|>60 rad/s로 재현).
+- **임시 대응**: heavy_gripper 생성 XML이 diaginertia 강제 + `test_heavy_gripper.py`가
+  `body_iquat==identity` 회귀 가드. 기존 변종은 원래 대각이라 무증상.
+- **제대로 고치려면**: hydro가 `mjOBJ_XBODY`(body 프레임)로 측정하거나 ximat로 변환 —
+  물리 파일 수정이라 별도 검증(기존 변종 byte-identical 확인) 필요.
+- **2026-07-19 갱신**: C3를 실측 위치(전방-하단)로 옮기면서 버려지는 Ixz가
+  −0.0016(0.4%) → **heavy_gripper +0.064 kg·m² (Ixx의 16.8%) / heavy_c3 +0.046 (12.4%)**
+  로 커짐. 실기체에 존재할 roll-yaw 곱관성이 플랜트에 없다는 뜻 — hydro를 body-frame으로
+  고치기 전까지는 구조적으로 못 넣는다. 위 "제대로 고치려면"의 우선순위가 올라감.
+
 ## ⏳ 보류 중 (알고 있지만 아직 안 돌린 것)
 
 ### 새 PID gain으로 full compare 미재실행
@@ -74,5 +96,22 @@
 - hydro가 CPU passive callback이라 MJX 미지원 — `verify_gpu_mjx.py`의 bonus check가
   non-gating으로 확인함. RL phase 전에 hydro의 MJX 포팅 필요.
 
+### C3-BR 마운트 브래킷 질량은 관성 합성에 미포함 (2026-07-19)
+- heavy_gripper·heavy_c3의 브래킷(`meshes/c3_mount.stl`)은 **visual-only** — 재질/질량
+  미상이라 `compute_payload_inertia.py` 합성에서 빠져 있음(카메라 1.7 kg 대비 수백 g 추정).
+- 사용자에게 실물 브래킷 질량(또는 재질)을 받으면 C3처럼 합성에 추가할 것.
+
+### Newton 그리퍼는 아직 Onshape에 없어 heavy_c3에서 제외 (2026-07-20)
+- 사용자 요청: Onshape 어셈블리에 있는 것(차체 + C3)만 반영. 그리퍼는 CAD 추가 전까지
+  `heavy_c3`에서 제외. `heavy_gripper` 변종은 그리퍼가 추가될 때를 위한 config로 유지되나,
+  현재 그 GRIP_POS=[0.25,0,−0.17]는 여전히 **추정값**(Onshape 미검증)이다.
+- 그리퍼가 Onshape에 추가되면: export 재실행 → 브래킷처럼 실측 위치로 GRIP_POS 갱신 →
+  heavy_gripper 재생성.
+
+### sim 차체 스킨은 실물 대비 2.3% 큼 (MarineGym USD 유래)
+- 발견 2026-07-19 (C3 위치 정합 중): 스킨 bbox = 벤더 치수 × 1.0233 (세 축 균일).
+- C3/페이로드 배치는 **실측 metric**(COM 앵커) 기준이라 동역학·카메라는 정확하지만,
+  렌더에서 페이로드가 스킨 대비 ~3–5 mm 어긋나 보일 수 있음(코스메틱).
+
 ---
-*마지막 갱신: 2026-07-06*
+*마지막 갱신: 2026-07-19*

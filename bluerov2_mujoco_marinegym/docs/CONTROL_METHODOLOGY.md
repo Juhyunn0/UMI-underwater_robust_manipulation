@@ -892,3 +892,159 @@ heading-slew rate (60°/s at corners, 0 on straights) so the D term no longer fi
 
 **Validity:** sim-only (ideal thrusters, perfect 500 Hz state). For hardware derate ωn to 1.0–1.5 rad/s and
 filter the D term. Beyond the |S(1.6)| ≈ 0.41 wave-band residual, the answer is DOB-MPC, not more PID gain.
+
+---
+
+## 2026-07-07 — DOB-MPC yaw reference completed (yaw preview + yaw-rate FF on turns)
+
+**Why.** On the square, DOB-MPC's largest CW/CDW error concentrates at the **(1,1) upstream
+corner** (17 cm, seed 0 / current 0° / wave 0°), a cross-track sag ~0.36 m past the corner. Root
+cause is a half-finished feature: the 2026-06-30 `_xref_ned` upgrade (constant-pose → moving-path)
+added the **translational** feed-forward (position preview + linear `v_ref`) but never the
+**rotational** half. The yaw reference was held CONSTANT over the horizon and the angular-velocity
+reference was hard `zeros(3)`; the 2026-07-03 `r_ref` yaw-rate FF was wired into the PID only
+(`DOBMPCController.set_target` accepted it "for interface parity … ignores it"). So the NMPC chased
+a 60°/s-slewing yaw target as a zero-rate position regulator → slew lag (1.8 s vs 1.5 s nominal) and
+~199° overshoot, opening a mis-heading window that the upstream-edge wave drag exploits.
+
+**What.** `_xref_ned` now fills the rotation reference on turns, mirroring the existing linear FF:
+- **yaw-rate FF** → `xref[11,:] = -r_ref` (world-FLU +yaw-rate → NED/FRD `r` via the `S=diag(1,-1,-1)`
+  sign flip; Q weight 10);
+- **yaw-angle preview** → `xref[5,k]` ramps from the current NED command yaw at the reference rate
+  toward the final edge heading `yaw_target`, **clamped** at it (Q weight 150) so it never predicts
+  past the corner (an unclamped constant-rate ramp over the 3 s horizon would extrapolate a 90° turn
+  to 180°+ → over-rotation). `run_compare`/`run_viewer` now pass `yaw_target = atan2(ty, tx)` (the
+  edge tangent). `set_target(yaw_target=None)` defaults to the current yaw → no preview (safe).
+- **Gate:** `r_ref == 0` (straights / DP) is an exact no-op → DP/station-keeping byte-identical
+  (new `test_dobmpc.test_xref_yaw_preview` asserts DP-equivalence + the `-r_ref` sign + the clamp).
+- Runtime-only (`yref`); no acados rebuild. Weights unchanged.
+
+**Result (A/B, dobmpc, seed 0, current 0° / wave 0°, run_viewer headless).** Yaw slew-to-5° at the
+(1,1) corner **1.85 → 1.45 s** (≈ nominal) in both NONE and CDW — the lag mechanism is fixed. CDW
+(1,1) top-edge **max 17.2 → 13.2 cm (−23%)**; overall radial RMS unchanged (CDW 3.13→3.16, NONE
+2.08→2.07 — no regression; still-water per-corner peaks ±0.3–1.7 cm, since a no-wave corner
+transient is dominated by the *position*-reference kink, not the yaw lag). The residual ~13 cm is
+the **relative-speed wave drag (M2) + EAOB wave-band/frame limits (M3)** — out of this change's
+scope (M1/M4 only). The documented deferred "yaw on turns" item (rotate ŵ to each predicted ψ_k =
+M3b) is complementary and still open. Unit suite passes (heavy: frames/predictor/EAOB/yaw-preview;
+bluerov2: full). See memory `dobmpc-corner-deviation`.
+
+---
+
+## 2026-07-12 — heavy_gripper variant: the real payload (Newton gripper + MarineSitu C3) as a third plant
+
+Added `ROV_MODEL=heavy_gripper` = heavy + the lab's actual payload, **composed, not hand-tuned**: vendor-verified
+masses (Newton Subsea Gripper 524 g air / 267 g water, w/ cable; MarineSitu C3 1700 g / 430 g — both from the
+Blue Robotics store pages, cross-checked) fed through a parallel-axis composition
+([compute_payload_inertia.py](../compute_payload_inertia.py)); the MJCF is *generated* from `bluerov_heavy.xml`
+by [gen_gripper_variant.py](../gen_gripper_variant.py) so it cannot drift from the baseline. mass 13.724 kg,
+I = [0.363, 0.749, 0.699], displaced volume 0.0131815 m³ → **net buoyancy −5.7 N (sinks — no trim foam, by
+decision)**; hydro added-mass/damping stay the heavy set (payload increments are a few %–20% per axis, below the
+30–100% spread across published BlueROV2 sets; DNV-RP-C205 build-up estimates documented in the YAML, HOLD until
+in-situ system ID). Jaws are two mirrored slide joints driven by ONE `position` actuator at **ctrl index 8** —
+thruster code indexes actuators by name (`thr0..7`), so allocation/teleop are untouched. Three onboard cameras
+(stereo pair 7.5 cm + center) look forward-45°-down at the tag floor.
+
+**Two hard lessons (both now regression-guarded in [test_heavy_gripper.py](../test_heavy_gripper.py)):**
+
+1. **origin == COM is a stack-wide assumption, not a convention.** First build kept the heavy body frame and let
+   the payload shift the COM 3.3 cm off-origin; PID (model-free + new rp-leveling) held fine, but the NMPC closed
+   loop diverged in <1 s — the predictor (`fossen.py`, `params.ZG_MASS=0`) and hydro's force application all
+   assume the body origin is the COM, and the unmodeled m·r rotation–translation coupling (0.45 kg·m vs
+   Ixx 0.36 kg·m²) is not small. Fix: the generated frame is **re-origined at the composite COM** (all sites/
+   geoms shifted by −COM; thruster geometry relative to the vehicle unchanged; allocation B picks up the
+   physically-correct new moment arms automatically).
+
+2. **hydro.py implicitly requires body_iquat = identity (diagonal inertia).** Emitting the composite as
+   `fullinertia` (Ixz = −0.0016) made MuJoCo diagonalize and *sort* the principal axes — for this payload the
+   inertial frame becomes an axis PERMUTATION of the body frame — and `mj_objectVelocity(mjOBJ_BODY)` reports ν
+   in that permuted frame while hydro applies the drag wrench via `xmat`. Crossed drag axes turn the dissipative
+   term into an energy pump: a torque-free 0.5 rad/s pitch kick exploded to |q| > 60 rad/s in 1.5 s. Isolated by
+   ablation (buoyancy-only stable, drag-only explodes; heavy control stable). Fix: emit **diaginertia** (the
+   0.4% Ixz is far below coefficient uncertainty); the deeper hydro fix is logged in KNOWN_ISSUES.
+
+**Controller updates:** `GAINS_HEAVY_GRIPPER` re-derives the same pole placement at the payload masses (sway
+m_eff 26.42 → kp/kd/ki 143.7/99.5/42.3; heave 28.29 → 153.9/108.0/45.3; yaw I_eff 0.811 → 9.92/4.79/4.38) and
+adds an optional **roll/pitch leveling PD** (`rp_kp=(4.3,7.7)`, `rp_kd=(2.6,4.6)`, gated on the gains dict so
+heavy/bluerov2 are byte-identical): the payload's static attitude torque (jaw weight + CB_x offset ~1.3 N·m)
+rivals the passive B·coBM restoring (~1.2 N·m/rad), so passive-only attitude walks off. dobmpc params flow from
+the registry automatically (MPC weights untouched — the earlier "calm the attitude weights" hypothesis was a
+misdiagnosis of lesson 2 and was reverted).
+
+**Results:** PID DP hold 0.0 cm (still water, 20 s); DOB-MPC DP hold rms(12–20 s) **1.3 cm** still / **1.4 cm**
+current+waves / 22 cm with 20–50 N Poisson kicks (impulse-recovery transients — EAOB cannot predict kicks,
+consistent with the C-mode analysis). heavy reference on the same harness: 0.4 cm (cw). acados-vs-IPOPT
+worst-case |Δu| 0.2717 N (marginally over the heavy-calibrated 0.25 N gate; ~0.9% of authority — logged in
+KNOWN_ISSUES). Full three-variant regression (selftest / load / thrusters / controller / hydro / observe /
+water_viz) passes; heavy and bluerov2 files untouched.
+
+---
+
+## 2026-07-19 — heavy_gripper: C3 moved to its MEASURED mount (front-bottom, lens forward) from the lab's Onshape CAD
+
+The C3 placement used since 2026-07-12 (front-top, pitched 45° down, `C3_POS=[0.18, 0, 0.09]`) was a guess and
+was wrong. The real mount was measured end-to-end from the lab's Onshape assembly (BROV2 Heavy + C3 on its
+C3-BR bracket): exported with **onshape-to-robot** (v1.8.2, MuJoCo output; export kept in
+`assets/CAD files/onshape_export/`), then the exported vehicle geometry was **registered to the sim base_link
+frame** with the rotation constrained to a pure axis permutation (the CAD sits axis-aligned; its bbox equals the
+vendor 575×254×457 mm exactly), a global voxel-occupancy grid search over translation (no ICP local minima),
+scale 1.0233 accounted for (the MarineGym-derived skin is uniformly 2.3% large; placement is TRUE METRIC anchored
+at the COM), and a trimmed-ICP translation polish: residual 1.6 mm, seed spread <0.1 mm, fore-aft disambiguated
+by the electronics-tube dome. Pipeline constants frozen in [process_c3_mesh.py](../process_c3_mesh.py), which now
+emits `meshes/c3_payload_frames.json` consumed by the generator (drift-guarded against `CP.C3_POS`).
+
+**Result** (base_link FLU, origin = vehicle COM): C3 mesh centroid `[0.199, 0.008, −0.156]` — **front-bottom on
+the centreline**, housing protruding ~9 mm past the frame nose and ~3 cm below the skid line; optical axis
+`[1.000, 0, 0.0056]` (0.32° up-tilt kept verbatim from the CAD mates); stereo baseline horizontal. The C3-BR
+bracket straddles the Newton-gripper tube with ~1 mm clearance — independently confirming the guessed
+`GRIP_POS=[0.25, 0, −0.17]` is compatible with the real bracket. The 3 MJCF cameras now sit at the **lens plane**
+(`x=0.2395`, `y=0.0055±0.0375`, `z=−0.1554`) looking forward-level; the gripper jaws appear dead ahead at ~18 cm.
+
+**Model consequences:** composite inertia diag `[0.38154, 0.77780, 0.70954]` (was `[0.363, 0.749, 0.699]`),
+TOTAL COM `[+0.0349, +0.0010, −0.0258]`, coBM **+0.01625 m** (was +0.00955 — COM dropped, CB barely moved),
+net buoyancy unchanged −5.7 N. The dropped off-diagonal grew from Ixz −0.0016 (0.4%) to **+0.064 kg·m² (16.8% of
+Ixx)** — a real roll-yaw product the plant cannot carry until hydro reads body-frame velocity (KNOWN_ISSUES).
+Bracket mass is NOT yet composed (visual-only; pending real mass). Bonus fix: the mesh visual-orientation helper
+used `conj(mesh_quat)`; MuJoCo's convention is `v_orig = R(mesh_quat)·v_stored + mesh_pos`, so the geom quat must
+be `mesh_quat` itself — the old bake's ~180° principal rotation masked this (conj(q) = −q). Verified: vertex
+reconstruction error 0.000 mm; `test_heavy_gripper.py` all green; renders `assets/screenshots/c3/c3new_*.png`.
+
+---
+
+## 2026-07-20 — heavy_c3 variant: reflect ONLY the Onshape assembly (heavy + C3, no gripper)
+
+The lab's Onshape assembly contains the BlueROV2 Heavy + the MarineSitu C3 on its C3-BR bracket — but **not** the
+Newton gripper (it isn't in CAD yet). Added `ROV_MODEL=heavy_c3` to reflect exactly that, so the sim never models
+hardware the CAD doesn't have. It is `heavy_gripper` minus the gripper: `compute_payload_inertia.compose_c3()` /
+`buoyancy_c3()` compose vehicle + C3 only (bracket is visual-only, mass unknown), `gen_c3_variant.py` generates
+`bluerov_heavy_c3.xml` from `bluerov_heavy.xml` (frame re-origined at the composite COM, diagonal inertia, C3 mesh
++ bracket + 3 lens-plane cameras, **no** gripper cylinder / jaws / actuator). Numbers: mass 13.2 kg,
+I = [0.37014, 0.73153, 0.67460], COM [+0.026, +0.001, −0.020], displaced volume 0.0129237 m³ →
+**net buoyancy −3.1 N (sinks)**; coBM +0.01372. With no articulated bodies the composite COM is the whole-vehicle
+COM, so `<inertial pos>` = 0. Gains: `heavy_c3` inherits `GAINS_HEAVY` (fully-actuated fallback) — PID holds the
+origin at 0.0 cm; without the roll/pitch-leveling PD (`heavy_gripper` has it) the C3's forward-low COM leaves a
+~1° residual pitch (position hold unaffected). The dropped off-diagonal is Ixz +0.046 (12.4% of Ixx), same
+body-frame-hydro limitation as heavy_gripper (KNOWN_ISSUES). Regression `test_heavy_c3.py` (composition /
+no-gripper / thrusters-identical-to-heavy / sinks / cameras-forward / PID-hold) passes; heavy, heavy_gripper,
+and bluerov2 untouched. Renders: `assets/screenshots/c3/heavy_c3_*.png`. `heavy_gripper` stays as the future config
+for when the gripper is added to Onshape.
+
+---
+
+## 2026-07-20 (2) — payload-mesh orientation bug: MuJoCo composes the mesh reframe into the geom — no cancellation quat, ever
+
+The user compared the sim against their Onshape front view and caught the C3 rendering ~90°-twisted (panel not
+facing forward). Root cause — and a correction to the 2026-07-19 "bonus fix", which was itself wrong: MuJoCo
+re-orients each mesh to principal axes internally, but **the compiler composes that reframe back into every
+referencing geom's pos/quat** (verified numerically: with XML quat = mesh_quat, the compiled geom_quat came out
+exactly mesh_quat⊗mesh_quat). So an XML geom pose applies to the mesh **as authored**, and a pre-baked mesh needs
+**no quat at all** — which is also why the quat-less `rovc_*` skins always rendered correctly. Both prior
+"cancellation" schemes (conj(mesh_quat), then mesh_quat) double-handled the reframe; the C3's near-square cross
+section (95×89 mm) made the error a clean-looking 90° twist that survived eyeballing. Fix: quat-less payload
+geoms in both generators + a build-time guard `_verify_mesh_geoms()` (compile the emitted XML, reconstruct
+rendered vertices from the compiled geom pos/quat, assert bbox == baked STL at the intended position, ±1 mm) so a
+mis-oriented payload can never ship silently again. Also re-exported from Onshape to double-check the assembly:
+C3/mount poses byte-identical to the frozen constants — the user's mates are fine; the error was purely in our
+visualisation chain. Housing/bracket now use the exact Onshape appearance colors (blue 0.231/0.380/0.706, gray
+0.753). Renders match the user's front view (landscape screwed panel forward, connector to port):
+`assets/screenshots/c3/heavy_c3_front_full.png`. Dynamics untouched (visual-only geoms); both variant suites pass.

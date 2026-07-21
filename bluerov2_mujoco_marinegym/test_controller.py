@@ -32,10 +32,16 @@ def run_episode(mode, disturb, start=START, T_sec=40.0, seed=0):
     if disturb:                       # isolate the CONSTANT current (clean PID-vs-PD);
         field.use_waves = False       # waves/kicks are oscillatory/impulsive and would
         field.use_kicks = False       # swamp the steady-state offset both share.
-    hydro = H.Hydrodynamics(model, disturbance=field).install()
-    # This test drives the hard-coded rank-5 bluerov.xml plant, so pin its matching
-    # gain set: DEFAULT_GAINS follows ROV_MODEL (default heavy) and GAINS_HEAVY's
-    # 30 N surge on rank-5 would nose the vehicle over (the 6 N cap is load-bearing).
+    # This test drives the hard-coded rank-5 bluerov.xml plant, so pin BOTH of its
+    # matching configs (they otherwise follow ROV_MODEL and would mismatch the plant):
+    #  * hydro coeffs -> BlueROV.yaml (under ROV_MODEL=heavy_gripper the default YAML
+    #    carries the payload's displaced volume -> +19 N buoyancy on this 11.2 kg
+    #    plant, which blows the vehicle to the surface);
+    #  * gains -> GAINS_BLUEROV2 (GAINS_HEAVY's 30 N surge on rank-5 would nose the
+    #    vehicle over; the 6 N cap is load-bearing).
+    hydro = H.Hydrodynamics(model, disturbance=field,
+                            coeff_path=os.path.join(HERE, "marinegym_assets",
+                                                    "BlueROV.yaml")).install()
     ctrl = C.PoseController(model, mode=mode, setpoint=(0, 0, 0), yaw_ref=0.0,
                             buoyancy_ff=hydro, gains=C.GAINS_BLUEROV2)
     sx, sy, sz, syaw = start

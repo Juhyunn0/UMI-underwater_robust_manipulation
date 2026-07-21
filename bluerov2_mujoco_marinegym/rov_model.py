@@ -56,6 +56,49 @@ _MODELS = {
         n_thrusters=8,
         fully_actuated=True,
     ),
+    "heavy_gripper": dict(
+        # heavy + Newton Subsea Gripper (jaws articulated, ctrl index 8) + MarineSitu C3
+        # stereo camera, rigidly attached. Rigid-body numbers COMPOSED (parallel-axis)
+        # from the verified vendor masses -- gripper 0.524 kg (2x0.030 kg jaws as child
+        # bodies), C3 1.700 kg -- by compute_payload_inertia.py; the MJCF is GENERATED
+        # from bluerov_heavy.xml by gen_gripper_variant.py (rerun after edits there).
+        # The generated frame is RE-ORIGINED at the composite COM (origin==COM, like
+        # heavy) -- required by the dobmpc predictor / params.ZG_MASS=0 / hydro, which
+        # all assume it; without it the NMPC closed loop destabilizes. mass = total
+        # subtree (incl. jaws); inertia = TOTAL composite about the total COM
+        # (Ixz=+0.064, 16.8% of Ixx, DROPPED by the diagonal-inertia constraint --
+        # see gen_gripper_variant.py / KNOWN_ISSUES). volume adds the payloads'
+        # displaced water -> net buoyancy ~ -5.7 N (SINKS: real payload, no trim
+        # foam, per the 2026-07-12 decision). Hydro added-mass/damping stay the
+        # heavy set (increments documented in the YAML). C3 placement measured from
+        # the user's Onshape assembly 2026-07-19 (front-bottom, lens forward level).
+        xml="bluerov_heavy_gripper.xml",
+        yaml="BlueROVHeavyGripper.yaml",
+        mass=13.7240,
+        inertia=(0.38154, 0.77780, 0.70954),
+        volume=0.0131815,
+        n_thrusters=8,
+        fully_actuated=True,
+    ),
+    "heavy_c3": dict(
+        # heavy + MarineSitu C3 stereo camera on its C3-BR bracket = EXACTLY the lab's
+        # Onshape assembly (the Newton gripper is NOT in Onshape yet, so it is absent
+        # here; heavy_gripper is the future config for when it exists in CAD). Rigid-body
+        # numbers COMPOSED (parallel-axis) from the vehicle + C3 vendor mass 1.700 kg by
+        # compute_payload_inertia.compose_c3(); the MJCF is GENERATED from bluerov_heavy.xml
+        # by gen_c3_variant.py (rerun after edits there). Frame RE-ORIGINED at the composite
+        # COM (origin==COM, like heavy). C3 placement measured from Onshape 2026-07-19
+        # (front-bottom, lens forward level). Bracket is visual-only (mass unknown). Dropped
+        # Ixz = +0.046 (12.4% of Ixx, KNOWN_ISSUES). volume adds the C3's displaced water ->
+        # net buoyancy ~ -3.1 N (SINKS: payload, no trim foam).
+        xml="bluerov_heavy_c3.xml",
+        yaml="BlueROVHeavyC3.yaml",
+        mass=13.2000,
+        inertia=(0.37014, 0.73153, 0.67460),
+        volume=0.0129237,
+        n_thrusters=8,
+        fully_actuated=True,
+    ),
 }
 
 MODEL = os.environ.get("ROV_MODEL", "heavy").strip().lower()
@@ -73,7 +116,9 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 # every loader that reads RM.XML_PATH (teleop.py, eval_dp, run_compare, test_*/verify_*)
 # picks this up for free.
 _POOL_TAGS = os.environ.get("POOL_TAGS", "0").strip().lower() in ("1", "true", "yes", "on")
-_POOL_WRAP = {"bluerov2": "scene_bluerov_tags.xml", "heavy": "scene_bluerov_heavy_tags.xml"}
+_POOL_WRAP = {"bluerov2": "scene_bluerov_tags.xml", "heavy": "scene_bluerov_heavy_tags.xml",
+              "heavy_gripper": "scene_bluerov_heavy_gripper_tags.xml",
+              "heavy_c3": "scene_bluerov_heavy_c3_tags.xml"}
 
 XML_NAME = _POOL_WRAP[MODEL] if _POOL_TAGS else _CFG["xml"]
 YAML_NAME = _CFG["yaml"]

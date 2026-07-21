@@ -167,7 +167,8 @@ def run_one(ctrl_name, cfg, mode, seed, scenario, scen, dist):
                 r_cmd = (yaw_new - yaw_cmd) / model.opt.timestep   # slew rate = yaw-rate ref
                 yaw_cmd = yaw_new
             ctrl.set_target((rx, ry, depth), yaw_ref=(yaw_cmd if heading_follow else 0.0),
-                            v_ref=(speed * tx, speed * ty, 0.0), r_ref=r_cmd)
+                            v_ref=(speed * tx, speed * ty, 0.0), r_ref=r_cmd,
+                            yaw_target=(np.arctan2(ty, tx) if heading_follow else 0.0))
         else:
             rx, ry = 0.0, 0.0
         ctrl.apply(model, data)

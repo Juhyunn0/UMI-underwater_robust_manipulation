@@ -1,0 +1,36 @@
+{
+  "c3_centroid_bl": [
+    0.19869,
+    0.008,
+    -0.15583
+  ],
+  "mount_centroid_bl": [
+    0.1355,
+    0.00547,
+    -0.16607
+  ],
+  "cam_center_bl": [
+    0.23949,
+    0.00547,
+    -0.15537
+  ],
+  "optical_bl": [
+    0.99998,
+    0.0,
+    0.0056
+  ],
+  "baseline_dir_bl": [
+    0.0,
+    1.0,
+    0.0
+  ],
+  "cam_xyaxes": [
+    -0.0,
+    -1.0,
+    -0.0,
+    -0.0056,
+    0.0,
+    0.99998
+  ],
+  "provenance": "onshape_export/robot.xml + registration 2026-07-19 (process_c3_mesh.py; metric, base_link origin = vehicle COM)"
+}

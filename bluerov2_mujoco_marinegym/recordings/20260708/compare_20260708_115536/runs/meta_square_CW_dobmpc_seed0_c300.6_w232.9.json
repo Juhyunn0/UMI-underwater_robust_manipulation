@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "rov_model": "heavy",
+  "run": {
+    "mode": "CW",
+    "seed": 0,
+    "theta_c_deg": 300.6,
+    "beta_deg": 232.9,
+    "T": 26.666666666666668,
+    "dt": 0.002,
+    "log_hz": 20.0,
+    "wall_s": 3.32,
+    "n_fail": 0,
+    "config": "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/d0292c49-0183-4022-abde-dbbacb3a7568/scratchpad/yawff_smoke.yaml",
+    "csv": "traj_square_CW_dobmpc_seed0_c300.6_w232.9.csv"
+  },
+  "controller": {
+    "type": "dobmpc"
+  },
+  "trajectory": {
+    "kind": "square",
+    "size": 1.0,
+    "speed": 0.15,
+    "laps": 1,
+    "depth": 0.0,
+    "heading_follow": true,
+    "yaw_rate_deg_s": 60.0
+  },
+  "disturbance": {
+    "schema_version": 1,
+    "kind": "finite_depth_env",
+    "mode": "CW",
+    "seed": 0,
+    "enabled": true,
+    "dt": 0.002,
+    "T_sim": 26.666666666666668,
+    "use_current": true,
+    "use_drift": false,
+    "use_waves": true,
+    "current": {
+      "V_bar_c": 0.2,
+      "theta_c_deg": 300.6,
+      "tau": 300.0,
+      "sigma_inf": 0.020000000000000004,
+      "v_z": 0.008217701239287258,
+      "a": 0.9999933333555555,
+      "b": 7.302943090219584e-05,
+      "dt": 0.002,
+      "T_sim": 26.666666666666668,
+      "seed": 0
+    },
+    "waves": {
+      "kind": "finite_depth_directional",
+      "Hs": 0.75,
+      "Tp": 12.0,
+      "gamma": 5.0,
+      "h": 4.0,
+      "z_ROV": -3.0,
+      "beta_bar_deg": 232.9,
+      "s": 30.0,
+      "seed": 0,
+      "N_omega": 60,
+      "N_beta": 21,
+      "omega_min": 0.2,
+      "omega_max": 1.6,
+      "M": 1260
+    },
+    "froude_krylov": {
+      "rho": 1025.0,
+      "vol": 0.0113459,
+      "fk_mode": "froude_krylov",
+      "C_M": 1.0,
+      "C_M_axis": [
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "note": "kick_* CSV columns = wave Froude-Krylov inertia force (no Poisson kicks)"
+  }
+}

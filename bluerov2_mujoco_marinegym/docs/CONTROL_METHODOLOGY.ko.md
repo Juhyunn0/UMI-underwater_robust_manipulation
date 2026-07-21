@@ -800,3 +800,142 @@ run_viewer 1랩 square NONE: **radial RMS 1.34 cm** (t>5 s) vs 구게인의 `com
 
 **유효 범위:** sim 한정(이상 추진기, 완전 상태, 500 Hz). 하드웨어에선 ωn을 1.0–1.5 rad/s로 낮추고 D항
 필터링 필요. wave 대역 잔류 |S(1.6)| ≈ 0.41 너머는 PID 게인이 아니라 DOB-MPC의 몫.
+
+---
+
+## 2026-07-07 — DOB-MPC yaw 레퍼런스 완성 (선회 시 yaw preview + yaw-rate FF)
+
+**왜.** 사각형에서 DOB-MPC의 CW/CDW 최대 오차는 **(1,1) 상류 코너**에 집중(17 cm, seed 0 /
+current 0° / wave 0°) — 코너 0.36 m 지난 지점의 cross-track 처짐. 원인은 절반만 완성된 기능:
+2026-06-30 `_xref_ned` 업그레이드(정지-자세 → 이동-경로)가 **병진** 피드포워드(위치 preview +
+선속도 `v_ref`)만 넣고 **회전** 절반을 안 만듦. yaw 레퍼런스는 호라이즌 내내 상수, 각속도
+레퍼런스는 하드 `zeros(3)`; 2026-07-03의 `r_ref` yaw-rate FF는 PID에만 배선
+(`DOBMPCController.set_target`는 "인터페이스 parity용으로만 받고 무시"). 그래서 NMPC가 60°/s로
+슬루하는 yaw 목표를 zero-rate 위치 레귤레이터로 쫓아 → 슬루 지연(1.8 s, nominal 1.5 s)·~199°
+오버슈트, 이 미스히딩 창을 상류 edge의 파도 drag가 파고듦.
+
+**무엇.** `_xref_ned`가 선회 시 회전 레퍼런스를 채운다(기존 선속도 FF 미러링):
+- **yaw-rate FF** → `xref[11,:] = -r_ref` (world-FLU +yaw-rate → NED/FRD `r`, `S=diag(1,-1,-1)`
+  부호 반전; Q 가중치 10);
+- **yaw-angle preview** → `xref[5,k]`가 현재 NED command yaw에서 레퍼런스 rate로 최종 edge
+  heading `yaw_target`까지 ramp하되 거기서 **clamp**(Q 가중치 150) — 3 s 호라이즌 내내 상수 rate
+  ramp하면 90° 선회를 180°+로 외삽해 **과회전**하므로 필수. `run_compare`/`run_viewer`가
+  `yaw_target = atan2(ty, tx)`(edge tangent) 전달. `set_target(yaw_target=None)`은 현재 yaw로
+  기본값 → preview 없음(안전).
+- **게이트:** `r_ref == 0`(직선 / DP)이면 정확히 no-op → DP/정지유지 byte-identical
+  (신규 `test_dobmpc.test_xref_yaw_preview`가 DP-등가 + `-r_ref` 부호 + clamp 검증).
+- 런타임 전용(`yref`); acados 재빌드 없음. 가중치 불변.
+
+**결과 (A/B, dobmpc, seed 0, current 0° / wave 0°, run_viewer headless).** (1,1) 코너 yaw
+슬루-to-5° **1.85 → 1.45 s**(≈ nominal), NONE·CDW 공통 — 지연 메커니즘 수정됨. CDW (1,1)
+top-edge **최대 17.2 → 13.2 cm (−23%)**; 전체 radial RMS 불변(CDW 3.13→3.16, NONE 2.08→2.07 —
+회귀 없음; 정지수 코너별 peak ±0.3–1.7 cm, 무외란 코너 과도는 yaw 지연이 아니라 *위치*-레퍼런스
+kink 지배). 잔존 ~13 cm는 **상대속도 파도 drag(M2) + EAOB 파도대역/프레임 한계(M3)** — 이 변경
+범위 밖(M1/M4만). 문서의 deferred "yaw on turns"(ŵ를 예측 ψ_k마다 회전 = M3b)는 상보적이며 여전히
+열림. 유닛 전체 통과(heavy: frames/predictor/EAOB/yaw-preview; bluerov2: 전체). 메모리
+`dobmpc-corner-deviation` 참조.
+
+---
+
+## 2026-07-12 — heavy_gripper 변종: 실제 페이로드(Newton 그리퍼 + MarineSitu C3)를 세 번째 플랜트로
+
+`ROV_MODEL=heavy_gripper` 추가 = heavy + 실험실의 실제 페이로드. **손튜닝이 아니라 합성**: 벤더 검증 질량
+(Newton Subsea Gripper 공기중 524 g / 수중 267 g, 케이블 포함; MarineSitu C3 1700 g / 430 g — 둘 다
+Blue Robotics 스토어 페이지, 교차 확인)을 평행축 합성([compute_payload_inertia.py](../compute_payload_inertia.py))
+에 통과. MJCF는 [gen_gripper_variant.py](../gen_gripper_variant.py)가 `bluerov_heavy.xml`에서 *생성*(기준선
+과 드리프트 불가). 질량 13.724 kg, I=[0.363, 0.749, 0.699], 배수량 0.0131815 m³ → **순부력 −5.7 N (가라앉음
+— 트림 폼 없음, 결정사항)**; hydro added-mass/감쇠는 heavy 세트 유지(페이로드 증분은 축당 수 %~20% = 공개
+세트 간 30~100% 편차 미만; DNV-RP-C205 build-up 추정치는 YAML에 문서화, 자체 system ID까지 HOLD). 조(jaw)는
+미러된 슬라이드 관절 2개 + `position` 액추에이터 1개(**ctrl index 8**) — 스러스터 코드는 이름(`thr0..7`)으로
+찾으므로 할당/teleop 무영향. 온보드 카메라 3개(스테레오 7.5 cm + 센터)가 전방 45° 아래 태그 바닥을 봄.
+
+**뼈아픈 교훈 2개 (둘 다 [test_heavy_gripper.py](../test_heavy_gripper.py)가 회귀 가드):**
+
+1. **origin == COM은 관례가 아니라 스택 전체의 가정.** 첫 빌드는 heavy 프레임을 유지한 채 COM만 3.3 cm
+   이동 — PID는 버텼지만 NMPC 폐루프는 1초 내 발산. 예측 모델(`fossen.py`, `params.ZG_MASS=0`)과 hydro가
+   전부 원점=COM을 가정하고, 미모델 m·r 회전-병진 커플링(0.45 kg·m vs Ixx 0.36)은 작지 않았다. 해결:
+   생성 프레임을 **합성 COM에 재정렬**(전 site/geom −COM 이동; 기체-상대 기하 불변; 할당 B는 물리적으로
+   맞는 새 모멘트암을 자동 획득).
+
+2. **hydro.py는 body_iquat=identity(대각 관성)를 암묵 요구.** 합성 관성을 `fullinertia`(Ixz=−0.0016)로
+   내보내자 MuJoCo가 주축을 정렬하며 관성 프레임이 body 축의 **순열**이 됨 — `mj_objectVelocity(mjOBJ_BODY)`
+   는 그 순열 프레임으로 ν를 보고하는데 hydro는 `xmat`(body)로 drag를 적용. 축이 엇갈린 drag는 소산 대신
+   **에너지 펌프**: 무토크 0.5 rad/s 피치 킥이 1.5 s 만에 |q|>60 rad/s로 폭발. ablation으로 격리(부력만=안정,
+   drag만=폭발; heavy 대조군 안정). 해결: **diaginertia**로 출력(Ixz 0.4%는 계수 불확실성 이하); hydro
+   근본 수정은 KNOWN_ISSUES에 기록.
+
+**제어기 갱신:** `GAINS_HEAVY_GRIPPER` = 동일 pole placement를 페이로드 질량으로 재유도(sway m_eff 26.42 →
+kp/kd/ki 143.7/99.5/42.3; heave 28.29 → 153.9/108.0/45.3; yaw I_eff 0.811 → 9.92/4.79/4.38) + 옵션 **roll/pitch
+leveling PD**(`rp_kp=(4.3,7.7)`, `rp_kd=(2.6,4.6)`, 게인 dict 게이트라 heavy/bluerov2 동작 불변): 페이로드의
+정적 자세 토크(jaw 중력 + CB_x 오프셋 ~1.3 N·m)가 수동 복원(B·coBM ~1.2 N·m/rad)과 맞먹어 수동만으론 자세가
+흘러감. dobmpc params는 레지스트리에서 자동 추종(MPC 가중치 무변경 — 초기의 "자세 가중치 완화" 가설은 교훈
+2의 오진이라 되돌림).
+
+**결과:** PID DP hold 0.0 cm (still, 20 s); DOB-MPC DP hold rms(12–20 s) **1.3 cm** still / **1.4 cm**
+current+waves / 22 cm (20–50 N Poisson kick 포함 — 임펄스 회복 과도; EAOB는 kick 예측 불가, 기존 분석과 일관).
+동일 하니스 heavy 참조: 0.4 cm (cw). acados-vs-IPOPT worst-case |Δu| 0.2717 N (heavy 기준 0.25 N 게이트 근소
+초과; authority의 ~0.9% — KNOWN_ISSUES 기록). 3변종 전체 회귀(selftest/load/thrusters/controller/hydro/
+observe/water_viz) 통과; heavy·bluerov2 파일 무변경.
+
+---
+
+## 2026-07-19 — heavy_gripper: C3를 실측 마운트 위치(전방-하단, 렌즈 전방 수평)로 이동 — Onshape CAD 기반
+
+2026-07-12부터 쓰던 C3 배치(전방-상단, 45° 하향, `C3_POS=[0.18, 0, 0.09]`)는 추정값이었고 실물과 전혀 달랐다.
+실험실 Onshape 어셈블리(BROV2 Heavy + C3-BR 브래킷 위 C3)에서 끝까지 실측: **onshape-to-robot**(v1.8.2,
+MuJoCo 출력; export는 `assets/CAD files/onshape_export/`에 보존)으로 내보낸 뒤, 차체 지오메트리를 sim
+base_link 프레임에 **정합** — 회전은 순수 축 치환으로 고정(CAD가 축 정렬 상태; bbox가 벤더 치수 575×254×457 mm와
+정확히 일치), 평행이동은 복셀 점유 전역 격자탐색(ICP 국소최소 회피), 스케일 1.0233 보정(MarineGym 유래 스킨이
+균일하게 2.3% 큼; 배치는 COM 앵커 기준 **실측 metric**), trimmed-ICP 미세조정: 잔차 1.6 mm, 시드 간 편차
+<0.1 mm, 전후 방향은 전자튜브 돔 형상으로 판별. 파이프라인 상수는 [process_c3_mesh.py](../process_c3_mesh.py)에
+동결, 이제 `meshes/c3_payload_frames.json`을 생성해 생성기가 소비(`CP.C3_POS`와 불일치 시 에러).
+
+**결과** (base_link FLU, 원점 = 차체 COM): C3 메쉬 중심 `[0.199, 0.008, −0.156]` — **전방-하단 중앙선**,
+하우징이 프레임 코보다 ~9 mm 앞, 스키드 라인보다 ~3 cm 아래로 돌출; 광축 `[1.000, 0, 0.0056]`(CAD mate의
+0.32° 상향 틸트 그대로 유지); 스테레오 베이스라인 수평. C3-BR 브래킷이 Newton 그리퍼 튜브를 **~1 mm 간격**으로
+감싸고 지나감 — 추정값이었던 `GRIP_POS=[0.25, 0, −0.17]`가 실물 브래킷과 양립함을 독립 확인. MJCF 카메라 3개는
+이제 **렌즈 평면**(`x=0.2395`, `y=0.0055±0.0375`, `z=−0.1554`)에서 전방 수평을 봄; 그리퍼 죠가 ~18 cm 앞 정면.
+
+**모델 영향:** 합성 관성 diag `[0.38154, 0.77780, 0.70954]`(이전 `[0.363, 0.749, 0.699]`), TOTAL COM
+`[+0.0349, +0.0010, −0.0258]`, coBM **+0.01625 m**(이전 +0.00955 — COM이 내려가고 CB는 거의 그대로), 순부력
+−5.7 N 불변. 버려지는 비대각 성분이 Ixz −0.0016(0.4%) → **+0.064 kg·m² (Ixx의 16.8%)** 로 증가 — hydro가
+body-frame 속도를 읽도록 고치기 전까지 플랜트에 못 싣는 실존 roll-yaw 곱관성(KNOWN_ISSUES). 브래킷 질량은 아직
+합성 미포함(visual-only; 실물 질량 받으면 추가). 덤 수정: 메쉬 시각 방향 헬퍼가 `conj(mesh_quat)`를 썼는데
+MuJoCo 규약은 `v_orig = R(mesh_quat)·v_stored + mesh_pos` → geom quat은 `mesh_quat` 그대로여야 함 — 구 베이크의
+~180° 주축 회전이 버그를 가렸었음(conj(q) = −q). 검증: 정점 재구성 오차 0.000 mm; `test_heavy_gripper.py` 전부
+통과; 렌더 `assets/screenshots/c3/c3new_*.png`.
+
+---
+
+## 2026-07-20 — heavy_c3 변종: Onshape 어셈블리에 있는 것만 반영 (heavy + C3, 그리퍼 없음)
+
+실험실 Onshape 어셈블리에는 BlueROV2 Heavy + C3-BR 브래킷 위 MarineSitu C3만 있고 **Newton 그리퍼는 없다**(아직
+CAD에 없음). 이를 그대로 반영하려고 `ROV_MODEL=heavy_c3`를 추가 — CAD에 없는 하드웨어는 심에서도 모델링하지 않음.
+`heavy_gripper`에서 그리퍼만 뺀 것: `compute_payload_inertia.compose_c3()` / `buoyancy_c3()`가 차체 + C3만 합성
+(브래킷은 visual-only, 질량 미상), `gen_c3_variant.py`가 `bluerov_heavy.xml`에서 `bluerov_heavy_c3.xml`을 생성
+(프레임을 합성 COM에 재원점, 대각 관성, C3 메쉬 + 브래킷 + 렌즈평면 카메라 3개, 그리퍼 실린더/죠/액추에이터 **없음**).
+수치: 질량 13.2 kg, I = [0.37014, 0.73153, 0.67460], COM [+0.026, +0.001, −0.020], 배수량 0.0129237 m³ →
+**순부력 −3.1 N (가라앉음)**; coBM +0.01372. 관절체가 없어 합성 COM = 전체 차체 COM이므로 `<inertial pos>` = 0.
+게인: `heavy_c3`는 `GAINS_HEAVY`를 상속(fully-actuated 폴백) — PID가 원점을 0.0 cm로 유지; roll/pitch 레벨링 PD가
+없어(그건 `heavy_gripper`에 있음) C3의 전방-하단 COM 때문에 ~1° 피치 잔류(위치 유지엔 영향 없음). 버려지는 비대각은
+Ixz +0.046(Ixx의 12.4%), heavy_gripper와 동일한 body-frame hydro 한계(KNOWN_ISSUES). 회귀 `test_heavy_c3.py`
+(합성/무그리퍼/thruster-heavy동일/침강/카메라전방/PID유지) 통과; heavy·heavy_gripper·bluerov2 무변경. 렌더:
+`assets/screenshots/c3/heavy_c3_*.png`. `heavy_gripper`는 그리퍼가 Onshape에 추가될 때를 위한 향후 config로 유지.
+
+---
+
+## 2026-07-20 (2) — 페이로드 메쉬 방향 버그: MuJoCo는 메쉬 재정렬을 geom에 합성한다 — 상쇄 쿼터니언은 절대 불필요
+
+사용자가 Onshape 정면 뷰와 심을 비교해 C3가 ~90° 뒤틀려 렌더되는 것(패널이 정면을 안 봄)을 잡아냈다. 근본 원인
+— 그리고 2026-07-19의 "덤 수정" 자체가 틀렸다는 정정: MuJoCo는 메쉬를 내부적으로 주관성축으로 재정렬하지만,
+**컴파일러가 그 재정렬을 참조하는 geom의 pos/quat에 도로 합성한다**(수치 검증: XML quat = mesh_quat일 때 컴파일된
+geom_quat이 정확히 mesh_quat⊗mesh_quat로 나옴). 즉 XML geom pose는 **저작된 원본 그대로의** 메쉬에 적용되며,
+미리 구운 메쉬에는 **quat이 아예 필요 없다** — quat 없는 `rovc_*` 스킨이 항상 제대로 렌더된 이유이기도 하다. 이전
+두 "상쇄" 방식(conj(mesh_quat), 그다음 mesh_quat)은 재정렬을 이중 처리한 것; C3 단면이 거의 정사각(95×89 mm)이라
+오류가 깔끔한 90° 뒤틀림으로 보여 눈검사를 통과해버렸다. 수정: 두 생성기 모두 quat 없는 페이로드 geom + 빌드 시
+가드 `_verify_mesh_geoms()`(생성된 XML을 컴파일해 컴파일된 geom pos/quat로 렌더 정점을 재구성, bbox가 의도 위치의
+구운 STL과 ±1 mm 일치함을 assert) — 방향이 틀린 페이로드는 이제 빌드가 실패한다. Onshape 재-export로 어셈블리도
+재확인: C3/마운트 pose가 동결 상수와 바이트 단위 동일 — **사용자의 mate는 문제없었고** 오류는 전적으로 우리
+시각화 체인에 있었다. 하우징/브래킷은 Onshape 외관 색 그대로(파랑 0.231/0.380/0.706, 회색 0.753). 렌더가 사용자
+정면 뷰와 일치(가로 나사 패널이 전방, 커넥터는 좌현): `assets/screenshots/c3/heavy_c3_front_full.png`. 동역학은
+무변경(visual-only geom); 두 변종 테스트 스위트 통과.

@@ -133,6 +133,7 @@ class Hydrodynamics:
             a[1]*v*u - a[0]*u*v + a[4]*q*p - a[3]*p*q,
         ])
 
+# Hydrodynamic Model 
     def wrench_body(self, data):
         """Drag + added-mass(+Coriolis) wrench in the body frame (excl. buoyancy).
 
@@ -147,22 +148,28 @@ class Hydrodynamics:
         if self.disturbance is not None and self.disturbance.enabled:
             R = data.xmat[self.bid].reshape(3, 3)
             v_water = self.disturbance.water_velocity(data.time, data.xipos[self.bid])
-            nu_r[:3] = nu[:3] - R.T @ v_water        # relative linear vel, body frame
+            nu_r[:3] = nu[:3] - R.T @ v_water        # relative linear vel(water doesn't have angular part), body frame (by JJ)
 
+
+        # this is for the added-mass finite-difference (nudot) term; the filter is what makes it stable (by JJ)
         if self._nu_prev is None:
             nudot = np.zeros(6)
         else:
             nudot = (nu_r - self._nu_prev) / self.dt
-        self._nudot_f = self.acc_filter * nudot + (1 - self.acc_filter) * self._nudot_f
+        self._nudot_f = self.acc_filter * nudot + (1 - self.acc_filter) * self._nudot_f # acts as low-pass filter on the added-mass force (by JJ)
         self._nu_prev = nu_r
 
-        f_drag = -(self.D_L * nu_r + self.D_NL * np.abs(nu_r) * nu_r)  # opposes rel. motion
-        f_added = -self.M_A * self._nudot_f                            # opposes rel. accel
-        f_cor = -self._coriolis_added(nu_r)
+        # For the forces that MuJoCo doesn't know about; drag(body) + added mass effect + Coriolis (added mass) (by JJ) 
+        f_drag = -(self.D_L * nu_r + self.D_NL * np.abs(nu_r) * nu_r)  # opposes rel. motion  # linear drag + quadratic drag (by JJ)
+        f_added = -self.M_A * self._nudot_f                            # opposes rel. accel   # added-mass inertia multiplied by low-pass filter (by JJ)
+        f_cor = -self._coriolis_added(nu_r)                                                   # Coriolis (added mass) (by JJ)
+
         self._last_drag = f_drag      # stored (read-only) for visualization
         self._last_added = f_added
         if self.diag_wtrue:
             self._update_wb_still(nu)
+
+
         return f_drag + f_added + f_cor
 
     def _update_wb_still(self, nu):
@@ -190,15 +197,18 @@ class Hydrodynamics:
 
         # buoyancy (world +z) applied at the CB = COM + coBM along body +z;
         # mj_applyFT turns the offset point into the restoring moment for us.
-        cb = com + R @ np.array([0.0, 0.0, self.coBM])
+        cb = com + R @ np.array([0.0, 0.0, self.coBM])  # self.coBM is the distance from COM to CB along body +z (by JJ)
+
+        # 1. Buoyancy (world +z) at the CB (COM + coBM along body +z) (by JJ)
         mujoco.mj_applyFT(model, data, np.array([0.0, 0.0, self.buoyancy]),
                           np.zeros(3), cb, bid, data.qfrc_passive)
 
-        # drag + added mass (body frame) -> world, applied at the COM
+        # 2. drag + added mass (body frame) -> world, applied at the COM (by JJ)
         wb = self.wrench_body(data)
         mujoco.mj_applyFT(model, data, R @ wb[:3], R @ wb[3:], com, bid,
                           data.qfrc_passive)
-
+        
+        # 3. external force at the COM (by JJ) 
         # Phase 4: impulsive kick (world-frame external force) at the COM
         Fk = np.zeros(3)
         if self.disturbance is not None and self.disturbance.enabled:

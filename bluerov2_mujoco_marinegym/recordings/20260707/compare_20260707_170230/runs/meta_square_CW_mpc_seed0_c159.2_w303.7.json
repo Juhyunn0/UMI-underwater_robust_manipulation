@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "rov_model": "heavy",
+  "run": {
+    "mode": "CW",
+    "seed": 0,
+    "theta_c_deg": 159.2,
+    "beta_deg": 303.7,
+    "T": 266.6666666666667,
+    "dt": 0.002,
+    "log_hz": 20.0,
+    "wall_s": 41.91,
+    "n_fail": 0,
+    "config": "/home/bdml/Desktop/umi_underwater_robust_control/bluerov2_mujoco_marinegym/config/base.yaml",
+    "csv": "traj_square_CW_mpc_seed0_c159.2_w303.7.csv"
+  },
+  "controller": {
+    "type": "mpc"
+  },
+  "trajectory": {
+    "kind": "square",
+    "size": 1.0,
+    "speed": 0.15,
+    "laps": 10,
+    "depth": 0.0,
+    "heading_follow": true,
+    "yaw_rate_deg_s": 60.0
+  },
+  "disturbance": {
+    "schema_version": 1,
+    "kind": "finite_depth_env",
+    "mode": "CW",
+    "seed": 0,
+    "enabled": true,
+    "dt": 0.002,
+    "T_sim": 266.6666666666667,
+    "use_current": true,
+    "use_drift": false,
+    "use_waves": true,
+    "current": {
+      "V_bar_c": 0.2,
+      "theta_c_deg": 159.2,
+      "tau": 300.0,
+      "sigma_inf": 0.020000000000000004,
+      "v_z": 0.008217701239287258,
+      "a": 0.9999933333555555,
+      "b": 7.302943090219584e-05,
+      "dt": 0.002,
+      "T_sim": 266.6666666666667,
+      "seed": 0
+    },
+    "waves": {
+      "kind": "finite_depth_directional",
+      "Hs": 0.75,
+      "Tp": 12.0,
+      "gamma": 5.0,
+      "h": 4.0,
+      "z_ROV": -3.0,
+      "beta_bar_deg": 303.7,
+      "s": 30.0,
+      "seed": 0,
+      "N_omega": 60,
+      "N_beta": 21,
+      "omega_min": 0.2,
+      "omega_max": 1.6,
+      "M": 1260
+    },
+    "froude_krylov": {
+      "rho": 1025.0,
+      "vol": 0.0113459,
+      "fk_mode": "froude_krylov",
+      "C_M": 1.0,
+      "C_M_axis": [
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "note": "kick_* CSV columns = wave Froude-Krylov inertia force (no Poisson kicks)"
+  }
+}

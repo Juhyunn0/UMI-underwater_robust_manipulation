@@ -394,6 +394,12 @@ def write_wrappers(sky="gradient"):
     with open(os.path.join(HERE, "scene_bluerov_heavy_tags.xml"), "w") as f:
         f.write(WRAPPER_TMPL.format(model="bluerov2_heavy_tagpool", rov="bluerov_heavy.xml",
                                     sky=sky_xml))
+    with open(os.path.join(HERE, "scene_bluerov_heavy_gripper_tags.xml"), "w") as f:
+        f.write(WRAPPER_TMPL.format(model="bluerov2_heavy_gripper_tagpool",
+                                    rov="bluerov_heavy_gripper.xml", sky=sky_xml))
+    with open(os.path.join(HERE, "scene_bluerov_heavy_c3_tags.xml"), "w") as f:
+        f.write(WRAPPER_TMPL.format(model="bluerov2_heavy_c3_tagpool",
+                                    rov="bluerov_heavy_c3.xml", sky=sky_xml))
 
 
 # ---------------------------------------------------------------------------

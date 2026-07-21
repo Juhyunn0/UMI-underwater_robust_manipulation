@@ -42,7 +42,7 @@ solver.
 | Experiment: 3 controllers × 5 disturbance modes × N seeds × current/wave heading sweep (paired or full grid), metrics + per-run CSVs/meta + all figures in one run | `experiments/run_compare.py`, `config/*.yaml` | ✅ |
 | **Live viewer**: watch ONE controller × mode run the square in real-time MuJoCo + save trajectory CSV + 1-lap mp4 | `experiments/run_viewer.py` | ✅ |
 | Trajectory-overlay figure from `run_viewer` CSVs (single mode, or all-modes 2×3 grid) | `experiments/plot_trajectories.py` | ✅ |
-| Slide figures: β̄ = mean-of-a-spread wave heading (sea snapshot + cos^2s lobe, s=30 vs s=2) → `assets/screenshots/wave_*.png` | `plot_wave_spreading.py` | ✅ |
+| Slide figures: β̄ = mean-of-a-spread wave heading (sea snapshot + cos^2s lobe, s=30 vs s=2) → `assets/screenshots/waves/wave_*.png` | `plot_wave_spreading.py` | ✅ |
 | Verification: hydro (smoke + precision), acados equivalence, run-meta | `verify_*.py` | ✅ |
 
 Two model variants, selected by `ROV_MODEL` (see below): **heavy** (default,
@@ -68,23 +68,67 @@ conda activate robust
 cd bluerov2_mujoco_marinegym
 ```
 
-### Model variant: BlueROV2 vs BlueROV2 Heavy
+### Model variant: BlueROV2 vs BlueROV2 Heavy (vs Heavy+Gripper)
 
 Pick the vehicle with the **`ROV_MODEL`** env var (default **`heavy`**); a single
 [rov_model.py](rov_model.py) registry keeps the plant and the controller in sync:
 
 ```bash
-                   python teleop.py --square --ctrl dobmpc --disturb   # heavy (default)
-ROV_MODEL=bluerov2 python teleop.py --square --ctrl dobmpc --disturb   # vectored-6 (rank-5)
-                   python -m dobmpc.eval_dp --ctrls pid,mpc,dobmpc     # heavy, headless
+                        python teleop.py --square --ctrl dobmpc --disturb   # heavy (default)
+ROV_MODEL=bluerov2      python teleop.py --square --ctrl dobmpc --disturb   # vectored-6 (rank-5)
+ROV_MODEL=heavy_gripper python teleop.py --observe                          # payload variant
+                        python -m dobmpc.eval_dp --ctrls pid,mpc,dobmpc     # heavy, headless
 ```
 
-| | bluerov2 | heavy |
-|---|---|---|
-| thrusters | 6 (rank 5) | 8 (rank 6, **fully actuated**) |
-| mass / inertia | 11.2 kg / [0.30375, 0.626, 0.5769] | 11.5 kg / [0.3291, 0.6347, 0.6109]† |
-| NMPC input | `u=[X,Y,Z,N]` (NU 4) | `u=[X,Y,Z,K,M,N]` (NU 6) |
-| pitch | floats to trim (~12°) | actively leveled (~0.8°) |
+| | bluerov2 | heavy | heavy_c3 | heavy_gripper |
+|---|---|---|---|---|
+| thrusters | 6 (rank 5) | 8 (rank 6, **fully actuated**) | 8 (rank 6) | 8 (rank 6) + gripper servo (ctrl 8) |
+| mass / inertia | 11.2 kg / [0.30375, 0.626, 0.5769] | 11.5 kg / [0.3291, 0.6347, 0.6109]† | 13.2 kg / [0.37014, 0.73153, 0.67460]§ | 13.724 kg / [0.38154, 0.77780, 0.70954]‡ |
+| net buoyancy | ~+1.1 N | ~+1.1 N | **−3.1 N (sinks)** | **−5.7 N (sinks)** |
+| NMPC input | `u=[X,Y,Z,N]` (NU 4) | `u=[X,Y,Z,K,M,N]` (NU 6) | same as heavy | same as heavy |
+| pitch | floats to trim (~12°) | actively leveled (~0.8°) | ~−1° (heavy gains, no rp-PD) | actively leveled (PID adds rp-PD) |
+
+**§ heavy_c3 = heavy + MarineSitu C3 stereo camera on its C3-BR bracket** — EXACTLY the
+lab's Onshape assembly (the Newton gripper is **not in Onshape yet**, so it is absent;
+`heavy_gripper` is the future config that adds it). Same composition philosophy: vendor C3
+mass 1.700 kg + parallel-axis via [compute_payload_inertia.py](compute_payload_inertia.py)
+`compose_c3()`; MJCF GENERATED from `bluerov_heavy.xml` by
+[gen_c3_variant.py](gen_c3_variant.py) (never hand-edit). Body frame re-origined at the
+composite COM; inertia **diagonal** (`Ixz` +0.046 dropped, 12.4% of Ixx — KNOWN_ISSUES). C3
+mount **measured from the Onshape assembly** (2026-07-19: front-bottom on the centreline,
+lens forward and level; 3 cameras `c3_center/left/right` at the lens plane). Bracket is
+visual-only (mass unknown). Uses `GAINS_HEAVY` (no active roll/pitch leveling → ~1° residual
+pitch from the C3's static moment). Selected with `ROV_MODEL=heavy_c3`; `POOL_TAGS=1` →
+`scene_bluerov_heavy_c3_tags.xml`. Regression: [test_heavy_c3.py](test_heavy_c3.py).
+
+**‡ heavy_gripper = heavy + Newton Subsea Gripper + MarineSitu C3 stereo camera** (the
+real payload this lab bolts on). Rigid-body numbers are COMPOSED, not hand-tuned:
+vendor-verified masses (gripper 524 g air/267 g water; C3 1700 g/430 g) + parallel-axis
+inertia via [compute_payload_inertia.py](compute_payload_inertia.py); the MJCF is
+GENERATED from `bluerov_heavy.xml` by [gen_gripper_variant.py](gen_gripper_variant.py)
+(never hand-edit it). Key properties:
+- **Body frame re-origined at the composite COM** (origin==COM, like heavy) — the dobmpc
+  predictor, `params.ZG_MASS=0`, and hydro all assume it. Inertia is emitted **diagonal**
+  (`Ixz` +0.064 dropped, **16.8% of Ixx** since the C3 moved to its measured front-bottom
+  mount): a `fullinertia` here gets axis-permuted by MuJoCo's principal-axis sort, which
+  breaks hydro's body-frame drag (see KNOWN_ISSUES).
+- **Articulated jaws**: two mirrored slide joints + ONE `position` actuator named
+  `gripper` at **ctrl index 8** (`d.ctrl[8] = 0…0.031` = closed…62 mm open). All thruster
+  code finds actuators by name (`thr0..7`), so the extra actuator is invisible to it.
+- **3 onboard cameras** (`c3_center` 12 MP-equiv fovy 52.5°, `c3_left`/`c3_right` stereo
+  pair, 7.5 cm baseline), mounted **front-bottom on the centreline, lens forward and
+  level** — measured from the lab's Onshape assembly (2026-07-19, onshape-to-robot +
+  mesh registration; the C3-BR bracket straddles the gripper tube with mm clearance).
+  They see the gripper jaws dead ahead (render with
+  `mujoco.Renderer(...).update_scene(d, camera="c3_center")`).
+- **Negative buoyancy** (−5.7 N, no trim foam — deliberate): controllers hold depth with
+  sustained upward thrust; PID gains re-derived (`GAINS_HEAVY_GRIPPER`, same pole
+  placement at the payload masses + roll/pitch leveling PD `rp_kp/rp_kd`).
+- Hydro added-mass/damping stay the heavy set (payload increments ≪ published-set spread;
+  DNV build-up estimates documented in
+  [marinegym_assets/BlueROVHeavyGripper.yaml](marinegym_assets/BlueROVHeavyGripper.yaml) —
+  revisit with in-situ system ID). Verified: `python test_heavy_gripper.py`
+  (composition/buoyancy/gripper/PID) + DOB-MPC DP hold 1.3 cm (still), 1.4 cm (current+waves).
 
 The **heavy** visual is the real MarineGym BlueROVHeavy skin — the body mesh is split
 by material into **cyan foam / white tube / black frame / silver hardware** (matching the
@@ -162,7 +206,7 @@ viewer isn't a black void — default `--sky gradient` (light blue → white), a
 `blue`, `dark`, `none`. It's a skybox texture + a `<visual>` override (haze/ambient) placed
 after the includes, so it's **pure rendering** — no dynamics, no plant-file edit — and only
 the POOL_TAGS scene has it (training on the bare XML stays as-is). Preview:
-[assets/screenshots/pool_sky_gradient.png](../assets/screenshots/pool_sky_gradient.png).
+[assets/screenshots/pool/pool_sky_gradient.png](../assets/screenshots/pool/pool_sky_gradient.png).
 
 The **visual** water column (default **2 m**: seabed z=-0.5 → surface z=+1.5) is ONE
 translucent geom — the animated heightfield's skirt is extruded down to the seabed, so
@@ -192,8 +236,8 @@ physically faithful** — a gentle heave/tilt, barely-rippled. `WATER_WAVE_LAMBD
 shrinks the *visual* wavelength for dramatic ripples; `WATER_WAVE_AMP=<gain>` scales the
 swing. Both are render-only (physics wavenumber/amplitude untouched). Grid/headroom knobs
 live on the generator (`--water-hf-rows/-cols/-elev`, `--no-water-anim` for the old flat
-box). Previews: [assets/screenshots/pool_waves_stylized.mp4](../assets/screenshots/pool_waves_stylized.mp4),
-[pool_waves_faithful.mp4](../assets/screenshots/pool_waves_faithful.mp4).
+box). Previews: [assets/screenshots/pool/pool_waves_stylized.mp4](../assets/screenshots/pool/pool_waves_stylized.mp4),
+[pool_waves_faithful.mp4](../assets/screenshots/pool/pool_waves_faithful.mp4).
 
 ---
 
@@ -290,7 +334,7 @@ default sea state). `--recenter-radius R` swaps in a fixed drift distance instea
 byte-identical with vs without the observe gate). The pool floor + animated water surface
 are on by default in teleop (`POOL_TAGS=0` for a bare scene). Also works headless over
 `--viser` (a **Recenter** button appears; drive buttons are hidden). Preview:
-[assets/screenshots/pool_observe_drift.mp4](../assets/screenshots/pool_observe_drift.mp4).
+[assets/screenshots/pool/pool_observe_drift.mp4](../assets/screenshots/pool/pool_observe_drift.mp4).
 
 **Random headings in observe.** `--observe` draws the **wave heading β** and **current
 heading θ_c** *randomly* in [0,360°) each launch (the legacy-model equivalents of the

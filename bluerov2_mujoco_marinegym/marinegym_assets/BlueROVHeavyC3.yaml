@@ -1,0 +1,93 @@
+# BlueROV2 Heavy + MarineSitu C3 stereo camera on its C3-BR bracket (heavy_c3).
+#
+# EXACTLY the lab's Onshape assembly: heavy + C3 only (the Newton gripper is NOT in
+# Onshape yet, so it is absent — see heavy_gripper / BlueROVHeavyGripper.yaml for the
+# future config that adds it). Derived from BlueROVHeavy.yaml. ONLY volume and coBM change:
+#   volume: 0.0116499 + C3 1.274e-3 (1700-430 g / rho 997) = 0.0129237 m^3
+#           -> net buoyancy ~ -3.1 N (SINKS; the C3 is negatively buoyant and no trim
+#           foam is modeled, per the 2026-07-12 no-foam decision).
+#   coBM:   volume-weighted CB_z minus composite-COM_z = +0.01372 m
+#           (compute_payload_inertia.compose_c3()/buoyancy_c3(); the generated MJCF
+#           re-origins the body frame at the composite COM. hydro.py models only this z
+#           offset — the CB_x-COM_x mismatch leaves ~0.8 N*m static pitch moment unmodeled,
+#           countered by the PID rp-leveling / the NMPC's EAOB).
+#
+# added_mass / damping are the UNCHANGED heavy (Wu 2018) set — DELIBERATE (same
+# HOLD-until-own-system-ID policy as heavy / heavy_gripper): the C3 increment
+# (box 95x165x89 mm, level, lens fwd) is dXu'/dZw' ~ +0.5..0.9 kg (+9%/+6% worst-case),
+# dYv' ~ +0.4 kg (+3%) — small vs the 30-100% spread between published BlueROV2 sets;
+# documented here but NOT applied. -> revisit with in-situ system ID.
+name: BlueROVHeavyC3
+
+drag_coef: 0.3
+volume: 0.0129237
+coBM: 0.01372
+hydro_coef:
+  added_mass:
+  - 5.5
+  - 12.7
+  - 14.57
+  - 0.12
+  - 0.12
+  - 0.12
+  linear_damping:
+  - 4.03
+  - 6.22
+  - 5.18
+  - 0.07
+  - 0.07
+  - 0.07
+  quadratic_damping:
+  - 18.18
+  - 21.66
+  - 36.99
+  - 1.55
+  - 1.55
+  - 1.55
+rotor_configuration:
+  directions:
+  - 1.0
+  - -1.0
+  - 1.0
+  - -1.0
+  - 1.0
+  - -1.0
+  - 1.0
+  - -1.0
+  time_constants:
+  - 0.01
+  - 0.01
+  - 0.01
+  - 0.01
+  - 0.01
+  - 0.01
+  - 0.01
+  - 0.01
+  force_constants:
+  - 4.4e-07
+  - 4.4e-07
+  - 4.4e-07
+  - 4.4e-07
+  - 4.4e-07
+  - 4.4e-07
+  - 4.4e-07
+  - 4.4e-07
+  max_rotation_velocities:
+  - 3900
+  - 3900
+  - 3900
+  - 3900
+  - 3900
+  - 3900
+  - 3900
+  - 3900
+  moment_constants:
+  - 1.3677728816219314e-09
+  - 1.3677728816219314e-09
+  - 1.3677728816219314e-09
+  - 1.3677728816219314e-09
+  - 1.3677728816219314e-09
+  - 1.3677728816219314e-09
+  - 1.3677728816219314e-09
+  - 1.3677728816219314e-09
+  num_rotors: 8

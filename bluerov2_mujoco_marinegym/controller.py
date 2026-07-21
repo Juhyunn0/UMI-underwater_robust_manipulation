@@ -79,9 +79,38 @@ GAINS_BLUEROV2 = dict(
     pitch_guard_deg=15.0,       # soft-scale surge above this |pitch| (deg)
 )
 
-# Selected by the structural property that motivated the split (the surge cap is a
-# rank-5/under-actuation artifact), so a future variant fails safe, not silently.
-DEFAULT_GAINS = GAINS_HEAVY if RM.FULLY_ACTUATED else GAINS_BLUEROV2
+# heavy_gripper — the SAME pole-placement design re-evaluated at the payload masses
+# (heavy + Newton gripper + MarineSitu C3: m=13.724 kg, Iz=0.6906; added-mass set
+# unchanged). Same design point (ωn=2.0 translation / 3.0 yaw, ζ=0.9, α=0.2):
+#   sway  m_eff = 13.724+12.7  = 26.42 kg -> kp=143.7 kd=99.5  ki=42.3 (isotropic hor.)
+#   heave m_eff = 13.724+14.57 = 28.29 kg -> kp=153.9 kd=108.0 ki=45.3
+#   yaw   I_eff = 0.6906+0.12  = 0.811    -> kp=9.92  kd=4.79  ki=4.38
+# The static -5.7 N net buoyancy (payload sinks) is carried by the buoyancy_ff term
+# in compute(), not by these gains.
+GAINS_HEAVY_GRIPPER = dict(
+    kp=(143.7, 143.7, 153.9),   # surge, sway, heave  [N/m]
+    kd=(99.5, 99.5, 108.0),     #                     [N·s/m]
+    ki=(42.3, 42.3, 45.3),      #                     [N/(m·s)]
+    i_max=(4.0, 5.0, 5.0),      # |Ki*integral| clamp [N]
+    f_max=(30.0, 30.0, 30.0),   # rank-6: no surge derate
+    surge_slew=120.0,           # surge force slew-rate limit [N/s]
+    yaw_kp=9.92, yaw_kd=4.79, yaw_ki=4.38, yaw_i_max=2.0, mz_max=10.0,  # yaw [N·m]
+    e_gate=0.15, yaw_gate=0.2,  # integrate only when |error| < gate (m, rad)
+    pitch_guard_deg=15.0,       # soft-scale surge above this |pitch| (deg)
+    # ACTIVE roll/pitch leveling (rank-6): the payload's static attitude torque
+    # (forward COM + jaw weight, ~0.2-0.5 N·m) rivals the passive restoring
+    # B·coBM ≈ 1.1 N·m/rad, so without this the attitude walks off and flips.
+    # PD pole placement at ωn=3, ζ=0.9 on I_eff = I + K'/M': roll 0.481, pitch 0.859.
+    rp_kp=(4.3, 7.7), rp_kd=(2.6, 4.6), rp_max=8.0,   # roll, pitch [N·m]
+)
+
+# Per-variant gains; unknown variants fall back on the structural property that
+# motivated the original split (the surge cap is a rank-5/under-actuation artifact),
+# so a future variant fails safe, not silently.
+_GAINS_BY_MODEL = {"bluerov2": GAINS_BLUEROV2, "heavy": GAINS_HEAVY,
+                   "heavy_gripper": GAINS_HEAVY_GRIPPER}
+DEFAULT_GAINS = _GAINS_BY_MODEL.get(
+    RM.MODEL, GAINS_HEAVY if RM.FULLY_ACTUATED else GAINS_BLUEROV2)
 
 
 class PoseController:
@@ -122,10 +151,13 @@ class PoseController:
         if getattr(self, "actuator", None) is not None:
             self.actuator.reset()
 
-    def set_target(self, p_ref=None, yaw_ref=None, v_ref=None, r_ref=None):
+    def set_target(self, p_ref=None, yaw_ref=None, v_ref=None, r_ref=None,
+                   yaw_target=None):
         """Update the (possibly moving) setpoint. v_ref is the reference world velocity
         used as a feed-forward in the derivative term, for trajectory tracking; r_ref
-        is the reference yaw RATE (heading-follow slew FF) used the same way in yaw."""
+        is the reference yaw RATE (heading-follow slew FF) used the same way in yaw.
+        yaw_target (final edge heading) is accepted for interface parity with the
+        DOB-MPC horizon yaw preview; the PID needs only the instantaneous r_ref FF."""
         if p_ref is not None:
             self.p_ref = np.asarray(p_ref, float)
         if yaw_ref is not None:
@@ -194,7 +226,21 @@ class PoseController:
             mz += g["yaw_ki"] * self._I_yaw
         mz = float(np.clip(mz, -g["mz_max"], g["mz_max"]))
 
-        wrench = np.array([F_body[0], F_body[1], F_body[2], 0.0, 0.0, mz])  # Mx=0,My=0
+        # OPTIONAL roll/pitch leveling PD (rank-6 only; gains provide rp_kp to enable).
+        # Needed by heavy_gripper: the asymmetric payload (forward COM + jaw weight)
+        # applies a static attitude torque comparable to the passive coBM restoring
+        # (~1.1 N·m/rad), which alone lets the attitude walk off and eventually flip.
+        # heavy/bluerov2 gains omit rp_kp -> Mx=My=0, byte-identical behavior.
+        mx = my = 0.0
+        if g.get("rp_kp") is not None:
+            rp_kp = np.asarray(g["rp_kp"]); rp_kd = np.asarray(g["rp_kd"])
+            roll = float(np.arctan2(R[2, 1], R[2, 2]))
+            p_rate, q_rate = float(data.qvel[3]), float(data.qvel[4])
+            rp_max = float(g.get("rp_max", 8.0))
+            mx = float(np.clip(-rp_kp[0] * roll - rp_kd[0] * p_rate, -rp_max, rp_max))
+            my = float(np.clip(-rp_kp[1] * pitch - rp_kd[1] * q_rate, -rp_max, rp_max))
+
+        wrench = np.array([F_body[0], F_body[1], F_body[2], mx, my, mz])
         self.commanded = wrench
         return wrench
 

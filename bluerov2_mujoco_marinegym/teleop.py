@@ -1139,14 +1139,22 @@ def selftest(model, data, scale=1.0):
     m = model.body_mass[bid]
     I = np.array(model.body_inertia[bid])
 
+    ipos = np.array(model.body_ipos[bid])   # COM offset from the body origin (0 for
+                                            # heavy/bluerov2; nonzero with a payload)
+
     def accel6(ch):
         mujoco.mj_resetData(model, data)
         data.qpos[:7] = [0, 0, 0, 1, 0, 0, 0]
         tp.wrench[:] = 0.0
         tp.on_key(ch)
         mujoco.mj_forward(model, data)
-        return np.concatenate([m * np.array(data.qacc[:3]),
-                               I * np.array(data.qacc[3:6])])  # [F; M]
+        # Free-joint linear qacc is the acceleration of the body ORIGIN. When the COM
+        # is offset (payload variants), a pure torque about the COM swings the origin
+        # (a_origin = a_com - alpha x r_com), which would leak into the force metric.
+        # Report the COM acceleration instead: a_com = a_origin + alpha x r_com
+        # (identity pose, zero velocity). Identical to before when ipos == 0.
+        a_com = np.array(data.qacc[:3]) + np.cross(np.array(data.qacc[3:6]), ipos)
+        return np.concatenate([m * a_com, I * np.array(data.qacc[3:6])])  # [F; M]
 
     expect = {"W": (0, +1), "S": (0, -1), "Q": (1, +1), "E": (1, -1),
               "R": (2, +1), "F": (2, -1), "A": (5, +1), "D": (5, -1),

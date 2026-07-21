@@ -14,6 +14,13 @@ vendor/
 *.run
 *.whl
 
+# Onshape API credentials (never commit)
+.env
+
+# onshape-to-robot export meshes (258 MB of per-part STLs; robot.xml + config.json ARE
+# tracked — the poses used by the sim are frozen in process_c3_mesh.py)
+assets/CAD files/onshape_export/assets/
+
 # acados generated C code (regenerated on solver construction; not a source artifact)
 **/dobmpc/_acados_gen/
 MUJOCO_LOG.TXT

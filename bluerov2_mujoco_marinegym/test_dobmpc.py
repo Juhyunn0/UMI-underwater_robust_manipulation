@@ -198,12 +198,50 @@ def test_pitch_aware():
           f"|theta|<={P.THETA_MAX} rad bound (<1.2)")
 
 
+def test_xref_yaw_preview():
+    """_xref_ned: (a) r_ref=0 & v_ref=0 reduces EXACTLY to the constant-pose tile
+    (DP unchanged), (b) a world-FLU +yaw-rate lands in the NED yaw-rate slot xref[11]
+    with the correct -r_ref sign (S flip), (c) the yaw-angle preview ramps toward the
+    final heading and is CLAMPED there (never over-rotates past the corner)."""
+    import types
+    from dobmpc_controller import DOBMPCController, _Rz_flu
+
+    def stub(yaw_ref, yaw_target, r_ref, psi_now=0.0, v_ref=(0, 0, 0)):
+        s = types.SimpleNamespace()
+        s.nmpc = types.SimpleNamespace(N=60)
+        s.p_ref = np.zeros(3)
+        s.v_ref = np.asarray(v_ref, float)
+        s.yaw_ref = yaw_ref
+        s.yaw_target = yaw_target
+        s.r_ref = r_ref
+        s._psi_ned_now = psi_now
+        return s
+
+    # (a) DP-equivalence: no motion, no turn -> velocity/rate rows 0, orientation constant
+    x0 = DOBMPCController._xref_ned(stub(0.3, 0.3, 0.0, psi_now=-0.3))
+    assert np.allclose(x0[6:12, :], 0.0), "DP: velocity/rate reference must be zero"
+    assert np.allclose(x0[3:6, :], x0[3:6, :1]), "DP: orientation must be constant over horizon"
+
+    # (b) turning: world-FLU +yaw-rate r -> NED yaw-rate slot xref[11] = -r while ramping
+    r = 1.047
+    x1 = DOBMPCController._xref_ned(stub(yaw_ref=0.0, yaw_target=np.pi / 2, r_ref=r, psi_now=0.0))
+    assert np.isclose(x1[11, 1], -r), f"xref[11] must be -r_ref (S sign flip), got {x1[11, 1]:.4f}"
+
+    # (c) clamp: NED target = -pi/2 (yaw flips FLU->NED); ramp reaches it and stops, rate->0
+    assert np.isclose(x1[5, -1], -np.pi / 2, atol=1e-6), f"yaw not clamped at target: {x1[5, -1]:.4f}"
+    assert np.isclose(x1[11, -1], 0.0), "rate FF must be 0 once clamped at the target"
+    # monotone toward target, never past it (all stages within [target, start])
+    assert np.all(x1[5, :] >= -np.pi / 2 - 1e-9) and np.all(x1[5, :] <= 1e-9), "yaw preview over-rotated"
+    print("[yaw-preview] OK  DP-equivalent at r_ref=0; xref[11]=-r_ref (S sign); ramp clamped at target")
+
+
 def main():
     test_frames()
     test_predictor()
     test_eaob_no_accel_doublecount()
     test_casadi_matches_numpy()
     test_pitch_aware()
+    test_xref_yaw_preview()
     print("\nDOBMPC UNIT TESTS PASSED")
 
 

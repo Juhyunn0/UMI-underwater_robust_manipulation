@@ -46,7 +46,7 @@ experiment:
   settle_s: 10.0        # steady-state window start [s]
   settle_band_cm: 5.0   # settling-time band (radial error) [cm]
   directions:           # heading sweep: theta_c (current) x beta (wave)
-    n_random: 100               # <-- THE knob: sample N random (current, wave) heading
+    n_random: 200              # <-- THE knob: sample N random (current, wave) heading
     #                           pairs; current AND wave headings drawn independently
     direction_seed: 100       # reproducible draw of the current headings
     sweep_wave_heading: true  # wave heading beta randomized per point too
@@ -67,10 +67,10 @@ experiment:
     depth: 0.0
     heading_follow: true   # face travel direction (yaw -> path tangent); false = yaw fixed 0
     yaw_rate_deg_s: 60     # heading slew-rate limit for smooth corner turns (90 deg ~ 1.5 s)
-  # secondary: null       # nothing else in the preliminary run
-  secondary:             # DP deferred — to run it later, RENAME this key to `primary` (or `secondary`)
-    scenario: dp
-    modes: [NONE, C, CD, CW, CDW]   # NONE = still water baseline (no current/waves)
-    seeds: [0]                # bump to [0,1,2,3,4] for the full DP run
-    start: [0.1, 0.05, 0.0]   # initial offset from the origin setpoint [m]
-    depth: 0.0                # DP hold depth (FLU body z)
+  secondary: null        # DP disabled — square sweep only
+  # secondary:           # DP deferred — to run it later, uncomment this block and
+  #   scenario: dp       # set the key above to this block instead of null
+  #   modes: [NONE, C, CD, CW, CDW]   # NONE = still water baseline (no current/waves)
+  #   seeds: [0]                # bump to [0,1,2,3,4] for the full DP run
+  #   start: [0.1, 0.05, 0.0]   # initial offset from the origin setpoint [m]
+  #   depth: 0.0                # DP hold depth (FLU body z)
