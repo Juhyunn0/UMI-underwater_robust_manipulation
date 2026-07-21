@@ -235,6 +235,118 @@ def test_xref_yaw_preview():
     print("[yaw-preview] OK  DP-equivalent at r_ref=0; xref[11]=-r_ref (S sign); ramp clamped at target")
 
 
+def test_xref_traj_preview():
+    """_xref_ned with a mission trajectory sampler (tracking mode):
+    (a) a constant sampler reproduces the constant-pose DP tile EXACTLY,
+    (b) a corner inside the horizon BENDS the position preview at the corner stage
+        (the setpoint body would extrapolate straight through),
+    (c) the stage-wise body-velocity reference rotates onto the new leg + the
+        yaw-rate FF lands in xref[11] with the -r sign flip,
+    (d) stage-to-stage yaw unwrap stays continuous across +-pi, anchored at psi_now."""
+    import types
+    from dobmpc_controller import DOBMPCController
+
+    N = 60
+    dt = P.DT_CTRL
+
+    def stub(traj, psi_now=0.0):
+        s = types.SimpleNamespace()
+        s.nmpc = types.SimpleNamespace(N=N)
+        s._ref_traj = traj
+        s._psi_ned_now = psi_now
+        return s
+
+    # (a) constant sampler == the constant-pose DP tile from the setpoint body
+    p0, yaw0 = np.array([0.4, -0.3, 0.2]), 0.3
+
+    def const_traj(ts):
+        K = np.asarray(ts).size
+        return (np.tile(p0[:, None], (1, K)), np.full(K, yaw0),
+                np.zeros((3, K)), np.zeros(K))
+
+    sp = types.SimpleNamespace(nmpc=types.SimpleNamespace(N=N), p_ref=p0,
+                               v_ref=np.zeros(3), yaw_ref=yaw0, yaw_target=yaw0,
+                               r_ref=0.0, _psi_ned_now=-0.3, _ref_traj=None)
+    x_dp = DOBMPCController._xref_ned(sp)                          # setpoint body
+    x_tr = DOBMPCController._xref_ned_traj(stub(const_traj, psi_now=-0.3), 5.0)
+    assert np.allclose(x_dp, x_tr, atol=1e-12), "constant sampler must equal the DP tile"
+
+    # (b)+(c) corner at t_c: +x leg then +y leg, yaw ramps at w from the vertex
+    v, t_c, w = 0.15, 1.0, np.radians(60.0)
+
+    def corner_traj(ts):
+        ts = np.asarray(ts, float)
+        K = ts.size
+        p = np.empty((3, K)); vv = np.empty((3, K))
+        yaw = np.empty(K); r = np.empty(K)
+        for j, t in enumerate(ts):
+            if t < t_c:
+                p[:, j] = (v * t, 0.0, 0.0); vv[:, j] = (v, 0.0, 0.0)
+                yaw[j] = 0.0; r[j] = 0.0
+            else:
+                p[:, j] = (v * t_c, v * (t - t_c), 0.0); vv[:, j] = (0.0, v, 0.0)
+                ramp = min(w * (t - t_c), np.pi / 2)
+                yaw[j] = ramp; r[j] = w if ramp < np.pi / 2 else 0.0
+        return p, yaw, vv, r
+
+    x = DOBMPCController._xref_ned_traj(stub(corner_traj), 0.0)
+    kc = int(np.ceil(t_c / dt))                     # first stage at/past the vertex
+    assert np.allclose(x[0, :kc], v * np.arange(kc) * dt), "pre-corner: preview along +x"
+    assert np.allclose(x[0, kc:], v * t_c), "post-corner: x must freeze at the vertex"
+    assert np.all(x[1, kc + 1:] < -1e-6), "post-corner: NED y must decrease (FLU +y leg)"
+    assert np.allclose(x[7, :kc], 0.0, atol=1e-9), "pre-corner: no sway reference"
+    assert np.any(np.abs(x[7, kc:]) > 0.01), "post-corner: sway reference must appear"
+    assert np.allclose(x[11, :kc], 0.0) and np.isclose(x[11, kc + 1], -w), \
+        "yaw-rate FF must be 0 before the corner and -r (S flip) during the ramp"
+
+    # (d) unwrap continuity: FLU yaw 170 -> 190 deg crosses +-pi in NED (-170 -> -190)
+    def wrapcross_traj(ts):
+        K = np.asarray(ts).size
+        yaw = np.radians(170.0) + np.radians(20.0) * np.linspace(0.0, 1.0, K)
+        return (np.zeros((3, K)), yaw, np.zeros((3, K)), np.zeros(K))
+
+    psi0 = -np.radians(170.0)                       # NED yaw = -FLU yaw
+    xw = DOBMPCController._xref_ned_traj(stub(wrapcross_traj, psi_now=psi0), 0.0)
+    dpsi = np.diff(xw[5, :])
+    assert np.all(np.abs(dpsi) < 0.02), f"yaw preview jumped across +-pi: {np.abs(dpsi).max():.3f}"
+    assert np.isclose(xw[5, 0], psi0, atol=1e-9), "yaw preview must anchor at psi_now"
+    print("[traj-preview] OK  constant==DP tile; corner bends position+velocity preview; "
+          "rate-FF sign; yaw unwrap continuous across +-pi")
+
+
+def test_square_ref_matches_live_loop():
+    """make_square_ref's load-bearing claim: the precomputed heading profile equals
+    the live loop's slew_heading recursion at every physics step (the heading
+    command has no vehicle feedback, so its future is knowable). One small lap
+    (all 4 corners incl. the +-pi leg) at the real physics dt; p/v must equal
+    square_setpoint exactly and yaw/r must match the recursion exactly on-grid.
+    If someone ever adds vehicle feedback to the heading command, this fails."""
+    from experiments.run_compare import square_setpoint, slew_heading, make_square_ref
+
+    size, speed, depth, dt = 0.25, 0.15, 0.0, 0.002
+    yaw_rate = np.radians(60.0)
+    T = 4.0 * size / speed                                     # one lap = 6.67 s
+    ref = make_square_ref(size, speed, depth, True, yaw_rate, dt, T + 4.0)
+
+    yaw_cmd = 0.0
+    ts = np.arange(0.0, T, dt)
+    p, yaw, v, r = ref(ts)                                     # one vectorized call
+    for i, t in enumerate(ts):
+        (rx, ry), (tx, ty) = square_setpoint(t, size, speed)
+        yaw_new = slew_heading(yaw_cmd, tx, ty, yaw_rate, dt)
+        r_cmd = (yaw_new - yaw_cmd) / dt
+        yaw_cmd = yaw_new
+        assert abs(p[0, i] - rx) < 1e-12 and abs(p[1, i] - ry) < 1e-12, f"p mismatch @t={t}"
+        assert abs(v[0, i] - speed * tx) < 1e-12 and abs(v[1, i] - speed * ty) < 1e-12
+        assert abs(yaw[i] - yaw_cmd) < 1e-9, f"yaw sampler != live loop @t={t:.3f}"
+        assert abs(r[i] - r_cmd) < 1e-9, f"r sampler != live loop @t={t:.3f}"
+    # at t=T-dt the 4th-corner turn (vertex exactly at t=T) has not started yet, so
+    # the CCW accumulation stands at 3 completed 90-deg turns = 3pi/2 (no wrap-back)
+    assert abs(yaw_cmd - 1.5 * np.pi) < 0.05, f"expected ~3pi/2 accumulated, got {yaw_cmd:.3f}"
+    print("[square-ref] OK  sampler == live slew recursion over a full lap "
+          "(p/v exact, yaw/r < 1e-9)")
+
+
 def main():
     test_frames()
     test_predictor()
@@ -242,6 +354,8 @@ def main():
     test_casadi_matches_numpy()
     test_pitch_aware()
     test_xref_yaw_preview()
+    test_xref_traj_preview()
+    test_square_ref_matches_live_loop()
     print("\nDOBMPC UNIT TESTS PASSED")
 
 

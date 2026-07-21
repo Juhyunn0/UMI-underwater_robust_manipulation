@@ -1048,3 +1048,35 @@ C3/mount poses byte-identical to the frozen constants — the user's mates are f
 visualisation chain. Housing/bracket now use the exact Onshape appearance colors (blue 0.231/0.380/0.706, gray
 0.753). Renders match the user's front view (landscape screwed panel forward, connector to port):
 `assets/screenshots/c3/heavy_c3_front_full.png`. Dynamics untouched (visual-only geoms); both variant suites pass.
+
+---
+
+## 2026-07-21 — MPC reference preview (tracking mode): the horizon now sees corners
+
+Motivated by the n=200 corner analysis (compare_20260720_230025): the dominant routine corner deviation for
+mpc/dobmpc — outside corner-rounding, corner/edge RMS ratio ~2.4–2.9× for dobmpc, present identically in NONE —
+traced to the horizon reference being a straight-line extrapolation `p_ref + v_ref·k·dt` through corners
+(`_xref_ned`), i.e. the NMPC never saw the turn coming. That extrapolation was an artifact of growing the tracking
+reference out of the constant-pose DP tile behind the PID-parity `set_target()` interface; DP (point stabilization)
+and trajectory tracking are different problems and now have separate reference modes.
+
+**Change** — standard receding-horizon reference preview (textbook tracking-MPC form; same pattern as rpg_mpc's
+`setReferenceTrajectory`, acados stage-wise `yref`): `DOBMPCController.set_reference_traj(fn)` takes a mission
+sampler `fn(ts) → (p (3,K), yaw (K), v (3,K), r (K))` in world FLU; each 20 Hz tick fills the acados stage
+references from `fn(t + k·dt)`, k=0..N (3 s), so a corner inside the horizon bends the position preview, rotates
+the stage-wise body-velocity reference `S·R(ψ_k)ᵀ·v_k` onto the new leg, and ramps the per-stage yaw/rate FF. Yaw
+is unwrapped stage-to-stage anchored at the measured yaw (short-way across ±π, bounded over 10 CCW laps by the
+per-tick re-anchor). Mission side: `run_compare.make_square_ref()` — position/tangent are exact `square_setpoint`
+evaluations; the heading profile is precomputed with the SAME `slew_heading` recursion as the live loop (no vehicle
+feedback → knowable future), verified equal to <1e-9 over a full lap (`test_square_ref_matches_live_loop`). Wired
+in `run_one` and `run_viewer` for mpc/dobmpc square runs only; PID, DP, and teleop keep the plain `set_target`
+path (legacy body verified bit-identical via the constant-sampler test). No OCP/model/cost change — runtime
+reference data only, no acados rebuild; the sharp (corner-infeasible) square reference is kept deliberately as the
+benchmark stress test (P2 review: reference smoothing would change the task; observed rounding = the controller's
+optimal smoothing). Provenance: run meta now records `controller.ref_preview` (all runs before 2026-07-21 are
+False-equivalent — do not pool square mpc/dobmpc results across this boundary). P2 review (simulation-advisor +
+control-theory-advisor): no wrong findings; applied their minimal fixes (meta provenance, sampler shape gate,
+`reset()` clears the sampler). Expected effect (theory): corner transient shrinks several-fold and flips sign to
+anticipatory inside-cut; solver failures same or fewer (tick-to-tick reference now changes smoothly instead of the
+all-stages-at-once 90° flip at the vertex). The comparison experiments themselves are deliberately left to be
+rerun by the user.

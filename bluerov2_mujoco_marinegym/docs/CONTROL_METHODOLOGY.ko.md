@@ -939,3 +939,32 @@ geom_quat이 정확히 mesh_quat⊗mesh_quat로 나옴). 즉 XML geom pose는 **
 시각화 체인에 있었다. 하우징/브래킷은 Onshape 외관 색 그대로(파랑 0.231/0.380/0.706, 회색 0.753). 렌더가 사용자
 정면 뷰와 일치(가로 나사 패널이 전방, 커넥터는 좌현): `assets/screenshots/c3/heavy_c3_front_full.png`. 동역학은
 무변경(visual-only geom); 두 변종 테스트 스위트 통과.
+
+---
+
+## 2026-07-21 — MPC 참조 preview (tracking 모드): 호라이즌이 이제 코너를 본다
+
+n=200 코너 분석(compare_20260720_230025)이 동기: mpc/dobmpc의 일상적 코너 편차(outside corner-rounding,
+dobmpc corner/edge RMS 비율 ~2.4–2.9×, NONE에서도 동일)는 호라이즌 참조가 코너를 직진 관통 외삽
+(`p_ref + v_ref·k·dt`, `_xref_ned`)하는 데서 나왔다 — NMPC가 턴을 미리 본 적이 없었던 것. 이 외삽은
+constant-pose DP 타일을 PID-동등 `set_target()` 인터페이스 위에서 키워온 흔적이며, DP(점 안정화)와
+trajectory tracking은 다른 문제이므로 이제 참조 모드를 분리했다.
+
+**변경** — 표준 receding-horizon reference preview (교과서 tracking-MPC 정식화; rpg_mpc
+`setReferenceTrajectory`, acados stage별 `yref`와 같은 패턴): `DOBMPCController.set_reference_traj(fn)`이
+미션 샘플러 `fn(ts) → (p (3,K), yaw (K), v (3,K), r (K))` (world FLU)를 받아, 매 20 Hz tick마다
+`fn(t + k·dt)` (k=0..N, 3 s)로 acados stage 참조를 채운다 — 호라이즌 안의 코너가 위치 preview를 꺾고,
+stage별 body-속도 참조 `S·R(ψ_k)ᵀ·v_k`를 새 leg로 회전시키고, stage별 yaw/rate FF를 램프시킨다. yaw는
+측정 yaw에 앵커한 stage-간 unwrap(±π short-way; 매 tick 재앵커로 10랩 CCW에도 유계). 미션 쪽:
+`run_compare.make_square_ref()` — 위치/접선은 `square_setpoint` 정확값, heading 프로파일은 live 루프와
+**같은** `slew_heading` 재귀로 사전계산(차량 피드백 없음 → 미래가 알려짐), 1랩 전체에서 <1e-9 일치 검증
+(`test_square_ref_matches_live_loop`). `run_one`·`run_viewer`의 mpc/dobmpc square에만 배선; PID·DP·teleop은
+기존 `set_target` 경로 유지(상수-샘플러 테스트로 legacy body 비트 동일 확인). OCP/모델/비용 무변경 —
+런타임 참조 데이터만이라 acados 재빌드 없음; 코너-불가능한 sharp square 참조는 벤치마크 스트레스 테스트로
+**의도적으로 유지**(P2 리뷰: 참조 smoothing은 과제 정의를 바꿈; 관측되는 rounding이 곧 컨트롤러의 최적
+smoothing). Provenance: run meta에 `controller.ref_preview` 기록(2026-07-21 이전 run은 전부 False에 해당 —
+이 경계를 넘어 square mpc/dobmpc 결과를 합산하지 말 것). P2 리뷰(simulation-advisor +
+control-theory-advisor): wrong 판정 0건; 최소 수정 3건 반영(meta provenance, 샘플러 shape 게이트,
+`reset()`의 샘플러 해제). 이론 예상: 코너 과도 수 배 감소 + 부호가 선제적 inside-cut으로 반전; 솔버 실패는
+동일하거나 감소(vertex에서 전 stage가 한꺼번에 90° 도는 대신 tick 간 참조가 매끄럽게 변함). 비교 실험
+재실행은 의도적으로 사용자 몫으로 남김.

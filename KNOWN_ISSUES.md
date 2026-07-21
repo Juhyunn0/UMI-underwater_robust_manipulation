@@ -58,6 +58,24 @@
   폐루프도 검증됨(DP hold 1.3 cm). heavy/bluerov2는 여전히 PASS.
 - **제대로 고치려면**: 게이트를 변종별 스케일 또는 ‖u‖ 상대비로.
 
+### 파랑 모드에서 acados 솔버 실패(n_fail)가 드물게 자세/깊이 blowup 유발
+- **발견**: 2026-07-21 (`compare_20260720_221845` 분석 워크플로; n=200
+  `compare_20260720_230025`로 규모 확정)
+- **증상**: n=200 census — 3000 run 중 217 run에서 총 289회 실패, 전부 MPC 계열이고
+  89–99%가 CW/CDW(run 실패율 **mpc 14.0% vs dobmpc 7.7%** — EAOB FF가 OCP를 오히려
+  안정화). 실패 run에서 depth/pitch 결합 극단 excursion — mpc 최대 181.8 cm(pitch 최대
+  79.5°), dobmpc 최대 134.7 cm(|pz| 97 cm). **dobmpc radial_max>40 cm는 23/23이 fail run**
+  (클린 run 상한 37.8 cm) → worst-case 통계를 이 클래스가 지배. 트리거는 seed-0 공통
+  파랑그룹의 lap-7/8 V3 턴 이벤트이고 실패는 증폭자(원인 아님, run-level 연관만 확인 가능).
+- **임시 대응**: 분석 시 `n_fail>0` run의 radial_max는 별도 취급(RMS 집계는 강건:
+  제외해도 평균 −3~−8%만 이동).
+- **제대로 고치려면**: (1) 실패 **시각** 로깅(현재 run당 카운트만 있어 tick-level 인과
+  확정 불가), (2) 실패 시 fallback 전략 점검(mpc_acados 실패 경로), (3) traj CSV에
+  w_hat·solver-status 기록 추가.
+- **2026-07-21 갱신**: reference preview 도입 후 실패율 급감(공유 50 heading 기준 dobmpc
+  10–13→1–2런, mpc 16→7/12→4) 및 dobmpc >40 cm 꼬리 소멸 — 그러나 이슈 자체는 잔존
+  (mpc CDW에 신규 210 cm blowup; 위 세 수정은 여전히 유효).
+
 ### hydro.py는 body_iquat=identity(대각 관성)를 암묵 전제
 - **발견**: 2026-07-12 (heavy_gripper NMPC 발산 근본원인 추적으로 발견)
 - **증상**: `mj_objectVelocity(mjOBJ_BODY, local=1)`은 **inertial(주축) 프레임** 기준인데
@@ -72,15 +90,6 @@
   −0.0016(0.4%) → **heavy_gripper +0.064 kg·m² (Ixx의 16.8%) / heavy_c3 +0.046 (12.4%)**
   로 커짐. 실기체에 존재할 roll-yaw 곱관성이 플랜트에 없다는 뜻 — hydro를 body-frame으로
   고치기 전까지는 구조적으로 못 넣는다. 위 "제대로 고치려면"의 우선순위가 올라감.
-
-## ⏳ 보류 중 (알고 있지만 아직 안 돌린 것)
-
-### 새 PID gain으로 full compare 미재실행
-- **상태**: 2026-07-03에 heavy PID를 pole-placed `GAINS_HEAVY`로 교체했지만
-  **run_compare full matrix는 old gains 결과가 마지막**. 이전 PID 결과와 비교할 땐
-  각 결과 폴더 `meta.json`의 `pid_gains`로 구분할 것.
-- **할 일**: `python -m experiments.run_compare --config config/base.yaml` 재실행 후
-  결과 figure/표 갱신.
 
 ## 📌 알려진 한계 (당장 고칠 계획 없음, 잊지 말 것)
 
@@ -108,10 +117,15 @@
 - 그리퍼가 Onshape에 추가되면: export 재실행 → 브래킷처럼 실측 위치로 GRIP_POS 갱신 →
   heavy_gripper 재생성.
 
-### sim 차체 스킨은 실물 대비 2.3% 큼 (MarineGym USD 유래)
+### 방향 sweep이 seed-0 파랑 실현 하나를 공유 — worst-vertex 통계는 단일-실현 아티팩트
+- 발견 2026-07-21 (`compare_20260720_230025` 코너 기하 분석): 모든 (current, wave) 헤딩쌍
+  run이 **같은 seed-0 파랑 시계열**을 봄(실현 반복 주기 264.8 s ≈ run 길이 266.7 s) →
+  특정 절대시각의 wave-group이 매 run 같은 lap/vertex를 때림(dobmpc 400 run 중 181개가
+  t=200–210 s에 피크, worst vertex 66%가 V3). 방향 의존 결론은 **per-passage 상대각 통계**
+  로만 뽑을 것; vertex별·시각별 주장은 multi-seed 재실행 전에는 출판 불가.
 - 발견 2026-07-19 (C3 위치 정합 중): 스킨 bbox = 벤더 치수 × 1.0233 (세 축 균일).
 - C3/페이로드 배치는 **실측 metric**(COM 앵커) 기준이라 동역학·카메라는 정확하지만,
   렌더에서 페이로드가 스킨 대비 ~3–5 mm 어긋나 보일 수 있음(코스메틱).
 
 ---
-*마지막 갱신: 2026-07-19*
+*마지막 갱신: 2026-07-21*

@@ -65,6 +65,7 @@ class DOBMPCController:
         self.v_ref = np.zeros(3)                 # world-FLU reference velocity (DP: 0)
         self.r_ref = 0.0                         # reference yaw rate (heading-follow FF)
         self.yaw_target = float(yaw_ref)         # final edge heading for the yaw preview
+        self._ref_traj = None                    # mission trajectory sampler (tracking)
 
         self.nmpc = make_nmpc(N=N, dt=P.DT_CTRL)   # acados (fast) or ipopt (ref)
         self.eaob = None                         # lazy-init at first tick (needs eta0)
@@ -97,9 +98,29 @@ class DOBMPCController:
         # preview (delta == 0). The NMPC uses yaw_ref + r_ref + yaw_target on turns.
         self.yaw_target = float(yaw_target) if yaw_target is not None else self.yaw_ref
 
+    def set_reference_traj(self, fn):
+        """Give the NMPC the mission's TIME-PARAMETERIZED reference (tracking mode).
+
+        `fn(ts)` takes a 1-D array of absolute sim times (K,) and returns the
+        reference at those times, all in world FLU (same conventions as set_target):
+            p   (3, K)  position          yaw (K,)  heading command
+            v   (3, K)  path velocity     r   (K,)  heading slew rate
+        With a sampler set, every control tick fills the acados stage references
+        yref_k from fn(t + k*dt), k = 0..N -- the standard receding-horizon
+        reference preview of trajectory-tracking MPC -- so corners (position,
+        heading AND velocity direction changes) inside the 3 s horizon are seen
+        in advance instead of being straight-line-extrapolated through.
+        `fn=None` clears it and falls back to the set_target interface, which
+        remains the DP / teleop / station-keeping path (point stabilization and
+        trajectory tracking are deliberately separate reference modes). reset()
+        also clears the sampler -- re-arm it after reset, as run_compare/run_viewer
+        do."""
+        self._ref_traj = fn
+
     def reset(self):
         self.eaob = None
         self.r_ref = 0.0
+        self._ref_traj = None                    # tracking sampler does not survive reset
         self._tau_flu = np.zeros(6)
         self._tau_ned_cmd = np.zeros(6)
         self._nu_prev_ned = None
@@ -118,11 +139,17 @@ class DOBMPCController:
         nu_flu = np.concatenate([res[3:6], res[0:3]])         # [lin; ang], body frame
         return p, R, nu_flu
 
-    def _xref_ned(self):
+    def _xref_ned(self, t=None):
         """Horizon trajectory reference (12, N+1) in NED.
 
-        Over the original constant-pose DP tile this adds, all as RUNTIME reference
-        data (model + cost untouched -> NO acados rebuild):
+        Two reference modes, dispatched on set_reference_traj:
+          * TRACKING (sampler set, t given): delegate to _xref_ned_traj -- true
+            receding-horizon preview sampled from the mission trajectory.
+          * DP / SETPOINT (no sampler; this body): the set_target interface --
+            constant pose extrapolated with the current v_ref/r_ref.
+
+        Over the original constant-pose DP tile this body adds, all as RUNTIME
+        reference data (model + cost untouched -> NO acados rebuild):
           * velocity feed-forward: the path velocity self.v_ref (world FLU) becomes
             the reference body velocity nu_ref (so the MPC stops fighting motion);
           * position preview: the setpoint is extrapolated forward over the horizon
@@ -138,6 +165,8 @@ class DOBMPCController:
         unwrap is a no-op when |psi_ref - psi_now| < pi), so DP / station-keeping is
         unchanged.
         """
+        if getattr(self, "_ref_traj", None) is not None and t is not None:
+            return self._xref_ned_traj(float(t))
         N = self.nmpc.N
         dt = P.DT_CTRL
         R_ref = _Rz_flu(self.yaw_ref)
@@ -170,6 +199,50 @@ class DOBMPCController:
             xref[11, :] = np.where(np.abs(step) < abs(delta) - 1e-12, r_ned, 0.0)  # rate FF (Q 10)
         return xref
 
+    def _xref_ned_traj(self, t0):
+        """Horizon reference (12, N+1) sampled from the mission trajectory.
+
+        The standard trajectory-tracking form: stage k gets the TRUE reference at
+        t0 + k*dt (position, heading, path velocity, heading rate), so a corner
+        inside the horizon bends the position preview, rotates the stage-wise
+        body-velocity reference onto the new leg, and ramps the yaw reference --
+        the NMPC starts turning BEFORE the vertex instead of extrapolating
+        straight through it (the _xref_ned setpoint body's known artifact).
+
+        Frame handling mirrors _xref_ned exactly: world-FLU pose -> NED via
+        frames.flu_to_ned_eta; per-stage body-FLU linear velocity R_k^T v_k -> FRD
+        via S; world +yaw-rate -> NED r with the S sign flip. Yaw is unwrapped
+        stage-to-stage anchored at the current measured yaw (_psi_ned_now), so the
+        no-wrap NMPC cost always turns the short way across +-pi and stays
+        continuous along the horizon."""
+        N = self.nmpc.N
+        dt = P.DT_CTRL
+        ts = t0 + np.arange(N + 1) * dt
+        p_w, yaw_w, v_w, r_w = self._ref_traj(ts)          # world FLU, vectorized
+        p_w = np.asarray(p_w, float)
+        v_w = np.asarray(v_w, float)
+        yaw_w = np.asarray(yaw_w, float).ravel()
+        r_w = np.asarray(r_w, float).ravel()
+        # hard shape gate: a transposed (K,3) return would silently scramble
+        # components under reshape -- fail loudly instead
+        assert p_w.shape == (3, N + 1) and v_w.shape == (3, N + 1), \
+            f"sampler must return (3,{N + 1}) p/v, got {p_w.shape}/{v_w.shape}"
+        assert yaw_w.size == N + 1 and r_w.size == N + 1, \
+            f"sampler must return {N + 1} yaw/r samples, got {yaw_w.size}/{r_w.size}"
+
+        xref = np.zeros((12, N + 1))
+        xref[0:3, :] = frames.S @ p_w
+        psi_prev = self._psi_ned_now
+        for k in range(N + 1):
+            Rk = _Rz_flu(yaw_w[k])
+            eta_k = frames.flu_to_ned_eta(p_w[:, k], Rk)
+            psi_prev = psi_prev + wrap_angle(eta_k[5] - psi_prev)   # short-way unwrap
+            xref[3:5, k] = eta_k[3:5]
+            xref[5, k] = psi_prev
+            xref[6:9, k] = frames.S @ (Rk.T @ v_w[:, k])   # body-FLU lin vel -> FRD
+        xref[11, :] = -r_w                                  # world +yaw-rate -> NED r
+        return xref
+
     # --------------------------------------------------------- control tick
     def _control_step(self, data):
         p, R, nu_flu = self._read_state(data)
@@ -191,7 +264,7 @@ class DOBMPCController:
             self.w_hat = np.zeros(6)
 
         x_ned = np.concatenate([eta_ned, nu_ned])
-        u = self.nmpc.solve(x_ned, self.w_hat, self._xref_ned())
+        u = self.nmpc.solve(x_ned, self.w_hat, self._xref_ned(data.time))
         self.n_fail = self.nmpc.n_fail
         if getattr(P, "FULLY_ACTUATED", False):
             # heavy: NU=6, the full wrench [X,Y,Z,K,M,N] is commanded and realized.

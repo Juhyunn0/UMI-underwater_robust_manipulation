@@ -37,6 +37,7 @@ solver.
 | Baseline **PD/PID** setpoint controller | `controller.py` | ✅ |
 | **DOB-MPC** = Extended Active Observer (EAOB) + NMPC | `dobmpc_controller.py`, `dobmpc/` | ✅ |
 | NMPC solved by **acados SQP-RTI** (~1 ms, default) with IPOPT fallback | `dobmpc/mpc_acados.py`, `dobmpc/mpc.py` | ✅ verified |
+| **Reference preview** (tracking mode, 2026-07-21): mpc/dobmpc square runs sample the TRUE future reference over the 3 s horizon (`set_reference_traj` + `make_square_ref`) instead of extrapolating straight through corners; DP/teleop keep the setpoint interface; run meta records `ref_preview` — don't pool square mpc/dobmpc results across this boundary | `dobmpc_controller.py`, `experiments/run_compare.py` | ✅ |
 | Autonomous square-tracking mission + CSV recorder + run manifest (incl. kicks) | `mission.py`, `recorder.py` | ✅ |
 | Experiments: station-keeping comparison, actuator-realism ablation | `dobmpc/eval_dp.py`, `ablation_thrusters.py` | ✅ |
 | Experiment: 3 controllers × 5 disturbance modes × N seeds × current/wave heading sweep (paired or full grid), metrics + per-run CSVs/meta + all figures in one run | `experiments/run_compare.py`, `config/*.yaml` | ✅ |

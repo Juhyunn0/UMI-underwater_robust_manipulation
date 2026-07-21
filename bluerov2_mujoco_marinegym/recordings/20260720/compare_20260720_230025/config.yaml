@@ -1,0 +1,76 @@
+# Disturbance-comparison experiment — shallow Monterey Bay, swell-dominated.
+# All params here; change modes/seeds/scenario with NO code edit.
+# Frame: FLU (z up). Oceanographic depth convention: surface z=0, seabed z=-h.
+
+site:
+  h: 4.0            # water-column depth [m] (seabed at z=-4); finite-depth dispersion uses tanh(k*h)
+  z_ROV: -3.0       # ROV operating depth (oceanographic z, up from surface); 1 m above seabed
+
+waves:
+  Hs: 0.75          # significant wave height [m]
+  Tp: 12.0          # peak period [s]  -> kh ~= 0.34 (shallow/intermediate)
+  gamma: 5.0        # JONSWAP peak factor
+  s: 30             # cos^{2s} directional spreading (large = narrow)
+  beta_bar_deg: 0.0 # mean wave heading [deg] (FLU world)
+  N_omega: 60
+  N_beta: 21
+  omega_min: 0.2
+  omega_max: 1.6    # [rad/s]
+
+current:
+  V_bar_c: 0.20         # mean current speed [m/s]
+  theta_c_deg: 0.0      # mean current heading [deg]
+  tau: 300.0            # Gauss-Markov drift correlation time [s]
+  sigma_inf_frac: 0.1   # drift stationary std = 0.1 * V_bar_c
+  v_z_range: [-0.03, 0.03]  # constant small vertical current [m/s], drawn once per seed
+
+inertia:                # Froude-Krylov wave-inertia force injected via external_wrench
+  rho: 1025.0           # seawater density [kg/m^3] (FK term; hydro buoyancy still uses 997)
+  vol: 0.0113459        # displaced volume [m^3] (BlueROV.yaml)
+  fk_mode: froude_krylov  # froude_krylov (C_M=1, recommended) | morison_ca | off
+  C_M: 1.0
+  C_D: 1.2              # carried for metadata only — NOT injected (hull D-matrix owns drag)
+  A_x: 0.10             # reference areas [m^2] — metadata only
+  A_z: 0.15
+  added_mass_xyz: [5.5, 12.7, 14.57]  # only used if fk_mode=morison_ca
+
+sim:
+  dt: 0.002             # informational; the real dt comes from the MJCF (model.opt.timestep)
+  T_sim: 1000.0         # seconds per DP run (square is laps-bounded, see secondary.laps)
+  log_hz: 20.0          # logging rate (matches the control tick)
+
+experiment:
+  controllers: [pid, mpc, dobmpc]   # all 3 controllers
+  record_runs: true     # per-run trajectory CSV + meta under runs/ + the
+                        # trajectory_compare figures (~0.4 MB/run; false for huge sweeps)
+  settle_s: 10.0        # steady-state window start [s]
+  settle_band_cm: 5.0   # settling-time band (radial error) [cm]
+  directions:           # heading sweep: theta_c (current) x beta (wave)
+    n_random: 200              # <-- THE knob: sample N random (current, wave) heading
+    #                           pairs; current AND wave headings drawn independently
+    direction_seed: 100       # reproducible draw of the current headings
+    sweep_wave_heading: true  # wave heading beta randomized per point too
+    wave_heading_seed: 200    #   (beta only affects wave-active modes CW/CDW)
+    # -- explicit-grid alternative: run EVERY current x wave combination --
+    # pairing: grid
+    # headings_deg: [0, 90, 180, 270]    # 4 current headings
+    # wave_headings_deg: [0, 90]         # 2 wave headings -> 4x2 = 8 sweep points
+    #   (grid + random: n_random current headings x n_random_wave wave headings)
+  # PRELIMINARY: run SQUARE now (1 seed x 10 directions, all 3 controllers); DP deferred.
+  primary:              # NOW running: square trajectory sweep
+    scenario: square
+    modes: [NONE, C, CD, CW, CDW]   # NONE = still water baseline (no current/waves)
+    seeds: [0]                # 1 seed (the 10 directions provide the variety)
+    size: 1.0
+    laps: 10            # each square run = exactly 10 laps (perimeter 4 m / 0.15 m/s -> ~267 s)
+    speed: 0.15
+    depth: 0.0
+    heading_follow: true   # face travel direction (yaw -> path tangent); false = yaw fixed 0
+    yaw_rate_deg_s: 60     # heading slew-rate limit for smooth corner turns (90 deg ~ 1.5 s)
+  secondary: null        # DP disabled — square sweep only
+  # secondary:           # DP deferred — to run it later, uncomment this block and
+  #   scenario: dp       # set the key above to this block instead of null
+  #   modes: [NONE, C, CD, CW, CDW]   # NONE = still water baseline (no current/waves)
+  #   seeds: [0]                # bump to [0,1,2,3,4] for the full DP run
+  #   start: [0.1, 0.05, 0.0]   # initial offset from the origin setpoint [m]
+  #   depth: 0.0                # DP hold depth (FLU body z)

@@ -158,14 +158,14 @@ class PoseController:
         is the reference yaw RATE (heading-follow slew FF) used the same way in yaw.
         yaw_target (final edge heading) is accepted for interface parity with the
         DOB-MPC horizon yaw preview; the PID needs only the instantaneous r_ref FF."""
-        if p_ref is not None:
-            self.p_ref = np.asarray(p_ref, float)
+        if p_ref is not None: 
+            self.p_ref = np.asarray(p_ref, float) # x,y,z by JJ
         if yaw_ref is not None:
-            self.yaw_ref = float(yaw_ref)
+            self.yaw_ref = float(yaw_ref) # only yaw because pitch and roll are passively stabilized by buoyancy by JJ
         if v_ref is not None:
-            self.v_ref = np.asarray(v_ref, float)
+            self.v_ref = np.asarray(v_ref, float) # vx, vy, vz by JJ
         if r_ref is not None:
-            self.r_ref = float(r_ref)
+            self.r_ref = float(r_ref) #wx, wy, wz by JJ
 
     @staticmethod
     def _yaw_from_R(R):
@@ -189,32 +189,46 @@ class PoseController:
         i_max = np.asarray(g["i_max"])
         e = self.p_ref - p                                    # world position error
 
-        # gated anti-windup integral (only near the setpoint, then clamped)
+
+
+        ########
+        # i term in PID : reduce steady-state error by JJ
+        """
+        if we compund error in the begining, then when ROV is near the setpoint, the integral term will be too large and cause overshoot by JJ 
+        so we only integrate when the error is small (within a gate) to avoid overshoot and windup by JJ
+        """
         if self.use_i:
-            gate = np.abs(e) < g["e_gate"]
-            self._I = self._I + np.where(gate, e * self.dt, 0.0)
-            i_cap = i_max / np.maximum(ki, 1e-9)
-            self._I = np.clip(self._I, -i_cap, i_cap)
-            i_term = ki * self._I
+            gate = np.abs(e) < g["e_gate"] # True or False by JJ
+            self._I = self._I + np.where(gate, e * self.dt, 0.0) # integrate only when |error| < g["e_gate"] by JJ
+            i_cap = i_max / np.maximum(ki, 1e-9) 
+            self._I = np.clip(self._I, -i_cap, i_cap) # clip the integral term to avoid windup by JJ
+            i_term = ki * self._I # ki x compound error by JJ
         else:
             i_term = np.zeros(3)
+        ######## 
 
-        F_world = kp * e - kd * (v - self.v_ref) + i_term     # v_ref = trajectory FF
-        F_world[2] += -self.net_buoy                          # hold depth vs +buoyancy
-        F_body = R.T @ F_world                                # rotate force to body
+        F_world = kp * e - kd * (v - self.v_ref) + i_term     # calculate the world force by JJ
+        F_world[2] += -self.net_buoy                          # buoyancy compensation (world +z) by JJ
+        F_body = R.T @ F_world                                # coordinate transformation by JJ
 
-        # surge (body x): slew-rate limit -> optional pitch guard -> amplitude clamp
+
+
+        # surge (body x): slew-rate limit(N/s) -> optional pitch guard -> amplitude clamp
         fx = F_body[0]
-        dmax = g["surge_slew"] * self.dt
-        fx = np.clip(fx, self._fx_prev - dmax, self._fx_prev + dmax)
-        guard = np.radians(g["pitch_guard_deg"])
-        if abs(pitch) > guard:
-            fx *= max(0.0, 1.0 - (abs(pitch) - guard) / np.radians(40.0))
-        fx = float(np.clip(fx, -g["f_max"][0], g["f_max"][0]))
-        self._fx_prev = fx
+        dmax = g["surge_slew"] * self.dt # maximum Force by JJ
+        fx = np.clip(fx, self._fx_prev - dmax, self._fx_prev + dmax) # clip the surge force to avoid sudden change by JJ
+        
+        # reduce surge when pitch is too large by JJ 
+        guard = np.radians(g["pitch_guard_deg"]) # soft limit 
+        if abs(pitch) > guard: 
+            fx *= max(0.0, 1.0 - (abs(pitch) - guard) / np.radians(40.0)) 
+        
+        fx = float(np.clip(fx, -g["f_max"][0], g["f_max"][0])) # final clip to avoid too large surge force by JJ
+
+        self._fx_prev = fx 
         F_body[0] = fx
-        F_body[1] = float(np.clip(F_body[1], -g["f_max"][1], g["f_max"][1]))
-        F_body[2] = float(np.clip(F_body[2], -g["f_max"][2], g["f_max"][2]))
+        F_body[1] = float(np.clip(F_body[1], -g["f_max"][1], g["f_max"][1])) # clip sway force to avoid too large sway force by JJ
+        F_body[2] = float(np.clip(F_body[2], -g["f_max"][2], g["f_max"][2])) # clip heave force to avoid too large heave force by JJ
 
         # yaw PD (+ gated integral)
         e_yaw = wrap_angle(self.yaw_ref - yaw)

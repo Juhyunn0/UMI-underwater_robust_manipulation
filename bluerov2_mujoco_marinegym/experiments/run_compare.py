@@ -121,6 +121,47 @@ def slew_heading(yaw_ref, tx, ty, rate_rad, dt):
     return yaw_ref + float(np.clip(d, -step, step))
 
 
+def make_square_ref(size, speed, depth, heading_follow, yaw_rate, dt, T_total):
+    """Mission-side half of the MPC reference preview: a sampler
+    fn(ts) -> (p (3,K), yaw (K,), v (3,K), r (K,)) in world FLU for the square
+    mission, handed to DOBMPCController.set_reference_traj (tracking mode; the
+    PID and the DP scenario keep the plain set_target interface).
+
+    Position/velocity are exact square_setpoint evaluations at each requested
+    time. The heading command is stateful (slew_heading recursion), but it has no
+    vehicle feedback, so its future is knowable: precompute the profile on the
+    physics-dt grid with the SAME recursion the live loop runs -- sampled future
+    yaw == the yaw_cmd the loop will command when that time arrives. Pass
+    T_total >= run duration + MPC horizon so end-of-run sampling stays in range
+    (beyond the grid the profile holds its last value)."""
+    tg = np.arange(0.0, T_total + dt, dt)
+    yaw_prof = np.zeros(len(tg))
+    r_prof = np.zeros(len(tg))
+    if heading_follow:
+        yc = 0.0
+        for i, t in enumerate(tg):
+            _, (tx, ty) = square_setpoint(t, size, speed)
+            yn = slew_heading(yc, tx, ty, yaw_rate, dt)
+            r_prof[i] = (yn - yc) / dt
+            yaw_prof[i] = yn
+            yc = yn
+
+    def ref(ts):
+        ts = np.atleast_1d(np.asarray(ts, float))
+        K = ts.size
+        p = np.empty((3, K))
+        v = np.empty((3, K))
+        for j, t in enumerate(ts):
+            (rx, ry), (tx, ty) = square_setpoint(t, size, speed)
+            p[:, j] = (rx, ry, depth)
+            v[:, j] = (speed * tx, speed * ty, 0.0)
+        yaw = np.interp(ts, tg, yaw_prof)              # continuous, accumulates CCW
+        idx = np.clip(np.searchsorted(tg, ts, side="right") - 1, 0, len(tg) - 1)
+        r = r_prof[idx]                                # piecewise-constant: no interp
+        return p, yaw, v, r
+    return ref
+
+
 # --------------------------------------------------------------------- one run
 def run_one(ctrl_name, cfg, mode, seed, scenario, scen, dist):
     """Run one (controller, mode, seed, scenario, dist). Returns a log dict of arrays."""
@@ -138,6 +179,16 @@ def run_one(ctrl_name, cfg, mode, seed, scenario, scen, dist):
     model, data, hydro, env, bid = build(cfg, mode, seed, ctrl_name, T, dist)
     ctrl = make_controller(ctrl_name, model, hydro)
     ctrl.reset()
+    if scenario == "square" and ctrl_name in ("mpc", "dobmpc"):
+        # tracking mode: hand the NMPC the mission trajectory so every tick fills
+        # the stage references from the TRUE future (corners bend inside the 3 s
+        # horizon). The live set_target calls below stay -- PID needs them and
+        # they keep the rx/ry logging identical -- but the NMPC horizon no longer
+        # extrapolates straight through corners. DP keeps set_target only.
+        horizon_s = ctrl.nmpc.N * ctrl.ctrl_dt
+        ctrl.set_reference_traj(make_square_ref(
+            size, speed, depth, heading_follow, yaw_rate,
+            float(model.opt.timestep), T + horizon_s + 1.0))
     nu_act = model.nu
     ctrlrange = np.asarray(model.actuator_ctrlrange[:nu_act], float)   # (nu,2) [lo,hi]
 
@@ -198,6 +249,7 @@ def run_one(ctrl_name, cfg, mode, seed, scenario, scen, dist):
         env_meta = {"error": str(e)}
     H.Hydrodynamics.uninstall()
     out = {k: np.asarray(v, float) for k, v in L.items()}
+    out["ref_preview"] = getattr(ctrl, "_ref_traj", None) is not None   # provenance
     out["U"] = np.asarray(U, float)                   # (n_log, nu)
     out["ctrlrange"] = ctrlrange
     out["log_dt"] = log_dt
@@ -764,6 +816,11 @@ def _write_run_outputs(run_dir, scenario, scen, mode, seed, ctrl, theta, beta, L
     ctrl_meta = dict(type=ctrl)
     if ctrl == "pid":
         ctrl_meta["pid_gains"] = dict(DEFAULT_GAINS)
+    if ctrl in ("mpc", "dobmpc"):
+        # tracking-mode provenance: True = horizon reference sampled from the mission
+        # trajectory (reference preview, 2026-07-21+), False = setpoint extrapolation.
+        # Runs recorded before this key exist are all False-equivalent.
+        ctrl_meta["ref_preview"] = bool(L.get("ref_preview", False))
     meta = build_run_meta(
         disturbance=L.get("env_meta"),               # rotated theta_c/beta inside
         controller=ctrl_meta,

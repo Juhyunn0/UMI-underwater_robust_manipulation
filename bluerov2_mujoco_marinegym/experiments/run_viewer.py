@@ -51,7 +51,8 @@ import hydro as H
 import water_viz as WV     # animated pool water surface (VISUAL ONLY; POOL_TAGS scene)
 import thrusters as Tt
 from disturbance.config import load_config
-from .run_compare import build, make_controller, square_setpoint, slew_heading
+from .run_compare import (build, make_controller, square_setpoint, slew_heading,
+                          make_square_ref)
 # teleop's overlay drawers (module import is display-safe: no viser/pyqtgraph at top)
 from teleop import _draw_plan, draw_force_arrows
 
@@ -328,6 +329,14 @@ def main():
     model, data, hydro, env, bid = build(cfg, args.mode, args.seed, args.ctrl, T_run, dist)
     ctrl = make_controller(args.ctrl, model, hydro)
     ctrl.reset()
+    if args.ctrl in ("mpc", "dobmpc"):
+        # tracking mode (same wiring as run_compare.run_one): the NMPC samples the
+        # TRUE future square reference over its horizon instead of extrapolating.
+        horizon_s = ctrl.nmpc.N * ctrl.ctrl_dt
+        ctrl.set_reference_traj(make_square_ref(
+            size, speed, depth, args.heading == "follow",
+            np.radians(args.yaw_rate), float(model.opt.timestep),
+            T_run + horizon_s + 1.0))
     data.qpos[:3] = [0.0, 0.0, depth]                          # start at the origin corner
     mujoco.mj_forward(model, data)
 
@@ -350,6 +359,7 @@ def main():
                 seed=args.seed, dir_deg=args.dir_deg, size=size, speed=speed,
                 depth=depth, laps=laps, T_run=T_run, record_lap=record_lap,
                 heading=args.heading, yaw_rate_deg_s=args.yaw_rate,
+                ref_preview=(args.ctrl in ("mpc", "dobmpc")),   # tracking-mode provenance
                 dt=float(model.opt.timestep), log_hz=log_hz,
                 video=dict(hz=args.video_hz, width=width, height=height,
                            frames=n_frames, path=os.path.basename(mp4_path) if n_frames else None),
