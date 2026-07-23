@@ -17,11 +17,13 @@ computes the grounded `voltage_scale` for a chosen operating voltage (default
 Read-only; no plant, no MuJoCo. Run in `robust` (or any Python 3).
 """
 import os
+import sys
 import zipfile
 import re
 import xml.etree.ElementTree as ET
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # package root
+sys.path.insert(0, HERE)
 XLSX = os.path.join(HERE, "marinegym_assets",
                     "T200-Public-Performance-Data-10-20V-September-2019.xlsx")
 

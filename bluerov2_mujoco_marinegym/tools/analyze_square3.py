@@ -11,7 +11,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIR = os.path.join(HERE, "recordings", "20260615")
 RUNS = [
     ("PID",     "20260615_164104_square_pid.csv"),

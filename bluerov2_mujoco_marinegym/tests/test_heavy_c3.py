@@ -2,7 +2,7 @@
 
 heavy_c3 reflects exactly the lab's Onshape assembly (heavy + C3 on its C3-BR bracket;
 the Newton gripper is not in Onshape yet). Run:
-    ROV_MODEL=heavy_c3 python test_heavy_c3.py      (env set below if unset)
+    ROV_MODEL=heavy_c3 python tests/test_heavy_c3.py      (env set below if unset)
 
 Contracts pinned down:
   1. COMPOSITION — MuJoCo's composed subtree mass/COM/inertia match the transparent
@@ -24,7 +24,7 @@ import sys
 import numpy as np
 import mujoco
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 import rov_model as RM              # noqa: E402
 import compute_payload_inertia as CP  # noqa: E402

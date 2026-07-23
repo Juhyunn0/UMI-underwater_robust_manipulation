@@ -7,7 +7,7 @@ its before/after is a noise-level sanity check; MPC/DOB-MPC swapped IPOPT->acado
 
 The CSV carries no solver flag or solve-time, so this confirms CLOSED-LOOP
 TRACKING IS PRESERVED across the solver swap; the speed/determinism win
-(103x, n_fail 7->0) is the runtime result in verify_acados.py.
+(103x, n_fail 7->0) is the runtime result in verify/verify_acados.py.
 """
 import os
 import numpy as np
@@ -15,7 +15,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIR = os.path.join(HERE, "recordings", "20260615")
 # controller -> (pre-acados file, acados file)
 PAIRS = {

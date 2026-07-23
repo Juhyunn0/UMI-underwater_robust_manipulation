@@ -1,6 +1,6 @@
 """Tests for the animated pool water surface (water_viz.py) — VISUAL ONLY.
 
-Run:  POOL_TAGS=1 python test_water_viz.py     (env is set below if unset)
+Run:  POOL_TAGS=1 python tests/test_water_viz.py     (env is set below if unset)
 
 Checks:
   1. the POOL_TAGS scene exposes `pool_water_surface` as a heightfield geom;
@@ -18,7 +18,7 @@ import sys
 import numpy as np
 import mujoco
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 import rov_model as RM          # noqa: E402
 import water_viz                # noqa: E402
@@ -36,7 +36,7 @@ def _load(path=None):
 def test_hfield_present():
     m, _ = _load()
     gid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "pool_water_surface")
-    assert gid >= 0, "pool_water_surface geom missing (regenerate with gen_pool_apriltags.py)"
+    assert gid >= 0, "pool_water_surface geom missing (regenerate with tools/gen_pool_apriltags.py)"
     assert int(m.geom_type[gid]) == int(mujoco.mjtGeom.mjGEOM_HFIELD), \
         "water geom is not a heightfield (did --no-water-anim get used?)"
     assert water_viz.make_surface(m) is not None

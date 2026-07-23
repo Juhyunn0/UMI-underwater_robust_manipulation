@@ -10,9 +10,13 @@
 """
 import json
 import os
+import sys
 import tempfile
 
 import numpy as np
+
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # package root
+sys.path.insert(0, HERE)
 
 import disturbances as D
 from recorder import Recorder, build_run_meta, record_row, RECORD_FIELDS
@@ -57,7 +61,7 @@ def test_recorder_sidecar():
         mp = p[:-4] + ".meta.json"
         assert os.path.exists(mp), "sidecar not written"
         meta = json.load(open(mp))
-        assert meta["rov_model"] in ("bluerov2", "heavy"), meta
+        assert meta["rov_model"] in ("heavy", "heavy_gripper", "heavy_c3"), meta
         assert meta["controller"]["solver"] == "acados"
         assert meta["trajectory"]["kind"] == "square" and meta["trajectory"]["laps"] == 2
         assert meta["disturbance"]["seed"] == 0
@@ -74,7 +78,7 @@ def test_controller_meta_detects_solver():
     import mujoco
     import dobmpc.params as P
     from teleop import _controller_meta
-    model = mujoco.MjModel.from_xml_path("bluerov.xml")
+    model = mujoco.MjModel.from_xml_path(os.path.join(HERE, "bluerov.xml"))
     import hydro as H
     field = D.DisturbanceField(waves=D.jonswap_wave_specs(seed=0), seed=0)
     hydro = H.Hydrodynamics(model, disturbance=field).install()

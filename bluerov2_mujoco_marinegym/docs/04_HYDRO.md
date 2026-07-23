@@ -1,6 +1,6 @@
 # 04 — Hydrodynamics (Phase 3: buoyancy, added mass, drag)
 
-**Status: DONE ✓.** Code: `hydro.py`. Verify: `python test_hydro.py`
+**Status: DONE ✓.** Code: `hydro.py`. Verify: `python tests/test_hydro.py`
 (`--render` for the viewer). FLU, gravity **ON**, MarineGym coefficients only.
 
 ## Coefficients (all from `marinegym_assets/BlueROV.yaml`)
@@ -57,7 +57,7 @@ repo's dobmpc plant. If you ever raise dt or drop the filter, re-check stability
 differs (MuJoCo RB + lagged added mass vs Isaac). Results agree to the fidelity of
 the added-mass lag.
 
-## Verified (Phase 3) — `python test_hydro.py`
+## Verified (Phase 3) — `python tests/test_hydro.py`
 
 1. **Neutral buoyancy** — no thrust, 10 s: steady **vz ≈ +0.115 m/s** (slow drift
    up from +1.1 N), not free-fall.

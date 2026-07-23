@@ -1,7 +1,7 @@
 # 07 — Disturbances & domain randomization (Phase 4)
 
 **Status: DONE ✓.** Code: `disturbances.py` (+ hydro.py / teleop.py hooks).
-Verify: `python test_disturbances.py` (`--render` for the viewer). FLU, on top of
+Verify: `python tests/test_disturbances.py` (`--render` for the viewer). FLU, on top of
 Phase-3 hydro, gravity ON. MarineGym-derived model unchanged.
 
 ## The 3 layers (all FLU)
@@ -89,7 +89,7 @@ params: `drag_scale` 0.7–1.3, `thruster_scale` 0.8–1.2, `buoyancy_trim` ±2 
 thruster scale for the caller to apply at command time. This is the **knobs +
 sampler**; full DR training comes in the RL phase (Phase 8).
 
-## Verified (Phase 4) — `python test_disturbances.py`
+## Verified (Phase 4) — `python tests/test_disturbances.py`
 
 1. **Current**: at rest the first-step horizontal velocity is +x (so `vr`, not `v`,
    is used — with `v` an unpowered vehicle wouldn't move); after 40 s the

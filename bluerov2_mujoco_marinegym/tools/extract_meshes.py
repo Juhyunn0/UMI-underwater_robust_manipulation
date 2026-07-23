@@ -29,7 +29,7 @@ import trimesh
 import fast_simplification
 from pxr import Usd, UsdGeom, UsdShade
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 USD = os.path.normpath(os.path.join(
     HERE, "..", "external", "MarineGym",
     "marinegym", "robots", "assets", "usd", "BlueROV", "BlueROV.usd"))

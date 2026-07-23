@@ -1,6 +1,6 @@
 """Tests for the heavy_gripper variant (BlueROV2 Heavy + Newton gripper + MarineSitu C3).
 
-Run:  ROV_MODEL=heavy_gripper python test_heavy_gripper.py     (env set below if unset)
+Run:  ROV_MODEL=heavy_gripper python tests/test_heavy_gripper.py     (env set below if unset)
 
 Contracts pinned down:
   1. COMPOSITION — MuJoCo's composed subtree mass/COM/inertia match the transparent
@@ -23,7 +23,7 @@ import sys
 import numpy as np
 import mujoco
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 import rov_model as RM              # noqa: E402
 import compute_payload_inertia as CP  # noqa: E402

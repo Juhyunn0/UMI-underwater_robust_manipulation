@@ -16,7 +16,7 @@ Tests (control-theory-advisor reviewed):
   T6  Coriolis + energy   nu.C_A(nu)nu=0 ; mechanical energy non-increasing
   T7  whole-plant         R2 force-level (integrator-free bug detector) + R1 1-DOF lag
 
-Run:  /home/bdml/miniforge3/envs/robust/bin/python verify_hydro.py [--no-plot]
+Run:  /home/bdml/miniforge3/envs/robust/bin/python verify/verify_hydro.py [--no-plot]
 """
 import os
 import sys
@@ -25,7 +25,7 @@ import argparse
 import numpy as np
 import mujoco
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 import hydro as H
 

@@ -12,10 +12,11 @@ base.yaml parameters) — not a cartoon — as slide-ready PNGs:
                                  differs (optional supporting slide)
 
 Run (robust env, from bluerov2_mujoco_marinegym/):
-    python plot_wave_spreading.py [--beta-deg 25] [--seed 0] [--out-dir ../assets/screenshots]
+    python tools/plot_wave_spreading.py [--beta-deg 25] [--seed 0] [--out-dir ../assets/screenshots]
 """
 import argparse
 import os
+import sys
 
 import numpy as np
 import matplotlib
@@ -23,6 +24,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # package root
 from disturbance.waves import DirectionalWaveField, solve_wavenumber
 
 # --- config/base.yaml values (waves + site blocks) ---
@@ -240,7 +242,7 @@ def fig_compare(beta_deg, seed, out):
 
 
 def main():
-    here = os.path.dirname(os.path.abspath(__file__))
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ap = argparse.ArgumentParser()
     ap.add_argument("--beta-deg", type=float, default=25.0, help="mean wave heading")
     ap.add_argument("--seed", type=int, default=0, help="component phase seed")

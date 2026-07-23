@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Phase-1 verification for the MarineGym BlueROV2 MJCF import.
+Phase-1 verification for the MarineGym BlueROV2 Heavy MJCF import.
 
-Loads bluerov.xml with *base* MuJoCo (no MJX / JAX / CUDA needed), prints model
+Loads bluerov_heavy.xml with *base* MuJoCo (no MJX / JAX / CUDA needed), prints model
 stats, lists the thruster mount sites, and runs a zero-control stability check
 (a few seconds of free fall; with no buoyancy yet the vehicle simply sinks --
 that is expected this phase). Optionally renders one headless frame to a PNG.
 
 Usage
 -----
-    python test_load.py                 # load + stats + stability check
-    python test_load.py --seconds 3     # longer stability check
-    python test_load.py --render preview.png
-    python test_load.py --viewer        # interactive viewer (needs a display)
+    python tests/test_load.py                 # load + stats + stability check
+    python tests/test_load.py --seconds 3     # longer stability check
+    python tests/test_load.py --render preview.png
+    python tests/test_load.py --viewer        # interactive viewer (needs a display)
 
 Only `mujoco` and `numpy` are required. The PNG writer is pure stdlib, so
 --render adds no dependency (it still needs a working offscreen GL context).
@@ -26,8 +26,8 @@ import zlib
 import numpy as np
 import mujoco
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-XML = os.path.join(HERE, "bluerov.xml")
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+XML = os.path.join(HERE, "bluerov_heavy.xml")
 
 
 def write_png(path, rgb):
@@ -60,7 +60,7 @@ def print_stats(model, data):
     print(f"  meshes               : {model.nmesh}")
     print(f"  sites                : {model.nsite}")
     print(f"  free joints / DoF    : {model.njnt}  /  nv={model.nv}, nq={model.nq}")
-    print(f"  TOTAL MASS           : {total_mass:.4f} kg   (BlueROV2 ~ 10-11 kg)")
+    print(f"  TOTAL MASS           : {total_mass:.4f} kg   (BlueROV2 Heavy ~ 11-12 kg)")
 
     bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "base_link")
     print(f"  base_link mass       : {model.body_mass[bid]:.4f} kg")
@@ -83,7 +83,7 @@ def print_stats(model, data):
             xmat = np.array(data.site_xmat[sid]).reshape(3, 3)
             xaxis = xmat[:, 0].round(3)
             print(f"    {name:<11} pos={pos.tolist()}   thrust_axis(world)={xaxis.tolist()}")
-    print(f"  -> {nthr} thruster sites (expected 6)")
+    print(f"  -> {nthr} thruster sites (expected 8)")
     print("=" * 64)
     return total_mass, nthr
 
@@ -149,10 +149,10 @@ def main():
     ok = stability_check(model, data, args.seconds)
 
     # sanity assertions for the phase-1 deliverable
-    assert 9.0 <= total_mass <= 12.0, f"total mass {total_mass} out of expected range"
-    assert nthr == 6, f"expected 6 thruster sites, found {nthr}"
+    assert 9.0 <= total_mass <= 13.0, f"total mass {total_mass} out of expected range"
+    assert nthr == 8, f"expected 8 thruster sites, found {nthr}"
     assert ok, "stability check failed (NaN / blow-up)"
-    print("\nPHASE-1 CHECKS PASSED ✔  (loads, ~11 kg, 6 thrusters, stable under gravity)")
+    print("\nPHASE-1 CHECKS PASSED ✔  (loads, ~11.5 kg, 8 thrusters, stable under gravity)")
 
     if args.render:
         mujoco.mj_resetData(model, data)

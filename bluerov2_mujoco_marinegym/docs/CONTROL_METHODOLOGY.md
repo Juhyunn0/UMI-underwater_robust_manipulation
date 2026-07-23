@@ -1080,3 +1080,51 @@ control-theory-advisor): no wrong findings; applied their minimal fixes (meta pr
 anticipatory inside-cut; solver failures same or fewer (tick-to-tick reference now changes smoothly instead of the
 all-stages-at-once 90° flip at the vertex). The comparison experiments themselves are deliberately left to be
 rerun by the user.
+
+## 2026-07-21 (2) — roll/pitch leveling PD→PID, and the rank-5 surge shaping stripped from the heavy path
+
+Two `controller.py` (`PoseController`) changes for the rank-6 heavy family. Analysis + adversarial verification via a
+control-theory workflow (both claim sets returned CONFIRMED).
+
+**(1) Roll/pitch leveling PD → PID.** The optional leveling loop (enabled per variant by `rp_kp`; on for
+`heavy_gripper`) was pure PD, which is type-0 against a *constant* attitude torque: the asymmetric payload (forward
+COM + jaw weight, ~0.2–0.5 N·m) leaves a steady tilt `φ_ss = τ/(kp + B_restore)`. Measured at a 0.40 N·m constant
+torque: PD holds roll 3.53° / pitch 3.58°; that is ~cm-scale end-effector error at manipulation reach. Adding any
+`Ki>0` makes the loop **type-1** so `φ_ss → 0` exactly (verified 0.00°/0.00°), independent of `Ki` magnitude and of
+the exact `B_restore` estimate. Design = **option (a)**: keep the validated `kp/kd`, add only `ki = I_eff·α·ωn³`
+(same analytic pole placement as translation, α=0.2, ωn=3): `I_eff` roll 0.481 → 2.60, pitch 0.859 → 4.64
+N·m/(rad·s). Anti-windup mirrors the position/yaw loops — integrate `-angle` only when near level (`|angle| <
+rp_gate = 0.15 rad`), clamp `|ki·I| < rp_i_max = (1.5, 2.0)` N·m. Verified the 3rd-order closed loop
+`I·s³+Kd·s²+(Kp+B)·s+Ki` has all roots in the LHP with dominant pair ζ≈0.83–0.89 (the integral does **not** erode PD
+damping; it inserts a slow companion pole at −0.67/−0.84 rad/s → residual nulled in ~4.5–6 s). Gains added to
+`GAINS_HEAVY_GRIPPER` (`rp_ki`, `rp_i_max`, `rp_gate`). Gated on `self.use_i` **and** presence of `rp_ki`, so
+`mode="pd"` and rp_kp-only variants stay byte-identical PD. Provenance: `heavy`/`heavy_c3` leveling was off and stays
+off (unchanged); `heavy_gripper` PID-leveling runs before 2026-07-21 used PD leveling (no integral) — do not pool
+attitude-accuracy data across this boundary.
+
+**(2) Body-force shaping generalized on rank-6.** The surge-**only** slew-rate limit is generalized to a **uniform**
+slew on all three body-force axes (finite actuator/command bandwidth; rarely binds at 120 N/s — ~66 N/s at hover).
+The soft **pitch guard** (scales surge down above |pitch|>15°) is **KEPT** for the heavy family, gated on the
+`pitch_guard_deg` gain key. Correction to the first-pass analysis (which removed it): the rank-6 `pinv` of the
+full-rank 6×8 `B` only STATICALLY decouples `Fx` from `My` (pure `Fx → My=0`), but the migrated `test_controller` on
+the heavy plant showed a **DYNAMIC Coriolis/added-mass coupling** still excites the weakly-restored pitch mode on an
+aggressive far-offset slew — pitch transiently swings to ~70° WITHOUT the guard vs ~45–56° WITH it (recovering to
+level either way). So the guard IS useful on heavy: a dormant transient-pitch limit that fires only above 15° (never
+in normal small-error operation; on `heavy_gripper` the rp-PID leveling handles attitude first and the guard only
+backs it up on large excursions). Amplitude clamp unchanged (already isotropic 30/30/30). Docstring corrected: the
+heavy family is rank-6 fully actuated → all 6 DOF independently commandable (the old "NEVER pitch / rank-5
+underactuated" note was bluerov2-only). `test_controller`'s pitch thresholds were recalibrated for heavy (its
+stress-start transient exceeds the old rank-5-tuned 45°; the gate is now "never flips <90°" + "recover to level <8°")
+and the PD-vs-PID current-headroom reduced (stiff heavy already shrinks the PD offset to ~1 cm).
+
+**(3) `bluerov2` variant removed — heavy-only (2026-07-21).** The legacy rank-5 vectored-6 `bluerov2` was removed as
+a selectable variant: dropped from `rov_model._MODELS`/`_POOL_WRAP`, from the gains (`GAINS_BLUEROV2` + the
+`DEFAULT_GAINS` under-actuated fallback, now `→ GAINS_HEAVY`), and from the docs; `ROV_MODEL=bluerov2` now fails fast.
+The three root smoke tests (`test_load`, `test_controller`, `test_square_mission`) were migrated to the bare-heavy
+plant. `bluerov.xml` + `marinegym_assets/BlueROV.yaml` are **kept as the fixed reference fixtures** for the
+hydro/thruster verify_*/test_* scripts (`verify_hydro`, `verify_hydro_precise`, `test_hydro`, `test_thrusters`,
+`test_disturbances`, `verify_meta`, `verify_gpu_mjx`) and the `compute_heavy_inertia` provenance — deleting them would
+break 8 scripts. **Deferred** (per user): the dobmpc `NU=4`/option-(b) surge→pitch dead path and `test_dobmpc`'s
+rank-5 trim assertions, to be collapsed to NU=6-only later (see KNOWN_ISSUES). Regression: `test_load`,
+`test_controller`, `test_square_mission`, `test_hydro`, `test_thrusters`, `test_disturbances`, `verify_meta`,
+`test_heavy_gripper`, `test_heavy_c3` all PASS.

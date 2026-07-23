@@ -44,3 +44,7 @@ Thumbs.db
 
 # Make sure requirements.txt is tracked even if a parent rule would match
 !requirements.txt
+
+# MuJoCo auto-generated error log + ad-hoc nohup run logs
+MUJOCO_LOG.TXT
+run.log

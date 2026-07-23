@@ -1,6 +1,6 @@
 """Tests for the --observe (free-drift) mode in teleop.py.
 
-Run:  python test_observe.py        (headless; no viewer needed)
+Run:  python tests/test_observe.py        (headless; no viewer needed)
 
 The mode releases the ROV from rest and lets the current+waves carry it, with an
 optional recenter to keep it in view. These checks pin down its two contracts:
@@ -25,7 +25,7 @@ import sys
 import numpy as np
 import mujoco
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 import rov_model as RM          # noqa: E402
 import hydro as H              # noqa: E402

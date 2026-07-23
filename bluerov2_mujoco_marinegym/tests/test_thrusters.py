@@ -10,11 +10,11 @@ yaw->+Mz, roll->+Mx, and document the geometric couplings (the 4 horizontal
 thrusters sit 0.0725 m below the COM, so surge couples to pitch and sway to
 roll; the vectored-6 layout is rank-5, i.e. pitch is underactuated).
 
-    python test_thrusters.py            # asserts + print allocation matrix
-    python test_thrusters.py --render   # gravity-off viewer for manual checks
+    python tests/test_thrusters.py            # asserts + print allocation matrix
+    python tests/test_thrusters.py --render   # gravity-off viewer for manual checks
 
 Only mujoco + numpy required. (--render needs a display; on macOS run with
-`mjpython test_thrusters.py --render`.)
+`mjpython tests/test_thrusters.py --render`.)
 """
 import argparse
 import os
@@ -23,10 +23,10 @@ import sys
 import numpy as np
 import mujoco
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import thrusters as T
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 XML = os.path.join(HERE, "bluerov.xml")
 np.set_printoptions(precision=4, suppress=True, floatmode="fixed")
 

@@ -12,7 +12,7 @@ Exercises the riskiest viser API assumptions and the refactor:
 import os
 import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 
 import numpy as np

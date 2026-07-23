@@ -10,7 +10,7 @@ Checks, in order:
 
 Run with the dedicated env's interpreter:
   XLA_PYTHON_CLIENT_PREALLOCATE=false \
-  /home/bdml/miniforge3/envs/robust-mjx/bin/python verify_gpu_mjx.py
+  /home/bdml/miniforge3/envs/robust-mjx/bin/python verify/verify_gpu_mjx.py
 """
 import os
 import sys
@@ -116,7 +116,7 @@ except Exception as e:
 # ----------------------------------------------------------------------
 line()
 print("4) CANONICAL bluerov.xml UNDER MJX (bonus; non-gating)")
-xml_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bluerov.xml")
+xml_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bluerov.xml")
 try:
     mb = mujoco.MjModel.from_xml_path(xml_path)
     mbx = mjx.put_model(mb)

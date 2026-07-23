@@ -968,3 +968,46 @@ control-theory-advisor): wrong 판정 0건; 최소 수정 3건 반영(meta prove
 `reset()`의 샘플러 해제). 이론 예상: 코너 과도 수 배 감소 + 부호가 선제적 inside-cut으로 반전; 솔버 실패는
 동일하거나 감소(vertex에서 전 stage가 한꺼번에 90° 도는 대신 tick 간 참조가 매끄럽게 변함). 비교 실험
 재실행은 의도적으로 사용자 몫으로 남김.
+
+## 2026-07-21 (2) — roll/pitch 레벨링 PD→PID, 그리고 heavy 경로에서 rank-5 surge 정형 제거
+
+rank-6 heavy 계열을 위한 `controller.py`(`PoseController`) 두 가지 변경. 분석 + 반증 검증을 control-theory
+워크플로로 수행(두 주장 집합 모두 CONFIRMED).
+
+**(1) roll/pitch 레벨링 PD → PID.** 선택적 레벨링 루프(변종별로 `rp_kp`로 활성; `heavy_gripper`에서 ON)는
+순수 PD였는데, 이는 *일정* 자세 토크에 대해 type-0라서 정상상태 틸트 `φ_ss = τ/(kp + B_restore)`를 남긴다.
+비대칭 페이로드(전방 COM + 조 무게, ~0.2–0.5 N·m). 0.40 N·m 일정 토크에서 실측: PD는 roll 3.53° / pitch
+3.58° 유지 — 매니퓰레이션 리치에서 cm급 말단 오차. `Ki>0`이면 루프가 **type-1**이 되어 `φ_ss → 0`
+(실측 0.00°/0.00°), `Ki` 크기와 `B_restore` 추정 오차와 무관. 설계 = **옵션 (a)**: 검증된 `kp/kd`는 유지하고
+`ki = I_eff·α·ωn³`만 추가(병진과 동일한 해석적 극배치, α=0.2, ωn=3): `I_eff` roll 0.481 → 2.60,
+pitch 0.859 → 4.64. anti-windup은 위치/yaw 루프와 동일 — 수평 근처(`|angle| < rp_gate = 0.15 rad`)에서만
+`-angle` 적분, `|ki·I| < rp_i_max = (1.5, 2.0)` N·m 클램프. 3차 폐루프 `I·s³+Kd·s²+(Kp+B)·s+Ki`의 모든 근이
+LHP이고 지배극쌍 ζ≈0.83–0.89임을 검증(적분이 PD 감쇠를 **약화하지 않음**; −0.67/−0.84 rad/s의 느린 동반극을
+삽입 → 잔류 틸트 ~4.5–6 s에 소거). 게인은 `GAINS_HEAVY_GRIPPER`에 추가(`rp_ki`, `rp_i_max`, `rp_gate`).
+`self.use_i` **및** `rp_ki` 존재로 게이트 → `mode="pd"`와 rp_kp-only 변종은 바이트 동일 PD 유지. 프로버넌스:
+`heavy`/`heavy_c3`는 레벨링 OFF 유지(불변), `heavy_gripper`의 2026-07-21 이전 PID-레벨링 런은 PD 레벨링(적분
+없음)이었음 — 자세 정확도 데이터를 이 경계로 섞지 말 것.
+
+**(2) rank-6에서 body-force 정형 일반화.** surge **전용** slew-rate 제한을 세 축 전체에 대한 **균일** slew로
+일반화(유한 액추에이터/명령 대역폭; 120 N/s에서 거의 바인딩 안 됨 — hover에서 ~66 N/s). 소프트
+**pitch guard**(|pitch|>15°에서 surge 감쇠)는 heavy 계열에 **유지**(`pitch_guard_deg` 게인 키로 게이트).
+1차 분석(제거)에 대한 정정: rank-6 `pinv`(full-rank 6×8 `B`)는 `Fx`↔`My`를 **정적으로만** 분리(순수
+`Fx → My=0`)하지만, heavy로 이관한 `test_controller`에서 **동적 Coriolis/부가질량 커플링**이 약복원 pitch 모드를
+여전히 여기함이 드러남 — 공격적 far-offset 슬루에서 guard 없으면 pitch가 transient ~70°, 있으면 ~45–56°(둘 다
+레벨 복귀). 즉 guard는 heavy에도 유용 — 15° 초과에서만 발동하는 dormant transient-pitch 한계(정상 소각도
+운용엔 무발동; `heavy_gripper`에선 rp-PID 레벨링이 자세를 먼저 처리하고 guard는 큰 이탈에서만 백업).
+진폭 클램프 불변(이미 등방 30/30/30). docstring 정정: heavy 계열은 rank-6 완전작동 → 6-DOF 독립 지령 가능.
+`test_controller`의 pitch 임계값은 heavy용으로 재보정(스트레스 스타트 transient가 옛 rank-5 기준 45°를 넘음 →
+게이트를 "뒤집힘 없음 <90°" + "레벨 복귀 <8°"로) + PD-vs-PID 전류 헤드룸 축소(강성 큰 heavy는 PD offset이 이미
+~1 cm).
+
+**(3) `bluerov2` 변종 제거 — heavy 전용 (2026-07-21).** 레거시 rank-5 벡터드-6 `bluerov2`를 선택 가능 변종에서
+제거: `rov_model._MODELS`/`_POOL_WRAP`, 게인(`GAINS_BLUEROV2` + `DEFAULT_GAINS`의 under-actuated 폴백,
+이제 `→ GAINS_HEAVY`), 문서에서 삭제; `ROV_MODEL=bluerov2`는 이제 즉시 실패. 루트 스모크 테스트 3개
+(`test_load`, `test_controller`, `test_square_mission`)는 bare-heavy 플랜트로 이관. `bluerov.xml` +
+`marinegym_assets/BlueROV.yaml`은 hydro/thruster verify_*/test_* 스크립트(`verify_hydro`, `verify_hydro_precise`,
+`test_hydro`, `test_thrusters`, `test_disturbances`, `verify_meta`, `verify_gpu_mjx`)와 `compute_heavy_inertia`
+provenance의 **고정 reference fixture로 유지** — 삭제 시 8개 스크립트가 깨짐. **보류**(사용자 지시): dobmpc
+`NU=4`/option-(b) surge→pitch 죽은 경로 + `test_dobmpc`의 rank-5 trim 단정 → 추후 NU=6-only로 정리
+(KNOWN_ISSUES 참조). 회귀: `test_load`, `test_controller`, `test_square_mission`, `test_hydro`, `test_thrusters`,
+`test_disturbances`, `verify_meta`, `test_heavy_gripper`, `test_heavy_c3` 전부 PASS.

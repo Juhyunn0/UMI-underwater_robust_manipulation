@@ -2,7 +2,7 @@
 """Compose the heavy_gripper variant's rigid-body + buoyancy numbers (payload build-up).
 
 BlueROV2 Heavy + Newton Subsea Gripper + MarineSitu C3 stereo camera, rigidly bolted.
-Companion to compute_heavy_inertia.py (same philosophy: transparent, reproducible,
+Companion to tools/compute_heavy_inertia.py (same philosophy: transparent, reproducible,
 parallel-axis composition instead of opaque hand-tuned literals).
 
 Payload specs (verified 2026-07-12 against the vendor pages; see the memory note
@@ -15,7 +15,7 @@ heavy-gripper-variant / .claude/journal/research.md):
       Box 95(L,optical) x 165(W) x 89(H) mm, mounted FRONT-BOTTOM on the centreline,
       lens FORWARD and level (0.32 deg up-tilt kept verbatim from the CAD). Position
       measured from the user's Onshape assembly via onshape-to-robot + registration
-      (2026-07-19, see process_c3_mesh.py docstring; replaces the earlier guessed
+      (2026-07-19, see tools/process_c3_mesh.py docstring; replaces the earlier guessed
       front-top/45-down placement, which was wrong).
       https://bluerobotics.com/store/the-reef/marinesitu-c3-stereo-camera/
 
@@ -25,7 +25,7 @@ Composition model:
     inertial. Everything else (gripper body incl. cable share, camera) is rigidly
     baked into base_link's <inertial>: total mass, COM shift, and the parallel-axis
     inertia. Off-diagonals are REPORTED but the generated MJCF keeps a DIAGONAL
-    inertial (see gen_gripper_variant.py: fullinertia would axis-permute body_iquat
+    inertial (see tools/gen_gripper_variant.py: fullinertia would axis-permute body_iquat
     and break hydro's body-frame drag); the C3's 8 mm lateral offset makes Ixy/Iyz
     nonzero but negligible.
   * Buoyancy: new displaced volume = heavy volume + payload displaced volumes; the
@@ -193,4 +193,4 @@ if __name__ == "__main__":
     print(f'mass={m_total:.4f}, inertia=({dT[0]:.5f}, {dT[1]:.5f}, {dT[2]:.5f}), '
           f'volume={vol:.7f}')
     print("(the generated XML re-origins the body frame at the TOTAL COM; "
-          "gen_gripper_variant.py consumes compose()/compose_total() directly)")
+          "tools/gen_gripper_variant.py consumes compose()/compose_total() directly)")

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """PRECISION verification of the marinegym hydrodynamics -- a rigorous superset of
-verify_hydro.py (which stays as the fast 32-check smoke test). The simulator is NOT
+verify/verify_hydro.py (which stays as the fast 32-check smoke test). The simulator is NOT
 modified; we drive it through xfrc_applied in still water and compare to first
 principles, but here with: structural Fossen identities (independent symbolic
 ground truth), order-of-accuracy / continuum-convergence (MMS + dt-ladder),
@@ -9,7 +9,7 @@ characterization of the added-mass-lag approximation.
 
 Methodology reviewed by control-theory-advisor (Fossen 2011; Roache 1998 V&V;
 Salari & Knupp MMS).  Run:
-    python verify_hydro_precise.py [--tier 1234] [--ladder 2,1,0.5,0.25,0.125]
+    python verify/verify_hydro_precise.py [--tier 1234] [--ladder 2,1,0.5,0.25,0.125]
 
 Tier 1 is a GATE: if the independent symbolic C_A disagrees with hydro, STOP --
 there is no point extrapolating a wrong-but-self-consistent model.
@@ -20,7 +20,7 @@ import sys
 
 import numpy as np
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 
 # reuse the validated still-water harness + ground-truth constants from verify_hydro

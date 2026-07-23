@@ -35,7 +35,7 @@ import os
 import numpy as np
 import mujoco
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Standard BlueROV2 whole-vehicle inertia (bluerov.xml / MarineGym BlueROV USD).
 I_BLUEROV2 = np.array([0.30375, 0.626, 0.5769])

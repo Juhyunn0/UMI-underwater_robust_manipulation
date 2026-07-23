@@ -46,16 +46,19 @@ SLACK_L1 = 1.0e2     # zl / zu  (linear)
 def _build_model(name="dobmpc_bluerov"):
     """AcadosModel wrapping the identical Fossen dynamics used by the IPOPT
     NMPC.  x=[eta;nu] (12), u=[X,Y,Z,N] (4), p=w_hat (6, NED body)."""
-    x = ca.SX.sym("x", NX)
-    u = ca.SX.sym("u", NU)
-    w = ca.SX.sym("w", 6)
+    # set symbolic variables by JJ 
+    x = ca.SX.sym("x", NX) # NX : number of variables 
+    u = ca.SX.sym("u", NU) # NU : number of inputs
+    w = ca.SX.sym("w", 6) # 6 : number of disturbance parameters
     xdot = ca.SX.sym("xdot", NX)
-    f_expl = _f_casadi(x, u, w)          # <-- single source of truth
+
+    
+    f_expl = _f_casadi(x, u, w)          # set the Fossen's equations of motion :  ν˙=M−1(τ+w−C(ν)ν−D(ν)ν−g(η))  by JJ
     m = AcadosModel()
     m.name = name
     m.x, m.u, m.p, m.xdot = x, u, w, xdot
     m.f_expl_expr = f_expl
-    m.f_impl_expr = xdot - f_expl
+    m.f_impl_expr = xdot - f_expl  # to make implicit form for acados like  0 = x_dot - f(x,u,w) by JJ 
     return m
 
 
@@ -81,39 +84,41 @@ class AcadosNMPC:
         ocp.solver_options.tf = self.N * self.dt
 
         # ---- LINEAR_LS cost:  y = [x; u],  y_e = x
-        ocp.cost.cost_type = "LINEAR_LS"
-        ocp.cost.cost_type_e = "LINEAR_LS"
+        ocp.cost.cost_type = "LINEAR_LS" # Running Cost function : linear least squares (LLS) by JJ
+        ocp.cost.cost_type_e = "LINEAR_LS" # Terminal Cost function : linear least squares (LLS) by JJ
         Vx = np.zeros((ny, nx)); Vx[:nx, :] = np.eye(nx)
         Vu = np.zeros((ny, nu)); Vu[nx:, :] = np.eye(nu)
+        # assign the cost matrices to the ocp object by JJ
         ocp.cost.Vx, ocp.cost.Vu = Vx, Vu
         ocp.cost.Vx_e = np.eye(nx)
         ocp.cost.W = np.diag(np.concatenate([np.asarray(Q, float), np.asarray(R, float)]))
-        ocp.cost.W_e = np.diag(np.asarray(QN, float))
-        ocp.cost.yref = np.zeros(ny)
+        ocp.cost.W_e = np.diag(np.asarray(QN, float)) 
+        ocp.cost.yref = np.zeros(ny) 
         ocp.cost.yref_e = np.zeros(ny_e)
 
         # ---- disturbance parameter (constant over horizon, set each solve)
         ocp.parameter_values = np.zeros(6)
 
         # ---- hard control bounds
-        ocp.constraints.idxbu = np.arange(nu)
-        ocp.constraints.lbu = -np.asarray(u_max, float)
-        ocp.constraints.ubu = np.asarray(u_max, float)
+        ocp.constraints.idxbu = np.arange(nu) # index of control bounds by JJ
+        ocp.constraints.lbu = -np.asarray(u_max, float) # lower bound on u by JJ 
+        ocp.constraints.ubu = np.asarray(u_max, float) # upper bound on u by JJ
 
         # ---- state bounds: roll(3), pitch(4)=THETA_MAX[option-b], lin-vel(6,7,8)
-        idxbx = np.array([3, 4, 6, 7, 8])
-        th = P.THETA_MAX if getattr(P, "PITCH_AWARE", False) else 1.2
-        lbx = np.array([-1.2, -th, -v_max, -v_max, -v_max])
-        ubx = np.array([1.2,  th,  v_max,  v_max,  v_max])
+        idxbx = np.array([3, 4, 6, 7, 8]) # no yaw bound by JJ
+        th = P.THETA_MAX if getattr(P, "PITCH_AWARE", False) else 1.2 # set the pitch limit by JJ
+        lbx = np.array([-1.2, -th, -v_max, -v_max, -v_max]) # lower bound on [roll, pitch, vx, vy, vz] by JJ
+        ubx = np.array([1.2,  th,  v_max,  v_max,  v_max]) # upper bound on [roll, pitch, vx, vy, vz] by JJ
         ocp.constraints.idxbx, ocp.constraints.lbx, ocp.constraints.ubx = idxbx, lbx, ubx
         ocp.constraints.idxbx_e, ocp.constraints.lbx_e, ocp.constraints.ubx_e = idxbx, lbx, ubx
-        ocp.constraints.x0 = np.zeros(nx)
+        ocp.constraints.x0 = np.zeros(nx) # initial state constraint by JJ 
 
-        if soft:
+        if soft: # to prevent solver with dying (NaN) by JJ 
             ns = len(idxbx)
             ocp.constraints.idxsbx = np.arange(ns)
             ocp.constraints.idxsbx_e = np.arange(ns)
-            ocp.cost.zl = SLACK_L1 * np.ones(ns)
+            # linear panelty by JJ 
+            ocp.cost.zl = SLACK_L1 * np.ones(ns) 
             ocp.cost.zu = SLACK_L1 * np.ones(ns)
             ocp.cost.Zl = SLACK_L2 * np.ones(ns)
             ocp.cost.Zu = SLACK_L2 * np.ones(ns)
@@ -124,23 +129,24 @@ class AcadosNMPC:
 
         # ---- solver options
         so = ocp.solver_options
-        so.qp_solver = "PARTIAL_CONDENSING_HPIPM"
-        so.hessian_approx = "GAUSS_NEWTON"
-        so.integrator_type = "ERK"
-        so.sim_method_num_stages = 4    # RK4
+        so.qp_solver = "PARTIAL_CONDENSING_HPIPM"                # QP solver name : HPIPM (High-Performance Interior Point Method) by JJ
+        so.hessian_approx = "GAUSS_NEWTON"                       # Hessian approximation : Gauss-Newton by JJ
+        so.integrator_type = "ERK"                               # Integrator type : Explicit Runge-Kutta by JJ
+        so.sim_method_num_stages = 4    # RK4                    
         so.sim_method_num_steps = 2     # h = dt/2 = 25 ms  (== mpc._rk4 n_int=2)
-        so.nlp_solver_type = "SQP_RTI" if rti else "SQP"
+        so.nlp_solver_type = "SQP_RTI" if rti else "SQP"         # optimization algorithm : Sequential Quadratic Programming - Real Time Iteration (SQP-RTI) by JJ
         if not rti:
             so.nlp_solver_max_iter = 80
+
         so.qp_solver_iter_max = 50
 
+        # c code generation by JJ 
         gen_dir = os.path.join(GEN_DIR, variant)
         ocp.code_export_directory = gen_dir
         os.makedirs(gen_dir, exist_ok=True)
         json_file = os.path.join(gen_dir, "acados_ocp_dobmpc.json")
         self.solver = AcadosOcpSolver(ocp, json_file=json_file,
-                                      build=build, generate=build, verbose=False)
-
+                                      build=build, generate=build, verbose=False)        
         self.rti = rti
         self._u_prev = np.zeros(nu)
         self._warm = False
@@ -153,25 +159,35 @@ class AcadosNMPC:
         # NaN cascades (RTI warm-starts from the corrupted iterate and diverges; see
         # the 2026-06-16 seed-3 finding). Built lazily so the IPOPT cost is paid only
         # if a failure ever happens.
-        self._fallback_enabled = bool(fallback_ipopt)
-        self._fallback = None
+        self._fallback_enabled = bool(fallback_ipopt) # if acados fails, then try Interior Point OPTimzer (IPOPT) to recover by JJ 
+        self._fallback = None 
 
     # ----------------------------------------------------------------- solve
     def solve(self, x, w_hat, xref_traj):
         """x (12,), w_hat (6,) NED body, xref_traj (12, N+1) -> u (4,)."""
-        N = self.N
+        N = self.N # Prediction Horizon 
         x = np.asarray(x, float)
-        w_hat = np.clip(np.asarray(w_hat, float), -50.0, 50.0)
+        w_hat = np.clip(np.asarray(w_hat, float), -50.0, 50.0) # clip the disturbance wrench to avoid solver divergence by JJ # However, 50 N is good? 
         xref = np.asarray(xref_traj, float)
         s = self.solver
 
-        s.set(0, "lbx", x)
+        # set the initial state constraint (x0) to the current state x by JJ
+        s.set(0, "lbx", x) 
         s.set(0, "ubx", x)
+
+
+        """
+        This is important. There are two things that I can modify or improve in the future ? 
+        1. I set the constant disturbance(I mean current estimation) for each stage, but I can set the different disturbance for each stage. 
+        2. I set the motor command reference to zero for each stage, but I can set the different reference for each stage.
+        By JJ 
+        """
         for k in range(N):
-            s.set(k, "p", w_hat)
-            s.set(k, "yref", np.concatenate([xref[:, k], np.zeros(NU)]))
+            s.set(k, "p", w_hat) # set the disturbance wrench parameter for each stage by JJ
+            s.set(k, "yref", np.concatenate([xref[:, k], np.zeros(NU)])) # set the reference for each stage by JJ 
         s.set(N, "p", w_hat)
         s.set(N, "yref", xref[:, N])
+
 
         if not self._warm:                      # cold init: flat trajectory at x
             for k in range(N + 1):
@@ -182,7 +198,7 @@ class AcadosNMPC:
 
         status = self.solver.solve()
         self.last_status = int(status)
-        u = np.asarray(self.solver.get(0, "u"), float)
+        u = np.asarray(self.solver.get(0, "u"), float) # take first step by JJ 
         if status in (0, 2) and np.isfinite(u).all():   # 0 ok; 2 = max_iter (usable)
             self._u_prev = u.copy()
             return u.copy()
@@ -191,11 +207,12 @@ class AcadosNMPC:
         self.n_fail += 1
         self._warm = False                              # re-init the acados iterate next tick
         if self._fallback_enabled:
-            uf = self._ipopt_fallback(x, w_hat, xref)
-            if uf is not None and np.isfinite(uf).all():
+            uf = self._ipopt_fallback(x, w_hat, xref) # try to recover with one IPOPT solve (full convergence) by JJ
+            if uf is not None and np.isfinite(uf).all(): 
                 self.n_fallback += 1
-                self._u_prev = np.asarray(uf, float).copy()
+                self._u_prev = np.asarray(uf, float).copy() # if IPOPT fails, then hold the previous u 
                 return self._u_prev.copy()
+
         return self._u_prev.copy()
 
     def _ipopt_fallback(self, x, w_hat, xref):

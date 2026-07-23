@@ -12,7 +12,7 @@ import sys
 import math
 import time
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 
 import numpy as np  # noqa: F401

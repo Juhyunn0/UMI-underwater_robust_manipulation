@@ -1,7 +1,7 @@
 # 03 — Thrusters (Phase 2: actuation & allocation)
 
 **Status: DONE ✓.** Code: `thrusters.py`, actuators in `bluerov.xml`. Verify:
-`python test_thrusters.py`. Everything FLU; MarineGym coefficients only.
+`python tests/test_thrusters.py`. Everything FLU; MarineGym coefficients only.
 
 ## T200 thrust model (from MarineGym `t200.py` + `BlueROV.yaml`)
 
@@ -37,7 +37,7 @@ reverts to the ideal force path. (Manual keyboard teleop, `eval_dp`, and `ablati
 use their own explicit paths.)
 
 **`voltage_scale` is grounded in the official datasheet** (Blue Robotics *T200
-Public Performance Data 10–20 V*, Sep 2019; reproduce with `analyze_t200_voltage.py`):
+Public Performance Data 10–20 V*, Sep 2019; reproduce with `tools/analyze_t200_voltage.py`):
 
 | V | 10 | 12 | 14 | 16 | 18 | 20 |
 |---|---|---|---|---|---|---|
@@ -121,7 +121,7 @@ proportional to Fx), and the 2 vertical thrusters share nearly the same x.
 
 ## Verified (Phase 2)
 
-`python test_thrusters.py` (gravity off, to isolate thrust):
+`python tests/test_thrusters.py` (gravity off, to isolate thrust):
 - T200 curve limits match the actuator `ctrlrange`.
 - Each commanded DOF gives the right **FLU** response: surge→+x, sway→+y (left),
   heave→+z (up), yaw→+Mz, roll→+Mx; measured wrench (from MuJoCo acceleration)

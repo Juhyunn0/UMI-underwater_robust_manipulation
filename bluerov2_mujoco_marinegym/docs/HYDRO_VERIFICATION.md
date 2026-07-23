@@ -4,14 +4,14 @@
 the intended Fossen physics to within measurement precision; the single deliberate approximation
 (the lagged/filtered added-mass force) is quantified and negligible.
 
-- **What:** an independent harness, [verify_hydro.py](../verify_hydro.py), compares each hydro term
+- **What:** an independent harness, [verify/verify_hydro.py](../verify_hydro.py), compares each hydro term
   against a closed-form analytic prediction with **disturbances OFF** (`disturbance=None` → still
   water, so each term is cleanly isolated).
 - **Method:** the simulator is **not modified**. Known body wrenches are injected through MuJoCo's
   independent external-force buffer `data.xfrc_applied` (hydro keeps running as its own passive
   callback). Where a single axis must move purely, the net buoyancy (+1.10 N) is cancelled with a
   test-only vertical force.
-- **Run:** `python verify_hydro.py` (env `robust`). Figures saved under [docs/figs/](figs/).
+- **Run:** `python verify/verify_hydro.py` (env `robust`). Figures saved under [docs/figs/](figs/).
 - **Reviewed by** the control-theory advisor (predictions, isolation logic, tolerances).
 
 Reference truth (from `marinegym_assets/BlueROV.yaml` + `bluerov.xml`): m=11.2 kg,
@@ -85,7 +85,7 @@ B=ρgV=**110.97 N**, W=mg=**109.87 N**, net **+1.10 N**, restoring stiffness k=c
 - [figs/hydro_P_convergence.png](figs/hydro_P_convergence.png) — trajectory error vs dt: slope-1 **O(dt)** convergence to the continuous Fossen model.
 - [figs/hydro_P_lagfidelity.png](figs/hydro_P_lagfidelity.png) — added-mass-lag: effective-mass fraction & transport delay vs Ω (in-band ≈ ideal).
 
-## Precision verification (`verify_hydro_precise.py`)
+## Precision verification (`verify/verify_hydro_precise.py`)
 A rigorous superset of the above (methodology reviewed by the control-theory advisor; grounded in Fossen
 2011, Roache 1998 *V&V*, and the Salari–Knupp method of manufactured solutions). **17/17 checks across 4
 tiers**; the simulator is again unmodified (driven through `xfrc_applied`, still water).
@@ -126,7 +126,7 @@ to translation (pitch↔surge, roll↔sway) — a real effect the sim captures e
 (e.g. Yṙ, Nv̇) of a full BlueROV2 identification are not modeled. This is a *modeling* choice, separate
 from the lag approximation, and acceptable for this control study.
 
-*Reproduce:* `python verify_hydro_precise.py --tier 1234` (env `robust`; ~25 s; needs `casadi`, `scipy`).
+*Reproduce:* `python verify/verify_hydro_precise.py --tier 1234` (env `robust`; ~25 s; needs `casadi`, `scipy`).
 
 ## Conclusion
 Every hydrodynamic term — **buoyancy, restoring, linear+quadratic drag, added mass, and added-mass
@@ -137,4 +137,4 @@ be numerically unstable in MuJoCo's explicit passive channel), is shown to be **
 physically relevant frequencies (m_eff = m+M_A to 0.1%; transient lag 0.01 cm/s). The simulator's
 hydrodynamics is verified correct for control work.
 
-*Reproduce:* `python verify_hydro.py` (env `robust`).
+*Reproduce:* `python verify/verify_hydro.py` (env `robust`).

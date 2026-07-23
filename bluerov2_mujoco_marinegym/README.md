@@ -28,8 +28,8 @@ solver.
 
 | capability | where | status |
 |---|---|---|
-| Rigid body + 6 thruster sites/actuators (MJCF) | `bluerov.xml`, `meshes/` | ✅ verified |
-| T200 thruster curve, allocation `B` (rank 5), realistic actuator model | `thrusters.py` | ✅ |
+| Rigid body + 8 thruster sites/actuators (MJCF) | `bluerov_heavy.xml`, `meshes/` | ✅ verified |
+| T200 thruster curve, allocation `B` (rank 6, fully actuated), realistic actuator model | `thrusters.py` | ✅ |
 | Fossen hydrodynamics: buoyancy/restoring + added mass + drag (passive callback) | `hydro.py` | ✅ verified |
 | Disturbances: current + irregular waves + kicks + domain randomization | `disturbances.py` | ✅ verified |
 | **Finite-depth** disturbance env: directional JONSWAP + current+drift + Froude-Krylov inertia (5 modes: NONE/C/CD/CW/CDW, NONE=still-water baseline) | `disturbance/` | ✅ verified |
@@ -39,18 +39,18 @@ solver.
 | NMPC solved by **acados SQP-RTI** (~1 ms, default) with IPOPT fallback | `dobmpc/mpc_acados.py`, `dobmpc/mpc.py` | ✅ verified |
 | **Reference preview** (tracking mode, 2026-07-21): mpc/dobmpc square runs sample the TRUE future reference over the 3 s horizon (`set_reference_traj` + `make_square_ref`) instead of extrapolating straight through corners; DP/teleop keep the setpoint interface; run meta records `ref_preview` — don't pool square mpc/dobmpc results across this boundary | `dobmpc_controller.py`, `experiments/run_compare.py` | ✅ |
 | Autonomous square-tracking mission + CSV recorder + run manifest (incl. kicks) | `mission.py`, `recorder.py` | ✅ |
-| Experiments: station-keeping comparison, actuator-realism ablation | `dobmpc/eval_dp.py`, `ablation_thrusters.py` | ✅ |
+| Experiments: station-keeping comparison, actuator-realism ablation | `dobmpc/eval_dp.py`, `tools/ablation_thrusters.py` | ✅ |
 | Experiment: 3 controllers × 5 disturbance modes × N seeds × current/wave heading sweep (paired or full grid), metrics + per-run CSVs/meta + all figures in one run | `experiments/run_compare.py`, `config/*.yaml` | ✅ |
 | **Live viewer**: watch ONE controller × mode run the square in real-time MuJoCo + save trajectory CSV + 1-lap mp4 | `experiments/run_viewer.py` | ✅ |
 | Trajectory-overlay figure from `run_viewer` CSVs (single mode, or all-modes 2×3 grid) | `experiments/plot_trajectories.py` | ✅ |
-| Slide figures: β̄ = mean-of-a-spread wave heading (sea snapshot + cos^2s lobe, s=30 vs s=2) → `assets/screenshots/waves/wave_*.png` | `plot_wave_spreading.py` | ✅ |
+| Slide figures: β̄ = mean-of-a-spread wave heading (sea snapshot + cos^2s lobe, s=30 vs s=2) → `assets/screenshots/waves/wave_*.png` | `tools/plot_wave_spreading.py` | ✅ |
 | Verification: hydro (smoke + precision), acados equivalence, run-meta | `verify_*.py` | ✅ |
 
-Two model variants, selected by `ROV_MODEL` (see below): **heavy** (default,
-8 thrusters, `rank = 6` — **fully actuated**, the NMPC commands the full 6-DOF
-wrench incl. roll and pitch) and **bluerov2** (6 thrusters,
-`rank(allocation) = 5` — under-actuated in pitch, command
-surge/sway/heave/yaw/roll, **never pitch**).
+The BlueROV2 **Heavy** family, selected by `ROV_MODEL` (see below): **heavy**
+(default), **heavy_c3** (+ MarineSitu C3 camera), and **heavy_gripper** (+ Newton
+gripper + C3). All are 8-thruster, `rank = 6` — **fully actuated**: the NMPC commands
+the full 6-DOF wrench incl. roll and pitch. (The legacy 6-thruster rank-5 `bluerov2`
+variant was removed 2026-07-21.)
 
 ---
 
@@ -69,44 +69,44 @@ conda activate robust
 cd bluerov2_mujoco_marinegym
 ```
 
-### Model variant: BlueROV2 vs BlueROV2 Heavy (vs Heavy+Gripper)
+### Model variant: BlueROV2 Heavy family (bare / +C3 / +Gripper)
 
 Pick the vehicle with the **`ROV_MODEL`** env var (default **`heavy`**); a single
 [rov_model.py](rov_model.py) registry keeps the plant and the controller in sync:
 
 ```bash
                         python teleop.py --square --ctrl dobmpc --disturb   # heavy (default)
-ROV_MODEL=bluerov2      python teleop.py --square --ctrl dobmpc --disturb   # vectored-6 (rank-5)
-ROV_MODEL=heavy_gripper python teleop.py --observe                          # payload variant
+ROV_MODEL=heavy_c3      python teleop.py --square --ctrl dobmpc --disturb   # + MarineSitu C3
+ROV_MODEL=heavy_gripper python teleop.py --observe                          # + Newton gripper + C3
                         python -m dobmpc.eval_dp --ctrls pid,mpc,dobmpc     # heavy, headless
 ```
 
-| | bluerov2 | heavy | heavy_c3 | heavy_gripper |
-|---|---|---|---|---|
-| thrusters | 6 (rank 5) | 8 (rank 6, **fully actuated**) | 8 (rank 6) | 8 (rank 6) + gripper servo (ctrl 8) |
-| mass / inertia | 11.2 kg / [0.30375, 0.626, 0.5769] | 11.5 kg / [0.3291, 0.6347, 0.6109]† | 13.2 kg / [0.37014, 0.73153, 0.67460]§ | 13.724 kg / [0.38154, 0.77780, 0.70954]‡ |
-| net buoyancy | ~+1.1 N | ~+1.1 N | **−3.1 N (sinks)** | **−5.7 N (sinks)** |
-| NMPC input | `u=[X,Y,Z,N]` (NU 4) | `u=[X,Y,Z,K,M,N]` (NU 6) | same as heavy | same as heavy |
-| pitch | floats to trim (~12°) | actively leveled (~0.8°) | ~−1° (heavy gains, no rp-PD) | actively leveled (PID adds rp-PD) |
+| | heavy | heavy_c3 | heavy_gripper |
+|---|---|---|---|
+| thrusters | 8 (rank 6, **fully actuated**) | 8 (rank 6) | 8 (rank 6) + gripper servo (ctrl 8) |
+| mass / inertia | 11.5 kg / [0.3291, 0.6347, 0.6109]† | 13.2 kg / [0.37014, 0.73153, 0.67460]§ | 13.724 kg / [0.38154, 0.77780, 0.70954]‡ |
+| net buoyancy | ~+1.1 N | **−3.1 N (sinks)** | **−5.7 N (sinks)** |
+| NMPC input | `u=[X,Y,Z,K,M,N]` (NU 6) | same as heavy | same as heavy |
+| pitch | passive restoring only (no rp loop) | passive (heavy gains, no rp loop) | actively leveled — **rp-PID** (2026-07-21) |
 
 **§ heavy_c3 = heavy + MarineSitu C3 stereo camera on its C3-BR bracket** — EXACTLY the
 lab's Onshape assembly (the Newton gripper is **not in Onshape yet**, so it is absent;
 `heavy_gripper` is the future config that adds it). Same composition philosophy: vendor C3
 mass 1.700 kg + parallel-axis via [compute_payload_inertia.py](compute_payload_inertia.py)
 `compose_c3()`; MJCF GENERATED from `bluerov_heavy.xml` by
-[gen_c3_variant.py](gen_c3_variant.py) (never hand-edit). Body frame re-origined at the
+[tools/gen_c3_variant.py](tools/gen_c3_variant.py) (never hand-edit). Body frame re-origined at the
 composite COM; inertia **diagonal** (`Ixz` +0.046 dropped, 12.4% of Ixx — KNOWN_ISSUES). C3
 mount **measured from the Onshape assembly** (2026-07-19: front-bottom on the centreline,
 lens forward and level; 3 cameras `c3_center/left/right` at the lens plane). Bracket is
 visual-only (mass unknown). Uses `GAINS_HEAVY` (no active roll/pitch leveling → ~1° residual
 pitch from the C3's static moment). Selected with `ROV_MODEL=heavy_c3`; `POOL_TAGS=1` →
-`scene_bluerov_heavy_c3_tags.xml`. Regression: [test_heavy_c3.py](test_heavy_c3.py).
+`scene_bluerov_heavy_c3_tags.xml`. Regression: [tests/test_heavy_c3.py](tests/test_heavy_c3.py).
 
 **‡ heavy_gripper = heavy + Newton Subsea Gripper + MarineSitu C3 stereo camera** (the
 real payload this lab bolts on). Rigid-body numbers are COMPOSED, not hand-tuned:
 vendor-verified masses (gripper 524 g air/267 g water; C3 1700 g/430 g) + parallel-axis
 inertia via [compute_payload_inertia.py](compute_payload_inertia.py); the MJCF is
-GENERATED from `bluerov_heavy.xml` by [gen_gripper_variant.py](gen_gripper_variant.py)
+GENERATED from `bluerov_heavy.xml` by [tools/gen_gripper_variant.py](tools/gen_gripper_variant.py)
 (never hand-edit it). Key properties:
 - **Body frame re-origined at the composite COM** (origin==COM, like heavy) — the dobmpc
   predictor, `params.ZG_MASS=0`, and hydro all assume it. Inertia is emitted **diagonal**
@@ -128,7 +128,7 @@ GENERATED from `bluerov_heavy.xml` by [gen_gripper_variant.py](gen_gripper_varia
 - Hydro added-mass/damping stay the heavy set (payload increments ≪ published-set spread;
   DNV build-up estimates documented in
   [marinegym_assets/BlueROVHeavyGripper.yaml](marinegym_assets/BlueROVHeavyGripper.yaml) —
-  revisit with in-situ system ID). Verified: `python test_heavy_gripper.py`
+  revisit with in-situ system ID). Verified: `python tests/test_heavy_gripper.py`
   (composition/buoyancy/gripper/PID) + DOB-MPC DP hold 1.3 cm (still), 1.4 cm (current+waves).
 
 The **heavy** visual is the real MarineGym BlueROVHeavy skin — the body mesh is split
@@ -137,12 +137,12 @@ paper render), with the frame + thruster shrouds baked into that mesh set. It's 
 ONLY**: dynamics come from the explicit `<inertial>` (mass 11.5, the diaginertia below),
 the collision box, and the 8 thruster sites/actuators — all unchanged, so the colored skin
 is byte-identical in physics (verified 3000-step rollout Δ=0 vs the old gray body).
-Regenerate the color parts with `python extract_meshes.py --colored`.
+Regenerate the color parts with `python tools/extract_meshes.py --colored`.
 
 Same T200 thrusters and hydro coefficients; only mass/volume/thruster layout
 differ. **†** Heavy's inertia is *derived* from the bluerov2 tensor by adding the
 parallel-axis term of the vertical-thruster layout change
-([compute_heavy_inertia.py](compute_heavy_inertia.py)) — the farol Heavy USD's own
+([tools/compute_heavy_inertia.py](tools/compute_heavy_inertia.py)) — the farol Heavy USD's own
 [0.21, 0.245, 0.245] is a hand-tuned Gazebo-stability literal, not physical. It's a
 physically-motivated estimate (not a Heavy CAD measurement) but Heavy-specific and
 ≥ BlueROV2. See [docs/CONTROL_METHODOLOGY.md](docs/CONTROL_METHODOLOGY.md) (2026-06-18).
@@ -187,17 +187,17 @@ POOL_TAGS=0 python teleop.py                # bare scene (no tags/water)
 POOL_TAGS=1 python run_compare ...          # opt IN for an experiment (default off there)
 ```
 
-The floor is built once by [gen_pool_apriltags.py](gen_pool_apriltags.py) (each tag PNG is
+The floor is built once by [tools/gen_pool_apriltags.py](tools/gen_pool_apriltags.py) (each tag PNG is
 round-trip verified with `pupil_apriltags` so sim tag ids provably match the real family). It
 is **VISUAL ONLY** — all added geoms are `contype=0 conaffinity=0` (group 1) and MuJoCo's fluid
 model is off, so **dynamics are byte-for-byte identical** with `POOL_TAGS` set or unset
 (verified: old-vs-new 3000-step rollout Δ=0, incl. `--disturb`). Regenerate / retune with:
 
 ```bash
-python gen_pool_apriltags.py                 # default: 8 m plane floor (waves visible), sky=gradient
-python gen_pool_apriltags.py --floor-size 24 # bigger floor (waves get gentler as it grows)
-python gen_pool_apriltags.py --tag-mode tiles                     # old unique-id per-tile floor
-python gen_pool_apriltags.py --selftest      # (tiles) render a couple tiles + detect them
+python tools/gen_pool_apriltags.py                 # default: 8 m plane floor (waves visible), sky=gradient
+python tools/gen_pool_apriltags.py --floor-size 24 # bigger floor (waves get gentler as it grows)
+python tools/gen_pool_apriltags.py --tag-mode tiles                     # old unique-id per-tile floor
+python tools/gen_pool_apriltags.py --selftest      # (tiles) render a couple tiles + detect them
 # plane knobs: --floor-size (m, def 8) --mosaic-blocks (B, def 10) --mosaic-gap-modules --sky
 # tiles knobs: --layout {survey,grid,hybrid} --pool-width/--pool-length --pitch-x/--pitch-y ...
 ```
@@ -245,7 +245,7 @@ box). Previews: [assets/screenshots/pool/pool_waves_stylized.mp4](../assets/scre
 ## How to run
 
 All commands run from `bluerov2_mujoco_marinegym/` in the **`robust`** conda env
-(one exception: `verify_gpu_mjx.py` runs in `robust-mjx`, see §6). The env-var
+(one exception: `verify/verify_gpu_mjx.py` runs in `robust-mjx`, see §6). The env-var
 knobs (`ROV_MODEL`, `POOL_TAGS`, …) are collected in [§8](#8-environment-variables) —
 **`ROV_MODEL` is the only one that changes dynamics**; everything else is visual
 or infrastructure.
@@ -259,11 +259,11 @@ or infrastructure.
 | `python -m experiments.run_viewer --config config/base.yaml --ctrl dobmpc --mode CDW` | watch ONE (controller, mode) square run live; trajectory CSV + 1-lap mp4 | 4 |
 | `python -m experiments.plot_trajectories` | overlay figure of `run_viewer` trajectory CSVs | 4 |
 | `python -m dobmpc.eval_dp` | station-keeping (DP) PID / MPC / DOB-MPC comparison | 4 |
-| `python ablation_thrusters.py` | actuator-realism ablation (ideal / realistic / low-voltage T200) | 4 |
+| `python tools/ablation_thrusters.py` | actuator-realism ablation (ideal / realistic / low-voltage T200) | 4 |
 | `python test_<name>.py` (11 files) · `python -m disturbance.test_{waves,env}` | per-component smoke/unit tests | 1 |
-| `python verify_hydro[_precise].py` · `verify_acados.py` · `verify_meta.py` · `verify_gpu_mjx.py` | V&V suite (hydro, solver equivalence, run manifest, GPU env) | 6 |
-| `python analyze_square3.py` · `analyze_acados_vs_before.py` · `analyze_t200_voltage.py` | recording analysis + datasheet provenance | 5 |
-| `python gen_pool_apriltags.py` · `extract_meshes.py` · `generate_bluerov_xml.py` · `compute_heavy_inertia.py` · `plot_wave_spreading.py` | asset & figure generators (occasional) | 7 |
+| `python verify_hydro[_precise].py` · `verify/verify_acados.py` · `verify/verify_meta.py` · `verify/verify_gpu_mjx.py` | V&V suite (hydro, solver equivalence, run manifest, GPU env) | 6 |
+| `python tools/analyze_square3.py` · `tools/analyze_acados_vs_before.py` · `tools/analyze_t200_voltage.py` | recording analysis + datasheet provenance | 5 |
+| `python tools/gen_pool_apriltags.py` · `tools/extract_meshes.py` · `tools/generate_bluerov_xml.py` · `tools/compute_heavy_inertia.py` · `tools/plot_wave_spreading.py` | asset & figure generators (occasional) | 7 |
 
 ### 1. Smoke / unit tests (fast, headless)
 
@@ -274,17 +274,17 @@ instead.
 
 | command | what it checks |
 |---|---|
-| `python test_load.py` | model loads; mass ∈ [9, 12] kg; 6 thruster sites; zero-control stability, no NaN. Flags: `--seconds`, `--render out.png`, `--viewer` |
-| `python test_thrusters.py` | ctrlrange = T200 curve limits; measured body wrench ≡ `B @ f`; surge→pitch / sway→roll coupling ratios; pitch underactuation (rank(B) = 5). Flags: `--T`, `--render` |
-| `python test_hydro.py` | neutral-buoyancy hover; self-righting from 20° roll/pitch; drag-bounded terminal velocity + coast-to-stop; 60 s stability. Flag: `--render` |
-| `python test_disturbances.py` | no-thrust drift converges to the current velocity (proves relative velocity is used); wave decay with depth; kick rate; distinct current/wave/kick signatures; bounded domain randomization. Flag: `--render` |
-| `python test_controller.py` | PID/PD go-to-origin × {still water, 0.2 m/s current}: convergence, PID rejects the current, PD keeps a steady-state offset |
-| `ROV_MODEL=bluerov2 python test_dobmpc.py` | FLU↔NED round-trips; Fossen predictor (6 N ≈ 23° trim — a bluerov2-derived ground truth, hence the env var); EAOB unbiasedness; CasADi MPC model ≡ NumPy fossen model (< 1e-9). Needs casadi; no MuJoCo |
-| `python test_square_mission.py` | JONSWAP spectrum sanity (Hs recovery, irregularity, seed reproducibility) + a 2-lap auto-recorded square completes and returns |
-| `python test_observe.py` | `--observe` contracts: drive keys are no-ops; recenter is state-only; the free-drift rollout is byte-identical with the observe gate installed |
-| `python test_water_viz.py` | the animated water hfield visibly changes the render AND leaves a 2000-step rollout byte-identical (Δ = 0). Needs EGL offscreen GL |
-| `python test_monitor_smoke.py` | pyqtgraph monitor builds/redraws headless; spawned-process handle round-trip; degenerate-time guards. Needs PyQt5 + pyqtgraph |
-| `python test_viser_smoke.py` | `--viser` plumbing without a browser (starts a real viser server on port 8099 — the port must be free) |
+| `python tests/test_load.py` | model loads; mass ∈ [9, 12] kg; 6 thruster sites; zero-control stability, no NaN. Flags: `--seconds`, `--render out.png`, `--viewer` |
+| `python tests/test_thrusters.py` | ctrlrange = T200 curve limits; measured body wrench ≡ `B @ f`; surge→pitch / sway→roll coupling ratios; pitch underactuation (rank(B) = 5). Flags: `--T`, `--render` |
+| `python tests/test_hydro.py` | neutral-buoyancy hover; self-righting from 20° roll/pitch; drag-bounded terminal velocity + coast-to-stop; 60 s stability. Flag: `--render` |
+| `python tests/test_disturbances.py` | no-thrust drift converges to the current velocity (proves relative velocity is used); wave decay with depth; kick rate; distinct current/wave/kick signatures; bounded domain randomization. Flag: `--render` |
+| `python tests/test_controller.py` | PID/PD go-to-origin × {still water, 0.2 m/s current}: convergence, PID rejects the current, PD keeps a steady-state offset |
+| `python tests/test_dobmpc.py` | FLU↔NED round-trips; Fossen predictor; EAOB unbiasedness; CasADi MPC model ≡ NumPy fossen model (< 1e-9). Needs casadi; no MuJoCo. **⚠ pending rework:** its option-(b) trim assertions (6 N ≈ 23° pitch) assume the removed rank-5 `bluerov2` plant (NU=4) — reworks with the deferred dobmpc NU=6-only cleanup (see KNOWN_ISSUES) |
+| `python tests/test_square_mission.py` | JONSWAP spectrum sanity (Hs recovery, irregularity, seed reproducibility) + a 2-lap auto-recorded square completes and returns |
+| `python tests/test_observe.py` | `--observe` contracts: drive keys are no-ops; recenter is state-only; the free-drift rollout is byte-identical with the observe gate installed |
+| `python tests/test_water_viz.py` | the animated water hfield visibly changes the render AND leaves a 2000-step rollout byte-identical (Δ = 0). Needs EGL offscreen GL |
+| `python tests/test_monitor_smoke.py` | pyqtgraph monitor builds/redraws headless; spawned-process handle round-trip; degenerate-time guards. Needs PyQt5 + pyqtgraph |
+| `python tests/test_viser_smoke.py` | `--viser` plumbing without a browser (starts a real viser server on port 8099 — the port must be free) |
 | `python -m disturbance.test_waves` | 12 checks on the finite-depth directional wave field: dispersion residual + limits, JONSWAP + cos^2s normalization, realized Hs, seabed velocity limit, seed reproducibility |
 | `python -m disturbance.test_env` | 21 checks on current/env: exact Gauss–Markov discretization, C/CD/CW/CDW mode gating, identical wave phases across modes per seed, FK force = ρ·vol·C_M·a_wave |
 
@@ -377,7 +377,7 @@ lag / voltage), since they exist to predict the real robot. `--ideal-thrusters`
 reverts to the ideal force path (commanded == realized); `--thruster-voltage 0.72`
 sets the battery thrust scale (default `0.72` = 4S nominal 14.8 V,
 datasheet-grounded — see [docs/03_THRUSTERS.md](docs/03_THRUSTERS.md) and
-`analyze_t200_voltage.py`).
+`tools/analyze_t200_voltage.py`).
 
 Each run writes `recordings/<YYYYMMDD>/<timestamp>_square_<ctrl>.csv` **plus a
 sidecar `<...>.meta.json`** capturing the full run manifest — controller + solver
@@ -499,10 +499,10 @@ same `--start` offset (0.1,0.05,0). Prints the steady-window (t ≥ 10 s) metric
 table (radial RMS, DC bias, wave-residual std, pitch, EAOB ŵ_x) and saves a
 6-panel comparison figure to `recordings/<date>/dp_compare_<ts>.png`.
 
-#### Actuator-realism ablation — `ablation_thrusters.py`
+#### Actuator-realism ablation — `tools/ablation_thrusters.py`
 
 ```bash
-python ablation_thrusters.py   # no flags: 3 ctrl × {ideal, realistic, realistic-LV} × 5 seeds
+python tools/ablation_thrusters.py   # no flags: 3 ctrl × {ideal, realistic, realistic-LV} × 5 seeds
 ```
 
 Re-runs the DP task under the ideal force path vs the realistic T200 model
@@ -515,9 +515,9 @@ limit-cycle jitter, voltage DC sag). Prints the degradation table and writes
 
 | command | what it does |
 |---|---|
-| `python analyze_square3.py` | off-path + time-referenced error, orientation stats, and control effort for the 3 recorded square CSVs (PID/MPC/DOB-MPC) → comparison table + `recordings/20260615/square3_compare.png` |
-| `python analyze_acados_vs_before.py` | before/after IPOPT→acados solver-swap deltas on the same square mission (PID as noise floor) → per-metric tables + `recordings/20260615/acados_vs_before.png` |
-| `python analyze_t200_voltage.py` | parses the official T200 datasheet xlsx (stdlib-only) and re-derives the thruster `voltage_scale` for 14.8 V; MATCH-checks the live constant (0.72) |
+| `python tools/analyze_square3.py` | off-path + time-referenced error, orientation stats, and control effort for the 3 recorded square CSVs (PID/MPC/DOB-MPC) → comparison table + `recordings/20260615/square3_compare.png` |
+| `python tools/analyze_acados_vs_before.py` | before/after IPOPT→acados solver-swap deltas on the same square mission (PID as noise floor) → per-metric tables + `recordings/20260615/acados_vs_before.png` |
+| `python tools/analyze_t200_voltage.py` | parses the official T200 datasheet xlsx (stdlib-only) and re-derives the thruster `voltage_scale` for 14.8 V; MATCH-checks the live constant (0.72) |
 
 The first two read **hard-coded folders/filenames** under `recordings/20260615/` —
 edit the `DIR`/`RUNS`/`PAIRS` constants at the top to point at your run. All three
@@ -527,33 +527,33 @@ are headless (no flags).
 
 | command | what it proves |
 |---|---|
-| `python verify_hydro.py` | 32-check first-principles smoke on hydro.py in still water: net buoyancy, terminal velocity / drag anisotropy, restoring pendulum, added mass, energy sanity, frame checks. Flag: `--no-plot`; figures → `docs/figs/hydro_T*.png`. Takes minutes |
-| `python verify_hydro_precise.py` | rigorous 4-tier superset: structural Fossen identities (hard gate), order-of-accuracy convergence vs a DOP853 continuum reference, frame/Galilean invariance, added-mass-lag transfer-function fidelity. Flags: `--tier 1234`, `--ladder 2,1,0.5,0.25,0.125` [ms], `--no-plot`. Slow |
-| `python verify_acados.py` | acados NMPC ≡ IPOPT NMPC: equivalence (worst max\|Δu\| < 0.25 N on interior states) + SQP-RTI timing vs the 50 ms @ 20 Hz budget. First run code-generates the solver into `dobmpc/_acados_gen/` |
-| `python verify_meta.py` | the recorder sidecar manifest is complete: the disturbance snapshot round-trips (kicks/waves reproduced exactly), CSV header matches, solver + effective PID gains captured. Run from the package dir |
-| `/home/bdml/miniforge3/envs/robust-mjx/bin/python verify_gpu_mjx.py` | Phase-0 GPU env check (**`robust-mjx` env, NOT `robust`**): JAX sees the CUDA GPU and a jitted MJX rollout actually runs on it; loading bluerov.xml under MJX is a non-gating bonus check (the CPU passive-callback hydro does not run under MJX) |
+| `python verify/verify_hydro.py` | 32-check first-principles smoke on hydro.py in still water: net buoyancy, terminal velocity / drag anisotropy, restoring pendulum, added mass, energy sanity, frame checks. Flag: `--no-plot`; figures → `docs/figs/hydro_T*.png`. Takes minutes |
+| `python verify/verify_hydro_precise.py` | rigorous 4-tier superset: structural Fossen identities (hard gate), order-of-accuracy convergence vs a DOP853 continuum reference, frame/Galilean invariance, added-mass-lag transfer-function fidelity. Flags: `--tier 1234`, `--ladder 2,1,0.5,0.25,0.125` [ms], `--no-plot`. Slow |
+| `python verify/verify_acados.py` | acados NMPC ≡ IPOPT NMPC: equivalence (worst max\|Δu\| < 0.25 N on interior states) + SQP-RTI timing vs the 50 ms @ 20 Hz budget. First run code-generates the solver into `dobmpc/_acados_gen/` |
+| `python verify/verify_meta.py` | the recorder sidecar manifest is complete: the disturbance snapshot round-trips (kicks/waves reproduced exactly), CSV header matches, solver + effective PID gains captured. Run from the package dir |
+| `/home/bdml/miniforge3/envs/robust-mjx/bin/python verify/verify_gpu_mjx.py` | Phase-0 GPU env check (**`robust-mjx` env, NOT `robust`**): JAX sees the CUDA GPU and a jitted MJX rollout actually runs on it; loading bluerov.xml under MJX is a non-gating bonus check (the CPU passive-callback hydro does not run under MJX) |
 
 ### 7. Asset & figure generators (occasional)
 
 | command | what it (re)generates |
 |---|---|
-| `python gen_pool_apriltags.py` | the visual pool AprilTag floor + water scene: `apriltags/*.png` (round-trip verified), `tag_floor.xml`, the two `scene_*_tags.xml` wrappers. `--selftest` renders 2 tiles and re-detects them — **note: it overwrites `tag_floor.xml` with just those tiles, rerun the full build after**. All layout/water/sky knobs: see [Pool AprilTag floor](#pool-apriltag-floor-visual-pool_tags) above |
-| `python extract_meshes.py` | gray `meshes/bluerov_body.obj` + `bluerov_thruster.obj` from the MarineGym USD. Flags: `--body-faces` (40000), `--thruster-faces` (3000) |
-| `python extract_meshes.py --colored` | the 4-part Heavy color skin `meshes/rov_body_{cyan,white,black,silver}.obj` that `bluerov_heavy.xml` references (split by USD GeomSubset material). Flag: `--colored-faces` (55000 total budget) |
-| `python generate_bluerov_xml.py` | **overwrites `bluerov.xml`** from the authoritative BlueROV.usd (mass/COM/inertia via UsdPhysics, thruster sites, force actuators). Hand edits to that file are lost on rerun. No flags |
-| `python compute_heavy_inertia.py` | (stdout only) derives the Heavy rotational inertia from the bluerov2 tensor via the vertical-thruster parallel-axis term, + an m_v sensitivity sweep. No flags |
-| `python plot_wave_spreading.py` | slide figures in `../assets/screenshots/`: `wave_beta_vectors.png` + `wave_spreading_s_compare.png` (β̄ is the MEAN of a cos^2s directional spread, not a single wave direction). Flags: `--beta-deg` (25), `--seed` (0), `--out-dir`, `--sea-lobe` (adds `wave_beta_spreading.png`). Wave params are hardcoded copies of `config/base.yaml` — keep them in sync |
+| `python tools/gen_pool_apriltags.py` | the visual pool AprilTag floor + water scene: `apriltags/*.png` (round-trip verified), `tag_floor.xml`, the two `scene_*_tags.xml` wrappers. `--selftest` renders 2 tiles and re-detects them — **note: it overwrites `tag_floor.xml` with just those tiles, rerun the full build after**. All layout/water/sky knobs: see [Pool AprilTag floor](#pool-apriltag-floor-visual-pool_tags) above |
+| `python tools/extract_meshes.py` | gray `meshes/bluerov_body.obj` + `bluerov_thruster.obj` from the MarineGym USD. Flags: `--body-faces` (40000), `--thruster-faces` (3000) |
+| `python tools/extract_meshes.py --colored` | the 4-part Heavy color skin `meshes/rov_body_{cyan,white,black,silver}.obj` that `bluerov_heavy.xml` references (split by USD GeomSubset material). Flag: `--colored-faces` (55000 total budget) |
+| `python tools/generate_bluerov_xml.py` | **overwrites `bluerov.xml`** from the authoritative BlueROV.usd (mass/COM/inertia via UsdPhysics, thruster sites, force actuators). Hand edits to that file are lost on rerun. No flags |
+| `python tools/compute_heavy_inertia.py` | (stdout only) derives the Heavy rotational inertia from the bluerov2 tensor via the vertical-thruster parallel-axis term, + an m_v sensitivity sweep. No flags |
+| `python tools/plot_wave_spreading.py` | slide figures in `../assets/screenshots/`: `wave_beta_vectors.png` + `wave_spreading_s_compare.png` (β̄ is the MEAN of a cos^2s directional spread, not a single wave direction). Flags: `--beta-deg` (25), `--seed` (0), `--out-dir`, `--sea-lobe` (adds `wave_beta_spreading.png`). Wave params are hardcoded copies of `config/base.yaml` — keep them in sync |
 
-The USD-reading generators (`extract_meshes.py`, `generate_bluerov_xml.py`) need
+The USD-reading generators (`tools/extract_meshes.py`, `tools/generate_bluerov_xml.py`) need
 `usd-core` and the MarineGym checkout at `../external/MarineGym/`;
-`gen_pool_apriltags.py` needs `pupil_apriltags` + `cv2` and reads
+`tools/gen_pool_apriltags.py` needs `pupil_apriltags` + `cv2` and reads
 `../config/{config,tag_map}.yaml`.
 
 ### 8. Environment variables
 
 | var | default | scope | effect |
 |---|---|---|---|
-| `ROV_MODEL` | `heavy` | **dynamics** | plant variant: `heavy` (8 thrusters, rank 6, NU=6) or `bluerov2` (6 thrusters, rank 5, NU=4). Read at import by `rov_model.py`. **The only env var that changes dynamics** |
+| `ROV_MODEL` | `heavy` | **dynamics** | plant variant (all 8 thrusters, rank 6, NU=6): `heavy` \| `heavy_c3` (+C3) \| `heavy_gripper` (+gripper+C3). Read at import by `rov_model.py`. **The only env var that changes dynamics** |
 | `POOL_TAGS` | `0` (teleop flips it to `1`) | visual | truthy loads the AprilTag pool wrapper scene (tags + seabed + animated water). Δ=0 verified; an explicit value always wins over teleop's default |
 | `WATER_WAVE_LAMBDA` | unset (faithful) | visual | stylized visual wavelength [m] for the animated water surface (e.g. `0.9` = clearly sloshing); physics untouched |
 | `WATER_WAVE_AMP` | `1.0` | visual | visual wave-height gain for the animated surface |
@@ -590,13 +590,12 @@ bluerov2_mujoco_marinegym/
 │   ├── 00_OVERVIEW.md … 07_DISTURBANCES.md   # per-phase design docs
 │   ├── CONTROL_METHODOLOGY.md / .ko.md        # controller why-journal (EN/KO)
 │   └── HYDRO_VERIFICATION.md / .ko.md         # hydro V&V writeup (EN/KO)
-├── rov_model.py                # variant registry (ROV_MODEL: bluerov2 | heavy) — single source of truth
-├── bluerov.xml                 # bluerov2 MJCF (rigid body + 6 thruster sites + 6 actuators)
-├── bluerov_heavy.xml           # heavy MJCF (8 thrusters, mass 11.5, fully actuated)
-├── gen_pool_apriltags.py       # build the opt-in pool AprilTag floor (POOL_TAGS=1); VISUAL ONLY
-├── water_viz.py                #   animated waves+current water surface (hfield); VISUAL ONLY
-├── tag_floor.xml               #   generated <mujocoinclude>: seabed + tag36h11 grid + water hfield
-├── scene_bluerov_tags.xml · scene_bluerov_heavy_tags.xml   # generated opt-in wrappers (ROV + tag_floor)
+├── rov_model.py                # variant registry (ROV_MODEL: heavy | heavy_c3 | heavy_gripper) — single source of truth
+├── bluerov_heavy.xml           # heavy MJCF (8 thrusters, mass 11.5, fully actuated) — the default plant
+├── bluerov.xml                 # legacy rank-5 MJCF — NOT a selectable variant; kept only as the fixed reference plant for the hydro/thruster verify_*/test_* scripts + heavy-inertia provenance
+├── water_viz.py                # animated waves+current water surface (hfield); VISUAL ONLY
+├── tag_floor.xml               # generated <mujocoinclude>: seabed + tag36h11 grid + water hfield (built by tools/gen_pool_apriltags.py, opt-in via POOL_TAGS=1)
+├── scene_bluerov_heavy_tags.xml   # generated opt-in wrapper (ROV + tag_floor); also *_heavy_c3/_gripper
 ├── apriltags/                  # generated tag36h11 PNGs (one per tag id), round-trip verified
 ├── meshes/                     # real MarineGym meshes (body + T200), from the USD
 ├── marinegym_assets/           # MarineGym BlueROV.yaml / BlueROVHeavy.yaml (hydro/rotor coeffs) + config
@@ -604,6 +603,9 @@ bluerov2_mujoco_marinegym/
 ├── thrusters.py                # T200 curve, allocation B/pinv(B), realistic ThrusterModel
 ├── hydro.py                    # Fossen buoyancy/restoring/added-mass/drag (passive callback)
 ├── disturbances.py             # current + waves + kicks + DR sampler
+├── compute_payload_inertia.py  # C3/gripper payload mass-composition library (imported by tests/ + tools/gen_*)
+├── disturbance/                # finite-depth directional wave/current field package (run_compare env)
+├── experiments/                # run_compare.py — 3-controller × 5-mode batch comparison driver
 │
 ├── controller.py               # baseline PD/PID setpoint controller
 ├── dobmpc_controller.py        # DOB-MPC controller (wraps dobmpc/)
@@ -619,13 +621,15 @@ bluerov2_mujoco_marinegym/
 ├── recorder.py                 # CSV logger + sidecar run manifest (.meta.json)
 ├── monitor.py                  # separate-process live dashboard
 │
-├── ablation_thrusters.py       # actuator-realism ablation experiment
-├── analyze_square3.py · analyze_acados_vs_before.py   # recording analysis
-├── analyze_t200_voltage.py     # datasheet provenance for thruster voltage_scale (0.72)
-├── compute_heavy_inertia.py    # derive the Heavy inertia from bluerov2 (parallel-axis)
-├── verify_hydro.py · verify_hydro_precise.py · verify_acados.py · verify_meta.py
-├── test_*.py                   # per-component tests (pytest)
-├── generate_bluerov_xml.py · extract_meshes.py        # regenerate MJCF/meshes from USD
+├── tests/                      # per-component tests (test_*.py) — run from the package root
+├── verify/                     # V&V scripts: verify_hydro(_precise), verify_acados, verify_meta, verify_gpu_mjx
+├── tools/                      # one-off generators & analysis (not needed at runtime):
+│   ├── gen_c3_variant.py · gen_gripper_variant.py   # regenerate the heavy_c3 / heavy_gripper MJCF
+│   ├── gen_pool_apriltags.py                        # build the pool AprilTag floor (POOL_TAGS=1); VISUAL ONLY
+│   ├── generate_bluerov_xml.py · extract_meshes.py · process_c3_mesh.py   # MJCF/meshes from USD/CAD
+│   ├── compute_heavy_inertia.py                     # derive the Heavy inertia from bluerov2 (parallel-axis)
+│   ├── analyze_square3.py · analyze_acados_vs_before.py · analyze_t200_voltage.py   # recording/datasheet analysis
+│   └── ablation_thrusters.py · plot_wave_spreading.py   # actuator-realism ablation; wave-spreading figures
 └── recordings/                 # experiment CSVs + .meta.json sidecars
 ```
 
@@ -638,10 +642,10 @@ bluerov2_mujoco_marinegym/
   written in NED). Mislabelling a frame = silent sign-flip bug.
 - **The MarineGym-derived model is canonical** — don't mix parameters with the
   separate hand-built `bluerov2_mujoco_dobmpc/` model.
-- **Pitch is underactuated on `bluerov2`** (`rank(allocation) = 5`) — command
-  surge/sway/heave/yaw/roll, never pitch. (On `heavy` the 8-thruster allocation is
-  rank 6 / fully actuated, so pitch IS commanded — keep the variants' assumptions
-  straight via `rov_model.py`.)
+- **The Heavy family is rank-6 fully actuated** (`rank(allocation) = 6`) — the
+  8-thruster allocation realizes the full 6-DOF wrench, pitch and roll included.
+  (The legacy rank-5 `bluerov2` variant, where pitch was underactuated, was removed
+  2026-07-21; `bluerov.xml` survives only as a verify/test fixture.)
 - **Append to the methodology journal** on every major control change, and keep
   this README's run instructions current when entry points change.
 

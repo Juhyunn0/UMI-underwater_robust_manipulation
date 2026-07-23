@@ -26,7 +26,7 @@ current:
 
 inertia:                # Froude-Krylov wave-inertia force injected via external_wrench
   rho: 1025.0           # seawater density [kg/m^3] (FK term; hydro buoyancy still uses 997)
-  vol: 0.0113459        # displaced volume [m^3] (BlueROV.yaml)
+  vol: 0.0116499        # displaced volume [m^3] (bare heavy, BlueROVHeavy.yaml; payload variants differ)
   fk_mode: froude_krylov  # froude_krylov (C_M=1, recommended) | morison_ca | off
   C_M: 1.0
   C_D: 1.2              # carried for metadata only — NOT injected (hull D-matrix owns drag)

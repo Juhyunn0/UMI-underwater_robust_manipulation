@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""Baseline PD/PID setpoint (go-to-origin) controller for the BlueROV2 (FLU).
+"""Baseline PD/PID setpoint (go-to-origin) controller for the BlueROV2 Heavy (FLU).
 
 Drives the vehicle to a world setpoint (default: global origin) + yaw reference in
-the MarineGym FLU model. Fully FLU — no NED (that conversion is only the Phase-7
-DOB-MPC's boundary). Commands surge/sway/heave/yaw; NEVER pitch (rank-5
-underactuated), and leaves roll/pitch to passive buoyancy restoring.
+the MarineGym FLU model. Fully FLU — no NED (that conversion is only the DOB-MPC's
+boundary). The heavy family is rank-6 FULLY ACTUATED, so all 6 DOF are independently
+commandable: surge/sway/heave + yaw, PLUS optional roll/pitch leveling (enabled per
+variant by rp_kp; on for heavy_gripper, whose asymmetric payload needs it). Passive
+buoyancy restoring still stabilizes roll/pitch when the leveling loop is off.
 
 Design (reviewed by control-theory-advisor):
-  * World-frame position PD; rotate ONLY the final force to body (avoids the
+  * World-frame position PID; rotate ONLY the final force to body (avoids the
     rotating-stiffness / crabbing issue with anisotropic gains).
   * D term uses world linear velocity (data.qvel[:3]); yaw D uses body yaw rate.
-  * Net-buoyancy feedforward (the known +1.1 N), and a GATED anti-windup integral
-    (integrate only near the setpoint) for the unknown current bias.
-  * Surge force saturated in WRENCH space + slew-rate limited (per-thruster
-    clipping would distort the wrench direction); optional soft pitch guard.
+  * Net-buoyancy feedforward, and GATED + CLAMPED anti-windup integrals on position,
+    yaw, and (PID mode) roll/pitch leveling — integrate only near the setpoint.
+  * Body forces saturated in WRENCH space + a uniform slew-rate limit across all three
+    axes (per-thruster clipping would distort the commanded wrench direction).
 Reuses thrusters.py allocation (allocation_matrix / set_wrench_command).
-See docs/03_THRUSTERS.md (rank-5, My≈-0.0725·Fx surge->pitch coupling).
 """
 import os
 import sys
@@ -46,7 +47,7 @@ def wrap_angle(a):
 # world-frame PD only commutes with yaw when kp_x=kp_y, and the primary compare
 # scenario is square + heading_follow. Companion values (NOT optional): surge
 # f_max 30 N (the old 6 N cap was a rank-5 pitch-coupling relic and would bind
-# ωn to ≤0.54), e_gate 0.15 m, surge_slew 120 N/s, and the yaw rate reference
+# ωn to ≤0.54), e_gate 0.15 m, slew 120 N/s, and the yaw rate reference
 # feed-forward r_ref in compute(). Sim-only validity (ideal thrusters, perfect
 # state, 500 Hz) — derate ωn to 1.0–1.5 and filter D for hardware.
 GAINS_HEAVY = dict(
@@ -56,27 +57,10 @@ GAINS_HEAVY = dict(
     i_max=(4.0, 5.0, 5.0),      # |Ki*integral| clamp [N]
     f_max=(30.0, 30.0, 30.0),   # wrench-space force saturation [N] (rank-6: no
                                 # surge-pitch coupling, so no surge derate)
-    surge_slew=120.0,           # surge force slew-rate limit [N/s]
+    slew=120.0,                 # uniform body-force slew-rate limit [N/s] (all axes)
     yaw_kp=8.95, yaw_kd=4.32, yaw_ki=3.95, yaw_i_max=2.0, mz_max=10.0,  # yaw [N·m]
     e_gate=0.15, yaw_gate=0.2,  # integrate only when |error| < gate (m, rad)
-    pitch_guard_deg=15.0,       # soft-scale surge above this |pitch| (deg)
-)
-
-# bluerov2 (vectored-6, rank-5) — legacy hand-tuned set (2026-06-14), kept as-is:
-# the pole-placement design above was derived and verified for heavy only, and
-# the 6 N surge cap here is load-bearing on rank-5 (a steady Fx balances the weak
-# pitch restoring 1.11 N·m at sin(theta)=0.0725·Fx/1.11, so 6 N -> ~23°).
-GAINS_BLUEROV2 = dict(
-    kp=(6.0, 12.0, 20.0),       # surge, sway, heave  [N/m]
-    kd=(8.0, 12.0, 22.0),       #                     [N·s/m]  (heave: true still-
-                                # water zeta≈0.60 with the full m_eff=26.07 kg)
-    ki=(1.0, 1.5, 1.2),         #                     [N/(m·s)]
-    i_max=(4.0, 5.0, 5.0),      # |Ki*integral| clamp [N]
-    f_max=(6.0, 30.0, 30.0),    # surge kept low — see rank-5 note above
-    surge_slew=30.0,            # surge force slew-rate limit [N/s] (softens pitch kick)
-    yaw_kp=5.0, yaw_kd=3.0, yaw_ki=0.5, yaw_i_max=2.0, mz_max=10.0,  # yaw [N·m]
-    e_gate=0.5, yaw_gate=0.2,   # integrate only when |error| < gate (m, rad)
-    pitch_guard_deg=15.0,       # soft-scale surge above this |pitch| (deg)
+    pitch_guard_deg=15.0,       # dormant transient-pitch limit (dynamic surge->pitch)
 )
 
 # heavy_gripper — the SAME pole-placement design re-evaluated at the payload masses
@@ -93,24 +77,28 @@ GAINS_HEAVY_GRIPPER = dict(
     ki=(42.3, 42.3, 45.3),      #                     [N/(m·s)]
     i_max=(4.0, 5.0, 5.0),      # |Ki*integral| clamp [N]
     f_max=(30.0, 30.0, 30.0),   # rank-6: no surge derate
-    surge_slew=120.0,           # surge force slew-rate limit [N/s]
+    slew=120.0,                 # uniform body-force slew-rate limit [N/s] (all axes)
     yaw_kp=9.92, yaw_kd=4.79, yaw_ki=4.38, yaw_i_max=2.0, mz_max=10.0,  # yaw [N·m]
     e_gate=0.15, yaw_gate=0.2,  # integrate only when |error| < gate (m, rad)
-    pitch_guard_deg=15.0,       # soft-scale surge above this |pitch| (deg)
+    pitch_guard_deg=15.0,       # dormant backup limit (rp-PID leveling handles pitch first)
     # ACTIVE roll/pitch leveling (rank-6): the payload's static attitude torque
     # (forward COM + jaw weight, ~0.2-0.5 N·m) rivals the passive restoring
     # B·coBM ≈ 1.1 N·m/rad, so without this the attitude walks off and flips.
-    # PD pole placement at ωn=3, ζ=0.9 on I_eff = I + K'/M': roll 0.481, pitch 0.859.
+    # kp/kd from PD pole placement at ωn=3, ζ=0.9 on I_eff (roll 0.481, pitch 0.859).
     rp_kp=(4.3, 7.7), rp_kd=(2.6, 4.6), rp_max=8.0,   # roll, pitch [N·m]
+    # PID leveling (2026-07-21): the integral nulls the steady tilt PD leaves under a
+    # constant payload torque (φ_ss = τ/(kp+B_restore) ≈ 2-5° → ~cm end-effector error
+    # at reach; any Ki>0 makes the loop type-1 → φ_ss→0). ki = I_eff·α·ωn³ (same pole
+    # placement as translation, α=0.2, ωn=3): roll 0.481·5.4=2.60, pitch 0.859·5.4=4.64.
+    # Gated (|angle|<rp_gate) + clamped (|ki·I|<rp_i_max) anti-windup; verified 3rd-order
+    # poles all LHP with dominant ζ≈0.83-0.89 (integral does NOT erode PD damping).
+    rp_ki=(2.60, 4.64), rp_i_max=(1.5, 2.0), rp_gate=0.15,   # roll, pitch
 )
 
-# Per-variant gains; unknown variants fall back on the structural property that
-# motivated the original split (the surge cap is a rank-5/under-actuation artifact),
-# so a future variant fails safe, not silently.
-_GAINS_BY_MODEL = {"bluerov2": GAINS_BLUEROV2, "heavy": GAINS_HEAVY,
-                   "heavy_gripper": GAINS_HEAVY_GRIPPER}
-DEFAULT_GAINS = _GAINS_BY_MODEL.get(
-    RM.MODEL, GAINS_HEAVY if RM.FULLY_ACTUATED else GAINS_BLUEROV2)
+# Per-variant gains. Every variant is now rank-6 fully-actuated, so unknown variants
+# (e.g. heavy_c3) fall back on GAINS_HEAVY.
+_GAINS_BY_MODEL = {"heavy": GAINS_HEAVY, "heavy_gripper": GAINS_HEAVY_GRIPPER}
+DEFAULT_GAINS = _GAINS_BY_MODEL.get(RM.MODEL, GAINS_HEAVY)
 
 
 class PoseController:
@@ -143,7 +131,8 @@ class PoseController:
     def reset(self):
         self._I = np.zeros(3)
         self._I_yaw = 0.0
-        self._fx_prev = 0.0
+        self._I_rp = np.zeros(2)             # roll, pitch leveling integral (PID mode)
+        self._f_prev = np.zeros(3)           # previous body force (uniform slew state)
         self.v_ref = np.zeros(3)             # world reference velocity (trajectory FF)
         self.r_ref = 0.0                     # reference yaw rate (heading-follow FF)
         self.commanded = np.zeros(6)
@@ -178,8 +167,8 @@ class PoseController:
     # ---- control law -----------------------------------------------------
     def compute(self, data):
         g = self.g
-        p = np.asarray(data.xpos[self.bid], float)            # world position
-        R = np.asarray(data.xmat[self.bid], float).reshape(3, 3)   # body->world
+        p = np.asarray(data.xpos[self.bid], float)            # world position (x,y,z)
+        R = np.asarray(data.xmat[self.bid], float).reshape(3, 3)   # body->world 
         v = np.asarray(data.qvel[:3], float)                  # world linear vel
         r = float(data.qvel[5])                               # body yaw rate
         yaw = self._yaw_from_R(R)
@@ -213,24 +202,34 @@ class PoseController:
 
 
 
-        # surge (body x): slew-rate limit(N/s) -> optional pitch guard -> amplitude clamp
-        fx = F_body[0]
-        dmax = g["surge_slew"] * self.dt # maximum Force by JJ
-        fx = np.clip(fx, self._fx_prev - dmax, self._fx_prev + dmax) # clip the surge force to avoid sudden change by JJ
-        
-        # reduce surge when pitch is too large by JJ 
-        guard = np.radians(g["pitch_guard_deg"]) # soft limit 
-        if abs(pitch) > guard: 
-            fx *= max(0.0, 1.0 - (abs(pitch) - guard) / np.radians(40.0)) 
-        
-        fx = float(np.clip(fx, -g["f_max"][0], g["f_max"][0])) # final clip to avoid too large surge force by JJ
+        # Body-force shaping (rank-6 heavy: axis-symmetric over surge/sway/heave).
+        # (1) a UNIFORM slew-rate limit models finite actuator/command bandwidth (abrupt
+        #     wrench steps are unphysical -> smoother thruster demand, better sim2real);
+        # (2) a per-axis amplitude clamp = finite thruster authority. Both act in WRENCH
+        #     space so the commanded force DIRECTION is preserved (per-thruster clipping
+        #     would distort it). by JJ
+        f = np.array(F_body[:3], float)                          # working copy of body force
+        f_max = np.asarray(g["f_max"], float)
+        dmax = g["slew"] * self.dt                               # max Δforce per step
+        f = np.clip(f, self._f_prev - dmax, self._f_prev + dmax) # slew-rate limit
+        # Soft pitch guard: scale surge down when |pitch| is large. Kept for the heavy
+        # family (gated on the pitch_guard_deg gain key). NOTE — although the rank-6
+        # allocation STATICALLY decouples Fx from My (pure Fx -> My=0), a DYNAMIC
+        # Coriolis/added-mass coupling still lets fast surge excite the weakly-restored
+        # pitch mode: an aggressive far-offset slew transiently swings pitch to ~70°
+        # WITHOUT this guard (test_controller) vs <45° with it. So it is useful on heavy
+        # too, as a dormant transient-pitch limit (fires only above pitch_guard_deg, never
+        # in normal small-error operation; on heavy_gripper the rp-PID leveling handles
+        # attitude first and this only backs it up on large excursions). by JJ
+        if "pitch_guard_deg" in g:
+            guard = np.radians(g["pitch_guard_deg"])
+            if abs(pitch) > guard:
+                f[0] *= max(0.0, 1.0 - (abs(pitch) - guard) / np.radians(40.0))
+        f = np.clip(f, -f_max, f_max)                            # amplitude clamp
+        self._f_prev = f
+        F_body[:3] = f
 
-        self._fx_prev = fx 
-        F_body[0] = fx
-        F_body[1] = float(np.clip(F_body[1], -g["f_max"][1], g["f_max"][1])) # clip sway force to avoid too large sway force by JJ
-        F_body[2] = float(np.clip(F_body[2], -g["f_max"][2], g["f_max"][2])) # clip heave force to avoid too large heave force by JJ
-
-        # yaw PD (+ gated integral)
+        # yaw PID (+ gated integral) # same algorithm as position PID by JJ
         e_yaw = wrap_angle(self.yaw_ref - yaw)
         if self.use_i and abs(e_yaw) < g["yaw_gate"]:
             cap = g["yaw_i_max"] / max(g["yaw_ki"], 1e-9)
@@ -240,19 +239,35 @@ class PoseController:
             mz += g["yaw_ki"] * self._I_yaw
         mz = float(np.clip(mz, -g["mz_max"], g["mz_max"]))
 
-        # OPTIONAL roll/pitch leveling PD (rank-6 only; gains provide rp_kp to enable).
+        # OPTIONAL roll/pitch leveling PID (rank-6 only; gains provide rp_kp to enable).
         # Needed by heavy_gripper: the asymmetric payload (forward COM + jaw weight)
         # applies a static attitude torque comparable to the passive coBM restoring
         # (~1.1 N·m/rad), which alone lets the attitude walk off and eventually flip.
-        # heavy/bluerov2 gains omit rp_kp -> Mx=My=0, byte-identical behavior.
+        # The GATED + CLAMPED integral (PID mode, gains provide rp_ki) nulls the steady
+        # tilt PD leaves under that constant torque: PD gives φ_ss = τ/(kp+B_restore) ≠ 0,
+        # but any Ki>0 makes the loop type-1 so φ_ss -> 0 (matters for manipulation
+        # end-effector accuracy). Anti-windup mirrors the position/yaw loops: integrate
+        # -angle only when near level (|angle| < rp_gate) and clamp |ki·I| < rp_i_max.
+        # heavy/bluerov2 gains omit rp_kp -> Mx=My=0; an rp_kp-only variant (or mode="pd")
+        # stays pure PD, byte-identical to before.
         mx = my = 0.0
         if g.get("rp_kp") is not None:
             rp_kp = np.asarray(g["rp_kp"]); rp_kd = np.asarray(g["rp_kd"])
             roll = float(np.arctan2(R[2, 1], R[2, 2]))
             p_rate, q_rate = float(data.qvel[3]), float(data.qvel[4])
             rp_max = float(g.get("rp_max", 8.0))
-            mx = float(np.clip(-rp_kp[0] * roll - rp_kd[0] * p_rate, -rp_max, rp_max))
-            my = float(np.clip(-rp_kp[1] * pitch - rp_kd[1] * q_rate, -rp_max, rp_max))
+            if self.use_i and g.get("rp_ki") is not None:
+                rp_ki = np.asarray(g["rp_ki"]); rp_i_max = np.asarray(g["rp_i_max"])
+                ang = np.array([roll, pitch])                   # leveling error = -ang
+                gate = np.abs(ang) < g.get("rp_gate", 0.15)     # integrate only near level
+                self._I_rp = self._I_rp + np.where(gate, -ang * self.dt, 0.0)
+                cap = rp_i_max / np.maximum(rp_ki, 1e-9)
+                self._I_rp = np.clip(self._I_rp, -cap, cap)     # clamp so |ki·I| < rp_i_max
+                i_rp = rp_ki * self._I_rp
+            else:
+                i_rp = np.zeros(2)
+            mx = float(np.clip(-rp_kp[0] * roll - rp_kd[0] * p_rate + i_rp[0], -rp_max, rp_max))
+            my = float(np.clip(-rp_kp[1] * pitch - rp_kd[1] * q_rate + i_rp[1], -rp_max, rp_max))
 
         wrench = np.array([F_body[0], F_body[1], F_body[2], mx, my, mz])
         self.commanded = wrench
@@ -262,9 +277,15 @@ class PoseController:
         """Compute the wrench and write thruster forces. Returns (forces, realized)."""
         wrench = self.compute(data)
         forces, realized = T.set_wrench_command(model, data, wrench, self.B,
-                                                actuator=self.actuator)
+                                                actuator=self.actuator) # assign the wrench to the thrusters by JJ 
+                                                # if we select actuator, then we will use the realistic thrusters to allocate the wrench to the thrusters by JJ
         self.realized = np.asarray(realized, float)
-        return forces, self.realized
+        return forces, self.realized 
+        # force : [F1, F2, F3, F4, F5, F6, F7, F8], each motor force 
+        # realized : [Fx, Fy, Fz, Mx, My, Mz], the actual wrench after allocation by JJ
+
+
+
 
     # ---- convenience for tests / logging ---------------------------------
     def pos_error(self, data):

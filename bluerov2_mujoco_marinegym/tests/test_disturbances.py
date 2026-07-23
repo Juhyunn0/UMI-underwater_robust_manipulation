@@ -10,8 +10,8 @@ All in FLU on top of Phase-3 hydro. Checks:
   5. DR       : randomize() across seeds -> varied, bounded, NaN-free.
   6. Combined : all three for 60 s -> finite and bounded.
 
-    python test_disturbances.py            # asserts + prints
-    python test_disturbances.py --render    # viewer with all disturbances on
+    python tests/test_disturbances.py            # asserts + prints
+    python tests/test_disturbances.py --render    # viewer with all disturbances on
 
 Only mujoco + numpy required.
 """
@@ -22,11 +22,11 @@ import sys
 import numpy as np
 import mujoco
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import hydro as H
 import disturbances as D
 
-XML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bluerov.xml")
+XML = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bluerov.xml")
 
 
 def make(disturbance=None):

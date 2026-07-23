@@ -24,7 +24,7 @@ from . import fossen
 from . import params as P
 
 NX = 12
-NU = P.NU                    # 4 for bluerov2 (rank-5), 6 for heavy (fully actuated)
+NU = P.NU                    # 6 for heavy 
 
 
 def make_nmpc(N=P.MPC_N, dt=P.DT_CTRL, solver=None):
@@ -47,6 +47,8 @@ def make_nmpc(N=P.MPC_N, dt=P.DT_CTRL, solver=None):
 def _f_casadi(x, u, w):
     """Symbolic Eq. 22; mirrors fossen.f_state (validated in
     scripts/validate_plant.py)."""
+
+    # state decomposition by JJ
     nu = x[6:]
     phi, theta, psi = x[3], x[4], x[5]
     uu, vv, ww, p, q, r = nu[0], nu[1], nu[2], nu[3], nu[4], nu[5]
@@ -90,17 +92,11 @@ def _f_casadi(x, u, w):
                        zg * W * cth * sph,
                        zg * W * sth,
                        0.0)
-    # map the control u to the body wrench tau:
-    #   * heavy (NU=6, fully actuated): the full wrench is realizable -> tau = u.
-    #   * bluerov2 (NU=4, rank-5): only [X,Y,Z,N] are commandable; option (b) models
-    #     the surge->pitch coupling as an explicit function of the surge DECISION, so
-    #     the MPC foresees that raising surge raises pitch (NED sign +, verified by the
-    #     equilibrium-pitch gate in test_dobmpc). PITCH_AWARE=False -> 0 (option a).
-    if getattr(P, "FULLY_ACTUATED", False):
-        tau = ca.vertcat(u[0], u[1], u[2], u[3], u[4], u[5])
-    else:
-        _kappa = P.SURGE_PITCH_COUPLING if getattr(P, "PITCH_AWARE", False) else 0.0
-        tau = ca.vertcat(u[0], u[1], u[2], 0.0, _kappa * u[0], u[3])
+    # control u -> body wrench tau: every loadable variant is the fully actuated
+    # heavy family (NU=6, rank-6 allocation), so the full wrench is realizable
+    # directly. (The rank-5 bluerov2 option-(b) surge->pitch mapping is gone with
+    # the variant; see KNOWN_ISSUES "dobmpc NU=4" for the remaining deferred cleanup.)
+    tau = u
     nu_dot = ca.DM(fossen.M_INV) @ (tau + w - crb - cad - damp - g_eta)
     return ca.vertcat(eta_dot, nu_dot)
 
@@ -178,9 +174,8 @@ class NMPC:
             ubx[k * NX + 6:k * NX + 9] = v_max
             lbx[k * NX + 3] = -1.2                       # |phi| (roll): T(eta) singularity
             ubx[k * NX + 3] = 1.2
-            _th = P.THETA_MAX if getattr(P, "PITCH_AWARE", False) else 1.2
-            lbx[k * NX + 4] = -_th                       # |theta| (pitch): option-(b) cap
-            ubx[k * NX + 4] = _th                         # (implicitly caps the planned surge)
+            lbx[k * NX + 4] = -1.2                       # |theta| (pitch): T(eta) singularity
+            ubx[k * NX + 4] = 1.2
         off = NX * (N + 1)
         for k in range(N):
             lbx[off + k * NU:off + (k + 1) * NU] = -np.asarray(u_max)
@@ -192,7 +187,7 @@ class NMPC:
         self.n_fail = 0
 
     def solve(self, x, w_hat, xref_traj):
-        """x (12,), w_hat (6,) body frame, xref_traj (12, N+1) -> u (4,)."""
+        """x (12,), w_hat (6,) body frame, xref_traj (12, N+1) -> u (6,)."""
         N = self.N
         x = np.asarray(x, float)
         w_hat = np.clip(np.asarray(w_hat, float), -50.0, 50.0)

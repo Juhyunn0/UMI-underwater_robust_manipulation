@@ -11,8 +11,8 @@ Gravity is ON (buoyancy counteracts it). Checks:
                          Phase 2 had (compared head-to-head with hydro off).
   5. Stability         : long run, no NaN / blow-up.
 
-    python test_hydro.py            # asserts + prints
-    python test_hydro.py --render   # managed viewer (gravity+hydro on; starts tilted)
+    python tests/test_hydro.py            # asserts + prints
+    python tests/test_hydro.py --render   # managed viewer (gravity+hydro on; starts tilted)
 
 Only mujoco + numpy required.
 """
@@ -23,11 +23,11 @@ import sys
 import numpy as np
 import mujoco
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import thrusters as TH
 import hydro as H
 
-XML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bluerov.xml")
+XML = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bluerov.xml")
 
 
 def tilt_deg(model, data, bid):

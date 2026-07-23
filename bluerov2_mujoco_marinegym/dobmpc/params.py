@@ -24,7 +24,7 @@ FULLY_ACTUATED = RM.FULLY_ACTUATED
 # ---------------------------------------------------------------- rigid body
 # mass (bluerov2 11.2 / heavy 11.5) from the MarineGym USD. Inertia: bluerov2
 # [0.30375,0.626,0.5769]; heavy [0.3291,0.6347,0.6109] DERIVED from it by parallel-axis
-# of the vertical-thruster layout change (compute_heavy_inertia.py) -- the farol Heavy
+# of the vertical-thruster layout change (tools/compute_heavy_inertia.py) -- the farol Heavy
 # USD's [0.21,0.245,0.245] is a Gazebo-stability hand-tune, not physical (see rov_model.py
 # / CONTROL_METHODOLOGY.md 2026-06-18).
 MASS = RM.MASS

@@ -62,12 +62,12 @@ All under `bluerov2_mujoco_marinegym/` (this folder):
 | `hydro.py` | Fossen buoyancy/restoring/added-mass/drag (passive-force callback); relative velocity for current |
 | `disturbances.py` | current + waves + kicks + domain-randomization sampler |
 | `teleop.py` | keyboard driving + **live force-arrow viz** (launch_passive/user_scn); `--managed` for the old no-arrow viewer; G toggles disturbances |
-| `test_load.py`, `test_thrusters.py`, `test_hydro.py` | per-phase verification |
-| `generate_bluerov_xml.py`, `extract_meshes.py` | regenerate the MJCF / meshes from the USD |
+| `tests/test_load.py`, `tests/test_thrusters.py`, `tests/test_hydro.py` | per-phase verification |
+| `tools/generate_bluerov_xml.py`, `tools/extract_meshes.py` | regenerate the MJCF / meshes from the USD |
 | `external/MarineGym/` (repo root) | MarineGym source asset (git submodule, files only) |
 
 Run anything with plain `python <script>.py` from this folder (base `mujoco` +
-`numpy`). Quick verify: `python test_load.py && python test_thrusters.py && python test_hydro.py`.
+`numpy`). Quick verify: `python tests/test_load.py && python tests/test_thrusters.py && python tests/test_hydro.py`.
 
 ## Roadmap & status
 

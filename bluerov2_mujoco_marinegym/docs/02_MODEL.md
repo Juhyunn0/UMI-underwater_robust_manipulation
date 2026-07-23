@@ -1,8 +1,8 @@
 # 02 — Model (Phase 1: rigid body)
 
 **Status: DONE ✓.** The rigid-body BlueROV2 MJCF, imported from MarineGym's asset.
-Code: `bluerov.xml`, `meshes/`, regenerators `generate_bluerov_xml.py` +
-`extract_meshes.py`. Verify: `python test_load.py`.
+Code: `bluerov.xml`, `meshes/`, regenerators `tools/generate_bluerov_xml.py` +
+`tools/extract_meshes.py`. Verify: `python tests/test_load.py`.
 
 ## Provenance — this is the non-obvious part
 
@@ -12,8 +12,8 @@ MarineGym does **not** ship a URDF. Its BlueROV is a **binary Isaac USD crate**
 
 - The authoritative **mass, inertia, COM, and the 6 thruster mount transforms**
   were read straight out of the USD with **`usd-core`** (`pxr`) and authored into
-  `bluerov.xml` by `generate_bluerov_xml.py`.
-- The **visual meshes** were extracted from the USD by `extract_meshes.py`
+  `bluerov.xml` by `tools/generate_bluerov_xml.py`.
+- The **visual meshes** were extracted from the USD by `tools/extract_meshes.py`
   (`UsdGeom.Mesh` points/faces → welded → decimated → OBJ): body
   `bluerov_body.obj` (307,785 → 40,000 faces) and one T200 `bluerov_thruster.obj`
   (instanced 6× in the MJCF). These are MarineGym's real meshes.
@@ -24,7 +24,7 @@ MarineGym does **not** ship a URDF. Its BlueROV is a **binary Isaac USD crate**
   the asset). The committed `bluerov.xml` + `meshes/` load with base `mujoco` +
   `numpy` alone and are portable.
 
-To regenerate from the USD: `python extract_meshes.py && python generate_bluerov_xml.py`.
+To regenerate from the USD: `python tools/extract_meshes.py && python tools/generate_bluerov_xml.py`.
 
 ## Frame & world
 
@@ -50,7 +50,7 @@ To regenerate from the USD: `python extract_meshes.py && python generate_bluerov
 > with mass **11.5 kg** and **8** thruster sites/actuators (`thr0..thr7`) — see
 > [03_THRUSTERS.md](03_THRUSTERS.md) and `rov_model.py`. Its inertia **[0.3291, 0.6347,
 > 0.6109]** is *derived* from the bluerov2 tensor by adding the parallel-axis term of
-> the vertical-thruster layout change (`compute_heavy_inertia.py`): the farol Heavy USD's
+> the vertical-thruster layout change (`tools/compute_heavy_inertia.py`): the farol Heavy USD's
 > own [0.21, 0.245, 0.245] is a hand-tuned Gazebo-stability literal, not physical. See the
 > 2026-06-18 entry in [CONTROL_METHODOLOGY.md](CONTROL_METHODOLOGY.md).
 | collision | one box: center (0,0,−0.05), half-size (0.25,0.175,0.125) m |
@@ -86,7 +86,7 @@ uses this offset for the restoring moment. See [04_HYDRO.md](04_HYDRO.md).
 
 ## Verified (Phase 1)
 
-`python test_load.py`:
+`python tests/test_load.py`:
 - Loads via `mujoco.MjModel.from_xml_path`, **zero compile warnings**.
 - Mass 11.20 kg, inertia as above, 6 thruster sites, correct vectored layout.
 - Zero-control free fall (gravity on, no buoyancy yet): Δz ≈ −19.6 m over 2 s,

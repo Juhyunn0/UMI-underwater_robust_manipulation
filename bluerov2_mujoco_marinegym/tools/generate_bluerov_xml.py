@@ -18,7 +18,7 @@ import os
 import numpy as np
 from pxr import Usd, UsdGeom, UsdPhysics
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 USD = os.path.normpath(os.path.join(
     HERE, "..", "external", "MarineGym",
     "marinegym", "robots", "assets", "usd", "BlueROV", "BlueROV.usd"))
@@ -68,7 +68,7 @@ thruster_xml = "\n".join(thruster_blocks)
 # a pure force along the site's local +X axis (= the thrust direction). ctrl is
 # the thrust in NEWTONS; the throttle[-1,1] -> N mapping (T200 curve) lives in
 # thrusters.py. ctrlrange is the T200 steady-state reverse/forward limit and is
-# consistency-checked against thrusters.t200_thrust(-/+1) by test_thrusters.py.
+# consistency-checked against thrusters.t200_thrust(-/+1) by tests/test_thrusters.py.
 T200_MAX_FWD = 64.1319   # N at throttle +1  (MarineGym t200.py, clamp 3900 rpm)
 T200_MAX_REV = -51.5507  # N at throttle -1
 actuator_blocks = [

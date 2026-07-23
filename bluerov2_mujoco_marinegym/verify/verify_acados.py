@@ -8,8 +8,12 @@ B. TIMING -- acados SQP-RTI solve time vs the IPOPT baseline (the whole point).
 
 Run from the package root in the `robust` env.
 """
+import os
+import sys
 import time
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # package root
 
 from dobmpc.mpc import NMPC
 from dobmpc.mpc_acados import AcadosNMPC

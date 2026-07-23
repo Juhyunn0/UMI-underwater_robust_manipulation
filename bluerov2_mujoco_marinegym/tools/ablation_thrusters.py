@@ -15,15 +15,17 @@ Quantifies the sim-to-real actuator gap and which controller tolerates it best.
 The simulator is unchanged; the realism is the opt-in ThrusterModel. Run in `robust`.
 """
 import os
+import sys
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # package root
 from dobmpc import eval_dp as E
 from thrusters import ThrusterModel
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CTRLS = ["pid", "mpc", "dobmpc"]
 SCEN = [("ideal", None),
         ("realistic", dict(lag=True, voltage_scale=1.0)),

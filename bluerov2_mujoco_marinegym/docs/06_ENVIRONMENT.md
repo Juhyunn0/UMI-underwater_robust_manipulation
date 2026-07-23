@@ -17,8 +17,8 @@ We are drafting on a MacBook (no NVIDIA GPU). Everything here runs on CPU with
   `bluerov.xml`, `thrusters.py`, `hydro.py`, `teleop.py`, `test_*.py` need just
   these.
 - **Build-time-only deps (to regenerate the asset from the USD):** `usd-core`,
-  `trimesh`, `fast-simplification`. Used by `extract_meshes.py` /
-  `generate_bluerov_xml.py`. CPU-only, nothing CUDA. **Not** needed to run the sim.
+  `trimesh`, `fast-simplification`. Used by `tools/extract_meshes.py` /
+  `tools/generate_bluerov_xml.py`. CPU-only, nothing CUDA. **Not** needed to run the sim.
 - **Do NOT install** `mujoco-mjx`, `jax[cuda*]`, or anything CUDA on macOS — those
   are for the Linux machine (Phase 0). MJX has no CPU benefit here.
 - **Do NOT run MarineGym** (it needs Isaac Sim). We only consume its **static
@@ -70,7 +70,7 @@ conda create -n robust-mjx python=3.12 -y
 /home/bdml/miniforge3/envs/robust-mjx/bin/python -m pip install -U mujoco mujoco-mjx
 ```
 
-**Verified** by `bluerov2_mujoco_marinegym/verify_gpu_mjx.py` (run with
+**Verified** by `bluerov2_mujoco_marinegym/verify/verify_gpu_mjx.py` (run with
 `XLA_PYTHON_CLIENT_PREALLOCATE=false`): `jax.default_backend()=='gpu'`,
 `jax.devices()==[CudaDevice(id=0)]` = NVIDIA GeForce RTX 5090; a tiny MJX rollout
 **and** the canonical `bluerov.xml` both step on GPU with finite states. (Benign

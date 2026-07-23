@@ -5,7 +5,7 @@ import os
 import sys
 import csv
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 
 import numpy as np
@@ -17,7 +17,7 @@ import controller as C
 from recorder import Recorder
 from mission import SquareMission
 
-XML = os.path.join(HERE, "bluerov.xml")
+XML = os.path.join(HERE, "bluerov_heavy.xml")
 
 
 def test_spectrum():
@@ -58,12 +58,14 @@ def test_square_mission():
     data = mujoco.MjData(model)
     field = D.DisturbanceField(waves=D.jonswap_wave_specs(seed=0), seed=0)
     field.enabled = False                                  # clean tracking assertions
-    hydro = H.Hydrodynamics(model, disturbance=field).install()
+    hydro = H.Hydrodynamics(model, disturbance=field,
+                            coeff_path=os.path.join(HERE, "marinegym_assets",
+                                                    "BlueROVHeavy.yaml")).install()
     bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "base_link")
-    # Pin the rank-5 gain set: this test's plant is the hard-coded bluerov.xml,
-    # while DEFAULT_GAINS follows ROV_MODEL (default heavy).
+    # Pin the heavy gain set + coeffs: this test's plant is the hard-coded bare
+    # bluerov_heavy.xml, while the default hydro/gains follow ROV_MODEL.
     ctrl = C.PoseController(model, mode="pid", buoyancy_ff=hydro,
-                            gains=C.GAINS_BLUEROV2)
+                            gains=C.GAINS_HEAVY)
     rec = Recorder("/tmp/sqtest", tag="sq")
     S, laps, speed = 0.25, 2, 0.12
     mission = SquareMission(ctrl, rec, hydro, bid, size=S, laps=laps, speed=speed, log_hz=50)

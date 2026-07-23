@@ -7,7 +7,7 @@ Inputs : assets/CAD files/C3-BR-Camera.obj   (C3 housing; authored frame, metres
 Outputs: meshes/c3_camera.stl, meshes/c3_mount.stl        (baked into the MOUNTED
          orientation, centred at their centroid)
          meshes/c3_payload_frames.json                    (placement numbers consumed
-         by gen_gripper_variant.py: centroids, camera lens-plane pose, optical axis)
+         by tools/gen_gripper_variant.py: centroids, camera lens-plane pose, optical axis)
 
 MOUNTED POSE PROVENANCE (2026-07-19, replaces the earlier guessed front-top/45-down):
   The user's Onshape assembly (BROV2 Heavy + C3 on its bracket) was exported with
@@ -33,7 +33,7 @@ import os
 import numpy as np
 import trimesh
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CAD = os.path.join(HERE, "..", "assets", "CAD files")
 SRC_C3 = os.path.join(CAD, "C3-BR-Camera.obj")
 SRC_MT = os.path.join(CAD, "C3-BR-Mount.stl")
@@ -114,7 +114,7 @@ def build():
         "baseline_dir_bl": baseline.round(5).tolist(),
         "cam_xyaxes": np.concatenate([x_cam, y_cam]).round(5).tolist(),
         "provenance": "onshape_export/robot.xml + registration 2026-07-19 "
-                      "(process_c3_mesh.py; metric, base_link origin = vehicle COM)",
+                      "(tools/process_c3_mesh.py; metric, base_link origin = vehicle COM)",
     }
     with open(DST_META, "w") as f:
         json.dump(meta, f, indent=2)

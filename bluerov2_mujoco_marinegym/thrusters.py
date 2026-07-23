@@ -79,7 +79,7 @@ T200_MAX_REV = float(t200_thrust(-1.0))   # -51.5507 N  = -5.26 kgf
 # voltage_scale=1.0 models a ~20 V thruster. A real BlueROV2 runs a 4S Li-ion pack
 # (nominal 14.8 V), which delivers less. From the official "T200 Public Performance
 # Data 10-20V (Sep 2019)" (marinegym_assets/*.xlsx; reproduce with
-# analyze_t200_voltage.py): max thrust at 14.8 V (interp 14<->16 V) is 4.81 kgf fwd
+# tools/analyze_t200_voltage.py): max thrust at 14.8 V (interp 14<->16 V) is 4.81 kgf fwd
 # / 3.74 kgf rev, so the 14.8V-over-base ratio is 4.81/6.54=0.74 (fwd), 3.74/5.26=
 # 0.71 (rev) -> a single grounded scalar ~0.72. (Full-charge 16.8 V ~0.83; near-
 # empty 13 V ~0.62.) This replaces the earlier illustrative 0.85.

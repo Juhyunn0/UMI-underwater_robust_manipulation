@@ -1,6 +1,6 @@
 """Animated water surface for the pool scene — VISUAL ONLY, dynamics-inert.
 
-Drives the `pool_water_surface` heightfield (built by gen_pool_apriltags.py) so the
+Drives the `pool_water_surface` heightfield (built by tools/gen_pool_apriltags.py) so the
 water visibly undulates like real waves and drifts with the current, reconstructed
 from the SAME disturbance field the physics uses. Nothing here touches dynamics:
 the hfield geom is contype=0 conaffinity=0, hydro acts only on base_link, and
