@@ -35,6 +35,19 @@ MODE_TITLE = {"NONE": "NONE  (still water)", "C": "C  (current)",
               "CDW": "CDW  (current + drift + waves)"}
 
 
+SETTLE_S = 10.0            # default steady-window start; keep == experiment.settle_s
+
+
+def _steady_mask(t, settle_s):
+    """Steady-state window mask. MIRRORS experiments.run_compare.steady_mask (kept
+    local so this viewer stays dependency-free) -- the RMS printed here must equal
+    results.csv / bar_<scenario>_radial_rms.png, not a full-run number."""
+    t = np.asarray(t, float)
+    t_end = float(t[-1]) if t.size else 0.0
+    m = t >= min(float(settle_s), 0.5 * t_end)
+    return m if m.sum() >= 3 else np.ones(t.shape, dtype=bool)
+
+
 def _latest_square_view():
     cands = sorted(glob.glob(os.path.join(HERE, "recordings", "*", "square_view")))
     return cands[-1] if cands else os.path.join(HERE, "recordings")
@@ -58,9 +71,10 @@ def _find(d, mode, ctrl, seed, ddeg):
     return f
 
 
-def _plot_all_modes(d, seed, ddeg, ctrls, S, out):
+def _plot_all_modes(d, seed, ddeg, ctrls, S, out, settle=SETTLE_S):
     """Combined overview: one trajectory panel per disturbance mode (NONE..CDW),
-    all laps, with a shared legend. The 6th cell holds the legend."""
+    all laps, with a shared legend. The 6th cell holds the legend. Lines show the
+    whole run; the boxed RMS is the steady-window number (== the bar charts)."""
     plt.rcParams.update({
         "font.family": "DejaVu Sans", "axes.linewidth": 0.9, "axes.edgecolor": "#2b2b2b",
         "xtick.labelsize": 9, "ytick.labelsize": 9, "savefig.dpi": 300, "figure.dpi": 130,
@@ -83,8 +97,9 @@ def _plot_all_modes(d, seed, ddeg, ctrls, S, out):
             ax.plot(a["px"], a["py"], color=COLOR[c], lw=1.5, alpha=ALPHA[c],
                     solid_joinstyle="round", zorder=ZORDER[c])
             xs.append(a["px"]); ys.append(a["py"])
+            sm = _steady_mask(a["t"], settle)
             rms[c] = float(np.sqrt(np.mean(np.hypot(a["px"] - a["rx"],
-                                                    a["py"] - a["ry"]) ** 2))) * 100.0
+                                                    a["py"] - a["ry"])[sm] ** 2))) * 100.0
         ax.plot(0, 0, marker="o", ms=7, mfc="#1b1b1b", mec="white", mew=1.0, zorder=6)
         ax.set_aspect("equal", "box")
         ax.grid(True, color="#dddddd", lw=0.7); ax.set_axisbelow(True)
@@ -102,7 +117,9 @@ def _plot_all_modes(d, seed, ddeg, ctrls, S, out):
     handles = [Line2D([0], [0], color=COLOR[c], lw=3.0, label=LABEL[c]) for c in ctrls]
     handles.append(Line2D([0], [0], ls="--", lw=1.6, color="#555555", label="Reference square"))
     axes[-1].legend(handles=handles, loc="center", frameon=False, fontsize=15,
-                    handlelength=2.2, title="radial RMS shown per panel", title_fontsize=11)
+                    handlelength=2.2, title=f"radial RMS per panel:\nsteady window "
+                    f"(t ≥ {float(settle):g} s,\nsame metric as the bar chart)",
+                    title_fontsize=11)
     fig.suptitle("BlueROV2-Heavy — square tracking across disturbance modes  "
                  f"(seed {seed}, current {ddeg}°, all laps)",
                  fontsize=16, fontweight="bold")
@@ -120,6 +137,9 @@ def main():
     ap.add_argument("--ctrls", default="pid,mpc,dobmpc")
     ap.add_argument("--all-modes", action="store_true",
                     help="one combined figure: a trajectory panel per mode (NONE..CDW).")
+    ap.add_argument("--settle", type=float, default=SETTLE_S,
+                    help="steady-window start [s] for the printed RMS; must match the "
+                         "run's experiment.settle_s to agree with results.csv.")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -129,7 +149,7 @@ def main():
 
     if args.all_modes:
         out = args.out or os.path.join(d, "trajectory_compare_ALLMODES.png")
-        _plot_all_modes(d, args.seed, args.dir_deg, ctrls, S, out)
+        _plot_all_modes(d, args.seed, args.dir_deg, ctrls, S, out, args.settle)
         return
 
     data = {}
@@ -141,10 +161,14 @@ def main():
         a = np.genfromtxt(f, delimiter=",", names=True)
         rxy = np.hypot(a["px"] - a["rx"], a["py"] - a["ry"])      # radial error [m]
         lap = a["lap"]
-        steady = lap >= max(0, int(lap.max()) - 1)               # last 2 laps (steady)
-        data[c] = dict(t=a["t"], px=a["px"], py=a["py"], err=rxy, steady=steady,
-                       rms=float(np.sqrt(np.mean(rxy ** 2))) * 100.0,           # full-run
-                       rms_ss=float(np.sqrt(np.mean(rxy[steady] ** 2))) * 100.0)  # steady, cm
+        # `rms` = THE reported number: same steady window as run_compare.metrics()
+        # (t >= settle), so it equals results.csv / the bar charts. `rms_lastlaps` is
+        # the separate last-2-laps view, kept for reference only.
+        sm = _steady_mask(a["t"], args.settle)
+        last2 = lap >= max(0, int(lap.max()) - 1)
+        data[c] = dict(t=a["t"], px=a["px"], py=a["py"], err=rxy, steady=sm,
+                       rms=float(np.sqrt(np.mean(rxy[sm] ** 2))) * 100.0,
+                       rms_lastlaps=float(np.sqrt(np.mean(rxy[last2] ** 2))) * 100.0)
     if not data:
         raise SystemExit(f"[plot] no trajectory CSVs found in {d}")
 
@@ -195,7 +219,10 @@ def main():
     handles.append(Line2D([0], [0], ls="--", lw=1.5, color="#555555",
                           label="Reference square"))
     axT.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.10),
-               ncol=2, frameon=False, handlelength=1.8, columnspacing=1.4)
+               ncol=2, frameon=False, handlelength=1.8, columnspacing=1.4,
+               title=f"lines = all laps · radial RMS = steady window "
+                     f"(t ≥ {float(args.settle):g} s, same metric as the bar chart)",
+               title_fontsize=8)
 
     axT.set_title(f"BlueROV2-Heavy — square trajectory  (mode {args.mode}, "
                   f"current {args.dir_deg}°, seed {args.seed})",

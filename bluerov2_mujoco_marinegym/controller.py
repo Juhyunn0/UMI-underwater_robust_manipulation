@@ -27,11 +27,27 @@ import mujoco
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import thrusters as T
 import rov_model as RM
+from dobmpc import params as _P     # shared sensor-noise sigmas + PID_STATE_SOURCE
 
 
 def wrap_angle(a):
     """Wrap to (-pi, pi]."""
     return (a + np.pi) % (2 * np.pi) - np.pi
+
+
+def _R_from_rpy(roll, pitch, yaw):
+    """Body->world rotation from ZYX euler, R = Rz(yaw)·Ry(pitch)·Rx(roll) -- the
+    exact inverse of PoseController's yaw=atan2(R10,R00) / pitch=-asin(R20) /
+    roll=atan2(R21,R22) extraction, so re-extracting from this R returns the inputs.
+    Used to rebuild a self-consistent noisy attitude from noisy euler angles."""
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    return np.array([
+        [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+        [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+        [-sp,     cp * sr,                cp * cr],
+    ])
 
 
 # Gains are per-variant (rov_model). Translational gains are WORLD-frame.
@@ -103,7 +119,8 @@ DEFAULT_GAINS = _GAINS_BY_MODEL.get(RM.MODEL, GAINS_HEAVY)
 
 class PoseController:
     def __init__(self, model, mode="pid", setpoint=(0.0, 0.0, 0.0), yaw_ref=0.0,
-                 buoyancy_ff=None, body="base_link", gains=None, dt=None, actuator=None):
+                 buoyancy_ff=None, body="base_link", gains=None, dt=None, actuator=None,
+                 meas_noise=None, noise_seed=0):
         self.model = model
         self.mode = mode
         self.actuator = actuator                         # optional realistic thrusters
@@ -126,6 +143,24 @@ class PoseController:
         else:
             self.net_buoy = float(getattr(buoyancy_ff, "buoyancy", 0.0)
                                   - getattr(buoyancy_ff, "weight", 0.0))
+
+        # ---- state-measurement model (apples-to-apples with the DOB-MPC x0) -------
+        # meas_noise on -> the controller SEES the clean plant state corrupted by the
+        # SAME Gaussian sensor model the MPC consumes (params.EAOB_SIG_*), sampled at
+        # the control tick (DT_CTRL) and HELD (ZOH) between ticks, so the PID and the
+        # (DOB-)MPC eat an identically-degraded 20 Hz estimate and differ only by the
+        # control law. off -> the clean 500 Hz readout (byte-identical to before).
+        # None -> params.PID_STATE_SOURCE. Only the PID's own reads are corrupted;
+        # the logged truth / metric always stays on the plant.
+        self.meas_noise = (_P.PID_STATE_SOURCE == "meas") if meas_noise is None \
+            else bool(meas_noise)
+        self.state_source = "meas" if self.meas_noise else "truth"
+        self.noise_seed = int(noise_seed)
+        self._meas_decim = max(1, round(_P.DT_CTRL / self.dt))   # substeps per sensor tick
+        self._sig_pos = np.asarray(_P.EAOB_SIG_POS, float)       # m   [x,y,z]
+        self._sig_ang = np.asarray(_P.EAOB_SIG_ANG, float)       # rad [roll,pitch,yaw]
+        self._sig_lvel = np.asarray(_P.EAOB_SIG_LVEL, float)     # m/s [world lin vel]
+        self._sig_avel = np.asarray(_P.EAOB_SIG_AVEL, float)     # rad/s [body p,q,r]
         self.reset()
 
     def reset(self):
@@ -137,6 +172,11 @@ class PoseController:
         self.r_ref = 0.0                     # reference yaw rate (heading-follow FF)
         self.commanded = np.zeros(6)
         self.realized = np.zeros(6)
+        # sensor-noise state: reseed for reproducible runs, drop the held sample so the
+        # first tick refreshes (mirrors DOBMPCController.reset).
+        self._noise_rng = np.random.default_rng(getattr(self, "noise_seed", 0))
+        self._meas_k = 0
+        self._held_meas = None
         if getattr(self, "actuator", None) is not None:
             self.actuator.reset()
 
@@ -164,13 +204,45 @@ class PoseController:
     def _pitch_from_R(R):
         return float(-np.arcsin(np.clip(R[2, 0], -1.0, 1.0)))
 
+    # ---- state measurement ----------------------------------------------
+    def _measure(self, data):
+        """The (p, R, v, omega) the controller SEES this substep. meas_noise off ->
+        the clean plant readout (byte-identical to the pre-2026-07-24 path). on ->
+        the clean readout corrupted by Gaussian sensor noise (params.EAOB_SIG_*, the
+        SAME model the DOB-MPC x0 uses), drawn ONCE per control tick (DT_CTRL) and
+        HELD (ZOH) between ticks -- so the PID sees the same 20 Hz noisy estimate the
+        MPC does, not a 500 Hz stream it could average away. The noisy attitude is
+        rebuilt into a full R (via _R_from_rpy) so both the yaw/pitch/roll extraction
+        AND the body-force rotation R.T use the estimated attitude consistently.
+        v is world linear velocity; omega = [p,q,r] is body angular velocity."""
+        p = np.asarray(data.xpos[self.bid], float)            # world position (x,y,z)
+        R = np.asarray(data.xmat[self.bid], float).reshape(3, 3)   # body->world
+        v = np.asarray(data.qvel[:3], float)                  # world linear vel
+        omega = np.asarray(data.qvel[3:6], float)             # body angular vel [p,q,r]
+        if not self.meas_noise:
+            return p, R, v, omega
+        if self._meas_k % self._meas_decim == 0:              # new sensor sample this tick
+            rng = self._noise_rng
+            p_m = p + rng.normal(0.0, self._sig_pos)
+            roll = float(np.arctan2(R[2, 1], R[2, 2]))
+            rpy = np.array([roll, self._pitch_from_R(R), self._yaw_from_R(R)]) \
+                + rng.normal(0.0, self._sig_ang)
+            R_m = _R_from_rpy(rpy[0], rpy[1], rpy[2])
+            self._held_meas = (p_m, R_m, v + rng.normal(0.0, self._sig_lvel),
+                               omega + rng.normal(0.0, self._sig_avel))
+        self._meas_k += 1
+        return self._held_meas
+
+    def meas_meta(self):
+        """Provenance dict for run meta sidecars (state-source parity with the MPC)."""
+        return dict(state_source=self.state_source, noise_seed=self.noise_seed,
+                    sig_pos_xy=float(self._sig_pos[0]))
+
     # ---- control law -----------------------------------------------------
     def compute(self, data):
         g = self.g
-        p = np.asarray(data.xpos[self.bid], float)            # world position (x,y,z)
-        R = np.asarray(data.xmat[self.bid], float).reshape(3, 3)   # body->world 
-        v = np.asarray(data.qvel[:3], float)                  # world linear vel
-        r = float(data.qvel[5])                               # body yaw rate
+        p, R, v, omega = self._measure(data)                  # state the controller SEES
+        r = float(omega[2])                                   # body yaw rate
         yaw = self._yaw_from_R(R)
         pitch = self._pitch_from_R(R)
 
@@ -253,8 +325,8 @@ class PoseController:
         mx = my = 0.0
         if g.get("rp_kp") is not None:
             rp_kp = np.asarray(g["rp_kp"]); rp_kd = np.asarray(g["rp_kd"])
-            roll = float(np.arctan2(R[2, 1], R[2, 2]))
-            p_rate, q_rate = float(data.qvel[3]), float(data.qvel[4])
+            roll = float(np.arctan2(R[2, 1], R[2, 2]))          # from the measured R
+            p_rate, q_rate = float(omega[0]), float(omega[1])   # measured body rates
             rp_max = float(g.get("rp_max", 8.0))
             if self.use_i and g.get("rp_ki") is not None:
                 rp_ki = np.asarray(g["rp_ki"]); rp_i_max = np.asarray(g["rp_i_max"])

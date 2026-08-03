@@ -13,6 +13,9 @@ Outputs under recordings/<YYYYMMDD>/compare_<ts>/:
   (incl. trajectory_compare_<MODE>/_ALLMODES with every sweep heading overlaid),
   runs/traj_*.csv + runs/meta_*.json (per-run trajectory + manifest, run_viewer-
   compatible schema; gate with experiment.record_runs), config snapshot.
+  With a `waves:` LIST (>1 sea state): one wave<i>_<label>/ subfolder apiece plus
+  wave_comparison/ (results_all_waves.csv, xwave_<scenario>_radial_rms.png,
+  xwave_square_trajectory_{CW,CDW}.png sea-state trajectory composites).
   Reuses hydro / controllers / recorder / Disturbance.to_meta().
 
 Usage:
@@ -40,6 +43,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+# Pick an offscreen GL backend when there is no display, BEFORE `import mujoco` binds
+# the GL context (mujoco reads MUJOCO_GL once at import). Without this the headless
+# batch's wave-preview render (experiments/wave_preview.py, imported lazily long after
+# mujoco is already bound here) would silently fail on a display-less host. With a
+# display present we leave the default (GLFW).
+if not os.environ.get("DISPLAY"):
+    os.environ.setdefault("MUJOCO_GL", "egl")
 import mujoco
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # marinegym dir
@@ -89,7 +99,12 @@ def build(cfg, mode, seed, ctrl_name, t_sim_env, dist):
 
 def make_controller(ctrl_name, model, hydro):
     if ctrl_name == "pid":
-        return PoseController(model, mode="pid", buoyancy_ff=hydro, actuator=None)
+        # noise_seed=0 matches the MPC's fixed sensor-noise stream; meas_noise defaults
+        # to params.PID_STATE_SOURCE ("meas") so the PID eats the same degraded 20 Hz
+        # state the (DOB-)MPC does (apples-to-apples; set PID_STATE_SOURCE="truth" for
+        # the clean-state baseline).
+        return PoseController(model, mode="pid", buoyancy_ff=hydro, actuator=None,
+                              noise_seed=0)
     if ctrl_name in ("mpc", "dobmpc"):
         return DOBMPCController(model, hydro=hydro, mode=ctrl_name, actuator=None)
     raise ValueError(ctrl_name)
@@ -250,6 +265,19 @@ def run_one(ctrl_name, cfg, mode, seed, scenario, scen, dist):
     H.Hydrodynamics.uninstall()
     out = {k: np.asarray(v, float) for k, v in L.items()}
     out["ref_preview"] = getattr(ctrl, "_ref_traj", None) is not None   # provenance
+    # EAOB tuning provenance (profile / meas_noise / gate counters); None for mpc/pid
+    out["eaob_meta"] = ctrl.eaob_meta() if ctrl_name == "dobmpc" else None
+    # what the NMPC consumed as x0 (2026-07-23+): "estimate" | "truth"
+    out["mpc_state_source"] = (getattr(ctrl, "mpc_state_source", "truth")
+                               if ctrl_name in ("mpc", "dobmpc") else None)
+    # NMPC input box (2026-07-24+): heavy surge went 8 -> 30 N (= PID f_max). Absent
+    # key in old records = the 8 N box; don't pool results across that boundary.
+    out["u_max"] = (list(map(float, ctrl.nmpc.u_max))
+                    if ctrl_name in ("mpc", "dobmpc")
+                    and getattr(ctrl.nmpc, "u_max", None) is not None else None)
+    # PID state-measurement provenance (2026-07-24+): state_source meas/truth +
+    # noise seed/sigma. None for mpc/dobmpc. Absent key in old records = truth.
+    out["pid_meas_meta"] = ctrl.meas_meta() if ctrl_name == "pid" else None
     out["U"] = np.asarray(U, float)                   # (n_log, nu)
     out["ctrlrange"] = ctrlrange
     out["log_dt"] = log_dt
@@ -280,19 +308,32 @@ def _band_rms(x, log_dt, lo, hi):
     return float(np.sqrt(power[mask].sum()))
 
 
+def settle_start(cfg):
+    """Steady-window start [s] -- the ONE place experiment.settle_s is read."""
+    return float(cfg.experiment.get("settle_s", 10.0))
+
+
+def steady_mask(t, settle_s):
+    """Boolean mask of the steady-state window: t >= settle_s, but never past half the
+    run (keeps short/smoke runs non-empty); falls back to the whole record if that
+    still leaves < 3 samples.
+
+    THE single definition of "which samples get scored". metrics() (-> results.csv +
+    the bar charts) and the trajectory-panel RMS boxes both call it, so those two
+    figures can never disagree on the window again."""
+    t = np.asarray(t, float)
+    t_end = float(t[-1]) if t.size else 0.0
+    m = t >= min(float(settle_s), 0.5 * t_end)
+    return m if m.sum() >= 3 else np.ones(t.shape, dtype=bool)
+
+
 def metrics(L, cfg, scenario):
     t = L["t"]
     band = float(cfg.experiment.get("settle_band_cm", 5.0)) / 100.0
-    # steady-state window: settle_s, but never past half the run (keeps short/smoke
-    # runs non-empty); fall back to the whole record if still too few samples.
-    t_end = float(t[-1]) if t.size else 0.0
-    settle = min(float(cfg.experiment.get("settle_s", 10.0)), 0.5 * t_end)
     ex = L["px"] - L["rx"]                            # tracking error (m)
     ey = L["py"] - L["ry"]
     rxy = np.hypot(ex, ey)
-    m = t >= settle
-    if m.sum() < 3:
-        m = np.ones_like(t, dtype=bool)
+    m = steady_mask(t, settle_start(cfg))             # shared steady window
     U = L["U"]; log_dt = L["log_dt"]
     ranges = L["ctrlrange"]
     lo = ranges[:, 0]; hi = ranges[:, 1]
@@ -381,9 +422,11 @@ def fig_timehistory(out_dir, mode, logs, mets):
     plt.close(fig)
 
 
-def fig_bars(out_dir, agg, modes, ctrls, metric, ylabel, tag):
+def fig_bars(out_dir, agg, modes, ctrls, metric, ylabel, tag, note=None):
     """Grouped bar chart: one cluster per disturbance mode, one bar per controller.
-    Bars show mean +- std pooled over seeds x current headings."""
+    Bars show mean +- std pooled over seeds x current headings. `note` is a footnote
+    naming the scored window -- pass it so this chart states the same window the
+    trajectory-compare boxes print."""
     n = len(ctrls)
     x = np.arange(len(modes)); width = 0.8 / max(1, n)
     fig, ax = plt.subplots(figsize=(9.6, 5.6), dpi=200)
@@ -423,6 +466,9 @@ def fig_bars(out_dir, agg, modes, ctrls, metric, ylabel, tag):
                  fontweight="bold", color="0.13", pad=44)
     ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1.02), ncol=n,
               frameon=False, fontsize=10.5, handlelength=1.3, columnspacing=2.2)
+    if note:                                          # below the x-label, right-aligned
+        ax.text(1.0, -0.155, note, transform=ax.transAxes, ha="right", va="top",
+                fontsize=8.5, color="0.45")
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, f"bar_{tag}.png"), dpi=200,
                 bbox_inches="tight")
@@ -531,6 +577,12 @@ def parse_sweep(cfg):
     modes.)"""
     thetas = parse_directions(cfg)
     d = cfg.experiment.get("directions") or {}
+    # default (fixed) wave heading; cfg.raw["waves"] may be a mapping OR a list of them
+    # (multi-spectrum) -> take the first spectrum's beta_bar_deg in that case.
+    _wraw = cfg.raw.get("waves") or {}
+    if isinstance(_wraw, (list, tuple)):
+        _wraw = _wraw[0] if _wraw else {}
+    beta_fixed = float(_wraw.get("beta_bar_deg", 0.0))
     pairing = str(d.get("pairing", "paired")).lower()
     if pairing not in ("grid", "paired"):
         raise ValueError(f"directions.pairing must be grid|paired, got {pairing!r}")
@@ -545,7 +597,7 @@ def parse_sweep(cfg):
             betas = [round(float(b), 1)
                      for b in rng.uniform(0.0, 360.0, int(d["n_random_wave"]))]
         else:
-            betas = [float((cfg.raw.get("waves") or {}).get("beta_bar_deg", 0.0))]
+            betas = [beta_fixed]
         return [(t, b) for t in thetas for b in betas]
     if d.get("sweep_wave_heading"):
         if d.get("wave_headings_deg"):                    # explicit list (cycled to length)
@@ -555,8 +607,7 @@ def parse_sweep(cfg):
             rng = np.random.default_rng(int(d.get("wave_heading_seed", 200)))
             betas = [round(float(b), 1) for b in rng.uniform(0.0, 360.0, len(thetas))]
     else:
-        beta0 = float((cfg.raw.get("waves") or {}).get("beta_bar_deg", 0.0))
-        betas = [beta0] * len(thetas)
+        betas = [beta_fixed] * len(thetas)
     return list(zip(thetas, betas))
 
 
@@ -630,14 +681,21 @@ def _load_run_traj(run_dir, scenario, mode, ctrl, seed, theta, beta):
     return a if a.size else None
 
 
-def _draw_traj_panel(ax, run_dir, scenario, mode, ctrls, sweep, seeds, S):
+def _draw_traj_panel(ax, run_dir, scenario, mode, ctrls, sweep, seeds, S, settle):
     """One mode panel: reference square + EVERY (sweep point x seed) run overlaid
-    (controller = color, individual runs = thin translucent lines). Returns
-    {ctrl: [per-run full-run radial RMS in cm]} over the runs actually loaded."""
+    (controller = color, individual runs = thin translucent lines). The LINES always
+    show the whole run (all laps); the returned/boxed RMS is scored on the SAME
+    steady window as metrics() (steady_mask(t, settle)) so the numbers here match
+    results.csv and bar_<scenario>_radial_rms.png -- to the %.5f m precision of the
+    per-run CSVs these are re-read from, i.e. ~1e-6 cm, far below the 0.1 cm shown.
+    Returns
+    {ctrl: [per-run steady-window radial RMS in cm]} over the runs actually loaded."""
     sq = np.array([[0, 0], [S, 0], [S, S], [0, S], [0, 0]], float)
-    ax.plot(sq[:, 0], sq[:, 1], ls="--", lw=1.4, color="#555555", zorder=2)
+    # reference ABOVE the run bundles (> max TRAJ_ZORDER) or dense overlays bury it;
+    # the dashes keep the trajectories visible through the gaps
+    ax.plot(sq[:, 0], sq[:, 1], ls="--", lw=1.4, color="#555555", zorder=6)
     ax.scatter(sq[:-1, 0], sq[:-1, 1], s=20, facecolor="white",
-               edgecolor="#555555", linewidths=1.0, zorder=2.5)
+               edgecolor="#555555", linewidths=1.0, zorder=6.5)
     N = len(sweep) * len(seeds)                          # runs per controller
     lw = 1.5 if N == 1 else 0.9
     xs, ys, rms = [], [], {}
@@ -655,11 +713,14 @@ def _draw_traj_panel(ax, run_dir, scenario, mode, ctrls, sweep, seeds, S):
                         color=TRAJ_COLOR.get(c, COL.get(c)), lw=lw, alpha=alpha,
                         solid_joinstyle="round", zorder=TRAJ_ZORDER.get(c, 3))
                 xs.append(a["px"][::stride]); ys.append(a["py"][::stride])
+                # scored on the FULL-rate record (never the plot decimation) and on
+                # the shared steady window -> identical to results_raw.csv
+                sm = steady_mask(a["t"], settle)
                 vals.append(float(np.sqrt(np.mean(np.hypot(
-                    a["px"] - a["rx"], a["py"] - a["ry"]) ** 2))) * 100.0)
+                    a["px"] - a["rx"], a["py"] - a["ry"])[sm] ** 2))) * 100.0)
         if vals:
             rms[c] = vals
-    ax.plot(0, 0, marker="o", ms=7, mfc="#1b1b1b", mec="white", mew=1.0, zorder=6)
+    ax.plot(0, 0, marker="o", ms=7, mfc="#1b1b1b", mec="white", mew=1.0, zorder=7)
     ax.set_aspect("equal", "box")
     ax.grid(True, color="#dddddd", lw=0.7); ax.set_axisbelow(True)
     ax.set_xlabel("x  [m]", fontsize=11); ax.set_ylabel("y  [m]", fontsize=11)
@@ -673,12 +734,15 @@ def _draw_traj_panel(ax, run_dir, scenario, mode, ctrls, sweep, seeds, S):
         txt = "\n".join((f"{BAR_LABEL.get(c, c)}: {np.mean(rms[c]):.1f} cm" if len(rms[c]) == 1
                          else f"{BAR_LABEL.get(c, c)}: {np.mean(rms[c]):.1f} ± {np.std(rms[c]):.1f} cm")
                         for c in ctrls if c in rms)
+        # zorder ABOVE the reference square (6/6.5) + origin dot (7) so the raised
+        # square's dashes/corner markers never overdraw the RMS numbers
         ax.text(0.035, 0.97, txt, transform=ax.transAxes, va="top", ha="left",
-                fontsize=9.5, bbox=dict(boxstyle="round,pad=0.3", fc="white",
-                                        ec="#cccccc", alpha=0.92))
+                fontsize=9.5, zorder=10,
+                bbox=dict(boxstyle="round,pad=0.3", fc="white",
+                          ec="#cccccc", alpha=0.92))
     else:
         ax.text(0.5, 0.5, "(no per-run CSVs)", transform=ax.transAxes,
-                ha="center", va="center", color="#888888")
+                ha="center", va="center", color="#888888", zorder=10)
     return rms
 
 
@@ -701,25 +765,33 @@ def _n_txt(rms_dicts, N):
     return f"n={N}" if loaded and min(loaded) == N else f"n≤{N}"
 
 
-def fig_trajectory_compare(fig_dir, run_dir, scenario, mode, ctrls, sweep, seeds, S):
+def _rms_window_txt(settle):
+    """One phrase naming the scored window -- reused by every figure that prints a
+    radial RMS, so the trajectory boxes and the bar charts read the same."""
+    return f"steady-window radial RMS (t ≥ {float(settle):g} s, same metric as the bar chart)"
+
+
+def fig_trajectory_compare(fig_dir, run_dir, scenario, mode, ctrls, sweep, seeds, S,
+                           settle):
     """Single-panel trajectory compare for one mode, ALL sweep directions overlaid
     -> trajectory_compare_<MODE>.png (like the old square_view per-mode figure)."""
     fig, ax = plt.subplots(figsize=(7.6, 7.6), constrained_layout=True)
-    rms = _draw_traj_panel(ax, run_dir, scenario, mode, ctrls, sweep, seeds, S)
+    rms = _draw_traj_panel(ax, run_dir, scenario, mode, ctrls, sweep, seeds, S, settle)
     N = len(sweep) * len(seeds)
     ax.set_title(f"{RM.MODEL} — square trajectory  (mode {mode}, "
                  f"{_sweep_desc(sweep, seeds)})", fontsize=12, fontweight="bold", pad=10)
     ax.legend(handles=_traj_handles(ctrls, rms, N), loc="upper center",
               bbox_to_anchor=(0.5, -0.10), ncol=2, frameon=False,
               handlelength=1.8, columnspacing=1.4, fontsize=9,
-              title=f"boxed RMS = full-run radial RMS (all laps), "
-                    f"mean ± std over runs ({_n_txt([rms], N)})", title_fontsize=8)
+              title=(f"lines = all laps · boxed RMS = {_rms_window_txt(settle)}\n"
+                     f"mean ± std over runs ({_n_txt([rms], N)})"), title_fontsize=8)
     fig.savefig(os.path.join(fig_dir, f"trajectory_compare_{mode}.png"),
                 dpi=200, bbox_inches="tight")
     plt.close(fig)
 
 
-def fig_trajectory_allmodes(fig_dir, run_dir, scenario, modes, ctrls, sweep, seeds, S):
+def fig_trajectory_allmodes(fig_dir, run_dir, scenario, modes, ctrls, sweep, seeds, S,
+                            settle):
     """2x3 overview: one panel per disturbance mode (up to 5) + shared legend in the
     6th cell; every sweep direction x seed overlaid per panel
     -> trajectory_compare_ALLMODES.png (like the old square_view composite)."""
@@ -728,7 +800,8 @@ def fig_trajectory_allmodes(fig_dir, run_dir, scenario, modes, ctrls, sweep, see
     shown = list(modes)[:5]
     have, rms_all = set(), []
     for i, mode in enumerate(shown):
-        rms = _draw_traj_panel(axes[i], run_dir, scenario, mode, ctrls, sweep, seeds, S)
+        rms = _draw_traj_panel(axes[i], run_dir, scenario, mode, ctrls, sweep, seeds, S,
+                               settle)
         have.update(rms.keys())
         rms_all.append(rms)
     for j in range(len(shown), 6):
@@ -736,8 +809,9 @@ def fig_trajectory_allmodes(fig_dir, run_dir, scenario, modes, ctrls, sweep, see
     N = len(sweep) * len(seeds)
     axes[-1].legend(handles=_traj_handles(ctrls, have, N), loc="center", frameon=False,
                     fontsize=15, handlelength=2.2,
-                    title=f"radial RMS per panel: full-run mean ± std "
-                          f"over runs ({_n_txt(rms_all, N)})",
+                    title=(f"radial RMS per panel: steady window (t ≥ {float(settle):g} s,\n"
+                           f"same metric as the bar chart)\n"
+                           f"mean ± std over runs ({_n_txt(rms_all, N)})"),
                     title_fontsize=11)
     fig.suptitle(f"{RM.MODEL} — square tracking across disturbance modes  "
                  f"({_sweep_desc(sweep, seeds)}, all laps)",
@@ -747,6 +821,46 @@ def fig_trajectory_allmodes(fig_dir, run_dir, scenario, modes, ctrls, sweep, see
     plt.close(fig)
     print(f"[fig] trajectory_compare figures ({'+'.join(shown)} + ALLMODES), "
           f"all headings overlaid", flush=True)
+
+
+def fig_xwave_trajectory(xw_dir, panels, scenario, mode, ctrls, sweep, seeds, S, settle):
+    """Cross-wave trajectory compare for ONE wave-affected mode: one panel per sea
+    state (`panels` = [(label, spec, run_dir), ...]), every sweep heading x seed
+    overlaid, IDENTICAL axis limits on every panel, one shared legend below
+    -> wave_comparison/xwave_<scenario>_trajectory_<MODE>.png."""
+    n = len(panels)
+    ncols = min(3, n); nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.3 * ncols, 5.6 * nrows),
+                             squeeze=False, constrained_layout=True)
+    axes = axes.ravel()
+    have, rms_all = set(), []
+    for i, (label, spec, run_dir) in enumerate(panels):
+        rms = _draw_traj_panel(axes[i], run_dir, scenario, mode, ctrls, sweep, seeds, S,
+                               settle)
+        have.update(rms.keys()); rms_all.append(rms)
+        axes[i].set_title(f"{label}  (Hs {float(spec['Hs']):g} m · Tp {float(spec['Tp']):g} s)",
+                          fontsize=12, fontweight="bold", pad=6)
+    for j in range(n, len(axes)):
+        axes[j].axis("off")
+    # one shared square window (per-panel xlim == ylim already) -> at-a-glance compare
+    lo = min(a.get_xlim()[0] for a in axes[:n])
+    hi = max(a.get_xlim()[1] for a in axes[:n])
+    for a in axes[:n]:
+        a.set_xlim(lo, hi); a.set_ylim(lo, hi)
+    N = len(sweep) * len(seeds)
+    handles = _traj_handles(ctrls, have, N)
+    fig.legend(handles=handles, loc="outside lower center",
+               ncol=len(handles), frameon=False, fontsize=11,
+               handlelength=2.0, columnspacing=1.6,
+               title=(f"lines = all laps · boxed RMS = {_rms_window_txt(settle)}, "
+                      f"mean ± std over runs ({_n_txt(rms_all, N)})"), title_fontsize=9)
+    fig.suptitle(f"{RM.MODEL} — square tracking across sea states  (mode {mode} "
+                 f"[{MODE_DESC.get(mode, mode)}], {_sweep_desc(sweep, seeds)}, all laps)",
+                 fontsize=15, fontweight="bold")
+    out = os.path.join(xw_dir, f"xwave_{scenario}_trajectory_{mode}.png")
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f"[fig] {os.path.basename(out)} ({n} sea states)", flush=True)
 
 
 def run_block(cfg, scenario, scen, ctrls, raw_rows, dist, direction_deg):
@@ -816,11 +930,25 @@ def _write_run_outputs(run_dir, scenario, scen, mode, seed, ctrl, theta, beta, L
     ctrl_meta = dict(type=ctrl)
     if ctrl == "pid":
         ctrl_meta["pid_gains"] = dict(DEFAULT_GAINS)
+        # state-measurement provenance (2026-07-24+): "meas" = the PID saw the same
+        # noisy 20 Hz state the MPC does, "truth" = clean plant. Absent key = truth.
+        if L.get("pid_meas_meta") is not None:
+            ctrl_meta["meas"] = L["pid_meas_meta"]
     if ctrl in ("mpc", "dobmpc"):
         # tracking-mode provenance: True = horizon reference sampled from the mission
         # trajectory (reference preview, 2026-07-21+), False = setpoint extrapolation.
         # Runs recorded before this key exist are all False-equivalent.
         ctrl_meta["ref_preview"] = bool(L.get("ref_preview", False))
+        # x0 provenance (2026-07-23+): "estimate" = NMPC consumed EAOB eta_hat/
+        # nu_hat, "truth" = clean plant state. Absent key = truth (old records).
+        ctrl_meta["mpc_state_source"] = str(L.get("mpc_state_source") or "truth")
+        # input-box provenance (2026-07-24+): absent key = the old 8 N surge box.
+        if L.get("u_max") is not None:
+            ctrl_meta["u_max"] = list(L["u_max"])
+    if ctrl == "dobmpc" and L.get("eaob_meta") is not None:
+        # EAOB tuning provenance (2026-07-23+): profile perf/verify, meas_noise,
+        # tau_dist, NIS-gate counters. Absent key = verify/deadbeat + clean meas.
+        ctrl_meta["eaob"] = L["eaob_meta"]
     meta = build_run_meta(
         disturbance=L.get("env_meta"),               # rotated theta_c/beta inside
         controller=ctrl_meta,
@@ -911,46 +1039,50 @@ def _run_all_tasks(tasks, jobs):
     return out
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default=os.path.join(HERE, "config", "base.yaml"))
-    ap.add_argument("--smoke", action="store_true",
-                    help="tiny run: T=5s, seed 0, pid only, dp only, single direction")
-    ap.add_argument("--ctrls", default=None, help="override controllers, e.g. pid,mpc")
-    ap.add_argument("--seeds", default=None, help="override seeds, e.g. 0,1")
-    ap.add_argument("--dirs", type=int, default=None,
-                    help="override with N random current headings (legacy paired "
-                         "sweep; replaces any directions block incl. pairing: grid)")
-    ap.add_argument("--T", type=float, default=None, help="override DP T_sim [s]")
-    ap.add_argument("--jobs", type=int, default=None,
-                    help="parallel worker processes (default: min(cpu,16); 1 = sequential)")
-    args = ap.parse_args()
+def _render_preview(cfg, out_dir, sweep, modes_all, args, wave_label):
+    """Render the wave-environment preview MP4 (CDW if present, else CW) into out_dir,
+    at ONE arbitrary heading (the first sweep point). No-op when no wave-active mode is
+    in the run or --no-preview is set. Never raises -- a preview failure must not touch
+    the results."""
+    if getattr(args, "no_preview", False):
+        return
+    mode = "CDW" if "CDW" in modes_all else ("CW" if "CW" in modes_all else None)
+    if mode is None:
+        return
+    theta0, beta0 = sweep[0]
+    try:
+        width, height = (int(x) for x in str(args.preview_size).lower().split("x"))
+    except Exception:                                    # noqa: BLE001
+        width, height = 720, 480
+    try:
+        from experiments.wave_preview import render_wave_preview
+    except Exception as e:                               # noqa: BLE001
+        print(f"[run_compare] wave preview unavailable ({type(e).__name__}: {e}); "
+              f"skipping", flush=True)
+        return
+    try:
+        render_wave_preview(
+            cfg.dist, os.path.join(out_dir, "wave_preview.mp4"),
+            mode=mode, seed=int(args.preview_seed),
+            theta_deg=float(theta0), beta_deg=float(beta0),
+            duration=float(args.preview_secs), fps=float(args.preview_fps),
+            width=width, height=height, label=wave_label)
+    except Exception as e:                               # noqa: BLE001
+        print(f"[run_compare] wave preview failed ({type(e).__name__}: {e}); "
+              f"continuing", flush=True)
 
-    cfg = load_config(args.config)
-    if args.T is not None:
-        cfg.sim["T_sim"] = args.T
-    ctrls = cfg.experiment.get("controllers", ["pid", "mpc", "dobmpc"])
-    if args.ctrls:
-        ctrls = args.ctrls.split(",")
-    if args.smoke:
-        cfg.sim["T_sim"] = args.T if args.T is not None else 5.0
-        ctrls = args.ctrls.split(",") if args.ctrls else ["pid"]
-        cfg.experiment["primary"]["seeds"] = [0]
-        cfg.experiment["secondary"] = None
-        cfg.experiment["directions"] = None              # single direction unless --dirs
-    if args.dirs is not None:                            # overrides smoke's single dir
-        d0 = cfg.experiment.get("directions") or {}
-        nd = {"n_random": args.dirs, "direction_seed": d0.get("direction_seed", 100)}
-        if d0.get("sweep_wave_heading"):                 # keep the wave-heading sweep on
-            nd["sweep_wave_heading"] = True
-            nd["wave_heading_seed"] = d0.get("wave_heading_seed", 200)
-        cfg.experiment["directions"] = nd
-    seed_override = [int(s) for s in args.seeds.split(",")] if args.seeds else None
 
-    sweep = parse_sweep(cfg)                              # [(theta_c_deg, beta_deg), ...]
-    wave_swept = len({b for _, b in sweep}) > 1           # >1 distinct wave heading
-    day = time.strftime("%Y%m%d"); ts = time.strftime("%Y%m%d_%H%M%S")
-    out_dir = os.path.join(HERE, "recordings", day, f"compare_{ts}")
+def run_wave(cfg, out_dir, ctrls, sweep, wave_swept, blocks, jobs, seed_override,
+             args, wave_label):
+    """Run the full comparison for ONE wave spectrum into out_dir: task list ->
+    parallel run -> aggregate -> figures -> results CSVs -> config snapshot.
+    `cfg.dist` is this spectrum's DistConfig; `sweep` (the shared (current, wave)
+    heading set) is identical across wave spectra so the cross-wave comparison is
+    apples-to-apples. Returns {block_name: (scenario, modes, agg_overall)} for the
+    cross-wave summary. The acados solver is prebuilt ONCE by the caller (main), so
+    workers here always load it. The wave-environment preview MP4 is rendered by
+    main AFTER every wave's fork pool has closed (so a GL context is only created in
+    the parent once all forking is done)."""
     fig_dir = os.path.join(out_dir, "figures")
     os.makedirs(fig_dir, exist_ok=True)
     record = bool(cfg.experiment.get("record_runs", True))
@@ -960,23 +1092,6 @@ def main():
     else:
         print("[run_compare] record_runs=false -> skipping per-run CSVs + "
               "trajectory-compare figures", flush=True)
-    _sw = "current+wave headings" if wave_swept else "current headings"
-    print(f"[run_compare] {RM.MODEL} plant | ctrls={ctrls} | {len(sweep)} sweep pt(s) | "
-          f"{_sw}(deg)="
-          f"{[(round(t,1), round(b,1)) for t, b in sweep] if wave_swept else [t for t, _ in sweep]}"
-          f" | out={out_dir}", flush=True)
-
-    blocks = [("primary", cfg.experiment.get("primary"))]
-    if cfg.experiment.get("secondary"):
-        blocks.append(("secondary", cfg.experiment["secondary"]))
-    # runs/ CSVs, meta_*.json and figure filenames are scenario-keyed: two enabled
-    # blocks with the SAME scenario would silently overwrite (and, in the fork pool,
-    # race on) each other's files -- fail loudly instead.
-    _scens = [s["scenario"] for _, s in blocks if s]
-    if len(set(_scens)) != len(_scens):
-        raise ValueError(f"primary and secondary both use scenario {_scens[0]!r}; "
-                         "per-run CSVs and figures are scenario-keyed and would "
-                         "overwrite each other -- give the blocks distinct scenarios")
 
     # ---- flat task list: every (block x sweep-point x mode x seed x ctrl) run
     block_meta = {}                                      # name -> (scenario, scen, modes, seeds)
@@ -1004,11 +1119,6 @@ def main():
                         tasks.append((cfg, name, scenario, scen, mode, seed, c,
                                       theta, beta, k, need_log, run_dir))
 
-    # ---- pick worker count; pre-build acados once if going parallel
-    jobs = args.jobs if args.jobs is not None else min(os.cpu_count() or 1, 16)
-    jobs = max(1, min(jobs, len(tasks)))
-    if jobs > 1 and _prebuild_acados(cfg, ctrls):
-        os.environ["DOBMPC_ACADOS_BUILD"] = "0"          # forked workers load, no rebuild
     print(f"[run_compare] {len(tasks)} runs on {jobs} worker(s)", flush=True)
     if run_dir:
         print(f"[run_compare] record_runs=true -> ~{est_mb:.0f} MB of per-run CSVs "
@@ -1017,15 +1127,16 @@ def main():
         print(f"[run_compare] WARN: {len(tasks)} runs is a LOT (grid sweeps multiply) "
               f"-- expect a long wall time", flush=True)
 
-    # Run-level manifest (meta.json): plant variant + the exact PID gains in effect.
-    # make_controller passes no gains= override, so DEFAULT_GAINS *is* the effective
-    # set — if an override is ever added there, it must be reflected here too.
+    # Run-level manifest (meta.json): plant variant + exact PID gains + this spectrum.
     meta = build_run_meta(
         controller=dict(controllers=list(ctrls), pid_gains=dict(DEFAULT_GAINS)),
         run=dict(started=time.strftime("%Y-%m-%d %H:%M:%S"), xml=RM.XML_NAME,
                  n_thrusters=RM.N_THRUSTERS, fully_actuated=RM.FULLY_ACTUATED,
                  config=os.path.abspath(cfg.path), T_sim=float(cfg.sim["T_sim"]),
-                 smoke=bool(args.smoke), jobs=jobs),
+                 smoke=bool(args.smoke), jobs=jobs,
+                 wave=dict(label=wave_label, Hs=cfg.dist.Hs, Tp=cfg.dist.Tp,
+                           gamma=cfg.dist.gamma, s=cfg.dist.s,
+                           omega_max=cfg.dist.omega_max)),
     )
     with open(os.path.join(out_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
@@ -1044,6 +1155,7 @@ def main():
     K = len(sweep)
     raw_rows = []
     results = {}                                         # name -> (scenario, modes, agg_k, agg_overall, sweep)
+    summary = {}                                         # name -> (scenario, modes, agg_overall) for cross-wave
     for name, (scenario, scen, modes, seeds) in block_meta.items():
         per_run_k = {k: {} for k in range(K)}
         for k, (theta, beta) in enumerate(sweep):
@@ -1065,32 +1177,31 @@ def main():
                 agg_overall[(mode, c)] = _aggregate(
                     [per_run_k[k][(mode, s, c)] for k in range(K) for s in seeds])
         results[name] = (scenario, modes, agg_k, agg_overall, sweep)
+        summary[name] = (scenario, modes, agg_overall)
 
         # figures: representative-point time histories, overall radial bar, direction summary
         flog = fig_logs.get(name, {})
         for mode in modes:
             fig_timehistory(fig_dir, f"{scenario}_{mode}", flog[mode], agg_overall)
+        settle = settle_start(cfg)                   # same window the boxes will print
         fig_bars(fig_dir, agg_overall, modes, ctrls, "radial_rms",
-                 "radial RMS [cm]", f"{scenario}_radial_rms")
+                 "radial RMS [cm]", f"{scenario}_radial_rms",
+                 note=f"scored over the steady window: t ≥ {settle:g} s of each run")
         fig_direction_summary(fig_dir, scenario, modes, ctrls, sweep, agg_k, wave_swept)
-        # trajectory-compare figures (per mode + ALLMODES composite) from the per-run
-        # CSVs, all sweep directions overlaid. Square only -- dp has no trajectory.
-        # Guarded: a figure failure must never cost the results.csv written below.
+        # trajectory-compare figures (per mode + ALLMODES composite). Square only.
         if scenario == "square" and run_dir:
             try:
                 S = float(scen.get("size", 1.0))
                 for mode in modes:
                     fig_trajectory_compare(fig_dir, run_dir, scenario, mode, ctrls,
-                                           sweep, seeds, S)
+                                           sweep, seeds, S, settle)
                 fig_trajectory_allmodes(fig_dir, run_dir, scenario, modes, ctrls,
-                                        sweep, seeds, S)
+                                        sweep, seeds, S, settle)
             except Exception as e:
                 print(f"[fig] WARN: trajectory-compare figures failed ({e}); "
                       f"continuing to results CSVs", flush=True)
 
-    # per-environment disturbance figures (controller-independent; depend only on each
-    # sweep point's (theta_c, beta), seed 0, mode CDW): ocean current + wave particle
-    # velocity split into two folders, plus raw .npz time series.
+    # per-environment disturbance figures (controller-independent; seed 0, mode CDW)
     cur_dir = os.path.join(fig_dir, "selfcheck", "current")
     wav_dir = os.path.join(fig_dir, "selfcheck", "wave")
     raw_dir = os.path.join(fig_dir, "selfcheck", "raw")
@@ -1113,12 +1224,10 @@ def main():
         with open(agg_path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["scenario", "direction", "mode", "controller", "metric", "mean", "std"])
-            for name, (scenario, modes, agg_k, agg_overall, sweep) in results.items():
-                if len(sweep) > 1:
-                    # wave heading swept too -> label both, else rows with equal
-                    # theta (grid) would collide/ambiguate
-                    multi_w = len({b for _, b in sweep}) > 1
-                    for ki, (theta, beta) in enumerate(sweep):
+            for name, (scenario, modes, agg_k, agg_overall, sweep_) in results.items():
+                if len(sweep_) > 1:
+                    multi_w = len({b for _, b in sweep_}) > 1
+                    for ki, (theta, beta) in enumerate(sweep_):
                         lbl = f"c{theta:.1f}/w{beta:.1f}" if multi_w else f"{theta:.1f}"
                         for mode in modes:
                             for c in ctrls:
@@ -1143,6 +1252,228 @@ def main():
     except Exception as e:
         print(f"[run_compare] WARN copy config: {e}")
     print(f"[run_compare] figures in {fig_dir}", flush=True)
+    return summary
+
+
+def _write_cross_wave(out_root, all_summ, ctrls, wave_dirs, sweep, blocks,
+                      seed_override, settle):
+    """Cross-wave comparison across sea states -> out_root/wave_comparison/: a merged
+    results_all_waves.csv + per-scenario grouped bars (one panel per mode; x = wave
+    spectrum, clustered by controller; y = radial RMS, shared across panels) + one
+    trajectory composite per wave-affected mode (CW/CDW; one panel per sea state,
+    from the per-run CSVs under wave_dirs[i]/runs). Called only for >1 wave spec."""
+    xw_dir = os.path.join(out_root, "wave_comparison")
+    os.makedirs(xw_dir, exist_ok=True)
+
+    rows = []
+    for i, label, spec, summ in all_summ:
+        Hs, Tp = float(spec.get("Hs")), float(spec.get("Tp"))
+        for name, (scenario, modes, agg_overall) in summ.items():
+            for mode in modes:
+                for c in ctrls:
+                    for mk, (mu, sd) in agg_overall[(mode, c)].items():
+                        rows.append(dict(wave_idx=i, wave_label=label, Hs=Hs, Tp=Tp,
+                                         scenario=scenario, mode=mode, controller=c,
+                                         metric=mk, mean=round(mu, 4), std=round(sd, 4)))
+    if rows:
+        with open(os.path.join(xw_dir, "results_all_waves.csv"), "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w.writeheader(); w.writerows(rows)
+
+    xlabels = [f"{label}  Hs{float(spec['Hs']):g}·Tp{float(spec['Tp']):g}"
+               for _, label, spec, _ in all_summ]
+    x = np.arange(len(all_summ)); width = 0.8 / max(1, len(ctrls))
+    _, _, _, summ0 = all_summ[0]
+    for name, (scenario, modes, _agg0) in summ0.items():
+        nm = len(modes)
+        # panel width follows the sea-state count (6 rotated labels need the room)
+        pw = max(4.3, 0.72 * len(all_summ) + 1.2)
+        fig, axes = plt.subplots(1, nm, figsize=(pw * nm, 4.9),
+                                 squeeze=False, sharey=True)
+        for j, mode in enumerate(modes):
+            ax = axes[0][j]
+            ax.set_axisbelow(True); ax.grid(axis="y", color="0.9", lw=0.8, zorder=0)
+            for ci, c in enumerate(ctrls):
+                means = np.array([summ[name][2][(mode, c)]["radial_rms"][0]
+                                  for _, _, _, summ in all_summ])
+                stds = np.array([summ[name][2][(mode, c)]["radial_rms"][1]
+                                 for _, _, _, summ in all_summ])
+                off = (ci - (len(ctrls) - 1) / 2) * width
+                ax.bar(x + off, means, width * 0.9, yerr=stds, capsize=3,
+                       color=BAR_COL.get(c, COL.get(c)), edgecolor="white",
+                       linewidth=0.7, zorder=3, label=BAR_LABEL.get(c, c))
+            ax.set_xticks(x)
+            ax.set_xticklabels(xlabels, fontsize=8, rotation=30, ha="right",
+                               rotation_mode="anchor")
+            ax.set_title(f"[{mode}] {MODE_DESC.get(mode, mode)}", fontsize=10)
+            if j == 0:
+                ax.set_ylabel("radial RMS [cm]")
+        handles, labels = axes[0][0].get_legend_handles_labels()
+        fig.legend(handles, labels, loc="lower center", ncol=max(1, len(ctrls)),
+                   frameon=False, fontsize=10)
+        fig.suptitle(f"{scenario}: radial RMS across wave spectra "
+                     f"({len(all_summ)} sea states)", fontsize=13, fontweight="bold")
+        fig.text(0.995, 0.005, f"scored over the steady window: t ≥ {float(settle):g} s "
+                 f"of each run", ha="right", va="bottom", fontsize=8, color="0.45")
+        fig.tight_layout(rect=[0, 0.08, 1, 0.95])   # bottom band = the shared legend
+        fig.savefig(os.path.join(xw_dir, f"xwave_{scenario}_radial_rms.png"), dpi=150)
+        plt.close(fig)
+
+    # trajectory composites for the wave-affected modes (square only -- needs the
+    # per-run CSVs, so record_runs=false or a missing runs/ dir quietly skips)
+    try:
+        panels = [(label, spec, os.path.join(od, "runs"))
+                  for (_, label, spec, _), od in zip(all_summ, wave_dirs)
+                  if os.path.isdir(os.path.join(od, "runs"))]
+        for bname, scen in blocks:
+            if not scen or scen.get("scenario") != "square" or len(panels) < 2:
+                continue
+            seeds = list(seed_override if seed_override is not None else scen["seeds"])
+            S = float(scen.get("size", 1.0))
+            for mode in ("CW", "CDW"):
+                if mode in list(scen["modes"]):
+                    fig_xwave_trajectory(xw_dir, panels, "square", mode, ctrls,
+                                         sweep, seeds, S, settle)
+    except Exception as e:
+        print(f"[fig] WARN: cross-wave trajectory figures failed ({e}); "
+              f"bar figures + CSV intact", flush=True)
+    print(f"[run_compare] cross-wave comparison -> {xw_dir}", flush=True)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default=os.path.join(HERE, "config", "base.yaml"))
+    ap.add_argument("--smoke", action="store_true",
+                    help="tiny run: T=5s, seed 0, pid only, dp only, single direction")
+    ap.add_argument("--ctrls", default=None, help="override controllers, e.g. pid,mpc")
+    ap.add_argument("--seeds", default=None, help="override seeds, e.g. 0,1")
+    ap.add_argument("--dirs", type=int, default=None,
+                    help="override with N random current headings (legacy paired "
+                         "sweep; replaces any directions block incl. pairing: grid)")
+    ap.add_argument("--T", type=float, default=None, help="override DP T_sim [s]")
+    ap.add_argument("--jobs", type=int, default=None,
+                    help="parallel worker processes (default: min(cpu,16); 1 = sequential)")
+    # wave-environment preview MP4 (rendered per wave spec when CDW/CW is in the modes)
+    ap.add_argument("--no-preview", action="store_true",
+                    help="skip the CDW wave-environment preview MP4(s).")
+    ap.add_argument("--preview-secs", type=float, default=10.0,
+                    help="preview clip length [s] (default 10).")
+    ap.add_argument("--preview-fps", type=float, default=30.0)
+    ap.add_argument("--preview-size", default="720x480", help="WIDTHxHEIGHT for the preview.")
+    ap.add_argument("--preview-seed", type=int, default=0,
+                    help="disturbance seed for the preview clip.")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    if args.T is not None:
+        cfg.sim["T_sim"] = args.T
+    ctrls = cfg.experiment.get("controllers", ["pid", "mpc", "dobmpc"])
+    if args.ctrls:
+        ctrls = args.ctrls.split(",")
+    if args.smoke:
+        cfg.sim["T_sim"] = args.T if args.T is not None else 5.0
+        ctrls = args.ctrls.split(",") if args.ctrls else ["pid"]
+        cfg.experiment["primary"]["seeds"] = [0]
+        cfg.experiment["secondary"] = None
+        cfg.experiment["directions"] = None              # single direction unless --dirs
+    if args.dirs is not None:                            # overrides smoke's single dir
+        d0 = cfg.experiment.get("directions") or {}
+        nd = {"n_random": args.dirs, "direction_seed": d0.get("direction_seed", 100)}
+        if d0.get("sweep_wave_heading"):                 # keep the wave-heading sweep on
+            nd["sweep_wave_heading"] = True
+            nd["wave_heading_seed"] = d0.get("wave_heading_seed", 200)
+        cfg.experiment["directions"] = nd
+    seed_override = [int(s) for s in args.seeds.split(",")] if args.seeds else None
+
+    # Shared sweep from the FIRST wave spectrum -> the SAME (current, wave) heading set
+    # for every sea state, so the cross-wave comparison is apples-to-apples.
+    cfg_repr = dataclasses.replace(cfg, raw={**cfg.raw, "waves": cfg.wave_specs[0]})
+    sweep = parse_sweep(cfg_repr)                        # [(theta_c_deg, beta_deg), ...]
+    wave_swept = len({b for _, b in sweep}) > 1          # >1 distinct wave heading
+
+    # Experiment blocks (shared across wave spectra); scenarios must be distinct because
+    # per-run CSVs / figures are scenario-keyed (would overwrite / race otherwise).
+    blocks = [("primary", cfg.experiment.get("primary"))]
+    if cfg.experiment.get("secondary"):
+        blocks.append(("secondary", cfg.experiment["secondary"]))
+    _scens = [s["scenario"] for _, s in blocks if s]
+    if len(set(_scens)) != len(_scens):
+        raise ValueError(f"primary and secondary both use scenario {_scens[0]!r}; "
+                         "per-run CSVs and figures are scenario-keyed and would "
+                         "overwrite each other -- give the blocks distinct scenarios")
+
+    # runs per wave spectrum -> worker count -> a SINGLE acados prebuild for all waves
+    n_per_wave = 0
+    for _n, scen in blocks:
+        if scen is None:
+            continue
+        _seeds = seed_override if seed_override is not None else scen["seeds"]
+        n_per_wave += len(sweep) * len(scen["modes"]) * len(_seeds) * len(ctrls)
+    jobs = args.jobs if args.jobs is not None else min(os.cpu_count() or 1, 16)
+    jobs = max(1, min(jobs, max(1, n_per_wave)))
+    if jobs > 1 and _prebuild_acados(cfg, ctrls):
+        os.environ["DOBMPC_ACADOS_BUILD"] = "0"          # forked workers load, no rebuild
+
+    day = time.strftime("%Y%m%d"); ts = time.strftime("%Y%m%d_%H%M%S")
+    out_root = os.path.join(HERE, "recordings", day, f"compare_{ts}")
+    os.makedirs(out_root, exist_ok=True)
+    n_waves = len(cfg.wave_configs)
+    multi = n_waves > 1
+    _sw = "current+wave headings" if wave_swept else "current headings"
+    print(f"[run_compare] {RM.MODEL} plant | ctrls={ctrls} | {n_waves} wave spec(s) "
+          f"{cfg.wave_labels} | {len(sweep)} sweep pt(s) | {_sw}(deg)="
+          f"{[(round(t,1), round(b,1)) for t, b in sweep] if wave_swept else [t for t, _ in sweep]}"
+          f" | {jobs} worker(s) | out={out_root}", flush=True)
+
+    # One full comparison per wave spectrum (single spectrum -> straight into out_root).
+    all_summ = []
+    preview_jobs = []                                    # (cfg_w, out_dir, label) per wave
+    for i in range(n_waves):
+        wdist = cfg.wave_configs[i]; wlabel = cfg.wave_labels[i]; wspec = cfg.wave_specs[i]
+        cfg_w = dataclasses.replace(
+            cfg, dist=wdist, wave_configs=[wdist], wave_labels=[wlabel],
+            wave_specs=[wspec], raw={**cfg.raw, "waves": wspec})
+        out_dir_w = out_root if not multi else os.path.join(out_root, f"wave{i:02d}_{wlabel}")
+        if multi:
+            os.makedirs(out_dir_w, exist_ok=True)
+            print(f"\n[run_compare] ===== wave {i + 1}/{n_waves}: {wlabel} "
+                  f"(Hs={wdist.Hs:g}, Tp={wdist.Tp:g}) =====", flush=True)
+        summ = run_wave(cfg_w, out_dir_w, ctrls, sweep, wave_swept, blocks, jobs,
+                        seed_override, args, wlabel)
+        all_summ.append((i, wlabel, wspec, summ))
+        preview_jobs.append((cfg_w, out_dir_w, wlabel))
+
+    if multi:
+        try:
+            _write_cross_wave(out_root, all_summ, ctrls,
+                              [od for _, od, _ in preview_jobs], sweep, blocks,
+                              seed_override, settle_start(cfg))
+        except Exception as e:
+            print(f"[run_compare] WARN cross-wave summary failed ({e}); "
+                  f"per-wave outputs intact", flush=True)
+        top = build_run_meta(
+            controller=dict(controllers=list(ctrls), pid_gains=dict(DEFAULT_GAINS)),
+            run=dict(started=time.strftime("%Y-%m-%d %H:%M:%S"), xml=RM.XML_NAME,
+                     n_waves=n_waves, smoke=bool(args.smoke), jobs=jobs,
+                     config=os.path.abspath(cfg.path),
+                     waves=[dict(index=i, label=l, Hs=float(s.get("Hs")),
+                                 Tp=float(s.get("Tp"))) for i, l, s, _ in all_summ]),
+        )
+        with open(os.path.join(out_root, "meta.json"), "w") as f:
+            json.dump(top, f, indent=2, default=str)
+        try:
+            import shutil
+            shutil.copy(cfg.path, os.path.join(out_root, "config.yaml"))
+        except Exception as e:
+            print(f"[run_compare] WARN copy config: {e}")
+
+    # Wave-environment preview MP4s LAST: every fork pool is closed, so creating the
+    # offscreen GL context in the parent can no longer collide with worker forking.
+    modes_all = sorted({m for _, s in blocks if s for m in list(s["modes"])})
+    for cfg_w, out_dir_w, wlabel in preview_jobs:
+        _render_preview(cfg_w, out_dir_w, sweep, modes_all, args, wlabel)
+
+    print(f"[run_compare] DONE -> {out_root}", flush=True)
 
 
 if __name__ == "__main__":

@@ -6,16 +6,83 @@ site:
   h: 4.0            # water-column depth [m] (seabed at z=-4); finite-depth dispersion uses tanh(k*h)
   z_ROV: -3.0       # ROV operating depth (oceanographic z, up from surface); 1 m above seabed
 
+# `waves:` may be a single mapping (one sea state) OR a YAML LIST of mappings to
+# sweep several sea states in ONE `run_compare` (each -> its own wave<i>_<label>/
+# subfolder + a top-level wave_comparison/ + cross-wave summary; `label:` names the
+# folder). The current + heading sweep are SHARED across spectra, so the comparison
+# is apples-to-apples. With CW/CDW in the modes, run_compare also renders a ~10 s
+# wave_preview.mp4 of the pool scene per sea state. See README "Multiple wave spectra".
+#
+# Sea-state ladder, STRONG -> WEAK, for h=4 m / z_ROV=-3 m (shallow Monterey Bay).
+# As the sea calms the family walks from a young steep wind-sea (high Hs, short Tp,
+# broad+spread: low gamma/s) to an old clean swell (low Hs, long Tp, narrow: high
+# gamma/s) -- the physical wind-sea->swell progression. Hs is the primary severity
+# knob; note the ROV sits 3 m down, so short-period (high-omega) energy decays with
+# depth faster than the long swell (finite-depth cosh(k(z+h))/cosh(kh)). N_omega is
+# scaled to keep the spectral spacing ~0.035 rad/s. NOTE: a single seed-0 wave
+# realization recurs ~run-length, so per-vertex claims need multi-seed (KNOWN_ISSUES).
 waves:
-  Hs: 0.75          # significant wave height [m]
-  Tp: 12.0          # peak period [s]  -> kh ~= 0.34 (shallow/intermediate)
-  gamma: 5.0        # JONSWAP peak factor
-  s: 30             # cos^{2s} directional spreading (large = narrow)
-  beta_bar_deg: 0.0 # mean wave heading [deg] (FLU world)
-  N_omega: 60
-  N_beta: 21
-  omega_min: 0.2
-  omega_max: 1.6    # [rad/s]
+  # - label: storm            # ENTIRE strongest -- near the shallow-water breaking limit
+  #   Hs: 1.8                 # Hs/h = 0.45: linear finite-depth theory is EXTRAPOLATED
+  #   Tp: 5.0                 #   here (no wave breaking modeled) -- read as an upper bound
+  #   gamma: 1.3              # broad (young wind-sea)
+  #   s: 5                    # wide directional spread (confused sea)
+  #   beta_bar_deg: 0.0
+  #   N_omega: 96
+  #   N_beta: 21
+  #   omega_min: 0.2
+  #   omega_max: 3.8
+  - label: very_rough
+    Hs: 1.5
+    Tp: 5.5
+    gamma: 1.7
+    s: 8
+    beta_bar_deg: 0.0
+    N_omega: 88
+    N_beta: 21
+    omega_min: 0.2
+    omega_max: 3.4
+  # - label: rough            # the current default (prior Hs 1.2 runs live here)
+  #   Hs: 1.2
+  #   Tp: 6.0
+  #   gamma: 2.0
+  #   s: 10
+  #   beta_bar_deg: 0.0
+  #   N_omega: 80
+  #   N_beta: 21
+  #   omega_min: 0.2
+  #   omega_max: 3.0
+  - label: moderate
+    Hs: 1.0
+    Tp: 8.0
+    gamma: 3.0
+    s: 16
+    beta_bar_deg: 0.0
+    N_omega: 68
+    N_beta: 21
+    omega_min: 0.2
+    omega_max: 2.4
+  # - label: mild
+  #   Hs: 0.9
+  #   Tp: 10.0
+  #   gamma: 4.0
+  #   s: 22
+  #   beta_bar_deg: 0.0
+  #   N_omega: 62
+  #   N_beta: 21
+  #   omega_min: 0.2
+  #   omega_max: 1.9
+  - label: gentle           # the tuning was validated here (long clean swell)
+    Hs: 0.75                #   -> the CDW EAOB consistency the perf profile passes
+    Tp: 12.0
+    gamma: 5.0
+    s: 30
+    beta_bar_deg: 0.0
+    N_omega: 60
+    N_beta: 21
+    omega_min: 0.2
+    omega_max: 1.6
+
 
 current:
   V_bar_c: 0.20         # mean current speed [m/s]
@@ -46,7 +113,7 @@ experiment:
   settle_s: 10.0        # steady-state window start [s]
   settle_band_cm: 5.0   # settling-time band (radial error) [cm]
   directions:           # heading sweep: theta_c (current) x beta (wave)
-    n_random: 50              # <-- THE knob: sample N random (current, wave) heading
+    n_random: 100              # <-- THE knob: sample N random (current, wave) heading
     #                           pairs; current AND wave headings drawn independently
     direction_seed: 100       # reproducible draw of the current headings
     sweep_wave_heading: true  # wave heading beta randomized per point too

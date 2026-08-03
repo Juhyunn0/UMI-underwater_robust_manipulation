@@ -263,6 +263,12 @@ def _controller_meta(controller, ctrl_name=None):
     if nmpc is not None:
         m["solver"] = "acados" if type(nmpc).__name__ == "AcadosNMPC" else "ipopt"
         m["N"] = int(getattr(nmpc, "N", 0))
+        # input box (2026-07-24+): surge went 8 -> 30 N on heavy to match the PID's
+        # f_max; absent key = the old 8 N box. Records must not be pooled across it.
+        # Read off the live solver, so a caller-supplied u_max is reported truthfully.
+        umax = getattr(nmpc, "u_max", None)
+        if umax is not None:
+            m["u_max"] = [float(v) for v in umax]
     cd = getattr(controller, "ctrl_dt", None)
     if cd:
         m["ctrl_hz"] = round(1.0 / cd, 3)

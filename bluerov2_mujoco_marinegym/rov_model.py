@@ -114,6 +114,16 @@ _POOL_WRAP = {"heavy": "scene_bluerov_heavy_tags.xml",
 XML_NAME = _POOL_WRAP[MODEL] if _POOL_TAGS else _CFG["xml"]
 YAML_NAME = _CFG["yaml"]
 XML_PATH = os.path.join(_HERE, XML_NAME)
+
+
+def pool_xml_path(model=MODEL):
+    """Absolute path to the POOL_TAGS wrapper scene (visual AprilTag floor + animated
+    water surface) for `model`, REGARDLESS of the POOL_TAGS env var. Lets an offscreen
+    visualiser (e.g. experiments/wave_preview.py) render the pool scene even when the
+    batch itself runs on the plain plant. Returns the path whether or not the file
+    exists on disk — the caller checks os.path.isfile and regenerates via
+    tools/gen_pool_apriltags.py if missing."""
+    return os.path.join(_HERE, _POOL_WRAP[model])
 YAML_PATH = os.path.join(_HERE, "marinegym_assets", YAML_NAME)
 MASS = _CFG["mass"]
 INERTIA = tuple(_CFG["inertia"])           # (Ix, Iy, Iz)

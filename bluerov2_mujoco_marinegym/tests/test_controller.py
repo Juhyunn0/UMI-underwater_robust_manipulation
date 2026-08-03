@@ -40,7 +40,8 @@ def run_episode(mode, disturb, start=START, T_sec=40.0, seed=0):
                             coeff_path=os.path.join(HERE, "marinegym_assets",
                                                     "BlueROVHeavy.yaml")).install()
     ctrl = C.PoseController(model, mode=mode, setpoint=(0, 0, 0), yaw_ref=0.0,
-                            buoyancy_ff=hydro, gains=C.GAINS_HEAVY)
+                            buoyancy_ff=hydro, gains=C.GAINS_HEAVY,
+                            meas_noise=False)   # control-law regression: clean state
     sx, sy, sz, syaw = start
     data.qpos[:3] = [sx, sy, sz]
     half = np.radians(syaw) / 2.0

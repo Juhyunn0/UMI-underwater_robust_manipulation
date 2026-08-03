@@ -6,6 +6,17 @@
 
 ## 🐛 테스트 / 스크립트 함정
 
+### 📊 compare sweep 재실행 대기 — MPC surge 박스 8 → 30 N 변경 이후 (기록 경계)
+- **발견/변경**: 2026-07-24 (wave-crossover 워크플로에서 벤치마크 불공정 발견 → 같은 날 수정)
+- **증상**: `params.U_MAX[0]`을 8 → 30 N(= PID `f_max`)으로 고쳤으므로 **기존 recordings의 모든
+  mpc/dobmpc 결과는 낡은 8 N 박스 하에서 측정된 것**. 특히 `compare_20260724_160210` 등에서
+  관측된 "강파랑에서 PID가 MPC보다 낫다"는 **벤치마크 아티팩트이며 인용 금지**(ablation:
+  storm PID−MPC −4.24 → +8.60 cm 부호 역전, crossover 소멸).
+- **임시 대응**: 새 run meta는 `controller.u_max`를 기록하므로 신/구 기록은 구분 가능
+  (키가 없으면 낡은 8 N). 경계를 넘어 결과를 합산하지 말 것.
+- **제대로 고치는 법**: full sweep(`experiments/run_compare.py`, 6 sea state × 5 mode × 3 ctrl)
+  재실행 후 이 항목 삭제. 재실행은 사용자 몫.
+
 ### w_hat ±50 클립 — 단일 스칼라가 N·N·m 겸용 + 발동 무음 + 상수 중복
 - **발견**: 2026-07-22 (mpc_acados 리뷰 워크플로: control-theory ×2 + simulation-advisor,
   verifier 수치 검증 11/12 verified)
@@ -20,8 +31,15 @@
   하드코드 중복.
 - **임시 대응**: 없음(정상 미션에선 힘 클립이 거의 안 물림; 관측기 상태는 클립 안 되므로
   추정 자체는 오염 없음).
-- **제대로 고치려면**: params.py에 per-axis `W_HAT_CLIP=[15,45,45,5,5,8]` 단일 정의 +
-  발동 카운터를 n_fail 옆에 기록 + (주 방어선) EAOB innovation gating(Mahalanobis χ² gate).
+- **2026-07-23 갱신**: EAOB innovation gating을 **구현했으나 실측 후 기본 OFF로 결정**
+  (`params.EAOB_GATE_ON=False`, 메커니즘·`n_gated` 카운터·meta 기록은 유지) — square
+  seed-0 A/B(tau_dist=0.5 기준)에서 χ²(0.999,18) 게이트가 파랑/코너의 상시적 w_dot=0 위반
+  프레임을 25–76% 기각해 파랑 추종 자체를 차단(CDW radRMS 4.5→15.5 cm, CD 1.35→1.43 cm);
+  기각이 다시 혁신을 키우는 악순환으로 NIS 통계도 오염(137 vs gate-off 25). 최종 기본
+  tau_dist=0.2에선 같은 시나리오에서 게이트가 아예 발동하지 않음(0/1067). 일관성 게이트는
+  wave-band 모델 위반과 구조적으로 양립 불가 → 스파이크 방어는 여전히 per-axis
+  `W_HAT_CLIP=[15,45,45,5,5,8]` 단일 정의 + 클립 발동 카운터 기록(mpc_acados.py:170·
+  mpc.py의 ±50 하드코딩 중복은 그대로)이 담당해야 함. 근본 해결은 harmonic-EAOB.
 
 ### `tests/test_dobmpc.py` — rank-5(NU=4/option-b) 전제, bluerov2 제거로 실행 불가 (deferred)
 - **발견**: 2026-07-06, **갱신 2026-07-21** (bluerov2 변종 제거)
@@ -71,8 +89,10 @@
 ### `experiments/plot_trajectories.py` — docstring/코드 불일치
 - **발견**: 2026-07-06
 - **증상**: docstring은 error-vs-time 패널을 언급하지만 현재 코드에 없음.
-  steady-state RMS(마지막 2랩)는 내부에서 계산만 하고 어디에도 표시하지 않음.
-- **제대로 고치려면**: docstring 정리, 또는 패널/범례에 SS-RMS 추가.
+  마지막-2랩 RMS(`rms_lastlaps`)는 내부에서 계산만 하고 어디에도 표시하지 않음.
+  (2026-07-28에 *표시되는* RMS는 run_compare와 동일한 steady window로 통일됨 —
+  이 항목은 남은 docstring 정리 + 미표시 `rms_lastlaps` 건에 한정.)
+- **제대로 고치려면**: docstring 정리, 또는 패널/범례에 마지막-2랩 RMS 추가.
 
 ### `verify/verify_acados.py` 게이트가 heavy_gripper에서 근소 초과 (0.2717 > 0.25 N)
 - **발견**: 2026-07-12 (heavy_gripper 변종 검증 중)
@@ -114,7 +134,76 @@
   로 커짐. 실기체에 존재할 roll-yaw 곱관성이 플랜트에 없다는 뜻 — hydro를 body-frame으로
   고치기 전까지는 구조적으로 못 넣는다. 위 "제대로 고치려면"의 우선순위가 올라감.
 
+### 2026-07-23 base.yaml 파랑 강화 이후 CDW에서 EAOB perf 일관성 깨짐 (소스 무관)
+- **발견**: 2026-07-23 (verify_state_source A/B 검증 중; 파랑 블록이 19:28에
+  Hs 0.75→1.2 m, Tp 12→6 s, γ 5→2, s 30→10, ω_max 1.6→3.0으로 강화됨)
+- **증상**: 새 해상 상태의 CDW에서 mpc_state_source와 무관하게 NIS 80(truth)/71(estimate)
+  (DP), 44/42(square) — τ_dist=0.2로 검증했던 목표범위(14–24) 크게 이탈, radRMS도
+  DP 1.5→9.6 cm / square 3.5→15.7 cm로 악화. w_dot=0 + τ_dist=0.2가 새 파랑 대역
+  (ω_p≈1.05, 에너지 ~3 rad/s)을 못 쫓아가는 것; 구파랑 config로는 전 항목 PASS 재현.
+- **임시 대응**: 없음(발산은 아님 — n_fail 0, 유한). `verify/verify_eaob.py`·
+  `verify_state_source.py`가 현 config에서 exit 1로 신호.
+- **2026-07-24(3) 갱신**: surge 박스 8→30 N 변경 A/B(같은 명령 `verify_eaob --no-plot`,
+  CDW/T=60/seed 0)에서 **NIS 245.8→100.0, NEES 398.9→122.0으로 2.5–3.3× 개선**(여전히
+  게이트 24 초과 = FAIL). 즉 이 일관성 붕괴의 일부는 **authority 부족으로 인한 큰 추종오차**
+  였고(박스가 EAOB의 pseudo-measurement 채널까지 오염), 나머지는 원래 진단대로 τ_dist가
+  새 파랑 대역을 못 쫓는 것. 재스윕은 30 N 박스 기준으로 할 것(옛 8 N 수치로 튜닝 금지).
+- **제대로 고치려면**: 새 해상 상태 기준으로 EAOB_TAU_DIST 재스윕(0.05–0.1 예상) 또는
+  harmonic-EAOB — 어느 쪽이든 실험 설계 결정이라 사용자 판단 필요.
+
 ## 📌 알려진 한계 (당장 고칠 계획 없음, 잊지 말 것)
+
+### C3 BNO086 IMU: extrinsic 없음 + 가속도계 스케일 +20% → VIO 쓰려면 캘리브레이션 필수 (2026-07-29)
+- **사실 1**: `getImuToCameraExtrinsics(CAM_A)` → `IMU calibration data is not available
+  on device yet.` 공장 캘리브레이션은 카메라만 담고 있어 **T_imu_cam이 미지**다.
+  (카메라 intrinsics·스테레오 extrinsics는 정상이니 RGB-D/스테레오는 영향 없음.)
+- **사실 2**: 정지 상태에서 |a| = **11.8 m/s²** (중력 9.81 대비 **+20%**). raw/calibrated
+  둘 다 동일, accuracy 플래그는 UNRELIABLE/MEDIUM. 즉 **IMU intrinsic(스케일/바이어스)이
+  미보정**이다. 축 방향(카메라 광축 대비)도 벤더 미문서화·미확정.
+- **영향**: visual-inertial SLAM(VIO)에서 스케일과 중력 정렬이 틀어진다. 더 나쁜 건
+  **"알고리즘이 안 맞는 것처럼" 실패**해서 원인을 IMU로 의심하기 어렵다는 점.
+  RGB-D SLAM / stereo SLAM만 쓸 거면 무관하다.
+- **임시 대응**: `c3_collect.py`가 두 사실을 모든 데이터셋의 `metadata.txt`에 명시하고,
+  샘플마다 accuracy 필드를 남긴다. `c3_dataset_check.py`도 extrinsic 부재를 경고한다.
+  → 동료가 모르고 쓰는 일은 없다.
+- **제대로 고치는 법**: (a) Kalibr류로 camera-IMU extrinsic + IMU intrinsic 동시
+  캘리브레이션(체커보드, 공기 중 → 수중 재검), 또는 (b) extrinsic만 기계적 실측 +
+  accel 스케일/바이어스 6-position 캘리브레이션. 완료 후 `calibration.json`에
+  주입하는 경로를 만들고 이 항목 삭제.
+
+### C3 직결(`c3_camera/`): 컬러/depth 촬영시각 skew 약 1 프레임 — 하드웨어 동기 여부 미확인 (2026-07-29)
+- **사실**: `c3_stream.py` 기본(`--pair-mode latest`)에서 컬러(CAM_A)와 depth(CAM_B/C 스테레오)의
+  `getTimestamp()` 차이가 **약 66 ms(15 fps에서 ≈1 프레임 간격)** 로 관측된다. 컬러 카메라와
+  mono 쌍이 같은 파이프라인 안에서 **하드웨어 동기(FSYNC)로 묶여 있지 않기 때문**으로 보인다.
+- **영향**: 카메라나 장면이 움직이는 동안 RGB-D 정합이 최대 한 프레임만큼 어긋난다. 정지 상태
+  파악에는 무해하지만, **움직이는 매니퓰레이션 데이터 수집·학습에는 실제로 문제가 될 수 있다**
+  (66 ms × 0.2 m/s = 1.3 cm 어긋남).
+- **임시 대응**: `--pair-mode timestamp` (+`--pair-tolerance-ms`)를 쓰면 두 스트림의 촬영시각이
+  허용범위 안에 들어올 때만 bundle을 내보낸다. 대가는 최대 한 프레임 지연.
+  `Bundle.skew_ms`가 매 프레임 실제 skew를 보고하므로 HUD에서 감시 가능.
+- **제대로 고치는 법**: OAK-D-W-POE가 CAM_A와 mono 쌍의 **FSYNC 하드웨어 트리거를 지원하는지
+  미확인**(이 보드의 FFC/FSYNC 배선 여부에 달림). 지원하면 파이프라인에서 동기를 켠다.
+  아니면 depthai `Sync` 노드(디바이스측 정렬, 지연 증가) 또는 호스트측 보간을 검토.
+  판정 전에는 이 항목 삭제하지 말 것.
+
+### square 참조가 코너에서 동역학적으로 실현 불가 → 지울 수 없는 ~2 cm 코너 오차 바닥 (2026-07-24)
+- **사실**: `square_setpoint`의 위치 경로는 각진 사각형이라 코너에서 참조 속도가 한 샘플
+  (0.05 s) 만에 90° 뒤집힌다(|Δv|=0.212 m/s → 요구 가속도 사실상 무한). 게다가 yaw 참조는
+  60°/s로 슬루(90°에 1.5 s)라 위치 참조와 **서로 모순** — 코너를 실제로 돌 때 필요한 선회율
+  126°/s(횡력 8 N)~474°/s(30 N)가 슬루 상한 60°/s를 크게 초과. 힘이 무한해도 기수가 경로를
+  못 따라간다. (슬루 자체는 `slew_heading` docstring에 의도된 설계로 명시돼 있음.)
+- **정량**(dobmpc, gentle, **NONE 모드 = 외란 0**, lap 2–10 folded): 코너 2.00/1.92/2.04/2.39 cm
+  vs 직선 0.22–0.28 cm(≈10×). **surge 박스 8→30 N에서 소수점까지 불변**(코너 명령 surge는
+  평균 0.9–1.4 N으로 박스 근처도 안 감, 발동 0.7%) → **authority가 아니라 참조 기하 문제**.
+  MPC는 preview+2차 비용으로 코너를 미리 돌아 안쪽으로 자르는(corner-cutting) **최적 절충**을
+  하는 것이지 고장이 아님. 파랑 하에선 박스도 일부 기여하나 코너·직선을 거의 같은 비율로
+  줄여(33% vs 37%) 코너 특유 효과가 아님; 박스가 실제 개선하는 건 코너 **직후 회복**.
+- **영향**: DOB-MPC는 직선이 0.6–1.3 cm로 거의 완벽해서 이 코너 바닥이 오차 예산을 지배하고
+  trajectory_compare 그림에서 유독 도드라진다(절대값으로는 3사 중 최소: gentle CDW 코너
+  PID 24.6 / MPC 13.2 / DOB 3.8 cm). 컨트롤러 튜닝으로는 제거 불가.
+- **줄이려면**: 참조 설계를 고칠 것 — 코너 필렛(원호/스플라인, 반경을 달성 가능 횡력과 yaw
+  슬루율에 정합) 또는 코너 감속 프로파일, 또는 yaw 슬루 상한 상향. 어느 쪽이든 벤치마크
+  정의가 바뀌므로 기존 기록과 비교 불가 → 사용자 판단 필요.
 
 ### heavy 회전 added mass = isotropic placeholder
 - `[0.12, 0.12, 0.12]`는 임시값 — 문헌 근거 약함(von Benzon 30–100% 오차 보고,

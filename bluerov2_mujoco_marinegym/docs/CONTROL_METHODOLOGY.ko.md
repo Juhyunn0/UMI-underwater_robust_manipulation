@@ -1011,3 +1011,280 @@ provenance의 **고정 reference fixture로 유지** — 삭제 시 8개 스크�
 `NU=4`/option-(b) surge→pitch 죽은 경로 + `test_dobmpc`의 rank-5 trim 단정 → 추후 NU=6-only로 정리
 (KNOWN_ISSUES 참조). 회귀: `test_load`, `test_controller`, `test_square_mission`, `test_hydro`, `test_thrusters`,
 `test_disturbances`, `verify_meta`, `test_heavy_gripper`, `test_heavy_c3` 전부 PASS.
+
+## 2026-07-23 — EAOB 현실적 센서 기준 재튜닝: 시그마 유도 공분산("perf" 프로파일) + 센서노이즈 주입; NIS 게이트는 구현 후 기본 OFF
+
+EAOB 튜닝에 대한 verify-first 리뷰(외부 리뷰의 주장을 코드에서 한 줄씩 검증 후 수정) 및 재튜닝.
+아래 수치는 전부 heavy 플랜트, seed 0, 20 Hz, `verify/verify_eaob.py` 실측.
+
+**(1) 진단 — 구 튜닝은 near-deadbeat이었고, 시뮬이 관측기에 무노이즈 진리값을 먹여줬기 때문에만 "동작"했다.**
+확인: marinegym 루프 어디에도 측정 노이즈가 없음(EAOB는 raw `xpos/xmat/mj_objectVelocity` + 클린 tick FD를
+받음; XML `<sensor>` 없음; disturbance 패키지는 힘만 교란). 공분산은 단위 무시 DT 템플릿(`Q_pose=R=DT⁴/4`,
+`Q_vel=Q_dist=DT²` — 미터·라디안·뉴턴에 같은 분산). hover에서 실제 (F,H)의 정상상태 Riccati 분석: 축별
+w-오차 시정수 6.8–13.4 ms(tau 채널 칼만 이득 −0.976…−0.999) = 사실상 한 틱 만에 재고정되는 deadbeat
+역동역학 디코더. 현실적 센서 노이즈가 있으면 그대로 `w_hat`에 통과된다.
+
+**(2) 재튜닝("perf" 프로파일, 이제 기본값).** `params.py`에 센서 시그마 블록
+(`EAOB_SIG_POS/ANG/LVEL/AVEL/ACC/AACC/ALLOC`)을 추가 — 시뮬 측 주입과 필터 R의 **단일 출처**. R은 채널별
+블록대각; tau 의사측정 노이즈는 가속도계 노이즈를 질량행렬로 통과시킨 `R_tau = M Σ_a Mᵀ + Σ_alloc` —
+N/N·m 스케일은 물리가 정하고 손튜닝 없음. `q_dist`는 스칼라 정상상태 역산 `K = 1−exp(−DT/τ_dist)`,
+`q = diag(R_tau)·K²/(1−K)` — **`EAOB_TAU_DIST`(0.2 s, (3)의 반복 참조)가 유일한 노브**. 구 튜닝은
+`profile="verify"`로 보존(무노이즈 배선 점검용, byte-identical 구성). `DOBMPCController`가 같은 시그마로
+EAOB의 eta/nu/nudot에 가우시안 노이즈를 주입(`meas_noise`, perf에서 기본 ON; MPC는 여전히 클린 플랜트
+상태를 소비 — 관측기를 격리 평가). run meta에 `controller.eaob = {profile, meas_noise, noise_seed,
+tau_dist, gate, n_upd, n_gated}` 기록 — 이 키가 없는 기록은 verify/deadbeat + 클린 측정과 동등;
+**이 경계를 넘어 dobmpc 결과를 합산하지 말 것**(2026-07-22 이전 sweep 전부가 경계 이전).
+
+**(3) 검증 + τ_dist 반복(`verify/verify_eaob.py`: w_true = 클린 상태에서의 모델 잔차 M·a+C+D+g−τ,
+hydro의 독립 `diag_wtrue` 진단과 교차검증 — 둘이 ≤0.08 N 일치).** 초기 설계점 0.5 s는 w_dot=0 모델이
+유효한 곳(DP CD: NIS 14.8 PASS)만 통과하고 파랑에서 실패(DP CDW: NIS 25.4, NEES 77 — 파랑 대역이 w 랜덤워크를
+앞지름). 단일 노브 반복, 게이트 OFF(DP CDW, T=60 s, seed 0): τ = 0.5 / 0.3 / **0.2** / 0.1 →
+NIS 25.4 / 19.8 / **17.1** / 14.8, NEES 77 / 26.1 / **15.0** / 11.5, w-RMSE_X 1.11 / 0.74 / **0.55** / 0.48 N.
+**기본값 τ_dist = 0.2 s** — CDW에서 두 범위를 모두 통과하는 유일한 값; CD에선 NIS 14.4 PASS,
+RMSE X/Y/Z 0.29/0.41/0.48 N. CD NEES ~9(보수적, 안전한 방향)는 R/Q가 이상적 시뮬에 없는 실기체 항
+(할당 오차, 프로세스 플로어)을 의도적으로 모델링하기 때문 — 줄이면 로봇이 아니라 시뮬에 맞추는 것이라 유지.
+저속 외란 전용 실험은 τ를 올려도 됨(τ≈2 s면 CD RMSE 다시 절반, 대신 파랑 lag). 측정 주의: 초기 스윕 하나가
+실수로 게이트 ON 상태로 돌아 NIS가 크게 부풀려짐(τ 0.5→0.05에서 137/67/43/27) — 기각이 필터를 굶기고 다음
+혁신을 키우는 피드백 아티팩트; 일관성은 반드시 게이트 OFF로 측정. 운동상관 진단: 최종 구성에서 잔차 vs |nu|
+기울기 ≈ 0, |r| ≤ 0.18(모델 오차 누출 없음; CDW의 작은 Z/M 상관은 파랑동조 운동이지 drag 미스매치 아님).
+square의 코너 NIS 스파이크는 psi/r 채널 지배 — placeholder 회전 added mass와 정합.
+
+**(4) χ² innovation 게이트: 구현·실측 후 기본 OFF.** `update()`가 매 틱 NIS를 계산(`last_nis`,
+`last_zscore`, `n_gated`)하고 χ²(0.999,18)=42.31에서 프레임 기각 가능(`params.EAOB_GATE_ON`). 폐루프
+A/B(square 2랩, seed 0)가 기본값으로는 부적합함을 확정: 파랑 대역 + 코너 기동이 w_dot=0을 **상시적으로**
+위반하므로 일관성 게이트가 프레임의 25–76%를 기각해 외란을 추종하는 바로 그 업데이트를 차단 —
+CDW radRMS 4.53→15.45 cm(게이트 off→on), CD 1.35→1.43 cm(τ=0.5 기준; 최종 τ=0.2에선 같은 시나리오에서
+게이트 발동 0/1067 — 무해하지만 무용). 모든 파랑을 이상치로 부르는 모델 아래에서 게이트는 "스파이크"와
+"파랑"을 구분할 수 없다; 스파이크 방어는 per-axis `W_HAT_CLIP`(KNOWN_ISSUES, 미해결) 몫.
+
+**(5) 정직한 수치의 비용(최종 구성: perf, 노이즈 ON, τ=0.2, 게이트 OFF; 2랩 square / 60 s DP, seed 0).**
+DP C 모드: 현실적 센서에서도 DOB-MPC의 헤드라인 DC 제거 유지 — dc 오프셋 (−0.11, −0.01) cm, radial RMS
+0.33 cm, vs 일반 MPC +2.13 cm(구 0.00 cm는 무노이즈 허구였음). square: CD 1.02(verify, 클린) → 1.21 cm,
+CDW 3.09 → 3.51 cm — vision급 센싱의 정직한 비용은 ≈0.2–0.4 cm. 회귀:
+`test_frames`/`test_predictor`/`test_eaob_no_accel_doublecount` 새 기본값에서 PASS;
+`test_casadi_matches_numpy`는 기존 실패(NU=4 전제, KNOWN_ISSUES 추적).
+
+## 2026-07-23 (2) — MPC 상태 입력을 플랜트 진리값에서 EAOB 추정치로 전환 (mpc_state_source)
+
+오전 재튜닝이 남긴 정직한-평가 공백을 닫는다: NMPC가 이제 클린 플랜트 상태 대신 EAOB의 eta_hat/nu_hat을
+소비한다(dobmpc 모드, perf 프로파일 기본). verify-first 프로토콜; 수치는 전부 seed 0,
+`verify/verify_state_source.py`.
+
+**(1) 스위치(단일 지점, 유일성 증명).** `_control_step`의 `x_ned`는 소비처가 정확히 하나(`nmpc.solve`)인
+지역 변수 — 감사 결과 다른 NMPC 상태 유입 경로 없음. `mpc_state_source="estimate"`면 솔버 x0과
+yaw 참조 앵커 `_psi_ned_now`가 함께 추정치를 따른다(둘은 같은 branch여야 함: NMPC 비용에는 각도 wrap이
+없고 참조는 매 틱 `_psi_ned_now`에 재앵커). 나머지는 전부 계약상 플랜트 읽기 유지: EAOB 자신의 측정
+(meas/a_meas/_nu_prev_ned), `_read_state`(verify_eaob가 클린 진리값으로 의존), 모든 로깅 표면
+(recorder/mission/run_compare/run_viewer/eval_dp/teleop은 `data.*` 직접 읽음). 기본값: mode="dobmpc"이고
+profile="perf"일 때만 "estimate"(params.MPC_STATE_SOURCE); 일반 "mpc"는 관측기가 없고 verify 프로파일은
+배선 점검이라 둘 다 "truth". run meta에 `controller.mpc_state_source` 기록(키 부재 = truth;
+ref_preview·eaob에 이은 세 번째 provenance 키).
+
+**(2) yaw 연속성엔 unwrap 누산기가 필요 없었다.** EAOB yaw 상태가 이미 연속 신호이고(적분만 되고 재wrap
+없음; innovation만 wrap), 두 솔버 모두 yaw/위치 bound가 없어(acados idxbx=[3,4,6,7,8]; IPOPT는
+roll/pitch/|v|만) 멀티랩 누적 yaw(2랩 ≈ 4π)가 안전 — 실측: 전 런에서 틱당 |Δpsi_hat| ≤ 0.12 rad
+(branch 점프면 ~6.3). 부수 이득: 추정 경로는 RTI warm start가 매 ±π 교차마다 보던 측정 yaw 점프를
+없앤다. 스타트업 워밍업도 불필요: EAOB가 첫 읽기값에서 lazy-init하므로 추정치가 정확히 진리값에서 출발
+(모든 A/B 쌍에서 startup max radial이 초기 오프셋과 동일).
+
+**(3) A/B 결과 (perf+노이즈, τ_dist=0.2, seed 0; 60 s DP / 2랩 square; truth → estimate).** 튜닝이 검증된
+해상 상태(Hs 0.75/Tp 12) 기준: DP C 0.33→1.46 cm(dc −0.11→−0.45), CD는 C와 동일; DP CDW 1.51→2.22 cm;
+square C 1.20→1.88, CDW 3.51→3.92 cm. 관측기 건강도는 루프 폐합에 무영향(DP CDW NIS 17.1→16.8,
+NEES 15.0→14.5 — 전부 PASS; truth 행은 오전 verify_eaob 수치를 정확히 재현). chatter(틱당 Σ|ΔF| 평균):
+DP C 0.71→1.18 N(추정 지터 유입, +66%)이지만 square CDW는 2.43→1.32 N — 관측기가 기동 중 상태 필터
+역할을 해 추종을 약간 내주고 명령을 매끈하게 만든다; 포화 0, n_fail 0, 전 런 유한. 수용 기준 PASS
+(estimate NIS 14–24, NEES ≤ 24; C/CD의 ~9 NEES는 문서화된 보수적 방향이라 비게이팅 보고).
+
+**(4) 검증 중 발견 — 현재 base.yaml 해상 상태는 소스와 무관하게 CDW 일관성을 깬다.** config/base.yaml의
+파랑 블록이 2026-07-23 19:28에 강화됨(Hs 0.75→1.2 m, Tp 12→6 s, γ 5→2, s 30→10, ω_max 1.6→3.0): 그 아래서
+CDW NIS = 80(truth)/71(estimate) (DP), 44/42 (square), radRMS 9.6→10.1 / 15.7→17.5 cm — w_dot=0 +
+τ_dist=0.2 관측기가 새 파랑 대역을 못 쫓아간다. 이는 상태 소스 전환과 직교(두 소스가 동일하게 실패;
+구파랑 A/B는 전부 통과)하며 KNOWN_ISSUES에 등재; 새 해상 상태용 τ_dist 재튜닝(또는 harmonic-EAOB)은
+이 과제 밖의 인간 결정 사항.
+
+## 2026-07-23 (3) — DOB 플러그인 구조: NMPC x0 = state-estimator 출력("meas"), EAOB는 w_hat만 넘김
+
+오전의 상태-소스 전환을 고전 DOBC 토폴로지로 재정립(control-theory-advisor 상담, P1, journal 2026-07-23):
+EAOB는 순수 disturbance 플러그인이 되고 — 필터된 eta_hat/nu_hat은 컨트롤러가 더 이상 쓰지 않으며 NMPC x0는
+state estimator에서, w_hat만 EAOB→MPC로 건너감. Endgame 근거: diffusion policy가 SLAM/AI estimator를
+관측하므로 트래커 x0도 같은 estimator를 공유해야 하고(플래너/트래커 상태 일치), 그러면 "MPC vs DOB-MPC"가
+w_hat 단일 변수로만 갈림.
+
+**(1) 스위치(`params.MPC_STATE_SOURCE`, 이제 3-way).** `"meas"`(노이즈 활성 시 mpc·dobmpc 공통 새 기본값) =
+루프가 실제로 가진 estimator 출력: 시뮬에선 클린 읽기 + 가우시안 센서노이즈(EAOB가 먹는 것과 같은 틱 샘플,
+params.EAOB_SIG_*), 하드웨어에선 SLAM/AI-model 추정치. `"estimate"`(2026-07-23 (2) 기본값, 이제 opt-in) =
+EAOB 필터 상태(offset-free-MPC 스타일). `"truth"` = 클린 플랜트(회귀/관측기 격리; 무노이즈 경로). 한 샘플이
+EAOB 측정과 x0에 함께 들어가고, yaw 참조 앵커도 선택 소스를 따름. 일반 mpc도 이제 noisy x0 소비(기존 truth) —
+mpc/dobmpc 비교를 단일변수로 만들기 위한 의도적 변경; mpc 베이스라인이 그만큼 이동(run meta
+`controller.mpc_state_source`가 경계, 키 부재 = truth).
+
+**(2) A/B 결과 — 안정적이나 raw-노이즈 x0는 chatter 대가가 큼(advisor 예측의 정량화).** perf+노이즈,
+τ_dist=0.2, seed 0, 구파랑(Hs 0.75/Tp 12 — base.yaml 파랑 이슈와 분리), truth → meas → estimate:
+
+| 시나리오 | radRMS [cm] | effF [N] | chatF [N/tick] | NIS |
+|---|---|---|---|---|
+| dp C | 0.33 / 1.44 / 1.46 | 3.0 / 8.3 / 3.4 | 0.71 / **10.89** / 1.18 | 14.4 / 14.9 / 14.4 |
+| dp CDW | 1.51 / 2.58 / 2.22 | 5.2 / 10.0 / 5.6 | 0.88 / **10.66** / 1.32 | 17.1 / 18.5 / 16.8 |
+| square C | 1.20 / 2.06 / 1.88 | 4.6 / 9.5 / 4.6 | 1.19 / **11.81** / 1.18 | 15.5 / 17.3 / 15.4 |
+| square CDW | 3.51 / 3.98 / 3.92 | 7.5 / 11.4 / 6.9 | 2.43 / **12.02** / 1.32 | 20.1 / 22.9 / 17.9 |
+
+추종(radRMS)은 소스 간 사실상 동일(meas ≈ estimate)하지만 "meas" chatter는 **truth의 9–15배**, "estimate"의
+~9배, 제어노력은 ~2–3배: MPC가 5 cm/tick @ 20 Hz 위치 지터를 직접 쫓음. 발산 없음 — 유한, 포화 0, n_fail 0,
+EAOB yaw 연속(max |Δψ̂| ≤ 0.08 rad; "meas"는 "estimate"가 유일하게 매끈히 하던 ±π 측정yaw warm-start 과도를
+재도입하나 RTI가 흡수). "meas"의 NEES가 기동에서 24를 근소 초과(square C/CD 24.3/24.4; CDW 46.5 — 단 truth도
+30.8이라 이는 알려진 파랑 한계) — chatter가 플랜트를 통해 추정 잔차로 되먹임.
+
+**(3) 해석 — "상태 스무딩을 누가 소유하나"에 대한 실증적 답.** raw noisy estimator로 플러그인하는 것은
+하드웨어 정직한 토폴로지가 맞지만 큰 액추에이터 chatter 세금을 문다; EAOB 필터 "estimate"는 동일 추종을
+truth 수준 chatter로 냄 — 그 자체가 상태 필터이기 때문. advisor대로: 실기에선 SLAM+IMU 융합이 스무딩을
+소유하며(융합 출력 ~1–2 cm 유색, 시뮬의 5 cm 백색 @ 20 Hz보다 훨씬 온화), 시뮬 "meas"는 비관적. 이것은
+의도된 임시 출발점(estimator를 SLAM/학습모델 중 미정인 동안 사용자 선택); 완화책(EAOB·MPC 양쪽에 공급하는
+SLAM-proxy KF, MPC rate weight, 또는 "estimate" 복귀)은 별도 인간 결정이라 여기서 적용 안 함. EAOB 튜닝
+(R/Q/P0/τ_dist)은 제약대로 불변.
+
+## 2026-07-24 — 센서 노이즈 시그마를 추종오차 아래로 축소 ("meas" x0 chatter 진정)
+
+2026-07-23 (3) 플러그인 전환의 후속: `mpc_state_source="meas"`에서 raw x/y 5 cm(1σ) 위치 노이즈가 폐루프
+추종오차(~1.2 cm)보다 컸기에 MPC가 자기 측정 지터를 쫓음(chatter 9–15배). `params.EAOB_SIG_*`(pose/vel
+채널만)를 좋은 visual-inertial/SLAM+DVL+depth 스택 값으로 축소: x/y **0.5 cm**, z 0.3 cm, 자세 0.3°(yaw 0.5°),
+선속도 0.5 cm/s, 자이로 0.11°/s. 이제 위치 노이즈 ≈ 추종오차의 0.4배. `ACC/AACC/ALLOC`(외란 의사측정 →
+R_tau, q_dist)는 불변이라 w_hat 품질 보존(verify_eaob CD w-RMSE 0.24/0.34/0.39 N, 구노이즈 0.29/0.41/0.48보다
+오히려 약간 좋음). `EAOB_SIG_*`가 주입·R 단일 출처라 R도 함께 줄어 필터는 설계상 일관/보수적 유지.
+
+**A/B (gentle 해상, seed 0, truth → meas → estimate; 5 cm → 0.5 cm):**
+
+| 시나리오 | radRMS [cm] | chatF [N/tick] (meas) |
+|---|---|---|
+| dp C | 0.22 / 0.26 / 0.31 | 10.89 → **1.76** (truth 0.70) |
+| square C | 1.13 / 1.20 / 1.16 | 11.81 → **2.91** (truth 1.19) |
+| square CDW | 3.19 / 3.26 / 3.26 | 12.02 → **3.08** (truth 1.93) |
+
+"meas" 추종이 이제 truth 수준(이전 4–5배 악화), DC 편향 누출 사라짐, chatter는 truth-x0의 ~2–3배(이전 ~15배).
+상태추정 오차 pose ~1.6 mm / vel ~2.7 mm/s로 감소. 일관성: NIS/NEES가 ~13/9(목표 ~18 아래) — **안전·보수적**
+방향(필터가 자기를 과소신뢰; 과신은 절대 아님). verify 게이트(verify_eaob, verify_state_source)를 **과신만**
+(값 ≤ 24) 게이팅하도록 변경, 하한은 보수적으로 보고 → 저노이즈 config가 더 이상 헛되이 FAIL 안 함. run meta에
+`controller.eaob.sig_pos_xy`(0.005) + `mpc_state_source` 기록 — 5 cm 시절 meas-noise 기록(내부 A/B 뿐)과 구분.
+주의: 극단적 정밀 DP hold에선 truth 오차(0.22 cm)가 0.5 cm 노이즈보다 작음; "추종오차보다 작게" 목표는 운영
+square 미션(~1.2 cm)에서 충족. 더 낮추길(0.25 cm) 원하면 chatter를 truth floor까지 내릴 수 있음(센서 스펙 선택).
+
+## 2026-07-24 (2) — PID도 MPC와 동일한 noisy 상태를 소비 (apples-to-apples 비교)
+
+지금까지 compare sweep은 PID에 **ground-truth** 상태(`data.xpos/xmat/qvel`, 500 Hz)를 주고 MPC/DOB-MPC만
+**noisy 20 Hz** 추정치(`mpc_state_source="meas"`)로 돌렸다. 이 비대칭이 모든 PID-vs-MPC 수치를 confound시켰다 —
+2026-07-24 wave sweep 분석에서 "C/CD 격차가 state 노이즈 때문이 아니다"를 *간접적으로*(NONE 대조군 + DOB-MPC
+반사실) 증명해야 했던 이유가 바로 PID만 더 좋은 입력을 몰래 받았기 때문이다. 새 `PoseController(meas_noise,
+noise_seed)`가 이 간극을 닫는다: `meas_noise` ON이면 PID가 보는 상태는 MPC x0가 먹는 것과 **동일한** 가우시안
+센서 모델(`params.EAOB_SIG_*`: pose 0.5 cm / z 0.3 cm, 자세 0.3°/yaw 0.5°, 선속도 0.5 cm/s, gyro 0.11°/s)로
+오염되며, **제어틱(20 Hz)에서 샘플링·ZOH 홀드**된다 — 그래서 PID와 (DOB-)MPC는 동일하게 열화된 추정치를 먹고
+**오직 제어법칙만** 다르다. noisy 자세는 full R로 재구성(`_R_from_rpy`, yaw/pitch/roll 추출의 정확한 역함수)해서
+각도 읽기와 힘 회전 `R.T` 모두 추정 자세를 일관되게 쓴다. `meas_noise`는 MPC가 이미 갖던 두 결합 효과(가우시안
+노이즈 + 20 Hz 샘플링 지연)를 함께 포함한다. 로그되는 truth(`px,py`)와 radial-RMS 지표는 항상 plant에 붙어 있어
+지표는 여전히 **참** 추종오차를 잰다.
+
+기본값 `params.PID_STATE_SOURCE = "meas"`(`MPC_STATE_SOURCE`와 대칭)라 sweep은 기본적으로 apples-to-apples;
+`"truth"`는 opt-in clean-state baseline. 인터랙티브/eval 도구(teleop, eval_dp)는 `meas` 상속(이미 noisy한
+자기 MPC와 일관), 결정론적 제어법칙 회귀 4개(test_controller/test_square_mission/test_heavy_gripper/
+test_heavy_c3)는 `meas_noise=False` 고정 → clean state에서 제어법칙을 검증. run meta에 `controller.meas =
+{state_source, noise_seed, sig_pos_xy}` 기록(키 없으면 truth); **이 날짜 이전 PID 기록은 truth 상태라 새 meas
+기록과 비교 불가** — 비교하려면 sweep 재실행.
+
+**A/B (heavy, seed 0, 3-lap square, truth → meas x0):**
+
+| ctrl / mode | radRMS [cm] | dc [cm] | slew Σ\|dU\| [N/tick] |
+|---|---|---|---|
+| pid  NONE truth | 1.49 | 0.08 | 0.85 |
+| pid  NONE meas  | 1.47 | 0.10 | 3.27 |
+| pid  C    truth | 1.61 | 0.08 | 0.85 |
+| pid  C    meas  | 1.58 | 0.10 | 3.24 |
+| mpc  C   (meas) | 3.17 | **2.87** | 11.1 |
+
+핵심 결과가 이제 추론이 아니라 **직접** 보인다: 동일한 noisy 20 Hz 상태를 먹어도 PID는 C모드 DC offset을
+~0.1 cm로 유지(적분기가 영평균 노이즈를 평균화)하는 반면 nominal MPC는 2.87 cm — 즉 C/CD 격차는 **적분 작용
+부재**이지 상태 품질이 아니다. noisy 상태의 비용은 커맨드 chatter뿐(slew ×3.8, 그래도 MPC보다 낮음 — PID의
+120 N/s slew 리미터가 20 Hz 노이즈 스텝을 사실상 필터링); radRMS·offset은 거의 불변. `pid/NONE/truth`는 기록된
+sweep의 `radial_max` 4.402 cm를 바이트 단위로 재현 → `meas_noise=False`가 변경 전 경로와 정확히 동일함을 확인.
+검증: `_R_from_rpy` round-trip 4e-16; 주입 σ 실측 5.24 mm / 4.82 mm·s⁻¹ / 0.482°(타깃 5/5/0.5); refresh
+주기 25 서브스텝(20 Hz), 틱 내 홀드.
+
+## 2026-07-24 (3) — NMPC surge 입력 박스 8 → 30 N (heavy): 벤치마크가 like-for-like가 아니었다
+
+대칭-state sweep에서 "강파랑=PID 승, 약파랑=MPC 승"이 나온 원인을 추적한 결과, 제어이론적 성질이 **아니라**
+NMPC 자신의 하드 입력 박스였다. heavy(rank-6)에서 `params.U_MAX`가 `[8, 30, 30, 8, 8, 10]` — **surge만 8 N인데
+PID의 `f_max`는 전 축 30 N**, 즉 3.75× 핸디캡. 8 N은 rank-5 유물이다: bluerov2에선 surge→pitch 커플링
+`My = −0.0725·Fx`가 Fx ≈ 15 N에서 sin θ = 1을 넘겨 전복시키므로 실재하는 물리 한계지만, heavy에선 수직
+스러스터 4개가 그 커플링을 상쇄한다. 기존 주석은 8 N을 "like-for-like compare를 위해" 유지한다고 적었으나
+**정반대**였다. PID 쪽 동일 유물(surge 6 N cap)은 2026-07-03 pole-placement 때 이미 제거됨("ωn을 ≤0.54로
+묶는다"). MPC 쪽만 남아 있었다.
+
+**영향 크기**(storm CW, 10 lap × 4 페어드 헤딩, 런타임 박스 오버라이드, 나머지 전부 동일):
+
+| | PID | MPC box 8 N | MPC box 30 N |
+|---|---|---|---|
+| storm  | 26.32 | 30.55 (박스 물림 60–66%) | **17.72** (0.7–1.8%) |
+| gentle | 12.51 | 8.50 (5–9%) | 7.64 (0.2–0.3%) |
+
+박스는 **storm에서 20 Hz 틱의 60%(dobmpc 75%), gentle에선 7%** 물렸다 — **진폭 의존적** 스로틀이며, 그래서
+*같은* 주파수 대역인데도 해상상태에 따라 우열이 뒤집혔다(0.85–2.30 rad/s MPC/PID 오차비 storm 1.38 → gentle
+0.51; LTI 대역폭 논리로는 불가능). 박스를 풀자 storm PID−MPC가 **−4.24 → +8.60 cm**로 바뀌고 gentle은 거의
+불변(+4.01 → +4.87) — 즉 **"강파랑=PID 승" crossover 전체가 이 제약 하나였다**. 기존 `sat_freq` 지표는 이걸
+못 잡는다(전 구간 0.0000) — 8 N은 스러스터 포화가 아니라 소프트웨어 한계이기 때문.
+
+**적용**: heavy `U_MAX = [30, 30, 30, 8, 8, 10]`; rank-5 분기는 8 N 유지(커플링이 실재). 재빌드된 솔버로 검증
+(storm/gentle CW, 10 lap × 3 페어드 헤딩):
+
+| 해상상태 | PID | MPC | DOB-MPC | max 스러스터 | sat_freq |
+|---|---|---|---|---|---|
+| storm  | 26.14 | **17.86** (이전 28.82) | **7.30** (이전 17.36) | 40.3 N | 0.0000 |
+| gentle | 11.56 | **7.63** (이전 9.51)   | **1.87** (이전 3.14)  | 36.1 N | 0.0000 |
+
+이제 MPC가 **양단 모두 승**(PID−MPC storm +8.28, gentle +3.93) — crossover 소멸 — 이고, 가장 authority에
+굶주렸던 **DOB-MPC가 가장 크게 개선**(storm 2.4배). 물리 포화는 여전히 없음: 스러스터 피크 40.3 N vs T200
+`ctrlrange` −51.6…+64.1 N. 고정 헤딩에선 30 N 박스가 오히려 피크 스러스터를 **낮춘다**(36.1 vs 36.9 N) —
+authority가 충분하면 8 N 박스가 유발하던 뒤늦은 과격 보정이 사라지기 때문. `verify_acados` 통과(acados↔IPOPT
+max|Δu| 0.0615 N < 0.25 게이트, 1.04 ms, n_fail=0), 폐루프 n_fail ≈ 1/5334틱로 변화 없음.
+
+**기록 경계**: run meta에 `controller.u_max` 기록 시작(run_compare + teleop 매니페스트, 라이브 솔버에서 읽음).
+**키가 없으면 낡은 8 N**. 이 날짜 이전 모든 mpc/dobmpc 기록(20260724 sweep 포함)은 8 N 하에서 측정된 것이라
+새 기록과 합산 금지 — 특히 그 기록으로 **"강파랑에서 PID가 MPC보다 낫다"고 인용하면 안 된다(아티팩트)**.
+full sweep 재실행은 대기 중(KNOWN_ISSUES).
+
+**박스와 무관하게 살아남는 진짜 결론**: MPC의 오차 PSD는 **모든** 해상상태에서 0.7 rad/s 아래 전 주파수에서
+PID보다 3–8배 낮다 — Fossen 모델 + 3 s reference preview 덕분이며, 무외란 NONE에서 이기는 이유와 같다
+(1.089 vs 1.492 cm). 그리고 정상류 C 모드에서 nominal MPC는 적분 작용이 없어 2.70 cm 하류로 밀린 채 유지된다
+(PID 0.03 cm) — DOB-MPC의 `w_hat`이 메우는 격차. **미확립**: 이 crossover가 *주파수* 현상이라는 주장 —
+사다리가 Hs와 Tp를 함께 바꾸고(corr(log Hs, log ω_p)=0.967) γ·s까지 공변해서 회귀로 분리 불가(공선인 γ를
+대입하면 순위가 뒤집히고, 6 rung만으로는 Hs 계수가 유의하지 않음 p=0.22). 회귀 대신 ablation으로 결판냈다.
+
+## 2026-07-28 — 보고되는 모든 RMS를 하나의 steady window로 통일 (궤적 박스 == 막대그래프)
+
+**같은** 100개 런에서 나온 두 그림이 서로 다른 숫자를 말했다: `bar_square_radial_rms.png`는 PID/CDW를
+**18.6 cm**로, `trajectory_compare_CDW.png`의 박스는 **18.2 ± 2.4 cm**로 적었다. 어느 쪽도 계산 오류가 아니라
+**창(window)이 달랐다**. `metrics()`는 steady window(`t ≥ experiment.settle_s` = 10 s, 런의 절반으로 clamp)에서
+점수를 매기고 그 값이 `results.csv` / `results_raw.csv` / 모든 막대로 간다. 반면 궤적 패널은 `runs/traj_*.csv`를
+다시 읽어 **전체 구간**으로 계산했다. square 런은 참조 위에서 오차 ≈ 0으로 출발하므로, 그 초기 10 s —
+266.7 s 기록의 3.7 %(196 / 5268 샘플) — 가 나머지보다 훨씬 조용해서 pooled RMS를 끌어내린다:
+
+| 컨트롤러 (CDW) | 초기 10 s | 10 s 이후 | pooled (이전 박스) | steady (막대) |
+|---|---|---|---|---|
+| PID | 4.47 | 18.57 | 18.24 | **18.57** |
+| MPC | 6.13 | 10.69 | 10.55 | **10.69** |
+| DOB-MPC | 1.92 | 2.62 | 2.60 | **2.62** |
+
+**적용**: 창을 한 곳에서만 정의한다 — `run_compare.steady_mask(t, settle_s)` (+ `experiment.settle_s`를 읽는
+유일한 지점 `settle_start(cfg)`) — 그리고 `metrics()`와 `_draw_traj_panel`이 **둘 다** 이걸 호출한다. `settle`을
+`fig_trajectory_compare` / `fig_trajectory_allmodes` / `fig_xwave_trajectory`로 전달하고, 모든 그림이 캡션에
+자신의 창을 **명시**한다(`fig_bars`에 `note=` 각주 추가, 궤적 범례는 "lines = all laps · boxed RMS =
+steady-window radial RMS (t ≥ 10 s, same metric as the bar chart)"). 독립 실행 도구
+`experiments/plot_trajectories.py`도 같은 마스크를 `--settle` 플래그로 미러링 — `run_compare`의 `runs/` 폴더를
+가리키면 제3의 숫자가 아니라 그 런의 `results.csv` 값을 그대로 재현한다. 궤적 **선**은 여전히 전체 런을 그린다;
+바뀐 건 점수 매기는 구간뿐.
+
+**검증**(시뮬 재실행 없음): `20260727/compare_20260727_000850/wave01_moderate`의 기존 per-run CSV만으로 그림을
+다시 렌더 — 15개(5 모드 × 3 컨트롤러) 박스 값이 전부 `results_raw.csv`와 ≤ 1.6e-6 cm 이내 일치(그 CSV의
+`%.5f` m 기록 정밀도가 바닥). `plot_trajectories`로 단일 런을 뽑으면 17.26 / 10.88 / 2.79 cm — 해당 런의 기록값과
+동일. `--smoke` 전체 파이프라인 정상.
+
+**기록 경계**: 기록된 숫자는 하나도 안 움직인다 — `results.csv`, `results_raw.csv`, `results_all_waves.csv`,
+막대그래프는 원래부터 steady-window 지표였고 그대로다. 바뀐 것은 **궤적 그림의 박스**뿐. 이 날짜 **이전**에
+생성된 그림의 박스는 full-run RMS라 대응 막대보다 ~1–2 % 낮으니, 캡션("full-run radial RMS (all laps)")을
+확인하거나 다시 생성할 것.

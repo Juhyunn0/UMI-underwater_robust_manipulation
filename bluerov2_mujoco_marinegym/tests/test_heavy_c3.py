@@ -124,7 +124,7 @@ def test_allocation_and_pid_hold():
     import controller as C
     hy = H.Hydrodynamics(m).install()
     ctl = C.PoseController(m, mode="pid", setpoint=(0.0, 0.0, 0.0), yaw_ref=0.0,
-                           buoyancy_ff=hy)
+                           buoyancy_ff=hy, meas_noise=False)   # clean leveling regression
     d.qpos[:3] = [0.3, 0.2, -0.2]
     mujoco.mj_forward(m, d)
     for _ in range(int(20.0 / m.opt.timestep)):

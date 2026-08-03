@@ -1128,3 +1128,310 @@ break 8 scripts. **Deferred** (per user): the dobmpc `NU=4`/option-(b) surge→p
 rank-5 trim assertions, to be collapsed to NU=6-only later (see KNOWN_ISSUES). Regression: `test_load`,
 `test_controller`, `test_square_mission`, `test_hydro`, `test_thrusters`, `test_disturbances`, `verify_meta`,
 `test_heavy_gripper`, `test_heavy_c3` all PASS.
+
+## 2026-07-23 — EAOB retuned for realistic sensors: sigma-derived covariances ("perf" profile) + sensor-noise injection; NIS gate built but default-off
+
+Verify-first review of the EAOB tuning (external review claims checked line-by-line against this repo before
+any edit), then a retune. Everything below was measured on the heavy plant, seed 0, 20 Hz, `verify/verify_eaob.py`.
+
+**(1) Diagnosis — the old tuning was near-deadbeat, and only "worked" because the sim feeds the observer
+noise-free ground truth.** Confirmed: no measurement noise exists anywhere in the marinegym loop (the EAOB gets
+raw `xpos/xmat/mj_objectVelocity` + a clean tick FD as `nudot`; no `<sensor>` elements; the disturbance package
+perturbs forces only). The covariances were unit-blind DT templates (`Q_pose=R=DT⁴/4`, `Q_vel=Q_dist=DT²`,
+`R = 1.5625e-6·I₁₈` — the same variance for a meter, a radian and a Newton). Steady-state Riccati analysis of
+the real (F,H) at hover: per-axis w-error time constants 6.8–13.4 ms (tau-channel Kalman gains −0.976…−0.999),
+i.e. the disturbance state re-locks in ~one tick — a deadbeat inverse-dynamics decoder, not a filter. Under any
+realistic sensor noise it would pass that noise straight into `w_hat`.
+
+**(2) The retune ("perf" profile, now the default).** `params.py` gains a single sensor-sigma block
+(`EAOB_SIG_POS/ANG/LVEL/AVEL/ACC/AACC/ALLOC`) that is the SINGLE SOURCE for both the sim-side injection and the
+filter R. R is block-diagonal per channel; the tau pseudo-measurement noise is the accelerometer noise pushed
+through the mass matrix, `R_tau = M Σ_a Mᵀ + Σ_alloc` — physics sets the N/N·m scale, no hand-tuning.
+`q_dist` comes from the scalar steady-state inversion `K = 1−exp(−DT/τ_dist)`, `q = diag(R_tau)·K²/(1−K)`, so
+**`EAOB_TAU_DIST` (0.2 s, see the iteration in (3)) is the only tuning knob**. The old tuning survives as `profile="verify"`
+(wiring checks with clean measurements; byte-identical construction). `DOBMPCController` injects Gaussian noise
+from the same sigmas into the EAOB's eta/nu/nudot (`meas_noise`, ON by default with perf; the MPC still consumes
+the clean plant state, so the observer is evaluated in isolation). Run meta records
+`controller.eaob = {profile, meas_noise, noise_seed, tau_dist, gate, n_upd, n_gated}` — records without this key
+are verify/deadbeat + clean-measurement equivalent; **don't pool results across this boundary** (all compare
+sweeps ≤ 2026-07-22 are pre-boundary).
+
+**(3) Validation + the τ_dist iteration (`verify/verify_eaob.py`: w_true = model residual M·a+C+D+g−τ at clean
+states, cross-checked against hydro's independent `diag_wtrue` diagnostic — the two agree to ≤0.08 N).** At the
+initial 0.5 s design point the perf profile passed only where the w_dot=0 model holds (DP CD: NIS 14.8 PASS) and
+failed under waves (DP CDW: NIS 25.4, NEES 77 — the wave band outruns the w random walk). Iterating the single
+knob, gate OFF (DP CDW, T=60 s, seed 0): τ = 0.5 / 0.3 / **0.2** / 0.1 → NIS 25.4 / 19.8 / **17.1** / 14.8,
+NEES 77 / 26.1 / **15.0** / 11.5, w-RMSE_X 1.11 / 0.74 / **0.55** / 0.48 N. **Default set to τ_dist = 0.2 s** —
+the only value passing BOTH ranges in CDW; in CD it gives NIS 14.4 PASS, RMSE X/Y/Z 0.29/0.41/0.48 N. CD NEES
+sits at ~9 (conservative, safe direction) because R/Q deliberately model real-hardware terms the ideal sim doesn't
+produce (allocation mismatch, process floors) — tuning them down would fit the sim, not the robot, so they stay.
+Slow-disturbance-only experiments can raise τ (CD RMSE halves again by τ≈2 s) at the cost of wave-band lag.
+Measurement caution: an early sweep accidentally run WITH the gate enabled reported wildly inflated NIS
+(137/67/43/27 for τ 0.5→0.05) — gate rejections starve the filter, which inflates the next innovations
+(a feedback artifact); filter consistency must be measured gate-off. Motion-correlation diagnostic: residual
+slopes vs |nu| ≈ 0 with |r| ≤ 0.18 everywhere in the final config (no model error leaking; the small CDW Z/M
+correlation is wave-coherent motion, not drag mismatch). Corner NIS spikes in square runs are dominated by the
+psi/r channels, consistent with the placeholder rotational added mass.
+
+**(4) Chi-square innovation gate: built, measured, and turned OFF by default.** `update()` now computes NIS
+per tick (`last_nis`, `last_zscore`, `n_gated`) and can reject frames at χ²(0.999,18)=42.31
+(`params.EAOB_GATE_ON`). Closed-loop A/B (square, 2 laps, seed 0) killed it as a default: the wave band + corner
+maneuvers violate w_dot=0 ROUTINELY, so a consistency gate rejects 25–76% of frames and blocks exactly the
+updates that track the disturbance — CDW radRMS 4.53→15.45 cm (gate off→on), CD 1.35→1.43 cm (measured at
+τ=0.5; at the final τ=0.2 the gate never fires in the same scenarios, 0/1067, so it is harmless but also
+useless). A gate cannot separate "spike" from "wave" under a model that calls every wave an outlier; anti-spike
+defense belongs to the per-axis `W_HAT_CLIP` (KNOWN_ISSUES, still open).
+
+**(5) What the honest numbers cost (final config: perf, noise on, τ=0.2, gate off; 2-lap square / 60 s DP,
+seed 0).** DP mode C: DOB-MPC keeps its headline DC rejection under realistic sensors — dc offset
+(−0.11, −0.01) cm, radial RMS 0.33 cm, vs plain MPC +2.13 cm (the old 0.00 cm was the noise-free fiction).
+Square: CD 1.02 (verify, clean) → 1.21 cm, CDW 3.09 → 3.51 cm — the honest price of vision-grade sensing is
+≈0.2–0.4 cm. Regression: `test_frames`/`test_predictor`/`test_eaob_no_accel_doublecount` PASS under the new
+default; `test_casadi_matches_numpy` fails pre-existing (NU=4 assumption, tracked in KNOWN_ISSUES).
+
+## 2026-07-23 (2) — MPC state input switched from plant truth to EAOB estimates (mpc_state_source)
+
+Closes the honest-evaluation gap left by the morning's retune: the NMPC now consumes the EAOB's eta_hat/nu_hat
+instead of the clean plant state (dobmpc mode, perf profile default). Verify-first protocol; all numbers seed 0,
+`verify/verify_state_source.py`.
+
+**(1) The switch (single point, provably unique).** `x_ned` in `_control_step` was a local with exactly one
+consumer (`nmpc.solve`, dobmpc_controller.py) — the audit found no other NMPC state entry. With
+`mpc_state_source="estimate"` the solver x0 AND the yaw-reference anchor `_psi_ned_now` both follow the estimate
+(they must share a branch: the NMPC cost has no angle wrapping and the reference re-anchors to `_psi_ned_now`
+every tick). Everything else stays on the plant readout by contract: the EAOB's own measurements
+(meas/a_meas/_nu_prev_ned), `_read_state` (verify_eaob depends on it as clean truth), and every logging surface
+(recorder/mission/run_compare/run_viewer/eval_dp/teleop all read `data.*` directly). Defaults: "estimate" iff
+mode="dobmpc" AND profile="perf" (params.MPC_STATE_SOURCE); plain "mpc" has no observer and verify-profile runs
+are wiring checks — both stay "truth". Run meta records `controller.mpc_state_source` (absent key = truth;
+2026-07-23+ = the third provenance key after ref_preview and eaob).
+
+**(2) Yaw continuity needed NO unwrap accumulator.** The EAOB yaw state is already the continuous signal (it is
+integrated, never re-wrapped; only innovations are wrapped) and NEITHER solver bounds yaw or position
+(acados idxbx=[3,4,6,7,8]; IPOPT bounds only roll/pitch/|v|), so a multi-lap accumulated yaw (2 laps ≈ 4π) is
+safe — verified: max per-tick |Δpsi_hat| ≤ 0.12 rad across all runs (a branch jump would be ~6.3). Side benefit:
+the estimate path removes the ±π measured-yaw jump the RTI warm start used to see each crossing. Startup needed
+no warm-up either: the EAOB lazy-inits AT the first reading, so the estimate starts exactly at truth (startup
+max radial identical to the initial offset in every A/B pair).
+
+**(3) A/B results (perf + noise, τ_dist=0.2, seed 0; 60 s DP / 2-lap square; truth → estimate).** Under the
+sea state the tuning was validated for (Hs 0.75/Tp 12): DP C 0.33→1.46 cm (dc −0.11→−0.45), CD identical to C;
+DP CDW 1.51→2.22 cm; square C 1.20→1.88, CDW 3.51→3.92 cm. Observer health is UNAFFECTED by loop closure
+(DP CDW NIS 17.1→16.8, NEES 15.0→14.5 — all PASS; truth rows reproduce the morning's verify_eaob numbers
+exactly). Chatter (mean Σ|ΔF| per tick): DP C 0.71→1.18 N (estimate jitter enters the loop, +66%) but square
+CDW 2.43→1.32 N — the observer acts as a state FILTER during maneuvers, trading a little tracking for a
+smoother command; no saturation, n_fail 0, all runs finite. Acceptance PASS (estimate NIS in 14–24, NEES ≤ 24;
+the ~9 NEES in C/CD is the documented conservative direction, reported non-gating).
+
+**(4) Discovered during validation — the CURRENT base.yaml sea state breaks CDW consistency for BOTH sources.**
+config/base.yaml's wave block was strengthened at 2026-07-23 19:28 (Hs 0.75→1.2 m, Tp 12→6 s, γ 5→2, s 30→10,
+ω_max 1.6→3.0): under it, CDW NIS = 80(truth)/71(estimate) on DP and 44/42 on square, radRMS 9.6→10.1 /
+15.7→17.5 cm — the w_dot=0 + τ_dist=0.2 observer cannot follow the new faster/bigger wave band. This is
+orthogonal to the state-source switch (both sources fail identically; the old-waves A/B passes everything) and
+is logged in KNOWN_ISSUES; retuning τ_dist (or harmonic-EAOB) for the new sea state is a deliberate human
+decision, not part of this task.
+
+## 2026-07-23 (3) — DOB plug-in architecture: NMPC x0 = the state-estimator output ("meas"), EAOB hands over only w_hat
+
+Reframes the morning's state-source switch to the classic DOBC topology, per the control-theory-advisor consult
+(P1, journal 2026-07-23): the EAOB becomes a PURE disturbance plug-in — its filtered eta_hat/nu_hat are no
+longer used by the controller; the NMPC x0 comes from the state estimator, and only w_hat crosses from the EAOB
+to the MPC. Endgame rationale: the diffusion policy will observe the SLAM/AI estimator, so the tracker's x0 must
+share that estimator (planner/tracker state consistency), and "MPC vs DOB-MPC" then differ ONLY by w_hat.
+
+**(1) The switch (`params.MPC_STATE_SOURCE`, now three-way).** `"meas"` (new default under noise, for BOTH mpc
+and dobmpc) = the estimator output the loop actually has: in sim the clean reading + Gaussian sensor noise (the
+SAME per-tick sample the EAOB consumes, params.EAOB_SIG_*); on hardware the SLAM / AI-model estimate. `"estimate"`
+(the 2026-07-23 (2) default, now opt-in) = the EAOB-filtered state (offset-free-MPC style). `"truth"` = clean
+plant (regression / observer isolation; also the no-noise path). One sample feeds both the EAOB measurement and
+the x0; the yaw-ref anchor follows the chosen source. Plain mpc now consumes the noisy x0 too (was truth) — a
+deliberate change so the mpc/dobmpc comparison is single-variable; the mpc baseline shifts accordingly (run meta
+`controller.mpc_state_source` marks the boundary; absent key = truth).
+
+**(2) A/B result — stable, but raw-noise x0 costs heavy chatter (advisor's prediction, quantified).** perf +
+noise, τ_dist=0.2, seed 0, old sea state (Hs 0.75/Tp 12 — isolates the switch from the base.yaml wave issue),
+truth → meas → estimate:
+
+| scenario | radRMS [cm] | effF [N] | chatF [N/tick] | NIS |
+|---|---|---|---|---|
+| dp C | 0.33 / 1.44 / 1.46 | 3.0 / 8.3 / 3.4 | 0.71 / **10.89** / 1.18 | 14.4 / 14.9 / 14.4 |
+| dp CDW | 1.51 / 2.58 / 2.22 | 5.2 / 10.0 / 5.6 | 0.88 / **10.66** / 1.32 | 17.1 / 18.5 / 16.8 |
+| square C | 1.20 / 2.06 / 1.88 | 4.6 / 9.5 / 4.6 | 1.19 / **11.81** / 1.18 | 15.5 / 17.3 / 15.4 |
+| square CDW | 3.51 / 3.98 / 3.92 | 7.5 / 11.4 / 6.9 | 2.43 / **12.02** / 1.32 | 20.1 / 22.9 / 17.9 |
+
+Tracking is essentially the SAME across sources (meas ≈ estimate radRMS), but "meas" chatter is **9–15× truth**
+and ~9× "estimate", and control effort ~2–3×: the MPC chases the 5 cm/tick @ 20 Hz position jitter directly.
+No divergence anywhere — finite, no saturation, n_fail 0, EAOB yaw continuous (max |Δψ̂| ≤ 0.08 rad; "meas"
+reintroduces the ±π measured-yaw warm-start transient that "estimate" uniquely smooths, but RTI absorbs it).
+NEES for "meas" marginally exceeds 24 in maneuvers (square C/CD 24.3/24.4; CDW 46.5, though truth is already 30.8
+there = the known wave-model limit) — the chatter couples back through the plant into the estimation residual.
+
+**(3) Interpretation — this is the "who owns the state smoothing" question, answered empirically.** The plug-in
+with a RAW noisy estimator is the correct hardware-honest topology but pays a large actuator-chatter tax; the
+EAOB-filtered "estimate" delivers identical tracking at truth-like chatter because it IS a state filter. Per the
+advisor: on real hardware the SLAM+IMU FUSION owns the smoothing (its fused output is ~1–2 cm colored, far less
+punishing than the sim's 5 cm white @ 20 Hz), so the sim's "meas" is pessimistic. This is the deliberate,
+temporary starting point (user-chosen while the estimator — SLAM vs learned model — is undecided); mitigation
+(a SLAM-proxy KF feeding both EAOB and MPC, MPC rate weights, or reverting to "estimate") is a separate human
+decision and was NOT applied here. EAOB tuning (R/Q/P0/τ_dist) untouched, as constrained.
+
+## 2026-07-24 — Sensor-noise sigmas reduced below the tracking error (tames the "meas" x0 chatter)
+
+Follow-up to the 2026-07-23 (3) plug-in switch: with `mpc_state_source="meas"` the raw x/y 5 cm (1σ) pose noise
+sat ABOVE the ~1.2 cm closed-loop tracking error, so the MPC chased its own measurement jitter (9-15× command
+chatter). Reduced `params.EAOB_SIG_*` (pose/vel channels only) to a good visual-inertial/SLAM+DVL+depth stack:
+x/y **0.5 cm**, z 0.3 cm, attitude 0.3° (yaw 0.5°), lin-vel 0.5 cm/s, gyro 0.11°/s. The pose noise now sits at
+~0.4× the tracking error. `ACC/AACC/ALLOC` (the disturbance pseudo-measurement → R_tau, q_dist) are UNCHANGED,
+so w_hat quality is preserved (verify_eaob CD w-RMSE 0.24/0.34/0.39 N, if anything slightly better than the
+0.29/0.41/0.48 at the old noise). Because `EAOB_SIG_*` is the single source for BOTH the injection and the perf
+filter R, R shrinks with the injected noise — the filter stays consistent-or-conservative by construction.
+
+**A/B (gentle sea state, seed 0, truth → meas → estimate; the 5 cm → 0.5 cm change):**
+
+| scenario | radRMS [cm] | chatF [N/tick] (meas) |
+|---|---|---|
+| dp C | 0.22 / 0.26 / 0.31 | 10.89 → **1.76** (truth 0.70) |
+| square C | 1.13 / 1.20 / 1.16 | 11.81 → **2.91** (truth 1.19) |
+| square CDW | 3.19 / 3.26 / 3.26 | 12.02 → **3.08** (truth 1.93) |
+
+"meas" tracking is now truth-level (was 4-5× worse), the DC bias leak is gone, and chatter drops to ~2-3× the
+truth-x0 level (was ~15×). State-estimate RMSE falls to pose ~1.6 mm / vel ~2.7 mm/s. Consistency: NIS/NEES now
+sit ~13/9 (below the ~18 target) — the SAFE, conservative direction (the filter under-trusts itself; it is never
+over-confident). The verify gates (verify_eaob, verify_state_source) were changed to gate on OVER-confidence only
+(value ≤ 24), reporting the low side as conservative, so a legitimately low-noise config no longer spuriously
+fails. Run meta now stamps `controller.eaob.sig_pos_xy` (0.005) + `mpc_state_source` — the 5 cm-era meas-noise
+runs (sig_pos_xy 0.05, all internal A/B only) are distinguishable. NOTE: in ultra-tight DP hold the truth error
+(0.22 cm) is itself below the 0.5 cm pose noise; the "< tracking error" target is met for the operational square
+mission (~1.2 cm). Going to 0.25 cm would push chatter to the truth floor if desired (a sensor-spec choice).
+
+## 2026-07-24 (2) — PID now consumes the SAME noisy state as the MPC (apples-to-apples comparison)
+
+Until now the compare sweep gave the PID **ground-truth** state (`data.xpos/xmat/qvel`, 500 Hz) while both the MPC
+and DOB-MPC ran off a **noisy 20 Hz** estimate (`mpc_state_source="meas"`). That asymmetry confounded every
+PID-vs-MPC number: the analysis of the 2026-07-24 wave sweep had to prove *indirectly* (NONE control group +
+DOB-MPC counterfactual) that state noise was not what made the MPC lose in C/CD — because the PID was silently
+handed a better input. New `PoseController(meas_noise, noise_seed)` closes that gap: with `meas_noise` on the PID
+SEES the clean plant state corrupted by the **same** Gaussian sensor model the MPC x0 uses (`params.EAOB_SIG_*`:
+pose 0.5 cm / z 0.3 cm, attitude 0.3°/yaw 0.5°, lin-vel 0.5 cm/s, gyro 0.11°/s), **sampled at the control tick
+(20 Hz) and held (ZOH)** between ticks — so the PID and the (DOB-)MPC eat an identically-degraded estimate and
+differ ONLY by the control law. The noisy attitude is rebuilt into a full R (`_R_from_rpy`, the exact inverse of
+the yaw/pitch/roll extraction) so both the angle read AND the body-force rotation `R.T` use the estimated
+attitude consistently. `meas_noise` bundles the two coupled sensor effects the MPC already had: Gaussian noise
+AND 20 Hz sampling lag. The logged truth (`px,py`) and the radial-RMS metric always stay on the plant, so the
+metric still measures TRUE tracking error.
+
+Default `params.PID_STATE_SOURCE = "meas"` (symmetric with `MPC_STATE_SOURCE`), so the sweep is apples-to-apples
+out of the box; `"truth"` is the opt-in clean-state baseline. Interactive/eval tools (teleop, eval_dp) inherit
+`meas` — consistent with their already-noisy MPC — while the four deterministic control-law regressions
+(test_controller/test_square_mission/test_heavy_gripper/test_heavy_c3) pin `meas_noise=False` so they keep testing
+the control law on clean state. Run meta now stamps `controller.meas = {state_source, noise_seed, sig_pos_xy}`
+(absent key = truth); **PID records made before this date used truth state and are NOT comparable** to new
+meas-state PID records — rerun the sweep to compare.
+
+**A/B (heavy, seed 0, 3-lap square, truth → meas x0):**
+
+| ctrl / mode | radRMS [cm] | dc [cm] | slew Σ\|dU\| [N/tick] |
+|---|---|---|---|
+| pid  NONE truth | 1.49 | 0.08 | 0.85 |
+| pid  NONE meas  | 1.47 | 0.10 | 3.27 |
+| pid  C    truth | 1.61 | 0.08 | 0.85 |
+| pid  C    meas  | 1.58 | 0.10 | 3.24 |
+| mpc  C   (meas) | 3.17 | **2.87** | 11.1 |
+
+The key result is now shown DIRECTLY rather than inferred: even fed the identical noisy 20 Hz state, the PID keeps
+its C-mode DC offset at ~0.1 cm (its integrator averages out the zero-mean noise) while the nominal MPC sits at
+2.87 cm — so the C/CD gap is the **missing integral action**, not state quality. Noisy state costs the PID only
+command chatter (slew ×3.8, still below the MPC's because the PID's 120 N/s slew limiter de-facto filters the
+20 Hz noise steps); radRMS and offset are essentially unchanged. `pid/NONE/truth` reproduces the recorded sweep
+`radial_max` 4.402 cm byte-for-byte, confirming `meas_noise=False` is the exact pre-change path. Verified:
+`_R_from_rpy` round-trips to 4e-16; injected σ measured 5.24 mm / 4.82 mm·s⁻¹ / 0.482° vs the 5/5/0.5 targets;
+refresh cadence 25 substeps (20 Hz), held within a tick.
+
+## 2026-07-24 (3) — NMPC surge input box 8 → 30 N on heavy: the benchmark was not like-for-like
+
+Investigating why the symmetric-state sweep showed PID beating the MPC in strong waves and losing in weak ones,
+the cause turned out **not** to be a control-theoretic property but the NMPC's own hard input box. On heavy
+(rank-6) `params.U_MAX` was `[8, 30, 30, 8, 8, 10]` — surge capped at **8 N while the PID's `f_max` is 30 N on
+every axis**, a 3.75× handicap. The 8 N figure is a rank-5 relic: on bluerov2 the surge→pitch coupling
+`My = −0.0725·Fx` tumbles the vehicle past sin θ = 1 at Fx ≈ 15 N, so 8 N is a real physical limit there; on
+heavy the four vertical thrusters cancel that coupling. The old comment claimed 8 N was kept "for a like-for-like
+compare", which was exactly backwards. The PID's identical relic (a 6 N surge cap) had already been removed on
+2026-07-03 during the pole-placement redesign ("would bind ωn to ≤0.54"); the MPC's was left in place.
+
+**How much it mattered** (storm CW, 10 laps, 4 paired headings, runtime box override, everything else identical):
+
+| | PID | MPC box 8 N | MPC box 30 N |
+|---|---|---|---|
+| storm  | 26.32 | 30.55 (box active 60–66 % of ticks) | **17.72** (0.7–1.8 %) |
+| gentle | 12.51 | 8.50 (5–9 %) | 7.64 (0.2–0.3 %) |
+
+The box was active on **60 % of 20 Hz ticks at storm (dobmpc 75 %) vs 7 % at gentle** — an amplitude-dependent
+throttle, which is why the *same* frequency band flipped sign with sea state (0.85–2.30 rad/s MPC/PID error ratio
+1.38 at storm → 0.51 at gentle; no LTI bandwidth argument can do that). Releasing it moved storm PID−MPC from
+**−4.24 cm to +8.60 cm** while gentle barely moved (+4.01 → +4.87) — i.e. **the entire "PID wins in strong waves"
+crossover was this one constraint.** The recorded `sat_freq` metric is blind to it (0.0000 everywhere) because
+8 N is a software bound, not thruster saturation.
+
+**Applied:** heavy `U_MAX = [30, 30, 30, 8, 8, 10]`; the rank-5 branch keeps 8 N (the coupling is real there).
+Validation with the rebuilt solver (storm/gentle CW, 10 laps, 3 paired headings):
+
+| sea state | PID | MPC | DOB-MPC | max thruster | sat_freq |
+|---|---|---|---|---|---|
+| storm  | 26.14 | **17.86** (was 28.82) | **7.30** (was 17.36) | 40.3 N | 0.0000 |
+| gentle | 11.56 | **7.63** (was 9.51)   | **1.87** (was 3.14)  | 36.1 N | 0.0000 |
+
+MPC now wins at **both** ends (PID−MPC +8.28 storm, +3.93 gentle) — the crossover is gone — and DOB-MPC gains the
+most (2.4× better at storm), since it was the most authority-starved. Still no physical saturation: peak
+per-thruster demand 40.3 N against a T200 `ctrlrange` of −51.6…+64.1 N, and at a fixed heading the 30 N box
+actually *lowers* peak thruster force (36.1 vs 36.9 N) because adequate authority prevents the violent late
+corrections the 8 N box provoked. `verify_acados` still passes (acados↔IPOPT max|Δu| = 0.0615 N < 0.25 N gate,
+1.04 ms median, n_fail = 0); closed-loop n_fail ≈ 1 per 5334-tick run, unchanged.
+
+**Records boundary:** run meta now stamps `controller.u_max` (both `run_compare` and the teleop manifest, read off
+the live solver). **Absent key = the old 8 N box.** Every mpc/dobmpc result recorded before this date — including
+the 20260724 sweeps — is under 8 N and must not be pooled with new runs; in particular "PID beats MPC in strong
+waves" from those records is a benchmark artifact and must not be cited. A full sweep rerun is pending
+(KNOWN_ISSUES).
+
+**What survives as real control findings** (unaffected by the box): the MPC's error PSD is 3–8× below the PID's at
+every frequency under 0.7 rad/s in *every* sea state — its Fossen model plus 3 s reference preview — which is also
+why it wins the disturbance-free NONE baseline (1.089 vs 1.492 cm). And in constant-current C mode the nominal
+MPC still parks 2.70 cm downstream for want of integral action (PID 0.03 cm), the gap DOB-MPC's `w_hat` closes.
+**Not established:** that the ladder's crossover was a *frequency* phenomenon — the sea-state ladder co-varies Hs
+and Tp (corr(log Hs, log ω_p) = 0.967) plus γ and s, so a regression cannot separate them (substituting the
+equally-collinear γ reverses the ranking, and the Hs coefficient is not significant on 6 rungs, p = 0.22). The
+ablation settled the mechanism directly instead of the regression.
+
+## 2026-07-28 — One steady window for every reported RMS (trajectory boxes == bar chart)
+
+Two figures from the *same* 100 runs disagreed: `bar_square_radial_rms.png` put PID/CDW at **18.6 cm**, while the
+boxed number on `trajectory_compare_CDW.png` read **18.2 ± 2.4 cm**. Not a bug in either number — two different
+windows. `metrics()` scores the steady window (`t ≥ experiment.settle_s` = 10 s, clamped to half the run), which
+is what lands in `results.csv` / `results_raw.csv` / every bar; the trajectory panel re-read `runs/traj_*.csv` and
+scored the **whole** record. A square run starts on the reference with near-zero error, so those first 10 s — only
+3.7 % of the 266.7 s record (196 / 5268 samples) — are much quieter than the rest and pull the pooled RMS down:
+
+| controller (CDW) | first 10 s | after 10 s | pooled (old box) | steady (bar) |
+|---|---|---|---|---|
+| PID | 4.47 | 18.57 | 18.24 | **18.57** |
+| MPC | 6.13 | 10.69 | 10.55 | **10.69** |
+| DOB-MPC | 1.92 | 2.62 | 2.60 | **2.62** |
+
+**Applied:** the window is now defined once — `run_compare.steady_mask(t, settle_s)` (+ `settle_start(cfg)`, the
+single read of `experiment.settle_s`) — and called by both `metrics()` and `_draw_traj_panel`. `settle` is threaded
+into `fig_trajectory_compare` / `fig_trajectory_allmodes` / `fig_xwave_trajectory`; every figure now *names* its
+window in the caption (`fig_bars` grew a `note=` footnote, the trajectory legends read "lines = all laps · boxed
+RMS = steady-window radial RMS (t ≥ 10 s, same metric as the bar chart)"). The standalone
+`experiments/plot_trajectories.py` mirrors the same mask behind a `--settle` flag, so pointing it at a
+`run_compare` `runs/` folder reproduces that run's `results.csv` numbers instead of a third value. The trajectory
+*lines* still draw the entire run — only the scored number changed.
+
+**Verification** (no sim re-run): re-rendered the `20260727/compare_20260727_000850/wave01_moderate` figures from
+its existing per-run CSVs — all 15 (5 modes × 3 controllers) boxed values now equal `results_raw.csv` to
+≤ 1.6e-6 cm, the `%.5f` m write precision of those CSVs. `plot_trajectories` on one run prints 17.26 / 10.88 /
+2.79 cm against that run's recorded 17.26 / 10.88 / 2.79. Full `--smoke` pipeline green.
+
+**Records boundary:** no recorded number moves — `results.csv`, `results_raw.csv`, `results_all_waves.csv` and the
+bar charts were always the steady-window metric and are unchanged. Only the *trajectory-figure boxes* changed.
+Figures generated **before this date** box a full-run RMS, ~1–2 % below the matching bar; read their caption
+("full-run radial RMS (all laps)") or regenerate them.

@@ -65,7 +65,7 @@ def test_square_mission():
     # Pin the heavy gain set + coeffs: this test's plant is the hard-coded bare
     # bluerov_heavy.xml, while the default hydro/gains follow ROV_MODEL.
     ctrl = C.PoseController(model, mode="pid", buoyancy_ff=hydro,
-                            gains=C.GAINS_HEAVY)
+                            gains=C.GAINS_HEAVY, meas_noise=False)   # clean tracking test
     rec = Recorder("/tmp/sqtest", tag="sq")
     S, laps, speed = 0.25, 2, 0.12
     mission = SquareMission(ctrl, rec, hydro, bid, size=S, laps=laps, speed=speed, log_hz=50)

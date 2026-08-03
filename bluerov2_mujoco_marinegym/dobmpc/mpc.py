@@ -125,6 +125,7 @@ class NMPC:
                  u_max=P.U_MAX, v_max=P.V_MAX,
                  solver="ipopt", max_iter=15, n_int=2):
         self.N, self.dt = N, dt
+        self.u_max = np.asarray(u_max, float).copy()   # for run-meta provenance
         X = ca.SX.sym("X", NX, N + 1)
         U = ca.SX.sym("U", NU, N)
         Pp = ca.SX.sym("P", NX + 6 + NX * (N + 1))

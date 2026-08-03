@@ -42,12 +42,52 @@ def _Rz_flu(yaw):
 
 class DOBMPCController:
     def __init__(self, model, hydro=None, mode="dobmpc", setpoint=(0.0, 0.0, 0.0),
-                 yaw_ref=0.0, body="base_link", ctrl_hz=20.0, N=P.MPC_N, actuator=None):
+                 yaw_ref=0.0, body="base_link", ctrl_hz=20.0, N=P.MPC_N, actuator=None,
+                 eaob_profile="perf", meas_noise=None, noise_seed=0,
+                 mpc_state_source=None):
+        """eaob_profile: EAOB tuning ("perf" = sensor-sigma covariances + NIS gate,
+        "verify" = legacy near-deadbeat DT templates). meas_noise: corrupt the
+        EAOB's eta/nu/nudot with Gaussian noise from params.EAOB_SIG_* (the same
+        sigmas the perf filter R assumes); None -> on iff profile is "perf", so
+        the consistent pairs (verify, clean) / (perf, noisy) are the defaults.
+        mpc_state_source: what the NMPC consumes as x0 --
+          "meas"     = the state-estimator output the loop actually has (in sim:
+                       the clean reading + sensor noise, the SAME sample the EAOB
+                       consumes; on hardware: the SLAM / AI-model estimator). The
+                       DOB plug-in architecture -- the EAOB hands the MPC ONLY
+                       w_hat, never its filtered eta_hat/nu_hat. Default under
+                       noise, for BOTH mpc and dobmpc, so the two differ only by
+                       w_hat (single-variable ablation).
+          "estimate" = the EAOB-filtered eta_hat/nu_hat (offset-free-MPC style;
+                       dobmpc only). The 2026-07-23 (2) default, now an opt-in.
+          "truth"    = the clean plant readout (regression / observer isolation;
+                       also the no-noise path).
+        None -> params.MPC_STATE_SOURCE when measurement noise is active, else
+        "truth". Whatever the source, it feeds ONLY the MPC x0 + its yaw-ref
+        anchor -- measurement generation, the EAOB's inputs, and every
+        truth-logging surface stay on the plant readout."""
         assert mode in ("dobmpc", "mpc"), mode
+        assert eaob_profile in ("perf", "verify"), eaob_profile
+        self.meas_noise = (eaob_profile == "perf") if meas_noise is None else bool(meas_noise)
+        if mpc_state_source is None:
+            src = P.MPC_STATE_SOURCE if self.meas_noise else "truth"
+        else:
+            src = mpc_state_source
+        assert src in ("meas", "estimate", "truth"), src
+        assert not (src == "estimate" and mode != "dobmpc"), \
+            "estimate state source needs the EAOB -- use mode='dobmpc'"
+        self.mpc_state_source = src
         self.model = model
         self.actuator = actuator                 # optional realistic thrusters (opt-in)
         self.hydro = hydro                       # only for parity with PoseController
         self.mode = mode
+        self.eaob_profile = eaob_profile         # self.meas_noise set above (x0 default)
+        self.noise_seed = int(noise_seed)
+        self._noise_rng = np.random.default_rng(self.noise_seed)
+        self._sig_eta = np.concatenate([P.EAOB_SIG_POS, P.EAOB_SIG_ANG])
+        self._sig_nu = np.concatenate([P.EAOB_SIG_LVEL, P.EAOB_SIG_AVEL])
+        self._sig_nudot = np.concatenate([np.full(3, P.EAOB_SIG_ACC),
+                                          np.full(3, P.EAOB_SIG_AACC)])
         self.bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body)
         self.B, _ = T.allocation_matrix(model)   # constant rank-5 body geometry
 
@@ -119,6 +159,7 @@ class DOBMPCController:
 
     def reset(self):
         self.eaob = None
+        self._noise_rng = np.random.default_rng(self.noise_seed)   # reproducible runs
         self.r_ref = 0.0
         self._ref_traj = None                    # tracking sampler does not survive reset
         self._tau_flu = np.zeros(6)
@@ -245,26 +286,58 @@ class DOBMPCController:
 
     # --------------------------------------------------------- control tick
     def _control_step(self, data):
-        p, R, nu_flu = self._read_state(data)
+        p, R, nu_flu = self._read_state(data)     # clean plant truth
         eta_ned = frames.flu_to_ned_eta(p, R)
         nu_ned = frames.flu_to_ned_nu(nu_flu)
-        self._psi_ned_now = float(eta_ned[5])     # for the yaw-ref unwrap in _xref_ned
 
-        if self.eaob is None:                     # lazy init at the measured pose
-            self.eaob = EAOB(eta0=eta_ned, nu0=nu_ned)
+        if self.eaob is None:                     # lazy init at the (clean) pose
+            self.eaob = EAOB(eta0=eta_ned, nu0=nu_ned, profile=self.eaob_profile)
             self._nu_prev_ned = nu_ned.copy()
 
-        a_meas = (nu_ned - self._nu_prev_ned) / self.ctrl_dt   # FD over the tick
+        a_meas = (nu_ned - self._nu_prev_ned) / self.ctrl_dt   # clean FD over the tick
         self._nu_prev_ned = nu_ned.copy()
 
+        # ---- state-estimator output: ONE pose/vel sample per tick, feeding BOTH
+        # the EAOB measurements AND the MPC x0 (when mpc_state_source=="meas"). In
+        # sim = the clean reading + Gaussian sensor noise (params.EAOB_SIG_*: eta/
+        # nu model vision+pressure/DVL, nudot an IMU accel + differentiated gyro,
+        # so it gets its OWN noise on top of the clean FD, which -- with
+        # _nu_prev_ned -- always tracks the true velocity); on hardware = the SLAM
+        # / AI-model estimator. meas_noise off -> the estimator output IS truth.
+        if self.meas_noise:
+            rng = self._noise_rng
+            eta_meas = eta_ned + rng.normal(0.0, self._sig_eta)
+            nu_meas = nu_ned + rng.normal(0.0, self._sig_nu)
+            nudot_meas = a_meas + rng.normal(0.0, self._sig_nudot)
+        else:
+            eta_meas, nu_meas, nudot_meas = eta_ned, nu_ned, a_meas
+
+        eta_hat = nu_hat = None
         if self.mode == "dobmpc":
-            meas = {"eta": eta_ned, "nu": nu_ned, "nudot": a_meas}
-            _, _, self.w_hat = self.eaob.update(meas, self._tau_ned_cmd)
+            eta_hat, nu_hat, self.w_hat = self.eaob.update(
+                {"eta": eta_meas, "nu": nu_meas, "nudot": nudot_meas},
+                self._tau_ned_cmd)
         else:                                     # plain MPC: no disturbance comp
             self.w_hat = np.zeros(6)
 
-        x_ned = np.concatenate([eta_ned, nu_ned])
-        u = self.nmpc.solve(x_ned, self.w_hat, self._xref_ned(data.time))
+        # THE single x0 source switch (params.MPC_STATE_SOURCE):
+        #   "meas"     -> the estimator output the loop has (DOB plug-in: the EAOB
+        #                 feeds the MPC only w_hat, not its filtered state);
+        #   "estimate" -> the EAOB-filtered state (offset-free-MPC style);
+        #   "truth"    -> the clean plant state.
+        # The yaw-ref anchor follows the SAME source so x0 yaw and the reference
+        # sit on one branch (the NMPC cost has no angle wrapping; the reference
+        # re-anchors to _psi_ned_now every tick; neither backend bounds yaw, so a
+        # continuously accumulated estimate yaw is safe).
+        if self.mpc_state_source == "estimate":
+            eta0, nu0 = eta_hat, nu_hat
+        elif self.mpc_state_source == "meas":
+            eta0, nu0 = eta_meas, nu_meas
+        else:                                     # "truth"
+            eta0, nu0 = eta_ned, nu_ned
+        self._psi_ned_now = float(eta0[5])
+        u = self.nmpc.solve(np.concatenate([eta0, nu0]), self.w_hat,
+                            self._xref_ned(data.time))
         self.n_fail = self.nmpc.n_fail
         if getattr(P, "FULLY_ACTUATED", False):
             # heavy: NU=6, the full wrench [X,Y,Z,K,M,N] is commanded and realized.
@@ -307,7 +380,22 @@ class DOBMPCController:
             return np.zeros(6)
         return frames.ned_w_world_to_flu(self.eaob.w_world())
 
+    def eaob_meta(self):
+        """Provenance dict for run meta sidecars (tuning + gate counters).
+        Records recorded before this key existed are all verify/deadbeat +
+        clean-measurement equivalent."""
+        m = dict(profile=self.eaob_profile, meas_noise=self.meas_noise,
+                 noise_seed=self.noise_seed, tau_dist=float(P.EAOB_TAU_DIST),
+                 mpc_state_source=self.mpc_state_source,
+                 sig_pos_xy=float(P.EAOB_SIG_POS[0]))   # 2026-07-24: 0.05 -> 0.005 m
+        if self.eaob is not None:
+            m["gate"] = self.eaob.gate               # None = gate off
+            m["n_upd"] = int(self.eaob.n_upd)
+            m["n_gated"] = int(self.eaob.n_gated)
+        return m
+
     def status(self):
         tag = "DOB-MPC" if self.mode == "dobmpc" else "MPC"
         wn = np.linalg.norm(self.w_hat[:3])
-        return f"{tag}  |w_hat|={wn:.1f}N  solve_fail={self.n_fail}"
+        gated = self.eaob.n_gated if self.eaob is not None else 0
+        return f"{tag}  |w_hat|={wn:.1f}N  solve_fail={self.n_fail}  gated={gated}"
