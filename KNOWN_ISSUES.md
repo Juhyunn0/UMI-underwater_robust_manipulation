@@ -6,12 +6,150 @@
 
 ## 🐛 테스트 / 스크립트 함정
 
+### 1280×800에서 **컬러 스트림이 디바이스 프레임의 3.3%를 떨어뜨린다** (2026-08-04)
+- **발견**: 2026-08-04, maxres를 8.4 → 29 fps로 고친 뒤 실기 take 검증 중.
+- **증상 (시퀀스 번호로 센 정확한 값, `bench_stereo`와 같은 파이프라인, 10 s/행)**:
+
+  | | age | 드롭 | fps |
+  |---|---|---|---|
+  | 컬러 ON | 153.0 ms | **3.67%** | 28.90 |
+  | 컬러 OFF | 161.5 ms | **0.33%** | 29.90 |
+
+  기본 프로파일(320×200)과 near 모드(19.7 fps)에서는 안 나타난다 — 여유가 없는 건
+  1280×800 · 29 fps 조합뿐이다.
+- **디스크가 아니다**: writer 6→12 스레드 + queue 128→256으로 올려도 개선되지 않았다.
+  XLink/USB 대역 쪽으로 보이지만 **원인 미확정**. 참고로 장치는
+  `maxUsbSpeed=SUPER_PLUS`를 요청해도 `usb=SUPER`로 붙는다.
+- **임시 대응**: `record.streams:`에서 `color`를 빼면 된다(0.33%). 프레임은 타임스탬프로
+  기록되므로 유실이 있어도 take 자체는 유효하다.
+- **제대로 고치는 법**: 컬러 MJPEG 품질/해상도를 낮춰(97 → 80, 또는 800p 대신 720p)
+  대역을 확보하고 `umi_handheld/bench_stereo.py`로 재측정. 컬러를 downstream이 실제로
+  쓰기 시작하기 전까지는 결정할 근거가 없다 — 현재 아무것도 읽지 않는다.
+
+### 1280×800의 **150 ms 잔여 지연은 해상도 자체**라 설정으로 못 줄인다 (2026-08-04)
+- **증상**: stereo 입력 큐를 8 → 1로 고쳐 ~95 ms를 걷어낸 뒤에도 프레임이 호스트에
+  도착할 때 이미 **153 ms** 지났다(29 fps 기준 ~4.4 프레임). 프리뷰가 그만큼 늦게 보인다.
+- **원인 후보를 전부 배제했다** (전부 실측, 디바이스 고정): 호스트 루프 아님(디스플레이
+  없을 때 640 kHz, `draw_overlay` 3.0 ms) · XLink 대역 아님(`streams`에서 right/color를
+  빼도 153 → 159 ms로 변화 없음) · `setXLinkChunkSize(0)` 무효 · 호스트 큐 크기 무효 ·
+  후처리 필터 거의 무효(median/temporal 전부 끄면 152.8 ms). 남는 변수는 해상도뿐:
+  같은 필터 체인으로 **640×400은 36.1 ms**.
+- **임시 대응**: 지연이 문제인 작업(정밀 티칭 등)에서는 `configs/pipeline.yaml`(320×200
+  depth)을 쓴다. 1280×800을 쓰는 한 ~150 ms는 따라온다.
+- **제대로 고치는 법**: 디바이스 내부 파이프라인 깊이라 depthai 설정으로는 못 만진다.
+  줄이려면 프레임 주기를 줄여야 하는데(지연 ≈ 단수 × 주기) 800p에서 stereo 코어가
+  29–30 fps가 한계다. 720p(같은 MinZ, 행 10% 감소)에서 21.4 fps가 측정된 적 있어
+  기대하기 어렵다 — 재측정 없이 단정하지 말 것.
+
+### `record.py`는 depthai **2.x 전용**인데 base conda 환경은 3.5.0 (2026-08-04)
+- **증상**: base(`/home/bdml/miniforge3`)에서 `--source device`를 돌리면 즉시
+  `AttributeError: module 'depthai.node' has no attribute 'XLinkOut'`. `dai.node.XLinkOut`,
+  `dai.RawStereoDepthConfig`, `Device.getOutputQueue`가 전부 3.x에서 사라졌다
+  (record.py:154-159, 177, 197, 216, 403-409).
+- **임시 대응**: depthai 2.32.0.0이 있는 인터프리터로만 실행 —
+  `~/.venvs/c3-depthai/bin/python`, 또는 conda `robust`(2026-08-05에 설치함, 단 위의
+  numpy 항목을 먼저 읽을 것). 같은 폴더의 `test_oak_depth.py`는
+  `DEPTHAI_MAJOR_VERSION`으로 양쪽을 분기하므로 base에서도 돌아가고, 그래서 두
+  스크립트가 **서로 다른 스택**에서 돈다.
+- **진행 (2026-08-05)**: `c3_camera` 쪽은 리포 루트 `./c3` 래퍼가 인터프리터와 작업
+  디렉터리를 고정해서 해소됐다. `umi_handheld/record.py`는 **아직** 그대로다 —
+  래퍼도 버전 분기도 없어서 `python -m umi_handheld.record`가 어떤 python을 잡느냐에
+  달려 있다.
+- **제대로 고치는 법**: record.py에도 test_oak_depth.py와 같은 버전 분기를 넣거나,
+  `./c3`와 같은 래퍼를 umi_handheld에도 두어 인터프리터를 고정한다.
+
+### `xlink_out_queue`는 적용했으나 **아직 실측하지 않았다** (2026-08-06)
+- **한 일**: `build_device_pipeline`이 `XLinkOut` 노드들의 입력 큐를 DepthAI 기본값
+  (8, blocking) 그대로 두고 있었다 — 체인에서 유일하게 설정도 측정도 없던 버퍼링 단계다.
+  `stereo_input_queue`와 같은 방식으로 `record.xlink_out_queue: {size: 1, blocking: false}`
+  키를 만들어 left/depth/right/color 전부에 적용했다.
+- **왜 유망한가**: stereo **입력** 큐를 8→1로 바꿨을 때 지연이 252 → 153 ms로 떨어졌다
+  (record.py:283-297). 출력 큐도 같은 종류의 자리인데 여기만 손대지 않았었다.
+- **미검증**: 작업 시점에 벤치 카메라가 연결돼 있지 않아
+  (`dai.Device.getAllAvailableDevices()` → none) 전후 비교를 못 했다. **효과가 있다고
+  주장하지 말 것.**
+- **재는 법**: `python -m umi_handheld.bench_stereo --config configs/pipeline.yaml --seconds 10`
+  — 이번에 `age`(호스트 도달 시점의 프레임 나이, ms 중앙값)와 `drop%`(시퀀스 번호 결번) 열을
+  추가해서 이제 잴 수 있다. `xlink_out_queue: {size: 8, blocking: true}`로 되돌린 행과
+  나란히 찍어 비교한다(같은 장면·같은 디바이스여야 유효).
+- **기대치**: `KNOWN_ISSUES` 아래 항목대로 1280×800의 잔여 ~150 ms는 해상도 자체다.
+  640×400의 기준선은 36 ms이므로 여기서 걷어낼 수 있는 몫은 그보다 작다.
+
+### 리포 루트의 출력 디렉터리 `zarr/`가 `import zarr`를 가로챈다 (2026-08-06)
+- **증상**: `robust`에서 `python -m umi_handheld.build_zarr`를 돌리면
+  `AttributeError: module 'zarr' has no attribute 'open'`. 리포 루트가 `sys.path[0]`이고
+  거기에 산출물 디렉터리 `zarr/`가 있어서, 진짜 zarr가 **설치돼 있지 않을 때** 그 디렉터리가
+  namespace package로 잡힌다 (`import zarr` → `_NamespacePath(['<repo>/zarr'])`).
+- **더 나쁜 건 진단을 망친다는 점**: 리포 루트에서 `import zarr`가 성공하므로
+  "이 환경에 zarr가 있다"로 오독된다. **`robust`에는 zarr가 없다** (`pip list` 확인:
+  robust 무, `~/.venvs/c3-depthai` 2.18.3). 정규 패키지가 설치돼 있으면 namespace
+  portion을 이기므로 venv에서는 리포 루트에서도 정상 동작한다.
+- **임시 대응**: `build_zarr.py`는 `~/.venvs/c3-depthai/bin/python`으로 실행한다
+  (실측: 리포 루트에서 `zarr 2.18.3` 정상 해석, session_syn 72프레임 빌드 성공).
+  환경 확인은 리포 **밖**에서 — `cd /tmp && <python> -c "import zarr; print(zarr.__version__)"`.
+- **제대로 고치는 법**: `robust`에 zarr를 설치하거나(numpy<2 제약 확인 필요), 산출물
+  디렉터리를 `zarr_out/`처럼 모듈명과 겹치지 않게 바꾼다. 후자가 근본 해결이지만
+  기존 7개 데이터셋 경로가 전부 바뀐다.
+
+### C3 공장 캘리브레이션은 **수중** 값인데 코드·문서가 "IN-AIR"라고 단정 → 공기 중 촬영분 depth가 ~1.33배 과대 (2026-08-04)
+- **발견**: 2026-08-04 (OAK-D W 핸드헬드 파이프라인 계획 중, 사용자 지적으로 재검증)
+- **사실 1 (벤더)**: MarineSitu C3는 **개체별로 수중 캘리브레이션되어 출고**된다.
+  Blue Robotics 제품 페이지 *"Each unit is individually calibrated for underwater
+  operation"*, 포럼에서 Tony White가 *"the calibration Marine Situ performs takes
+  place entirely underwater. It uses the standard checkerboard approach with openCV"*.
+- **사실 2 (우리 EEPROM 실측)**: `datasets/*/calibration.json` 10개 전부 동일한 한 벌이고,
+  거기 담긴 K+왜곡(rational 8계수)을 **순방향 투영**해 실제 화각을 재면
+  **CAM_A 63.7° / CAM_B 85.6° / CAM_C 85.1°** (HFOV). 공기 중 OAK-D-W 스펙은
+  **95 / 127 / 127°**, 평판포트 Snell 예측은 **67.2 / 84.3 / 84.3°** → 세 카메라 전부
+  물속 예측과 3.5° 이내, 공기 스펙과는 최대 41.9° 차이.
+  (산출물: `python calib/fov_audit.py --audit`, 방법·통제실험 [calib/FOV_AUDIT.md](calib/FOV_AUDIT.md))
+  세 카메라가 독립적으로 같은 결론을 준다. 즉 EEPROM = **수중** 캘리브레이션.
+- **증상**: 이 캘리브레이션으로 **공기 중에서** 찍으면 `Z_reported = (fx_water/fx_air)·Z_true
+  ≈ 1.33 · Z_true` — 즉 **depth가 약 33% 멀게 나온다**. 정류(rectification)도 매질이
+  달라 어긋난다. `c3_camera/datasets/*`와 `recordings/*`는 전부 실내(공기 중) 촬영이므로
+  **기존 C3 RGB-D 데이터셋의 depth 스케일은 계통 오차를 갖는다**. 반대로 실제 물속에서는
+  이 캘리브레이션이 **맞다**.
+- **틀린 문구가 박혀 있는 곳**(전부 근거 없이 하드코딩된 우리 주석):
+  `c3_collect.py:330`(이 문자열이 **모든 데이터셋의 calibration.json `note`로 기록됨**),
+  `dataset.py:593, 649, 909`, `geometry.py:15`, `TESTING.md`(T2를 "전부 공기 중,
+  수중은 미보정 시 스케일 ~1.33배"로 서술 — 부호가 반대).
+- **임시 대응**: 공기 중에서 찍은 C3 depth는 중심부 기준 **÷1.33**으로 읽을 것. 단
+  **깨끗한 스칼라가 아니다** — 왜곡 모델까지 매질이 어긋나 있어 주변부로 갈수록 반경
+  방향 추가 오차가 붙는다. MinZ 표(400p **300 mm**)는 수중 fx 기준이므로
+  **공기 중 실제 최소거리는 ≈225 mm이고 그것이 300 mm로 보고된다**.
+  보고되는 바닥 300 mm(및 `--extended` 150 mm)는 이제 실측이다
+  `[측정: c3_camera/datasets/*/depth/, recordings/*/depth/ — 47,270 프레임 전수,
+  바닥 정확히 300/150 mm, 그 아래 0 픽셀]`. 공기 중 물리거리 ≈225 mm 쪽은 여전히
+  `[유도: fx_air = fx_water/1.333 대입. 미실측 — depth_accuracy/rungs.csv 부재,
+  줄자 검증은 한 번도 실행된 적 없음]`.
+- **제대로 고치는 법**: (a) 위 5곳 문구를 사실대로 정정하고 `calibration.json`에
+  `medium: "water"` + 근거를 명시, (b) 카메라가 네트워크에 돌아오면 EEPROM 메타
+  (`getEepromData()`의 `batchTime`/`boardCustom`/`productName`)를 읽어 provenance를 못박고,
+  (c) 공기 중 작업용 별도 in-air 캘리브레이션을 체커보드로 떠서 매질별로 선택 가능하게 한다.
+  (a)만 해도 이 항목의 위험 대부분이 사라지므로 우선순위 높음. 고치면 이 항목 삭제.
+
+### `dataset.py` telemetry CSV 스키마가 "첫 메시지 승자독식" — 세션마다 열이 달라짐 (2026-08-03)
+- **발견**: 2026-08-03 (`c3_option_sweep.py` 작성 중 API 매핑 워크플로)
+- **증상**: `DatasetWriter.mavlink_rows`가 그룹(telemetry/imu_rov/control)별로 **처음
+  도착한 메시지 하나의 필드 집합으로 헤더를 확정**하고(dataset.py:510-517),
+  `DictWriter(extrasaction="ignore")`(dataset.py:195)라 이후 다른 타입의 필드는
+  **조용히 버려진다**. 실측: `datasets/dataset_20260803_105221/telemetry.csv`는 첫
+  레코드가 AHRS2였던 탓에 열이 `altitude,lat,lng,pitch,roll,yaw` 6개뿐이고,
+  같은 파일에 섞인 **VFR_HUD 1169행은 전 열이 공백**이다(11개 메시지 타입 / 7935행).
+- **왜 스윕에서 더 나쁜가**: 어느 메시지가 먼저 도착하는지는 **레이스**라, 동일한
+  차량 트래픽인데도 셀마다 telemetry.csv 스키마가 달라져 **셀 간 비교가 깨진다**.
+- **임시 대응**: 텔레메트리를 쓸 때는 `msg_type`으로 먼저 필터링하고, 빈 열은
+  "그 메시지에 그 필드가 없다"가 아니라 "헤더에서 잘렸다"로 해석할 것. 원본은
+  `metadata.json`의 `mavlink.message_counts`로 교차 확인.
+- **제대로 고치는 법**: 그룹별 헤더를 `ALL_MESSAGES`의 필드 합집합으로 미리 확정하거나,
+  메시지 타입별로 파일을 분리(`telemetry_VFR_HUD.csv` …)한다. 고치면 이 항목 삭제.
+
 ### 📊 compare sweep 재실행 대기 — MPC surge 박스 8 → 30 N 변경 이후 (기록 경계)
 - **발견/변경**: 2026-07-24 (wave-crossover 워크플로에서 벤치마크 불공정 발견 → 같은 날 수정)
 - **증상**: `params.U_MAX[0]`을 8 → 30 N(= PID `f_max`)으로 고쳤으므로 **기존 recordings의 모든
   mpc/dobmpc 결과는 낡은 8 N 박스 하에서 측정된 것**. 특히 `compare_20260724_160210` 등에서
   관측된 "강파랑에서 PID가 MPC보다 낫다"는 **벤치마크 아티팩트이며 인용 금지**(ablation:
-  storm PID−MPC −4.24 → +8.60 cm 부호 역전, crossover 소멸).
+  storm PID−MPC −4.24 → +8.60 cm 부호 역전, crossover 소멸).  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 - **임시 대응**: 새 run meta는 `controller.u_max`를 기록하므로 신/구 기록은 구분 가능
   (키가 없으면 낡은 8 N). 경계를 넘어 결과를 합산하지 말 것.
 - **제대로 고치는 법**: full sweep(`experiments/run_compare.py`, 6 sea state × 5 mode × 3 ctrl)
@@ -22,7 +160,7 @@
   verifier 수치 검증 11/12 verified)
 - **증상**: `np.clip(w_hat, ±50)`(mpc_acados.py:170, mpc.py:198)에 대해 —
   (1) 힘 채널 50 N은 이 환경 물리 상한(realistic X≈35 / Y≈37 / Z≈3 N)보다 위라 사실상
-  안 물리지만, 스웨이 보수 스택(추력한계 속도로 파정 역류 과도) ≈85–100 N에서는 물리고
+  안 물리지만, 스웨이 보수 스택(추력한계 속도로 파정 역류 과도) ≈85–100 N에서는 물리고  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
   이 영역이 정확히 acados blowup 레짐; (2) 토크 채널 50 N·m은 authority(8–10 N·m)의
   5–6배·물리 상한(Munk 미스매치 ≤10 N·m)의 5배 — 회전 유효관성 0.45–0.76 kg·m²라
   40 N·m대 추정 스파이크가 통과하면 66–111 rad/s² 예측 → slack/RTI blowup;
@@ -34,9 +172,9 @@
 - **2026-07-23 갱신**: EAOB innovation gating을 **구현했으나 실측 후 기본 OFF로 결정**
   (`params.EAOB_GATE_ON=False`, 메커니즘·`n_gated` 카운터·meta 기록은 유지) — square
   seed-0 A/B(tau_dist=0.5 기준)에서 χ²(0.999,18) 게이트가 파랑/코너의 상시적 w_dot=0 위반
-  프레임을 25–76% 기각해 파랑 추종 자체를 차단(CDW radRMS 4.5→15.5 cm, CD 1.35→1.43 cm);
-  기각이 다시 혁신을 키우는 악순환으로 NIS 통계도 오염(137 vs gate-off 25). 최종 기본
-  tau_dist=0.2에선 같은 시나리오에서 게이트가 아예 발동하지 않음(0/1067). 일관성 게이트는
+  프레임을 25–76% 기각해 파랑 추종 자체를 차단(CDW radRMS 4.5→15.5 cm, CD 1.35→1.43 cm);  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
+  기각이 다시 혁신을 키우는 악순환으로 NIS 통계도 오염(137 vs gate-off 25). 최종 기본  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
+  tau_dist=0.2에선 같은 시나리오에서 게이트가 아예 발동하지 않음(0/1067). 일관성 게이트는  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
   wave-band 모델 위반과 구조적으로 양립 불가 → 스파이크 방어는 여전히 per-axis
   `W_HAT_CLIP=[15,45,45,5,5,8]` 단일 정의 + 클립 발동 카운터 기록(mpc_acados.py:170·
   mpc.py의 ±50 하드코딩 중복은 그대로)이 담당해야 함. 근본 해결은 harmonic-EAOB.
@@ -97,7 +235,7 @@
 ### `verify/verify_acados.py` 게이트가 heavy_gripper에서 근소 초과 (0.2717 > 0.25 N)
 - **발견**: 2026-07-12 (heavy_gripper 변종 검증 중)
 - **증상**: acados RTI vs IPOPT worst-case |Δu| 게이트 0.25 N은 heavy 기준 캘리브레이션;
-  heavy_gripper(13.7 kg)에서 0.2717 N — 30 N sway authority의 ~0.9%라 실효 동일 최적해,
+  heavy_gripper(13.7 kg)에서 0.2717 N — 30 N sway authority의 ~0.9%라 실효 동일 최적해,  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
   폐루프도 검증됨(DP hold 1.3 cm). heavy는 여전히 PASS.
 - **제대로 고치려면**: 게이트를 변종별 스케일 또는 ‖u‖ 상대비로.
 
@@ -124,7 +262,7 @@
 - **증상**: `mj_objectVelocity(mjOBJ_BODY, local=1)`은 **inertial(주축) 프레임** 기준인데
   hydro는 body 프레임으로 간주해 drag를 `xmat`으로 적용. `fullinertia`로 주축이
   정렬·순열되면(Iyy>Izz>Ixx 등) drag 축이 뒤엉켜 **에너지 주입 → 폭발**(torque-free
-  kick 0.5 rad/s → 1.5 s 만에 |q|>60 rad/s로 재현).
+  kick 0.5 rad/s → 1.5 s 만에 |q|>60 rad/s로 재현).  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 - **임시 대응**: heavy_gripper 생성 XML이 diaginertia 강제 + `tests/test_heavy_gripper.py`가
   `body_iquat==identity` 회귀 가드. 기존 변종은 원래 대각이라 무증상.
 - **제대로 고치려면**: hydro가 `mjOBJ_XBODY`(body 프레임)로 측정하거나 ximat로 변환 —
@@ -138,13 +276,13 @@
 - **발견**: 2026-07-23 (verify_state_source A/B 검증 중; 파랑 블록이 19:28에
   Hs 0.75→1.2 m, Tp 12→6 s, γ 5→2, s 30→10, ω_max 1.6→3.0으로 강화됨)
 - **증상**: 새 해상 상태의 CDW에서 mpc_state_source와 무관하게 NIS 80(truth)/71(estimate)
-  (DP), 44/42(square) — τ_dist=0.2로 검증했던 목표범위(14–24) 크게 이탈, radRMS도
+  (DP), 44/42(square) — τ_dist=0.2로 검증했던 목표범위(14–24) 크게 이탈, radRMS도  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
   DP 1.5→9.6 cm / square 3.5→15.7 cm로 악화. w_dot=0 + τ_dist=0.2가 새 파랑 대역
   (ω_p≈1.05, 에너지 ~3 rad/s)을 못 쫓아가는 것; 구파랑 config로는 전 항목 PASS 재현.
 - **임시 대응**: 없음(발산은 아님 — n_fail 0, 유한). `verify/verify_eaob.py`·
   `verify_state_source.py`가 현 config에서 exit 1로 신호.
 - **2026-07-24(3) 갱신**: surge 박스 8→30 N 변경 A/B(같은 명령 `verify_eaob --no-plot`,
-  CDW/T=60/seed 0)에서 **NIS 245.8→100.0, NEES 398.9→122.0으로 2.5–3.3× 개선**(여전히
+  CDW/T=60/seed 0)에서 **NIS 245.8→100.0, NEES 398.9→122.0으로 2.5–3.3× 개선**(여전히  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
   게이트 24 초과 = FAIL). 즉 이 일관성 붕괴의 일부는 **authority 부족으로 인한 큰 추종오차**
   였고(박스가 EAOB의 pseudo-measurement 채널까지 오염), 나머지는 원래 진단대로 τ_dist가
   새 파랑 대역을 못 쫓는 것. 재스윕은 30 N 박스 기준으로 할 것(옛 8 N 수치로 튜닝 금지).
@@ -152,6 +290,63 @@
   harmonic-EAOB — 어느 쪽이든 실험 설계 결정이라 사용자 판단 필요.
 
 ## 📌 알려진 한계 (당장 고칠 계획 없음, 잊지 말 것)
+
+### `rov_gui`: 카메라 틸트 · 조이스틱 passthrough · depth 20 fps가 **실기 미검증** (2026-08-06)
+세 가지 다 같은 이유다 — 구현한 날 C3가 크래시해서 네트워크에서 사라졌고 ROV도
+분리돼 있었다. 코드는 데모 백엔드와 27개 오프라인 테스트로만 검증됐다.
+
+1. **카메라 틸트 기능 번호가 [스펙]이다.** `BTN_FUNCTION`의
+   `mount_tilt_up=22 / mount_tilt_down=23 / mount_center=21`은 ArduSub `JSButton`
+   enum에서 왔고 **이 기체로 확인한 적이 없다**(리포에도 ArduPilot 소스가 없다).
+   버튼 번호 9/10/7은 사용자의 QGC 배치 캡처에서 온 것이라 근거가 있다.
+   - **완화됨**: 접속하면 `BTNn_FUNCTION`을 읽어 대조하고, 어긋나면 그 버튼을 **누르지
+     않고** 양쪽 가능성을 로그에 적는다. 즉 틀렸을 때의 증상은 "틸트가 조용히 안 됨 +
+     빨간 로그"이지 "엉뚱한 기능이 눌림"이 아니다.
+   - **확인법**: ROV 연결 후 `./c3 gui --source hw --allow-command` 로그에서
+     `button 10 = mount_tilt_up — tilt_up ok` 세 줄을 확인. 어긋나면 로그가 알려주는
+     실제 값으로 `BTN_FUNCTION`을 고치고 이 항목에서 1번을 지운다.
+2. **조이스틱 버튼 번역이 실기에서 안 돌아봤다.** 2026-08-07에 커널 번호를 그대로
+   보내다 **틸트 버튼이 arm을 걸어 모터가 살아나는 사고**가 났고, SDL 번역을 넣어
+   고쳤다(실기 관측 4건과 일치, `test_pad_buttons_are_translated_to_the_vehicles_numbering`).
+   번역 자체는 아직 기체로 확인 못 했다.
+   - **확인법**: COMMAND ENABLE만 켜고 **DISARM 상태에서** 버튼을 하나씩 눌러
+     `JOY` 줄의 `btn 커널>기체` 값이 아래와 맞는지 먼저 본다 — LB/RB `6>9`,`7>10` ·
+     View `10>4` · Menu `11>6` · 십자키 `>11..14`. 그 다음에야 arm한다.
+     조명은 **한 번에 한 칸**이어야 한다(두 칸이면 칩이 명령을 중복 발행하는 것 →
+     `notify=False` 경로 확인).
+   - **주의**: 패드 arm은 버튼 한 번이다(화면 ARM만 1.2 s hold). QGC와 같게 한 의도적
+     선택이지만, **패드 arm은 모드를 물려받는다** — 화면 ARM만 MANUAL을 먼저 요청한다
+     (비트마스크가 기체로 직행해서 가로챌 수 없다). 패드로 arm할 거면 모드를 먼저 볼 것.
+4. **비행 모드 제어가 실기 미검증이다.** `MAV_CMD_DO_SET_MODE`로 MANUAL(19) 등을
+   요청하고 ARM 버튼이 arm 직전에 MANUAL을 먼저 보낸다. 데모 백엔드로만 검증했다
+   (`test_arm_puts_the_vehicle_in_manual_first`).
+   - **확인법**: ARM 후 텔레옵의 `MANUAL` 버튼이 켜지는지(= 기체가 HEARTBEAT로 MANUAL을
+     보고), 그리고 armed + 입력 0에서 스러스터가 1500 µs로 가만히 있는지. `STAB`를
+     누르면 그때 비로소 움직여야 한다. ArduSub이 armed 중 전환을 거부하면 버튼
+     하이라이트가 안 바뀌는 것으로 드러난다(요청이 아니라 기체 보고를 그리므로).
+3. **영상 기본값 조합이 [유도]다.** `컬러 640×360 q80 @30 + depth 640×360 @20` =
+   83.1 Mb/s(92%). 부품은 전부 실측(depth 산식 + C3 자기 프레임 재인코딩)이지만
+   **조합을 링크에서 재본 적이 없다.** 92%는 여유가 크지 않다.
+   - **확인법**: 카메라 복구 후 HUD에서 depth 20.0 fps / drop 0%, 컬러 30 fps /
+     drop 0%, 합계 Mb/s가 85 아래인지. 드롭이 보이면 `--mjpeg-quality 75`(91%) →
+     `--fps 20`(88%) 순으로 내린다.
+- **부수**: 그 스윕 중 C3가 `ping was missed → Device likely crashed but did not
+  reboot` 로 죽고 전원이 돌아올 때까지 네트워크에서 사라졌다. 재현 조건 불명 —
+  다시 보이면 별도 항목으로 올릴 것.
+
+### `rov_gui`: ROS 2 백엔드는 **한 번도 실행된 적이 없다** (2026-08-06)
+- **사실**: 이 데스크톱에 `/opt/ros`가 없고 `robust` env에 `rclpy`도 없다(2026-08-06 확인).
+  `rov_gui/backends/ros2.py`는 구조만 완성돼 있고 **import 가드까지만 검증**됐다 —
+  토픽 이름, QoS 선택, `image_to_bgr`의 인코딩 처리, 퍼블리시 타이머는 전부 미실행 코드다.
+- **영향**: `--source ros2`가 처음 돌아갈 때 실패해도 놀랄 일이 아니다. demo/hw 경로는
+  `rov_gui/tests/test_offline.py`(14개)가 덮지만 ros2는 아무것도 덮지 않는다.
+- **임시 대응**: 실패해도 창은 뜨고 모든 패널이 OFFLINE으로 남는다(워커 예외 → `bus.log`).
+  즉 조용히 틀린 값을 그리지는 않는다.
+- **제대로 고치는 법**: ROS 2를 소싱한 인터프리터에서 실제 토픽으로 한 번 돌리고,
+  (a) `sensor_msgs/Image` step 패딩, (b) `SensorDataQoS`로 실제 conflate가 되는지,
+  (c) 헤더 stamp가 호스트 시계와 동기돼 있는지(아니면 latency가 상수 오프셋으로 읽힌다)
+  세 가지를 확인한 뒤 이 항목 삭제. conda env와 ROS python을 섞으면 rclpy 첫 spin에서
+  ABI 크래시가 나므로 인터프리터를 하나로 골라야 한다.
 
 ### C3 BNO086 IMU: extrinsic 없음 + 가속도계 스케일 +20% → VIO 쓰려면 캘리브레이션 필수 (2026-07-29)
 - **사실 1**: `getImuToCameraExtrinsics(CAM_A)` → `IMU calibration data is not available
@@ -190,16 +385,16 @@
 - **사실**: `square_setpoint`의 위치 경로는 각진 사각형이라 코너에서 참조 속도가 한 샘플
   (0.05 s) 만에 90° 뒤집힌다(|Δv|=0.212 m/s → 요구 가속도 사실상 무한). 게다가 yaw 참조는
   60°/s로 슬루(90°에 1.5 s)라 위치 참조와 **서로 모순** — 코너를 실제로 돌 때 필요한 선회율
-  126°/s(횡력 8 N)~474°/s(30 N)가 슬루 상한 60°/s를 크게 초과. 힘이 무한해도 기수가 경로를
+  126°/s(횡력 8 N)~474°/s(30 N)가 슬루 상한 60°/s를 크게 초과. 힘이 무한해도 기수가 경로를  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
   못 따라간다. (슬루 자체는 `slew_heading` docstring에 의도된 설계로 명시돼 있음.)
 - **정량**(dobmpc, gentle, **NONE 모드 = 외란 0**, lap 2–10 folded): 코너 2.00/1.92/2.04/2.39 cm
-  vs 직선 0.22–0.28 cm(≈10×). **surge 박스 8→30 N에서 소수점까지 불변**(코너 명령 surge는
+  vs 직선 0.22–0.28 cm(≈10×). **surge 박스 8→30 N에서 소수점까지 불변**(코너 명령 surge는  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
   평균 0.9–1.4 N으로 박스 근처도 안 감, 발동 0.7%) → **authority가 아니라 참조 기하 문제**.
   MPC는 preview+2차 비용으로 코너를 미리 돌아 안쪽으로 자르는(corner-cutting) **최적 절충**을
   하는 것이지 고장이 아님. 파랑 하에선 박스도 일부 기여하나 코너·직선을 거의 같은 비율로
-  줄여(33% vs 37%) 코너 특유 효과가 아님; 박스가 실제 개선하는 건 코너 **직후 회복**.
+  줄여(33% vs 37%) 코너 특유 효과가 아님; 박스가 실제 개선하는 건 코너 **직후 회복**.  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 - **영향**: DOB-MPC는 직선이 0.6–1.3 cm로 거의 완벽해서 이 코너 바닥이 오차 예산을 지배하고
-  trajectory_compare 그림에서 유독 도드라진다(절대값으로는 3사 중 최소: gentle CDW 코너
+  trajectory_compare 그림에서 유독 도드라진다(절대값으로는 3사 중 최소: gentle CDW 코너  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
   PID 24.6 / MPC 13.2 / DOB 3.8 cm). 컨트롤러 튜닝으로는 제거 불가.
 - **줄이려면**: 참조 설계를 고칠 것 — 코너 필렛(원호/스플라인, 반경을 달성 가능 횡력과 yaw
   슬루율에 정합) 또는 코너 감속 프로파일, 또는 yaw 슬루 상한 상향. 어느 쪽이든 벤치마크

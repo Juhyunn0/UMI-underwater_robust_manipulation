@@ -47,6 +47,7 @@ import cv2
 import numpy as np
 
 from c3_camera import config as C
+from c3_camera import preflight as PF
 from c3_camera import viz
 from c3_camera.config import STREAM_COLOR, STREAM_DEPTH, STREAM_LEFT, STREAM_RIGHT
 from c3_camera.recorder import Recorder, estimate_disk_mb_per_min
@@ -281,6 +282,7 @@ def main(argv: list[str] | None = None) -> int:
                    help="resolve the config and print the bandwidth budget without "
                         "connecting — plan a setting without paying the 12 s boot "
                         "or taking the camera from whoever has it")
+    PF.add_preflight_args(p)
     a = p.parse_args(argv)
 
     cfg = C.config_from_args(a)
@@ -311,6 +313,17 @@ def main(argv: list[str] | None = None) -> int:
     print("=" * 74)
     print("C3 direct DepthAI stream")
     print("=" * 74)
+
+    # Readiness before the ~12 s PoE boot, so "the camera is owned" costs two
+    # seconds and names its owner rather than three failed connection attempts.
+    # No vehicle checks: this tool records no telemetry, so waiting on MAVLink
+    # would be a delay that buys the operator nothing.
+    rc_pf = PF.gate(a, title="c3 stream", vehicle=False,
+                    out_dir=(a.record_dir or Path("c3_camera/recordings"))
+                            if a.record else None,
+                    display=not a.no_display)
+    if rc_pf is not None:
+        return rc_pf
 
     log = CsvLog(a.csv) if a.csv else None
     window = "C3 — RGB + depth"

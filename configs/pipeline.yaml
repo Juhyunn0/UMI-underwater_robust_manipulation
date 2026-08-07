@@ -1,0 +1,237 @@
+# Handheld-UMI capture pipeline. Every tunable lives here; none is hardcoded.
+#
+# record.py -> extract_gripper_width.py -> warp.py -> build_zarr.py
+#
+# Values marked PLACEHOLDER are not measurements. They are stand-ins chosen so the
+# pipeline runs end to end against synthetic input, and they are propagated into every
+# artifact as `dimensions_are_placeholders: true` rather than being quietly adopted.
+
+schema: umi_handheld_pipeline/1
+
+cameras:
+  # Departure grid: what the demonstrations are recorded on (in air).
+  source: configs/source_camera_air.yaml
+  # Arrival grid: what the policy is deployed on (underwater).
+  target: configs/target_camera_underwater.yaml
+
+record:
+  fps: 30.0
+  # The stereo core can be fed faster than it emits. Surplus input frames are not
+  # wasted — the temporal filter gets more evidence per output frame. Measured on this
+  # unit: 72.4% valid @ 30.5 fps at mono 30, 76.5% @ 39.7 fps at mono 60. The cost is a
+  # shorter auto-exposure ceiling (1/fps), which is not binding here: AE picked 10.35 ms
+  # at 30 fps and 8.07 ms at 60 fps, for -6% image brightness. Raise to 60 if you want
+  # the density and the scene is well lit.
+  mono_fps: 30.0
+  # What to save, and what crosses the XLink at all. left+depth are the pipeline's
+  # input contract and are always streamed; right and colour are optional and kept for
+  # later (a second view, and RGB if the predictor ever wants it). Nothing downstream
+  # reads them today.
+  #
+  # Dropping "color" from this list is the fix for the frame drops at 1280x800:
+  # measured 3.67% of device frames lost with colour on and 0.33% with it off, at the
+  # same latency. Dropping "right" saves disk and link but measured no latency change.
+  # (Until 2026-08-04 this key was read by nothing at all — editing it did nothing.)
+  streams: [left, right, depth, color]
+  # Preview/recording latency. The stereo node's input queues default to 8 frames deep
+  # and, at the compute limit, stay full — so the core works on 8-frame-old input.
+  # Size 1 measured 153 ms instead of 252 ms AND fewer dropped frames; see the table in
+  # record.py's build_device_pipeline. Raise it only with a measurement in hand.
+  stereo_input_queue: {size: 1, blocking: false}
+  # The other end of the same lever, and until 2026-08-06 the only buffering stage in
+  # the chain with no setting behind it: the XLinkOut nodes ran at DepthAI's default
+  # (8, blocking) while only the stereo inputs above were tuned. A deep blocking queue
+  # here holds finished frames on the device waiting for the link, so what the host
+  # receives is already several periods old. Measure with
+  # `python -m umi_handheld.bench_stereo --config <this file>` — it reports `age` and
+  # `drop%` — and change this with a number in hand.
+  xlink_out_queue: {size: 1, blocking: false}
+  colour:
+    enable: true
+    resolution: "800p"          # OV9782 on CAM_A, 1280x800 global shutter
+    # CAM_A is a separate sensor: colour is NOT pixel-aligned with depth, and its
+    # timestamp is recorded separately in frames.csv so the skew stays visible.
+    #
+    # encode: mjpeg | raw. This is a frame-rate setting, not a storage one. Writing
+    # 1280x800 BGR as PNG on the host measured 45.6 ms/frame — a 21.9 fps ceiling by
+    # itself, and it was the real reason recording sat at 17 fps. The device's hardware
+    # encoder removes it entirely. Use raw only if the colour stream must be lossless.
+    encode: mjpeg
+    quality: 97
+  # Host-side disk writing, moved off the capture loop. Serialised, the three mono/depth
+  # PNGs measured 12.0 ms/frame (an 83 fps ceiling — close enough to the device rate to
+  # steal from it). The queue is bounded, so a slow disk slows recording rather than
+  # buffering until memory runs out.
+  writer:
+    workers: 4
+    queue_depth: 96
+  # StereoDepth. Not defaults-by-taste: from same-scene sweeps on this unit
+  # (OAK-D-W 14442C10716DBCD600). Density numbers are only comparable WITHIN a sweep,
+  # because the camera was pointed at a different scene between them.
+  #
+  # Sweep 1 (2026-08-04, textureless desk scene) picked the filters:
+  #   400p, no subpixel, conf 200, spatial 2x1, no temporal -> 32.3% valid @ 19.9 fps
+  #   + subpixel + conf 245, no spatial/temporal            -> 38.3% valid @ 31.3 fps
+  #   + spatial 3x1 + temporal                              -> 47.2% valid @ 17.3 fps
+  # Sweep 2/3 (same day, second scene) found where the frame rate actually goes:
+  #   spatial filter is ALL-OR-NOTHING: radius 1 -> 18.5 fps, radius 3 -> 18.3 fps
+  #   extended, subpixel and temporal are each ~free (30.6 -> 30.7 fps)
+  #   more post-processing shaves buys little: 4 -> 8 shaves is 18.3 -> 22.1 fps
+  #   decimation 2 pays for the spatial filter outright:
+  #     dec1 spatial 3x1 -> 71.5% valid @ 18.3 fps  at 640x400
+  #     dec2 spatial 3x1 -> 72.4% valid @ 30.5 fps  at 320x200
+  #     dec2 spatial 3x2 -> 73.7% valid @ 30.5 fps  at 320x200   <- chosen
+  #     dec2 spatial 3x2, mono 60 -> 80.1% valid @ 30.8 fps
+  # 800p was measured in sweep 1 and is not worth it: 48.3% at 3.3 fps, and MinZ doubles.
+  stereo_depth:
+    mono_resolution: "400p"          # sets MinZ; see the table in record.py's output
+    depth_align: rectified_left      # dai DepthAlign.RECTIFIED_LEFT, not the socket
+    extended_disparity: true         # 95 -> 190 disparity levels, halves MinZ
+    subpixel: true                   # precision, and measured free vs no-subpixel at 3x1
+    subpixel_bits: 3
+    lr_check: true
+    confidence_threshold: 245        # permissive; 200 measured 6 points less dense
+    disparity_shift: 0
+    # MUST be off: extended x subpixel gives 95*2*8 = 1520 disparity levels and the
+    # median filter supports 1024, so the device disables it anyway and logs an error
+    # every frame. The spatial filter does the smoothing instead.
+    median_filter: "off"
+    # NOT cosmetic, and NOT the default. Leaving setPostProcessingHardwareResources
+    # uncalled measured 13.1 fps on the config below; calling it with (4, 4) measured
+    # 30.6 fps, and (2, 2) 21.7 fps. Whatever depthai 2.32 allocates implicitly is
+    # worse than (2, 2). Found by a harness that omitted the call and disagreed with
+    # record.py by 2.3x on a byte-identical filter chain.
+    # (6, 6) measured the same 30.6 fps; slices > 6 is rejected by the device.
+    hardware_resources: {shaves: 4, slices: 4}
+    post_processing:
+      # Decimation runs FIRST, so every later filter costs a quarter as much. This is
+      # what makes the spatial filter affordable. It shrinks the DEPTH image only:
+      # left/right stay 640x400.
+      #
+      # It does not move MinZ: disparity is computed on the full grid and decimation
+      # only downsamples the result afterwards, so fx*B/nd still holds. Measured, the
+      # 0.1st-percentile closest return was 152-153 mm with and without it. The
+      # absolute closest return did rise (124-133 mm at factor 1, 145 mm at factor 2),
+      # which is the 2x2 non-zero MEDIAN discarding isolated nearest samples, not the
+      # range floor moving. Nothing in that scene was near MinZ, so neither number
+      # bounds it -- MinZ itself stays derived, not measured.
+      #
+      # Set factor: 1 to keep depth at the full 640x400 and accept ~18 fps.
+      decimation: {factor: 2, mode: non_zero_median}
+      speckle:   {enable: true,  speckle_range: 28, difference_threshold: 2}
+      temporal:  {enable: true,  alpha: 0.4, delta: 20}
+      spatial:   {enable: true,  hole_filling_radius: 3, num_iterations: 2,
+                  alpha: 0.5, delta: 20}
+      threshold: {enable: true,  min_range_mm: 100, max_range_mm: 3000}
+  max_disparity: 190                 # must agree with extended_disparity
+  mono_encode: none                  # lossless on USB3; PoE budget does not apply
+  depth_scale: 1000.0                # metres = png_value / depth_scale
+
+gripper:
+  aruco:
+    dictionary: DICT_APRILTAG_36h11
+    # The OUTER BLACK SQUARE's side, which is what cv2.aruco.detectMarkers returns
+    # corners for and therefore what solvePnP's object points must match. For 36h11
+    # that square is 8 modules across: 6x6 of data plus one black border module on
+    # each side. Verified on this cv2 (4.10.0) by rendering at 40 px/module and
+    # measuring the returned corners: 319 px = 7.97 modules, i.e. the outer edge.
+    # Getting this wrong by using the 6-module data boundary instead would be a
+    # silent 33% scale error on every pose.
+    #
+    # 21.37 mm: caliper measurement of the printed sheet, reported by the user
+    # 2026-08-06. Not a nominal size and not from a file — remeasure and update this
+    # if the tags are ever reprinted, because the printer's scale is part of it.
+    marker_length_m: 0.02137
+    # Printed quiet zone is ~4 mm [사용자 실측 2026-08-06] = 1.5 modules at
+    # 21.37/8 = 2.671 mm per module. The detector's requirement is 1 module, so this
+    # clears it; widen it if the tags end up mounted against a dark surface.
+    #
+    # The two ids to look for. Under method: relative_axis these names are labels
+    # only — which one is the fixed reference is `reference_tag_id` below.
+    left_tag_id: 0
+    right_tag_id: 1
+    corner_refinement: subpix
+  # How the jaw opening is read off the two tags.
+  #
+  #   relative_axis  UMI_underwater's quantity: the MOVING tag's centre expressed in
+  #                  the REFERENCE tag's frame, one axis of it, SIGN PRESERVED
+  #                  (width_append.py:234-237 and :612-616; their default range
+  #                  -3.5 -> +15.5 mm crosses zero, so the sign is load-bearing).
+  #                  Cancels wrist rotation, because the reference tag defines the frame.
+  #
+  #   euclidean      ||t_a - t_b|| in the CAMERA frame. Always positive, so it folds
+  #                  into a V and stops being monotonic if the tags pass their closest
+  #                  approach — which is exactly what a moving-tag rig does. Correct
+  #                  only for a tag-per-jaw rig whose tags separate along one direction.
+  method: relative_axis
+  reference_tag_id: 1                # the FIXED tag; must be one of the aruco ids
+  # Which axis of the reference tag's frame carries the stroke.
+  #   auto  pick by smoothed-span / residual-noise on THIS take and say so. Fine for a
+  #         first grippercalibration run; pin it afterwards, because a per-take choice
+  #         can differ between takes and would silently change the signal.
+  #
+  # y, from sessions/grippercalibration_0004 (1151 frames, 38.4 s, 2026-08-06).
+  # snr y=17.6 against x=5.3 and z=5.0. The smoothed y trace holds flat plateaus at
+  # ~28 and ~43 mm and an FFT puts the dominant period at 4.80 s over a 38.4 s take,
+  # i.e. exactly the 8 open/close cycles that were performed. x is the near-constant
+  # lateral offset between the tags; z is the reference tag's out-of-plane rotation
+  # noise (raw span 57.6 mm, LARGER than the real signal — which is why raw span is
+  # not the selection rule; see axis_quality in extract_gripper_width.py).
+  axis: y                            # auto | x | y | z
+  # Outlier gate on the tag plane distance, after iPhUMI's z_tolerance idea. Applied to
+  # each tag's CAMERA-frame Z, so if the moving tag travels along the optical axis the
+  # tolerance has to span the whole stroke or the extremes are silently dropped.
+  #
+  # 332 +- 50 mm. Over sessions/grippercalibration_0004 both tags stayed inside
+  # 312-352 mm (tag 0 312-352 over 935 poses, tag 1 313-351 over 1079) — a 40 mm
+  # spread, which is what a camera rigidly mounted to the rig should give. The 50 mm
+  # tolerance is that range plus margin for a different grip, and still rejects the
+  # 400 mm+ returns that are failed poses rather than reach.
+  nominal_tag_z_m: 0.332
+  z_tolerance_m: 0.05
+  # Which way the signal runs, confirmed VISUALLY rather than assumed:
+  # sessions/grippercalibration_0004 frame 695 (y = 24.9 mm) has the jaws together and
+  # frame 724 (y = 43.9 mm), 1.0 s later at the same viewing angle, has them spread.
+  # So y grows as the gripper OPENS. That is the OPPOSITE of UMI_underwater's rig,
+  # where the distance decreases with opening (width_append.py:705-708) — which is
+  # exactly why this is a config value and not an assumption in the code.
+  distance_increases_with_opening: true
+  smoothing_window: 5                # moving average, frames
+  max_interp_gap: 10                 # frames; longer dropouts stay NaN
+  # Every number in this block is measured on the real rig now, not a stand-in.
+  dimensions_are_placeholders: false
+  calibration:
+    # Signed positions on the chosen axis, NOT widths — under relative_axis a negative
+    # endpoint is legitimate; only max > min is required.
+    #
+    # From sessions/grippercalibration_0004: 2nd/98th percentile of the signal at this
+    # file's smoothing_window (5), which is stable to about 1 mm across windows of
+    # 1, 5, 9, 15 and 21. Percentiles rather than min/max so one bad pose cannot set an
+    # endpoint. Stroke = 19.0 mm, which matches UMI_underwater's own 19 mm span
+    # (width_append.py:378-379, -3.5 to +15.5 mm).
+    #
+    # This is what makes episodes COMPARABLE: with these null, every take normalises
+    # against its own observed range, so 0.5 means a different physical opening in
+    # every episode and the training signal is inconsistent across the dataset.
+    min_width_m: 0.02555             # jaws CLOSED
+    max_width_m: 0.04450             # jaws OPEN
+
+warp:
+  # Departure grid -> arrival grid. Rays are built with the target model and
+  # projected through the source model, so the map is target-pixel -> source-pixel.
+  target_size: [640, 400]
+  # TODO(quality): the target model is raw CAM_B, not the rectified-left grid the C3
+  # actually serves depth on. The EEPROM dump carries no stereo extrinsics, so
+  # cv2.stereoRectify cannot be run and P1/R1 do not exist yet.
+  target_grid_note: "raw_CAM_B (rectified model unavailable)"
+  mono_interpolation: linear
+  depth_interpolation: nearest       # never interpolate depth across an edge
+
+zarr:
+  resize: [112, 112]                 # MUST match the training config's resize_to
+  crop: centre                       # centre | none — applied on the WARPED grid
+  z_near_m: 0.20
+  z_far_m: 2.0
+  depth_dtype: float16
+  chunk_len: 100
+  gripper_mask_png: null             # optional ROV-gripper silhouette overlay

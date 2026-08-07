@@ -17,6 +17,28 @@
 
 재실행: `Workflow({scriptPath: '.../measurement-audit-wf_41f2a0d2-ee5.js', resumeFromRunId: 'wf_41f2a0d2-ee5'})` — 완료된 9개 감사자는 캐시에서 즉시 돌아오고 실패한 4개만 다시 돈다.
 
+## 후속 — 해소된 항목 (표는 감사 시점의 기록이므로 고치지 않고 여기에 적는다)
+
+### MinZ 298.9 / 149.4 mm → **실측 300 / 150 mm** (2026-08-05)
+
+해당 행: **305, 390, 896, 910** (그리고 1042·1096의 인용). 감사가 "formula output,
+산출물 없음"으로 판정한 것이 맞았고, 이제 산출물이 생겼다.
+
+- **측정**: `c3_camera/datasets/*/depth/`, `c3_camera/recordings/*/depth/` 전수 —
+  47,270 프레임 / 3.6e9 유효 픽셀. 바닥이 정확히 **300 mm**(기본) / **150 mm**
+  (`--extended`)이고 **그 아래 픽셀은 0개**. 대표 산출물:
+  `datasets/dataset_20260803_102816`(300 mm에 877,378 px),
+  `datasets/dataset_20260803_162223`(150 mm, extended),
+  `recordings/20260729_162216`(유효 픽셀의 4.61%가 바닥).
+- **따라서 `TESTING.md:484`의 미해결 질문도 닫힌다**: rectified pair는 CAM_C(fx
+  760.28 @1280 → 380.14 @640)를 물려받는다. 바닥이 정확히 300으로 찍히려면
+  fx*B/95 ∈ [300, 301) 즉 fx_rect ∈ [380.0, 381.3)이어야 하는데 CAM_B의 378.56은
+  298을 찍었어야 하고 그런 값은 데이터에 없다.
+- **반영**: `c3_depth_accuracy.py`(FX_MONO_1280 = 760.28), `test_depth_accuracy.py`,
+  `TESTING.md`, `host_depth.py`, `KNOWN_ISSUES.md`. 공기 중 물리거리 ≈225 mm는
+  여전히 `[유도]`로 남는다 — 줄자 검증(`c3_depth_accuracy.py`)은 **아직 한 번도
+  실행된 적이 없다**.
+
 ## 왜 이 감사를 했는가
 
 `.claude/journal/research.md`의 "+28 mm bias"가 실측치처럼 서술되어 있었으나 실제로는

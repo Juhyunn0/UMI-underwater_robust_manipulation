@@ -3,7 +3,7 @@
 C3 카메라를 DepthAI로 직결(Madrona 우회)해서 잡고, 동시에 BlueROV2의 MAVLink
 텔레메트리를 기록해서, **전부 하나의 타임라인 위에** TUM RGB-D 레이아웃으로 쓴다.
 
-카메라 직결 자체(지연 3000 ms → 35 ms)와 그 실측 근거는
+카메라 직결 자체(지연 3000 ms → 35 ms)와 그 실측 근거는  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 [README.md](README.md)에 있다. 이 문서는 **데이터셋 수집** 부분만 다룬다.
 
 > 각 데이터셋 폴더의 `metadata.txt`는 **영어로** 쓰인다. depth_scale·타임스탬프·
@@ -16,10 +16,17 @@ OAK 디바이스는 **파이프라인을 하나만** 허용한다. Madrona가 �
 카메라가 유휴(`X_LINK_BOOTLOADER`)일 수 있다** — 이 경우 아무것도 안 건드리고 붙는다.
 
 ```bash
-V=~/.venvs/c3-depthai/bin/python
-
-$V c3_camera/discover_c3.py --probe        # free / OWNED 를 명시적으로 알려준다
+./c3 discover --probe                      # free / OWNED 를 명시적으로 알려준다
 ```
+
+> 아래 예시들은 `$V c3_camera/<tool>.py` 형태로 적혀 있는데, `./c3 <tool>`이 같은
+> 일을 한다 (`V=~/.venvs/c3-depthai/bin/python`). 그리고 플래그를 매번 치는 대신
+> **프로파일**을 쓸 수 있다:
+>
+> ```bash
+> ./c3 collect --profile research_near            # c3_camera/profiles/*.yaml
+> ./c3 collect --profile research_near --dry-run  # 값 + 출처 확인
+> ```
 
 `OWNED`로 나오면:
 
@@ -139,20 +146,20 @@ photometric calibration 데이터에는 쓰지 말고, 특징점 기반 SLAM에�
 | 영상 | `rgb.mp4`만 | 무손실 PNG 4스트림 **+** 참고용 `rgb.mp4` |
 | 기본 설정 | 960x540 MJPEG @15 | 480x270 무손실 @8, depth 1:1 |
 | 텔레메트리 | CSV | CSV |
-| 용량 | 약 0.5 GB/시간 | 약 21 GB/시간 |
+| 용량 | 약 0.5 GB/시간 | 약 21 GB/시간 [UNVERIFIED: 예시/유도값 — docs/MEASUREMENT_AUDIT.md] |
 
 ## 3. 실측 성능 (research 모드)
 
-기본 설정 480x270 컬러+depth + 640x400 스테레오 @8 fps, 20초 실측:
+기본 설정 480x270 컬러+depth + 640x400 스테레오 @8 fps, 20초 실측:  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 
 | 항목 | 값 |
 |---|---|
 | 프레임 | 8.0 fps 요청 → **8.0 실측, 드롭 0** |
 | 이미지 | 프레임당 4장 무손실 PNG |
 | 링크 | 62 Mbit/s (실측 천장 91.5의 69%) |
-| 디스크 | 약 11–13 MB/s (약 21 GB/시간) |
-| 지연 | 컬러 p50 88 ms, depth 89 ms |
-| 카메라 IMU | 200 Hz 요청 → **약 130 Hz 실측** (아래 참고) |
+| 디스크 | 약 11–13 MB/s (약 21 GB/시간) [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
+| 지연 | 컬러 p50 88 ms, depth 89 ms [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
+| 카메라 IMU | 200 Hz 요청 → **약 130 Hz 실측** (아래 참고) [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
 
 **병목은 디스크가 아니라 PoE 링크다.** 브리프에서 디스크를 걱정하셨지만, 이
 NVMe는 링크가 줄 수 있는 ~11 MB/s보다 수십 배 빠르다. PNG 인코딩도 프레임당
@@ -162,10 +169,10 @@ NVMe는 링크가 줄 수 있는 ~11 MB/s보다 수십 배 빠르다. PNG 인코
 | 해상도 (컬러=depth, 모노 640x400) | 링크 상한 fps |
 |---|---|
 | 480x270 | 11.8 |
-| 640x360 | 8.7 |
-| 960x540 | 4.9 |
+| 640x360 | 8.7 [UNVERIFIED: 예시/유도값 — docs/MEASUREMENT_AUDIT.md] |
+| 960x540 | 4.9 [UNVERIFIED: 예시/유도값 — docs/MEASUREMENT_AUDIT.md] |
 
-더 높은 fps가 필요하면 `--streams color,depth`로 스테레오를 빼거나(14 fps),
+더 높은 fps가 필요하면 `--streams color,depth`로 스테레오를 빼거나(14 fps),  [UNVERIFIED: 예시/유도값 — docs/MEASUREMENT_AUDIT.md]
 해상도를 내린다.
 
 ## 4. 출력 형식
@@ -187,7 +194,7 @@ dataset_YYYYMMDD_HHMMSS/
 ├── calibration.json 온디바이스 공장 캘리브레이션
 ├── orbslam3_rgbd.yaml  실제 intrinsics로 생성된 ORB-SLAM3 설정 초안
 ├── rgb.mp4          참고용 미리보기 (손실 압축, 데이터 아님)
-└── metadata.txt/.json  depth_scale·시계·IMU 주의사항 전부 (영어)
+└── metadata.txt/.json  depth_scale·시계·IMU 주의사항 + 시작 시점 preflight (영어)
 ```
 
 - **depth는 절대 비디오로 안 넣는다.** 16-bit PNG 무손실(`--record-depth-format
@@ -226,7 +233,7 @@ metres = png_pixel_value / 1000.0        ← 우리 데이터 (uint16 밀리미�
 ## 5. 타임스탬프 — 동료에게 설명할 내용
 
 **측정 결과 이 호스트에서 `dai.Clock.now()`와 `time.monotonic()`은 같은 시계
-(CLOCK_MONOTONIC)이고 8 마이크로초 이내로 일치합니다.** 따라서 카메라 프레임,
+(CLOCK_MONOTONIC)이고 8 마이크로초 이내로 일치합니다.** 따라서 카메라 프레임,  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 카메라 IMU, MAVLink 수신 시각이 **변환 없이 이미 한 타임라인 위에** 있습니다.
 
 파일에 쓰이는 값은 전부 **Unix epoch 초, 소수점 6자리**이고, 세션 시작 시 한 번
@@ -252,7 +259,7 @@ t_unix = t_monotonic + clock_offset_monotonic_to_unix
 
 **C3에는 온보드 IMU가 있습니다: BNO086** (`getConnectedIMU()`로 확인, firmware
 3.9.9). 카메라와 강체로 붙어 있고 타임스탬프가 이미지와 같은 시계라
-**VIO에는 이걸 쓰는 게 맞습니다.** ROV의 Navigator IMU는 수십 cm 떨어져 있고
+**VIO에는 이걸 쓰는 게 맞습니다.** ROV의 Navigator IMU는 수십 cm 떨어져 있고  [UNVERIFIED: 예시/유도값 — docs/MEASUREMENT_AUDIT.md]
 다른 보드에서 UDP로 도착 시각만 찍혀 옵니다 — 맥락·교차검증용입니다.
 
 ### 실측한 레이트 규칙
@@ -260,10 +267,10 @@ t_unix = t_monotonic + clock_offset_monotonic_to_unix
 | 설정 | 실측 |
 |---|---|
 | accel+gyro @500 요청 | **486 Hz** |
-| accel+gyro @200 | 194 Hz |
-| accel+gyro @200 **+ rotvec @100** | 97 Hz (전부 반토막) |
-| accel+gyro @200 **+ mag @100** | 97 Hz (전부 반토막) |
-| accel+gyro @200 **+ rotvec @200** | **194 Hz** (손실 없음) |
+| accel+gyro @200 | 194 Hz [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
+| accel+gyro @200 **+ rotvec @100** | 97 Hz (전부 반토막) [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
+| accel+gyro @200 **+ mag @100** | 97 Hz (전부 반토막) [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
+| accel+gyro @200 **+ rotvec @200** | **194 Hz** (손실 없음) [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
 
 **규칙 1: 켜 놓은 센서 중 가장 느린 것의 레이트가 전부에 적용된다.** 그래서
 `--imu-rotation-vector`는 같은 레이트로 요청하므로 공짜지만,
@@ -273,7 +280,7 @@ t_unix = t_monotonic + clock_offset_monotonic_to_unix
 
 | `--imu-batch` | 200 Hz 요청 결과 |
 |---|---|
-| 1 | 130 Hz 수신, **35% 손실** |
+| 1 | 130 Hz 수신, **35% 손실** [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
 | 10 (기본) | **199.5 Hz 수신, 손실 0** |
 
 원인은 대역폭이 아니라 **메시지당 XLink 오버헤드**였습니다. 리포트 1개당 메시지
@@ -302,6 +309,22 @@ preintegration이 깨집니다.** 그래서 `c3_collect.py` 기본값이 10입�
 
 이 세 가지는 전부 `metadata.txt`에 적힙니다. 캘리브레이션 안 된 IMU로 만든 VIO
 결과는 "알고리즘 문제"처럼 보이는 방식으로 실패하기 때문입니다.
+
+### 녹화가 시작될 때 리그가 어땠는지 (`preflight`)
+
+`c3_collect.py`는 연결 전에 준비 상태 검사를 돌리고(`c3_camera/preflight.py`), 그
+리포트를 `metadata.json`의 `preflight` 키에 통째로 남깁니다. 깨끗하지 않았던 검사는
+`metadata.txt`의 `== preflight ==` 절에도 한 줄씩 적힙니다:
+
+```
+== preflight ==
+These readiness checks were NOT clean when this run started. They are
+the first thing to suspect if something in this dataset looks wrong:
+  [WARN] telemetry path: nothing arrived on UDP 0.0.0.0:14551 in 3 s — ...
+```
+
+이게 있는 이유는 단순합니다 — 몇 달 뒤 폴더만 남았을 때 "`telemetry.csv`가 왜
+비었지"의 답이 대개 그 줄이고, 다른 어떤 파일도 그걸 기록하지 않습니다.
 
 ## 7. 제어 — 지금은 안 보냅니다
 
@@ -343,6 +366,7 @@ failsafe는 계속 ArduSub가 합니다. 바뀌는 건 **QGroundControl이 하�
 --fps 8                         --streams color,depth,left,right
 --color-wire nv12|bgr           --mono-source raw|rectified
 --depth-size WxH                (research는 기본이 컬러와 동일 = 1:1)
+--extended                      근거리 disparity 확장 (~30 cm -> ~15 cm 이론값)
 
 --imu-rate 200                  --imu-rotation-vector   (같은 레이트라 공짜)
 --imu-magnetometer              (전체를 100 Hz로 묶음)

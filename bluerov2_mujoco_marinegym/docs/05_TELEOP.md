@@ -42,8 +42,8 @@ wave (oscillating) — i.e. the disturbance *source*. **Kicks are a real externa
 force**, shown as the red arrow.
 
 **Scale:** arrow length = magnitude × scale, capped:
-- forces: `0.003 m/N`, cap `0.6 m` (buoyancy 111 N → 0.33 m ≈ vehicle size);
-- velocities: `0.5 m per m/s`, cap `0.4 m` (current 0.2 m/s → 0.10 m).
+- forces: `0.003 m/N`, cap `0.6 m` (buoyancy 111 N → 0.33 m ≈ vehicle size);  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
+- velocities: `0.5 m per m/s`, cap `0.4 m` (current 0.2 m/s → 0.10 m).  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 Arrows below ~0.5 N (or 0.01 m/s) are not drawn.
 
 **Legend & magnitudes:** the color→force legend is printed to the console at
@@ -87,14 +87,14 @@ python teleop.py --selftest              # headless key->direction check (any pl
 `--selftest` (no display) asserts W→+x, S→−x, Q→+y, E→−y, R→+z, F→−z, A→+Mz, D→−Mz,
 Z→+Mx, C→−Mx, X→zero — all pass. (Sway shows ~zero roll because the allocator cancels
 the sway→roll coupling; surge keeps a small uncontrollable pitch — both consistent
-with the rank-5 allocation.)
+with the rank-5 allocation.)  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 
 ## Verification of the arrows
 
 With disturbances on, the arrows match the physics (checked headlessly by drawing
 into an `MjvScene`): buoyancy ~111 N up (≈ constant), drag opposes motion, thrust
 matches the command, current arrow along the flow, wave arrow oscillates, and a kick
-gives a brief red spike (e.g. ~31 N). The Phase 1–4 suites still pass — the viz does
+gives a brief red spike (e.g. ~31 N). The Phase 1–4 suites still pass — the viz does  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 not alter the dynamics.
 
 ## Notes / gotchas

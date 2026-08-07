@@ -75,7 +75,7 @@ Additional notes:
  ./isaaclab.sh -p scripts/tools/convert_urdf.py  <input_urdf> <output_usd> --merge-joints --make-instance
  ```
 
- - Generally converges in about 400 iterations with 2048 environments and achieves mean total reward ~95-100. Lowering action penalty often helps if there are issues with convergence.
+ - Generally converges in about 400 iterations with 2048 environments and achieves mean total reward ~95-100. Lowering action penalty often helps if there are issues with convergence.  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 
 To cite:
 ```

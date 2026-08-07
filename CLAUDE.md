@@ -53,3 +53,30 @@ matching journal in [`.claude/journal/`](.claude/journal/) (`consults.md` /
 If a **durable fact or decision** emerged, ALSO write/update a memory file and add
 its `MEMORY.md` index line (the journal is the chronological trail; memory is the
 recall index). Skip trivial Q&A to avoid noise.
+
+## Measurements — cite the artifact or don't call it a measurement
+
+**Rule: whenever a number goes into a doc, journal, memory, or code comment as a
+measured value, the artifact path goes with it.** If you cannot name a path, it is not
+a measurement — tag it `[예측]`, `[유도]`, or `[스펙]` instead.
+
+```
+나쁨:  depth bias +28 mm
+좋음:  depth bias +28 mm  (c3_camera/depth_accuracy/rungs.csv, row tape=2000)
+좋음:  depth bias ±dZ/2 = ±70 mm  [예측: c3_depth_accuracy.py:88-99, 미실측]
+```
+
+Why: a 2026-08-04 audit of 1028 numeric claims across 26 docs found **284 that read as
+measurements but had no artifact behind them** — including a fabricated
+"+28 mm bias" (a synthetic example written while reviewing the tool) and an
+unsourced "IN-AIR calibration" assumption that was later cited as device fact and
+turned out to be backwards. Ledger: [`docs/MEASUREMENT_AUDIT.md`](docs/MEASUREMENT_AUDIT.md).
+
+Three failure modes that audit found, worth guarding against specifically:
+- **Docstring numbers become measurements.** A "this is roughly what you get" value
+  written beside a new tool gets cited later as a result.
+- **Precision grows on citation.** `PSNR 45.6` becomes `45.60`; extra significant
+  figures are a provenance smell.
+- **Hedges fall off on citation.** `약 3000 ms` becomes `3000 ms`, and our own
+  assumptions printed into output files (`calibration.json`'s `note`) come back
+  looking like the device said them.

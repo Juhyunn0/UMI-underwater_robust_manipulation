@@ -1,0 +1,96 @@
+# Maximum-resolution NEAR profile — the E key in record.py's preview switches to this.
+#
+#     python -m umi_handheld.record --source device --config configs/pipeline_maxres.yaml
+#     ... then press E, which reopens the device on this config.
+#
+# Everything not stated here comes from pipeline_maxres.yaml, so the two profiles differ
+# by exactly the block below. This is the same 1280x800 depth, bought closer:
+#
+#                        pipeline_maxres.yaml         this profile
+#   depth                1280 x 800                   1280 x 800
+#   MinZ                 449.0 mm                     224.5 mm      <-- the point
+#   frame rate           29.06 fps measured           19.68 fps measured
+#   depth step @ 1 m     2 mm measured                21 mm measured  <-- the price
+#
+# Frame rates from real takes, not the bench: sessions/demonstration_0015 (341 frames)
+# and sessions/demonstration_0019 (228 frames), both 12 s with all four streams written
+# to disk. 0019 dropped no frames; at 29 fps the colour stream costs 3.3% of them, and
+# at 19.7 fps there is enough link slack that it costs none (see KNOWN_ISSUES).
+#
+# MinZ = fx * B / d_max and extended disparity doubles d_max from 95 to 190, so
+# 566.376 * 0.075317 / 190 = 224.5 mm. Nothing else moves it at this resolution: the
+# disparity search is a fixed 95 px (190 extended) regardless of mono resolution.
+# CONFIRMED, not just derived: with the threshold floor set to 150 mm — deliberately
+# below the derived value — the closest return across 228 frames was 224 mm
+# (sessions/demonstration_0019).
+
+extends: pipeline_maxres.yaml
+
+schema: umi_handheld_pipeline/1
+profile: maxres-extended
+
+record:
+  stereo_depth:
+    extended_disparity: true
+    #
+    # SUBPIXEL AND MEDIAN CANNOT COEXIST HERE, and that is the whole design of this
+    # profile. The median filter supports at most 1024 disparity levels; extended x
+    # subpixel is 190 * 8 = 1520 and the device logs
+    #
+    #   [error] Maximum disparity value '1520' exceeds the maximum supported '1024'
+    #           by median filter. Disabling median filter!
+    #
+    # every frame and drops the filter. Without subpixel it is 190 levels and median
+    # is legal. Measured which way to resolve it (umi_handheld/bench_stereo.py
+    # --sweep extended, device 14442C10716DBCD600, 2026-08-04, one static scene, 7 s
+    # per row, extended on throughout):
+    #
+    #   config                              valid%  tstd  rough   tail    fps
+    #   subpixel, no filter (ceiling)         85.9  60.2   22.0  10.4%   16.00
+    #   subpixel + speckle                    91.5  33.9   17.0   6.2%    8.14
+    #   subpixel + temporal                   92.9  34.6   18.0   9.0%   16.00
+    #   no subpixel, no filter (ceiling)      91.7  53.6    0.0   6.3%   19.43
+    #   no subpixel + median 3x3              95.5  33.8   11.0   6.0%   19.29
+    #   no subpixel + median 5x5              95.4  30.2    5.0   4.4%   19.14
+    #   no subpixel + median 7x7              94.6  28.2    2.0   4.1%   19.29
+    #   no subpixel + median 7x7 + shaves 8   95.1  27.9    2.0   3.5%   19.43  <- chosen
+    #   no subpixel + median 7x7, no temporal 90.1  55.5    0.0   5.8%   19.43
+    #
+    # Dropping subpixel wins on frame rate AND on every noise measure, because what it
+    # buys back — the median filter — is worth more here than subpixel is. Note the last
+    # row: unlike in the normal profile, the temporal filter is NOT optional in extended
+    # mode (tstd 28.2 -> 55.5 without it). Keep it on; it is free.
+    subpixel: false
+    #
+    # WHAT SUBPIXEL OFF ACTUALLY COSTS, which tstd cannot see. A coarsely quantised
+    # depth is perfectly steady over time, so the noise measures above are blind to it.
+    # Disparity is integer without subpixel, so depth can only take d_max values, and
+    # the step grows as z^2: dz = z^2 / (fx*B*k), k = 8 with 3-bit subpixel else 1.
+    # Measured (bench_stereo.py reports `lvls` and `q@1m`, median gap between distinct
+    # depth values in a 0.9-1.1 m band):
+    #
+    #   extended, subpixel OFF, median 7x7   847 levels   21.0 mm step at 1 m
+    #   extended, subpixel ON               1333 levels    1.0 mm step at 1 m
+    #   pipeline_maxres.yaml (not extended) 1227 levels    2.0 mm step at 1 m
+    #
+    # 21 mm at 1 m, and [derived from the same dz formula, not measured] ~2 mm at 0.3 m
+    # and ~84 mm at 2 m. That is acceptable for THIS profile because its whole purpose
+    # is the 0.22-0.5 m band, where the step is a couple of millimetres. It is NOT
+    # acceptable out at zarr.z_far_m = 2.0 — if a demonstration works out there, use
+    # pipeline_maxres.yaml, which keeps subpixel and 2 mm at 1 m.
+    #
+    # If you need fine depth AND the near range, set subpixel: true and median_filter:
+    # "off" here: measured 16.00 fps, tstd 34.6, tail 9.0%. Strictly worse on every
+    # count except quantisation, which is why it is not the default.
+    median_filter: "7x7"          # 190 levels, under the 1024 ceiling
+    # 19.29 -> 19.43 fps and tail 4.1% -> 3.5%. Small, but this profile has none to
+    # spare, and slices > 6 is rejected by the device.
+    hardware_resources: {shaves: 8, slices: 6}
+    post_processing:
+      # Same reasoning as pipeline_maxres.yaml: median does the job for free, speckle
+      # costs 11 fps here (19.29 -> 8.14 measured with subpixel).
+      speckle:   {enable: false, speckle_range: 28, difference_threshold: 2}
+      # Deliberately BELOW the derived MinZ of 224.5 mm, so a recording re-measures the
+      # floor instead of hiding it — the same convention the other profiles use.
+      threshold: {enable: true,  min_range_mm: 150, max_range_mm: 3000}
+  max_disparity: 190              # must agree with extended_disparity: true

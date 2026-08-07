@@ -3,7 +3,7 @@ Context file for Claude Code. Summarizes the project, the validated diagnosis ch
 1. Project goal
 Long-term: energy-efficient, robust underwater manipulation in dynamic ocean currents (follow-up to "UMI-Underwater: Learning Underwater Manipulation without Underwater Teleoperation").
 This repo's immediate scope: build a relative pose/velocity estimator whose ground truth comes from AprilTags on the pool floor. Before the estimator can be trusted, the AprilTag-based ground truth itself must be metrically correct. That is what this codebase (src/zed2_underwater_tagslam.py) currently does: single-camera AprilTag SLAM (ZED2 left image → AprilTag → PnP → GTSAM iSAM2).
-Physical setup: ZED2 camera in air, ~0.17 m above the water surface, looking down through the (flat, calm) water surface at AprilTags tiled across the pool floor. Pool ≈ 4.877 m × 2.438 m × 1.143 m (45 in) deep. Water level varies slightly day to day; it is set in config. Camera is NOT yet in a waterproof housing (that is future work).
+Physical setup: ZED2 camera in air, ~0.17 m above the water surface, looking down through the (flat, calm) water surface at AprilTags tiled across the pool floor. Pool ≈ 4.877 m × 2.438 m × 1.143 m (45 in) deep. Water level varies slightly day to day; it is set in config. Camera is NOT yet in a waterproof housing (that is future work).  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 2. Code layout
 src/zed2_underwater_tagslam.py — main pipeline (latest is the file the user uploaded as zed2_underwater_tagslam__4_.py; treat the in-repo src/ file as the source of truth).
 tools/nadir_ruler_test.py — standalone raw-PnP ruler diagnostic (read-only; reuses the main module's intrinsics/detector/solvePnP).
@@ -14,16 +14,16 @@ Tag size was a 2× error. Config tags.tag_size_m is visualization-only; SLAM use
 Residual after tag-size fix is pure single flat-interface refraction. Confirmed by a near-nadir ruler test + first-principles physics:
 Camera in air h_air ≈ 0.17 m, water column d_water, n_water ≈ 1.333.
 Predicted R = (h_air + d_water/n) / (h_air + d_water).
-Measured (correct tag size 0.170, mode none): R ≈ 0.80 at d_water ≈ 1.0 m vs predicted ≈ 0.79. Intrinsics are fine (ZED factory fx=fy≈534.88 HD720; no hidden extra scale, else R would deviate from physics).
+Measured (correct tag size 0.170, mode none): R ≈ 0.80 at d_water ≈ 1.0 m vs predicted ≈ 0.79. Intrinsics are fine (ZED factory fx=fy≈534.88 HD720; no hidden extra scale, else R would deviate from physics).  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 A single global --water-scale is WRONG because the correction is geometry-dependent (air gap, water column, off-nadir angle). The old --water-scale 3.6 was tag-size-2× × refraction × over-tuning; it warps the floor and amplifies tracking noise.
 
 Refractive PnP implemented and validated. New --water-correction-mode refractive (modes: none/scalar/trust-region/ refractive; refractive is the one to use for real runs). Flat air→water interface + Snell, water surface is config-driven (water.surface_height_m, n_water, n_air), per-frame air gap derived from the tracked camera pose.
-M5 synthetic self-test passes (--refractive-self-test): rms ≈ 1e-5 px, trans ≈ 0 mm, rot ≈ 2e-4 deg.
-M6 real data: D_true ≈ 1.2 m → none ≈ 1.0 m (R ≈ 0.83), refractive ≈ 1.2 m (R ≈ 1.0). PASS.
+M5 synthetic self-test passes (--refractive-self-test): rms ≈ 1e-5 px, trans ≈ 0 mm, rot ≈ 2e-4 deg.  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
+M6 real data: D_true ≈ 1.2 m → none ≈ 1.0 m (R ≈ 0.83), refractive ≈ 1.2 m (R ≈ 1.0). PASS.  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 
-Refractive solver made real-time. The first refractive implementation was a per-tag finite-difference LM with a 48-iter inner bisection → fps collapsed (~10 → ~1 when tags appear, scaling with per-frame tag count; note: a normal frame shows at most ~10 tags, NOT 20 — the overlay "N observed / M in graph" is cumulative, not per-frame). Optimized to a fixed-point cv2.solvePnP loop + Newton refraction point + per-tag warm-start + batched correction. The old LM is kept only for --refractive-regression-check. Synthetic benchmark ≈ 41× speedup.
+Refractive solver made real-time. The first refractive implementation was a per-tag finite-difference LM with a 48-iter inner bisection → fps collapsed (~10 → ~1 when tags appear, scaling with per-frame tag count; note: a normal frame shows at most ~10 tags, NOT 20 — the overlay "N observed / M in graph" is cumulative, not per-frame). Optimized to a fixed-point cv2.solvePnP loop + Newton refraction point + per-tag warm-start + batched correction. The old LM is kept only for --refractive-regression-check. Synthetic benchmark ≈ 41× speedup.  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 --refractive-self-test: rms ≈ 2.1e-5 px (unchanged-level). PASS.
---refractive-regression-check: max_trans_delta ≈ 0.0003 mm, max_rot_delta ≈ 0.00037 deg (bounds 0.1 mm / 0.01 deg). PASS.
+--refractive-regression-check: max_trans_delta ≈ 0.0003 mm, max_rot_delta ≈ 0.00037 deg (bounds 0.1 mm / 0.01 deg). PASS.  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 New knobs: --refractive-max-iterations, --refractive-convergence-tol-m, --refractive-convergence-tol-deg, --refractive-ray-max-iterations, --refractive-ray-tol, --refractive-regression-check, --refractive-benchmark. New latency log line: Refractive PnP latency: last=... ms/frame (... tags), avg=..., ms/tag, fps=....
 
 4. Open problem (the current focus)

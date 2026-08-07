@@ -1,0 +1,8 @@
+SYNTHETIC CAPTURE — tools/make_synthetic_capture.py
+No hardware was connected. Every image is rendered.
+
+camera model : configs/source_camera_air.yaml (verified=True, medium=air)
+frames       : 72 @ 30.0 fps, 1280x800
+depth        : uint16 millimetres, metres = value/1000.0, 0 = invalid
+MinZ         : 224.5 mm [derived, not measured]
+ground truth : ground_truth.json

@@ -14,8 +14,25 @@ timeline, written in TUM RGB-D layout.
     # SLAM dataset: lossless rgb/depth/left/right + IMU + telemetry
     python c3_camera/c3_collect.py --mode research
 
+    # the same dataset, but the stereo matching happens on THIS computer:
+    # colour + left + right cross the link, depth/ is computed topside
+    python c3_camera/c3_collect.py --mode research --depth-source host
+
+    # ... and at 20 fps, which needs the pair encoded on the device
+    python c3_camera/c3_collect.py --mode research --depth-source host \
+        --fps 20 --mono-encode mjpeg --mono-quality 97
+
     # plan a configuration without touching the camera
     python c3_camera/c3_collect.py --mode research --dry-run
+
+    # is the rig ready? camera free, ROV talking, disk, display — nothing opened
+    python c3_camera/c3_collect.py --preflight-only
+
+Every run starts with those readiness checks (preflight.py), so a missing MAVLink
+endpoint or a camera Madrona still owns is named in the first couple of seconds,
+with the command that fixes it — instead of surfacing twelve seconds later as a
+connection error, or twenty minutes later as an empty telemetry CSV.
+`--no-preflight` skips them.
 
 Press SPACE (or pass --record-now) to start and stop recording, so you can dive
 first and capture only the segment that matters. Ctrl-C shuts down cleanly:
@@ -33,7 +50,10 @@ import argparse
 import json
 import signal
 import sys
+import threading
 import time
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -41,17 +61,22 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cv2
+import numpy as np
 
 from c3_camera import config as C
 from c3_camera import device as D
+from c3_camera import host_depth as HD
+from c3_camera import preflight as PF
+from c3_camera import profile as P
 from c3_camera import viz
 from c3_camera.config import (STREAM_COLOR, STREAM_DEPTH, STREAM_LEFT,
                               STREAM_RIGHT, StreamConfig)
 from c3_camera.control import NullControlSource
 from c3_camera.dataset import DEPTH_SCALE, DatasetWriter, estimate_rate
+from c3_camera.geometry import Intrinsics
 from c3_camera.imu import IMU_FIELDS
 from c3_camera.mavlink_log import MavlinkLogger
-from c3_camera.source import C3Source
+from c3_camera.source import Bundle, C3Source, Frame
 
 # Research mode defaults. Chosen from measurement, not taste: four lossless
 # streams at 480x270 (+640x400 mono) cost ~62 Mbit/s at 8 fps, i.e. ~68% of the
@@ -75,23 +100,48 @@ REVIEW_DEFAULTS = dict(
     fps=15.0, streams=(STREAM_COLOR, STREAM_DEPTH),
 )
 
+# What --depth-source host changes about the research configuration, and nothing
+# else. depth leaves the wire entirely — it is not shipped and not requested —
+# and the stereo pair takes its place, because the pair is what this computer
+# needs in order to compute depth itself.
+#
+# The colour path is deliberately NOT changed: 1080p * 1/4 -> 480x270 keeps the
+# colour grid no finer than the 640x400 depth grid, which is what the forward
+# scatter in host_depth.warp_depth_to_color needs to fill it (a 960x540 target
+# from 640x400 depth fills ~9.6% of the pixels). Raising --isp-scale here is a
+# real choice with a real cost, so it stays the operator's.
+HOST_DEPTH_DEFAULTS = dict(
+    streams=(STREAM_COLOR, STREAM_LEFT, STREAM_RIGHT),
+)
 
-def build_config(a: argparse.Namespace) -> StreamConfig:
+
+def build_config(a: argparse.Namespace, extra: dict | None = None) -> StreamConfig:
     """Mode defaults, overridden by anything given explicitly on the command line.
 
     Every camera option defaults to None so that "not given" is distinguishable
     from "given the same value the mode default happens to use" — otherwise
     switching --mode would silently ignore an explicit flag.
+
+    `extra` is the StreamConfig fields a --profile set that have no flag to land
+    on (depth_preset, median, subpixel, ...). Nothing on the command line can
+    reach them, so there is nothing for them to lose to.
     """
     base = dict(RESEARCH_DEFAULTS if a.mode == "research" else REVIEW_DEFAULTS)
+    # Applied before the explicit flags, so --streams still wins over the mode
+    # pair the same way it always has. getattr keeps a parser built before
+    # --depth-source existed working.
+    if getattr(a, "depth_source", "device") == "host":
+        base.update(HOST_DEPTH_DEFAULTS)
     for key in ("color_res", "isp_scale", "mono_res", "depth_size", "fps",
                 "color_encode", "video_bitrate_kbps",
-                "video_keyframe_frequency", "color_wire", "mono_source"):
+                "video_keyframe_frequency", "color_wire", "mono_source",
+                "mono_encode", "mono_quality", "extended"):
         val = getattr(a, key, None)
         if val is not None:
             base[key] = val
     if a.streams is not None:
         base["streams"] = tuple(a.streams)
+    base.update(extra or {})
 
     return StreamConfig(
         ip=a.ip, mxid=a.mxid,
@@ -107,7 +157,9 @@ def build_config(a: argparse.Namespace) -> StreamConfig:
     )
 
 
-def parse_args(argv=None) -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
+    """The parser. Split out from :func:`parse_args` so :func:`explicit_dests`
+    can build a second, throwaway copy of exactly the same thing."""
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 
@@ -115,6 +167,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--mode", default="research", choices=("research", "review"),
                    help="research = lossless TUM RGB-D dataset; review = mp4 + "
                         "telemetry only, for long exploratory dives (default: %(default)s)")
+    g.add_argument("--profile", default=None, metavar="NAME|PATH",
+                   help="YAML profile of settings, instead of a wall of flags. A "
+                        "bare NAME means c3_camera/profiles/NAME.yaml. Anything "
+                        "given on the command line still wins over the file; "
+                        "'none' disables an inherited default. See --dry-run for "
+                        "the resolved value and origin of every setting")
     g.add_argument("--out", type=Path, default=None,
                    help="output directory (default: "
                         "c3_camera/datasets/dataset_<YYYYMMDD_HHMMSS>)")
@@ -131,6 +189,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--isp-scale", type=C._parse_fraction, default=None, metavar="N/D")
     g.add_argument("--mono-res", default=None, choices=sorted(C.MONO_RESOLUTIONS))
     g.add_argument("--depth-size", type=C._parse_size, default=None, metavar="WxH")
+    g.add_argument("--extended", action="store_true", default=None,
+                   help="enable extended disparity, approximately halving the "
+                        "minimum depth range (about 30 cm to 15 cm theoretical)")
     g.add_argument("--fps", type=float, default=None)
     g.add_argument("--streams", type=C._parse_streams, default=None,
                    help="default research: color,depth,left,right")
@@ -149,8 +210,63 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--mono-source", default=None, choices=("raw", "rectified"),
                    help="raw sensor images (default; most general) or the "
                         "rectified pair StereoDepth produces")
+    g.add_argument("--mono-encode", default=None, choices=("none", "mjpeg"),
+                   help="encode left/right on the device (default: none). A raw "
+                        "640x400 pair costs 82 Mbit/s at 20 fps against a ~90 "
+                        "Mbit/s link; at q97 it costs 40. Lossy: the PNGs written "
+                        "to left/ and right/ are then re-encoded from JPEG, so a "
+                        "'lossless' dataset wants --mono-encode none")
+    g.add_argument("--mono-quality", type=int, default=None,
+                   help="mono MJPEG quality 0-100 (default: 90). Measured on real "
+                        "C3 frames, JPEG blocking starts costing stereo matches "
+                        "below ~q95, so q95 is the floor and q97 the target when "
+                        "the pair is going into a matcher")
     g.add_argument("--queue-size", type=int, default=2,
                    help="host output queue depth (default: %(default)s)")
+
+    g = p.add_argument_group(
+        "depth source (device StereoDepth, or topside stereo on this computer)")
+    g.add_argument("--depth-source", default="device", choices=("device", "host"),
+                   help="device = the camera's StereoDepth ships depth16 "
+                        "(default, unchanged); host = the camera ships the "
+                        "left/right pair and THIS computer matches it. The "
+                        "dataset layout is identical either way; metadata.json "
+                        "records which one produced depth/")
+    g.add_argument("--host-alpha", type=float, default=0.0,
+                   help="cv2.stereoRectify alpha for host matching (default: "
+                        "%(default)s = crop to fully-valid pixels). -1 reproduces "
+                        "the device's own rectification scale (fx_rect ~379.4 vs "
+                        "364.8 at alpha=0), so use it when host and device depth "
+                        "have to sit on the same near-range scale")
+    g.add_argument("--host-num-disparities", type=int, default=96,
+                   help="host SGBM disparity levels (default: %(default)s, which "
+                        "searches d in [0,95] — exactly the device's default max "
+                        "disparity). Costs the leftmost N columns, which can "
+                        "never be matched")
+    g.add_argument("--host-block-size", type=int, default=5,
+                   help="host SGBM block size, odd (default: %(default)s)")
+    g.add_argument("--host-downscale", type=int, default=1,
+                   help="match at 1/N resolution and upscale the result "
+                        "(default: %(default)s = full resolution)")
+    g.add_argument("--no-host-align-color", dest="host_align_color",
+                   action="store_false", default=True,
+                   help="leave host depth on the rectified-left grid instead of "
+                        "warping it onto the colour grid. RGB-D SLAM needs the "
+                        "warp, so orbslam3_rgbd.yaml is not written without it")
+    g.add_argument("--host-depth-workers", type=int, default=1,
+                   help="matcher threads (default: %(default)s). 0 runs the "
+                        "matcher INLINE on the capture thread, which cannot drop "
+                        "a depth frame but can stall capture — see the note in "
+                        "HostDepthRunner")
+    g.add_argument("--host-depth-queue", type=int, default=2,
+                   help="pairs allowed in flight (default: %(default)s). Beyond "
+                        "this a frame is recorded with colour but no depth, which "
+                        "is the bound that keeps a slow matcher from turning into "
+                        "growing latency")
+    g.add_argument("--host-cv-threads", type=int, default=None,
+                   help="cv2.setNumThreads for this process (default: leave "
+                        "OpenCV's own choice). Process-global, and the PNG writer "
+                        "pool shares it, so it is set once at start or not at all")
 
     g = p.add_argument_group("camera IMU (BNO086, on the camera board)")
     g.add_argument("--imu-rate", type=int, default=200,
@@ -225,7 +341,42 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--duration", type=float, default=None,
                    help="stop after N seconds of streaming")
     g.add_argument("--print-every", type=float, default=3.0)
-    return p.parse_args(argv)
+
+    PF.add_preflight_args(p)
+    return p
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
+
+
+def explicit_dests(argv=None) -> set[str]:
+    """The dests the operator actually typed, as opposed to argparse defaults.
+
+    A profile has to sit *below* the command line, and half of this program's
+    flags have a real default rather than None (--imu-rate 200, --min-mm 300.0,
+    --mavlink-transport udp, ...). Comparing the parsed namespace against
+    ``parse_args([])`` cannot tell "not given" from "given the value that happens
+    to be the default", so ``--imu-rate 200`` would silently lose to a profile
+    saying 400. Re-parsing with every default replaced by ``argparse.SUPPRESS``
+    answers it exactly: argparse only seeds a dest when its default is not
+    SUPPRESS, so presence in the namespace *is* the signal.
+
+    Two things this must not do, both learned the hard way:
+
+    * Not a unique string sentinel — argparse runs ``type=`` over string defaults
+      too, so ``--isp-scale``'s parser would reject it and exit 2.
+    * Not on the real parser — 17 help strings use ``%(default)s`` and would
+      render ``==SUPPRESS==``, and every ``a.<dest>`` read would need a getattr.
+
+    Call it only after the real parse has succeeded; then this one cannot fail,
+    print, or exit.
+    """
+    probe = build_parser()
+    for action in probe._actions:
+        if action.dest != "help":
+            action.default = argparse.SUPPRESS
+    return set(vars(probe.parse_known_args(argv)[0]))
 
 
 # =============================================================================
@@ -252,21 +403,13 @@ def calibration_payload(src: C3Source) -> dict:
     return out
 
 
-def blueos_info(host: str = "192.168.2.2") -> dict:
-    """ArduSub version and frame type, for the metadata. Never fatal."""
-    import urllib.request
-    out: dict = {}
-    for key, path in (("ardusub_version", "/v1.0/firmware_info"),
-                      ("vehicle_type", "/v1.0/vehicle_type")):
-        try:
-            with urllib.request.urlopen(f"http://{host}:8000{path}", timeout=4) as r:
-                out[key] = json.loads(r.read().decode())
-        except Exception:  # noqa: BLE001
-            out[key] = None
-    if isinstance(out.get("ardusub_version"), dict):
-        v = out["ardusub_version"]
-        out["ardusub_version"] = f"{v.get('version')} ({v.get('type')})"
-    return out
+def blueos_info(host: str = PF.BLUEOS_HOST) -> dict:
+    """ArduSub version and frame type, for the metadata. Never fatal.
+
+    One implementation, in preflight.py, so the version the banner reports and
+    the version the dataset records can never disagree.
+    """
+    return PF.vehicle_info(host)
 
 
 def compose_view(bundle, mode: str, min_mm: float, max_mm: float, scale: float):
@@ -308,10 +451,90 @@ def _extract_if_requested(a, cfg, out_dir: Path) -> None:
 # =============================================================================
 # main
 # =============================================================================
-def main(argv=None) -> int:
+def _show(value) -> str:
+    """A setting, printed the way it would be typed."""
+    if value is None:
+        return "-"
+    if isinstance(value, tuple) and len(value) == 2 and all(
+            isinstance(x, int) for x in value):
+        return f"{value[0]}/{value[1]}"          # isp_scale; depth_size overridden below
+    if isinstance(value, (tuple, list)):
+        return ",".join(str(x) for x in value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def print_resolution(a: argparse.Namespace, cfg: StreamConfig, prof: dict | None,
+                     explicit: set[str]) -> None:
+    """Every setting, its value, and where the value came from.
+
+    Precedence is only trustworthy if it is auditable, and the merge already
+    knows all of this — printing it is nearly free and it is the thing that
+    turns "I think the profile won" into something you can read.
+    """
+    if prof is not None:
+        print(f"  profile: {prof['_path']}")
+        for parent in prof.get("_extends_chain", []):
+            print(f"    extends: {parent}")
+    mode_keys = set(RESEARCH_DEFAULTS if a.mode == "research" else REVIEW_DEFAULTS)
+    if getattr(a, "depth_source", "device") == "host":
+        mode_keys |= set(HOST_DEPTH_DEFAULTS)
+
+    print(f"\n  {'setting':<33} {'value':<22} origin")
+    for section, keys in P.SCHEMA.items():
+        for key, field in keys.items():
+            # Prefer the RESOLVED value: a camera flag left unset on the command
+            # line is None on the namespace but has a real value on the config,
+            # and the real value is what the dive will actually use.
+            if hasattr(cfg, field.target):
+                value = getattr(cfg, field.target)
+            else:
+                value = getattr(a, field.target, None)
+                if field.invert:
+                    value = not value
+            if field.target == "depth_size" and isinstance(value, tuple):
+                text = f"{value[0]}x{value[1]}"
+            else:
+                text = _show(value)
+            origin = P.origin_of(f"{section}.{key}", prof, explicit,
+                                 mode_keys, a.mode)
+            print(f"  {section + '.' + key:<33} {text:<22} {origin}")
+
+
+def resolve_invocation(argv=None):
+    """argv -> (namespace, StreamConfig, profile or None, explicitly-typed dests).
+
+    The whole precedence rule lives here, and both main() and the tests go
+    through it, so what is tested is what runs. Raises ProfileError.
+    """
     a = parse_args(argv)
-    cfg = build_config(a)
-    rc = cfg.resolve()
+    explicit = explicit_dests(argv)
+    prof, extra = None, {}
+    if a.profile and str(a.profile).lower() != "none":
+        prof = P.load(a.profile)
+        # mode first: it picks the defaults dict that everything else layers
+        # onto, so resolving it afterwards would leave a profile's `mode:`
+        # changing nothing but the banner.
+        a.mode = P.mode_of(prof, a, explicit)
+        extra = P.apply(a, prof, explicit)
+    return a, build_config(a, extra), prof, explicit
+
+
+def main(argv=None) -> int:
+    try:
+        a, cfg, prof, explicit = resolve_invocation(argv)
+    except P.ProfileError as e:
+        print(f"c3_collect: {e}", file=sys.stderr)
+        return 2
+
+    try:
+        rc = cfg.resolve()
+    except ValueError as e:
+        if prof is None:
+            raise
+        raise ValueError(f"{e}\n  (settings came from --profile "
+                         f"{prof['_path']}; run with --dry-run to see which)") from None
 
     print("=" * 78)
     print(f"C3 dataset collection — {a.mode} mode")
@@ -346,11 +569,23 @@ def main(argv=None) -> int:
               "(slowest enabled sensor sets the rate for all of them).")
 
     if a.dry_run:
+        print_resolution(a, cfg, prof, explicit)
         print("\ndry run — nothing connected.")
         return 0
 
     out_dir = a.out or (Path("c3_camera/datasets") /
                         f"dataset_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+
+    # ----------------------------------------------------------- preflight
+    # Before the MAVLink logger binds anything and before the camera is opened,
+    # because those are the two things whose failure modes are slow and
+    # ambiguous. Nothing here connects to the camera — see preflight.py.
+    print()
+    rc_pf = PF.gate(a, title=f"c3 collect ({a.mode})", out_dir=out_dir,
+                    min_free_gb=a.min_free_gb, display=not a.no_display)
+    if rc_pf is not None:
+        return rc_pf
+    print()
 
     # ------------------------------------------------------------- MAVLink
     mav = None
@@ -586,6 +821,10 @@ def _finalize_metadata(writer: DatasetWriter, src: C3Source, cfg, rc,
                        mav, a, elapsed: float) -> None:
     """Write metadata.txt/json. Called on stop and on shutdown."""
     cs = src.metrics.streams.get(STREAM_COLOR)
+    # What the rig looked like when this run started. Months later the folder is
+    # all that is left, and a preflight warning is often the only thing that
+    # explains an empty telemetry CSV or a dataset from an unexpected mx_id.
+    pf_report = getattr(a, "preflight_report", None)
     meta = {
         "camera": src.device_report,
         "resolved": {
@@ -630,6 +869,8 @@ def _finalize_metadata(writer: DatasetWriter, src: C3Source, cfg, rc,
         "frames_dropped": writer.stats.dropped,
         "writer": writer.summary(),
         "camera_metrics": src.metrics.summary(),
+        "preflight": (pf_report.to_dict() if pf_report is not None
+                      else {"ran": False, "note": "--no-preflight"}),
     }
     meta.update(blueos_info())
     writer.write_metadata(meta, notes=a.notes)

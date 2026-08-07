@@ -1,0 +1,73 @@
+# Recording camera — MEASURED from the connected device, not synthesised.
+#
+# Written by tools/dump_camera_model.py from OAK-D-W mxid 14442C10716DBCD600.
+# Every number below came off the device's factory EEPROM; none is typed by hand.
+#
+# This describes the RECTIFIED-LEFT stream, which is what record.py saves.
+# StereoDepth has already removed the lens distortion, so `distortion` is zero
+# by construction and the intrinsics are P1 from cv2.stereoRectify. The raw
+# CAM_B calibration is under `raw_left` for reference and is NOT what the
+# saved pixels obey.
+
+schema: umi_camera_model/1
+name: oakd_oak_d_w_rectified_left
+role: source
+medium: air
+verified: true
+
+provenance:
+  device_product: OAK-D-W
+  device_mxid: 14442C10716DBCD600
+  source: on-device factory calibration (EEPROM), read via depthai readCalibration()
+  tool: tools/dump_camera_model.py
+  describes: stereo.rectifiedLeft (what record.py writes to left/)
+  rectification:
+    method: cv2.stereoRectify
+    alpha: -1.0
+    baseline_m_from_extrinsics: 0.075317084
+    R1: [[0.999953500433, 0.000562396008, -0.009627080644], [-0.000562233828, 0.999999841755, 1.955263e-05], [0.009627090116, -1.4139051e-05, 0.999953658394]]
+    P1: [[566.376434326, 0.0, 586.807647705, 0.0], [0.0, 566.376434326, 436.185829163, 0.0], [0.0, 0.0, 1.0, 0.0]]
+  measured_fov_deg:
+    rectified_hfov: 92.0300
+    rectified_vfov: 65.2863
+    raw_left_hfov: 126.0522
+    raw_left_vfov: 79.2773
+
+image_size: [1280, 800]
+
+model: opencv_rational
+intrinsics:
+  fx: 566.376434326
+  fy: 566.376434326
+  cx: 586.807647705
+  cy: 436.185829163
+# zero by construction: the rectified stream is already undistorted
+distortion: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+fov_deg:
+  hfov: 92.0300
+  vfov: 65.2863
+  valid_upto_half_angle: 85.00
+
+stereo:
+  baseline_m: 0.075317084
+  left_socket: CAM_B
+  right_socket: CAM_C
+  right_shares_model: false
+
+rectified: true
+
+# The raw sensor calibration. Kept so the unrectified grid can be reconstructed;
+# nothing in the pipeline reads it.
+raw_left:
+  fx: 566.239562988
+  fy: 565.865722656
+  cx: 626.984802246
+  cy: 407.454986572
+  distortion: [2.4927506447, 0.6666968465, 7.68307e-05, 9.2802e-06, 0.0095398985, 2.835552454, 1.3827470541, 0.0858206972, 0.0, 0.0, 0.0, 0.0, -0.000337897, -0.0007894927]
+raw_right:
+  fx: 566.844604492
+  fy: 566.887145996
+  cx: 623.533142090
+  cy: 411.347045898
+  distortion: [0.3374633491, -0.0574125871, -2.69765e-05, -0.0001510215, -0.0024122302, 0.671290338, -0.0310888756, -0.013935402, 0.0, 0.0, 0.0, 0.0, 0.0015724568, -0.0040936107]

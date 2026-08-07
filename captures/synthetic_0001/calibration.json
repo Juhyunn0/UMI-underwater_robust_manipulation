@@ -1,0 +1,108 @@
+{
+  "source": "SYNTHETIC \u2014 tools/make_synthetic_capture.py",
+  "note": "NOT a device calibration. Rendered with the camera model in source_camera_air.yaml, which is itself synthesised (verified: true). No hardware was measured.",
+  "camera_model_config": "configs/source_camera_air.yaml",
+  "camera_model_verified": true,
+  "medium": "air",
+  "streamed_intrinsics": {
+    "left": {
+      "fx": 566.376434326,
+      "fy": 566.376434326,
+      "cx": 586.807647705,
+      "cy": 436.185829163,
+      "width": 1280,
+      "height": 800,
+      "distortion": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "right": {
+      "fx": 566.376434326,
+      "fy": 566.376434326,
+      "cx": 586.807647705,
+      "cy": 436.185829163,
+      "width": 1280,
+      "height": 800,
+      "distortion": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "depth": {
+      "fx": 566.376434326,
+      "fy": 566.376434326,
+      "cx": 586.807647705,
+      "cy": 436.185829163,
+      "width": 1280,
+      "height": 800,
+      "distortion": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "color": {
+      "fx": 566.376434326,
+      "fy": 566.376434326,
+      "cx": 586.807647705,
+      "cy": 436.185829163,
+      "width": 1280,
+      "height": 800,
+      "distortion": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    }
+  },
+  "device": {
+    "stereo_left": "CAM_B",
+    "stereo_right": "CAM_C",
+    "baseline_cm": 7.5317084,
+    "intrinsics": {
+      "CAM_B": {
+        "default_size": [
+          1280,
+          800
+        ],
+        "fx": 566.376434326,
+        "fy": 566.376434326,
+        "cx": 586.807647705,
+        "cy": 436.185829163,
+        "distortion": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    }
+  }
+}

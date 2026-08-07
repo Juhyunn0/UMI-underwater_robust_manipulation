@@ -29,11 +29,11 @@ B=ρgV=**110.97 N**, W=mg=**109.87 N**, net **+1.10 N**, restoring stiffness k=c
 | **T2** | Terminal velocity (drag), surge/sway/heave/yaw | linear+quadratic drag (at steady state added-mass & diagonal Coriolis = 0) | F=D_L·v+D_NL·v² | **0.00%** on all 4 axes; added-mass < 1e-15 N | ✅ |
 | | — anisotropy | per-axis D_NL ordering | v order = inverse D_NL order | surge>sway>heave ✓ | ✅ |
 | **TL** | Cross-axis leakage | force frame / diagonal D, M_A | single-axis velocity → only on-axis accel | off-axis accel **exactly 0** (6 axes); nu() reorder OK | ✅ |
-| **T4** | Restoring pendulum | restoring stiffness + effective inertia | underdamped, ω_n=√(k/(I+M_A_rot)) | roll T=3.85 s vs 3.89 (1%); pitch 4.79 vs 5.16 (7%) | ✅ |
-| | — static equilibrium | restoring stiffness alone | tilt = asin(M/k) | 26.1° vs 26.8° (2.7%) | ✅ |
+| **T4** | Restoring pendulum | restoring stiffness + effective inertia | underdamped, ω_n=√(k/(I+M_A_rot)) | roll T=3.85 s vs 3.89 (1%); pitch 4.79 vs 5.16 (7%) | ✅ [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
+| | — static equilibrium | restoring stiffness alone | tilt = asin(M/k) | 26.1° vs 26.8° (2.7%) | ✅ [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
 | | — axis purity | no cross-coupling | roll tilt → roll-only moment | pitch/yaw accel = 0 | ✅ |
-| **T5** | Added mass (effective inertia, Ω=0.5–5 rad/s) | M_A delivery through the EMA filter | effective mass = m + M_A·Re{H(Ω)} ≈ m+M_A | **0.0–0.3%** on surge/sway/heave; sign −M_A on all 6 axes | ✅ |
-| **T6** | Coriolis passivity | skew-symmetry of C_A | νᵀC_A(ν)ν = 0 | **4.3e-14** | ✅ |
+| **T5** | Added mass (effective inertia, Ω=0.5–5 rad/s) | M_A delivery through the EMA filter | effective mass = m + M_A·Re{H(Ω)} ≈ m+M_A | **0.0–0.3%** on surge/sway/heave; sign −M_A on all 6 axes | ✅ [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
+| **T6** | Coriolis passivity | skew-symmetry of C_A | νᵀC_A(ν)ν = 0 | **4.3e-14** | ✅ [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
 | | — mechanical energy | dissipativity | E=½νᵀ(M_RB+M_A)ν+U non-increasing | dissipated 4.59 J, **monotone** | ✅ |
 | **T7-R2** | Whole-plant, force level | the TOTAL applied wrench, integrator-free | hydro wrench == independent Fossen recomputation | **0.0 N** over a 6 s excited trajectory; buoyancy+CB exact | ✅ |
 | **T7-R1** | Whole-plant, approximation size | the added-mass lag | sim vs analytic (M_A in mass matrix) | transient divergence **0.01 cm/s**; same terminal | ✅ |
@@ -62,7 +62,7 @@ B=ρgV=**110.97 N**, W=mg=**109.87 N**, net **+1.10 N**, restoring stiffness k=c
   one-step-lagged, EMA-filtered (α=0.3) acceleration, **not** placed in the MuJoCo mass matrix. We verify
   it as an **effective-inertia frequency sweep**: drive a sinusoidal force F·sin(Ωt), fit the velocity
   fundamental, and solve for the effective mass m_eff. The EMA filter's corner is ~230 rad/s, so across the
-  physically relevant band (Ω = 0.5–5 rad/s) its in-phase gain Re{H(Ω)} ≈ 1 and the measured effective
+  physically relevant band (Ω = 0.5–5 rad/s) its in-phase gain Re{H(Ω)} ≈ 1 and the measured effective  [UNVERIFIED: 예시/유도값 — docs/MEASUREMENT_AUDIT.md]
   mass equals **m + M_A within 0.0–0.3%** on every axis — including heave, where M_A (14.57) exceeds the
   body mass. The added-mass force sign (−M_A·ν̇, opposing acceleration) holds on all six axes.
 - **T6 Coriolis + energy** — the added-mass Coriolis matrix is skew-symmetric, so it does no work:
@@ -94,7 +94,7 @@ tiers**; the simulator is again unmodified (driven through `xfrc_applied`, still
 added-mass Coriolis matrix C_A(ν), built from M_A by the skew-block construction (Fossen Eq. 6.44),
 reproduces hydro's hand-typed `_coriolis_added` to **1.4 × 10⁻¹⁴** — this breaks the "same algebra typed
 twice" risk that a force-level check alone cannot. C_A = −C_Aᵀ holds as a **full skew matrix** (numeric 0;
-CasADi-symbolic residual *exactly* 0), not merely the quadratic form νᵀC_Aν = 0. M = M_RB + M_A is SPD
+CasADi-symbolic residual *exactly* 0), not merely the quadratic form νᵀC_Aν = 0. M = M_RB + M_A is SPD  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 (eigenvalues 0.42–25.8); D(ν) ≻ 0 and total passivity νᵀ(C+D)ν = νᵀD(ν)ν ≥ 0 hold over 2 × 10⁶ random
 states.
 

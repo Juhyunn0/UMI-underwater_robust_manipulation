@@ -14,8 +14,66 @@ Display choices worth knowing about:
 
 from __future__ import annotations
 
+import os
+import sys
+from pathlib import Path
+
 import cv2
 import numpy as np
+
+# ---------------------------------------------------------------------------
+# cv2's Qt plugin path, repaired. Runs at import, which is after `import cv2`
+# above and before anyone can call imshow — the only window that matters.
+# ---------------------------------------------------------------------------
+_QXCB = Path("platforms") / "libqxcb.so"
+
+
+def _qt_plugin_path(cv2_dir: Path, current: str | None) -> str | None:
+    """Where Qt should look for its xcb platform plugin, or None to leave it be.
+
+    opencv-python's ``cv2/config-3.py:14-18`` sets QT_QPA_PLATFORM_PLUGIN_PATH to
+    ``<cv2>/qt/plugins`` unconditionally at import — it overwrites whatever the
+    caller put there, so an environment variable cannot fix this from outside.
+    In the conda ``robust`` env that directory has been renamed to
+    ``qt/plugins.disabled`` (the usual workaround for letting PyQt5 and PySide6
+    coexist with cv2 in one process), so Qt finds no xcb plugin and the process
+    dies with "no Qt platform plugin could be initialized" the moment imshow is
+    called. Qt reads this variable when it builds the first QGuiApplication, so
+    putting it back after ``import cv2`` is early enough — measured 2026-08-05:
+    imshow works in ``robust`` with exactly this, and dies without it.
+
+    Renaming the shared directory back is the other fix and is deliberately NOT
+    used: something else in that env needs it disabled, and this process is the
+    only one that should be affected.
+
+    In the ``~/.venvs/c3-depthai`` venv ``qt/plugins`` is live and this returns
+    None, so the venv path is untouched.
+    """
+    if current and (Path(current) / _QXCB).exists():
+        return None                      # already pointing at a live plugin dir
+    for name in ("plugins", "plugins.disabled"):
+        candidate = cv2_dir / "qt" / name
+        if (candidate / _QXCB).exists():
+            return str(candidate)
+    return None                          # headless wheel, or no bundled Qt
+
+
+def repair_qt_plugin_path() -> str | None:
+    """Apply :func:`_qt_plugin_path` to this process. Returns the path it set."""
+    if not sys.platform.startswith("linux"):
+        return None
+    plugins = _qt_plugin_path(Path(cv2.__file__).resolve().parent,
+                              os.environ.get("QT_QPA_PLATFORM_PLUGIN_PATH"))
+    if plugins is None:
+        return None
+    os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = plugins
+    fonts = Path(plugins).parent / "fonts"
+    if fonts.is_dir():
+        os.environ["QT_QPA_FONTDIR"] = str(fonts)
+    return plugins
+
+
+repair_qt_plugin_path()
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 

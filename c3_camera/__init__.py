@@ -14,9 +14,11 @@ Layout
     geometry.py  intrinsics + depth(mm) -> XYZ(m) deprojection
     viz.py       depth colourisation + on-screen HUD
     madrona.py   stop/start the BlueOS Madrona extension that owns the camera
+    preflight.py readiness checks every hardware entry point runs before connecting
 
 Entry points
 ------------
+    preflight.py     is the rig ready? camera / ROV / disk, opening nothing
     discover_c3.py   find the camera, report capabilities
     c3_stream.py     live RGB + depth view with fps/latency HUD
     c3_bench.py      headless resolution/fps sweep -> CSV
@@ -110,6 +112,7 @@ __all__ = [
     "geometry",
     "viz",
     "madrona",
+    "preflight",
 ]
 
 __version__ = "0.1.0"

@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import socket
 import sys
 from pathlib import Path
 
@@ -46,22 +45,9 @@ from c3_camera import device as D
 EXIT_OK, EXIT_OWNED, EXIT_NOT_FOUND, EXIT_UNREACHABLE = 0, 3, 4, 5
 
 
-def local_route_to(ip: str) -> tuple[str | None, str]:
-    """Which local address the kernel would use to reach `ip`.
-
-    A UDP socket that is 'connected' sends nothing, so this is a pure routing
-    lookup — and it catches the common mistake of the camera being reachable
-    over the wrong interface (e.g. a VPN) or not routable at all.
-    """
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            s.connect((ip, 9))
-            return s.getsockname()[0], "ok"
-        finally:
-            s.close()
-    except OSError as e:
-        return None, f"no route: {e}"
+# Moved to device.py so preflight.py can ask the same question without importing
+# an entry point. Kept as a name here because this module documented it.
+local_route_to = D.local_route_to
 
 
 def report(args) -> tuple[int, dict]:

@@ -70,7 +70,20 @@ def extract_rgb_video(dataset: Path, *, force: bool = False,
             exe, "-hide_banner", "-loglevel", "error", "-y",
             "-i", str(video), "-vsync", "0", "-start_number", "1", pattern,
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        # Bounded, because c3_option_sweep.py calls this once per encoded cell
+        # from a loop that runs unattended for hours. A wedged decode with no
+        # timeout stalls the whole sweep with the camera still held. The bound is
+        # generous — half a second per frame is ~25x slower than a real decode —
+        # so it only fires on a genuine hang.
+        budget = max(120.0, 0.5 * len(rows))
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    timeout=budget)
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                f"ffmpeg did not finish decoding {video.name} within "
+                f"{budget:.0f} s for {len(rows)} frames; the dataset is "
+                f"unchanged and {video.name} is intact") from e
         if result.returncode:
             detail = result.stderr.strip() or "ffmpeg returned no diagnostic"
             raise RuntimeError(f"ffmpeg could not decode {video.name}: {detail}")

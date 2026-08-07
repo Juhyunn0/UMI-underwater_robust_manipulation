@@ -1,0 +1,70 @@
+# Deployment camera — MarineSitu C3 (Luxonis OAK-D-W-POE), underwater.
+#
+# This is the ARRIVAL grid of the warp: land-recorded frames get remapped into this
+# camera's projection so the affordance predictor sees the same geometry at training
+# time that it will see on the ROV.
+#
+# Every number below is copied verbatim from the on-device EEPROM dump cited under
+# `provenance`. Nothing here is typed by hand or inferred.
+
+schema: umi_camera_model/1
+name: marinesitu_c3_cam_b
+role: target
+medium: water
+verified: true
+
+provenance:
+  artifact: c3_camera/datasets/dataset_20260803_162223/calibration.json
+  field: device.intrinsics.CAM_B
+  note: >-
+    10 dumps under c3_camera/datasets/*/calibration.json (2026-07-29 .. 2026-08-03)
+    carry a byte-identical calibration; this is the most recent.
+  source_string: "on-device factory calibration (OAK-D-W-POE EEPROM)"
+  medium_determination:
+    method: calib/fov_audit.py --audit
+    doc: calib/FOV_AUDIT.md
+    result: >-
+      Forward-projected HFOV CAM_A/B/C = 63.7 / 85.6 / 85.1 deg, within 3.5 deg of the
+      flat-port Snell prediction (67.2 / 84.3 / 84.3) from the in-air spec 95/127/127,
+      and up to 41.9 deg away from the in-air hypothesis. Vendor confirms MarineSitu
+      calibrates each unit underwater.
+
+image_size: [1280, 800]
+
+# OpenCV pinhole + 8-coefficient rational distortion: [k1 k2 p1 p2 k3 k4 k5 k6].
+# Consumable directly by cv2.projectPoints / cv2.initUndistortRectifyMap.
+model: opencv_rational
+intrinsics:
+  fx: 757.12
+  fy: 757.51
+  cx: 648.87
+  cy: 381.28
+distortion: [-1.40532, -0.62655, -1.0e-05, -0.00152, 2.0006, -1.17453, -1.18481, 2.4386]
+
+# Derived from the model above by calib/fov_audit.py, not measured independently.
+# Present for sanity checks only; nothing should compute from these.
+fov_deg:
+  hfov: 85.561
+  vfov: 55.742
+  valid_upto_half_angle: 85.0
+
+stereo:
+  # Vendor spec, restated in the same dump under device.baseline_cm.
+  baseline_m: 0.075
+  left_socket: CAM_B
+  right_socket: CAM_C
+  right:
+    intrinsics: {fx: 760.28, fy: 760.16, cx: 648.88, cy: 387.62}
+    distortion: [-1.38519, -0.56224, 0.00066, 0.00236, 1.28054, -1.15989, -1.0738, 1.60905]
+
+# The C3 pipeline serves depth on the RECTIFIED-left grid, which is not this model.
+# Building that model needs cv2.stereoRectify, which needs the left->right extrinsics —
+# and the dumps do not contain them (device.extrinsics is absent; verified by reading
+# the artifact above). Until a dump with extrinsics exists, the warp targets the raw
+# CAM_B projection and this flag says so.
+rectified: false
+limitations:
+  - "stereo extrinsics absent from the EEPROM dump -> no rectified P1/R1 model yet"
+  - "distortion truncated to 8 coefficients by c3_camera/device.py:399 (dist[:8]);
+     the device may hold 14 (rational + thin-prism/tilt), which would matter at the
+     image edges"

@@ -51,9 +51,9 @@ tools: Read, Grep, Glob, WebSearch
 **The bottleneck is the converters, not the cable.** The stock link uses **Fathom-X** boards (one topside in the FXTI, one in the ROV) that send Ethernet over a **single twisted pair** using HomePlug AV. The tether itself is just copper twisted pairs.
 
 Key facts:
-- Fathom-X is rated **~80 Mbps over two wires** (vendor's own testing), but **real-world throughput is commonly 15–50 Mbps**, often ~15–20 Mbps effective once video is flowing.
+- Fathom-X is rated **~80 Mbps over two wires** (vendor's own testing), but **real-world throughput is commonly 15–50 Mbps**, often ~15–20 Mbps effective once video is flowing.  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 - The **Fathom tether is stranded copper, NOT Cat5/Cat6** (stranded improves durability but ruins high-frequency Ethernet performance).
-- **Direct gigabit over the stock tether basically does not work**, even at short range. Field data points: a near-identical RGB-D project got only **10 Mbps at 15 m** using cobalt connectors; a GigaBlox + 50 m Fathom tether **failed to link**; a 100 m run needed cutting to ~80 m just to reach **100 Mbps**.
+- **Direct gigabit over the stock tether basically does not work**, even at short range. Field data points: a near-identical RGB-D project got only **10 Mbps at 15 m** using cobalt connectors; a GigaBlox + 50 m Fathom tether **failed to link**; a 100 m run needed cutting to ~80 m just to reach **100 Mbps**.  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 - **Non-RJ45 connectors (cobalt, and the small Molex connectors on GigaBlox) further degrade the signal** — a real liability when pushing speed over marginal cable.
 - Per Blue Robotics, **gigabit over this tether may only be feasible with a G.hn solution** (an R&D item for the future).
 
@@ -101,7 +101,7 @@ Bandwidth cheat-sheet (C3 stereo = 1 MP OV9282):
 | 16-bit depth, 1280×800, uncompressed | ~491 Mbps | ❌ |
 | 16-bit depth, 640×400, uncompressed | ~123 Mbps | ❌ |
 | 16-bit depth, 400×300, uncompressed | ~58 Mbps | ❌ |
-| 2× mono stereo, H.264 (8-bit, compresses well) | ~6–10 Mbps | ✅ |
+| 2× mono stereo, H.264 (8-bit, compresses well) | ~6–10 Mbps | ✅ [UNVERIFIED: 예시/유도값 — docs/MEASUREMENT_AUDIT.md] |
 | Color, H.265, 720p | ~4–6 Mbps | ✅ |
 | **Stereo + color combined (compressed)** | **~12–16 Mbps** | ✅ |
 
@@ -121,7 +121,7 @@ Bandwidth cheat-sheet (C3 stereo = 1 MP OV9282):
 
 **Video pipeline latency** (encode → tether → decode), realistic:
 - Encode (camera): ~10–30 ms · Tether (HomePlug adds inherent delay): ~5–20 ms · Decode: ~5–20 ms · Jitter buffer: variable.
-- **Tuned low-latency pipeline ≈ 30–100 ms.** Default/buffered settings can balloon to 150–250 ms+.
+- **Tuned low-latency pipeline ≈ 30–100 ms.** Default/buffered settings can balloon to 150–250 ms+.  [UNVERIFIED: 예시/유도값 — docs/MEASUREMENT_AUDIT.md]
 
 **Reference thresholds from the literature:**
 - *Human teleoperation, vision-based:* empirical stability transition at **~150–225 ms one-way perception delay**; beyond it, completion rate collapses; added command delay accelerates instability.
@@ -141,7 +141,7 @@ Bandwidth cheat-sheet (C3 stereo = 1 MP OV9282):
 ## 6. Compute Architecture (Adding a Jetson)
 
 ### Desktop vs. onboard
-- **Desktop compute:** camera → tether → desktop (decode + infer) → command → tether → thrusters. The control loop **crosses the tether twice** (~60–150 ms). Easy to develop/debug, big GPU. Fine for prototyping and for slow underwater dynamics.
+- **Desktop compute:** camera → tether → desktop (decode + infer) → command → tether → thrusters. The control loop **crosses the tether twice** (~60–150 ms). Easy to develop/debug, big GPU. Fine for prototyping and for slow underwater dynamics.  [UNVERIFIED: 예시/유도값 — docs/MEASUREMENT_AUDIT.md]
 - **Onboard compute (Jetson in ROV):** control loop closes **inside the vehicle** (no tether round-trip → lowest latency). Camera can feed the Jetson uncompressed over internal gigabit. Topside gets only telemetry. Best for latency-critical work or autonomy/untethered operation.
 
 ### Does the BlueROV2 have a Jetson? No.
@@ -255,7 +255,7 @@ The recommendation changes substantially with these — confirm before specifyin
 
 - **Bottleneck = the Fathom-X converters, not the cable.** Don't buy a new tether expecting more speed.
 - **Gigabit over the stock tether ≈ impossible** (stranded copper). Real high bandwidth = **fiber + GigaBlox SFP**. Modest improvement = **direct 100BASE-TX with proper RJ45** at short range.
-- **Best bandwidth trick:** send **compressed stereo + color**, compute depth at the compute node → full-res depth+color in ~15 Mbps. Compression is **on the camera**, not the Pi.
+- **Best bandwidth trick:** send **compressed stereo + color**, compute depth at the compute node → full-res depth+color in ~15 Mbps. Compression is **on the camera**, not the Pi.  [UNVERIFIED: 예시/유도값 — docs/MEASUREMENT_AUDIT.md]
 - **For an end-to-end policy:** bandwidth/resolution are *not* the problem; latency is manageable. Desktop to start, Jetson if needed.
 - **For pose+fusion:** get **close** (not higher-res), run vision **low-rate** with DVL/IMU filling the gaps → Fathom-X is plenty.
 - **Adding a Jetson:** keep RPi+Navigator, **add** a Jetson on the internal switch; talk MAVLink to ArduSub, pull camera directly. **Orin Nano 8 GB** to start (low TDP); NX for big transformers.

@@ -95,6 +95,38 @@ DEFAULT_VIDEO_BITRATE_KBPS = 4000
 # trust the measured Mbit/s in the HUD.
 MJPEG_RATIO = 6.0
 
+# Frame size relative to quality 90, so the estimate responds to
+# --mjpeg-quality instead of ignoring it. MEASURED 2026-08-06 by re-encoding
+# 120 frames the C3 itself produced
+# (c3_camera/datasets/dataset_20260805_174544/rgb, 960x540 MJPEG). The
+# re-encode is trustworthy here rather than merely indicative: at q90 it
+# produced 114.1 kB/frame against the device encoder's own 114.2 kB/frame on
+# the same frames, so the host and device JPEG paths agree to 0.1%.
+#
+# Two resolutions were swept and averaged, because the curve is slightly
+# flatter on smaller images (960x540 q80 = 0.75 of q90, 640x360 q80 = 0.67):
+#   960x540  q95 1.36  q90 1.00  q85 0.89  q80 0.75  q75 0.57  q70 0.54  q60 0.46  q50 0.40
+#   640x360            q90 1.00  q85 0.79  q80 0.67  q75 0.58  q70 0.53
+MJPEG_QUALITY_SCALE = {
+    95: 1.36, 90: 1.00, 85: 0.84, 80: 0.71, 75: 0.58, 70: 0.53, 60: 0.46, 50: 0.40,
+}
+
+
+def mjpeg_quality_factor(quality: int) -> float:
+    """Frame-size multiplier relative to quality 90, linearly interpolated."""
+    q = max(1, min(100, int(quality)))
+    keys = sorted(MJPEG_QUALITY_SCALE)
+    if q >= keys[-1]:
+        return MJPEG_QUALITY_SCALE[keys[-1]]
+    if q <= keys[0]:
+        return MJPEG_QUALITY_SCALE[keys[0]]
+    for lo, hi in zip(keys, keys[1:]):
+        if lo <= q <= hi:
+            t = (q - lo) / (hi - lo)
+            return (MJPEG_QUALITY_SCALE[lo] * (1 - t)
+                    + MJPEG_QUALITY_SCALE[hi] * t)
+    return 1.0
+
 # Practical XLink-over-PoE throughput ceiling, MEASURED on this camera over this
 # network with c3_bench.py — not a datasheet figure. The PHY is gigabit, but the
 # XLink/TCP path through the Myriad X tops out far below that, and the ceiling is
@@ -348,7 +380,8 @@ class ResolvedConfig:
         if STREAM_COLOR in cfg.streams:
             raw = ow * oh * BPP["bgr" if cfg.color_wire == "bgr" else "nv12"]
             if cfg.color_encode == "mjpeg":
-                raw = ow * oh * BPP["nv12"] / MJPEG_RATIO
+                raw = (ow * oh * BPP["nv12"] / MJPEG_RATIO
+                       * mjpeg_quality_factor(cfg.mjpeg_quality))
             if cfg.color_encode in ("h264", "h265"):
                 out[STREAM_COLOR] = cfg.video_bitrate_kbps / 1000.0
             else:

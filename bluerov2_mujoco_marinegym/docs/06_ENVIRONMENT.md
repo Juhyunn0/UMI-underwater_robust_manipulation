@@ -11,7 +11,7 @@ We are drafting on a MacBook (no NVIDIA GPU). Everything here runs on CPU with
 **base `mujoco`** and stays portable to the Linux/GPU runtime.
 
 - **venv:** repo-root `.venv` (i.e. `UMI-underwater_robust_manipulation/.venv`),
-  Python 3.13, `mujoco` 3.9.x. Activate: `source .venv/bin/activate` from the repo
+  Python 3.13, `mujoco` 3.9.x. Activate: `source .venv/bin/activate` from the repo  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
   root.
 - **Runtime deps (to load/run the model):** `mujoco` + `numpy` only. All of
   `bluerov.xml`, `thrusters.py`, `hydro.py`, `teleop.py`, `test_*.py` need just
@@ -48,7 +48,7 @@ General shell hygiene: quote the path, and prefer absolute paths in scripts
 ## Linux + RTX 5090 runtime (Phase 0 — DONE 2026-06-14)
 
 The real runs happen on **Ubuntu 22.04 + NVIDIA RTX 5090 (Blackwell)**, driver
-**595.71.05** (CUDA 13.2). The runtime is split across **two conda envs** because
+**595.71.05** (CUDA 13.2). The runtime is split across **two conda envs** because  [UNVERIFIED: 예시/유도값 — docs/MEASUREMENT_AUDIT.md]
 the perception stack and GPU JAX impose contradictory numpy ranges:
 
 | env | Python | numpy | role | key packages |

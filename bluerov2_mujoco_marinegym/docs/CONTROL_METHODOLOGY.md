@@ -310,7 +310,7 @@ shared residual (the ẇ=0 model can't track a 4 s wave) → future work: an **o
 profiled to find the real bottleneck rather than guess.
 
 **What we found (profile, DP under disturbance, 120 warm ticks).** Per control tick (20 Hz, budget
-50 ms): **NMPC.solve ≈ 83 ms (≈79%)**, EAOB.update ≈ 22 ms (≈21%), full tick ≈ 106 ms = **0.47×
+50 ms): **NMPC.solve ≈ 83 ms (≈79%)**, EAOB.update ≈ 22 ms (≈21%), full tick ≈ 106 ms = **0.47×  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 real-time**; rare **2.2 s freezes** (IPOPT cold-restart on solver failure). `cProfile` confirms the
 time is *inside* the IPOPT solve (`casadi.Function_call`), not the Python rollout/Jacobian assembly.
 
@@ -432,7 +432,7 @@ equilibrium gate in `test_dobmpc.test_pitch_aware`.
 
 | run | pitch_rms | pitch_max | position | w[pitch] |
 |---|---|---|---|---|
-| DP (15 s) | 15.0 → 13.4° | 30.0 → **22.9°** | radial 4.9 → 6.1 cm | 0.22 → **0.09** |
+| DP (15 s) | 15.0 → 13.4° | 30.0 → **22.9°** | radial 4.9 → 6.1 cm | 0.22 → **0.09** [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
 | square (2 laps) | 17.8 → 12.6° | 46.7 → **23.2°** | off-path 2.6 → 3.0 cm | — |
 
 **Pitch max halved (capped at θ_max; the full-lap 67° → ~23°)** while position tracking is essentially
@@ -484,7 +484,7 @@ env; numpy stays <2.
 
 | check | IPOPT (reference) | acados SQP-RTI |
 |---|---|---|
-| solve / tick (N=60) | median **100 ms** (over the 50 ms budget) | median **0.97 ms**, max 1.1 ms |
+| solve / tick (N=60) | median **100 ms** (over the 50 ms budget) | median **0.97 ms**, max 1.1 ms [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
 | equivalence (interior states) | — | worst-case max\|Δu\| = **0.107 N** vs IPOPT (same optimum) |
 | closed-loop DP (15 s, disturb) | radial 8.6 cm, pitch_max 22.9°, ŵ_x 3.19 N, **7 freezes** | radial 7.0 cm, pitch_max **22.9°**, ŵ_x 3.11 N, **0 freezes** |
 | closed-loop square (1 m, 2 laps, disturb) | ~0.5× real-time | done, pitch_rms 14°, **0 freezes**, **1.2× real-time** |
@@ -518,7 +518,7 @@ failures) station-keeping radial RMS [cm], mean over 5 seeds:
 
 | ctrl | ideal | realistic | realistic-LV | jitter (std) ideal→LV |
 |---|---|---|---|---|
-| PID | 14.86 | 14.74 | 15.16 | 10.4 → 12.4 cm |
+| PID | 14.86 | 14.74 | 15.16 | 10.4 → 12.4 cm [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
 | MPC | 5.11 | 4.30 | 5.12 | 2.9 → 3.5 cm |
 
 Radial RMS barely moves (within the ±7–9 cm seed scatter); the visible signature is **jitter
@@ -531,7 +531,7 @@ often, would stress it harder — a follow-up.)
 **Result — the ablation incidentally exposed an acados DOB-MPC robustness bug.** Seed-averaging (which
 the noise demanded) revealed that **on seed 3 the acados SQP-RTI cascades into `ACADOS_NAN_DETECTED` /
 `MINSTEP` (n_fail 116) and blows up to 39 cm**, *independently of the actuator* (it happens on the ideal
-path). Per-seed, ideal DOB-MPC: seeds 0/1/2/4 = 4.1 / 0.7 / 0.9 / 1.4 cm, n_fail 0 (excellent); **seed 3
+path). Per-seed, ideal DOB-MPC: seeds 0/1/2/4 = 4.1 / 0.7 / 0.9 / 1.4 cm, n_fail 0 (excellent); **seed 3  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 = 39 cm, n_fail 116**. The single-seed acados verification (seed 0) missed this: a specific
 wave/kick realization drives the EAOB `ŵ` into a regime where the RTI QP goes indefinite and, doing one
 iteration, cannot recover (it holds a stale `u` → diverges → more failures). The IPOPT reference (full
@@ -608,7 +608,7 @@ one `ThrusterModel(lag=True, voltage_scale=…)` and passes `actuator=` to both 
 and the run manifest (`.meta.json`) now records `run.thrusters = {model, lag, voltage_scale}` so ideal vs
 realistic runs are never confused.
 
-**Result.** Closed-loop DP (dobmpc, seed 0, 20 s, disturbance ON): **ideal radial 5.02 cm / jitter 4.30 cm
+**Result.** Closed-loop DP (dobmpc, seed 0, 20 s, disturbance ON): **ideal radial 5.02 cm / jitter 4.30 cm  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 → realistic ×0.72 radial 7.76 cm / jitter 6.17 cm**, `n_fail 0` — the realistic stage degrades station-
 keeping as expected (deadband jitter + a 28 % thrust deficit the additive DOB only partly cancels), with no
 solver trouble. `analyze_t200_voltage.py` reproduces the table and `0.72` (MATCH). Regression: `eval_dp`
@@ -672,7 +672,7 @@ Heavy:     diag( 11.5, 11.5, 11.5,   0.3291,  0.6347, 0.6109 )   (inertia derive
 > `I_heavy = I_bluerov2 + [+0.0254, +0.0086, +0.0340] = [0.3291, 0.6347, 0.6109]`. This holds
 > whether or not the BlueROV2 base value includes its own thrusters (the hull + 4 horizontals
 > cancel). Reproduce / change the thruster-mass assumption with
-> [compute_heavy_inertia.py](../compute_heavy_inertia.py) (sensitivity: m_v 0.10→0.344 kg gives
+> [compute_heavy_inertia.py](../compute_heavy_inertia.py) (sensitivity: m_v 0.10→0.344 kg gives  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 > Ixx 0.321→0.362).
 >
 > **Honest limits:** this is a physically-motivated *estimate* (point-mass thrusters; the
@@ -723,7 +723,7 @@ MPC_Q roll/pitch position weight:  0,0 →  80,80   (the MPC actively levels the
 | BlueROV2 (rank-5) | 5.0 cm | **+11.8°** | 22.9° |
 | Heavy (full 6-DOF, inertia derived) | **3.3 cm** | **+0.4°** | 5.4° |
 
-Full actuation **actively levels pitch** (11.8° trim → 0.8°) and tightens station-keeping (5.0 → 3.3 cm).
+Full actuation **actively levels pitch** (11.8° trim → 0.8°) and tightens station-keeping (5.0 → 3.3 cm).  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 
 **How / blast radius.** [rov_model.py](../rov_model.py) (registry); [bluerov_heavy.xml](../bluerov_heavy.xml)
 + [marinegym_assets/BlueROVHeavy.yaml](../marinegym_assets/BlueROVHeavy.yaml); [params.py](../dobmpc/params.py)
@@ -776,7 +776,7 @@ structural lag dominates → DOB≈MPC (11 cm).
 [experiments/run_compare.py](../experiments/run_compare.py), config/{base,scenario_square}.yaml. The only edit
 to existing dynamics is a read-only `diag_wtrue` diagnostic in [hydro.py](../hydro.py) (`w_true_world` =
 plant force − still-water model force + FK; forces unchanged) — the env is a drop-in for hydro's duck-typed
-disturbance interface. 34 unit asserts + smoke pass. Run:
+disturbance interface. 34 unit asserts + smoke pass. Run:  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 `python -m experiments.run_compare --config config/base.yaml`.
 
 **Scope / follow-ups.** The slide's (von Benzon) M_RB/M_A differ from the current MarineGym-identified set
@@ -800,7 +800,7 @@ allocation, per-variant acados codegen) reads `RM.*` so it follows automatically
 On the square the yaw reference now tracks the path tangent `atan2(ty,tx)` (the ROV faces where it's going),
 **slew-rate-limited** so the 90° corner change ramps smoothly (`slew_heading`, default **60 °/s** ≈ 1.5 s/corner)
 instead of stepping — the POSITION path stays the sharp square (heading only). Config knobs in the square block:
-`heading_follow: true`, `yaw_rate_deg_s: 60`; viewer flags `--heading {follow,fixed}`, `--yaw-rate`. Verified:
+`heading_follow: true`, `yaw_rate_deg_s: 60`; viewer flags `--heading {follow,fixed}`, `--yaw-rate`. Verified:  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 the logged `yaw_deg` ramps at ≤3.1°/log (no 90° jump), progresses 0→90→±180→−90 through all four corners.
 
 **3. DOB-MPC `_xref_ned`: constant-pose DP tile → horizon trajectory reference** (the load-bearing fix).
@@ -822,7 +822,7 @@ world (FLU); the rotation is mandatory. EAOB is unaffected (it sees the actual c
 **Result (heavy, DP T=20 s / square 2 laps, mode C, seed 0):**
 | run | radial RMS |
 |---|---|
-| DP dobmpc (regression) | **0.00 cm** (fully-actuated + DOB rejects the current) |
+| DP dobmpc (regression) | **0.00 cm** (fully-actuated + DOB rejects the current) [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
 | square dobmpc (FF + heading) | **1.87 cm** |
 | square mpc (FF) | 3.63 cm |
 | square pid (baseline) | 25.1 cm |
@@ -886,18 +886,18 @@ heading-slew rate (60°/s at corners, 0 on straights) so the D term no longer fi
 `DOBMPCController.set_target` accepts `r_ref` for interface parity (the NMPC tracks `yaw_ref` and ignores it).
 
 **Result (heavy):** `--smoke` DP radial 1.4–1.5 cm (NONE/C/CD; wave modes 25 cm are 5 s-transient numbers);
-1-lap square NONE via run_viewer: **radial RMS 1.34 cm** (t>5 s) vs **17.8 cm** with the old gains in
+1-lap square NONE via run_viewer: **radial RMS 1.34 cm** (t>5 s) vs **17.8 cm** with the old gains in  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 `compare_20260702_222150` — ~13× — max 4.0 cm (corner transient), |pitch| 0.0°, no saturation chatter.
 `verify_meta.py` passes; `meta.json` sidecars stamp the new gain set. bluerov2 `--smoke` unchanged (legacy path).
 
 **Validity:** sim-only (ideal thrusters, perfect 500 Hz state). For hardware derate ωn to 1.0–1.5 rad/s and
-filter the D term. Beyond the |S(1.6)| ≈ 0.41 wave-band residual, the answer is DOB-MPC, not more PID gain.
+filter the D term. Beyond the |S(1.6)| ≈ 0.41 wave-band residual, the answer is DOB-MPC, not more PID gain.  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 
 ---
 
 ## 2026-07-07 — DOB-MPC yaw reference completed (yaw preview + yaw-rate FF on turns)
 
-**Why.** On the square, DOB-MPC's largest CW/CDW error concentrates at the **(1,1) upstream
+**Why.** On the square, DOB-MPC's largest CW/CDW error concentrates at the **(1,1) upstream  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 corner** (17 cm, seed 0 / current 0° / wave 0°), a cross-track sag ~0.36 m past the corner. Root
 cause is a half-finished feature: the 2026-06-30 `_xref_ned` upgrade (constant-pose → moving-path)
 added the **translational** feed-forward (position preview + linear `v_ref`) but never the
@@ -919,7 +919,7 @@ a 60°/s-slewing yaw target as a zero-rate position regulator → slew lag (1.8 
   (new `test_dobmpc.test_xref_yaw_preview` asserts DP-equivalence + the `-r_ref` sign + the clamp).
 - Runtime-only (`yref`); no acados rebuild. Weights unchanged.
 
-**Result (A/B, dobmpc, seed 0, current 0° / wave 0°, run_viewer headless).** Yaw slew-to-5° at the
+**Result (A/B, dobmpc, seed 0, current 0° / wave 0°, run_viewer headless).** Yaw slew-to-5° at the  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 (1,1) corner **1.85 → 1.45 s** (≈ nominal) in both NONE and CDW — the lag mechanism is fixed. CDW
 (1,1) top-edge **max 17.2 → 13.2 cm (−23%)**; overall radial RMS unchanged (CDW 3.13→3.16, NONE
 2.08→2.07 — no regression; still-water per-corner peaks ±0.3–1.7 cm, since a no-wave corner
@@ -959,7 +959,7 @@ thruster code indexes actuators by name (`thr0..7`), so allocation/teleop are un
    `fullinertia` (Ixz = −0.0016) made MuJoCo diagonalize and *sort* the principal axes — for this payload the
    inertial frame becomes an axis PERMUTATION of the body frame — and `mj_objectVelocity(mjOBJ_BODY)` reports ν
    in that permuted frame while hydro applies the drag wrench via `xmat`. Crossed drag axes turn the dissipative
-   term into an energy pump: a torque-free 0.5 rad/s pitch kick exploded to |q| > 60 rad/s in 1.5 s. Isolated by
+   term into an energy pump: a torque-free 0.5 rad/s pitch kick exploded to |q| > 60 rad/s in 1.5 s. Isolated by  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
    ablation (buoyancy-only stable, drag-only explodes; heavy control stable). Fix: emit **diaginertia** (the
    0.4% Ixz is far below coefficient uncertainty); the deeper hydro fix is logged in KNOWN_ISSUES.
 
@@ -971,9 +971,9 @@ rivals the passive B·coBM restoring (~1.2 N·m/rad), so passive-only attitude w
 the registry automatically (MPC weights untouched — the earlier "calm the attitude weights" hypothesis was a
 misdiagnosis of lesson 2 and was reverted).
 
-**Results:** PID DP hold 0.0 cm (still water, 20 s); DOB-MPC DP hold rms(12–20 s) **1.3 cm** still / **1.4 cm**
+**Results:** PID DP hold 0.0 cm (still water, 20 s); DOB-MPC DP hold rms(12–20 s) **1.3 cm** still / **1.4 cm**  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 current+waves / 22 cm with 20–50 N Poisson kicks (impulse-recovery transients — EAOB cannot predict kicks,
-consistent with the C-mode analysis). heavy reference on the same harness: 0.4 cm (cw). acados-vs-IPOPT
+consistent with the C-mode analysis). heavy reference on the same harness: 0.4 cm (cw). acados-vs-IPOPT  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 worst-case |Δu| 0.2717 N (marginally over the heavy-calibrated 0.25 N gate; ~0.9% of authority — logged in
 KNOWN_ISSUES). Full three-variant regression (selftest / load / thrusters / controller / hydro / observe /
 water_viz) passes; heavy and bluerov2 files untouched.
@@ -987,7 +987,7 @@ was wrong. The real mount was measured end-to-end from the lab's Onshape assembl
 C3-BR bracket): exported with **onshape-to-robot** (v1.8.2, MuJoCo output; export kept in
 `assets/CAD files/onshape_export/`), then the exported vehicle geometry was **registered to the sim base_link
 frame** with the rotation constrained to a pure axis permutation (the CAD sits axis-aligned; its bbox equals the
-vendor 575×254×457 mm exactly), a global voxel-occupancy grid search over translation (no ICP local minima),
+vendor 575×254×457 mm exactly), a global voxel-occupancy grid search over translation (no ICP local minima),  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 scale 1.0233 accounted for (the MarineGym-derived skin is uniformly 2.3% large; placement is TRUE METRIC anchored
 at the COM), and a trimmed-ICP translation polish: residual 1.6 mm, seed spread <0.1 mm, fore-aft disambiguated
 by the electronics-tube dome. Pipeline constants frozen in [process_c3_mesh.py](../process_c3_mesh.py), which now
@@ -996,7 +996,7 @@ emits `meshes/c3_payload_frames.json` consumed by the generator (drift-guarded a
 **Result** (base_link FLU, origin = vehicle COM): C3 mesh centroid `[0.199, 0.008, −0.156]` — **front-bottom on
 the centreline**, housing protruding ~9 mm past the frame nose and ~3 cm below the skid line; optical axis
 `[1.000, 0, 0.0056]` (0.32° up-tilt kept verbatim from the CAD mates); stereo baseline horizontal. The C3-BR
-bracket straddles the Newton-gripper tube with ~1 mm clearance — independently confirming the guessed
+bracket straddles the Newton-gripper tube with ~1 mm clearance — independently confirming the guessed  [UNVERIFIED: 예시/유도값 — docs/MEASUREMENT_AUDIT.md]
 `GRIP_POS=[0.25, 0, −0.17]` is compatible with the real bracket. The 3 MJCF cameras now sit at the **lens plane**
 (`x=0.2395`, `y=0.0055±0.0375`, `z=−0.1554`) looking forward-level; the gripper jaws appear dead ahead at ~18 cm.
 
@@ -1006,7 +1006,7 @@ net buoyancy unchanged −5.7 N. The dropped off-diagonal grew from Ixz −0.001
 Ixx)** — a real roll-yaw product the plant cannot carry until hydro reads body-frame velocity (KNOWN_ISSUES).
 Bracket mass is NOT yet composed (visual-only; pending real mass). Bonus fix: the mesh visual-orientation helper
 used `conj(mesh_quat)`; MuJoCo's convention is `v_orig = R(mesh_quat)·v_stored + mesh_pos`, so the geom quat must
-be `mesh_quat` itself — the old bake's ~180° principal rotation masked this (conj(q) = −q). Verified: vertex
+be `mesh_quat` itself — the old bake's ~180° principal rotation masked this (conj(q) = −q). Verified: vertex  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 reconstruction error 0.000 mm; `test_heavy_gripper.py` all green; renders `assets/screenshots/c3/c3new_*.png`.
 
 ---
@@ -1021,7 +1021,7 @@ hardware the CAD doesn't have. It is `heavy_gripper` minus the gripper: `compute
 + bracket + 3 lens-plane cameras, **no** gripper cylinder / jaws / actuator). Numbers: mass 13.2 kg,
 I = [0.37014, 0.73153, 0.67460], COM [+0.026, +0.001, −0.020], displaced volume 0.0129237 m³ →
 **net buoyancy −3.1 N (sinks)**; coBM +0.01372. With no articulated bodies the composite COM is the whole-vehicle
-COM, so `<inertial pos>` = 0. Gains: `heavy_c3` inherits `GAINS_HEAVY` (fully-actuated fallback) — PID holds the
+COM, so `<inertial pos>` = 0. Gains: `heavy_c3` inherits `GAINS_HEAVY` (fully-actuated fallback) — PID holds the  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 origin at 0.0 cm; without the roll/pitch-leveling PD (`heavy_gripper` has it) the C3's forward-low COM leaves a
 ~1° residual pitch (position hold unaffected). The dropped off-diagonal is Ixz +0.046 (12.4% of Ixx), same
 body-frame-hydro limitation as heavy_gripper (KNOWN_ISSUES). Regression `test_heavy_c3.py` (composition /
@@ -1039,7 +1039,7 @@ re-orients each mesh to principal axes internally, but **the compiler composes t
 referencing geom's pos/quat** (verified numerically: with XML quat = mesh_quat, the compiled geom_quat came out
 exactly mesh_quat⊗mesh_quat). So an XML geom pose applies to the mesh **as authored**, and a pre-baked mesh needs
 **no quat at all** — which is also why the quat-less `rovc_*` skins always rendered correctly. Both prior
-"cancellation" schemes (conj(mesh_quat), then mesh_quat) double-handled the reframe; the C3's near-square cross
+"cancellation" schemes (conj(mesh_quat), then mesh_quat) double-handled the reframe; the C3's near-square cross  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 section (95×89 mm) made the error a clean-looking 90° twist that survived eyeballing. Fix: quat-less payload
 geoms in both generators + a build-time guard `_verify_mesh_geoms()` (compile the emitted XML, reconstruct
 rendered vertices from the compiled geom pos/quat, assert bbox == baked STL at the intended position, ±1 mm) so a
@@ -1088,13 +1088,13 @@ control-theory workflow (both claim sets returned CONFIRMED).
 
 **(1) Roll/pitch leveling PD → PID.** The optional leveling loop (enabled per variant by `rp_kp`; on for
 `heavy_gripper`) was pure PD, which is type-0 against a *constant* attitude torque: the asymmetric payload (forward
-COM + jaw weight, ~0.2–0.5 N·m) leaves a steady tilt `φ_ss = τ/(kp + B_restore)`. Measured at a 0.40 N·m constant
+COM + jaw weight, ~0.2–0.5 N·m) leaves a steady tilt `φ_ss = τ/(kp + B_restore)`. Measured at a 0.40 N·m constant  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 torque: PD holds roll 3.53° / pitch 3.58°; that is ~cm-scale end-effector error at manipulation reach. Adding any
 `Ki>0` makes the loop **type-1** so `φ_ss → 0` exactly (verified 0.00°/0.00°), independent of `Ki` magnitude and of
 the exact `B_restore` estimate. Design = **option (a)**: keep the validated `kp/kd`, add only `ki = I_eff·α·ωn³`
 (same analytic pole placement as translation, α=0.2, ωn=3): `I_eff` roll 0.481 → 2.60, pitch 0.859 → 4.64
 N·m/(rad·s). Anti-windup mirrors the position/yaw loops — integrate `-angle` only when near level (`|angle| <
-rp_gate = 0.15 rad`), clamp `|ki·I| < rp_i_max = (1.5, 2.0)` N·m. Verified the 3rd-order closed loop
+rp_gate = 0.15 rad`), clamp `|ki·I| < rp_i_max = (1.5, 2.0)` N·m. Verified the 3rd-order closed loop  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 `I·s³+Kd·s²+(Kp+B)·s+Ki` has all roots in the LHP with dominant pair ζ≈0.83–0.89 (the integral does **not** erode PD
 damping; it inserts a slow companion pole at −0.67/−0.84 rad/s → residual nulled in ~4.5–6 s). Gains added to
 `GAINS_HEAVY_GRIPPER` (`rp_ki`, `rp_i_max`, `rp_gate`). Gated on `self.use_i` **and** presence of `rp_ki`, so
@@ -1103,12 +1103,12 @@ off (unchanged); `heavy_gripper` PID-leveling runs before 2026-07-21 used PD lev
 attitude-accuracy data across this boundary.
 
 **(2) Body-force shaping generalized on rank-6.** The surge-**only** slew-rate limit is generalized to a **uniform**
-slew on all three body-force axes (finite actuator/command bandwidth; rarely binds at 120 N/s — ~66 N/s at hover).
+slew on all three body-force axes (finite actuator/command bandwidth; rarely binds at 120 N/s — ~66 N/s at hover).  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 The soft **pitch guard** (scales surge down above |pitch|>15°) is **KEPT** for the heavy family, gated on the
 `pitch_guard_deg` gain key. Correction to the first-pass analysis (which removed it): the rank-6 `pinv` of the
 full-rank 6×8 `B` only STATICALLY decouples `Fx` from `My` (pure `Fx → My=0`), but the migrated `test_controller` on
 the heavy plant showed a **DYNAMIC Coriolis/added-mass coupling** still excites the weakly-restored pitch mode on an
-aggressive far-offset slew — pitch transiently swings to ~70° WITHOUT the guard vs ~45–56° WITH it (recovering to
+aggressive far-offset slew — pitch transiently swings to ~70° WITHOUT the guard vs ~45–56° WITH it (recovering to  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 level either way). So the guard IS useful on heavy: a dormant transient-pitch limit that fires only above 15° (never
 in normal small-error operation; on `heavy_gripper` the rp-PID leveling handles attitude first and the guard only
 backs it up on large excursions). Amplitude clamp unchanged (already isotropic 30/30/30). Docstring corrected: the
@@ -1139,7 +1139,7 @@ noise-free ground truth.** Confirmed: no measurement noise exists anywhere in th
 raw `xpos/xmat/mj_objectVelocity` + a clean tick FD as `nudot`; no `<sensor>` elements; the disturbance package
 perturbs forces only). The covariances were unit-blind DT templates (`Q_pose=R=DT⁴/4`, `Q_vel=Q_dist=DT²`,
 `R = 1.5625e-6·I₁₈` — the same variance for a meter, a radian and a Newton). Steady-state Riccati analysis of
-the real (F,H) at hover: per-axis w-error time constants 6.8–13.4 ms (tau-channel Kalman gains −0.976…−0.999),
+the real (F,H) at hover: per-axis w-error time constants 6.8–13.4 ms (tau-channel Kalman gains −0.976…−0.999),  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 i.e. the disturbance state re-locks in ~one tick — a deadbeat inverse-dynamics decoder, not a filter. Under any
 realistic sensor noise it would pass that noise straight into `w_hat`.
 
@@ -1157,19 +1157,19 @@ are verify/deadbeat + clean-measurement equivalent; **don't pool results across 
 sweeps ≤ 2026-07-22 are pre-boundary).
 
 **(3) Validation + the τ_dist iteration (`verify/verify_eaob.py`: w_true = model residual M·a+C+D+g−τ at clean
-states, cross-checked against hydro's independent `diag_wtrue` diagnostic — the two agree to ≤0.08 N).** At the
+states, cross-checked against hydro's independent `diag_wtrue` diagnostic — the two agree to ≤0.08 N).** At the  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 initial 0.5 s design point the perf profile passed only where the w_dot=0 model holds (DP CD: NIS 14.8 PASS) and
 failed under waves (DP CDW: NIS 25.4, NEES 77 — the wave band outruns the w random walk). Iterating the single
 knob, gate OFF (DP CDW, T=60 s, seed 0): τ = 0.5 / 0.3 / **0.2** / 0.1 → NIS 25.4 / 19.8 / **17.1** / 14.8,
 NEES 77 / 26.1 / **15.0** / 11.5, w-RMSE_X 1.11 / 0.74 / **0.55** / 0.48 N. **Default set to τ_dist = 0.2 s** —
-the only value passing BOTH ranges in CDW; in CD it gives NIS 14.4 PASS, RMSE X/Y/Z 0.29/0.41/0.48 N. CD NEES
+the only value passing BOTH ranges in CDW; in CD it gives NIS 14.4 PASS, RMSE X/Y/Z 0.29/0.41/0.48 N. CD NEES  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 sits at ~9 (conservative, safe direction) because R/Q deliberately model real-hardware terms the ideal sim doesn't
 produce (allocation mismatch, process floors) — tuning them down would fit the sim, not the robot, so they stay.
 Slow-disturbance-only experiments can raise τ (CD RMSE halves again by τ≈2 s) at the cost of wave-band lag.
 Measurement caution: an early sweep accidentally run WITH the gate enabled reported wildly inflated NIS
 (137/67/43/27 for τ 0.5→0.05) — gate rejections starve the filter, which inflates the next innovations
 (a feedback artifact); filter consistency must be measured gate-off. Motion-correlation diagnostic: residual
-slopes vs |nu| ≈ 0 with |r| ≤ 0.18 everywhere in the final config (no model error leaking; the small CDW Z/M
+slopes vs |nu| ≈ 0 with |r| ≤ 0.18 everywhere in the final config (no model error leaking; the small CDW Z/M  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 correlation is wave-coherent motion, not drag mismatch). Corner NIS spikes in square runs are dominated by the
 psi/r channels, consistent with the placeholder rotational added mass.
 
@@ -1177,13 +1177,13 @@ psi/r channels, consistent with the placeholder rotational added mass.
 per tick (`last_nis`, `last_zscore`, `n_gated`) and can reject frames at χ²(0.999,18)=42.31
 (`params.EAOB_GATE_ON`). Closed-loop A/B (square, 2 laps, seed 0) killed it as a default: the wave band + corner
 maneuvers violate w_dot=0 ROUTINELY, so a consistency gate rejects 25–76% of frames and blocks exactly the
-updates that track the disturbance — CDW radRMS 4.53→15.45 cm (gate off→on), CD 1.35→1.43 cm (measured at
+updates that track the disturbance — CDW radRMS 4.53→15.45 cm (gate off→on), CD 1.35→1.43 cm (measured at  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 τ=0.5; at the final τ=0.2 the gate never fires in the same scenarios, 0/1067, so it is harmless but also
 useless). A gate cannot separate "spike" from "wave" under a model that calls every wave an outlier; anti-spike
 defense belongs to the per-axis `W_HAT_CLIP` (KNOWN_ISSUES, still open).
 
 **(5) What the honest numbers cost (final config: perf, noise on, τ=0.2, gate off; 2-lap square / 60 s DP,
-seed 0).** DP mode C: DOB-MPC keeps its headline DC rejection under realistic sensors — dc offset
+seed 0).** DP mode C: DOB-MPC keeps its headline DC rejection under realistic sensors — dc offset  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 (−0.11, −0.01) cm, radial RMS 0.33 cm, vs plain MPC +2.13 cm (the old 0.00 cm was the noise-free fiction).
 Square: CD 1.02 (verify, clean) → 1.21 cm, CDW 3.09 → 3.51 cm — the honest price of vision-grade sensing is
 ≈0.2–0.4 cm. Regression: `test_frames`/`test_predictor`/`test_eaob_no_accel_doublecount` PASS under the new
@@ -1209,7 +1209,7 @@ are wiring checks — both stay "truth". Run meta records `controller.mpc_state_
 **(2) Yaw continuity needed NO unwrap accumulator.** The EAOB yaw state is already the continuous signal (it is
 integrated, never re-wrapped; only innovations are wrapped) and NEITHER solver bounds yaw or position
 (acados idxbx=[3,4,6,7,8]; IPOPT bounds only roll/pitch/|v|), so a multi-lap accumulated yaw (2 laps ≈ 4π) is
-safe — verified: max per-tick |Δpsi_hat| ≤ 0.12 rad across all runs (a branch jump would be ~6.3). Side benefit:
+safe — verified: max per-tick |Δpsi_hat| ≤ 0.12 rad across all runs (a branch jump would be ~6.3). Side benefit:  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 the estimate path removes the ±π measured-yaw jump the RTI warm start used to see each crossing. Startup needed
 no warm-up either: the EAOB lazy-inits AT the first reading, so the estimate starts exactly at truth (startup
 max radial identical to the initial offset in every A/B pair).
@@ -1224,7 +1224,7 @@ smoother command; no saturation, n_fail 0, all runs finite. Acceptance PASS (est
 the ~9 NEES in C/CD is the documented conservative direction, reported non-gating).
 
 **(4) Discovered during validation — the CURRENT base.yaml sea state breaks CDW consistency for BOTH sources.**
-config/base.yaml's wave block was strengthened at 2026-07-23 19:28 (Hs 0.75→1.2 m, Tp 12→6 s, γ 5→2, s 30→10,
+config/base.yaml's wave block was strengthened at 2026-07-23 19:28 (Hs 0.75→1.2 m, Tp 12→6 s, γ 5→2, s 30→10,  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 ω_max 1.6→3.0): under it, CDW NIS = 80(truth)/71(estimate) on DP and 44/42 on square, radRMS 9.6→10.1 /
 15.7→17.5 cm — the w_dot=0 + τ_dist=0.2 observer cannot follow the new faster/bigger wave band. This is
 orthogonal to the state-source switch (both sources fail identically; the old-waves A/B passes everything) and
@@ -1270,7 +1270,7 @@ there = the known wave-model limit) — the chatter couples back through the pla
 with a RAW noisy estimator is the correct hardware-honest topology but pays a large actuator-chatter tax; the
 EAOB-filtered "estimate" delivers identical tracking at truth-like chatter because it IS a state filter. Per the
 advisor: on real hardware the SLAM+IMU FUSION owns the smoothing (its fused output is ~1–2 cm colored, far less
-punishing than the sim's 5 cm white @ 20 Hz), so the sim's "meas" is pessimistic. This is the deliberate,
+punishing than the sim's 5 cm white @ 20 Hz), so the sim's "meas" is pessimistic. This is the deliberate,  [UNVERIFIED: 예시/유도값 — docs/MEASUREMENT_AUDIT.md]
 temporary starting point (user-chosen while the estimator — SLAM vs learned model — is undecided); mitigation
 (a SLAM-proxy KF feeding both EAOB and MPC, MPC rate weights, or reverting to "estimate") is a separate human
 decision and was NOT applied here. EAOB tuning (R/Q/P0/τ_dist) untouched, as constrained.
@@ -1282,14 +1282,14 @@ sat ABOVE the ~1.2 cm closed-loop tracking error, so the MPC chased its own meas
 chatter). Reduced `params.EAOB_SIG_*` (pose/vel channels only) to a good visual-inertial/SLAM+DVL+depth stack:
 x/y **0.5 cm**, z 0.3 cm, attitude 0.3° (yaw 0.5°), lin-vel 0.5 cm/s, gyro 0.11°/s. The pose noise now sits at
 ~0.4× the tracking error. `ACC/AACC/ALLOC` (the disturbance pseudo-measurement → R_tau, q_dist) are UNCHANGED,
-so w_hat quality is preserved (verify_eaob CD w-RMSE 0.24/0.34/0.39 N, if anything slightly better than the
+so w_hat quality is preserved (verify_eaob CD w-RMSE 0.24/0.34/0.39 N, if anything slightly better than the  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 0.29/0.41/0.48 at the old noise). Because `EAOB_SIG_*` is the single source for BOTH the injection and the perf
 filter R, R shrinks with the injected noise — the filter stays consistent-or-conservative by construction.
 
 **A/B (gentle sea state, seed 0, truth → meas → estimate; the 5 cm → 0.5 cm change):**
 
 | scenario | radRMS [cm] | chatF [N/tick] (meas) |
-|---|---|---|
+|---|---|--- [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
 | dp C | 0.22 / 0.26 / 0.31 | 10.89 → **1.76** (truth 0.70) |
 | square C | 1.13 / 1.20 / 1.16 | 11.81 → **2.91** (truth 1.19) |
 | square CDW | 3.19 / 3.26 / 3.26 | 12.02 → **3.08** (truth 1.93) |
@@ -1332,7 +1332,7 @@ meas-state PID records — rerun the sweep to compare.
 
 | ctrl / mode | radRMS [cm] | dc [cm] | slew Σ\|dU\| [N/tick] |
 |---|---|---|---|
-| pid  NONE truth | 1.49 | 0.08 | 0.85 |
+| pid  NONE truth | 1.49 | 0.08 | 0.85 [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
 | pid  NONE meas  | 1.47 | 0.10 | 3.27 |
 | pid  C    truth | 1.61 | 0.08 | 0.85 |
 | pid  C    meas  | 1.58 | 0.10 | 3.24 |
@@ -1343,7 +1343,7 @@ its C-mode DC offset at ~0.1 cm (its integrator averages out the zero-mean noise
 2.87 cm — so the C/CD gap is the **missing integral action**, not state quality. Noisy state costs the PID only
 command chatter (slew ×3.8, still below the MPC's because the PID's 120 N/s slew limiter de-facto filters the
 20 Hz noise steps); radRMS and offset are essentially unchanged. `pid/NONE/truth` reproduces the recorded sweep
-`radial_max` 4.402 cm byte-for-byte, confirming `meas_noise=False` is the exact pre-change path. Verified:
+`radial_max` 4.402 cm byte-for-byte, confirming `meas_noise=False` is the exact pre-change path. Verified:  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 `_R_from_rpy` round-trips to 4e-16; injected σ measured 5.24 mm / 4.82 mm·s⁻¹ / 0.482° vs the 5/5/0.5 targets;
 refresh cadence 25 substeps (20 Hz), held within a tick.
 
@@ -1362,7 +1362,7 @@ compare", which was exactly backwards. The PID's identical relic (a 6 N surge ca
 
 | | PID | MPC box 8 N | MPC box 30 N |
 |---|---|---|---|
-| storm  | 26.32 | 30.55 (box active 60–66 % of ticks) | **17.72** (0.7–1.8 %) |
+| storm  | 26.32 | 30.55 (box active 60–66 % of ticks) | **17.72** (0.7–1.8 %) [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
 | gentle | 12.51 | 8.50 (5–9 %) | 7.64 (0.2–0.3 %) |
 
 The box was active on **60 % of 20 Hz ticks at storm (dobmpc 75 %) vs 7 % at gentle** — an amplitude-dependent
@@ -1377,14 +1377,14 @@ Validation with the rebuilt solver (storm/gentle CW, 10 laps, 3 paired headings)
 
 | sea state | PID | MPC | DOB-MPC | max thruster | sat_freq |
 |---|---|---|---|---|---|
-| storm  | 26.14 | **17.86** (was 28.82) | **7.30** (was 17.36) | 40.3 N | 0.0000 |
+| storm  | 26.14 | **17.86** (was 28.82) | **7.30** (was 17.36) | 40.3 N | 0.0000 [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
 | gentle | 11.56 | **7.63** (was 9.51)   | **1.87** (was 3.14)  | 36.1 N | 0.0000 |
 
 MPC now wins at **both** ends (PID−MPC +8.28 storm, +3.93 gentle) — the crossover is gone — and DOB-MPC gains the
 most (2.4× better at storm), since it was the most authority-starved. Still no physical saturation: peak
 per-thruster demand 40.3 N against a T200 `ctrlrange` of −51.6…+64.1 N, and at a fixed heading the 30 N box
 actually *lowers* peak thruster force (36.1 vs 36.9 N) because adequate authority prevents the violent late
-corrections the 8 N box provoked. `verify_acados` still passes (acados↔IPOPT max|Δu| = 0.0615 N < 0.25 N gate,
+corrections the 8 N box provoked. `verify_acados` still passes (acados↔IPOPT max|Δu| = 0.0615 N < 0.25 N gate,  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 1.04 ms median, n_fail = 0); closed-loop n_fail ≈ 1 per 5334-tick run, unchanged.
 
 **Records boundary:** run meta now stamps `controller.u_max` (both `run_compare` and the teleop manifest, read off
@@ -1393,11 +1393,11 @@ the 20260724 sweeps — is under 8 N and must not be pooled with new runs; in pa
 waves" from those records is a benchmark artifact and must not be cited. A full sweep rerun is pending
 (KNOWN_ISSUES).
 
-**What survives as real control findings** (unaffected by the box): the MPC's error PSD is 3–8× below the PID's at
+**What survives as real control findings** (unaffected by the box): the MPC's error PSD is 3–8× below the PID's at  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 every frequency under 0.7 rad/s in *every* sea state — its Fossen model plus 3 s reference preview — which is also
 why it wins the disturbance-free NONE baseline (1.089 vs 1.492 cm). And in constant-current C mode the nominal
 MPC still parks 2.70 cm downstream for want of integral action (PID 0.03 cm), the gap DOB-MPC's `w_hat` closes.
-**Not established:** that the ladder's crossover was a *frequency* phenomenon — the sea-state ladder co-varies Hs
+**Not established:** that the ladder's crossover was a *frequency* phenomenon — the sea-state ladder co-varies Hs  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 and Tp (corr(log Hs, log ω_p) = 0.967) plus γ and s, so a regression cannot separate them (substituting the
 equally-collinear γ reverses the ranking, and the Hs coefficient is not significant on 6 rungs, p = 0.22). The
 ablation settled the mechanism directly instead of the regression.
@@ -1427,7 +1427,7 @@ RMS = steady-window radial RMS (t ≥ 10 s, same metric as the bar chart)"). The
 *lines* still draw the entire run — only the scored number changed.
 
 **Verification** (no sim re-run): re-rendered the `20260727/compare_20260727_000850/wave01_moderate` figures from
-its existing per-run CSVs — all 15 (5 modes × 3 controllers) boxed values now equal `results_raw.csv` to
+its existing per-run CSVs — all 15 (5 modes × 3 controllers) boxed values now equal `results_raw.csv` to  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 ≤ 1.6e-6 cm, the `%.5f` m write precision of those CSVs. `plot_trajectories` on one run prints 17.26 / 10.88 /
 2.79 cm against that run's recorded 17.26 / 10.88 / 2.79. Full `--smoke` pipeline green.
 
@@ -1435,3 +1435,13 @@ its existing per-run CSVs — all 15 (5 modes × 3 controllers) boxed values now
 bar charts were always the steady-window metric and are unchanged. Only the *trajectory-figure boxes* changed.
 Figures generated **before this date** box a full-run RMS, ~1–2 % below the matching bar; read their caption
 ("full-run radial RMS (all laps)") or regenerate them.
+
+
+<!-- MEASUREMENT AUDIT (2026-08-04): the following numbers appear inside code
+     blocks above and could not be annotated inline without corrupting them. -->
+
+> **[UNVERIFIED]** 아래 줄의 수치는 출처 감사에서 미검증으로 분류되었다 — 자세한 근거는 [docs/MEASUREMENT_AUDIT.md](docs/MEASUREMENT_AUDIT.md).
+>
+> - `bluerov2_mujoco_marinegym/docs/CONTROL_METHODOLOGY.md:130` — 산출물 없음 — `(both coefficient sets recovered back out of the sim to 0.00 %, T4.3)`
+> - `bluerov2_mujoco_marinegym/docs/CONTROL_METHODOLOGY.md:139` — 산출물 없음 — `└−a₂v   a₁u    0   −a₅q   a₄p     0   ┘   1e-14 (T1.1–1.2)`
+> - `bluerov2_mujoco_marinegym/docs/CONTROL_METHODOLOGY.md:704` — 예시/유도값 — `Heavy:     6×8,  rank 6   — FULLY ACTUATED (verified: a pure pitch wrench realiz`

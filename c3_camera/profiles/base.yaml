@@ -1,0 +1,63 @@
+# c3_collect operating profile — what is true for EVERY dive on this rig,
+# whatever the dive is for. Other profiles `extends:` this one and state only
+# their deltas.
+#
+#     ./c3 collect --profile research_near
+#     ./c3 collect --profile research_near --dry-run     # values + where each came from
+#
+# WHAT IS DELIBERATELY NOT HERE: the camera settings that `mode: research`
+# (c3_collect.py RESEARCH_DEFAULTS) and `mode: review` (REVIEW_DEFAULTS) already
+# carry. Those live in code with their reasoning attached, and every existing
+# flag-only invocation already gets them. Restating them here would make a second
+# copy, and this copy would silently win the next time the code one is corrected.
+#
+# Precedence, lowest to highest:
+#     StreamConfig defaults  (config.py:175)
+#   < mode defaults          (c3_collect.py:73-104)
+#   < this file, parents before children via `extends:`
+#   < flags typed on the command line
+# `--dry-run` prints the resolved value AND its origin for every key, so none of
+# the above has to be taken on faith.
+
+schema: c3_collect_profile/1
+profile: base
+
+mode: research
+
+mavlink:
+  # rest = poll MAVLink2Rest on the BlueOS host. Nothing to configure on the
+  # vehicle and no collision with QGroundControl's 14550, at the cost of SAMPLING
+  # telemetry rather than seeing every message. Switch to udp once
+  # --setup-endpoint has been run on this vehicle and full-rate telemetry matters.
+  transport: rest
+  rest_url: "http://192.168.2.2:6040"
+
+imu:
+  enable: true
+  # BNO086 accel + gyro, from the camera itself — same clock as the images.
+  rate_hz: 200
+  # Reports per XLink message. 1 is the lowest latency and loses samples when the
+  # image streams are busy; a dataset wants completeness instead.
+  batch: 10
+  # Both of these collapse the WHOLE IMU to the slowest enabled sensor, because
+  # the rate is shared. Leave them off unless you specifically want orientation
+  # or magnetometer data and can pay for it in IMU rate.
+  rotation_vector: false
+  magnetometer: false
+
+display:
+  # PREVIEW ONLY. min_mm/max_mm are the two ends of the depth colourmap
+  # (compose_view -> viz.colorize_depth). They never clip, mask or rescale one
+  # pixel of depth/*.png. To see closer, the setting is stereo.extended.
+  enable: true
+  min_mm: 300.0
+  max_mm: 6000.0
+  scale: 1.0
+  print_every_s: 3.0
+
+recording:
+  writer_threads: 3
+  writer_queue: 12
+  png_compression: 1        # lossless at every level; 1 is the fast end
+  min_free_gb: 10.0
+  mp4: true

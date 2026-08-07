@@ -88,7 +88,7 @@ uses this offset for the restoring moment. See [04_HYDRO.md](04_HYDRO.md).
 
 `python tests/test_load.py`:
 - Loads via `mujoco.MjModel.from_xml_path`, **zero compile warnings**.
-- Mass 11.20 kg, inertia as above, 6 thruster sites, correct vectored layout.
+- Mass 11.20 kg, inertia as above, 6 thruster sites, correct vectored layout.  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 - Zero-control free fall (gravity on, no buoyancy yet): Δz ≈ −19.6 m over 2 s,
   matching ½·g·t²; quaternion stays unit; **no NaN / no blow-up**.
 - Headless render (`--render`) looks like a BlueROV2 (`preview.png`).

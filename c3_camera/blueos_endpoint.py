@@ -77,6 +77,25 @@ def list_endpoints(host: str = DEFAULT_HOST) -> list[dict]:
     return _call(host, "GET") or []
 
 
+def default_name(port: int) -> str:
+    """A name unique per port.
+
+    ardupilot-manager requires endpoint names to be unique and answers a
+    duplicate with **HTTP 500 Internal Server Error**, which reads as "the
+    vehicle is broken" rather than "that name is taken" — measured 2026-08-06
+    while adding a second endpoint alongside the 14551 one. Deriving the name
+    from the port means a second, third, nth endpoint just works.
+    """
+    return f"{DEFAULT_NAME} {port}"
+
+
+def find_by_name(name: str, host: str = DEFAULT_HOST) -> dict | None:
+    for ep in list_endpoints(host):
+        if ep.get("name") == name:
+            return ep
+    return None
+
+
 def endpoint_body(port: int, place: str = "192.168.2.1",
                   name: str = DEFAULT_NAME, persistent: bool = True) -> dict:
     return {
@@ -146,7 +165,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="UDP port BlueOS should push to (default: %(default)s)")
     p.add_argument("--place", default="192.168.2.1",
                    help="destination address = this desktop (default: %(default)s)")
-    p.add_argument("--name", default=DEFAULT_NAME)
+    p.add_argument("--name", default=None,
+                   help="endpoint name (default: derived from the port, because "
+                        "BlueOS rejects duplicate names with an opaque HTTP 500)")
     p.add_argument("--no-persistent", dest="persistent", action="store_false",
                    default=True, help="do not keep the endpoint across reboots")
     p.add_argument("--yes", action="store_true",
@@ -169,6 +190,7 @@ def main(argv: list[str] | None = None) -> int:
               f"MAVLink Endpoints  ->  add udpout {a.place}:{a.port}")
         return 2
 
+    name = a.name or default_name(a.port)
     try:
         if a.action == "add":
             existing = find_recorder_endpoint(a.port, a.host)
@@ -176,7 +198,15 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"an endpoint already pushes to {a.place}:{a.port} "
                       f"(name={existing.get('name')!r}); nothing to do")
                 return 0
-            add_endpoint(a.port, a.host, a.place, a.name, a.persistent)
+            clash = find_by_name(name, a.host)
+            if clash is not None:
+                print(f"the name {name!r} is already used by the endpoint on "
+                      f"port {clash.get('argument')}.")
+                print("  BlueOS requires unique names and answers HTTP 500 to a "
+                      "duplicate, so this is caught here instead.")
+                print(f"  Pass a different one:  --name '{name} b'")
+                return 1
+            add_endpoint(a.port, a.host, a.place, name, a.persistent)
             print(f"added: udpout -> {a.place}:{a.port}  (persistent="
                   f"{'yes' if a.persistent else 'no'})")
             print(f"  the recorder can now use:  --mavlink udpin:0.0.0.0:{a.port}")

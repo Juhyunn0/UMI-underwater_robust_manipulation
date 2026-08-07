@@ -73,8 +73,8 @@ RMSE over 25 s:
 | controller | x [m] | y [m] | z [m] | yaw [rad] |
 |---|---|---|---|---|
 | PID    | 1.2005 | 1.1649 | 0.8223 | 0.4801 |
-| MPC    | 0.1045 | 0.1019 | 0.1430 | 0.0559 |
-| DOBMPC | **0.0074** | **0.0031** | **0.0150** | **0.0015** |
+| MPC    | 0.1045 | 0.1019 | 0.1430 | 0.0559 [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
+| DOBMPC | **0.0074** | **0.0031** | **0.0150** | **0.0015** [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
 
 Circle tracking (r = 2 m, 1 m/s) under mixed disturbance (3-6 N waves +
 10 N / 3 Nm step at t = 4 s):
@@ -82,8 +82,8 @@ Circle tracking (r = 2 m, 1 m/s) under mixed disturbance (3-6 N waves +
 | controller | x [m] | y [m] | z [m] | yaw [rad] |
 |---|---|---|---|---|
 | PID    | 2.1096 | 2.0778 | 1.1192 | 0.2034 |
-| MPC    | 0.1667 | 0.1524 | 0.2100 | **0.0520** |
-| DOBMPC | **0.1030** | **0.0837** | **0.0820** | 0.0825 |
+| MPC    | 0.1667 | 0.1524 | 0.2100 | **0.0520** [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
+| DOBMPC | **0.1030** | **0.0837** | **0.0820** | 0.0825 [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
 
 The EAOB tracks step and sinusoidal disturbances within 1-2 samples with
 ~0.5 N noise-induced jitter (see `results/*_eaob.png`), matching the
@@ -91,9 +91,9 @@ paper's Figs. 5/9. In tracking, DOBMPC's yaw RMSE is slightly *worse* than
 the baseline's: a ~0.2 rad transient right after the disturbance step while
 circling at 1 m/s (the body-frame `w_hat` is held constant over the horizon
 - Assumption 2 - while the true world-frame step rotates in the body frame).
-Position-channel gains of 1.6-2.6x dominate, as in the paper. Figures were
+Position-channel gains of 1.6-2.6x dominate, as in the paper. Figures were  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 produced with `--N 40` for speed; the shipped default is the paper's N = 60
-(closed-loop behaviour is indistinguishable, ~1.5x slower).
+(closed-loop behaviour is indistinguishable, ~1.5x slower).  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 
 ## Design decisions & caveats
 
@@ -114,7 +114,7 @@ produced with `--N 40` for speed; the shipped default is the paper's N = 60
    (`u_scaled ≈ F/106` in the reference code), i.e. an effective penalty of
    ~1.3e-3 F² in Newtons; copying `15` verbatim into Newton units makes
    within-horizon drifting cheaper than cancelling a 10 N disturbance and
-   even DOBMPC stops rejecting it (we verified this). `R = [0.5 0.5 0.5
+   even DOBMPC stops rejecting it (we verified this). `R = [0.5 0.5 0.5  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
    0.05]` reproduces the paper's behaviour: baseline MPC settles with the
    reported ~0.2-0.5 m offset, DOBMPC stays near zero.
 5. **Solver.** CasADi/Ipopt (SX, multiple shooting, warm-started) ≈ 0.1 s per

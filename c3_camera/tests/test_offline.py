@@ -13,6 +13,8 @@ a live device belongs in a bench run, not here.
 from __future__ import annotations
 
 import sys
+import tempfile
+import textwrap
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -669,6 +671,15 @@ def test_research_mode_makes_rgb_and_depth_the_same_size():
     assert cfg.pair_mode == "timestamp", "a dataset should pair, not take latest"
 
 
+def test_collector_exposes_extended_disparity():
+    from c3_camera.c3_collect import build_config, parse_args
+
+    args = parse_args(["--mode", "research", "--extended", "--dry-run"])
+    cfg = build_config(args)
+    assert cfg.extended is True
+    assert " ext" in cfg.resolve().describe()
+
+
 def test_review_and_research_modes_fit_the_link_budget():
     from c3_camera.c3_collect import RESEARCH_DEFAULTS, REVIEW_DEFAULTS
     from c3_camera.dataset import estimate_rate
@@ -709,6 +720,270 @@ def test_imu_extrinsics_absence_is_reported_as_data():
     out = read_imu_extrinsics(Broken(), socket=None)
     assert out["available"] is False
     assert "Kalibr" in out["note"]
+
+
+# =============================================================================
+# --profile: the precedence rule, and the errors that keep it honest
+# =============================================================================
+def _write(tmp: Path, name: str, body: str) -> Path:
+    p = tmp / f"{name}.yaml"
+    p.write_text(textwrap.dedent(body).lstrip(), encoding="utf-8")
+    return p
+
+
+def _resolve(argv):
+    """What c3_collect.main() would resolve, without touching a device."""
+    from c3_camera.c3_collect import resolve_invocation
+    return resolve_invocation(argv)
+
+
+def test_profile_beats_mode_defaults_but_loses_to_the_command_line():
+    """The whole rule in one test: file over mode default, flag over file."""
+    from c3_camera.c3_collect import RESEARCH_DEFAULTS
+    with tempfile.TemporaryDirectory() as d:
+        p = _write(Path(d), "p", """
+            schema: c3_collect_profile/1
+            camera:
+              fps: 12.0
+        """)
+        assert RESEARCH_DEFAULTS["fps"] == 8.0
+        assert _resolve(["--mode", "research"])[1].fps == 8.0
+        assert _resolve(["--profile", str(p)])[1].fps == 12.0
+        assert _resolve(["--profile", str(p), "--fps", "20"])[1].fps == 20.0
+
+
+def test_a_flag_whose_default_is_not_none_is_still_explicit():
+    """The crux. Half the flags have a real default, so "was it typed" cannot be
+    answered by comparing values — `--imu-rate 200` against a profile asking for
+    400 has to resolve to 200, even though 200 is also argparse's default."""
+    with tempfile.TemporaryDirectory() as d:
+        p = _write(Path(d), "p", """
+            schema: c3_collect_profile/1
+            mode: review
+            imu:
+              rate_hz: 400
+            mavlink:
+              transport: rest
+        """)
+        a, cfg, _, _ = _resolve(["--profile", str(p)])
+        assert cfg.imu_rate == 400 and a.mavlink_transport == "rest"
+        assert a.mode == "review"
+
+        a, cfg, _, _ = _resolve(["--profile", str(p), "--imu-rate", "200",
+                                 "--mavlink-transport", "udp",
+                                 "--mode", "research"])
+        assert cfg.imu_rate == 200, "an explicit flag equal to the default still wins"
+        assert a.mavlink_transport == "udp"
+        assert a.mode == "research"
+
+
+def test_store_true_and_store_false_survive_the_round_trip():
+    """Profiles spell positive concepts; the loader owns the three inversions."""
+    with tempfile.TemporaryDirectory() as d:
+        p = _write(Path(d), "p", """
+            schema: c3_collect_profile/1
+            imu:
+              enable: false
+            recording:
+              mp4: false
+            display:
+              enable: false
+            depth_source:
+              align_color: true
+        """)
+        a, cfg, _, _ = _resolve(["--profile", str(p)])
+        assert a.no_camera_imu is True and cfg.imu_enable is False
+        assert a.no_mp4 is True
+        assert a.no_display is True
+        assert a.host_align_color is True
+
+        a, _, _, _ = _resolve(["--profile", str(p), "--no-host-align-color"])
+        assert a.host_align_color is False, "a store_false flag counts as explicit"
+
+
+def test_mode_from_the_profile_selects_the_defaults_dict():
+    """`mode:` has to be resolved BEFORE the defaults dict is chosen, or it would
+    change nothing but the banner."""
+    with tempfile.TemporaryDirectory() as d:
+        p = _write(Path(d), "p", """
+            schema: c3_collect_profile/1
+            mode: review
+        """)
+        _, cfg, _, _ = _resolve(["--profile", str(p)])
+        assert cfg.fps == 15.0 and cfg.depth_match_color is False
+        assert set(cfg.streams) == {"color", "depth"}
+
+        _, cfg, _, _ = _resolve(["--profile", str(p), "--mode", "research"])
+        assert cfg.fps == 8.0 and cfg.depth_match_color is True
+        assert len(cfg.streams) == 4
+
+
+def test_extends_merges_deltas_and_refuses_a_cycle():
+    from c3_camera import profile as P
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        _write(tmp, "parent", """
+            schema: c3_collect_profile/1
+            camera:
+              fps: 12.0
+              color_encode: mjpeg
+            imu:
+              rate_hz: 400
+        """)
+        child = _write(tmp, "child", """
+            extends: parent.yaml
+            schema: c3_collect_profile/1
+            camera:
+              fps: 20.0
+        """)
+        _, cfg, prof, _ = _resolve(["--profile", str(child)])
+        assert cfg.fps == 20.0                      # child wins
+        assert cfg.color_encode == "mjpeg"          # parent survives
+        assert cfg.imu_rate == 400
+        assert prof["_extends_chain"] and "parent" in prof["_extends_chain"][0]
+
+        _write(tmp, "a", "extends: b.yaml\nschema: c3_collect_profile/1\n")
+        _write(tmp, "b", "extends: a.yaml\nschema: c3_collect_profile/1\n")
+        try:
+            P.load(tmp / "a.yaml")
+        except P.ProfileError as e:
+            assert "cycle" in str(e) and "a.yaml" in str(e) and "b.yaml" in str(e)
+        else:
+            raise AssertionError("a cycle should not load")
+
+
+def test_a_bad_key_names_the_file_the_key_and_the_fix():
+    """Three ways to get a key wrong, three sentences that say what to do."""
+    from c3_camera import profile as P
+    cases = [
+        ("camera:\n  colour_res: \"1080p\"\n", ("colour_res", "color_res")),
+        ("stereo:\n  fps: 20\n", ("belongs in section", "camera")),
+        ("stereo:\n  median: off\n", ("boolean", "quote it")),
+        ("camers:\n  fps: 20\n", ("unknown top-level key", "camera")),
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        for i, (body, wanted) in enumerate(cases):
+            p = _write(Path(d), f"bad{i}", f"schema: c3_collect_profile/1\n{body}")
+            try:
+                P.load(p)
+            except P.ProfileError as e:
+                msg = str(e)
+                assert p.name in msg, msg
+                for w in wanted:
+                    assert w in msg, (w, msg)
+            else:
+                raise AssertionError(f"case {i} should have been refused")
+
+
+def test_a_profile_can_set_what_the_command_line_never_exposed():
+    """Fifteen StreamConfig fields have no flag at all. This is the point."""
+    with tempfile.TemporaryDirectory() as d:
+        p = _write(Path(d), "p", """
+            schema: c3_collect_profile/1
+            camera:
+              mjpeg_quality: 97
+            stereo:
+              subpixel: true
+              lr_check: false
+              median: "7x7"
+              confidence: 200
+              depth_preset: high_accuracy
+              depth_match_color: false
+              depth_align: right
+            link:
+              pair_mode: latest
+              pair_tolerance_ms: 12.5
+        """)
+        _, cfg, _, _ = _resolve(["--profile", str(p)])
+        assert (cfg.mjpeg_quality, cfg.subpixel, cfg.lr_check) == (97, True, False)
+        assert (cfg.median, cfg.confidence) == ("7x7", 200)
+        assert cfg.depth_preset == "high_accuracy"
+        assert cfg.depth_match_color is False and cfg.depth_align == "right"
+        assert cfg.pair_mode == "latest" and cfg.pair_tolerance_ms == 12.5
+
+
+def test_a_foreign_schema_string_is_refused_in_one_sentence():
+    """--profile configs/pipeline.yaml is a plausible mistake; it should not turn
+    into a tour of that file's unknown keys."""
+    from c3_camera import profile as P
+    with tempfile.TemporaryDirectory() as d:
+        p = _write(Path(d), "other", """
+            schema: umi_handheld_pipeline/1
+            cameras:
+              source: configs/source_camera_air.yaml
+        """)
+        try:
+            P.load(p)
+        except P.ProfileError as e:
+            assert "umi_handheld_pipeline/1" in str(e)
+            assert P.SCHEMA_VERSION in str(e)
+        else:
+            raise AssertionError("a foreign schema should not load")
+
+
+def test_shipped_profiles_load_and_reproduce_the_documented_command():
+    """Every file under c3_camera/profiles/ must build and resolve, and
+    research_near must still be the flag wall it replaced."""
+    from c3_camera import profile as P
+    shipped = sorted(P.PROFILE_DIR.glob("*.yaml"))
+    assert shipped, "no profiles shipped"
+    for path in shipped:
+        a, cfg, _, _ = _resolve(["--profile", path.stem])
+        cfg.resolve()                                    # must not raise
+
+    a, cfg, _, _ = _resolve(["--profile", "research_near"])
+    assert a.mode == "research"
+    assert cfg.fps == 20.0
+    assert tuple(cfg.streams) == ("color", "depth")
+    assert cfg.extended is True
+    assert cfg.color_encode == "mjpeg"
+    assert cfg.color_res == "1080p"
+    assert cfg.isp_scale == (1, 4)
+    assert cfg.depth_size == (480, 270)
+    assert cfg.imu_rate == 200
+    assert cfg.imu_batch_threshold == 10
+    assert a.mavlink_transport == "rest"
+    assert a.min_mm == 150.0
+
+
+def test_the_two_parsers_cannot_drift():
+    """explicit_dests builds a second parser; if it ever stops matching the real
+    one, every other profile test would still pass while nothing was detected."""
+    from c3_camera.c3_collect import build_parser, explicit_dests
+    real = {act.dest for act in build_parser()._actions} - {"help"}
+    probe = build_parser()
+    for act in probe._actions:
+        if act.dest != "help":
+            act.default = None
+    assert real == {act.dest for act in probe._actions} - {"help"}
+    assert explicit_dests([]) == set()
+    assert explicit_dests(["--dry-run"]) == {"dry_run"}
+
+
+# =============================================================================
+# cv2's Qt plugin path (see viz._qt_plugin_path)
+# =============================================================================
+def test_qt_repair_only_fires_when_the_live_plugin_dir_is_missing():
+    """Three states, three behaviours — and the venv, where cv2's own qt/plugins
+    is intact, must be left completely alone."""
+    with tempfile.TemporaryDirectory() as d:
+        cv2_dir = Path(d)
+        live = cv2_dir / "qt" / "plugins" / "platforms"
+        dead = cv2_dir / "qt" / "plugins.disabled" / "platforms"
+
+        # (a) nothing bundled at all -> leave the environment as it is
+        assert viz._qt_plugin_path(cv2_dir, None) is None
+        assert viz._qt_plugin_path(cv2_dir, str(live.parent)) is None
+
+        # (b) only the disabled copy -> point at it
+        dead.mkdir(parents=True)
+        (dead / "libqxcb.so").write_bytes(b"")
+        assert viz._qt_plugin_path(cv2_dir, str(live.parent)) == str(dead.parent)
+
+        # (c) a live copy -> no-op, whatever cv2 set
+        live.mkdir(parents=True)
+        (live / "libqxcb.so").write_bytes(b"")
+        assert viz._qt_plugin_path(cv2_dir, str(live.parent)) is None
 
 
 # =============================================================================

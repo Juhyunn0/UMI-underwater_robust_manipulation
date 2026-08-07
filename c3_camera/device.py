@@ -129,6 +129,24 @@ def discover_available() -> list[Found]:
     ]
 
 
+def local_route_to(ip: str) -> tuple[str | None, str]:
+    """Which local address the kernel would use to reach `ip`.
+
+    A UDP socket that is 'connected' sends nothing, so this is a pure routing
+    lookup — and it catches the common mistake of the camera being reachable
+    over the wrong interface (e.g. a VPN) or not routable at all.
+    """
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect((ip, 9))
+            return s.getsockname()[0], "ok"
+        finally:
+            s.close()
+    except OSError as e:
+        return None, f"no route: {e}"
+
+
 def tcp_reachable(ip: str, port: int = XLINK_TCP_PORT, timeout_s: float = 2.0) -> tuple[bool, str]:
     """Is the device's XLink port accepting connections?
 

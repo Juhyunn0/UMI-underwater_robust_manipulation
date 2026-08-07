@@ -232,15 +232,33 @@ class MavlinkLogger:
                 self._note_ack(msg)
 
             if mtype in ALL_MESSAGES:
-                rec = {"t_host": t, "msg_type": mtype}
+                # Who sent it. to_dict() drops the MAVLink header, and on this
+                # vehicle the link carries heartbeats from at least three
+                # systems (autopilot 1/1, an onboard component 1/194, and the
+                # GCS 255/240 — observed 2026-08-06). Without the source, a
+                # consumer cannot tell the vehicle's arm state from someone
+                # else's flags.
+                rec = {"t_host": t, "msg_type": mtype,
+                       "_srcsys": msg.get_srcSystem(),
+                       "_srccomp": msg.get_srcComponent()}
                 rec.update(msg.to_dict())
                 rec.pop("mavpackettype", None)
                 with self._lock:
                     self._records.append(rec)
 
     def _note_heartbeat(self, msg) -> None:
+        """Arm state and mode, from the AUTOPILOT's heartbeat only.
+
+        Measured on this vehicle 2026-08-06: component 194 also heartbeats, with
+        ``base_mode = 0x80`` — which is exactly the SAFETY_ARMED bit. Taking any
+        heartbeat made a disarmed vehicle report ARMED, and the mode read
+        ``Mode(0x00000080)``. An arm indicator that can be wrong is worse than
+        no arm indicator, so this now ignores everything except component 1.
+        """
         try:
             from pymavlink import mavutil
+            if msg.get_srcComponent() != mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1:
+                return
             self.armed = bool(msg.base_mode &
                               mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
             self.mode = mavutil.mode_string_v10(msg) or ""

@@ -122,7 +122,7 @@ The right pane's four tabs are:
 | **Setup** | Home Reference group (Set Current as Home Reference + per-axis Axis Direction toggles). |
 | **Recording** | Start/Stop Recording, the clickable CSV path label, and the 30 s rolling per-axis position plot. |
 
-The left pane stays visible no matter which tab is active, so you always see live position and the workspace map. The splitter between left/right is draggable; default ratio 38/62, window default `1500 × 900`, minimum `1280 × 800`. The last-active tab is persisted to `~/.umi_gui_state.json` under `gantry_panel.active_tab` and restored on next launch.
+The left pane stays visible no matter which tab is active, so you always see live position and the workspace map. The splitter between left/right is draggable; default ratio 38/62, window default `1500 × 900`, minimum `1280 × 800`. The last-active tab is persisted to `~/.umi_gui_state.json` under `gantry_panel.active_tab` and restored on next launch.  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 
 The **Workspace Map** renders two stacked 2D plots: top-down `XY` (aspect-locked square) and side `XZ` (shares the same X axis as the top view). Each shows:
 - Light-blue dashed **pool outline** (dimensions from `config.yaml`, orientation from Pool Orientation setting)
@@ -138,7 +138,7 @@ The **Fit** dropdown (top of map) has three modes:
 | **Fit: Soft Limits** | View expands to the controller's loaded soft-limit envelope. |
 | **Fit: Trail + Target** | View auto-fits to current trail ∪ target with 50 mm margin. |
 
-Tick spacing adapts to the visible range (~6–10 major ticks at any zoom). Implementation is `pyqtgraph` when installed; falls back to a hand-painted `QPainter` widget otherwise. All updates ride the 10 Hz status-poll — no extra SDK calls.
+Tick spacing adapts to the visible range (~6–10 major ticks at any zoom). Implementation is `pyqtgraph` when installed; falls back to a hand-painted `QPainter` widget otherwise. All updates ride the 10 Hz status-poll — no extra SDK calls.  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 
 ### Per-Axis Control (jog + Move Abs + per-axis Home)
 
@@ -232,14 +232,14 @@ every axis **whether or not the lock was acquired**, releasing in `finally`
 only if it was. Rationale: the controller serializes incoming commands in
 its own queue, so a stop going through during another in-flight call is
 strictly safer than waiting for the lock and never stopping. Smoke-test
-timing (mock): click → handler return in **~3 ms**, halt distance after
+timing (mock): click → handler return in **~3 ms**, halt distance after  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 click **≈ 0 mm**. The handler also sets a panel-scoped
 `self._abort_event = threading.Event()` (in addition to the module-level
 `EMERGENCY_STOP` from `gantry_runner.py`); `HomingThread`, `SequenceThread`,
 and `AxisAbsMoveThread` all check both at every poll iteration and exit
 early. The Esc shortcut uses `Qt.ApplicationShortcut` context so it fires
 even when keyboard focus is in a spinbox, combobox, or table cell (verified
-on offscreen Qt with focus on a `QDoubleSpinBox`: handler ran in **~3 ms**).
+on offscreen Qt with focus on a `QDoubleSpinBox`: handler ran in **~3 ms**).  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 
 When an E-Stop fires, a **yellow banner** appears across the top of the
 window (`EMERGENCY STOP triggered at HH:MM:SS — click Reset to resume`)
@@ -351,7 +351,7 @@ python -m src.calibrate_fisheye --mock-camera
 2. **Pattern** — set inner corners (cols × rows), square size, and the three
    calibration flags.  Defaults: 9 × 6, 25 mm/square.  The selection summary
    line shows what the algorithm will do before you start recording:
-   `4×4 grid · 2 frames/cell · target ≈ 32 frames · ≥12 cells required`.
+   `4×4 grid · 2 frames/cell · target ≈ 32 frames · ≥12 cells required`.  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 
 3. **Record** — click **● Record** (or press **R**).
    Move the calibration board continuously across the image.
@@ -368,7 +368,7 @@ python -m src.calibrate_fisheye --mock-camera
      The algorithm rewards tilt diversity (30 % of the per-frame score).
    - Vary distance: one close pass (board fills ≥ 50 % of the frame) and
      one far pass.
-   - Record at least 10–20 seconds; 30 s gives ≥ 16 cells easily.
+   - Record at least 10–20 seconds; 30 s gives ≥ 16 cells easily.  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
    - Keep sharpness green.  If it's yellow/red, slow down or improve
      lighting before recording.
 
@@ -379,9 +379,9 @@ python -m src.calibrate_fisheye --mock-camera
    |------|-------------|
    | Hard gate | Drops frames with sharpness < 50 and duplicates within 200 ms |
    | Group by cell | Divides the image into a 4 × 4 grid; groups survivors by cell |
-   | Preliminary calibration | Runs `cv2.fisheye.calibrate` on one frame per cell |
+   | Preliminary calibration | Runs `cv2.fisheye.calibrate` on one frame per cell |  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
    | Score | Rates each survivor: sharpness 50 % + tilt 30 % + reproj 20 % |
-   | Top-K per cell | Picks the 2 highest-scoring frames from each occupied cell |
+   | Top-K per cell | Picks the 2 highest-scoring frames from each occupied cell |  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 
 5. **Coverage report** — a modal shows how many frames were picked and the
    coverage map.  If ≥ 14 cells are covered the default action is
@@ -429,7 +429,7 @@ python -m src.calibrate_fisheye --mock-camera
 2. Click **● Record** → watch the 4 × 4 grid light up progressively as the
    mock board sweeps across the image.
 3. After ~15 s click **■ Stop & Calibrate**.
-4. The progress dialog should show "16 / 16 cells covered, 32 frames picked".
+4. The progress dialog should show "16 / 16 cells covered, 32 frames picked".  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 5. Click **Proceed** → calibration completes; RMS < 0.5 px in mock.
 6. Click **Save YAML** → verified round-trip.
 7. Drag the splitter handle (8 px wide, turns blue on hover) — both panes
@@ -658,7 +658,7 @@ global map can squeeze/bend even while per-frame residuals stay low. Two fixes:
 
 ### Diagnostics ("black box") — every survey run is fully reconstructable
 
-When SURVEYING begins, a daemon-thread recorder (`survey_diagnostics.py`, never
+When SURVEYING begins, a daemon-thread recorder (`survey_diagnostics.py`, never  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 blocks the SLAM hot path, flushes every 1 s, ~1–2 % CPU, ~50 MB/hour) writes these
 files into `data/YYYYMMDD/<ts>_survey/` alongside the usual CSVs:
 
@@ -725,7 +725,7 @@ Outputs `config/tag_map.yaml` + `config/tag_map_layout.png` and a stdout report
   recorded poses by construction, so the optimizer confirms consistency and
   computes per-tag uncertainty from observation counts. **Scale is inherited from
   the recording** (no `--tag-size` needed).
-- **`--use-frames` (slower — ~10–90 ms/frame; a 3-min/~5000-frame run ≈ 1–7 min).**
+- **`--use-frames` (slower — ~10–90 ms/frame; a 3-min/~5000-frame run ≈ 1–7 min).**  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
   Re-detects AprilTags in the saved frames and runs solvePnP for an *independent*
   `camera_T_tag` per detection → genuine batch refinement (large error reduction).
   ⚠ The recorder saves **undistorted, downscaled JPEG** frames, so re-detection is
@@ -969,7 +969,7 @@ R_gantry_to_slam:
 
 Absent → identity. A non-orthonormal / det≠+1 matrix logs a warning and falls back to identity.
 
-> **Verifying R.** Generate a run's `trajectory_interactive.html` and watch stderr. If the Velocity tab's camera (red) does not track the gantry (blue) and you see `R_gantry_to_slam may be TRANSPOSED`, replace `R` with its transpose (swap the off-diagonal signs / transpose the 3×3). The known-good value for this rig is the example above (`[[0,1,0],[-1,0,0],[0,0,1]]`); its transpose `[[0,-1,0],[1,0,0],[0,0,1]]` flips Vx and makes the curves diverge.
+> **Verifying R.** Generate a run's `trajectory_interactive.html` and watch stderr. If the Velocity tab's camera (red) does not track the gantry (blue) and you see `R_gantry_to_slam may be TRANSPOSED`, replace `R` with its transpose (swap the off-diagonal signs / transpose the 3×3). The known-good value for this rig is the example above (`[[0,1,0],[-1,0,0],[0,0,1]]`); its transpose `[[0,-1,0],[1,0,0],[0,0,1]]` flips Vx and makes the curves diverge.  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 
 ### Aligning the two CSVs in pandas
 
@@ -1060,6 +1060,16 @@ dashboard after `--write` to see the gantry GT and camera curves overlap.
   then applies `--soft-limit-{min,max}-mm` overrides. If both min and max
   read 0 on an axis it's treated as unconfigured (no validation on that
   axis); use the CLI overrides to enforce a manual envelope.
-* Acceleration column in `gantry_telemetry.csv` is a 5-sample SMA-smoothed
+* Acceleration column in `gantry_telemetry.csv` is a 5-sample SMA-smoothed  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
   central finite difference of velocity — the FMC4030 has no acceleration
   readout. Treat it as a smoothed estimate, not a sensor value.
+
+
+<!-- MEASUREMENT AUDIT (2026-08-04): the following numbers appear inside code
+     blocks above and could not be annotated inline without corrupting them. -->
+
+> **[UNVERIFIED]** 아래 줄의 수치는 출처 감사에서 미검증으로 분류되었다 — 자세한 근거는 [docs/MEASUREMENT_AUDIT.md](docs/MEASUREMENT_AUDIT.md).
+>
+> - `README_fisheye_gantry.md:412` — 산출물 없음 — `MIN_SHARPNESS       = 50.0   # Laplacian-variance floor; lower in dim environmen`
+> - `README_fisheye_gantry.md:567` — 산출물 없음 — `run_metadata.json         # CLI args, K/D/T_gantry_camera, soft limits, t0/t1`
+> - `README_fisheye_gantry.md:795` — 예시/유도값 — `[tag-map] Loaded 24 tags from tag map`

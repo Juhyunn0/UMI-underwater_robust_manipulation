@@ -61,31 +61,76 @@ from .metrics import Metrics, frame_latency_ms
 from .pipeline import build_pipeline
 
 
-def _annexb_parameter_sets(data: bytes, codec: str) -> dict[int, bytes]:
-    """Return VPS/SPS/PPS NAL units, retaining each Annex-B start code."""
+# Wire formats whose payload size is not w*h*bpp, so the real packet length has
+# to be read instead of computed. "mjpeg_gray" is the encoded mono pair: same
+# JPEG bitstream as colour, but it decodes back to one channel (see _decode).
+_ENCODED_FORMATS = ("mjpeg", "mjpeg_gray", "h264", "h265")
+
+
+def _annexb_nal_spans(data: bytes) -> list[tuple[int, int]]:
+    """Annex-B start-code offsets as (start, prefix_length) pairs.
+
+    `bytes.find` rather than a per-byte loop: this runs on the capture thread
+    for every encoded packet, and a 4 Mbit/s H.265 stream at 20 fps is ~25 kB a
+    frame. The byte-at-a-time version built two throwaway slices per byte, which
+    turned a host-CPU cost into what looks like a link limit in exactly the
+    benchmark that reads these numbers.
+    """
     starts: list[tuple[int, int]] = []
     i = 0
-    while i <= len(data) - 3:
-        if data[i:i + 4] == b"\x00\x00\x00\x01":
-            starts.append((i, 4))
-            i += 4
-        elif data[i:i + 3] == b"\x00\x00\x01":
-            starts.append((i, 3))
-            i += 3
+    while True:
+        j = data.find(b"\x00\x00\x01", i)
+        if j < 0:
+            return starts
+        # A 4-byte start code is a 3-byte one with an extra leading zero.
+        if j > 0 and data[j - 1] == 0:
+            starts.append((j - 1, 4))
         else:
-            i += 1
-    wanted = {7, 8} if codec == "h264" else {32, 33, 34}
-    out: dict[int, bytes] = {}
+            starts.append((j, 3))
+        i = j + 3
+
+
+def _annexb_nal_types(data: bytes, codec: str, spans=None):
+    """Yield (nal_type, start, end) for each NAL unit, payload-bearing only."""
+    starts = _annexb_nal_spans(data) if spans is None else spans
     for n, (start, prefix) in enumerate(starts):
         payload = start + prefix
         end = starts[n + 1][0] if n + 1 < len(starts) else len(data)
         if payload >= end:
             continue
-        nal_type = (data[payload] & 0x1F) if codec == "h264" \
-            else ((data[payload] >> 1) & 0x3F)
-        if nal_type in wanted:
-            out[nal_type] = data[start:end]
-    return out
+        b0 = data[payload]
+        yield ((b0 & 0x1F) if codec == "h264" else ((b0 >> 1) & 0x3F)), start, end
+
+
+def _annexb_parameter_sets(data: bytes, codec: str, spans=None) -> dict[int, bytes]:
+    """Return VPS/SPS/PPS NAL units, retaining each Annex-B start code."""
+    wanted = {7, 8} if codec == "h264" else {32, 33, 34}
+    return {t: data[s:e] for t, s, e in _annexb_nal_types(data, codec, spans)
+            if t in wanted}
+
+
+def _annexb_frame_type(data: bytes, codec: str, spans=None) -> str:
+    """'I' if the packet carries a keyframe NAL, else 'P'.
+
+    `ImgFrame.getFrameType()` is the obvious source and does NOT exist on
+    depthai 2.32 (the version pinned here) — `hasattr` is False, and the call
+    below it raises AttributeError into a bare except. That left frame_type ""
+    on every packet, which is not a cosmetic loss: DatasetWriter opens its
+    encoded timeline on the first `frame_type == "I"`, so with a permanently
+    empty value the gate never opens and an H.264/H.265 dataset records ZERO
+    frames while reporting no error.
+
+    The bytes already in hand answer the question. H.264 nal_unit_type 5 is an
+    IDR slice; H.265 types 16-23 are the IRAP class (BLA/IDR/CRA), any of which
+    is a valid random-access point. Empty input is treated as 'P', because a
+    packet we cannot parse must not be trusted to start a decodable stream.
+    """
+    for nal, _s, _e in _annexb_nal_types(data or b"", codec, spans):
+        if codec == "h264" and nal == 5:
+            return "I"
+        if codec == "h265" and 16 <= nal <= 23:
+            return "I"
+    return "P"
 
 
 @dataclass
@@ -363,7 +408,7 @@ class C3Source:
         """
         fmt = self.formats.get(name, "nv12")
         w, h = msg.getWidth(), msg.getHeight()
-        if fmt in ("mjpeg", "h264", "h265"):
+        if fmt in _ENCODED_FORMATS:
             return int(len(msg.getData()))
         if fmt == "depth16":
             return w * h * 2
@@ -388,10 +433,16 @@ class C3Source:
         fmt = self.formats.get(name, "nv12")
         w, h = msg.getWidth(), msg.getHeight()
 
-        if fmt == "mjpeg":
+        if fmt in ("mjpeg", "mjpeg_gray"):
             data = msg.getData()
             buf = np.frombuffer(data, dtype=np.uint8)
-            img = cv2.imdecode(buf, cv2.IMREAD_COLOR)   # imdecode allocates anew
+            # One decode path for both, differing only in the destination channel
+            # count. The mono pair MUST come back HxW single-channel: that is the
+            # contract every existing consumer of "left"/"right" was written
+            # against, and IMREAD_COLOR would hand back a 3-channel image that
+            # looks fine, raises nothing, and is wrong everywhere downstream.
+            flag = cv2.IMREAD_GRAYSCALE if fmt == "mjpeg_gray" else cv2.IMREAD_COLOR
+            img = cv2.imdecode(buf, flag)   # imdecode allocates anew
             if img is None and self.verbose:
                 print(f"  warning: MJPEG decode failed on {name} "
                       f"(seq {msg.getSequenceNum()})")
@@ -429,8 +480,16 @@ class C3Source:
                 frame_type = str(msg.getFrameType()).rsplit(".", 1)[-1]
             except Exception:  # noqa: BLE001
                 frame_type = ""
+            # One scan, shared by both readers below: this is the capture
+            # thread, and walking every packet twice showed up as throughput.
+            spans = _annexb_nal_spans(raw or b"")
+            if frame_type not in ("I", "P", "B"):
+                # depthai 2.32 has no getFrameType(), so this is the normal path,
+                # not a fallback for exotic builds. Read the NAL type instead —
+                # see _annexb_frame_type for why an empty value is not harmless.
+                frame_type = _annexb_frame_type(raw or b"", encoding, spans)
             params = self._codec_parameter_sets.setdefault(encoding, {})
-            params.update(_annexb_parameter_sets(raw or b"", encoding))
+            params.update(_annexb_parameter_sets(raw or b"", encoding, spans))
             order = (7, 8) if encoding == "h264" else (32, 33, 34)
             codec_header = b"".join(params[t] for t in order if t in params)
 

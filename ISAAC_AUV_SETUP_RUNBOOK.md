@@ -11,7 +11,7 @@
 
 ## ✅ 최종 작동 구성 (2026-06-23 검증 — RTX 5090에서 학습 완주)
 
-WarpAUV 정책 **2048 envs · 400 iter · ~19.7M steps GPU 학습 완료**(보상 0.78→~76, 에러 0). 4개 Blackwell 블로커를 순서대로 해결:
+WarpAUV 정책 **2048 envs · 400 iter · ~19.7M steps GPU 학습 완료**(보상 0.78→~76, 에러 0). 4개 Blackwell 블로커를 순서대로 해결:  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 
 1. **드라이버 = `nvidia-driver-570-open` 570.211.01 (CUDA 12.8)** — ⭐핵심. 580/595(CUDA 13)는 PhysX GPU init 행. 570이 Isaac Sim 5.0(CUDA 12.8 빌드)와 매칭. (apt 파일충돌 시: `sudo apt --fix-broken install -o Dpkg::Options::="--force-overwrite"`)
 2. **warp 1.8.1** — `…/isaacsim/extscache/omni.warp.core-1.7.1+lx64/warp/`를 warp-lang 1.8.1 **실복사본**으로 교체(심볼릭 링크 금지; 백업 `warp.1.7.1.bak`). cuDeviceGetUuid 버그 해결.
@@ -183,7 +183,7 @@ cd ~/IsaacLab
 ```
 
 - 체크포인트 저장 위치: `logs/rsl_rl/warpauv_direct/<timestamp>/`
-- README 기준: 2048 envs로 **~400 iter**에 수렴, mean reward ~95–100. 수렴 문제 시 action penalty↓.
+- README 기준: 2048 envs로 **~400 iter**에 수렴, mean reward ~95–100. 수렴 문제 시 action penalty↓.  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 - `experiment_name = "warpauv_direct"` (agents/rsl_rl_ppo_cfg.py), max_iterations=400, num_steps_per_env=24.
 
 ### num_envs 가이드 (VRAM 32GB)
@@ -326,7 +326,7 @@ sudo update-grub
 sudo reboot
 # 재부팅 후: cat /proc/cmdline | grep amd_iommu=off  (적용 확인)
 ```
-> 대안(재부팅 회피): IOMMU off 안 해도 **매 부팅마다 ~5–6분 P2P 검증을 기다리면** 통과한다(무한 행 아님).
+> 대안(재부팅 회피): IOMMU off 안 해도 **매 부팅마다 ~5–6분 P2P 검증을 기다리면** 통과한다(무한 행 아님).  [UNVERIFIED: 예시/유도값 — docs/MEASUREMENT_AUDIT.md]
 > 단 부팅마다 6분 세금이라 반복 작업엔 비효율 → 학습을 길게 돌릴 거면 그냥 기다려도 되고, 편의를 위해선 IOMMU off 권장.
 
 ### 12-3. 위 3개 해결 후 — 학습까지 (Claude 자동 진행)
@@ -344,3 +344,11 @@ cd /home/bdml/IsaacLab && source /home/bdml/miniforge3/etc/profile.d/conda.sh &&
 > 참고(비치명): 부팅 로그의 `errno=28 / No space left on device`(change watch)는 디스크가 아니라
 > **inotify watch 한도(기본 65536) 초과** 경고다. 없애려면(선택, sudo):
 > `sudo sysctl fs.inotify.max_user_watches=524288`. 학습엔 영향 없음.
+
+
+<!-- MEASUREMENT AUDIT (2026-08-04): the following numbers appear inside code
+     blocks above and could not be annotated inline without corrupting them. -->
+
+> **[UNVERIFIED]** 아래 줄의 수치는 출처 감사에서 미검증으로 분류되었다 — 자세한 근거는 [docs/MEASUREMENT_AUDIT.md](docs/MEASUREMENT_AUDIT.md).
+>
+> - `ISAAC_AUV_SETUP_RUNBOOK.md:69` — 산출물 없음 — `# 설치 위치 제안: 홈 디렉토리 (디스크 625GB 여유로 충분)`

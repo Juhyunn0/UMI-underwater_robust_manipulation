@@ -66,9 +66,14 @@ PY
 cat <<EOF
 
 === done ===
-Next:
-  $VENV/bin/python c3_camera/discover_c3.py --probe
-  $VENV/bin/python c3_camera/c3_stream.py
+Next (the ./c3 wrapper finds this venv on its own):
+  ./c3 env
+  ./c3 discover --probe
+  ./c3 stream
+  ./c3 collect --profile research_near --dry-run
+
+Without the wrapper, same thing:
+  $VENV/bin/python -m c3_camera.discover_c3 --probe
 
 Optional convenience:
   alias c3py='$VENV/bin/python'

@@ -36,12 +36,12 @@ solver.
 | Keyboard teleop + live force-arrow viz + live dashboard | `teleop.py`, `monitor.py` | ✅ |
 | Baseline **PD/PID** setpoint controller | `controller.py` | ✅ |
 | **DOB-MPC** = Extended Active Observer (EAOB) + NMPC | `dobmpc_controller.py`, `dobmpc/` | ✅ |
-| NMPC solved by **acados SQP-RTI** (~1 ms, default) with IPOPT fallback | `dobmpc/mpc_acados.py`, `dobmpc/mpc.py` | ✅ verified |
+| NMPC solved by **acados SQP-RTI** (~1 ms, default) with IPOPT fallback | `dobmpc/mpc_acados.py`, `dobmpc/mpc.py` | ✅ verified [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
 | **Reference preview** (tracking mode, 2026-07-21): mpc/dobmpc square runs sample the TRUE future reference over the 3 s horizon (`set_reference_traj` + `make_square_ref`) instead of extrapolating straight through corners; DP/teleop keep the setpoint interface; run meta records `ref_preview` — don't pool square mpc/dobmpc results across this boundary | `dobmpc_controller.py`, `experiments/run_compare.py` | ✅ |
 | **EAOB "perf" profile** (2026-07-23, default): sensor-sigma-derived covariances (`params.EAOB_SIG_*`, knob = `EAOB_TAU_DIST`) + Gaussian sensor-noise injection into the observer (`meas_noise`, on by default); old deadbeat tuning = `profile="verify"` (clean-meas wiring checks); optional NIS gate default-OFF (`EAOB_GATE_ON`); run meta records `controller.eaob{...}` — don't pool dobmpc results across this boundary (sweeps ≤ 2026-07-22 are verify/clean-equivalent) | `dobmpc/eaob.py`, `dobmpc/params.py`, `dobmpc_controller.py` | ✅ validated |
-| **DOB plug-in: NMPC x0 = state-estimator output** (2026-07-23 (3), default `params.MPC_STATE_SOURCE="meas"`): the EAOB is a pure disturbance plug-in — it hands the MPC only `w_hat`; x0 + yaw-ref anchor come from the estimator (sim: the noisy measurement the EAOB also eats; hardware: SLAM/AI). Applies to BOTH mpc and dobmpc under noise → single-variable ablation. `"estimate"` (EAOB-filtered, the 2026-07-23 (2) default) and `"truth"` remain opt-in. Sensor sigmas reduced 2026-07-24 (x/y 5→0.5 cm, below the ~1.2 cm tracking error) so `"meas"` chatter drops from ~9–15× to ~2–3× the truth-x0 level while w_hat quality is preserved (`ACC/ALLOC` unchanged). Run meta `controller.mpc_state_source` + `eaob.sig_pos_xy` (absent = truth / 5 cm) | `dobmpc_controller.py`, `dobmpc/params.py`, `verify/verify_state_source.py` | ✅ validated |
+| **DOB plug-in: NMPC x0 = state-estimator output** (2026-07-23 (3), default `params.MPC_STATE_SOURCE="meas"`): the EAOB is a pure disturbance plug-in — it hands the MPC only `w_hat`; x0 + yaw-ref anchor come from the estimator (sim: the noisy measurement the EAOB also eats; hardware: SLAM/AI). Applies to BOTH mpc and dobmpc under noise → single-variable ablation. `"estimate"` (EAOB-filtered, the 2026-07-23 (2) default) and `"truth"` remain opt-in. Sensor sigmas reduced 2026-07-24 (x/y 5→0.5 cm, below the ~1.2 cm tracking error) so `"meas"` chatter drops from ~9–15× to ~2–3× the truth-x0 level while w_hat quality is preserved (`ACC/ALLOC` unchanged). Run meta `controller.mpc_state_source` + `eaob.sig_pos_xy` (absent = truth / 5 cm) | `dobmpc_controller.py`, `dobmpc/params.py`, `verify/verify_state_source.py` | ✅ validated [UNVERIFIED×2: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
 | **PID sees the SAME noisy state as the MPC** (2026-07-24 (2), default `params.PID_STATE_SOURCE="meas"`): `PoseController(meas_noise, noise_seed)` corrupts the PID's own state reads with the same Gaussian sensor model the MPC x0 uses (`params.EAOB_SIG_*`), sampled at 20 Hz + ZOH-held — so PID vs (DOB-)MPC differ ONLY by control law (apples-to-apples). Noisy attitude rebuilt into a full R (`_R_from_rpy`) for a consistent `R.T` force rotation; logged truth/metric stay on the plant. `"truth"` = clean 500 Hz baseline (opt-in). teleop/eval_dp inherit `meas`; the 4 control-law regression tests pin `meas_noise=False`. Run meta `controller.meas{state_source,noise_seed,sig_pos_xy}` (absent = truth) — **don't pool PID results across this boundary; pre-2026-07-24(2) PID runs used truth state** | `controller.py`, `dobmpc/params.py`, `experiments/run_compare.py` | ✅ validated |
-| **NMPC surge box 8 → 30 N on heavy** (2026-07-24 (3)): `params.U_MAX` surge was a rank-5 relic (the real `My=−0.0725·Fx` tumble limit applies to bluerov2 only) that gave the NMPC a 3.75× handicap vs the PID's `f_max`=30 N — the box was active on 60 % of ticks at storm (dobmpc 75 %) vs 7 % at gentle, and releasing it moves storm PID−MPC from −4.24 to +8.60 cm, i.e. **the "PID wins in strong waves" crossover was this constraint, not control theory** (`sat_freq` is blind to it: software bound, no thruster saturation). rank-5 branch keeps 8 N. Run meta now stamps `controller.u_max` — **absent key = the old 8 N box; pre-2026-07-24(3) mpc/dobmpc records must not be pooled with new ones, and their strong-wave ranking must not be cited**. Full sweep rerun pending | `dobmpc/params.py`, `dobmpc/mpc_acados.py`, `teleop.py`, `experiments/run_compare.py` | ✅ validated |
+| **NMPC surge box 8 → 30 N on heavy** (2026-07-24 (3)): `params.U_MAX` surge was a rank-5 relic (the real `My=−0.0725·Fx` tumble limit applies to bluerov2 only) that gave the NMPC a 3.75× handicap vs the PID's `f_max`=30 N — the box was active on 60 % of ticks at storm (dobmpc 75 %) vs 7 % at gentle, and releasing it moves storm PID−MPC from −4.24 to +8.60 cm, i.e. **the "PID wins in strong waves" crossover was this constraint, not control theory** (`sat_freq` is blind to it: software bound, no thruster saturation). rank-5 branch keeps 8 N. Run meta now stamps `controller.u_max` — **absent key = the old 8 N box; pre-2026-07-24(3) mpc/dobmpc records must not be pooled with new ones, and their strong-wave ranking must not be cited**. Full sweep rerun pending | `dobmpc/params.py`, `dobmpc/mpc_acados.py`, `teleop.py`, `experiments/run_compare.py` | ✅ validated [UNVERIFIED×2: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
 | Autonomous square-tracking mission + CSV recorder + run manifest (incl. kicks) | `mission.py`, `recorder.py` | ✅ |
 | Experiments: station-keeping comparison, actuator-realism ablation | `dobmpc/eval_dp.py`, `tools/ablation_thrusters.py` | ✅ |
 | Experiment: 3 controllers × 5 disturbance modes × N seeds × current/wave heading sweep (paired or full grid), metrics + per-run CSVs/meta + all figures in one run | `experiments/run_compare.py`, `config/*.yaml` | ✅ |
@@ -102,7 +102,7 @@ mass 1.700 kg + parallel-axis via [compute_payload_inertia.py](compute_payload_i
 composite COM; inertia **diagonal** (`Ixz` +0.046 dropped, 12.4% of Ixx — KNOWN_ISSUES). C3
 mount **measured from the Onshape assembly** (2026-07-19: front-bottom on the centreline,
 lens forward and level; 3 cameras `c3_center/left/right` at the lens plane). Bracket is
-visual-only (mass unknown). Uses `GAINS_HEAVY` (no active roll/pitch leveling → ~1° residual
+visual-only (mass unknown). Uses `GAINS_HEAVY` (no active roll/pitch leveling → ~1° residual  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 pitch from the C3's static moment). Selected with `ROV_MODEL=heavy_c3`; `POOL_TAGS=1` →
 `scene_bluerov_heavy_c3_tags.xml`. Regression: [tests/test_heavy_c3.py](tests/test_heavy_c3.py).
 
@@ -133,14 +133,14 @@ GENERATED from `bluerov_heavy.xml` by [tools/gen_gripper_variant.py](tools/gen_g
   DNV build-up estimates documented in
   [marinegym_assets/BlueROVHeavyGripper.yaml](marinegym_assets/BlueROVHeavyGripper.yaml) —
   revisit with in-situ system ID). Verified: `python tests/test_heavy_gripper.py`
-  (composition/buoyancy/gripper/PID) + DOB-MPC DP hold 1.3 cm (still), 1.4 cm (current+waves).
+  (composition/buoyancy/gripper/PID) + DOB-MPC DP hold 1.3 cm (still), 1.4 cm (current+waves).  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 
 The **heavy** visual is the real MarineGym BlueROVHeavy skin — the body mesh is split
 by material into **cyan foam / white tube / black frame / silver hardware** (matching the
 paper render), with the frame + thruster shrouds baked into that mesh set. It's **VISUAL
 ONLY**: dynamics come from the explicit `<inertial>` (mass 11.5, the diaginertia below),
 the collision box, and the 8 thruster sites/actuators — all unchanged, so the colored skin
-is byte-identical in physics (verified 3000-step rollout Δ=0 vs the old gray body).
+is byte-identical in physics (verified 3000-step rollout Δ=0 vs the old gray body).  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 Regenerate the color parts with `python tools/extract_meshes.py --colored`.
 
 Same T200 thrusters and hydro coefficients; only mass/volume/thruster layout
@@ -170,7 +170,7 @@ entry point that reads `rov_model.XML_PATH`.
 floor is ONE big plane carrying ONE repeating **tag-mosaic** texture (a 10×10 block of distinct
 tags baked into a single PNG, tiled to the floor), and the wave surface is enlarged to match.
 It loads **faster** than the old per-tile floor — **1 texture + 1 material + 1 plane geom**
-instead of ~198 textured boxes (measured ~2.2× faster model parse; the GPU texture upload win
+instead of ~198 textured boxes (measured ~2.2× faster model parse; the GPU texture upload win  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 is larger). Each mosaic cell still renders at the real 0.170 m size (verified by top-down
 `pupil_apriltags` detection). Tag ids repeat per block — fine for the current visual use (no
 camera/detection path). The default 8 m keeps the tag floor noticeably bigger than the real
@@ -195,7 +195,7 @@ The floor is built once by [tools/gen_pool_apriltags.py](tools/gen_pool_apriltag
 round-trip verified with `pupil_apriltags` so sim tag ids provably match the real family). It
 is **VISUAL ONLY** — all added geoms are `contype=0 conaffinity=0` (group 1) and MuJoCo's fluid
 model is off, so **dynamics are byte-for-byte identical** with `POOL_TAGS` set or unset
-(verified: old-vs-new 3000-step rollout Δ=0, incl. `--disturb`). Regenerate / retune with:
+(verified: old-vs-new 3000-step rollout Δ=0, incl. `--disturb`). Regenerate / retune with:  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 
 ```bash
 python tools/gen_pool_apriltags.py                 # default: 8 m plane floor (waves visible), sky=gradient
@@ -265,7 +265,7 @@ or infrastructure.
 | `python -m experiments.plot_trajectories` | overlay figure of `run_viewer` trajectory CSVs | 4 |
 | `python -m dobmpc.eval_dp` | station-keeping (DP) PID / MPC / DOB-MPC comparison | 4 |
 | `python tools/ablation_thrusters.py` | actuator-realism ablation (ideal / realistic / low-voltage T200) | 4 |
-| `python test_<name>.py` (11 files) · `python -m disturbance.test_{waves,env}` | per-component smoke/unit tests | 1 |
+| `python test_<name>.py` (11 files) · `python -m disturbance.test_{waves,env}` | per-component smoke/unit tests | 1 [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
 | `python verify_hydro[_precise].py` · `verify/verify_acados.py` · `verify/verify_eaob.py` · `verify/verify_state_source.py` · `verify/verify_meta.py` · `verify/verify_gpu_mjx.py` | V&V suite (hydro, solver equivalence, EAOB consistency, estimate-fed MPC A/B, run manifest, GPU env) | 6 |
 | `python tools/analyze_square3.py` · `tools/analyze_acados_vs_before.py` · `tools/analyze_t200_voltage.py` | recording analysis + datasheet provenance | 5 |
 | `python tools/gen_pool_apriltags.py` · `tools/extract_meshes.py` · `tools/generate_bluerov_xml.py` · `tools/compute_heavy_inertia.py` · `tools/plot_wave_spreading.py` | asset & figure generators (occasional) | 7 |
@@ -279,7 +279,7 @@ instead.
 
 | command | what it checks |
 |---|---|
-| `python tests/test_load.py` | model loads; mass ∈ [9, 12] kg; 6 thruster sites; zero-control stability, no NaN. Flags: `--seconds`, `--render out.png`, `--viewer` |
+| `python tests/test_load.py` | model loads; mass ∈ [9, 12] kg; 6 thruster sites; zero-control stability, no NaN. Flags: `--seconds`, `--render out.png`, `--viewer` [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
 | `python tests/test_thrusters.py` | ctrlrange = T200 curve limits; measured body wrench ≡ `B @ f`; surge→pitch / sway→roll coupling ratios; pitch underactuation (rank(B) = 5). Flags: `--T`, `--render` |
 | `python tests/test_hydro.py` | neutral-buoyancy hover; self-righting from 20° roll/pitch; drag-bounded terminal velocity + coast-to-stop; 60 s stability. Flag: `--render` |
 | `python tests/test_disturbances.py` | no-thrust drift converges to the current velocity (proves relative velocity is used); wave decay with depth; kick rate; distinct current/wave/kick signatures; bounded domain randomization. Flag: `--render` |
@@ -291,7 +291,7 @@ instead.
 | `python tests/test_monitor_smoke.py` | pyqtgraph monitor builds/redraws headless; spawned-process handle round-trip; degenerate-time guards. Needs PyQt5 + pyqtgraph |
 | `python tests/test_viser_smoke.py` | `--viser` plumbing without a browser (starts a real viser server on port 8099 — the port must be free) |
 | `python -m disturbance.test_waves` | 12 checks on the finite-depth directional wave field: dispersion residual + limits, JONSWAP + cos^2s normalization, realized Hs, seabed velocity limit, seed reproducibility |
-| `python -m disturbance.test_env` | 21 checks on current/env: exact Gauss–Markov discretization, C/CD/CW/CDW mode gating, identical wave phases across modes per seed, FK force = ρ·vol·C_M·a_wave |
+| `python -m disturbance.test_env` | 21 checks on current/env: exact Gauss–Markov discretization, C/CD/CW/CDW mode gating, identical wave phases across modes per seed, FK force = ρ·vol·C_M·a_wave [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
 
 ### 2. Interactive teleop (`teleop.py` — needs a display; `--viser` for browser/headless)
 
@@ -333,7 +333,7 @@ released from rest with **thrust held at 0** and **disturbances forced ON**, so 
 watch the current + waves carry and rock it. Drive keys are disabled (only `G` toggles the
 flow, `H` recenters now); it drifts freely **anywhere inside the water volume** and
 **auto-recenters** back to the release pose only when it LEAVES the water (the
-`pool_water_surface` extent — horizontal edges + the waterline; ~15 s per crossing at the
+`pool_water_surface` extent — horizontal edges + the waterline; ~15 s per crossing at the  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
 default sea state). `--recenter-radius R` swaps in a fixed drift distance instead;
 `--no-recenter` lets it drift off entirely. Recenter only rewrites state (like the viewer's
 *Reset pose*), so **dynamics/model are untouched** (verified: the free-drift rollout is
@@ -583,7 +583,7 @@ are headless (no flags).
 | `python verify/verify_hydro.py` | 32-check first-principles smoke on hydro.py in still water: net buoyancy, terminal velocity / drag anisotropy, restoring pendulum, added mass, energy sanity, frame checks. Flag: `--no-plot`; figures → `docs/figs/hydro_T*.png`. Takes minutes |
 | `python verify/verify_hydro_precise.py` | rigorous 4-tier superset: structural Fossen identities (hard gate), order-of-accuracy convergence vs a DOP853 continuum reference, frame/Galilean invariance, added-mass-lag transfer-function fidelity. Flags: `--tier 1234`, `--ladder 2,1,0.5,0.25,0.125` [ms], `--no-plot`. Slow |
 | `python verify/verify_acados.py` | acados NMPC ≡ IPOPT NMPC: equivalence (worst max\|Δu\| < 0.25 N on interior states) + SQP-RTI timing vs the 50 ms @ 20 Hz budget. First run code-generates the solver into `dobmpc/_acados_gen/` |
-| `python verify/verify_eaob.py` | EAOB observer validation: runs a disturbed DP hold twice (`profile="verify"` clean-deadbeat vs `profile="perf"` + injected sensor noise) and scores the OBSERVER — per-axis RMSE of `w_hat` vs the model-residual `w_true` (cross-checked against hydro's `diag_wtrue`), mean NIS/NEES vs the χ²₁₈ target ~18, gated frames, and a motion-correlation diagnostic (residual vs \|nu\|). Flags: `--mode {NONE..CDW}`, `--tau-dist`, `--profiles`, `--T`, `--seed`, `--no-plot`. At the default `EAOB_TAU_DIST=0.2` the perf profile passes NIS+NEES in CDW and NIS in CD (CD NEES ~9 = deliberate real-hardware conservatism). Exit 1 on perf FAIL |
+| `python verify/verify_eaob.py` | EAOB observer validation: runs a disturbed DP hold twice (`profile="verify"` clean-deadbeat vs `profile="perf"` + injected sensor noise) and scores the OBSERVER — per-axis RMSE of `w_hat` vs the model-residual `w_true` (cross-checked against hydro's `diag_wtrue`), mean NIS/NEES vs the χ²₁₈ target ~18, gated frames, and a motion-correlation diagnostic (residual vs \|nu\|). Flags: `--mode {NONE..CDW}`, `--tau-dist`, `--profiles`, `--T`, `--seed`, `--no-plot`. At the default `EAOB_TAU_DIST=0.2` the perf profile passes NIS+NEES in CDW and NIS in CD (CD NEES ~9 = deliberate real-hardware conservatism). Exit 1 on perf FAIL [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
 | `python verify/verify_state_source.py` | closed-loop A/B of `mpc_state_source` over {truth, meas, estimate} × {C,CD,CDW} × {dp,square} with FIXED seeds: radRMS/dc, startup transient, effort + chatter (Σ\|ΔF\| per tick), saturation, in-the-loop NIS/NEES, yaw-continuity check. Flags: `--sources`, `--modes`, `--scenarios`, `--T`, `--laps`, `--config`. Exit 1 if any imperfect-source run diverges, NIS leaves 14–24, or NEES exceeds 24 (below-range = documented conservatism, non-gating). NB: quantifies the raw-noise-x0 chatter cost |
 | `python verify/verify_meta.py` | the recorder sidecar manifest is complete: the disturbance snapshot round-trips (kicks/waves reproduced exactly), CSV header matches, solver + effective PID gains captured. Run from the package dir |
 | `/home/bdml/miniforge3/envs/robust-mjx/bin/python verify/verify_gpu_mjx.py` | Phase-0 GPU env check (**`robust-mjx` env, NOT `robust`**): JAX sees the CUDA GPU and a jitted MJX rollout actually runs on it; loading bluerov.xml under MJX is a non-gating bonus check (the CPU passive-callback hydro does not run under MJX) |
@@ -711,3 +711,11 @@ bluerov2_mujoco_marinegym/
 - [docs/02_MODEL.md](docs/02_MODEL.md) … [docs/07_DISTURBANCES.md](docs/07_DISTURBANCES.md) — per-phase design.
 - [docs/CONTROL_METHODOLOGY.md](docs/CONTROL_METHODOLOGY.md) — controller development journal (PID → MPC → DOB-MPC → acados).
 - [docs/HYDRO_VERIFICATION.md](docs/HYDRO_VERIFICATION.md) — hydrodynamics V&V writeup.
+
+
+<!-- MEASUREMENT AUDIT (2026-08-04): the following numbers appear inside code
+     blocks above and could not be annotated inline without corrupting them. -->
+
+> **[UNVERIFIED]** 아래 줄의 수치는 출처 감사에서 미검증으로 분류되었다 — 자세한 근거는 [docs/MEASUREMENT_AUDIT.md](docs/MEASUREMENT_AUDIT.md).
+>
+> - `bluerov2_mujoco_marinegym/README.md:418` — 산출물 없음 — `python -m disturbance.test_waves && python -m disturbance.test_env   # 33 unit a`

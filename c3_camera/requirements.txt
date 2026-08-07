@@ -1,9 +1,13 @@
 # c3_camera — direct DepthAI access to the MarineSitu C3 (OAK-D-W-POE)
 #
-# Install into a venv built on the SYSTEM python3, not conda — see README.md.
-# Verified working set on this desktop (Ubuntu 22.04, python 3.10.12):
+# The primary home is now the conda `robust` env — see README.md. These are the
+# same requirements either way; `~/.venvs/c3-depthai` (system python3, built by
+# setup_env.sh) remains as a fallback.
 #
-#   depthai 2.32.0.0 / opencv 4.11.0 / numpy 1.26.4
+# Verified working sets on this desktop (Ubuntu 22.04):
+#
+#   robust    python 3.12.13 / depthai 2.32.0.0 / opencv 4.10.0 / numpy 1.26.4
+#   venv      python 3.10.12 / depthai 2.32.0.0 / opencv 4.11.0 / numpy 1.26.4
 #
 # depthai 2.x is deliberate, not stale. The v2 line still ships wheels for
 # python 3.9-3.14 (2.32.0.0 is current) and is what the camera's own vendor
@@ -24,3 +28,7 @@ numpy>=1.26,<2
 # MAVLink telemetry from ArduSub (c3_collect.py). Passive listener by default —
 # it never transmits unless --mavlink-set-rates is given explicitly.
 pymavlink>=2.4.40
+
+# --profile YAML files (c3_camera/profiles/, read by profile.py). Imported lazily,
+# so everything except --profile still runs in an environment without it.
+PyYAML>=6

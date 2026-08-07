@@ -75,7 +75,7 @@ the added-mass lag.
 
 The restoring moment max is only **B·coBM ≈ 1.11 N·m**, while surge makes a pitch
 moment **Fx·0.0725** ([03_THRUSTERS.md](03_THRUSTERS.md)). So:
-- Below ~Fx ≈ 5 N: stable, nearly-level glide (good for open-loop driving).
+- Below ~Fx ≈ 5 N: stable, nearly-level glide (good for open-loop driving).  [UNVERIFIED: 예시/유도값 — docs/MEASUREMENT_AUDIT.md]
 - Above the restoring limit: the surge pitch moment wins → the vehicle noses
   over/tumbles. Drag bounds the **rate**, not the **angle**.
 

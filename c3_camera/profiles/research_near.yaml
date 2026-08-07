@@ -1,0 +1,59 @@
+# 20 fps RGB-D dataset, near range. This is the profile that this flag wall became:
+#
+#   --mode research --mavlink-transport rest --streams color,depth
+#   --color-res 1080p --isp-scale 1/4 --depth-size 480x270 --extended
+#   --fps 20 --color-encode mjpeg --imu-rate 200 --imu-batch 10 --min-mm 150
+#
+#     ./c3 collect --profile research_near
+#     ./c3 collect --profile research_near --dry-run
+#
+# Five of those twelve flags were restating a default (--mode, --color-res,
+# --isp-scale, --imu-rate, --imu-batch). They are written out anyway — here or in
+# base.yaml — because a profile should say what the dive WAS, not only where it
+# differed from something you would have to go and read.
+#
+# Wire budget: run --dry-run. It prints Mbit/s against the measured PoE ceiling
+# (POE_BUDGET_MBPS, config.py). No number is repeated here, because a number in a
+# comment becomes a citation.
+
+extends: base.yaml
+
+schema: c3_collect_profile/1
+profile: research-near-20fps
+mode: research
+
+camera:
+  # 1920x1080 * 1/4 -> 480x270. Both equal mode:research; stated for the record.
+  color_res: "1080p"
+  isp_scale: "1/4"
+  # The one change that buys 20 fps. mode:research ships raw NV12 at 8 fps because
+  # a lossless dataset wants untouched pixels; this profile spends that for frame
+  # rate using the device's hardware encoder.
+  # THE PRICE: rgb/*.png are decoded from JPEG, so this dataset is NOT
+  # photometrically lossless. Use mode:research unmodified when that matters.
+  color_encode: mjpeg
+  fps: 20.0
+  # Colour and depth only. left/right are still produced ON the device — StereoDepth
+  # needs them — they just do not cross the wire, which is what makes 20 fps fit.
+  streams: [color, depth]
+
+stereo:
+  # 480x270 IS the colour grid, so rgb[u,v] and depth[u,v] are the same ray.
+  # NOTE: depth_size WINS over depth_match_color when both are set
+  # (config.py:457-462). mode:research sets depth_match_color: true, which would
+  # have DERIVED this same 480x270, so the two agree here and either alone would
+  # do. If you change camera.isp_scale, change this too or delete it — a stale
+  # depth_size silently un-aligns the dataset.
+  depth_size: "480x270"
+  # Extended disparity doubles the search from 95 to 190 px, which halves the
+  # closest distance the matcher can represent.
+  #   MinZ 300 mm -> 150 mm at 400p mono
+  #   [측정: c3_camera/datasets/dataset_20260803_162223/depth/ — 바닥 정확히 150 mm,
+  #    그 아래 0 픽셀; 비교군 dataset_20260803_102816 은 300 mm]
+  # This is the ONLY setting in this file that changes how close the camera sees.
+  extended: true
+
+display:
+  # PREVIEW COLOURMAP ONLY (see base.yaml). Lowered from base's 300 so the near
+  # half of the extended range is visible on screen. It clips nothing on disk.
+  min_mm: 150.0
