@@ -34,6 +34,28 @@
 #   ~/miniforge3/envs/robust/bin/python           conda robust — the consolidated env
 #   ${C3_VENV:-~/.venvs/c3-depthai}/bin/python    the venv (setup_env.sh), fallback
 #
+# `./c3 gui` IS DIFFERENT. It runs in `rovgui-pose`, not `robust`, because the
+# station now hosts the SAM2 + FoundationPose object tracker in its own process
+# and that stack cannot live in `robust`:
+#
+#   rovgui-pose   torch 2.11+cu128, sam2, PyQt5, depthai 2.32, numpy 2.4.4, cv2 5.0
+#   robust        no torch; numpy pinned <2 for gtsam; the sim/acados/SLAM env
+#
+# The expensive part of that stack is FoundationPose's compiled CUDA extensions
+# (pytorch3d, kaolin, nvdiffrast, its own mycpp/mycuda), already built in `oakd`
+# — so rovgui-pose is a clone of `oakd` plus PyQt5 and depthai 2.32, rather than
+# torch bolted onto `robust`. numpy MUST be 2.x there: torch 2.11 is compiled
+# against numpy 2's C ABI and fails to initialise on 1.26 regardless of what its
+# metadata declares. Verified 2026-08-09: rov_gui 37/37 and c3_camera 58/58 pass
+# in that env, Qt is 5.15.14 in both, and the minimum window is identical.
+#
+# The camera tools above stay on `robust` deliberately: they are the code with
+# the most measurement invested in them, and nothing about perception requires
+# moving them. Override either side with $C3_PY / $ROVGUI_PY.
+#
+# If rovgui-pose is absent the GUI falls back to the normal interpreter and runs
+# fine WITHOUT --pose; it says so rather than failing.
+#
 # `robust` is first as of 2026-08-06, when it was moved from python 3.14.4 to
 # 3.12.13. That is not a cosmetic version bump: on 3.14 there is no numpy 1.26
 # wheel, so the installed numpy had been BUILT FROM SOURCE, and that combination
@@ -119,15 +141,33 @@ case "$tool" in
   extract-rgb)    mod=c3_extract_rgb_video ;;
   madrona)        mod=madrona ;;
   gui)
-    # Not a c3_camera module: rov_gui is a sibling package. Routed through this
-    # wrapper anyway because --source hw needs exactly the same interpreter
-    # (depthai 2.x) and the same cwd (repo root on sys.path) as the tools above.
+    # Not a c3_camera module: rov_gui is a sibling package, and as of 2026-08-09
+    # it runs in its OWN env — see the header. Still routed through this wrapper
+    # for the cwd (repo root on sys.path, so `python -m rov_gui` resolves).
+    GUI_PY="${ROVGUI_PY:-${CONDA_PREFIX_ROOT:-$HOME/miniforge3}/envs/rovgui-pose/bin/python}"
+    if [[ ! -x "$GUI_PY" ]]; then
+      echo "c3: rovgui-pose not found, falling back to $PY" >&2
+      echo "    the station will run, but --pose (object tracking) needs that env:" >&2
+      echo "      conda create -n rovgui-pose --clone oakd" >&2
+      echo "      P=~/miniforge3/envs/rovgui-pose/bin" >&2
+      echo "      \$P/pip install --force-reinstall --no-deps numpy==2.4.4" >&2
+      echo "      \$P/pip install PyQt5==5.15.11 'depthai~=2.32.0' pymavlink" >&2
+      GUI_PY="$PY"
+    fi
     cd "$REPO"
-    exec "$PY" -m rov_gui "$@"
+    exec "$GUI_PY" -m rov_gui "$@"
     ;;
   env)
     cd "$REPO"
     echo "interpreter : $PY"
+    # The GUI resolves separately (see the header). Report it here too, or
+    # "which interpreter am I on" answers the question for only half the tools.
+    GUI_PY="${ROVGUI_PY:-${CONDA_PREFIX_ROOT:-$HOME/miniforge3}/envs/rovgui-pose/bin/python}"
+    if [[ -x "$GUI_PY" ]]; then
+      echo "gui         : $GUI_PY"
+    else
+      echo "gui         : $PY  (rovgui-pose absent — --pose unavailable)"
+    fi
     echo "repo        : $REPO"
     "$PY" - <<'PY'
 import sys

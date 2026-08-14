@@ -236,6 +236,224 @@ class LinkStat:
 
 
 # =============================================================================
+# object tracking / pose
+# =============================================================================
+@dataclass
+class PoseTrack:
+    """What the object tracker knows, in plain data.
+
+    Everything here is already in SOURCE image pixels (the 640x360 stream), so
+    the overlay never does geometry and never needs the camera model — the same
+    division of labour the rest of this package uses: the worker computes, the
+    GUI thread blits.
+
+    ``contours`` rather than a mask, deliberately. A 640x360 bool mask is 230 kB
+    per frame and would have to be drawn pixel by pixel on the GUI thread;
+    ``cv2.findContours`` + ``approxPolyDP`` turn it into ~1 kB of polylines that
+    QPainter draws as a path. Same picture, no per-pixel work where it hurts.
+
+    ``T_cam_obj`` is 16 floats, ROW-MAJOR, object -> camera, metres, OpenCV
+    optical axes (+X right, +Y down, +Z forward). None until a pose exists —
+    and in the tracking-only build it stays None forever, which is a legitimate,
+    useful state and not a failure.
+    """
+
+    # off | loading | idle | live | capturing | building | pose_loading |
+    # registering | tracking | lost | failed | fault
+    state: str = "off"
+    contours: tuple = ()            # ((x, y), ...) per polyline, source pixels
+    T_cam_obj: tuple | None = None  # 16 floats row-major, or None
+    axes_px: tuple = ()             # 4 points: origin, +X tip, +Y tip, +Z tip
+    box_px: tuple = ()              # 8 corners of the oriented box
+    score: float | None = None      # SAM2 object-score logit; >0 visible
+    mask_px: int = 0
+    sam_hz: float = 0.0
+    pose_hz: float = 0.0
+    n_register: int = 0
+    frame_seq: int = 0
+    # The frame these pixels belong to. The overlay scales by this, so a change
+    # of stream resolution mid-session cannot silently misplace the mask.
+    src_w: int = 0
+    src_h: int = 0
+    load_s: float = 0.0             # how long the model has been loading
+    # On-site reconstruction. Only meaningful in the capturing/building states,
+    # and they are the two the pilot has to steer: the arc is a budget they
+    # spend by orbiting (75 deg, past which the per-view pose error goes off a
+    # cliff), and build_s is a wait with nothing to do but not lose the object.
+    n_views: int = 0
+    arc_deg: float = 0.0
+    max_arc: float = 0.0
+    max_views: int = 0
+    build_s: float = 0.0
+    distance_m: float = 0.0         # camera->object during capture, metres
+    fp_load_s: float = 0.0          # FoundationPose bring-up, seconds so far
+    # Whether a 6-DoF pose is expected at all. Without this the overlay cannot
+    # tell "no pose because you asked for a mask" from "no pose because
+    # something went wrong", and those need to look different.
+    pose_expected: bool = False
+    note: str = ""
+    conn: Conn = Conn.OFFLINE
+    stamp: float = field(default_factory=now)
+
+    @property
+    def has_mask(self) -> bool:
+        return bool(self.contours)
+
+
+# =============================================================================
+# closed-loop MPC (AprilTag localization + acados NMPC) — see rov_gui/control/
+# =============================================================================
+@dataclass
+class NavFix:
+    """One AprilTag-PnP localization of the VEHICLE, already in the NED world.
+
+    The frame chain (tag map -> camera -> body -> NED) is resolved by
+    ``rov_gui.control.tagnav`` + ``rov_gui.control.geometry`` BEFORE this
+    object exists, so everything downstream (the MPC, the plot, the CSV) reads
+    one convention and cannot re-derive it differently:
+
+    * ``p_ned`` / ``R_ned_body`` — vehicle position and body(FRD)->world(NED)
+      rotation in the tag-map-derived NED world frame (x north-ish, z DOWN).
+      For the floor map that world is the tag-25 frame (already +Z down); for
+      the wall-tag geometry it is the configured remap of the tag frame.
+    * ``t_capture`` — when the camera FRAME was true (stamp rule from the
+      module docstring), not when PnP finished. Latency compensation and the
+      freshness gate both hang off this.
+    * ``ambiguous`` — single-tag IPPE returned two plausible poses and the
+      disambiguation was not decisive; the state assembler may still use the
+      fix but the flag rides into the CSV so a bad stretch is auditable.
+    """
+
+    t_capture: float = 0.0
+    n_tags: int = 0
+    tag_ids: tuple = ()
+    tag_insts: tuple = ()            # which copy of each id (0 = the only one)
+    p_ned: tuple | None = None       # (x, y, z) metres, NED world
+    R_ned_body: tuple | None = None  # 9 floats row-major, body(FRD)->world(NED)
+    yaw_ned: float | None = None     # rad, extracted from R_ned_body (ZYX psi)
+    reproj_rms_px: float | None = None
+    detect_ms: float = 0.0
+    hz: float | None = None          # measured rate of ACCEPTED fixes
+    ambiguous: bool = False
+    geometry: str = ""               # "floor" | "wall"
+    source: str = ""                 # which feed localized: "main" (C3) | "second"
+    src_w: int = 0
+    src_h: int = 0
+    conn: Conn = Conn.OFFLINE
+    note: str = ""
+    stamp: float = field(default_factory=now)
+
+    @property
+    def ok(self) -> bool:
+        return self.p_ned is not None and self.R_ned_body is not None
+
+
+@dataclass
+class TagOverlay:
+    """AprilTag detections on ONE video feed, in that feed's SOURCE pixels.
+
+    Display data only — the pose/localization result rides :class:`NavFix`.
+    This exists so the pilot can SEE what the detector sees, per feed, and so
+    an uncalibrated camera (the ROV's own RGB) can still show detections
+    without pretending they localize anything: ``localizes`` says whether this
+    feed's detections feed the MPC state estimate.
+    """
+
+    panel: str = ""                  # "main" | "second" — the video panel key
+    quads: tuple = ()                # ((4 corner (x,y) tuples), ...) source px
+    ids: tuple = ()
+    mapped: tuple = ()               # per-quad: is this tag in the map?
+    src_w: int = 0
+    src_h: int = 0
+    detect_ms: float = 0.0
+    localizes: bool = False          # True = these detections drive the MPC
+    enabled: bool = True             # False = one last CLEAR after toggle-off
+    # The camera model and capture time these corners belong to. Present so a
+    # recording can carry RAW OBSERVATIONS, not just solved poses: rebuilding
+    # or extending the tag map needs corners + K, and a fix alone throws both
+    # away. Empty K = this feed has no calibration (overlay-only).
+    t_capture: float = 0.0
+    K: tuple = ()                    # (fx, fy, cx, cy) for THIS frame's size
+    dist: tuple = ()
+    note: str = ""
+    stamp: float = field(default_factory=now)
+
+
+@dataclass
+class VehicleImu:
+    """The autopilot's inertial state, in SI, NED/FRD — the MPC's second sensor.
+
+    All from ArduSub over MAVLink (ATTITUDE / SCALED_IMU2 / SCALED_PRESSURE2),
+    which already speaks NED/FRD, so NOTHING here is re-signed. ``ax..az`` are
+    SPECIFIC FORCE (what the accelerometer measures): a level, stationary
+    vehicle reads (0, 0, -9.81). Gravity removal happens in the state
+    assembler, next to the rotation that needs it. Per-record host stamps are
+    kept separately because the three messages arrive at different rates and
+    one shared stamp would hide a dead stream behind a live one.
+    """
+
+    roll: float | None = None        # rad, NED (ATTITUDE)
+    pitch: float | None = None
+    yaw: float | None = None         # compass yaw — consistency check ONLY,
+    p: float | None = None           # rad/s, FRD body (ATTITUDE rollspeed)
+    q: float | None = None
+    r: float | None = None
+    ax: float | None = None          # m/s^2 specific force, FRD (SCALED_IMU2)
+    ay: float | None = None
+    az: float | None = None
+    depth_m: float | None = None     # pressure-DERIVED, positive down
+    t_att: float | None = None       # host arrival stamps per message
+    t_imu: float | None = None
+    t_baro: float | None = None
+    conn: Conn = Conn.OFFLINE
+    stamp: float = field(default_factory=now)
+
+
+@dataclass
+class MpcStatus:
+    """One MPC control tick, as the UI and the CSV see it.
+
+    Positions here are WORLD FLU (x fwd, y left, z up) — the sim's recording
+    convention — so the TrajectoryWindow and the traj CSV read like the
+    simulator's outputs. The controller itself runs in NED; the bridge
+    converts at this boundary and nowhere else. ``w_hat``/``u_cmd`` stay in
+    the controller's native NED/FRD units (N, N·m) because converting a
+    diagnostic invites sign bugs in the thing meant to catch them.
+    """
+
+    engaged: bool = False
+    traj_on: bool = False
+    mode: str = ""                   # "mpc" | "dobmpc"
+    scenario: dict | None = None     # square params once the trajectory starts
+    solver: str = ""                 # "acados" | "ipopt" | "stub" | ""
+    solver_status: int = 0
+    solve_ms: float | None = None
+    n_fail: int = 0
+    w_hat: tuple = ()                # (6,) NED body wrench, N / N·m
+    u_cmd: tuple = ()                # (6,) NED body wrench command
+    axes: tuple = ()                 # (surge, sway, heave, yaw) sent, -1..+1
+    p_flu: tuple | None = None       # measured position, world FLU
+    ref_flu: tuple | None = None     # reference position, world FLU
+    yaw_flu_deg: float | None = None
+    err_xy: float | None = None      # |p - ref| horizontal, metres
+    n_tags: int = 0
+    tag_age_s: float | None = None
+    imu_age_s: float | None = None
+    geofence_ok: bool = True
+    warmup_left_s: float = 0.0
+    # The mission datum, set at ENGAGE: (x, y, z, yaw) of the engage pose in
+    # the TAG frame. Everything in this status (and the CSV, and the square,
+    # and the geofence) is relative to it — (0,0) is where START was pressed.
+    # None = no engagement yet this session.
+    datum: tuple | None = None
+    lap: int = 0
+    t_traj: float | None = None      # seconds since the trajectory clock began
+    reason: str = ""                 # why the last engage/disengage happened
+    conn: Conn = Conn.OFFLINE
+    stamp: float = field(default_factory=now)
+
+
+# =============================================================================
 # pilot input
 # =============================================================================
 @dataclass

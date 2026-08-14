@@ -71,7 +71,8 @@ from .joystick import JoystickReader, apply_deadzone
 from .qt import (QShortcut, QTimer, Qt, QtGui, QtWidgets, preload_platform_libs,
                  run_app, sanitize_plugin_path)
 from .recorder import ScreenRecorder, StreamRecorder
-from .state import Conn, LinkStat, PayloadState, Telemetry, ThrusterState, now
+from .state import (Conn, LinkStat, PayloadState, PilotInput, SensorStat,
+                    Telemetry, ThrusterState, now)
 from .widgets.health import HealthPanel, SensorPanel
 from .widgets.indicators import ElidedLabel, StatusPill
 from .widgets.payload import PayloadPanel
@@ -140,6 +141,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "thrusters": Freshness(warn_s=1.5, fail_s=4.0),
             "payload": Freshness(warn_s=2.0, fail_s=6.0),
             "link": Freshness(warn_s=3.0, fail_s=8.0),
+            # MpcStatus arrives at 20 Hz while the worker is alive; 1.5 s of
+            # silence while ENGAGED means the worker is wedged and the window
+            # must release itself (see _tick) — the sink deadman is already
+            # holding the vehicle at neutral by then.
+            "mpc": Freshness(warn_s=0.5, fail_s=1.5),
         }
 
         self._build()
@@ -162,6 +168,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._armed: bool | None = None
         self._mode: str = ""
         self._motor_mean = 0.0
+        self._pose3d = None            # the floating 3-D pose window, lazy
+        # Mirrors MpcStatus.engaged. While True the teleop pump yields the
+        # command channel to the MPC worker and any pilot axis input is a
+        # TAKEOVER (see _pilot_gate) — the single-command-source rule.
+        self._mpc_engaged = False
+        self._mpc_takeover_sent = False
+        self._mpc_datum = None         # engage datum, published in MpcStatus
         self._shut_down = False
         self._ui_frames = 0
         self._ui_t0 = time.monotonic()
@@ -221,10 +234,27 @@ class MainWindow(QtWidgets.QMainWindow):
             expect = float(getattr(self.opts, "fps", 30.0) or 30.0)
             if key == "depth":
                 expect = float(getattr(self.opts, "depth_fps", 20.0) or 20.0)
-            self.videos[key] = VideoPanel(key, title, self.mailboxes[key],
-                                          expected_fps=expect, legend=legend)
+            # Only the C3 colour feed can be tracked on: SAM2 needs the picture
+            # the pose will eventually be computed against, and only this feed
+            # has depth aligned to it on the same grid.
+            wants_pose = bool(getattr(self.opts, "pose", False)) and key == "main"
+            # AprilTag detection toggles: the C3 colour feed (localizes) and
+            # the ROV's own RGB (overlay only — no calibration exists for it).
+            wants_tag = (bool(getattr(self.opts, "mpc", False))
+                         and (key == "main"
+                              or (key == "second"
+                                  and getattr(self.opts, "panel2", "rov") == "rov")))
+            self.videos[key] = VideoPanel(
+                key, title, self.mailboxes[key], expected_fps=expect,
+                legend=legend, pose=wants_pose,
+                box3d=bool(getattr(self.opts, "pose_box3d", False)),
+                tag=wants_tag)
             self.videos[key].focus_requested.connect(self._toggle_focus)
             self.videos[key].record_toggled.connect(self._toggle_feed_record)
+            if wants_pose:
+                self.videos[key].track_toggled.connect(self.bus.cmd_pose_enable)
+                self.videos[key].prompt_clicked.connect(self._on_prompt)
+                self.videos[key].map_clicked.connect(self._show_pose3d)
 
         self.health = HealthPanel()
         self.sensors = SensorPanel()
@@ -232,13 +262,110 @@ class MainWindow(QtWidgets.QMainWindow):
         self.payload = PayloadPanel()
         self.propulsion = PropulsionPanel(n=int(getattr(self.opts, "thrusters", 8)))
 
+        # The MPC panel lives IN the grid. Since 2026-08-14 (operator request)
+        # it takes the WIDE slot: the whole bottom row's columns 2-3 — where
+        # PROPULSION and SENSORS used to sit — and those two panels stack into
+        # column 3 under SYSTEM HEALTH (the slack space the plot used to
+        # occupy). Without --mpc nothing moves.
+        self._traj_panel = None
+        self._nav_source = "main"
+        self._map_tags_raw: list = []            # (x, y, yaw, id) tag frame
+        self._pool_raw: list = []                # 4 corners (x, y) tag frame
+        self._nav_map_meta: dict = {}            # map.json payload for REC NAV
+        self._nav_rec: dict | None = None        # open REC NAV recording
+        if bool(getattr(self.opts, "mpc", False)):
+            from .widgets.trajectory import TrajectoryWindow
+
+            fence = None
+            cfg = None
+            try:
+                from .control.geometry import NavConfig
+                cfg = NavConfig.load(
+                    getattr(self.opts, "nav_config", "config/hw_nav.yaml"),
+                    geometry_override=getattr(self.opts, "nav_geometry", None))
+                fence = cfg.geofence
+                self._nav_source = cfg.nav_source
+                if cfg.geometry == "floor":
+                    # Draw the surveyed map on the plot — the whole point of
+                    # having one is seeing the vehicle move ACROSS it. Yaw
+                    # rides along so each tag is drawn the way it lies.
+                    import math as _m
+                    from .control.tagnav import TagMap
+                    tm = TagMap.load(cfg.tag_map_path)
+                    # EVERY physical tag, not one per id: a duplicated id has
+                    # two squares on the floor and the operator needs to see
+                    # both of them on the plot.
+                    self._map_tags_raw = [
+                        (float(t[0]), float(t[1]),
+                         _m.atan2(float(R[1, 0]), float(R[0, 0])), tid, k)
+                        for tid, poses in sorted(tm.instances.items())
+                        for k, (R, t) in enumerate(poses)]
+                    self._nav_map_meta = {
+                        "frame": "tag map NED-like (anchor tag frame, +z down)",
+                        "tag_map": str(cfg.tag_map_path),
+                        "anchor_tag_id": tm.anchor_id,
+                        "tag_size_m": float(cfg.tag_size_m),
+                        "duplicate_ids": sorted(tm.duplicate_ids),
+                        "tags": {(int(tid) if len(poses) == 1
+                                  else f"{int(tid)}#{k}"): {
+                            "x": float(t[0]), "y": float(t[1]),
+                            "z": float(t[2]),
+                            "yaw_rad": _m.atan2(float(R[1, 0]), float(R[0, 0]))}
+                            for tid, poses in sorted(tm.instances.items())
+                            for k, (R, t) in enumerate(poses)},
+                    }
+                # An explicit pool_ned wins; otherwise derive the wall from
+                # the tag map itself (outermost tag EDGES + pool_margin_m),
+                # so rebuilding the map moves the wall with it.
+                pool = cfg.pool_ned
+                if pool is None and cfg.geometry == "floor":
+                    pool = cfg.pool_from_tags(tm)
+                if pool:
+                    x0, x1 = pool["x"]
+                    y0, y1 = pool["y"]
+                    self._pool_raw = [(x0, y0), (x0, y1), (x1, y1), (x1, y0)]
+                self._nav_map_meta.update({
+                    "geometry": cfg.geometry, "nav_source": cfg.nav_source,
+                    "pool_ned": pool, "geofence_ned": cfg.geofence})
+            except Exception as e:                               # noqa: BLE001
+                print(f"[warn] mpc panel: no geofence/map ({e})", flush=True)
+            self._traj_panel = TrajectoryWindow(geofence=fence)
+            if cfg is not None:
+                self._traj_panel.view.tag_size_m = float(cfg.tag_size_m)
+            if self._map_tags_raw:
+                self._traj_panel.view.set_map_tags(self._map_tags_raw)
+            if self._pool_raw:
+                self._traj_panel.view.set_pool(self._pool_raw)
+
         self.grid = grid
         self._place_videos(main="main")
-        grid.addWidget(self.health, 1, 3, 2, 1)
-        grid.addWidget(self.teleop, 3, 0)
-        grid.addWidget(self.payload, 3, 1)
-        grid.addWidget(self.propulsion, 3, 2)
-        grid.addWidget(self.sensors, 3, 3)
+        if self._traj_panel is not None:
+            # Column 3: HEALTH over a PROPULSION|SENSORS pair. Side by side,
+            # not stacked — stacked, their fixed content heights (289 + 227)
+            # push the window's minimum past the 1080p budget; abreast, the
+            # column costs max(227, sensors) and the whole layout still fits
+            # (test_mpc_panel_lives_in_the_grid...). Sensors elide by design,
+            # so the narrower slot costs rows, not correctness.
+            col3 = QtWidgets.QWidget()
+            v = QtWidgets.QVBoxLayout(col3)
+            v.setContentsMargins(0, 0, 0, 0)
+            v.setSpacing(4)
+            v.addWidget(self.health, 1)
+            duo = QtWidgets.QHBoxLayout()
+            duo.setSpacing(4)
+            duo.addWidget(self.propulsion)
+            duo.addWidget(self.sensors)
+            v.addLayout(duo)
+            grid.addWidget(col3, 1, 3, 2, 1)
+            grid.addWidget(self.teleop, 3, 0)
+            grid.addWidget(self.payload, 3, 1)
+            grid.addWidget(self._traj_panel, 3, 2, 1, 2)
+        else:
+            grid.addWidget(self.health, 1, 3, 2, 1)
+            grid.addWidget(self.teleop, 3, 0)
+            grid.addWidget(self.payload, 3, 1)
+            grid.addWidget(self.propulsion, 3, 2)
+            grid.addWidget(self.sensors, 3, 3)
 
         # Rule 2 from the module docstring, applied where it matters: the row-3
         # panels must not compete with the video rows for vertical space.
@@ -351,7 +478,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # UI -> bus. The panels never talk to a backend directly; they emit and
         # the bus carries it across the thread boundary.
-        self.teleop.pilot_changed.connect(b.cmd_pilot)
+        # Pilot frames go through ONE gate (_pilot_gate) — both this
+        # edge-triggered path and the 20 Hz pump — so the MPC arbitration
+        # cannot be bypassed by whichever of the two fires first.
+        self.teleop.pilot_changed.connect(self._pilot_gate)
         self.teleop.enable_changed.connect(b.cmd_enable)
         self.teleop.arm_requested.connect(b.cmd_arm)
         self.teleop.mode_requested.connect(b.cmd_mode)
@@ -365,6 +495,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.payload.tilt_drive.connect(b.cmd_tilt)
         self.payload.tilt_center.connect(b.cmd_tilt_center)
         b.sensor_stat.connect(self._on_sensor_stat)
+        b.pose.connect(self._on_pose)
+        b.nav_fix.connect(self._on_nav_fix)
+        b.mpc_status.connect(self._on_mpc_status)
+        b.tag_overlay.connect(self._on_tag_overlay)
+        for panel in self.videos.values():
+            if panel.tag_btn is not None:
+                panel.tag_toggled.connect(b.cmd_tag_enable)
+        if self._traj_panel is not None:
+            self._traj_panel.engage_requested.connect(b.cmd_mpc_engage)
+            self._traj_panel.traj_requested.connect(b.cmd_mpc_traj)
+            self._traj_panel.mission_requested.connect(b.cmd_mpc_start)
+            self._traj_panel.mode_requested.connect(b.cmd_mpc_mode)
+            self._traj_panel.estop_requested.connect(self.estop)
+            self._traj_panel.record_requested.connect(self._toggle_nav_record)
 
         # Explicit .connect rather than the `activated=` constructor keyword:
         # that keyword form is a PyQt convenience and is not portable to PySide.
@@ -383,6 +527,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmd_timer.start()
         if getattr(self.opts, "joystick", "auto") != "none":
             self.js_timer.start()
+        # Mirror the tag detector's defaults onto the TAG buttons WITHOUT
+        # re-emitting the command (the worker already holds that state): the
+        # LOCALIZING feed (hw_nav.yaml nav_source) starts ON, the overlay-only
+        # feed starts off.
+        for key, panel in self.videos.items():
+            if panel.tag_btn is not None:
+                panel.set_tag_checked(key == self._nav_source)
         self.bus.log.emit("info", f"backend {backend.name} started")
 
     # ================================================================== slots
@@ -421,10 +572,248 @@ class MainWindow(QtWidgets.QMainWindow):
         self._extra_sensors[s.name] = s
         self._refresh_sensors()
 
+    def _on_prompt(self, x: float, y: float) -> None:
+        """A click on the video, already converted to SOURCE pixels."""
+        self.bus.cmd_pose_click.emit(x, y)
+        self.bus.log.emit("info", f"pose: prompt at ({x:.0f}, {y:.0f})")
+
+    def _show_pose3d(self) -> None:
+        """Bring the 3-D pose window up (MAP button, or automatically).
+
+        Built on first use, not at startup: the window only means something
+        with --pose, and even then only once a pose pipeline is in play.
+        """
+        if self._pose3d is None:
+            from .widgets.pose3d import Pose3DWindow
+            self._pose3d = Pose3DWindow()
+        self._pose3d.show()
+        self._pose3d.raise_()
+
+    def _on_pose(self, t) -> None:
+        panel = self.videos.get("main")
+        if panel is not None:
+            panel.canvas.set_track(t)
+        # The 3-D map opens ITSELF the first time FoundationPose enters the
+        # picture — loading, registering, or an actual pose — and only once:
+        # a window the pilot closed stays closed until the MAP button.
+        pose_active = (t.T_cam_obj is not None
+                       or t.state in ("pose_loading", "registering"))
+        if pose_active and not self._pose3d_shown:
+            self._pose3d_shown = True
+            self._show_pose3d()
+        if self._pose3d is not None:
+            self._pose3d.add(t)
+        # One row, and it shows the RATE — the value lives on the overlay, next
+        # to the thing it describes. SensorPanel's own rule: a number drawn in
+        # two places will eventually disagree with itself.
+        detail = {
+            "loading": f"loading {t.load_s:.0f}s",
+            "off": "TRACK off",
+            "capturing": f"views {t.n_views}/{t.max_views}",
+            "building": f"reconstructing {t.build_s:.0f}s",
+            "pose_loading": f"FoundationPose {t.fp_load_s:.0f}s",
+            "fault": t.note[:28],
+            "failed": t.note[:28] or "stopped",
+        }.get(t.state, t.state)
+        self._extra_sensors["Pose (C3)"] = SensorStat(
+            "Pose (C3)", t.sam_hz or None, t.conn, detail)
+        self._refresh_sensors()
+
     def _refresh_sensors(self) -> None:
         merged = dict(self._tel_sensors)
         merged.update(self._extra_sensors)
         self.sensors.set_sensors(merged, self._tel_conn)
+
+    # =========================================================== MPC (opt-in)
+    def _datum_xy(self, x: float, y: float) -> tuple[float, float]:
+        """TAG-frame xy -> the mission (engage-datum) frame the plot uses."""
+        if self._mpc_datum is None:
+            return x, y
+        import math as _m
+        x0, y0, _z0, yaw0 = self._mpc_datum
+        c0, s0 = _m.cos(yaw0), _m.sin(yaw0)
+        dx, dy = x - x0, y - y0
+        return c0 * dx + s0 * dy, -s0 * dx + c0 * dy
+
+    def _on_tag_overlay(self, t) -> None:
+        panel = self.videos.get(t.panel)
+        if panel is not None:
+            panel.canvas.set_tags(t)
+        # RAW OBSERVATIONS for the recording: the corners of every tag the
+        # LOCALIZING feed saw, plus the camera model for that frame. This is
+        # what makes a REC NAV run re-usable — a solved fix throws the corners
+        # away, and rebuilding or extending the tag map needs them
+        # (rov_gui/tools/build_tag_map.py).
+        if self._nav_rec is not None and t.localizes and t.K:
+            self._nav_rec_frame(t)
+
+    def _on_nav_fix(self, f) -> None:
+        # REC NAV logs the fix as it ARRIVED — raw tag-frame, before the
+        # mission-datum transform below, misses included — so the file is a
+        # record of what the localizer said, not of how the plot drew it.
+        if self._nav_rec is not None:
+            self._nav_rec_row(f)
+        # The plot lives in the MISSION frame (engage datum). Fixes arrive in
+        # the TAG frame; transform them with the datum the worker published so
+        # the trail, the reference and the readout can never disagree.
+        if self._mpc_datum is not None and f.ok:
+            from dataclasses import replace
+            import math as _m
+            x0, y0, z0, yaw0 = self._mpc_datum
+            c0, s0 = _m.cos(yaw0), _m.sin(yaw0)
+            dx = f.p_ned[0] - x0
+            dy = f.p_ned[1] - y0
+            f = replace(
+                f,
+                p_ned=(c0 * dx + s0 * dy, -s0 * dx + c0 * dy,
+                       f.p_ned[2] - z0),
+                yaw_ned=(None if f.yaw_ned is None else _m.atan2(
+                    _m.sin(f.yaw_ned - yaw0), _m.cos(f.yaw_ned - yaw0))))
+        if self._traj_panel is not None:
+            self._traj_panel.add_fix(f)
+        src = {"main": "C3", "second": "RGB"}.get(f.source, f.source or "?")
+        detail = (f"[{src}] {f.n_tags} tag(s), {f.reproj_rms_px:.1f} px, "
+                  f"det {f.detect_ms:.0f} ms"
+                  if f.ok and f.reproj_rms_px is not None
+                  else f"[{src}] " + (f.note or "--"))
+        self._extra_sensors["TagNav"] = SensorStat("TagNav", f.hz, f.conn,
+                                                   detail[:48])
+        self._refresh_sensors()
+
+    # REC NAV — raw localization recording (map + every fix), for replotting
+    # later with `python -m rov_gui.tools.plot_nav_run <run dir>`. Separate
+    # from the engage-gated MPC CSV on purpose: a hand-flown survey pass with
+    # the MPC never engaged is still a dataset.
+    _NAV_REC_HEADER = ("t_capture,host_stamp,ok,source,n_tags,tag_ids,"
+                       "x_ned,y_ned,z_ned,yaw_ned_rad,reproj_rms_px,"
+                       "detect_ms,hz,ambiguous,note\n")
+    _NAV_DET_HEADER = ("frame,t_capture,tag_id,"
+                       "x0,y0,x1,y1,x2,y2,x3,y3\n")
+    _NAV_FRM_HEADER = ("frame,t_capture,fx,fy,cx,cy,width,height,n_det\n")
+
+    def _toggle_nav_record(self, on: bool) -> None:
+        import json
+        from pathlib import Path
+
+        if not on:
+            if self._nav_rec is not None:
+                rec, self._nav_rec = self._nav_rec, None
+                for key in ("file", "det", "frm"):
+                    rec[key].close()
+                self.bus.log.emit("info",
+                                  f"nav recording saved: {rec['dir']} "
+                                  f"({rec['n']} fixes, {rec['frames']} frames, "
+                                  f"{rec['dets']} detections)")
+            if self._traj_panel is not None:
+                self._traj_panel.set_recording(False)
+            return
+        try:
+            base = Path(getattr(self.opts, "nav_rec_dir", "sessions/nav_runs"))
+            run_dir = base / time.strftime("%Y%m%d_%H%M%S")
+            run_dir.mkdir(parents=True, exist_ok=True)
+            meta = dict(self._nav_map_meta)
+            meta["recorded_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            meta["note"] = ("fixes.csv is RAW tag-frame localization "
+                            "(pre-datum); host_stamp is time.monotonic()")
+            (run_dir / "map.json").write_text(json.dumps(meta, indent=2))
+            fh = open(run_dir / "fixes.csv", "w", encoding="utf-8")
+            fh.write(self._NAV_REC_HEADER)
+            det = open(run_dir / "detections.csv", "w", encoding="utf-8")
+            det.write(self._NAV_DET_HEADER)
+            frm = open(run_dir / "frames.csv", "w", encoding="utf-8")
+            frm.write(self._NAV_FRM_HEADER)
+            self._nav_rec = {"dir": run_dir, "file": fh, "det": det,
+                             "frm": frm, "n": 0, "frames": 0, "dets": 0}
+            self.bus.log.emit("info", f"nav recording to {run_dir}")
+        except OSError as e:
+            self.bus.log.emit("error", f"nav recording failed: {e}")
+            if self._traj_panel is not None:
+                self._traj_panel.set_recording(False)
+
+    def _nav_rec_row(self, f) -> None:
+        rec = self._nav_rec
+        p = f.p_ned if f.ok else (None, None, None)
+        yaw = f.yaw_ned if f.ok else None
+
+        def num(v, spec=".4f"):
+            return "" if v is None else format(float(v), spec)
+
+        note = (f.note or "").replace(",", ";").replace("\n", " ")
+        rec["file"].write(
+            f"{f.t_capture:.4f},{f.stamp:.4f},{int(f.ok)},{f.source},"
+            f"{f.n_tags},{';'.join(str(i) for i in f.tag_ids)},"
+            f"{num(p[0])},{num(p[1])},{num(p[2])},{num(yaw, '.5f')},"
+            f"{num(f.reproj_rms_px, '.2f')},{f.detect_ms:.1f},"
+            f"{num(f.hz, '.1f')},{int(f.ambiguous)},{note}\n")
+        rec["n"] += 1
+        if rec["n"] % 40 == 0:                 # ~2 s at fix rate; crash-safe
+            rec["file"].flush()
+
+    def _nav_rec_frame(self, t) -> None:
+        """One frame of RAW observations: every detected quad + this frame's
+        camera model. Written for the localizing feed only — a second feed's
+        corners belong to a different camera and would need its own model."""
+        rec = self._nav_rec
+        n = rec["frames"]
+        fx, fy, cx, cy = t.K
+        rec["frm"].write(f"{n},{t.t_capture:.4f},{fx:.4f},{fy:.4f},"
+                         f"{cx:.4f},{cy:.4f},{t.src_w},{t.src_h},"
+                         f"{len(t.quads)}\n")
+        for tid, quad in zip(t.ids, t.quads):
+            pts = ",".join(f"{v:.3f}" for xy in quad for v in xy)
+            rec["det"].write(f"{n},{t.t_capture:.4f},{tid},{pts}\n")
+        rec["frames"] = n + 1
+        rec["dets"] += len(t.quads)
+        if rec["frames"] % 40 == 0:
+            rec["det"].flush()
+            rec["frm"].flush()
+
+    def _on_mpc_status(self, s) -> None:
+        was = self._mpc_engaged
+        self._mpc_engaged = bool(s.engaged)
+        self.fresh["mpc"].mark(s.stamp, s.conn)
+        # A NEW datum = a new run: clear the trails so the plot restarts at
+        # (0,0) instead of drawing a jump from the previous frame.
+        d = getattr(s, "datum", None)
+        if d != self._mpc_datum:
+            self._mpc_datum = d
+            if self._traj_panel is not None:
+                self._traj_panel.view.clear()
+                yaw0 = 0.0 if d is None else float(d[3])
+                if self._map_tags_raw:
+                    self._traj_panel.view.set_map_tags(
+                        [(*self._datum_xy(x, y), yaw - yaw0, tid, k)
+                         for x, y, yaw, tid, k in self._map_tags_raw])
+                if self._pool_raw:
+                    self._traj_panel.view.set_pool(
+                        [self._datum_xy(x, y) for x, y in self._pool_raw])
+        pilot_takeover = self._mpc_takeover_sent   # read BEFORE clearing
+        if not self._mpc_engaged:
+            self._mpc_takeover_sent = False
+        if was and not self._mpc_engaged and not pilot_takeover:
+            # WORKER-initiated release (fault, completion, e-stop): resume the
+            # teleop pump loudly, so a silent handback cannot surprise the
+            # pilot with weeks-old stick trim. A PILOT-initiated takeover must
+            # NOT pass here: the pilot is holding the input that caused the
+            # release, and all_stop() would wipe it — auto-repeat is filtered,
+            # so a held KEY would read neutral until re-pressed while the
+            # vehicle coasts (review 2026-08-12).
+            self.teleop.all_stop()
+        # While engaged, the teleop bars show the command actually leaving the
+        # station — the MPC's axes — labelled as such on the deadman line.
+        if s.engaged:
+            ax = s.axes if len(s.axes) == 4 else (0.0, 0.0, 0.0, 0.0)
+            self.teleop.show_command(PilotInput(
+                surge=ax[0], sway=ax[1], heave=ax[2], yaw=ax[3],
+                source="mpc"))
+        else:
+            self.teleop.show_command(None)
+        if self._traj_panel is not None:
+            self._traj_panel.add_status(s)
+        detail = {True: "ENGAGED " + ("traj" if s.traj_on else "hold"),
+                  False: (s.reason or "idle")[:28]}[bool(s.engaged)]
+        self._extra_sensors["MPC"] = SensorStat("MPC", None, s.conn, detail)
+        self._refresh_sensors()
 
     def _on_thrusters(self, s: ThrusterState) -> None:
         self.fresh["thrusters"].mark(s.stamp, s.conn)
@@ -480,8 +869,37 @@ class MainWindow(QtWidgets.QMainWindow):
         """One coherent UI frame: pull frames, age everything, repaint."""
         for key, panel in self.videos.items():
             image = panel.tick()
-            if image is not None:
-                self.feed_recorders[key].feed(image)
+            if image is None:
+                continue
+            rec = self.feed_recorders[key]
+            # Burn the tracking overlay into the recording, but only while
+            # something is actually being recorded — the copy-and-paint is the
+            # only per-frame cost this path has ever had, and it should not be
+            # paid by a session that is merely watching.
+            if rec.stats.recording:
+                rec.feed(panel.burn_overlay(image))
+
+        # A wedged MpcWorker cannot report its own death: while ENGAGED, aged
+        # silence on mpc_status forces the release from THIS side. Order
+        # matters — all_stop() BEFORE clearing the flag (loud handback rule),
+        # and cmd_mpc_engage(False) is queued so a worker that later unblocks
+        # finds the disengage waiting instead of resuming as a second command
+        # source. Between the wedge and this trigger the sink's 500 ms deadman
+        # already holds the vehicle at neutral (review 2026-08-12).
+        if self._mpc_engaged:
+            age = self.fresh["mpc"].age
+            if age is not None and age > self.fresh["mpc"].fail_s:
+                self.bus.log.emit("error",
+                                  f"MPC worker unresponsive ({age:.1f}s) — "
+                                  f"releasing control to the pilot")
+                self.teleop.all_stop()
+                self.teleop.show_command(None)
+                self._mpc_engaged = False
+                self._mpc_takeover_sent = False
+                self.bus.cmd_mpc_engage.emit(False)
+                self._extra_sensors["MPC"] = SensorStat(
+                    "MPC", None, Conn.FAULT, "worker unresponsive")
+                self._refresh_sensors()
 
         video_state = _worst(p.state() for p in self.videos.values())
         self.pills["video"].set_state(video_state)
@@ -656,15 +1074,44 @@ class MainWindow(QtWidgets.QMainWindow):
             pressed, self.joystick.name, raw=raw_held)
 
     def _pump_commands(self) -> None:
-        """Re-stamp and re-send the pilot's intent while commands are enabled."""
+        """Re-stamp and re-send the pilot's intent while commands are enabled.
+
+        With the MPC engaged this pump YIELDS: the MpcWorker is emitting
+        cmd_pilot at 20 Hz (which keeps the sink's deadman fed), and pumping
+        teleop neutral on top would interleave two command sources — the
+        exact hazard c3_camera/control.py warns about. Any pilot axis input
+        while engaged is a TAKEOVER: the MPC is told to release, and this
+        tick sends nothing (the next one belongs to the pilot). If the MPC
+        worker wedges instead of releasing, the sink's 500 ms deadman still
+        drives the vehicle to neutral — same backstop as a wedged GUI.
+        """
         if not self.teleop.enabled:
             return
-        self.bus.cmd_pilot.emit(self.teleop.current())
+        self._pilot_gate(self.teleop.current())
+
+    def _pilot_gate(self, cmd) -> None:
+        """Every teleop-origin pilot frame passes here — the edge-triggered
+        ``pilot_changed`` signal AND the 20 Hz pump. While the MPC is engaged
+        the gate swallows the frame; a non-neutral one additionally requests
+        release, ONCE (the latch stops a held key from spamming it at 20 Hz).
+        The latch clears when MpcStatus confirms the release."""
+        if self._mpc_engaged:
+            if cmd.any_axis and not self._mpc_takeover_sent:
+                self._mpc_takeover_sent = True
+                self.bus.cmd_mpc_engage.emit(False)
+                self.bus.log.emit("warn", "MPC disengage requested — pilot "
+                                          "input takes over")
+            return
+        self.bus.cmd_pilot.emit(cmd)
 
     # ============================================================== controls
     def estop(self) -> None:
         self.teleop.all_stop()
+        self.teleop.show_command(None)
         self.teleop.force_disable()
+        if self._mpc_engaged:
+            self._mpc_engaged = False          # yield the pump NOW, not next status
+            self.bus.cmd_mpc_engage.emit(False)
         self.bus.cmd_estop.emit()
         self.bus.log.emit("error", "E-STOP pressed — axes zeroed, commands disabled")
 
@@ -764,6 +1211,11 @@ class MainWindow(QtWidgets.QMainWindow):
         for rec in self.feed_recorders.values():
             if rec.stats.recording:
                 rec.stop()
+        if self._pose3d is not None:
+            self._pose3d.close()       # a floating window must not outlive us
+        if self._nav_rec is not None:
+            self._toggle_nav_record(False)     # flush + close the fix log
+        # (the MPC dock is a child of this window; it dies with it)
         if self.backend is not None:
             self.bus.cmd_estop.emit()      # leave the vehicle neutral
             self.backend.stop()

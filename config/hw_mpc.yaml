@@ -1,0 +1,82 @@
+# hw_mpc.yaml — the hardware MPC/DOB-MPC configuration (rov_gui/control/).
+#
+# The controller itself (horizon, weights, U_MAX, DT_CTRL) lives in
+# bluerov2_mujoco_marinegym/dobmpc/params.py and is reused verbatim — this
+# file only holds what is DIFFERENT on the real vehicle.
+
+rov_model: heavy_gripper    # ROV_MODEL for dobmpc (heavy | heavy_c3 | heavy_gripper)
+mode: dobmpc                # mpc | dobmpc (same solver; dobmpc adds w_hat) | pid
+ctrl_hz: 20.0               # MUST equal 1/DT_CTRL — baked into the solver
+
+# PID baseline (mode: pid, or the mode combo in the MPC panel). Gains are the
+# sim's pole-placed GAINS_HEAVY_GRIPPER (controller.py) scaled by
+# omega_derate (kp·d², kd·d, ki·d³ — the ωn scalings): the sim design point
+# assumed clean state and ideal thrust, and its own docs say derate for
+# hardware. [예측] until a pool session tunes it.
+pid:
+  omega_derate: 0.6
+  # kp/kd/ki/yaw_* overrides accepted here; see rov_gui/control/pid.py
+
+# Bridge tag fixes with the velocity/gyro estimate between camera frames —
+# the state (and the plot) moves at 20 Hz instead of holding each fix.
+vel_propagation: true
+
+# MANUAL-mode axis gains: the body wrench at FULL MANUAL_CONTROL deflection.
+# [예측] from the T200 curve + Heavy mixer geometry at nominal voltage, at the
+# vehicle's CURRENT pilot gain — never measured on this vehicle. Replace with
+# the P4 step-calibration values. Wrong gains = tracking offset (mpc) or a DC
+# w_hat (dobmpc), bounded either way by axis_cap.
+axis_gain:
+  surge_n: 60.0
+  sway_n: 60.0
+  heave_n: 60.0
+  yaw_nm: 20.0
+axis_cap: 0.5               # |axis| ceiling on everything the MPC sends
+
+# Per-axis w_hat clip [X,Y,Z,K,M,N] (N / N·m) applied BEFORE the solver — the
+# KNOWN_ISSUES replacement for the scalar ±50 backstop in mpc_acados.py.
+w_hat_clip: [15, 45, 45, 5, 5, 8]
+
+# nudot for the EAOB: 'imu' = SCALED_IMU2 specific force (+gravity, -omega x v);
+# 'fd' = finite-difference of nu (the sim's definition — much noisier here
+# because nu itself comes from differentiated tag positions).
+nudot_source: imu
+vel_lp_alpha: 0.35          # low-pass on the tag-derived world velocity
+
+# Honest hardware sigmas for the EAOB 'perf' profile (overrides params.EAOB_SIG_*).
+# [예측] until the P3 residual fit: pose from single-tag PnP at 1.5-3 m is
+# centimetres, not the sim's 5 mm; velocity is differentiated position.
+eaob_sigmas:
+  pos: [0.02, 0.02, 0.01]
+  ang_deg: [0.5, 0.5, 1.5]
+  lvel: [0.05, 0.05, 0.05]
+  avel: [0.005, 0.005, 0.005]
+  acc: 0.5
+  # aacc / alloc: keep the params.py defaults unless P3 says otherwise
+
+# The square (world = NED datum frame — first fix is (0,0) with
+# datum: first_fix in hw_nav.yaml). origin/yaw 'current' = wherever the
+# vehicle is holding when the trajectory starts, so START right after the
+# datum zeroes = a 0.2 m square from (0,0) at the initial heading.
+square:
+  size: 0.2                 # 20 cm x 20 cm (2026-08-12 mission)
+  speed: 0.05               # 16 s per lap — slow enough for the RTP-feed lag
+  laps: 2
+  depth_ned: null           # null = hold the engage depth
+  heading_follow: false     # yaw stays at the START heading (crab square)
+  yaw_rate_deg_s: 60
+  origin: current           # current | [x_ned, y_ned]
+  rot_deg: 0.0
+  yaw_fixed_deg: current    # current | degrees (NED), used when not heading_follow
+
+engage:
+  require_mode: MANUAL      # the flight mode the vehicle must be in
+  probe_ms_max: 25.0        # solver probe worse than this refuses engage
+  tag_stale_s: 0.5
+  imu_stale_s: 0.3
+  warmup_s: 1.5             # DP-hold EAOB warm-up before START TRAJ unlocks
+  start_err_max_m: 0.3      # max distance to the square origin at start
+  max_solver_fails: 3       # consecutive acados failures before disengage
+  tick_overrun_ms: 100.0
+
+log_dir: sessions/mpc_runs  # auto-opened CSV when no recording stem is active

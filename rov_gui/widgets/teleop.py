@@ -121,6 +121,7 @@ class TeleopPanel(Panel):
         self._enabled = False
         self._tx_hz = 0.0
         self._joy_axes: dict[str, float] = {}   # composed axis -> value
+        self._ext_cmd = None    # MPC's command, shown on the bars while engaged
         self._joy_buttons: set[int] = set()
         self._joy_raw: set[int] = set()
         self._joy_name: str | None = None
@@ -503,10 +504,35 @@ class TeleopPanel(Panel):
 
     def _emit(self, source: str) -> None:
         cmd = replace(self.current(), source=source, stamp=now())
+        # While an external source (the MPC) owns the bars, a key edge must
+        # not repaint them with the pilot's (swallowed) command — the frame
+        # still goes out so the window's gate can treat it as a takeover.
+        if self._ext_cmd is None:
+            for axis, bar in self.bars.items():
+                v = getattr(cmd, axis)
+                bar.set_value(v, f"{v:+.2f}", Conn.ONLINE)
+        self.pilot_changed.emit(cmd)
+
+    def show_command(self, cmd) -> None:
+        """Display an EXTERNAL command source's axes on the SRG/SWY/HVE/YAW
+        bars — the MPC while it is engaged. DISPLAY ONLY: ``current()`` and
+        every emitted frame stay the pilot's own input, so the takeover gate
+        keeps working. ``None`` hands the bars back to the pilot.
+
+        This is what makes the bars honest during an engagement: they show
+        the command actually leaving the station, whoever computed it (the
+        panel's standing rule — the bars are OUR command, not the vehicle's
+        motion; PROPULSION shows the vehicle's answer)."""
+        self._ext_cmd = cmd
+        if cmd is None:
+            own = self.current()
+            for axis, bar in self.bars.items():
+                v = getattr(own, axis)
+                bar.set_value(v, f"{v:+.2f}", Conn.ONLINE)
+            return
         for axis, bar in self.bars.items():
             v = getattr(cmd, axis)
             bar.set_value(v, f"{v:+.2f}", Conn.ONLINE)
-        self.pilot_changed.emit(cmd)
 
     # ------------------------------------------------------------ live state
     def tick(self, tx_hz: float | None = None, sink_conn: Conn = Conn.OFFLINE,
@@ -532,6 +558,12 @@ class TeleopPanel(Panel):
         if not self._enabled:
             text, colour = ("COMMANDS DISABLED — station is receive-only",
                             theme.TEXT_FAINT)
+        elif self._ext_cmd is not None:
+            # The MPC owns the channel; the bars are ITS axes. Saying so here
+            # is what keeps "bars moving, sticks untouched" from reading as a
+            # haunted station.
+            text, colour = ("MPC commanding — bars show ITS axes; move any "
+                            "stick to take over", theme.ACCENT)
         elif self.current().any_axis and self._armed is not True:
             # Commanding something, but the vehicle will not act on it. Without
             # this the pilot sees full bars, a healthy TX rate, and a vehicle

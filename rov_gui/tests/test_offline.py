@@ -27,6 +27,7 @@ import os
 import sys
 import tempfile
 import time
+import types
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -166,10 +167,10 @@ def test_mailbox_conflates_and_counts():
     img = bgr_to_qimage(np.zeros((2, 2, 3), np.uint8))
     for _ in range(5):
         mb.put(img, VideoStat("t"))
-    got, stat = mb.take()
+    got, stat, _aux = mb.take()
     assert got is not None
     assert mb.counters()["conflated"] == 4, "dropped frames must be counted"
-    assert mb.take() == (None, None), "take() must not repeat a frame"
+    assert mb.take() == (None, None, None), "take() must not repeat a frame"
 
 
 def test_fmt_renders_unknown_as_dash():
@@ -609,6 +610,353 @@ def test_tilt_is_held_and_reaches_the_bus():
     win.close()
 
 
+def test_object_tracking_is_opt_in_and_costs_nothing_when_off():
+    """A GPU feature must be off by default, and off must mean absent."""
+    from rov_gui.__main__ import build_parser
+    from rov_gui.widgets.video import VideoPanel
+
+    opts = build_parser().parse_args([])
+    assert opts.pose is False, "object tracking must be opt-in"
+
+    _app()
+    # A panel built without pose= is the panel that shipped before: no button,
+    # no overlay pass, no click handling.
+    plain = VideoPanel("main", "C3 RGB", FrameMailbox("main"))
+    assert plain.track_btn is None
+    assert plain.canvas.pose is False
+    assert plain.canvas.pose_armed is False
+
+
+def test_canvas_maps_a_click_to_source_pixels():
+    """Three coordinate systems, and getting the middle one wrong is silent.
+
+    The displayed image is NOT the source: the worker shrank it to the panel.
+    But `imaging.scale_to_fit` leaves the frame alone when the reduction would
+    be under 15%, so the ratio flips between 1.0 and something else as the
+    window resizes — a formula that assumes either is wrong at some sizes.
+    """
+    from rov_gui.qt import QImage, QPoint
+    from rov_gui.widgets.video import VideoCanvas
+
+    _app()
+    c = VideoCanvas("t", FrameMailbox("t"))
+    c.resize(400, 400)                       # square panel, 16:9 image
+    # displayed 320x180 (already shrunk), source 640x360 -> ratio 2.0
+    c._image = QImage(320, 180, QImage.Format.Format_RGB888)
+    c._stat = VideoStat(name="t", width=640, height=360)
+    c._fit_rect = c._fit(320, 180)           # what paintEvent would store
+    r = c._fit_rect
+    assert abs(r.width() - 400) < 1e-6, r    # letterboxed top and bottom
+
+    # centre of the drawn image -> centre of the SOURCE image
+    mid = c.to_source(QPoint(int(r.x() + r.width() / 2),
+                             int(r.y() + r.height() / 2)))
+    assert mid is not None
+    assert abs(mid[0] - 320) < 2 and abs(mid[1] - 180) < 2, mid
+
+    # top-left of the drawn image -> origin of the source
+    tl = c.to_source(QPoint(int(r.x()) + 1, int(r.y()) + 1))
+    assert tl is not None and tl[0] < 6 and tl[1] < 6, tl
+
+    # a click on the letterbox bar is NOT a prompt
+    assert c.to_source(QPoint(200, 2)) is None
+    assert c.to_source(QPoint(200, 398)) is None
+
+    # unshrunk frame (the >=0.85 case): ratio is 1.0 and it must still be right
+    c._image = QImage(640, 360, QImage.Format.Format_RGB888)
+    c._fit_rect = c._fit(640, 360)
+    r = c._fit_rect
+    mid = c.to_source(QPoint(int(r.x() + r.width() / 2),
+                             int(r.y() + r.height() / 2)))
+    assert abs(mid[0] - 320) < 2 and abs(mid[1] - 180) < 2, mid
+
+
+def test_a_prompt_click_does_not_break_double_click_to_promote():
+    """Qt sends press+release before it decides a gesture was a double click.
+
+    So a naive mousePressEvent fires a prompt on the first half of every
+    promote. The prompt is deferred by doubleClickInterval and cancelled when
+    the double click arrives; both gestures keep the left button.
+    """
+    from rov_gui.qt import QImage, QPoint, Qt as _Qt, QtGui
+    from rov_gui.widgets.video import VideoCanvas
+
+    app = _app()
+    c = VideoCanvas("t", FrameMailbox("t"), pose=True)
+    c.resize(400, 400)
+    c._image = QImage(320, 180, QImage.Format.Format_RGB888)
+    c._stat = VideoStat(name="t", width=640, height=360)
+    c._fit_rect = c._fit(320, 180)
+    c.pose_armed = True
+
+    prompts, promotes = [], []
+    c.prompt_clicked.connect(lambda x, y: prompts.append((x, y)))
+    c.double_clicked.connect(lambda: promotes.append(1))
+
+    def release(pos):
+        c.mouseReleaseEvent(QtGui.QMouseEvent(
+            QtGui.QMouseEvent.Type.MouseButtonRelease, pos,
+            _Qt.MouseButton.LeftButton, _Qt.MouseButton.LeftButton,
+            _Qt.KeyboardModifier.NoModifier))
+
+    centre = QPoint(200, 200)
+    # a double click, as Qt REALLY delivers it: Press, Release, DblClick, and
+    # then a SECOND Release. The first shipped version of this test omitted
+    # that trailing release, and the handler it exercised re-armed the prompt
+    # timer on it — so every double-click-to-promote still re-prompted SAM2
+    # 400 ms later on whatever pixel was under the cursor.
+    release(centre)
+    c.mouseDoubleClickEvent(None)
+    release(centre)                          # the trailing release
+    _pump(app, int(QtWidgets.QApplication.doubleClickInterval()) + 150)
+    assert promotes == [1], "double click must still promote"
+    assert prompts == [], f"a promote must not also prompt: {prompts}"
+
+    # a single click: nothing cancels it, so it becomes a prompt
+    release(centre)
+    _pump(app, int(QtWidgets.QApplication.doubleClickInterval()) + 150)
+    assert len(prompts) == 1, prompts
+    assert abs(prompts[0][0] - 320) < 2, prompts
+
+    # armed off: clicks are inert again
+    c.pose_armed = False
+    release(centre)
+    _pump(app, int(QtWidgets.QApplication.doubleClickInterval()) + 150)
+    assert len(prompts) == 1, "a disarmed canvas must not prompt"
+
+
+def test_layout_still_fits_with_tracking_enabled():
+    """The overlay and TRACK button must cost zero layout height."""
+    from rov_gui.window import MainWindow
+
+    app = _app()
+    theme.apply(app)
+
+    class PoseOpts(Opts):
+        pose = True
+
+    off = MainWindow(Opts())
+    off.resize(1366, 768)
+    off.show()
+    _pump(app, 200)
+    h_off = off.minimumSizeHint()
+    off.shutdown()
+    off.close()
+
+    on = MainWindow(PoseOpts())
+    on.resize(1366, 768)
+    on.show()
+    _pump(app, 200)
+    h_on = on.minimumSizeHint()
+    on.shutdown()
+    on.close()
+
+    assert h_on.height() <= 768, f"tracking pushed the window to {h_on.height()}"
+    assert h_on.height() == h_off.height(), (
+        f"tracking changed the layout: {h_off.height()} -> {h_on.height()}; "
+        "the overlay and button must be absolutely positioned children")
+
+
+def test_pose_track_is_plain_data():
+    """What crosses the thread boundary must be plain values (state.py:5-9)."""
+    import numpy as _np
+
+    from rov_gui.state import PoseTrack
+
+    t = PoseTrack()
+    assert t.T_cam_obj is None, "unknown is None, never a plausible default"
+    assert t.score is None
+    assert t.contours == () and t.has_mask is False
+    for name in ("contours", "axes_px", "box_px"):
+        assert isinstance(getattr(t, name), tuple), name
+    live = PoseTrack(state="tracking",
+                     contours=(((1.0, 2.0), (3.0, 4.0), (5.0, 6.0)),))
+    assert live.has_mask
+    for poly in live.contours:
+        for pt in poly:
+            assert not isinstance(pt[0], _np.generic), "numpy scalars must not cross"
+
+
+def test_pose_projection_is_pinhole_and_drops_points_behind_the_lens():
+    """3-D -> pixels happens off the GUI thread; this is that maths.
+
+    Deliberately distortion-free: the same K goes to FoundationPose, and on this
+    camera the pinhole model is within 2.08 px of the real one everywhere
+    (measured). Applying distortion here while feeding a pinhole K to the
+    estimator would be the inconsistent choice, not the accurate one.
+    """
+    try:
+        from rov_gui.perception.session import _project
+    except Exception:                                            # noqa: BLE001
+        return
+
+    K = np.array([[500.0, 0.0, 320.0], [0.0, 500.0, 180.0], [0.0, 0.0, 1.0]])
+    # a point on the optical axis lands on the principal point
+    assert _project([[0.0, 0.0, 1.0]], K) == ((320.0, 180.0),)
+    # 0.1 m right at 1 m -> 50 px right
+    (x, y), = _project([[0.1, 0.0, 1.0]], K)
+    assert abs(x - 370.0) < 1e-6 and abs(y - 180.0) < 1e-6
+    # +Y is DOWN in OpenCV optical axes, so a positive y goes down the screen
+    (_x, y2), = _project([[0.0, 0.1, 1.0]], K)
+    assert y2 > 180.0, "OpenCV +Y must project downward"
+    # anything behind the lens invalidates the whole set rather than drawing a
+    # mirrored ghost somewhere on screen
+    assert _project([[0.0, 0.0, 1.0], [0.0, 0.0, -0.5]], K) == ()
+    assert _project([[0.0, 0.0, 0.0]], K) == ()
+
+
+def test_pose_log_records_the_camera_and_its_provenance():
+    """A pose is only as metric as the intrinsics behind it.
+
+    The C3's EEPROM calibration is an UNDERWATER one (vendor-confirmed +
+    measured HFOV, KNOWN_ISSUES 2026-08-04), so the file must say so — and
+    say it the right way round: an earlier version wrote "in_air": true,
+    copied from a stale comment that same audit had flagged as wrong, telling
+    future readers to distrust exactly the in-water numbers that are metric.
+    Also pins the ordering bug: recording can start BEFORE the first frame,
+    and the CAMERA record must still carry a camera model, not an empty stub.
+    """
+    try:
+        from rov_gui.backends.hardware import PoseWorker
+    except Exception:                                            # noqa: BLE001
+        return          # no depthai/pymavlink on this machine
+
+    from rov_gui.bus import RgbdMailbox
+
+    class FakeSession:
+        ready, loading, error, load_seconds = True, False, "", 1.0
+        mesh_description = ""
+
+        def click(self, x, y):
+            pass
+
+        def reset(self):
+            pass
+
+        def submit(self, *a, **k):
+            pass
+
+        def poll(self):
+            return {"state": "tracking",
+                    "contours": (((1.0, 2.0), (3.0, 4.0), (5.0, 6.0)),),
+                    "score": 7.0, "mask_px": 42, "sam_hz": 25.0,
+                    "frame_seq": 7, "src_w": 640, "src_h": 360, "message": ""}
+
+        def close(self):
+            pass
+
+    class Intr:
+        fx, fy, cx, cy, width, height = 513.4, 513.5, 317.5, 179.8, 640, 360
+        distortion = (2.6, 81.3, 0.0)
+
+    _app()
+    out = Path(tempfile.mkdtemp(prefix="rov_gui_pose_"))
+    w = PoseWorker(DataBus(), RgbdMailbox(), Opts())
+    w.session = FakeSession()
+    w.enabled = True
+
+    # Recording starts before any frame exists — the ordering that broke it.
+    w.set_sensor_log(True, str(out / "take"))
+    w.set_click(311.0, 180.0)
+    for _ in range(3):
+        w.mailbox.put(np.zeros((360, 640, 3), np.uint8), None, Intr(),
+                      12345.0, 4.2)
+        w._last_pub = 0.0
+        w.tick()
+    w.set_sensor_log(False, "")
+
+    rows = [json.loads(x) for x in
+            (out / "take_pose.jsonl").read_text().splitlines()]
+    kinds = [r["msg"] for r in rows]
+    assert "CAMERA" in kinds and "TRACK" in kinds and "PROMPT" in kinds, kinds
+
+    cam = next(r for r in rows if r["msg"] == "CAMERA")
+    assert cam["fx"] == 513.4, "CAMERA written before the intrinsics arrived"
+    assert cam["medium"] == "water", "the calibration medium must be IN the file"
+    assert "in_air" not in cam, "the backwards in-air claim must be gone"
+    assert "1.33" in cam["note"], "the in-air 1.33x warning must be spelled out"
+    assert cam["rectified"] is False
+
+    track = next(r for r in rows if r["msg"] == "TRACK")
+    assert track["t"] == 12345.0, (
+        "rows must be stamped with the frame's CAPTURE time, or they cannot be "
+        "lined up against the video they belong to")
+    assert len(track["contours"]) == 1
+
+    meta = json.loads((out / "take_pose.json").read_text())
+    assert meta["error"] is None and meta["by_message"]["TRACK"] == 3, meta
+
+
+def test_no_loopworker_declares_a_slot():
+    """A LoopWorker's slots can never fire, so declaring one is always a bug.
+
+    ``LoopWorker.run()`` blocks for the worker's lifetime, so the thread's event
+    loop is never entered and a queued invocation sits in a queue nobody
+    services (backends/base.py module docstring). Qt does not warn; the slot is
+    simply never called. That is how ``C3VideoWorker.set_sensor_log`` shipped
+    and silently never wrote ``_c3_imu.jsonl``.
+
+    An AST scan, so the rule is enforced rather than remembered.
+    """
+    import ast
+
+    root = Path(__file__).resolve().parents[1]
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        tree = ast.parse(path.read_text(), str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            bases = {b.id if isinstance(b, ast.Name) else getattr(b, "attr", "")
+                     for b in node.bases}
+            if "LoopWorker" not in bases:
+                continue
+            for item in node.body:
+                if not isinstance(item, ast.FunctionDef):
+                    continue
+                for dec in item.decorator_list:
+                    name = dec.func if isinstance(dec, ast.Call) else dec
+                    if getattr(name, "id", getattr(name, "attr", "")) == "Slot":
+                        offenders.append(f"{path.name}::{node.name}.{item.name}")
+    assert not offenders, (
+        "LoopWorker subclasses cannot receive queued slots; these will never "
+        f"fire: {offenders}. Use a plain thread-safe method plus a "
+        "DirectConnection, as C3VideoWorker.request_sensor_log does.")
+
+
+def test_c3_sensor_log_request_reaches_a_loopworker():
+    """The C3 IMU log must actually start. It did not.
+
+    ``_rov.jsonl`` appeared every time (VehicleWorker is a TimerWorker) while
+    ``_c3_imu.jsonl`` never did, and the demo backend uses a TimerWorker too, so
+    nothing caught it. This drives the real signal into the real worker.
+    """
+    try:
+        from rov_gui.backends.hardware import C3VideoWorker
+    except Exception:                                            # noqa: BLE001
+        return          # no depthai/pymavlink on this machine
+
+    _app()
+    bus = DataBus()
+    # Fully constructed — __init__ opens no device (that is setup()'s job) and
+    # the QObject must really exist for connect() to bind to it.
+    w = C3VideoWorker(bus, {}, Opts())
+
+    bus.cmd_log_sensors.connect(w.request_sensor_log,
+                                Qt.ConnectionType.DirectConnection)
+    bus.cmd_log_sensors.emit(True, "/tmp/take_001")
+    assert not w._log_q.empty(), (
+        "the request never reached the worker — a LoopWorker cannot receive a "
+        "queued slot, so this must be a plain method on a DirectConnection")
+    assert w._log_q.get_nowait() == (True, "/tmp/take_001")
+
+    # A start/stop pair issued inside one loop iteration must not lose the start.
+    bus.cmd_log_sensors.emit(True, "/tmp/take_002")
+    bus.cmd_log_sensors.emit(False, "")
+    assert w._log_q.get_nowait() == (True, "/tmp/take_002")
+    assert w._log_q.get_nowait() == (False, "")
+
+
 def test_every_checked_button_can_be_disabled():
     """A button that fails its BTNn_FUNCTION check must be switchable off.
 
@@ -948,6 +1296,701 @@ def test_default_video_config_fits_the_c3_link():
         f"default needs {total:.1f} Mbit/s = "
         f"{total / POE_BUDGET_MBPS * 100:.0f}% of the link — too little margin "
         "for a scene change")
+
+
+def test_unprojection_is_metric_and_clamped():
+    """The reference-view geometry, checked without a camera or a GPU.
+
+    This is the maths every reconstructed mesh rests on: it turns the mask into
+    the point cloud that colored ICP registers, so a factor of 1000 or a flipped
+    axis here does not raise — it produces a confident-looking mesh of the wrong
+    size, which is exactly the failure mode the upstream project warns about.
+    """
+    try:
+        from rov_gui.perception.session import _PinholeUnprojector
+    except Exception:                                            # noqa: BLE001
+        return
+
+    K = np.array([[500.0, 0.0, 320.0], [0.0, 500.0, 180.0], [0.0, 0.0, 1.0]])
+    g = _PinholeUnprojector(K, 640, 360)
+    depth = np.zeros((360, 640), np.uint16)
+
+    # A pixel at the principal point, 1000 mm out -> (0, 0, 1.0) m.
+    depth[180, 320] = 1000
+    pts, (ys, xs) = g.unproject(depth)
+    assert pts.shape == (1, 3) and (ys[0], xs[0]) == (180, 320)
+    assert abs(pts[0, 2] - 1.0) < 1e-6, "millimetres in, METRES out"
+    assert abs(pts[0, 0]) < 1e-6 and abs(pts[0, 1]) < 1e-6
+
+    # 50 px right of centre at 1 m -> +0.1 m in X; 50 px BELOW -> +0.1 m in Y,
+    # because OpenCV's +Y points down.
+    depth[:] = 0
+    depth[180, 370] = 1000
+    depth[230, 320] = 1000
+    pts, (ys, _xs) = g.unproject(depth)
+    by_row = {int(r): p for r, p in zip(ys, pts)}
+    assert abs(by_row[180][0] - 0.1) < 1e-6
+    assert abs(by_row[230][1] - 0.1) < 1e-6, "OpenCV +Y must go DOWN"
+
+    # The clamp keeps the stereo module's 0 and its saturated far values out of
+    # the cloud; a single 4 m outlier drags the ICP that the mesh depends on.
+    depth[:] = 0
+    depth[10, 10], depth[11, 11], depth[12, 12] = 0, 100, 5000
+    assert g.unproject(depth)[0].shape[0] == 0
+
+    # A mask restricts it, which is the whole point: only the object.
+    depth[:] = 1000
+    mask = np.zeros((360, 640), bool)
+    mask[100:110, 100:110] = True
+    assert g.unproject(depth, mask)[0].shape[0] == 100
+
+
+def test_reference_directory_refuses_the_path_that_breaks_reconstruction():
+    """'rgb' anywhere in the path silently reconstructs the wrong thing.
+
+    The reconstruction derives its sibling directories from the rgb/ path by
+    string replacement (capture.py:254-256), so a parent called .../rgb_tests
+    sends it looking for depth in a directory that does not exist. It fails
+    late, in a child process, after two minutes.
+    """
+    try:
+        from rov_gui.perception.session import PoseSession, PoseSessionError
+    except Exception:                                            # noqa: BLE001
+        return
+
+    with tempfile.TemporaryDirectory() as td:
+        bad = PoseSession(ref_dir=Path(td) / "rgb_captures", build=True)
+        raised = False
+        try:
+            bad._new_ref_dir()
+        except PoseSessionError:
+            raised = True
+        assert raised, "a path containing 'rgb' must be refused up front"
+
+        ok = PoseSession(ref_dir=Path(td) / "meshes", build=True)
+        a = ok._new_ref_dir()
+        b = ok._new_ref_dir()
+        assert a.is_dir() and b.is_dir()
+        # Never the same directory twice: reference views are numbered from
+        # zero, so reusing one reconstructs a chimera of two objects.
+        assert a != b
+
+
+def test_track_off_cancels_a_running_reconstruction():
+    """The button that starts a two-minute GPU job must be able to stop it.
+
+    A BundleSDF child left running holds several GB of VRAM behind a station
+    that says it is idle — on a machine that is also flying a vehicle.
+    """
+    try:
+        from rov_gui.perception.session import PoseSession, PHASE_CAPTURE
+    except Exception:                                            # noqa: BLE001
+        return
+
+    class _FakeBuild:
+        def __init__(self):
+            self.cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+    class _FakeCapture:
+        def __init__(self):
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+        def join(self, timeout=None):
+            pass
+
+    s = PoseSession(build=True)
+    cap, bld = _FakeCapture(), _FakeBuild()
+    s._capture, s._builder = cap, bld
+    s.phase = "build"
+    s.reset()
+    assert bld.cancelled, "reset() must kill the reconstruction child"
+    assert cap.stopped
+    assert s.phase == PHASE_CAPTURE, "and leave the pipeline ready to retry"
+    assert s._builder is None and s._capture is None
+
+
+def test_reconstruction_is_the_default_only_when_there_is_no_mesh():
+    """Which of the three pose modes a flag set selects.
+
+    Getting this backwards is expensive in opposite directions: building when a
+    mesh was supplied wastes two minutes of GPU per click, and NOT building when
+    none was supplied is exactly the complaint that a click only ever produced a
+    mask.
+    """
+    from rov_gui.__main__ import build_parser
+
+    def mode(argv):
+        o = build_parser().parse_args(argv)
+        mesh = getattr(o, "pose_mesh", None) or None
+        return mesh, (not mesh and not o.pose_no_build)
+
+    assert mode(["--pose"]) == (None, True), "no mesh -> reconstruct on site"
+    assert mode(["--pose", "--pose-no-build"]) == (None, False)
+    mesh, build = mode(["--pose", "--pose-mesh", "/tmp/m.obj"])
+    assert mesh == "/tmp/m.obj" and build is False
+
+    o = build_parser().parse_args(["--pose"])
+    # The arc cap is a measured cliff, not a preference (9.7 mm at 80 deg,
+    # 87 mm at 100, 283 mm at 120), so the default must sit under it.
+    assert o.pose_max_arc <= 80.0
+    assert o.pose_max_views >= 10
+    assert "rgb" not in str(Path(o.pose_ref_dir).resolve())
+
+
+def _hangul(text: str) -> str:
+    """Any Hangul left in a UI string. Em-dashes and degrees are fine."""
+    return "".join(c for c in text
+                   if 0xAC00 <= ord(c) <= 0xD7A3        # syllables
+                   or 0x1100 <= ord(c) <= 0x11FF        # jamo
+                   or 0x3130 <= ord(c) <= 0x318F)       # compatibility jamo
+
+
+def test_every_pose_stage_says_what_it_is_doing_in_english():
+    """No stage may be silent, and none may be Korean.
+
+    The failure this pins: a capture that gave up reverted to a plain green
+    TRACKING chip with no text anywhere, so "collecting", "reconstructing" and
+    "quietly stopped" were indistinguishable from the pilot's seat. Every state
+    the session can publish now has to produce a stage line, and the reason line
+    has to be there too whenever there is a reason.
+    """
+    from rov_gui.state import PoseTrack
+    from rov_gui.widgets.video import VideoCanvas
+
+    states = ("off", "loading", "idle", "live", "capturing", "building",
+              "pose_loading", "registering", "tracking", "lost", "failed",
+              "fault")
+    for st in states:
+        stage, reason = VideoCanvas._pose_status(
+            PoseTrack(state=st, n_views=7, max_views=20, arc_deg=31.0,
+                      max_arc=75.0, build_s=42.0, load_s=1.1, fp_load_s=8.0,
+                      sam_hz=30.0, distance_m=0.45))
+        assert stage, f"state {st!r} draws no stage line"
+        assert stage == stage.upper() or any(c.isdigit() for c in stage)
+        for text in (stage, reason):
+            assert not _hangul(text), \
+                f"state {st!r} shows Korean text: {text!r}"
+
+    # The three that mean "waiting, nothing for you to do" must still explain
+    # themselves, because they are the ones that look like a hang.
+    for st in ("capturing", "building", "registering", "pose_loading"):
+        _stage, reason = VideoCanvas._pose_status(PoseTrack(state=st))
+        assert reason, f"state {st!r} gives the pilot no reason line"
+
+    # And the distinction the whole thing rests on: no pose because you asked
+    # for a mask, versus no pose yet.
+    mask_only, _ = VideoCanvas._pose_status(
+        PoseTrack(state="tracking", pose_expected=False))
+    pending, _ = VideoCanvas._pose_status(
+        PoseTrack(state="tracking", pose_expected=True))
+    assert "mask only" in mask_only and "no pose yet" in pending
+
+
+def test_the_recording_carries_the_tracking_overlay():
+    """A recording of a tracking session must show the tracking.
+
+    Three things at once, and the middle one is the trap: the overlay reaches
+    the file, the ORIGINAL frame is left alone (the canvas still paints its own
+    overlay on top of it live, so drawing into the same QImage would double
+    every stroke), and a panel with tracking off pays nothing.
+    """
+    from rov_gui.qt import QtGui
+    from rov_gui.state import Conn, PoseTrack, VideoStat
+    from rov_gui.widgets.video import VideoPanel
+
+    _app()
+    mb = FrameMailbox("c3")
+    panel = VideoPanel("main", "C3 RGB", mb, pose=True)
+    panel.resize(640, 360)
+
+    src = QtGui.QImage(320, 180, QtGui.QImage.Format.Format_RGB32)
+    src.fill(QtGui.QColor("#101010"))
+    before = src.copy()
+
+    # Nothing to draw yet: the same object comes straight back, no copy.
+    assert panel.burn_overlay(src) is src
+
+    panel.canvas._stat = VideoStat("C3 RGB", width=640, height=360)
+    panel.canvas.set_track(PoseTrack(
+        state="tracking", conn=Conn.ONLINE, src_w=640, src_h=360, sam_hz=30.0,
+        contours=(((100.0, 60.0), (400.0, 60.0), (400.0, 300.0),
+                   (100.0, 300.0)),)))
+    out = panel.burn_overlay(src)
+    assert out is not src, "must not paint into the frame the canvas still owns"
+    assert (out.width(), out.height()) == (320, 180)
+    assert out != before, "the overlay never reached the recorded frame"
+    assert src == before, "the source frame was modified"
+
+    # And a panel built without tracking is untouched by any of this.
+    plain = VideoPanel("rov", "DEFAULT RGB", FrameMailbox("rov"))
+    assert plain.burn_overlay(src) is src
+
+
+def test_upstream_operator_messages_are_translated():
+    """The upstream project talks to its operator in Korean; the UI is English.
+
+    These strings are the ONLY explanation the pilot gets for why a capture is
+    not progressing, so an untranslated one makes the most important line on the
+    panel the one nobody can act on. The upstream tree is read-only to us, so
+    the translation has to happen at this boundary.
+    """
+    try:
+        from rov_gui.perception.session import english
+    except Exception:                                            # noqa: BLE001
+        return
+
+    cases = {
+        "물체를 천천히 좌우로 돌려주세요": "turn the object slowly",
+        "수집 완료 — 누적 회전 75도 도달": "75 deg",
+        "물체가 너무 멉니다 (124 cm) — 30~80 cm 로 가져오세요": "124 cm",
+        "마스크가 갑자기 커졌다 (다른 물체로 옮겨탔을 수 있다)": "another object",
+        "각도 차이가 작다 (3도)": "3 deg",
+        # the one reject the pilot can fix in a second: say which way to move
+        "카메라-물체 거리가 이상하다 (2040 mm)": "bring it to 300-800 mm",
+        "놓침 — 재획득 중 (2s)": "2 s",
+        "물체를 클릭하세요": "click an object",
+    }
+    for src, expect in cases.items():
+        out = english(src)
+        assert expect in out, f"{src!r} -> {out!r}"
+        # The number must survive: a translation that drops the measurement is
+        # worse than no translation at all.
+        assert not _hangul(out), out
+
+    # A composed message translates in one pass, both halves.
+    both = english("수집 완료 — 20장 채움")
+    assert "collection finished" in both and "20 views" in both, both
+    # The summary line that goes to the log, numbers intact.
+    s = english("8장  회전 75도  마스크 1882~2064 px (중앙 1974)  "
+                "거리 426~460 mm  [누적 회전 75도 도달]")
+    for token in ("8 views", "arc 75 deg", "1882-2064", "426-460 mm"):
+        assert token in s, (token, s)
+    assert english("") == ""
+
+
+def test_the_reconstruction_states_reach_the_screen():
+    """capturing/building are the two states the pilot has to steer.
+
+    The arc is a budget they spend by orbiting and the build is a wait; if the
+    chip cannot say which one it is in, the counter just sits there and a
+    working capture looks like a hung station.
+    """
+    from rov_gui.qt import QtGui
+    from rov_gui.state import PoseTrack, Conn
+    from rov_gui.widgets.video import VideoCanvas
+
+    _app()
+    c = VideoCanvas("C3 RGB", FrameMailbox("c3"), pose=True)
+    c.resize(640, 360)
+    for t in (PoseTrack(state="capturing", n_views=7, max_views=20,
+                        arc_deg=31.0, max_arc=75.0, conn=Conn.CONNECTING,
+                        note="orbit the object slowly", src_w=640, src_h=360),
+              PoseTrack(state="building", build_s=42.0, conn=Conn.CONNECTING,
+                        note="reconstructing the mesh (about 2 minutes)",
+                        src_w=640, src_h=360)):
+        c.set_track(t)
+        img = QtGui.QImage(640, 360, QtGui.QImage.Format.Format_RGB32)
+        p = QtGui.QPainter(img)
+        try:
+            c._paint_pose(p, c.rect())        # must not raise
+        finally:
+            p.end()
+    # And the fields are plain data, so they can cross a process boundary.
+    t = PoseTrack(state="capturing", n_views=7, arc_deg=31.0)
+    for name in ("n_views", "arc_deg", "max_arc", "max_views", "build_s"):
+        assert isinstance(getattr(t, name), (int, float))
+
+
+def test_no_method_is_shadowed_by_an_instance_attribute():
+    """A `self.x = ...` in __init__ silently REPLACES a method named `x`.
+
+    This is the bug class behind the capture pipeline freeze: PoseWorker had a
+    method `_log` and an attribute `self._log` (the SensorLog). The attribute
+    won, so every `on_log=self._log` passed None — or, while recording, a
+    SensorLog object, which is not callable, so the capture finalizer raised
+    TypeError on every tick and COLLECTING VIEWS could never end. Nothing
+    about the pattern looks wrong at the call site, which is why a test bans
+    it package-wide instead of a review catching it once.
+    """
+    import ast
+
+    pkg = Path(__file__).resolve().parents[1]
+    offenders = []
+    for py in sorted(pkg.rglob("*.py")):
+        if "tests" in py.parts:
+            continue
+        tree = ast.parse(py.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            methods = set()
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    # property/setter pairs assign through the descriptor;
+                    # that is the pattern working as designed, not a shadow.
+                    decs = {getattr(d, "id", getattr(d, "attr", ""))
+                            for d in item.decorator_list}
+                    if not decs & {"property", "setter", "cached_property"}:
+                        methods.add(item.name)
+            for item in ast.walk(node):
+                if isinstance(item, ast.Assign) or isinstance(item, ast.AnnAssign):
+                    targets = (item.targets if isinstance(item, ast.Assign)
+                               else [item.target])
+                    for tgt in targets:
+                        if (isinstance(tgt, ast.Attribute)
+                                and isinstance(tgt.value, ast.Name)
+                                and tgt.value.id == "self"
+                                and tgt.attr in methods):
+                            offenders.append(
+                                f"{py.name}:{item.lineno} {node.name}."
+                                f"{tgt.attr} (method shadowed by attribute)")
+    assert not offenders, "\n".join(offenders)
+
+
+def test_capture_finalizes_even_if_the_object_was_lost_at_the_end():
+    """Collection done must finalize whatever SAM2 thinks NOW.
+
+    The pilot stops orbiting the moment the counter says done, and SAM2
+    routinely loses the object at exactly that moment. The old code gated the
+    finalize behind state == TRACKING, so the pipeline waited forever with
+    "collection finished" frozen on screen — the exact freeze reported from
+    the first hardware session.
+    """
+    try:
+        from rov_gui.perception.session import (PHASE_CAPTURE, PHASE_FAILED,
+                                                PoseSession)
+    except Exception:                                            # noqa: BLE001
+        return
+
+    class _Recorder:
+        n, arc = 3, 78.0
+        def summary(self):
+            return "3 views (fake)"
+
+    class _DoneCapture:
+        recorder = _Recorder()
+        def snapshot(self):
+            return {"done": True, "n": 3, "arc": 78.0}
+        def stop(self):
+            pass
+        def join(self, timeout=None):
+            pass
+
+    class _LostLive:
+        def submit(self, *a, **k):
+            pass
+        def snapshot(self):
+            # The worst case: the object is gone the moment the orbit ends.
+            return {"state": "LOST", "mask": None, "score": None,
+                    "message": "", "hz": 0.0}
+        def request_reset(self):
+            pass
+
+    s = PoseSession(build=True)
+    s._live = _LostLive()
+    s._np_K = np.eye(3)
+    s._capture = _DoneCapture()
+    assert s.phase == PHASE_CAPTURE
+    s.submit(np.zeros((360, 640, 3), np.uint8),
+             np.full((360, 640), 500, np.uint16))
+    assert s.phase == PHASE_FAILED, \
+        "a finished collection must finalize even with SAM2 in LOST"
+    assert "3" in s.poll()["message"] if s._live else True
+
+
+def test_depth_probe_reads_millimetres_from_the_frame_on_screen():
+    """Hover on the depth panel -> a metric readout from the SAME frame.
+
+    The raw uint16 map rides the mailbox WITH its picture, so the cursor can
+    never quote one frame while showing another. 0 is DepthAI's "no
+    measurement" and must come back as None ("no data"), never as 0.00 m.
+    """
+    from rov_gui.qt import QtCore, QtGui
+    from rov_gui.state import VideoStat
+    from rov_gui.widgets.video import VideoCanvas
+
+    _app()
+    mb = FrameMailbox("depth")
+    depth = np.full((360, 640), 1500, np.uint16)
+    depth[100, 200] = 420
+    depth[50, 50] = 0                       # a hole in the stereo map
+    img = bgr_to_qimage(np.zeros((360, 640, 3), np.uint8))
+    mb.put(img, VideoStat("depth", width=640, height=360), aux=depth)
+
+    c = VideoCanvas("C3 Depth", mb, legend=("0.3 m", "6 m"))
+    c.resize(640, 360)
+    assert c.pull()
+    # paint once so the letterbox rectangle exists for to_source()
+    target = QtGui.QImage(640, 360, QtGui.QImage.Format.Format_RGB32)
+    c.render(target)          # render() drives paintEvent with its own painter
+    r = c._fit_rect
+    assert r is not None
+
+    def canvas_pt(sx, sy):
+        return QtCore.QPoint(int(r.x() + (sx / 640) * r.width()),
+                             int(r.y() + (sy / 360) * r.height()))
+
+    assert c.depth_at(canvas_pt(200, 100)) == 420.0
+    assert c.depth_at(canvas_pt(50, 50)) is None, "0 mm is a hole, not a distance"
+    assert c.depth_at(QtCore.QPoint(-5, -5)) is None, "off the image"
+    # and painting the probe must not raise with a hover set
+    c._hover = canvas_pt(200, 100)
+    c.render(target)
+
+
+def test_pose3d_projection_keeps_the_conventions():
+    """The 3-D map must speak the same frame as the POSE log.
+
+    +Z forward must recede to the same side the yaw sends it, +Y must go DOWN
+    on screen at zero orbit (OpenCV optical axes), and zoom must scale
+    distances about the volume centre. Pure maths, no GPU.
+    """
+    from rov_gui.qt import QtGui
+    from rov_gui.state import PoseTrack
+    from rov_gui.widgets.pose3d import Pose3DView, Pose3DWindow, RANGE_Z
+
+    _app()
+    v = Pose3DView()
+    v.resize(400, 400)
+    v.yaw = 0.0
+    v.pitch = 0.0
+    v.zoom = 1.0
+    ox, oy = v._project(0, 0, RANGE_Z / 2)      # volume centre -> screen centre
+    assert abs(ox - 200) < 1e-6 and abs(oy - 200) < 1e-6
+    _x, y_down = v._project(0, 0.5, RANGE_Z / 2)
+    assert y_down > oy, "OpenCV +Y must project DOWN the screen"
+    x_right, _y = v._project(0.5, 0, RANGE_Z / 2)
+    assert x_right > ox, "+X must project right at zero orbit"
+    # zoom doubles the offset from centre, exactly
+    v.zoom = 2.0
+    x2, _ = v._project(0.5, 0, RANGE_Z / 2)
+    assert abs((x2 - ox) - 2 * (x_right - ox)) < 1e-6
+
+    # The feed dedups republished poses and survives poseless states.
+    v.zoom = 1.0
+    T = (1, 0, 0, 0.1, 0, 1, 0, 0.2, 0, 0, 1, 0.5, 0, 0, 0, 1)
+    for _ in range(5):
+        v.add(PoseTrack(state="tracking", T_cam_obj=T))
+    assert len(v.trail) == 1, "identical republished poses must not grow the trail"
+    v.add(PoseTrack(state="lost"))
+    assert v.pose_T is None and len(v.trail) == 1
+
+    # And the full window paints offscreen without raising.
+    w = Pose3DWindow()
+    w.resize(420, 400)
+    w.add(PoseTrack(state="tracking", T_cam_obj=T, pose_hz=44.0))
+    img = QtGui.QImage(420, 400, QtGui.QImage.Format.Format_RGB32)
+    w.view.render(img)
+
+
+def test_pose_csv_rides_the_recording_and_holds_the_full_pose():
+    """One CSV row per estimated pose, same numbers as the jsonl POSE rows.
+
+    A second FORMAT, never a second source: position, distance and the
+    rotation rows all come from the same T_cam_obj tuple the jsonl gets.
+    """
+    try:
+        from rov_gui.backends.hardware import PoseWorker
+    except Exception:                                            # noqa: BLE001
+        return
+    from rov_gui.bus import DataBus, RgbdMailbox
+    from rov_gui.state import PoseTrack
+
+    _app()
+    w = PoseWorker(DataBus(), RgbdMailbox(), type("O", (), {})())
+    with tempfile.TemporaryDirectory() as td:
+        w._open_csv(Path(td) / "x_pose.csv")
+        T = (1.0, 0.0, 0.0, 0.058, 0.0, 1.0, 0.0, 0.109,
+             0.0, 0.0, 1.0, 0.413, 0.0, 0.0, 0.0, 1.0)
+        w._write_csv(PoseTrack(state="tracking", T_cam_obj=T, frame_seq=7,
+                               pose_hz=44.0, n_register=1), 12.34)
+        # a poseless track writes nothing — the CSV is poses, not states
+        w._write_csv(PoseTrack(state="lost"), 12.44)
+        w._close_csv()
+        lines = (Path(td) / "x_pose.csv").read_text().strip().split("\n")
+    assert len(lines) == 2, lines
+    head = lines[0].split(",")
+    row = dict(zip(head, lines[1].split(",")))
+    assert row["frame_seq"] == "7" and row["state"] == "tracking"
+    assert abs(float(row["x_m"]) - 0.058) < 1e-9
+    assert abs(float(row["z_m"]) - 0.413) < 1e-9
+    assert abs(float(row["distance_m"]) - (0.058 ** 2 + 0.109 ** 2
+                                           + 0.413 ** 2) ** 0.5) < 1e-4
+    assert row["r00"] == "1.000000" and row["r21"] == "0.000000"
+    assert float(row["t"]) == 12.34
+
+
+def test_closing_the_session_mid_load_never_adopts_the_tracker():
+    """close() during the model load must win, whichever thread is ahead.
+
+    The load takes seconds to tens of seconds and the station quits whenever
+    the pilot quits. The old sequence (start the tracker thread, THEN store
+    it) had a window where close() found nothing to join, and the loader then
+    started a torch daemon thread into a discarded session — the interpreter-
+    exit abort the module's own docstring promises to prevent.
+    """
+    try:
+        from rov_gui.perception.session import PoseSession
+    except Exception:                                            # noqa: BLE001
+        return
+
+    started, stopped = [], []
+
+    class _FakeLive:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            started.append(1)
+
+        def stop(self):
+            stopped.append(1)
+
+        def join(self, timeout=None):
+            pass
+
+    class _FakeSam:
+        def __init__(self, *a, **k):
+            time.sleep(0.15)             # the "model build" window
+
+    fake_tracker = types.ModuleType("sam2_live.tracker")
+    fake_tracker.LiveTracker = _FakeLive
+    fake_tracker.StreamingSam2Tracker = _FakeSam
+    fake_pkg = types.ModuleType("sam2_live")
+    saved = {k: sys.modules.get(k) for k in ("sam2_live", "sam2_live.tracker")}
+    sys.modules["sam2_live"] = fake_pkg
+    sys.modules["sam2_live.tracker"] = fake_tracker
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            s = PoseSession(src_dir=td)
+            s.start_async()
+            time.sleep(0.02)             # loader is inside the build window
+            s.close()                    # must join the loader and refuse late adoption
+            assert s._loader is not None and not s._loader.is_alive(), \
+                "close() must join the loader thread"
+            assert started == [], \
+                "a tracker built after close() must never be STARTED"
+            assert s._live is None and not s.ready
+            # and a session closed mid-load must not advertise readiness later
+            time.sleep(0.05)
+            assert not s.ready
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+
+def test_track_off_means_the_video_worker_does_not_copy():
+    """The producer must know nobody is listening BEFORE it copies 1.15 MB.
+
+    PoseWorker discards every mailbox item while TRACK is off, so a tap that
+    copies colour+depth on every frame regardless is pure waste — and it
+    contradicts the documented promise that tracking off costs nothing.
+    """
+    from rov_gui.bus import RgbdMailbox
+
+    mb = RgbdMailbox()
+    assert not mb.wanted(), "nobody has pressed TRACK yet"
+    mb.put(np.zeros((2, 2, 3), np.uint8), None, None, 1.0)
+    mb.set_wanted(False)
+    assert mb.take() is None, "turning TRACK off must drop the stale item"
+    mb.set_wanted(True)
+    assert mb.wanted()
+
+    # And the worker actually flips it: set_enabled is the one switch.
+    try:
+        from rov_gui.backends.hardware import PoseWorker
+    except Exception:                                            # noqa: BLE001
+        return
+    _app()
+    w = PoseWorker(DataBus(), RgbdMailbox(), Opts())
+    w.set_enabled(True)
+    assert w.mailbox.wanted()
+    w.set_enabled(False)
+    assert not w.mailbox.wanted()
+
+
+def test_mesh_record_lands_in_a_log_opened_after_the_mesh_existed():
+    """The MESH row is per LOG FILE, not per process.
+
+    One latch shared by the console announcement and the file write meant a
+    mesh reconstructed before recording started was announced once and then
+    never written — the file whose whole point is provenance was the one
+    place without it.
+    """
+    try:
+        from rov_gui.backends.hardware import PoseWorker
+    except Exception:                                            # noqa: BLE001
+        return
+    from rov_gui.bus import RgbdMailbox
+    from rov_gui.sensorlog import SensorLog
+
+    class _Session:
+        mesh = __file__                  # any real file: sha1 must be readable
+        ref_dir = "/tmp/refs"
+        mesh_check_lines = ("mesh 100 verts",)
+
+    _app()
+    w = PoseWorker(DataBus(), RgbdMailbox(), Opts())
+    # The mesh exists BEFORE any log: console announcement only.
+    w._log_mesh_once(_Session())
+    assert w._mesh_logged and not w._mesh_record_written
+
+    with tempfile.TemporaryDirectory() as td:
+        w._log = SensorLog(Path(td) / "a_pose.jsonl", "pose")
+        w._mesh_record_written = False   # what set_sensor_log does on open
+        w._log_mesh_once(_Session())
+        w._log.close()
+        w._log = None
+        rows = [json.loads(x) for x in
+                (Path(td) / "a_pose.jsonl").read_text().splitlines()]
+    mesh_rows = [r for r in rows if r["msg"] == "MESH"]
+    assert len(mesh_rows) == 1, "the log opened later must still name the mesh"
+    assert len(mesh_rows[0]["sha1"]) == 40
+
+
+def test_pose_rows_between_frames_reuse_the_last_capture_stamp():
+    """The 10 Hz publish gate fires between camera frames; item is None then.
+
+    The pose on those ticks is still the one estimated from the LAST frame,
+    so its rows carry that frame's capture time — not 0.0 (which sorted the
+    CSV to the epoch) and not now().
+    """
+    try:
+        from rov_gui.backends.hardware import PoseWorker
+    except Exception:                                            # noqa: BLE001
+        return
+    from rov_gui.bus import RgbdMailbox
+    from rov_gui.sensorlog import SensorLog
+    from rov_gui.state import PoseTrack
+
+    _app()
+    w = PoseWorker(DataBus(), RgbdMailbox(), Opts())
+    T = tuple(float(v) for v in
+              (1, 0, 0, 0.1, 0, 1, 0, 0.2, 0, 0, 1, 0.5, 0, 0, 0, 1))
+    track = PoseTrack(state="tracking", T_cam_obj=T, frame_seq=3)
+    with tempfile.TemporaryDirectory() as td:
+        w._log = SensorLog(Path(td) / "b_pose.jsonl", "pose")
+        w._open_csv(Path(td) / "b_pose.csv")
+        w._log_track(track, {"t_capture": 777.5})    # a real frame
+        w._log_track(track, None)                    # a between-frames tick
+        w._log.close()
+        w._log = None
+        w._close_csv()
+        csv_rows = (Path(td) / "b_pose.csv").read_text().strip().split("\n")[1:]
+    assert len(csv_rows) == 2
+    stamps = [float(r.split(",")[0]) for r in csv_rows]
+    assert stamps == [777.5, 777.5], (
+        f"a tick with no fresh frame must reuse the last capture stamp, "
+        f"got {stamps}")
 
 
 def main() -> int:

@@ -1288,3 +1288,31 @@ steady-window radial RMS (t ≥ 10 s, same metric as the bar chart)"). 독립 �
 막대그래프는 원래부터 steady-window 지표였고 그대로다. 바뀐 것은 **궤적 그림의 박스**뿐. 이 날짜 **이전**에
 생성된 그림의 박스는 full-run RMS라 대응 막대보다 ~1–2 % 낮으니, 캡션("full-run radial RMS (all laps)")을
 확인하거나 다시 생성할 것.
+
+## 2026-08-12 — DOB-MPC가 시뮬레이터 밖으로: rov_gui 폐루프 AprilTag MPC (`--mpc`)
+
+이 문서가 기술하는 컨트롤러 스택에 **실기 소비자**가 생겼다: 관제 스테이션의 새 패키지
+`rov_gui/control/`이 `dobmpc/`를 **그대로 import**하고(params/fossen/frames/eaob/mpc/mpc_acados —
+전부 MuJoCo 무의존), sim 래퍼만 교체한다. `_read_state` → C3 컬러 스트림의 AprilTag PnP +
+ArduSub ATTITUDE/SCALED_IMU2(`state_assembler.py`), `set_wrench_command` → 기존 명령 sink의
+MANUAL_CONTROL 4축(`allocation.py`; ArduSub MANUAL 모드, roll/pitch 축이 없어 K/M은 버림).
+참조 로직(`set_target`/`set_reference_traj`/`_xref_ned`/`_xref_ned_traj`)은
+`dobmpc_controller.py:126-285`에서 `rov_gui/control/mpc_bridge.py`로 라인 단위 포팅했고, square
+생성기는 `run_compare.py:114-177`의 바이트 복사본을 테스트로 고정했다.
+
+sim 래퍼와 의도적으로 다른 결정:
+* **x0는 항상 "meas"** — 하드웨어에 truth 분기는 없다; DOB plug-in 구조(2026-07-23 항)는 그대로.
+* **EAOB의 tau_applied는 할당 후 추정치**(축 캡 적용, K/M=0) — 솔버 원출력을 주면 캡/드롭
+  불일치가 외란으로 이중 계상된다.
+* **w_hat 축별 클립 [15,45,45,5,5,8]**을 브리지에서 적용 — KNOWN_ISSUES의 스칼라 ±50 대체;
+  sim 쪽 코드는 백스톱으로 유지.
+* 솔버 실패마다 타임스탬프+status+|w_hat| 로그, `solve_ms`는 acados에서 직접 읽음.
+
+2026-08-12 검증(벤치만): rovgui-pose(numpy 2)에서 acados SQP-RTI 빌드 1.3 s, EAOB+solve
+p50 3.1 ms / p99 6.4 ms(n_fail 0/100, `rov_gui/control/smoke.py`); demo 백엔드 폐루프로
+engage → DP 워밍업 → square 1랩 → 완주 → DP → 해제 전 과정 완료(솔버 실패 0). 수중 상태와
+남은 [예측] 항목(축 게인, EAOB 시그마, 벽 태그 preset)은 같은 날짜의 KNOWN_ISSUES.md 참조.
+
+**기록 경계**: 하드웨어 CSV(`*_mpc.csv`)는 sim의 9열 접두를 공유하지만 **다른 모집단**이다 —
+meta.json에 `source: "hardware rov_gui.control"`, 태그맵 sha1, 축 게인 출처가 박힌다.
+sim `runs/traj_*.csv`와 절대 합산하지 말 것.

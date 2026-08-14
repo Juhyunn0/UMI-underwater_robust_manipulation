@@ -46,7 +46,8 @@ from __future__ import annotations
 from collections import deque
 
 from .qt import QImage, QMutex, QObject, Signal
-from .state import Conn, LinkStat, PayloadState, PilotInput, Telemetry, ThrusterState, VideoStat, now
+from .state import (Conn, LinkStat, PayloadState, PilotInput, PoseTrack,
+                    Telemetry, ThrusterState, VideoStat, now)
 
 
 class DataBus(QObject):
@@ -72,6 +73,16 @@ class DataBus(QObject):
     # vehicle worker would imply a relationship between them that does not
     # exist. The window merges these into the same panel by name.
     sensor_stat = Signal(object)      # state.SensorStat
+    pose = Signal(object)             # state.PoseTrack
+    # Closed-loop MPC (rov_gui/control/). nav_fix is the AprilTag localization
+    # at camera rate; vehicle_imu is the autopilot's inertial state at the MPC
+    # tick rate; mpc_status is one row per control tick. They ride the bus and
+    # not a mailbox because they are small immutable snapshots at <= 20-30 Hz —
+    # exactly the traffic shape DataBus is for (module docstring, mechanism 1).
+    nav_fix = Signal(object)          # state.NavFix
+    vehicle_imu = Signal(object)      # state.VehicleImu
+    mpc_status = Signal(object)       # state.MpcStatus
+    tag_overlay = Signal(object)      # state.TagOverlay (per video feed)
 
     # ---- commands (UI -> backend) -----------------------------------------
     # Connected with Qt.QueuedConnection so the send happens in the worker's
@@ -111,6 +122,30 @@ class DataBus(QObject):
     # Start/stop the raw sensor log that accompanies a depth recording.
     # (enabled, path stem) — the stem matches the video file it belongs to.
     cmd_log_sensors = Signal(bool, str)
+    # Object tracking. `cmd_pose_click` carries SOURCE image pixels, not panel
+    # pixels — the canvas converts before emitting, so nothing downstream needs
+    # to know how the video happened to be letterboxed.
+    cmd_pose_enable = Signal(bool)
+    cmd_pose_click = Signal(float, float)
+    cmd_pose_reset = Signal()
+    # Closed-loop MPC commands. ENGAGE and START TRAJ are two separate gates on
+    # purpose: engaging only makes the MPC hold the CURRENT pose (DP), and the
+    # trajectory clock starts on an explicit second action once the hold has
+    # settled — so the vehicle never lunges for a distant square corner the
+    # moment a ring-fill button completes.
+    cmd_mpc_engage = Signal(bool)     # True = engage (DP hold), False = release
+    cmd_mpc_traj = Signal(bool)       # True = start the square, False = back to DP
+    # The one-button mission flow: engage (if needed), warm up, then start the
+    # square by itself. Recording opens at engage as always, so one press ==
+    # "fly the square and log it". Kept SEPARATE from cmd_mpc_engage so the
+    # DP-only hold (calibration, station-keeping tests) still exists.
+    cmd_mpc_start = Signal()
+    cmd_mpc_mode = Signal(str)        # "mpc" | "dobmpc"
+    cmd_mpc_scenario = Signal(object) # dict of square overrides (size, speed, ...)
+    # Per-feed AprilTag detection toggle: (video panel key, on). Turning the
+    # C3 feed off mid-engagement starves the localizer and the MPC disengages
+    # on the stale-fix gate — that is the intended, safe consequence.
+    cmd_tag_enable = Signal(str, bool)
 
 
 class FrameMailbox:
@@ -132,14 +167,23 @@ class FrameMailbox:
         self._mutex = QMutex()
         self._image: QImage | None = None
         self._stat: VideoStat | None = None
+        self._aux = None
         self._target = (0, 0)
         self._put_count = 0
         self._take_count = 0
         self._conflated = 0
 
     # ------------------------------------------------------------- producer
-    def put(self, image: QImage, stat: VideoStat) -> None:
-        """Publish a frame. Any thread. Overwrites whatever was pending."""
+    def put(self, image: QImage, stat: VideoStat, aux=None) -> None:
+        """Publish a frame. Any thread. Overwrites whatever was pending.
+
+        ``aux`` rides along with the frame it belongs to — for the depth panel
+        it is the raw uint16 millimetre map, which is what lets the cursor
+        read out a real distance instead of a colour. It travels IN the
+        mailbox, not beside it, so the numbers under the cursor can never come
+        from a different frame than the picture. Must already be a copy the
+        producer will not touch again (DepthAI recycles its buffers).
+        """
         self._mutex.lock()
         try:
             if self._image is not None:
@@ -147,6 +191,7 @@ class FrameMailbox:
             self._image = image
             stat.conflated = self._conflated
             self._stat = stat
+            self._aux = aux
             self._put_count += 1
         finally:
             self._mutex.unlock()
@@ -160,8 +205,8 @@ class FrameMailbox:
             self._mutex.unlock()
 
     # ------------------------------------------------------------- consumer
-    def take(self) -> tuple[QImage | None, VideoStat | None]:
-        """Take the pending frame, or (None, None) if nothing new arrived.
+    def take(self):
+        """Take the pending frame as (image, stat, aux), or (None, None, None).
 
         Returning None is the normal case at a paint rate above the frame rate,
         and it means "keep showing what you have" — not "the feed died". Only
@@ -169,12 +214,13 @@ class FrameMailbox:
         """
         self._mutex.lock()
         try:
-            img, stat = self._image, self._stat
+            img, stat, aux = self._image, self._stat, self._aux
             if img is None:
-                return None, None      # nothing new; never hand back a repeat
+                return None, None, None  # nothing new; never hand back a repeat
             self._image = None
+            self._aux = None
             self._take_count += 1
-            return img, stat
+            return img, stat, aux
         finally:
             self._mutex.unlock()
 
@@ -189,6 +235,86 @@ class FrameMailbox:
         self._mutex.lock()
         try:
             return {"put": self._put_count, "taken": self._take_count,
+                    "conflated": self._conflated}
+        finally:
+            self._mutex.unlock()
+
+
+class RgbdMailbox:
+    """Latest RGB-D frame for the perception worker. One slot, newest wins.
+
+    :class:`FrameMailbox`'s sibling, and it exists for the same reason: the
+    camera produces at 30 fps while the tracker consumes at whatever the GPU
+    manages, and connecting those with a queue converts a rate mismatch into
+    unbounded, unrecoverable latency. Here the consequence would be worse than a
+    late picture — a pose computed from a frame ten seconds old is a pose that
+    describes where the object used to be.
+
+    Carries numpy, not QImage, and therefore carries the ONE rule that matters:
+    the producer must hand over arrays it will not touch again. DepthAI recycles
+    its frame pool, so :meth:`put` is called with copies (see
+    ``C3VideoWorker._tap_pose``); this class cannot enforce that, so it is
+    written down at both ends.
+    """
+
+    def __init__(self):
+        self._mutex = QMutex()
+        self._item: dict | None = None
+        self._put = 0
+        self._taken = 0
+        self._conflated = 0
+        # The consumer's appetite, visible to the producer. The video worker
+        # checks this BEFORE copying: with TRACK off the pose worker discards
+        # every item unread, so copying 1.15 MB per frame to feed it was pure
+        # waste — and contradicted the documented promise that tracking off
+        # costs nothing.
+        self._wanted = False
+
+    def set_wanted(self, on: bool) -> None:
+        self._mutex.lock()
+        try:
+            self._wanted = bool(on)
+            if not on:
+                self._item = None       # drop what nobody will ever read
+        finally:
+            self._mutex.unlock()
+
+    def wanted(self) -> bool:
+        self._mutex.lock()
+        try:
+            return self._wanted
+        finally:
+            self._mutex.unlock()
+
+    def put(self, color, depth, intrinsics, t_capture: float,
+            skew_ms: float = 0.0) -> None:
+        """Publish a frame. Any thread. Overwrites whatever was pending."""
+        self._mutex.lock()
+        try:
+            if self._item is not None:
+                self._conflated += 1        # the previous one was never used
+            self._put += 1
+            self._item = {"color": color, "depth": depth, "K": intrinsics,
+                          "t_capture": t_capture, "skew_ms": skew_ms,
+                          "seq": self._put}
+        finally:
+            self._mutex.unlock()
+
+    def take(self) -> dict | None:
+        """Take the pending frame, or None. Never hands back a repeat."""
+        self._mutex.lock()
+        try:
+            item, self._item = self._item, None
+            if item is not None:
+                self._taken += 1
+            return item
+        finally:
+            self._mutex.unlock()
+
+    def counters(self) -> dict[str, int]:
+        self._mutex.lock()
+        try:
+            return {"put": self._put, "taken": self._taken,
                     "conflated": self._conflated}
         finally:
             self._mutex.unlock()
@@ -246,5 +372,6 @@ class Freshness:
         return Conn.ONLINE
 
 
-__all__ = ["DataBus", "FrameMailbox", "Freshness", "Conn", "LinkStat",
-           "PayloadState", "PilotInput", "Telemetry", "ThrusterState", "VideoStat"]
+__all__ = ["DataBus", "FrameMailbox", "RgbdMailbox", "Freshness", "Conn",
+           "LinkStat", "PayloadState", "PilotInput", "PoseTrack", "Telemetry",
+           "ThrusterState", "VideoStat"]

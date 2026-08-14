@@ -1445,3 +1445,35 @@ Figures generated **before this date** box a full-run RMS, ~1–2 % below the ma
 > - `bluerov2_mujoco_marinegym/docs/CONTROL_METHODOLOGY.md:130` — 산출물 없음 — `(both coefficient sets recovered back out of the sim to 0.00 %, T4.3)`
 > - `bluerov2_mujoco_marinegym/docs/CONTROL_METHODOLOGY.md:139` — 산출물 없음 — `└−a₂v   a₁u    0   −a₅q   a₄p     0   ┘   1e-14 (T1.1–1.2)`
 > - `bluerov2_mujoco_marinegym/docs/CONTROL_METHODOLOGY.md:704` — 예시/유도값 — `Heavy:     6×8,  rank 6   — FULLY ACTUATED (verified: a pure pitch wrench realiz`
+
+## 2026-08-12 — The DOB-MPC leaves the simulator: closed-loop AprilTag MPC in rov_gui (`--mpc`)
+
+The controller stack this document describes now has a REAL-VEHICLE consumer: `rov_gui/control/`
+(the topside station's new closed-loop package) imports `dobmpc/` **verbatim** — params, fossen,
+frames, eaob, mpc, mpc_acados, none of which touch MuJoCo — and replaces only the sim wrapper:
+`_read_state` becomes AprilTag PnP off the C3 colour stream + ArduSub ATTITUDE/SCALED_IMU2
+(`state_assembler.py`), and `set_wrench_command` becomes MANUAL_CONTROL axes through the station's
+existing command sink (`allocation.py`; ArduSub in MANUAL, K/M dropped — no roll/pitch axis exists).
+The reference logic (`set_target` / `set_reference_traj` / `_xref_ned` / `_xref_ned_traj`) is ported
+line-for-line from `dobmpc_controller.py:126-285` into `rov_gui/control/mpc_bridge.py`; the square
+generators are byte-copies of `run_compare.py:114-177` pinned by tests.
+
+Decisions that differ from the sim wrapper, on purpose:
+* **x0 is always "meas"** — the hardware has no truth branch; the DOB plug-in architecture
+  (2026-07-23 entry) carries over unchanged: the EAOB hands the NMPC only w_hat.
+* **tau_applied fed to the EAOB is the post-allocation estimate** (axis caps applied, K/M zeroed),
+  not the raw solver output — otherwise the cap/drop mismatch double-counts as disturbance.
+* **w_hat is clipped per-axis [15,45,45,5,5,8]** in the bridge before the solver — the KNOWN_ISSUES
+  replacement for the scalar ±50; the sim code keeps its backstop untouched.
+* Solver failures now log timestamp + status + |w_hat| every occurrence, and `solve_ms` is read
+  live from acados (the sim wrapper's dead field is bypassed).
+
+Verified 2026-08-12, bench only: acados SQP-RTI builds and runs in the GUI's numpy-2 env
+(`rov_gui/control/smoke.py`: build 1.3 s, EAOB+solve p50 3.1 ms / p99 6.4 ms, n_fail 0/100);
+the demo backend closes the full loop (engage → DP warm-up → 1 square lap → complete → DP → release)
+with zero solver failures. Water status and the remaining [예측] items (axis gains, EAOB sigmas,
+wall-tag preset) are tracked in the repo-root KNOWN_ISSUES.md entry of the same date.
+
+**Records boundary:** hardware CSVs (`*_mpc.csv`) share the sim's 9-column prefix but are a NEW
+population — `meta.json` carries `source: "hardware rov_gui.control"`, the tag-map sha1 and the
+axis-gain provenance; never pool them with `runs/traj_*.csv` sim records.

@@ -48,3 +48,9 @@ Thumbs.db
 # MuJoCo auto-generated error log + ad-hoc nohup run logs
 MUJOCO_LOG.TXT
 run.log
+
+# rov_gui session output: screen/feed recordings, and the on-site object
+# reconstructions (reference views + BundleSDF training log + model/model.obj).
+# One reconstruction is tens of MB and is a per-run artifact, not a source one —
+# the path lands in the _pose.jsonl MESH record instead.
+sessions/

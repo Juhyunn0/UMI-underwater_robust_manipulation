@@ -40,8 +40,9 @@ from ..bus import FrameMailbox
 from ..net import NicMonitor
 from ..qt import Slot
 from ..sensorlog import SensorLog
-from ..state import (Conn, PayloadState, PilotInput, SensorStat, Telemetry,
-                     ThrusterState, VideoStat, now)
+from ..state import (Conn, NavFix, PayloadState, PilotInput, PoseTrack,
+                     SensorStat, Telemetry, ThrusterState, VehicleImu,
+                     VideoStat, now)
 from .base import Backend, TimerWorker
 
 # Demo thruster mixer: rows are the 8 motors of a BlueROV2 Heavy, columns are
@@ -153,11 +154,13 @@ class DemoVideoWorker(TimerWorker):
             # Render at the source resolution the real camera would deliver,
             # then shrink for the panel — same two-step the hardware path takes,
             # so the cost profile of the demo matches it.
+            aux = None
             if name == "depth":
                 src = self.scene.depth(t, 640, 400)
                 bgr = imaging.depth_to_bgr(src)
                 res = (640, 400)
                 enc = "16UC1"
+                aux = src            # the probe works in the demo too
             elif name == "second":
                 bgr = self.scene.render(t, 640, 400, mono=True)
                 res = (640, 400)
@@ -172,7 +175,7 @@ class DemoVideoWorker(TimerWorker):
                              fps=self.fps, latency_ms=40.0 + 8 * math.sin(t),
                              drop_rate=0.0, mbps=None, encoding=enc,
                              conn=Conn.ONLINE, note="synthetic")
-            mb.put(img, stat)
+            mb.put(img, stat, aux=aux)
             if self.bus is not None and (t - self._last_pub) > 0.5:
                 self.bus.video_stat.emit(stat)
         if (t - self._last_pub) > 0.5:
@@ -191,20 +194,39 @@ class DemoVehicleWorker(TimerWorker):
     in the worker, publish a snapshot at a human rate.
     """
 
-    def __init__(self, bus, hz: float = 20.0):
+    def __init__(self, bus, hz: float = 20.0, opts=None):
         super().__init__("demo-vehicle", interval_ms=int(1000 / hz))
         self.bus = bus
         self.hz = hz
+        self.opts = opts
         self._t0 = time.monotonic()
         self._last_pub = 0.0
         self._last_link = 0.0
         self.nic = NicMonitor()
+        # --mpc: the toy plant also plays "tag localization + autopilot IMU"
+        # so the whole closed loop (assembler -> EAOB -> NMPC -> cmd_pilot ->
+        # this plant) closes with zero hardware. SYNTHETIC like everything
+        # else here; the NavFix carries geometry="demo" so a log can never be
+        # mistaken for a pool run.
+        self.mpc_on = bool(getattr(opts, "mpc", False))
+        # NED world position of the toy vehicle. Starts at the origin — the
+        # demo plays the role of a datum'd (first-fix-relative) world, which
+        # keeps it inside hw_nav.yaml's relative geofence so ENGAGE works on
+        # the bench.
+        self.x = 0.0
+        self.y = 0.0
+        self._nav_rng = np.random.default_rng(3)
+        self._nu_prev = np.zeros(3)
+        if self.mpc_on:
+            self.depth0 = 0.4
+        else:
+            self.depth0 = 0.0
 
         # vehicle state
         self.pilot = PilotInput()
         self.enabled = False
         self.vel = np.zeros(4)        # surge, sway, heave, yaw rates
-        self.depth = 0.0
+        self.depth = self.depth0
         self.yaw = 0.0
         self.roll = 0.0
         self.pitch = 0.0
@@ -221,6 +243,8 @@ class DemoVehicleWorker(TimerWorker):
         # mode that drives the thrusters by itself.
         self.mode = "STABILIZE"
         self.js_buttons = 0
+        self.pose_on = False
+        self.pose_locked = False
         self._log: SensorLog | None = None
 
     # -------------------------------------------------------------- commands
@@ -253,6 +277,67 @@ class DemoVehicleWorker(TimerWorker):
     def set_mode(self, name: str) -> None:
         self.mode = str(name).upper()
         self.bus.log.emit("warn", f"demo: flight mode {self.mode}")
+
+    # ------------------------------------------------------- object tracking
+    # A synthetic tracker, so the overlay, the click path and the pose log can
+    # be developed and tested on a machine with no GPU at all. It follows the
+    # same moving rectangle the synthetic scene draws, so a click near the
+    # object "locks on" and a click on empty water does not.
+    @Slot(bool)
+    def set_pose_enabled(self, on: bool) -> None:
+        self.pose_on = bool(on)
+        if not on:
+            self.pose_locked = False
+
+    @Slot(float, float)
+    def set_pose_click(self, x: float, y: float) -> None:
+        if not self.pose_on:
+            return
+        cx, cy = self._demo_object_centre()
+        self.pose_locked = (abs(x - cx) < 90 and abs(y - cy) < 60)
+        self.bus.log.emit(
+            "info", f"demo: prompt at ({x:.0f},{y:.0f}) -> "
+                    f"{'locked on' if self.pose_locked else 'nothing there'}")
+
+    @Slot()
+    def reset_pose(self) -> None:
+        self.pose_locked = False
+
+    def _demo_object_centre(self) -> tuple[float, float]:
+        """Where the scene's moving box is, in SOURCE (960x540) pixels."""
+        t = time.monotonic() - self._t0
+        return (0.5 + 0.35 * math.sin(t * 0.25)) * 960.0, 0.55 * 540.0
+
+    def _publish_pose(self) -> None:
+        if not self.pose_on:
+            self.bus.pose.emit(PoseTrack(state="off", note="TRACK is off",
+                                         conn=Conn.OFFLINE, stamp=now()))
+            return
+        if not self.pose_locked:
+            self.bus.pose.emit(PoseTrack(state="idle", src_w=960, src_h=540,
+                                         note="click an object",
+                                         conn=Conn.ONLINE, stamp=now()))
+            return
+        cx, cy = self._demo_object_centre()
+        w, h = 70.0, 46.0
+        box = ((cx - w, cy - h), (cx + w, cy - h), (cx + w, cy + h),
+               (cx - w, cy + h))
+        # A synthetic 6-DoF pose so the axes/box overlay and the POSE log rows
+        # can be exercised without a GPU. FABRICATED, like everything else here.
+        t = time.monotonic() - self._t0
+        z = 0.55 + 0.05 * math.sin(t * 0.4)
+        ca, sa = math.cos(t * 0.5), math.sin(t * 0.5)
+        T = (ca, -sa, 0.0, (cx - 480.0) / 960.0 * 0.6,
+             sa, ca, 0.0, (cy - 270.0) / 540.0 * 0.4,
+             0.0, 0.0, 1.0, z,
+             0.0, 0.0, 0.0, 1.0)
+        axes = ((cx, cy), (cx + 55 * ca, cy + 55 * sa),
+                (cx - 40 * sa, cy + 40 * ca), (cx, cy + 46))
+        self.bus.pose.emit(PoseTrack(
+            state="tracking", contours=(box,), T_cam_obj=T, axes_px=axes,
+            score=7.1, mask_px=int(4 * w * h), sam_hz=28.0, pose_hz=42.0,
+            n_register=1, src_w=960, src_h=540,
+            note="synthetic", conn=Conn.ONLINE, stamp=now()))
 
     @Slot(bool, str)
     def set_sensor_log(self, on: bool, stem: str) -> None:
@@ -309,8 +394,15 @@ class DemoVehicleWorker(TimerWorker):
         self.vel += (u * 1.2 - self.vel * 1.6) * dt
         self.depth = max(0.0, self.depth - self.vel[2] * dt * 0.8)
         self.yaw = (self.yaw + self.vel[3] * dt * 1.4) % (2 * math.pi)
+        # World (NED-like) position: yaw as psi, surge/sway as u/v body FRD.
+        self.x += (self.vel[0] * math.cos(self.yaw)
+                   - self.vel[1] * math.sin(self.yaw)) * dt
+        self.y += (self.vel[0] * math.sin(self.yaw)
+                   + self.vel[1] * math.cos(self.yaw)) * dt
         self.roll = 0.03 * math.sin(t * 0.9) + 0.05 * self.vel[1]
         self.pitch = 0.02 * math.sin(t * 0.6) - 0.04 * self.vel[0]
+        if self.mpc_on:
+            self._publish_nav(dt)
 
         thrust = DEMO_MIX @ u
         load = float(np.abs(thrust).sum())
@@ -337,6 +429,48 @@ class DemoVehicleWorker(TimerWorker):
             return
         self._last_pub = t
         self._publish(thrust, current, volt, pct)
+        self._publish_pose()
+
+    def _publish_nav(self, dt: float) -> None:
+        """Synthetic NavFix + VehicleImu, every tick (20 Hz, camera-like).
+
+        The noise floor (1 cm position, 0.5 deg yaw) is in the ballpark the
+        real single-tag PnP is EXPECTED to produce — close enough for the
+        loop's behaviour to be representative, fabricated like everything
+        else in this module."""
+        from ..control.state_assembler import rot_zyx
+
+        R = rot_zyx(self.roll, self.pitch, self.yaw)
+        p = (np.array([self.x, self.y, self.depth])
+             + self._nav_rng.normal(0.0, 0.01, 3))
+        yaw_n = self.yaw + self._nav_rng.normal(0.0, math.radians(0.5))
+        Rn = rot_zyx(self.roll, self.pitch, yaw_n)
+        t = now()
+        self.bus.nav_fix.emit(NavFix(
+            t_capture=t, n_tags=1, tag_ids=(25,),
+            p_ned=tuple(float(v) for v in p),
+            R_ned_body=tuple(float(v) for v in Rn.ravel()),
+            yaw_ned=float(math.atan2(Rn[1, 0], Rn[0, 0])),
+            reproj_rms_px=0.4, detect_ms=2.0, geometry="demo",
+            src_w=960, src_h=540, conn=Conn.ONLINE,
+            note="synthetic", stamp=t))
+        # Body velocity for the accel FD: u, v from the plant, w from the
+        # depth integrator's own gain (see tick()).
+        nu = np.array([self.vel[0], self.vel[1], -0.8 * self.vel[2]])
+        a = (nu - self._nu_prev) / max(1e-6, dt)
+        self._nu_prev = nu.copy()
+        g = np.array([0.0, 0.0, 9.80665])
+        # Specific force consistent with what the assembler inverts:
+        # it computes a = f + R^T g - omega x v, so the plant must emit
+        # f = (dnu/dt) + omega x v - R^T g. Level & still ~ (0, 0, -9.81).
+        omega = np.array([0.0, 0.0, float(self.vel[3] * 1.4)])
+        f = a + np.cross(omega, nu) - R.T @ g
+        self.bus.vehicle_imu.emit(VehicleImu(
+            roll=self.roll, pitch=self.pitch, yaw=self.yaw,
+            p=0.0, q=0.0, r=float(self.vel[3] * 1.4),
+            ax=float(f[0]), ay=float(f[1]), az=float(f[2]),
+            depth_m=float(self.depth), t_att=t, t_imu=t, t_baro=t,
+            conn=Conn.ONLINE, stamp=t))
 
     def _publish(self, thrust, current, volt, pct) -> None:
         tel = Telemetry(
@@ -400,8 +534,29 @@ class DemoBackend(Backend):
         fps = float(getattr(opts, "fps", 15.0) or 15.0)
         self.video = DemoVideoWorker(mailboxes, fps=fps)
         self.video.bus = bus
-        self.vehicle = DemoVehicleWorker(bus)
+        self.vehicle = DemoVehicleWorker(bus, opts=opts)
         self.workers = [self.video, self.vehicle]
+        # --mpc closes the loop against the toy plant: the REAL MpcWorker
+        # (same code as hardware; the acados solver builds at startup), fed by
+        # the synthetic NavFix/VehicleImu the vehicle worker publishes.
+        self.mpc = None
+        if bool(getattr(opts, "mpc", False)):
+            from ..control.workers import MpcWorker
+
+            self.mpc = MpcWorker(bus, opts)
+            self.workers.append(self.mpc)
+            bus.nav_fix.connect(self.mpc.on_nav_fix)
+            bus.vehicle_imu.connect(self.mpc.on_vehicle_imu)
+            bus.telemetry.connect(self.mpc.on_telemetry)
+            bus.thrusters.connect(self.mpc.on_thrusters)
+            bus.cmd_mpc_engage.connect(self.mpc.set_engaged)
+            bus.cmd_mpc_traj.connect(self.mpc.set_traj)
+            bus.cmd_mpc_start.connect(self.mpc.start_mission)
+            bus.cmd_mpc_mode.connect(self.mpc.set_mode)
+            bus.cmd_mpc_scenario.connect(self.mpc.set_scenario)
+            bus.cmd_enable.connect(self.mpc.on_enable)
+            bus.cmd_estop.connect(self.mpc.estop)
+            bus.cmd_log_sensors.connect(self.mpc.set_sensor_log)
 
         # Commands go straight to the simulated vehicle. Connections are made
         # before moveToThread on purpose: Qt resolves AutoConnection at emit
@@ -418,6 +573,9 @@ class DemoBackend(Backend):
         bus.cmd_buttons.connect(self.vehicle.set_js_buttons)
         bus.cmd_log_sensors.connect(self.vehicle.set_sensor_log)
         bus.cmd_mode.connect(self.vehicle.set_mode)
+        bus.cmd_pose_enable.connect(self.vehicle.set_pose_enabled)
+        bus.cmd_pose_click.connect(self.vehicle.set_pose_click)
+        bus.cmd_pose_reset.connect(self.vehicle.reset_pose)
 
     def describe(self) -> str:
         return "demo — synthetic vehicle and cameras; NO measurement value"

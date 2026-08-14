@@ -1,0 +1,184 @@
+# hw_nav.yaml — AprilTag navigation for the real vehicle (rov_gui/control/).
+#
+# CURRENT MISSION (2026-08-13): the SURVEYED 47-TAG FLOOR MAP (the gantry
+# tagslam map, config/tag_map.yaml — world = anchor tag 25 at (0,0,0), +Z
+# down) seen by the ROV's DEFAULT RGB camera. Multi-tag joint PnP against the
+# locked map: no single-tag flip ambiguity, no gravity gate on the >=2-tag
+# path — the same "known map -> PnP-only" regime the gantry runs used.
+# Control still re-zeros its own datum at ENGAGE ((0,0) = START pose); the
+# absolute map pose of that datum lands in meta.json hardware.datum_tag_frame.
+#
+# Two supported geometries, same code path (rov_gui/control/geometry.py):
+#   floor  the surveyed 47-tag map; any camera that sees the floor tags
+#          (default RGB via nav_source: second — set second_cam.tilt_deg to
+#          whatever the mount is ACTUALLY at).
+#   wall   ONE upright tag on the pool wall, crab square (heading_follow:
+#          false in hw_mpc.yaml) so the camera never turns away from it.
+geometry: floor
+
+detector: auto            # auto = pupil_apriltags, falls back to cv2.aruco
+tag_family: tag36h11
+tag_size_m: 0.170         # [스펙] config/config.yaml tags.tag_size_m (black edge)
+
+# WHICH feed localizes: 'main' = C3 colour (factory UNDERWATER intrinsics —
+# the accurate choice), 'second' = the ROV default RGB (the [예측] second_cam
+# block below; fx is a guess, so distances scale with its error).
+nav_source: main
+
+# Localizer-side datum: 'map' = the tag frame as-is (normal); 'first_fix' =
+# re-zero at the first accepted fix. NOTE the MISSION datum is separate and
+# always on: at every ENGAGE the current pose becomes (0,0,0)/yaw 0 for the
+# controller, square, geofence, plot and CSV — "(0,0) is where START was
+# pressed". Keep this at 'map' unless you specifically want the raw
+# localizer stream re-zeroed too.
+datum: map
+
+# floor geometry — the WHOLE mat: 128 ids / 140 physical tags, exactly the
+# 20x7 layout the operator surveyed by eye (2026-08-14). Built by
+#   python -m rov_gui.tools.build_tag_map sessions/nav_runs/20260813_215640 \
+#       --anchor config/tag_map.yaml -o config/tag_map_full.yaml --exclude 112,113
+# from the 2026-05-29 gantry survey's 47 tags, which stay FROZEN inside it
+# (that survey: median residual 0.227 px, anchor drift 0.0 mm). Duplicated ids
+# carry both physical copies as "<id>#0"/"<id>#1" entries.
+#
+# Measured on the run it was built from (sessions/nav_runs/20260813_215640,
+# 2984 frames): fix acceptance 74.3% -> 82.3%, tags per fix p50 9 -> 23,
+# accepted reproj p50 1.20 -> 1.27 px. The newly added tags are less accurate
+# than the surveyed core (out-of-plane spread 39 mm vs 8 mm) and the mat edges
+# are the worst of them; a slower second pass over the outer rows would
+# tighten it. Excluded 112/113: detected but NOT part of the mat (112 sat
+# 132 mm off the lattice and 62 mm out of plane) — operator confirmed.
+# Still MISSING: tag 149 (row 12 col 7) is in the frozen survey but was never
+# decoded in this run, so it rides through unverified — check the physical tag.
+tag_map: config/tag_map_full.yaml
+# The frozen survey, kept as the anchor source for future build_tag_map runs:
+#   config/tag_map.yaml
+
+# wall geometry — the single tag that IS the world frame.
+wall_tag_id: 104
+# Same print scale as the tagslam pool tags (user-confirmed 2026-08-12) =
+# 0.170 m black edge [스펙: config/config.yaml tags.tag_size_m]. PnP distance
+# is proportional to this — if the print batch ever changes, re-measure.
+wall_tag_size_m: 0.170
+# x_into_wall: NED x points INTO the wall => facing the tag is yaw 0 and the
+# ROV operates at x < 0 (before the datum re-zeros everything). Validated at
+# rest by the tag-vs-ATTITUDE roll/pitch residual the state assembler reports.
+wall_preset: x_into_wall
+
+# floor map: demand >=2 tags so one grazing detection never carries the whole
+# state (joint PnP over all visible tags is the accuracy win of having a map).
+# Counts UNIQUE anchor ids only (duplicate_ids below never count toward it).
+# Set back to 1 for the wall geometry.
+min_tags: 2
+max_reproj_px: 3.0
+stale_s: 0.5
+
+# Ids that exist TWICE on the physical mat. [측정: operator's cell-by-cell
+# survey of the 20x7 mat, 2026-08-14; cross-checked against config/tag_map.yaml
+# — 46 of the 47 surveyed tags land on the same id in that array, the one
+# exception being the cell the survey calls 149 (n_obs 47, unc 11.2 mm,
+# data/20260528/20260528_202333_survey/diagnostics_summary.json), transcribed
+# as a second 147.]
+#
+# Only 6 of these are IN the current map (60, 61, 66, 67, 70, 71); the other
+# 6 are outside the surveyed block and already ignored. They are all listed
+# anyway so that re-surveying a wider patch cannot silently start trusting one.
+#
+# How they are handled (rov_gui/control/tagnav.py): they never anchor a solve.
+# The unique tags fix the pose first, then each duplicated detection is kept
+# only if it lands within dup_confirm_px of its map entry. The mat is not a
+# repeated sheet — the two copies of an id share no neighbour except their own
+# pair partner — so the tags seen alongside it are what identify the copy.
+# NOTE: the map file now DECLARES its own duplicates (any id holding two
+# entries), and TagNav takes the union of that and this list — so this only
+# has to name ids whose second copy the map does NOT yet know about. Kept
+# here: 54, which the operator's table shows twice but the build found only
+# once (the build says that cell is 64, read off the tag 495 times). Until
+# that cell is checked by eye, holding 54 back costs one anchor and nothing
+# else. The build's own list is [60..71].
+duplicate_ids: [54]
+# Accept a duplicated tag as the surveyed copy within this reprojection error.
+# Sized off measured accepted-frame reproj (p50 1.22-1.34 px, p99 2.36 px,
+# sessions/nav_runs/20260813_17*/fixes.csv) vs the smallest possible wrong-copy
+# offset (0.1995 m grid pitch, ~128 px at 0.8 m) — a wide margin either way.
+dup_confirm_px: 6.0
+
+# Single-tag gravity gate: reject a fix whose implied roll/pitch disagrees
+# with ATTITUDE by more than this. The strict default (10) assumes a truly
+# VERTICAL tag and a LEVELLED camera tilt; a paper tag leaning against a
+# shelf and an open-loop tilt mount both eat every frame at 10 — which is
+# exactly what "N seen: gravity gate ..." in the TagNav row means. 25 is the
+# bench value [예측]; tighten it back once the tag is flat on a wall and the
+# tilt is confirmed level.
+tilt_gate_deg: 25.0
+
+# AprilTag quad-search decimation, PER FEED (float = every feed). The C3
+# colour stream is only 640x360 — decimating it would miss small/far tags
+# for no speed win — while the 720p+ ROV RGB needs 2.0 for camera-rate
+# detection. Corners are refined at full resolution either way.
+quad_decimate:
+  main: 1.0
+  second: 2.0
+
+# z for the MPC state: 'pressure' = ArduSub depth + a session offset anchored
+# to the tag world at engage; 'tag' = trust the PnP z.
+z_source: pressure
+
+# Which C3 stream feeds the MAIN panel's detection (when used).
+nav_stream: color
+
+# C3 extrinsic, FLU body frame (origin = vehicle COM). Source: the sim's
+# measured registration (Onshape 2026-07-19). Used when nav_source: main.
+cam_extrinsic_json: bluerov2_mujoco_marinegym/meshes/c3_payload_frames.json
+# cam_t_flu: [0.23949, 0.00547, -0.15537]
+# cam_xyaxes_flu: [0.0, -1.0, 0.0, -0.0056, 0.0, 0.99998]
+
+# The ROV DEFAULT RGB camera model, used when nav_source: second.
+# EVERY NUMBER HERE IS [예측] — this camera has no factory calibration:
+#   t_flu        rough tape estimate of the dome camera position vs COM
+#   xyaxes_flu   tilt mount assumed LEVEL — press mount_center before runs;
+#                a tilted mount rotates the whole world estimate
+#   fx/fy        from the vendor's in-air HFOV (~80 deg at 1920) behind the
+#                dome port; a wrong fx scales EVERY distance proportionally,
+#                so the square stays square but its size inherits the error
+# Calibrate (checkerboard through the dome, in water) before quoting numbers.
+second_cam:
+  t_flu: [0.18, 0.0, 0.0]
+  xyaxes_flu: [0.0, -1.0, 0.0, 0.0, 0.0, 1.0]
+  # Tilt-mount angle the extrinsic assumes, degrees DOWN from level. The
+  # mount is OPEN-LOOP: press LEVEL and keep 0.0, or drive to a stop and
+  # enter that angle. Tilting down helps the floor-map view; a value that
+  # does not match the real mount rotates the whole world estimate.
+  tilt_deg: 0.0
+  fx: 1144.0
+  fy: 1144.0
+  cx: 960.0
+  cy: 540.0
+  width: 1920
+  height: 1080
+  dist: []
+
+# Soft operating box, NED metres, in the ENGAGE-datum frame (START pose =
+# origin): "±1.2 m around where the run began, ±1 m of depth change". [예측]
+# — walk the pool and tighten before the first engage.
+geofence_ned:
+  x: [-1.2, 1.2]
+  y: [-1.2, 1.2]
+  z: [-1.0, 1.0]
+  margin: 0.3
+
+pool_draw_flu: [4.877, 1.8]   # display only
+
+# Pool boundary, DISPLAY ONLY (the trajectory plot's solid border, and what
+# its axes are scaled to). DERIVED from the tag map rather than typed: the
+# outermost tag EDGES plus this margin on every side — operator's definition,
+# 2026-08-14. Half a tag is added to each extreme CENTRE first, because the
+# map stores centres and the operator measures to the printed edge.
+#
+# With config/tag_map_full.yaml (140 physical tags) this resolves to
+#   x [-0.723, +1.302]  y [-2.120, +2.317]   =>  2.025 m x 4.437 m
+# [유도: tag centres x -0.538..+1.117, y -1.935..+2.132, + tag_size/2 + margin]
+# It follows the map, so rebuilding or extending the map moves the wall too.
+# To pin an explicit rectangle instead, set pool_ned: {x: [..], y: [..]} —
+# that wins over this.
+pool_margin_m: 0.10

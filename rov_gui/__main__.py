@@ -352,6 +352,104 @@ def build_parser() -> argparse.ArgumentParser:
                             f"(default: %(default)s, the vehicle's own "
                             f"assignment); -1 to leave it unmapped")
 
+    g = p.add_argument_group(
+        "object tracking (SAM2) — OFF unless --pose")
+    g.add_argument("--pose", action="store_true",
+                   help="build the object tracker. OFF by default and that is "
+                        "deliberate: it loads torch and SAM2 (seconds to tens "
+                        "of seconds, ~1.5 GB of VRAM) into the same process "
+                        "that commands the vehicle, so it is opt-in. Without "
+                        "it nothing is imported and the video worker does not "
+                        "even copy a frame. Needs the rovgui-pose env — "
+                        "'./c3 env' shows which interpreter the GUI resolved.")
+    g.add_argument("--pose-src", default=None, metavar="DIR",
+                   help="where the SAM2/FoundationPose project lives (default: "
+                        "$SAM2_LIVE_ROOT, else ~/Desktop/New Folder). That tree "
+                        "is READ-ONLY to this repo: rov_gui/perception/ adapts "
+                        "it, never edits it.")
+    g.add_argument("--pose-model", default="tiny",
+                   choices=("tiny", "small", "base_plus", "large"),
+                   help="SAM2 size (default: %(default)s). Measured on this "
+                        "RTX 5090 by the upstream project: tiny 84.5 fps / 777 "
+                        "MB, small 78.5, base_plus 60.6, large 37.1 fps / 1523 "
+                        "MB. tiny is the default because the station is sharing "
+                        "the GPU with nothing else that matters and 84 fps "
+                        "against a 30 fps camera leaves headroom.")
+    g.add_argument("--pose-mesh", default=None, metavar="MODEL.obj",
+                   help="object mesh for 6-DoF pose, in METRES. With it, a "
+                        "click registers in ~0.73 s and then tracks at 40-60 "
+                        "Hz, and nothing is reconstructed. Without it the "
+                        "station reconstructs one on site (see --pose-no-build)"
+                        ". FoundationPose needs depth either way, so pose only "
+                        "works at 0.3-0.8 m: past about 2 m the stereo noise "
+                        "exceeds 50 mm and registration simply fails.")
+    g.add_argument("--pose-no-build", action="store_true",
+                   help="track only — never collect reference views and never "
+                        "reconstruct. Gives a mask and no 6-DoF pose, which is "
+                        "a useful mode on its own: it is the one with no "
+                        "working-distance limit and no GPU-minutes. Without "
+                        "this flag and without --pose-mesh, clicking an object "
+                        "starts the model-free path (collect while you orbit "
+                        "-> reconstruct ~2 min in a child process -> pose), "
+                        "which is what the upstream tool does.")
+    g.add_argument("--pose-ref-dir", default="sessions/pose_meshes",
+                   metavar="DIR",
+                   help="parent directory for on-site reconstructions "
+                        "(default: %(default)s). Each attempt gets its own "
+                        "obj_<timestamp>/ holding the reference views, the "
+                        "training log and model/model.obj — pass that .obj to "
+                        "--pose-mesh next time to skip the two minutes. The "
+                        "path must not contain 'rgb': the reconstruction "
+                        "derives sibling paths by replacing that substring.")
+    g.add_argument("--pose-max-arc", type=float, default=75.0, metavar="DEG",
+                   help="stop collecting after this much accumulated rotation "
+                        "(default: %(default)s). Measured upstream on "
+                        "synthetic data: the per-view pose error is 9.7 mm at "
+                        "80 deg, 87 mm at 100 and 283 mm at 120 — it does not "
+                        "degrade, it falls off a cliff. Raising this does not "
+                        "buy more coverage, it buys a wrong mesh.")
+    g.add_argument("--pose-max-views", type=int, default=20, metavar="N",
+                   help="reference-view budget (default: %(default)s). Under "
+                        "6 the station refuses to reconstruct; 10+ is "
+                        "recommended; the reference implementation uses 16.")
+    g.add_argument("--pose-box3d", action="store_true",
+                   help="draw the full 12-edge oriented box instead of the "
+                        "three axes only")
+    g.add_argument("--pose-ckpt", default=None, metavar="PATH",
+                   help="explicit SAM2 checkpoint; by default the upstream "
+                        "search path finds it ($SAM2_CHECKPOINT_DIR first)")
+
+    g = p.add_argument_group(
+        "closed-loop MPC (AprilTag + acados) — OFF unless --mpc")
+    g.add_argument("--mpc", action="store_true",
+                   help="build the closed-loop stack: AprilTag PnP off the C3 "
+                        "colour stream -> the sim's EAOB+NMPC (verbatim from "
+                        "bluerov2_mujoco_marinegym/dobmpc, acados SQP-RTI, "
+                        "20 Hz) -> MANUAL_CONTROL through the normal command "
+                        "sink and all of its gates. OFF by default: it "
+                        "imports casadi+acados and code-generates the solver "
+                        "at startup (measured 1.3 s build, 2.1 ms probe in "
+                        "rovgui-pose — rov_gui/control/smoke.py). Engaging "
+                        "additionally needs COMMAND ENABLE, an armed vehicle "
+                        "in MANUAL, and a fresh tag fix. In --source demo it "
+                        "closes the loop against the synthetic plant.")
+    g.add_argument("--nav-config", default="config/hw_nav.yaml",
+                   help="AprilTag navigation config (default: %(default)s)")
+    g.add_argument("--mpc-config", default="config/hw_mpc.yaml",
+                   help="controller/mission config (default: %(default)s)")
+    g.add_argument("--nav-geometry", default=None, choices=("wall", "floor"),
+                   help="override the config's geometry: 'wall' = one tag on "
+                        "the pool wall, forward-level camera, crab square; "
+                        "'floor' = the surveyed floor map, camera remounted "
+                        "DOWN (needs a re-measured extrinsic in hw_nav.yaml)")
+    g.add_argument("--mpc-mode", default=None, choices=("mpc", "dobmpc"),
+                   help="override hw_mpc.yaml mode (same solver either way; "
+                        "dobmpc adds the EAOB disturbance feedforward)")
+    g.add_argument("--rov-model", default=None,
+                   choices=("heavy", "heavy_c3", "heavy_gripper"),
+                   help="override hw_mpc.yaml rov_model (which dobmpc plant "
+                        "parameters the controller carries)")
+
     g = p.add_argument_group("ui")
     g.add_argument("--ui-fps", type=float, default=60.0,
                    help="repaint rate (default: %(default)s). This is real "

@@ -105,6 +105,7 @@ QSize = QtCore.QSize
 QRect = QtCore.QRect
 QRectF = QtCore.QRectF
 QPointF = QtCore.QPointF
+QPoint = QtCore.QPoint
 
 QImage = QtGui.QImage
 QPixmap = QtGui.QPixmap
@@ -260,7 +261,8 @@ def qt_versions() -> dict[str, str]:
 __all__ = ["QtCore", "QtGui", "QtWidgets", "QT_API", "Signal", "Slot", "Property",
            "QAction", "QShortcut", "Qt", "QTimer", "QThread", "QObject",
            "QMetaObject", "QMutex",
-           "QMutexLocker", "QSize", "QRect", "QRectF", "QPointF", "QImage",
+           "QMutexLocker", "QSize", "QRect", "QRectF", "QPointF", "QPoint",
+           "QImage",
            "QPixmap", "QPainter", "QColor", "QFont", "QPen", "QBrush",
            "run_app", "import_cv2", "qt_versions", "sanitize_plugin_path",
            "preload_platform_libs", "binding_plugin_dir"]

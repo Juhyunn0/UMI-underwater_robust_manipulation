@@ -40,7 +40,7 @@ MAX_SENSOR_ROWS = 8
 # single "IMU" row that used to be here made it impossible to tell which one had
 # gone quiet — or which one a downstream pipeline was actually fusing.
 SENSOR_ORDER = ("IMU (ROV)", "IMU (C3)", "Barometer", "Compass", "Leak", "EKF",
-                "Heartbeat", "GPS")
+                "Heartbeat", "Pose (C3)", "GPS")
 
 
 def _caption(text: str) -> QtWidgets.QLabel:

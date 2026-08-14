@@ -49,6 +49,7 @@ the commanding GCS.
 from __future__ import annotations
 
 import math
+import queue
 import shutil
 import subprocess
 import time
@@ -59,12 +60,27 @@ import numpy as np
 
 from .. import imaging
 from ..net import NicMonitor
-from ..qt import Slot, import_cv2
+from ..qt import Qt, Slot, import_cv2
 from ..sensorlog import SensorLog
-from ..state import (Conn, PayloadState, PilotInput, SensorStat, Telemetry,
-                     ThrusterState, VideoStat, now)
+from ..state import (Conn, PayloadState, PilotInput, PoseTrack, SensorStat,
+                     Telemetry, ThrusterState, VehicleImu, VideoStat, now)
 from ..widgets.propulsion import pwm_to_norm
 from .base import Backend, LoopWorker, TimerWorker
+
+def _sha1_file(path: Path) -> str:
+    """Content hash of a file, streamed. Identifies a mesh in a log record.
+
+    The path alone is not an identity: reference-view directories get reused,
+    reconstructions get re-run, and "model.obj" is the same name every time.
+    """
+    import hashlib
+
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
 
 def _parse_ratio(text) -> tuple[int, int] | None:
     """'1/3' -> (1, 3). None leaves the config default alone."""
@@ -234,7 +250,16 @@ class C3VideoWorker(LoopWorker):
         self._imu_marks: deque[float] = deque(maxlen=512)
         self._last_imu_pub = 0.0
         self._imu_log = None
-        self._log_req: tuple[bool, str] | None = None
+        # Thread-safe hand-off from the GUI thread; see request_sensor_log.
+        self._log_q: queue.SimpleQueue = queue.SimpleQueue()
+        # Set by HardwareBackend when --pose is on. None = perception off, and
+        # then _tap_pose does not even copy a frame.
+        self.pose_mb = None
+        # Set by HardwareBackend when --mpc is on: the AprilTag worker's own
+        # mailbox. A SECOND slot, not a shared one, so tag navigation and SAM2
+        # tracking cannot starve each other of frames — and colour-only,
+        # because tag PnP has no use for depth (no 1.15 MB copy).
+        self.nav_mb = None
 
     def setup(self) -> None:
         # Imported here, not at module import: c3_camera's __init__ requires
@@ -418,19 +443,82 @@ class C3VideoWorker(LoopWorker):
                 if frame is None or frame.image is None:
                     continue                  # encoded passthrough, not decoded
                 self._publish(panel, stream, frame)
+            self._tap_pose(bundle)
+
+    # ------------------------------------------------------------ pose tap
+    def _tap_pose(self, bundle) -> None:
+        """Hand the newest RGB-D pair to the perception worker.
+
+        After the publish loop and gated on COLOUR being fresh, on purpose:
+
+        * colour is the rate that matters (30 fps against depth's 20), and one
+          tap per colour frame is what the tracker wants;
+        * ``bundle.frames`` is the latest of EVERY stream, so the depth here is
+          the newest depth whether or not it arrived this pass;
+        * ``bundle.skew_ms`` and ``bundle.intrinsics`` are available at exactly
+          this point, so the frame, its pairing error and the camera model
+          travel together and cannot get out of step.
+
+        Costs nothing when perception is off — the mailbox is None with no
+        --pose, and ``wanted()`` is False while TRACK is off. Both checks come
+        BEFORE the copies: the pose worker discards every item unread while
+        disabled, so copying 1.15 MB per frame to feed it was pure waste (and
+        contradicted the documented "off costs nothing" promise). The price is
+        that intrinsics reach the pose worker only after TRACK is first
+        switched on, which is also the first moment anything needs them.
+        """
+        want_pose = self.pose_mb is not None and self.pose_mb.wanted()
+        want_nav = self.nav_mb is not None and self.nav_mb.wanted()
+        if (not (want_pose or want_nav)) or "color" not in bundle.fresh:
+            return
+        color = bundle.frames.get("color")
+        depth = bundle.frames.get("depth")
+        if color is None or color.image is None:
+            return
+        # The stamp is when the frame was TRUE, not when we got here
+        # (state.py:13-15). age_ms() covers sensor->host.
+        t_capture = now() - (color.age_ms() / 1000.0)
+        intr = bundle.intrinsics.get("color") if bundle.intrinsics else None
+        # .copy() is not optional: DepthAI recycles its frame pool, so an array
+        # handed to another thread is a race the moment the next frame lands.
+        # imaging.py:11-17 documents the same hazard for QImage. Each consumer
+        # gets its OWN copy for the same reason — two threads reading one
+        # array is fine, but the pose worker hands its copy to torch, which
+        # may write into it.
+        if want_pose:
+            self.pose_mb.put(
+                color.image.copy(),
+                depth.image.copy() if (depth is not None
+                                       and depth.image is not None) else None,
+                intr, t_capture, bundle.skew_ms)
+        if want_nav:
+            self.nav_mb.put(color.image.copy(), None, intr, t_capture,
+                            bundle.skew_ms)
 
     # -------------------------------------------------------------- C3 IMU
-    @Slot(bool, str)
-    def set_sensor_log(self, on: bool, stem: str) -> None:
-        """Queued from the GUI. Handing the loop a request rather than a file
-        handle keeps every open/close on the thread that does the writing."""
-        self._log_req = (bool(on), str(stem))
+    def request_sensor_log(self, on: bool, stem: str) -> None:
+        """Start/stop the C3 IMU log. Runs on the CALLER's thread.
+
+        A plain method, NOT a ``@Slot``, and that distinction is the whole
+        point. This is a :class:`LoopWorker`: ``run()`` blocks on the camera for
+        the process lifetime, so the thread's event loop is never entered and a
+        QUEUED slot invocation would sit in a queue nobody services
+        (``backends/base.py`` module docstring). It was a slot until 2026-08-09,
+        and the consequence was silent — ``_c3_imu.jsonl`` was never created on
+        hardware while ``_rov.jsonl`` appeared every time, because
+        :class:`VehicleWorker` is a TimerWorker and its identical slot works.
+        Half a dataset, and the README claimed both files.
+
+        A queue rather than a bare attribute so a start/stop pair issued inside
+        one loop iteration cannot lose the start.
+        """
+        self._log_q.put((bool(on), str(stem)))
 
     def _service_log_request(self) -> None:
-        if self._log_req is None:
+        try:
+            on, stem = self._log_q.get_nowait()
+        except queue.Empty:
             return
-        on, stem = self._log_req
-        self._log_req = None
         if on and self._imu_log is None:
             self._imu_log = SensorLog(Path(f"{stem}_c3_imu.jsonl"), "c3")
             self.bus.log.emit("info", f"c3 imu log -> {self._imu_log.path}")
@@ -487,11 +575,16 @@ class C3VideoWorker(LoopWorker):
         img = frame.image
         h, w = img.shape[:2]
         tw, th = mb.target_size()
+        aux = None
         if stream == "depth":
             # Shrink the millimetres first, then colourise the small image.
             # See imaging.scale_depth: this is both 4x cheaper and the only
             # correct downscale for a depth map.
             small = imaging.depth_to_bgr(imaging.scale_depth(img, tw, th))
+            # The raw millimetres ride along so the panel can read a distance
+            # out from under the cursor. .copy() is mandatory — DepthAI
+            # recycles this buffer the moment the next frame lands.
+            aux = img.copy()
         else:
             small = imaging.scale_to_fit(img, tw, th)
         st = self.src.metrics.streams.get(stream)
@@ -503,7 +596,7 @@ class C3VideoWorker(LoopWorker):
             mbps=st.mbps if st else None,
             encoding=frame.encoding or ("16UC1" if stream == "depth" else ""),
             conn=Conn.ONLINE, stamp=now())
-        mb.put(imaging.bgr_to_qimage(small), stat)
+        mb.put(imaging.bgr_to_qimage(small), stat, aux=aux)
 
         t = time.monotonic()
         if t - self._last_stat > 0.5:
@@ -567,6 +660,11 @@ class GstRovCamWorker(LoopWorker):
         self._last_frame_t = 0.0
         self._warned_quiet = False
         self._last_stat = 0.0
+        # Set by HardwareBackend when --mpc is on: the AprilTag worker's tap
+        # for this feed. This camera has NO calibration, so its detections
+        # are an overlay only (TagOverlay.localizes=False) — intrinsics are
+        # deliberately passed as None.
+        self.nav_mb = None
 
     # The stream's own size. Scaling above it invents pixels; the pipeline is
     # capped here so a maximised panel cannot ask for more detail than exists.
@@ -712,6 +810,11 @@ class GstRovCamWorker(LoopWorker):
         mb = self.mailboxes.get("second")
         if mb is None:
             return
+        # Tap BEFORE scaling, so tag corners land in the stream's own pixels
+        # (the overlay scales by src dims). .copy() for the same reason as
+        # _tap_pose: the buffer is reused the moment the next frame lands.
+        if self.nav_mb is not None and self.nav_mb.wanted():
+            self.nav_mb.put(frame.copy(), None, None, now(), 0.0)
         t = time.monotonic()
         self._last_frame_t = t
         self._count += 1
@@ -823,6 +926,8 @@ class RovCamWorker(LoopWorker):
         self._skip_logged = 0.0
         self._debt = 0.0                 # frames we owe the discard loop
         self._last_loop = 0.0
+        # AprilTag tap (see GstRovCamWorker): overlay-only, no calibration.
+        self.nav_mb = None
 
     # --------------------------------------------------------------- session
     def setup(self) -> None:
@@ -973,6 +1078,9 @@ class RovCamWorker(LoopWorker):
             self._fps = self._count / (t - self._rate_t)
             self._count, self._rate_t = 0, t
 
+        # Same tap as the GStreamer path: full-res, pre-scale, no intrinsics.
+        if self.nav_mb is not None and self.nav_mb.wanted():
+            self.nav_mb.put(frame.copy(), None, None, now(), 0.0)
         h, w = frame.shape[:2]
         tw, th = mb.target_size()
         small = imaging.scale_to_fit(frame, tw, th)
@@ -1011,13 +1119,19 @@ class VehicleWorker(TimerWorker):
     """
 
     def __init__(self, bus, opts):
-        super().__init__("vehicle", interval_ms=100)
+        # With --mpc the tick doubles to 20 Hz: the control loop needs
+        # VehicleImu at its own rate, while the Telemetry snapshot stays
+        # throttled to 10 Hz below (the UI does not need more, and doubling
+        # the GUI-thread slot traffic buys nothing).
+        self._mpc = bool(getattr(opts, "mpc", False))
+        super().__init__("vehicle", interval_ms=50 if self._mpc else 100)
         self.bus = bus
         self.opts = opts
         self.logger = None
         self.nic = NicMonitor(peer=(getattr(opts, "blueos_host", "192.168.2.2"), 80))
         self._latest: dict[str, dict] = {}
         self._last_link = 0.0
+        self._last_tel = 0.0
         self._rho = float(getattr(opts, "water_density", WATER_RHO) or WATER_RHO)
         self._log: SensorLog | None = None
         # Everything worth keeping beside a depth recording. Deliberately a
@@ -1065,8 +1179,14 @@ class VehicleWorker(TimerWorker):
             self._latest[rec["msg_type"]] = rec
             if self._log is not None and rec["msg_type"] in self._log_msgs:
                 self._log.write(rec["msg_type"], rec)
-        self._publish()
         t = time.monotonic()
+        # Telemetry stays a 10 Hz human-rate snapshot even when the worker
+        # ticks at 20 Hz for the MPC; VehicleImu goes out every tick.
+        if t - self._last_tel >= 0.1:
+            self._last_tel = t
+            self._publish()
+        if self._mpc:
+            self._publish_imu()
         if t - self._last_link > 1.0:
             self._last_link = t
             self.bus.link.emit(self.nic.sample())
@@ -1211,6 +1331,43 @@ class VehicleWorker(TimerWorker):
         self.bus.telemetry.emit(tel)
         self._publish_thrusters()
 
+    def _publish_imu(self) -> None:
+        """The MPC's half of this worker: ATTITUDE + SCALED_IMU2 + pressure
+        depth as one NED/FRD snapshot, at the tick rate (20 Hz with --mpc).
+
+        ArduSub already speaks NED/FRD, so nothing is re-signed here —
+        re-signing sensor data away from the message definition is how frame
+        bugs start. SCALED_IMU2 carries SPECIFIC FORCE in mg (level and still
+        reads ~(0,0,-1000)); the conversion to body acceleration (gravity,
+        transport term) belongs to the state assembler, which owns the one
+        rotation matrix it needs.
+        """
+        att = self._latest.get("ATTITUDE")
+        imu = self._latest.get("SCALED_IMU2") or self._latest.get("RAW_IMU")
+        baro = self._latest.get("SCALED_PRESSURE2") \
+            or self._latest.get("SCALED_PRESSURE")
+        v = VehicleImu(conn=Conn.ONLINE if att is not None else Conn.OFFLINE,
+                       stamp=now())
+        if att is not None:
+            v.roll = att.get("roll")
+            v.pitch = att.get("pitch")
+            v.yaw = att.get("yaw")
+            v.p = att.get("rollspeed")
+            v.q = att.get("pitchspeed")
+            v.r = att.get("yawspeed")
+            v.t_att = att.get("t_host")
+        if imu is not None:
+            MG = 9.80665 / 1000.0            # SCALED_IMU2 accel is mg
+            for src, dst in (("xacc", "ax"), ("yacc", "ay"), ("zacc", "az")):
+                raw = imu.get(src)
+                if raw is not None:
+                    setattr(v, dst, float(raw) * MG)
+            v.t_imu = imu.get("t_host")
+        v.depth_m = self._depth_m()
+        if baro is not None:
+            v.t_baro = baro.get("t_host")
+        self.bus.vehicle_imu.emit(v)
+
     def _arm_state(self) -> tuple[bool | None, str]:
         """(armed, mode) from the autopilot's own heartbeat, or (None, "").
 
@@ -1221,6 +1378,13 @@ class VehicleWorker(TimerWorker):
         """
         rec = self._latest.get("HEARTBEAT")
         if rec is None:
+            return None, ""
+        # Age the RECORD, not this republish tick: `_latest` retains the last
+        # heartbeat forever, so without this a died stream keeps reading as
+        # "armed" — the same class of bug as the 2026-08-07 thruster-panel
+        # incident (see _publish_thrusters), and the armed/mode interlock of
+        # the MPC worker consumes this value. 3 s = 3 missed 1 Hz beats.
+        if now() - float(rec.get("t_host", 0.0)) > 3.0:
             return None, ""
         from pymavlink import mavutil
 
@@ -1331,6 +1495,11 @@ class NullCommandSink(TimerWorker):
         self.pilot = PilotInput()
         self.grip = 0.0
         self.lights = 0.0
+        # tick() reads this like MavlinkCommandSink does; only that class ever
+        # measured it off a servo. Leaving it undefined made every tick of a
+        # no-command build raise AttributeError into the failed-log (found
+        # 2026-08-12 while wiring the MPC).
+        self.lights_fb: float | None = None
         self.enabled = False
         self._warned = False
 
@@ -2069,6 +2238,477 @@ class MavlinkCommandSink(TimerWorker):
 
 
 # =============================================================================
+# object tracking
+# =============================================================================
+class PoseWorker(TimerWorker):
+    """Drives the SAM2 tracker from the frames C3VideoWorker taps.
+
+    A ``TimerWorker`` and not a ``LoopWorker``, and that is forced rather than
+    chosen: this worker has to RECEIVE — clicks, the enable toggle, reset — and
+    only a TimerWorker has the event loop that delivers a queued slot
+    (``backends/base.py``). The package already shipped one LoopWorker with a
+    slot on it, and the slot silently never fired; see
+    ``C3VideoWorker.request_sensor_log``.
+
+    It never blocks: the mailbox take is a mutex, and the session's own work
+    happens on the tracker's thread upstream.
+    """
+
+    def __init__(self, bus, mailbox, opts):
+        super().__init__("pose", interval_ms=20)
+        self.bus = bus
+        self.mailbox = mailbox
+        self.opts = opts
+        self.session = None
+        self.enabled = False
+        self._last_pub = 0.0
+        self._logged_intrinsics = False
+        self._fault = ""
+        self._log: SensorLog | None = None
+        self._log_intr = None
+        self._camera_written = False
+        self._mesh_logged = False        # console announcement, once per mesh
+        self._mesh_record_written = False  # MESH row, once per LOG FILE
+        self._mesh_desc_logged = False   # the estimator's own one-line summary
+        self._csv = None                 # flat pose rows beside the jsonl
+        self._last_t_cap = 0.0           # capture stamp of the newest frame
+        self._last_state = ""            # cursor for the LOG panel
+        self._last_event_state = ""      # cursor for the jsonl EVENT rows
+
+    @staticmethod
+    def _K_matrix(intr):
+        """Intrinsics -> 3x3, or None. c3_camera.geometry.Intrinsics has .K."""
+        if intr is None:
+            return None
+        try:
+            return intr.K
+        except Exception:                                        # noqa: BLE001
+            return None
+
+    def setup(self) -> None:
+        # Imported here, not at module scope: this pulls torch and SAM2, which
+        # must not be a requirement for starting the station.
+        from ..perception.session import PoseSession
+
+        mesh = getattr(self.opts, "pose_mesh", None) or None
+        # No mesh and building not refused: a click starts the model-free path
+        # (collect reference views -> reconstruct -> pose), which is what the
+        # upstream tool does with --pose and no --mesh. --pose-no-build opts
+        # back down to tracking only.
+        build = not mesh and not bool(getattr(self.opts, "pose_no_build", False))
+        self.session = PoseSession(
+            src_dir=getattr(self.opts, "pose_src", None) or None,
+            model=str(getattr(self.opts, "pose_model", "tiny") or "tiny"),
+            ckpt=getattr(self.opts, "pose_ckpt", None) or None,
+            mesh=str(mesh) if mesh else None,
+            build=build,
+            ref_dir=getattr(self.opts, "pose_ref_dir", None) or None,
+            max_arc=float(getattr(self.opts, "pose_max_arc", 75.0)),
+            max_views=int(getattr(self.opts, "pose_max_views", 20)))
+        # Load eagerly. The model takes seconds to tens of seconds, and doing it
+        # on the first click would make the click feel broken; doing it now
+        # overlaps with the pilot's setup instead. An idle tracker costs VRAM
+        # and nothing else.
+        self.session.start_async(on_log=self._say)
+        how = ("click an object and it will register against the mesh"
+               if mesh else
+               ("click an object, then orbit it slowly — the station collects "
+                "reference views, reconstructs a mesh (~2 min) and then "
+                "estimates pose" if build else
+                "tracking only (--pose-no-build): a mask, no 6-DoF pose"))
+        self.bus.log.emit("info", f"pose: tracker loading. Use TRACK on the "
+                                  f"C3 RGB panel, then {how}")
+
+    def _say(self, level: str, text: str) -> None:
+        """The on_log callback handed to the session.
+
+        Named ``_say`` and NOT ``_log``, and that is a scar: ``self._log`` is
+        the SensorLog attribute, and a method of the same name is shadowed by
+        it the moment ``__init__`` runs. Every ``on_log=self._log`` then passes
+        None (logs silently vanish) — or, while a recording is running, the
+        SensorLog object itself, which is not callable, so the first log call
+        inside the capture finalizer raised TypeError on every tick and the
+        pipeline could never leave COLLECTING VIEWS. The shadow test in
+        tests/test_offline.py now bans the pattern package-wide.
+        """
+        self.bus.log.emit(level, text)
+
+    # -------------------------------------------------------------- commands
+    @Slot(bool)
+    def set_enabled(self, on: bool) -> None:
+        """TRACK on/off. Off is also the pilot's ABORT.
+
+        Turning it off drops the object and, if a reconstruction is under way,
+        kills the child process — a two-minute GPU job that the button that
+        started it cannot stop is not something to put on a station that is
+        flying a vehicle at the same time.
+        """
+        self.enabled = bool(on)
+        # Tell the producer, not just ourselves: the video worker only copies
+        # frames into the mailbox while somebody wants them.
+        self.mailbox.set_wanted(self.enabled)
+        if not on and self.session is not None:
+            self.session.reset(on_log=self._say)
+
+    @Slot(float, float)
+    def set_click(self, x: float, y: float) -> None:
+        """A prompt in SOURCE pixels. The canvas already converted."""
+        if self.session is not None and self.enabled:
+            self.session.click(x, y)
+            if self._log is not None:
+                self._log.write("PROMPT", {"x": float(x), "y": float(y)})
+
+    @Slot()
+    def reset(self) -> None:
+        if self.session is not None:
+            self.session.reset(on_log=self._say)
+
+    @Slot(bool, str)
+    def set_sensor_log(self, on: bool, stem: str) -> None:
+        """Rides the C3 Depth recording, like the other two sensor logs.
+
+        A TimerWorker, so this queued slot really is delivered — unlike the one
+        C3VideoWorker used to declare. See request_sensor_log there.
+        """
+        if on and self._log is None:
+            self._log = SensorLog(Path(f"{stem}_pose.jsonl"), "pose")
+            self._camera_written = False
+            self._mesh_record_written = False   # each file names its mesh
+            self.bus.log.emit("info", f"pose log -> {self._log.path}")
+            self._write_camera_record()
+            self._open_csv(Path(f"{stem}_pose.csv"))
+        elif not on and self._log is not None:
+            meta = self._log.close()
+            self._log = None
+            self._close_csv()
+            self.bus.log.emit(
+                "info", f"pose log closed: {meta['records']} records "
+                        f"({meta['hz_measured'].get('TRACK', 0):.0f} Hz)")
+
+    # A flat file next to the jsonl, one row per estimated pose, because that
+    # is what a plotting script or pandas wants to eat. Same numbers, same
+    # capture-time stamps as the POSE rows — a second FORMAT, never a second
+    # source (health.py's rule about drawing one number in two places).
+    _CSV_HEADER = ("t,frame_seq,x_m,y_m,z_m,distance_m,"
+                   "r00,r01,r02,r10,r11,r12,r20,r21,r22,"
+                   "pose_hz,n_register,state\n")
+
+    def _open_csv(self, path: Path) -> None:
+        try:
+            self._csv = open(path, "w", encoding="utf-8")
+            self._csv.write(self._CSV_HEADER)
+            self.bus.log.emit("info", f"pose csv -> {path}")
+        except OSError as e:
+            self._csv = None
+            self.bus.log.emit("error", f"pose csv: {e}")
+
+    def _close_csv(self) -> None:
+        if self._csv is not None:
+            try:
+                self._csv.close()
+            except OSError:
+                pass
+            self._csv = None
+
+    def _write_csv(self, track: PoseTrack, t_cap: float) -> None:
+        if self._csv is None or track.T_cam_obj is None:
+            return
+        T = track.T_cam_obj
+        d = (T[3] ** 2 + T[7] ** 2 + T[11] ** 2) ** 0.5
+        row = [f"{t_cap:.4f}", str(track.frame_seq),
+               f"{T[3]:.5f}", f"{T[7]:.5f}", f"{T[11]:.5f}", f"{d:.5f}",
+               # rotation ROWS of T_cam_obj, row-major like the jsonl
+               f"{T[0]:.6f}", f"{T[1]:.6f}", f"{T[2]:.6f}",
+               f"{T[4]:.6f}", f"{T[5]:.6f}", f"{T[6]:.6f}",
+               f"{T[8]:.6f}", f"{T[9]:.6f}", f"{T[10]:.6f}",
+               f"{track.pose_hz:.2f}", str(track.n_register), track.state]
+        self._csv.write(",".join(row) + "\n")
+
+    def _write_camera_record(self) -> None:
+        """The camera model, ONCE, with its provenance spelled out.
+
+        A pose is only as metric as the intrinsics behind it, and these are an
+        in-air factory calibration. Writing that into the file rather than
+        implying it is the difference between a dataset and a trap six months
+        from now (CLAUDE.md on measurement provenance).
+        """
+        # Deferred until the intrinsics exist. Recording can be started before
+        # the first frame arrives, and a CAMERA record without a camera model in
+        # it is worse than none — it looks like the calibration was unavailable
+        # rather than merely not read yet.
+        if self._log is None or self._camera_written:
+            return
+        i = self._log_intr
+        if i is None:
+            return
+        self._camera_written = True
+        fields = {
+            "source": "C3 factory EEPROM via C3Source.intrinsics",
+            # UNDERWATER, not in-air — vendor-confirmed and measured
+            # (calib/fov_audit.py: HFOV 63.7 deg vs 67.2 Snell-underwater vs
+            # 95 in-air spec; KNOWN_ISSUES.md 2026-08-04). An earlier version
+            # of this record said "in_air": True, copied from a stale comment
+            # the same audit had already flagged as one of five wrong hardcoded
+            # phrases — exactly the "our own assumption printed into an output
+            # file comes back looking like the device said it" failure the
+            # measurement rule exists for.
+            "medium": "water", "rectified": False,
+            "depth_align": "color", "depth_units": "mm",
+            "note": "UNDERWATER factory calibration (vendor-confirmed; "
+                    "measured HFOV 63.7 deg matches the Snell-underwater "
+                    "prediction, not the in-air spec — calib/fov_audit.py, "
+                    "KNOWN_ISSUES.md 2026-08-04). Distances ARE metric in "
+                    "water. IN-AIR captures read ~1.33x LONG with this "
+                    "calibration, so bench-test depths must be divided by "
+                    "~1.33 before comparing against a tape measure.",
+            # Spell the convention out. Implying it is how a dataset becomes
+            # wrong six months later, and this one has two easy ways to be read
+            # backwards (which direction the transform maps, and which way Y
+            # points).
+            "frame": "T_cam_obj maps OBJECT -> CAMERA. OpenCV optical axes: "
+                     "+X right, +Y DOWN, +Z forward. Metres, row-major. NO "
+                     "camera->body transform is applied; the vehicle's own "
+                     "pose is not in this file.",
+            "mesh": str(getattr(self.opts, "pose_mesh", "") or ""),
+        }
+        fields.update({"fx": i.fx, "fy": i.fy, "cx": i.cx, "cy": i.cy,
+                       "width": i.width, "height": i.height,
+                       "distortion": list(i.distortion)})
+        self._log.write("CAMERA", fields)
+
+    # ------------------------------------------------------------------ tick
+    def tick(self) -> None:
+        s = self.session
+        if s is None:
+            return
+        item = self.mailbox.take()
+        if item is not None and item.get("K") is not None:
+            self._log_intr = item["K"]
+            if not self._logged_intrinsics:
+                self._logged_intrinsics = True
+                self._log_intrinsics(item["K"])
+            self._write_camera_record()   # no-op once written, or if not logging
+        if item is not None and self.enabled and s.ready:
+            # The session owns the phase machine from here: with a mesh it
+            # brings FoundationPose up on the first frame that carries K (which
+            # is why this cannot happen in setup()), and without one it runs
+            # capture -> reconstruct -> pose off these same frames.
+            s.submit(item["color"], item.get("depth"),
+                     item.get("t_capture", 0.0), item.get("seq", 0),
+                     K=self._K_matrix(item.get("K")), on_log=self._say)
+            self._log_mesh_once(s)
+        t = now()
+        if t - self._last_pub < 0.1:          # publish at 10 Hz, not 50
+            return
+        self._last_pub = t
+        track = self._snapshot(s)
+        self.bus.pose.emit(track)
+        self._announce(track)
+        self._log_track(track, item)
+
+    # Stages worth a line in the LOG panel, and how loud. The overlay is where
+    # the pilot watches this, but the overlay has no history — after the fact,
+    # "did it ever start reconstructing?" can only be answered from the log.
+    _STAGE_WORDS = {
+        "capturing": ("info", "collecting reference views"),
+        "building": ("info", "reconstructing the mesh"),
+        "pose_loading": ("info", "loading FoundationPose"),
+        "registering": ("info", "registering the pose"),
+        "tracking": ("info", "tracking"),
+        "lost": ("warn", "lost the object"),
+        "failed": ("error", "stopped"),
+        "fault": ("error", "fault"),
+    }
+
+    def _announce(self, track: PoseTrack) -> None:
+        if track.state == self._last_state:
+            return
+        self._last_state = track.state
+        level, word = self._STAGE_WORDS.get(track.state, (None, ""))
+        if level is not None:
+            note = f" — {track.note}" if track.note else ""
+            self.bus.log.emit(level, f"pose: {word}{note}")
+
+    def _log_mesh_once(self, s) -> None:
+        """Record WHICH mesh the poses in this file were measured against.
+
+        A pose is a statement about a specific 3-D model, and an on-site
+        reconstruction is a different model every time. Without the path, the
+        hash and the sanity-check lines in the file, a POSE row six months from
+        now is a number with no object behind it (CLAUDE.md on provenance).
+        """
+        mesh = getattr(s, "mesh", None)
+        if not mesh:
+            return
+        # TWO latches, never one. The console announcement happens once per
+        # mesh; the file record happens once per LOG FILE. A single latch
+        # consumed by the console path meant a mesh that existed before the
+        # recording started was announced and then never written — the file
+        # whose whole point is provenance was the one place without it.
+        need_console = not self._mesh_logged
+        need_record = self._log is not None and not self._mesh_record_written
+        if not (need_console or need_record):
+            return
+        fields = {
+            "path": str(mesh),
+            "reconstructed_on_site": bool(not getattr(self.opts, "pose_mesh",
+                                                      None)),
+            "ref_views_dir": s.ref_dir,
+            "checks": list(s.mesh_check_lines),
+            "units": "metres",
+        }
+        try:
+            fields["sha1"] = _sha1_file(Path(str(mesh)))
+        except OSError as e:
+            fields["sha1"] = f"unreadable: {e}"
+        if need_console:
+            self._mesh_logged = True
+            self.bus.log.emit("info", f"pose: mesh {Path(str(mesh)).name} "
+                                      f"({fields['sha1'][:12]})")
+        if need_record:
+            self._mesh_record_written = True
+            self._log.write("MESH", fields)
+
+    def _log_track(self, track: PoseTrack, item) -> None:
+        """One row per published result, plus a row on every state change.
+
+        Stamped with the frame's CAPTURE time, not now — that is what lines the
+        rows up against the video they belong to (sensorlog.py on clocks).
+        """
+        if self._log is None:
+            return
+        # A separate cursor from _announce's: the log only exists while a
+        # recording is running, and sharing one would make the LOG panel go
+        # quiet the moment recording was off (or repeat itself the moment it
+        # was on).
+        if track.state != self._last_event_state:
+            self._log.write("EVENT", {"from": self._last_event_state,
+                                      "to": track.state, "note": track.note})
+            self._last_event_state = track.state
+        if track.state not in ("tracking", "lost", "idle", "live"):
+            return
+        # The 10 Hz publish gate is independent of frame arrival, so item is
+        # None on the ticks between camera frames. The pose on those ticks is
+        # still the one estimated from the LAST frame, so it gets that frame's
+        # capture time — not 0.0 (which sorted every such CSV row to the epoch)
+        # and not now() (which is the clock rule sensorlog.py exists to stop).
+        t_cap = float(item.get("t_capture") or 0.0) if item else 0.0
+        if t_cap:
+            self._last_t_cap = t_cap
+        else:
+            t_cap = self._last_t_cap
+        if track.T_cam_obj is not None:
+            T = track.T_cam_obj
+            self._log.write("POSE", {
+                "state": track.state, "frame_seq": track.frame_seq,
+                # 16 floats, ROW-MAJOR, object -> camera, metres, OpenCV axes.
+                # The manifest says so in words too; a convention that is only
+                # implied is a convention that will be read wrong.
+                "T_cam_obj": [round(v, 6) for v in T],
+                "pos_m": [round(T[3], 5), round(T[7], 5), round(T[11], 5)],
+                "distance_m": round(float(
+                    (T[3] ** 2 + T[7] ** 2 + T[11] ** 2) ** 0.5), 5),
+                "pose_hz": round(track.pose_hz, 2),
+                "n_register": track.n_register,
+                "mask_px": track.mask_px,
+            }, t=t_cap or None)
+            self._write_csv(track, t_cap)
+        self._log.write("TRACK", {
+            "state": track.state, "frame_seq": track.frame_seq,
+            "mask_px": track.mask_px, "score": track.score,
+            "sam_hz": round(track.sam_hz, 2),
+            "skew_ms": round(float(item.get("skew_ms") or 0.0), 2) if item else None,
+            "src_w": track.src_w, "src_h": track.src_h,
+            # The outline itself, so a recording can be re-analysed offline
+            # without re-running SAM2. ~1 kB, and it is the actual result.
+            "contours": [[[round(x, 1), round(y, 1)] for x, y in poly]
+                         for poly in track.contours],
+        }, t=t_cap or None)
+
+    def _snapshot(self, s) -> PoseTrack:
+        if s.error:
+            return PoseTrack(state="fault", note=s.error, conn=Conn.FAULT,
+                             stamp=now())
+        if s.loading:
+            return PoseTrack(state="loading", load_s=s.load_seconds,
+                             note="loading SAM2", conn=Conn.CONNECTING,
+                             stamp=now())
+        if not s.ready:
+            return PoseTrack(state="off", conn=Conn.OFFLINE, stamp=now())
+        if not self.enabled:
+            return PoseTrack(state="off", note="TRACK is off",
+                             conn=Conn.OFFLINE, stamp=now())
+        raw = s.poll() or {}
+        state = raw.get("state", "idle")
+        conn = {"tracking": Conn.ONLINE, "lost": Conn.DEGRADED,
+                "live": Conn.ONLINE,
+                # Work in progress, not a healthy steady state: CONNECTING is
+                # what the rest of the station uses for "on its way, do not
+                # read it yet". The colour is the fastest signal on the panel,
+                # so these must NOT be the same green as a working pose.
+                "capturing": Conn.CONNECTING,
+                "building": Conn.CONNECTING,
+                "pose_loading": Conn.CONNECTING,
+                "registering": Conn.CONNECTING,
+                # Gave up. Sticks until the pilot retries, and says why.
+                "failed": Conn.FAULT,
+                "fault": Conn.FAULT}.get(state, Conn.ONLINE)
+        if not self._mesh_desc_logged and s.mesh_description:
+            self._mesh_desc_logged = True
+            self.bus.log.emit("info", f"pose: {s.mesh_description}")
+        return PoseTrack(
+            state=state, contours=raw.get("contours", ()),
+            T_cam_obj=raw.get("T_cam_obj"),
+            axes_px=raw.get("axes_px", ()), box_px=raw.get("box_px", ()),
+            score=raw.get("score"), mask_px=int(raw.get("mask_px", 0)),
+            sam_hz=float(raw.get("sam_hz", 0.0)),
+            pose_hz=float(raw.get("pose_hz", 0.0)),
+            n_register=int(raw.get("n_register", 0)),
+            frame_seq=int(raw.get("frame_seq", 0)),
+            src_w=int(raw.get("src_w", 0)), src_h=int(raw.get("src_h", 0)),
+            n_views=int(raw.get("n_views", 0)),
+            arc_deg=float(raw.get("arc_deg", 0.0)),
+            max_arc=float(raw.get("max_arc", 0.0)),
+            max_views=int(raw.get("max_views", 0)),
+            build_s=float(raw.get("build_s", 0.0)),
+            distance_m=float(raw.get("distance_m", 0.0)),
+            fp_load_s=float(raw.get("fp_load_s", 0.0)),
+            pose_expected=bool(raw.get("pose_expected", False)),
+            note=raw.get("message", ""), conn=conn, stamp=now())
+
+    def _log_intrinsics(self, intr) -> None:
+        """Say the camera model out loud, once, with its provenance.
+
+        The C3's EEPROM calibration is an UNDERWATER one — vendor-confirmed
+        and measured (calib/fov_audit.py; KNOWN_ISSUES.md 2026-08-04). That
+        cuts the way an operator on a bench does not expect: in-water
+        distances are metric, and it is the DESK test that reads long. An
+        earlier version of this message said the opposite, quoting a stale
+        comment the audit had already flagged — the operator would have
+        distrusted exactly the numbers that were right.
+        """
+        try:
+            self.bus.log.emit(
+                "info",
+                f"pose: C3 colour intrinsics fx={intr.fx:.1f} fy={intr.fy:.1f} "
+                f"cx={intr.cx:.1f} cy={intr.cy:.1f} @{intr.width}x{intr.height} "
+                f"— UNDERWATER factory calibration (vendor-confirmed, "
+                f"KNOWN_ISSUES 2026-08-04): in-water distances are metric; "
+                f"IN-AIR bench tests read ~1.33x long")
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    def teardown(self) -> None:
+        if self._log is not None:
+            self._log.close()             # a killed station still gets a file
+            self._log = None
+        self._close_csv()
+        if self.session is not None:
+            self.session.close()          # joins the tracker thread; mandatory
+            self.session = None
+
+
+# =============================================================================
 # backend
 # =============================================================================
 class HardwareBackend(Backend):
@@ -2083,6 +2723,17 @@ class HardwareBackend(Backend):
         self.sink = (MavlinkCommandSink(bus, opts) if allow
                      else NullCommandSink(bus, opts))
         self.workers = [self.video, self.vehicle, self.sink]
+        # Object tracking: opt-in, and when it is off nothing is constructed,
+        # nothing is imported, and C3VideoWorker does not even copy a frame.
+        self.pose = None
+        if bool(getattr(opts, "pose", False)):
+            from ..bus import RgbdMailbox
+
+            mb = RgbdMailbox()
+            self.video.pose_mb = mb
+            self.pose = PoseWorker(bus, mb, opts)
+            self.workers.append(self.pose)
+
         self.rovcam = None
         if getattr(opts, "panel2", "rov") == "rov":
             want = getattr(opts, "rov_cam_backend", "auto")
@@ -2091,6 +2742,31 @@ class HardwareBackend(Backend):
             self.rovcam = (GstRovCamWorker(bus, mailboxes, opts) if use_gst
                            else RovCamWorker(bus, mailboxes, opts))
             self.workers.insert(1, self.rovcam)
+
+        # Closed-loop MPC: opt-in like --pose; off = nothing constructed and
+        # no video worker copies a frame for it. Both new workers are
+        # TimerWorkers, so every connection below is a queued slot that IS
+        # delivered (backends/base.py rule). Built AFTER the rovcam worker so
+        # its feed can be tapped too: the C3 colour feed localizes (factory
+        # intrinsics ride each frame), the ROV RGB feed is detection-overlay
+        # only (no calibration exists for it).
+        self.tagnav = None
+        self.mpc = None
+        if bool(getattr(opts, "mpc", False)):
+            from ..bus import RgbdMailbox
+            from ..control.workers import MpcWorker, TagNavWorker
+
+            nav_mb = RgbdMailbox()
+            self.video.nav_mb = nav_mb
+            nav_sources = {"main": nav_mb}
+            if self.rovcam is not None:
+                rov_mb = RgbdMailbox()
+                self.rovcam.nav_mb = rov_mb
+                nav_sources["second"] = rov_mb
+            self.tagnav = TagNavWorker(bus, nav_sources, opts)
+            self.mpc = MpcWorker(bus, opts)
+            self.workers.append(self.tagnav)
+            self.workers.append(self.mpc)
 
         bus.cmd_pilot.connect(self.sink.set_pilot)
         bus.cmd_gripper.connect(self.sink.set_gripper)
@@ -2109,8 +2785,44 @@ class HardwareBackend(Backend):
         # sources get the same request and each writes its own file, because
         # they are different devices on different clocks — one merged file would
         # have to pick a clock and would be lying about the other.
+        # VehicleWorker is a TimerWorker: it has an event loop, so a queued slot
+        # is delivered between ticks and AutoConnection is correct.
         bus.cmd_log_sensors.connect(self.vehicle.set_sensor_log)
-        bus.cmd_log_sensors.connect(self.video.set_sensor_log)
+        # C3VideoWorker is a LoopWorker: it has NO event loop, so an
+        # AutoConnection would resolve to Queued and never be delivered. The
+        # receiver is a plain thread-safe method and the connection must be
+        # DIRECT — it runs on the GUI thread and only puts to a queue.
+        bus.cmd_log_sensors.connect(self.video.request_sensor_log,
+                                    Qt.ConnectionType.DirectConnection)
+        if self.pose is not None:
+            # PoseWorker IS a TimerWorker, so these queued slots are delivered.
+            bus.cmd_pose_enable.connect(self.pose.set_enabled)
+            bus.cmd_pose_click.connect(self.pose.set_click)
+            bus.cmd_pose_reset.connect(self.pose.reset)
+            bus.cmd_log_sensors.connect(self.pose.set_sensor_log)
+        if self.mpc is not None:
+            # Sensor fan-in (worker -> bus -> worker: each hop is a queued
+            # snapshot, so the MPC thread never touches another thread's data).
+            bus.nav_fix.connect(self.mpc.on_nav_fix)
+            bus.vehicle_imu.connect(self.mpc.on_vehicle_imu)
+            bus.telemetry.connect(self.mpc.on_telemetry)
+            bus.thrusters.connect(self.mpc.on_thrusters)
+            bus.vehicle_imu.connect(self.tagnav.set_imu_hint)
+            # The sink's own health gates engage: computing a mission that the
+            # sink cannot deliver (no peer / SYSID mismatch) helps nobody.
+            # status() only reads plain fields — safe cross-thread.
+            self.mpc.sink_status_fn = self.sink.status
+            # Commands + the safety fan-out: E-STOP and COMMAND ENABLE off
+            # must reach the MPC as well as the sink.
+            bus.cmd_mpc_engage.connect(self.mpc.set_engaged)
+            bus.cmd_mpc_traj.connect(self.mpc.set_traj)
+            bus.cmd_mpc_start.connect(self.mpc.start_mission)
+            bus.cmd_mpc_mode.connect(self.mpc.set_mode)
+            bus.cmd_mpc_scenario.connect(self.mpc.set_scenario)
+            bus.cmd_enable.connect(self.mpc.on_enable)
+            bus.cmd_estop.connect(self.mpc.estop)
+            bus.cmd_log_sensors.connect(self.mpc.set_sensor_log)
+            bus.cmd_tag_enable.connect(self.tagnav.set_source_enabled)
 
     def describe(self) -> str:
         kind = "MAVLink command sink" if isinstance(self.sink, MavlinkCommandSink) \

@@ -6,16 +6,52 @@
 데이터, 실제 C3 + ArduSub, ROS 2 토픽 위에서 그대로 돈다.
 
 ```
-python -m rov_gui                    # 합성 데이터. 하드웨어를 열지 않는다
-python -m rov_gui --source hw        # C3 + ArduSub (연결 전에 preflight)
-python -m rov_gui --source ros2      # rclpy 토픽
-./c3 gui                             # 래퍼가 인터프리터·cwd를 골라준다
+./c3 gui                             # 이걸 쓴다. 래퍼가 인터프리터·cwd를 골라준다
+./c3 gui --source hw                 # C3 + ArduSub (연결 전에 preflight)
+./c3 gui --source demo               # 합성 데이터. 하드웨어를 열지 않는다
 ```
 
-`./c3 gui`를 권한다. `--source hw`는 `c3_camera`를 import하고 그건 **depthai
-2.x**를 요구하는데, 이 데스크톱의 기본 python은 conda base(depthai 3.5.0)라서
-Pipeline을 만드는 것만으로 카메라를 채갈 수 있다. 래퍼는 `robust` 인터프리터를
-절대경로로 호출한다.
+`./c3 gui`를 권한다. 이유가 두 개다.
+
+**1. depthai 버전.** `--source hw`는 `c3_camera`를 import하고 그건 **depthai 2.x**를
+요구하는데, 이 데스크톱의 기본 python은 conda base(depthai 3.5.0)라서 Pipeline을 만드는
+것만으로 카메라를 채갈 수 있다. 래퍼는 인터프리터를 절대경로로 호출한다.
+
+**2. GUI는 이제 자기 env에서 돈다** (2026-08-09부터). `./c3`의 카메라 도구들은 `robust`를
+쓰지만 `./c3 gui`는 **`rovgui-pose`** 를 쓴다 — 스테이션이 SAM2 + FoundationPose 물체
+추적기를 같은 프로세스에 얹기 때문이고, 그 스택은 `robust`에 못 들어간다:
+
+| | rovgui-pose (GUI) | robust (시뮬·acados·SLAM) |
+|---|---|---|
+| torch / sam2 | 2.11+cu128 / 있음 | 없음 |
+| numpy | **2.4.4** | 1.26.4 (gtsam 때문에 <2) |
+| depthai · cv2 · Qt | 2.32 · 5.0 · 5.15.14 | 2.32 · 4.10 · 5.15.14 |
+
+`rovgui-pose`는 **`oakd`의 복제본 + PyQt5 + depthai 2.32**다. 비싼 건 FoundationPose의
+컴파일된 CUDA 확장(pytorch3d·kaolin·nvdiffrast·자체 mycpp/mycuda)이고 그게 `oakd`에 이미
+빌드돼 있어서, `robust`에 torch를 얹는 것보다 이 방향이 압도적으로 싸다.
+**numpy는 반드시 2.x** — torch 2.11이 numpy 2의 C ABI에 컴파일돼 있어서 1.26에서는
+메타데이터와 무관하게 초기화에 실패한다.
+
+검증(2026-08-09): 그 env에서 `rov_gui` 37/37, `c3_camera` 58/58 통과, Qt는 양쪽 5.15.14로
+같고 최소 창 크기도 986×763으로 동일하다 — 한 화면 약속이 그대로다.
+
+`rovgui-pose`가 없으면 래퍼가 **원래 인터프리터로 폴백하고 그렇게 말한다.** 스테이션은
+정상 동작하고 `--pose`(물체 추적)만 못 쓴다. 만드는 법도 그때 같이 찍어준다:
+
+```bash
+conda create -n rovgui-pose --clone oakd
+P=~/miniforge3/envs/rovgui-pose/bin
+$P/pip install --force-reinstall --no-deps numpy==2.4.4   # 클론이 numpy를 깨뜨린다
+$P/pip install PyQt5==5.15.11 'depthai~=2.32.0' pymavlink
+```
+
+> `conda create --clone`은 **numpy를 조용히 깨뜨린다** — pip 메타데이터는 2.4.4인데 실제
+> 파일은 conda의 1.26.4가 된다. `pip list`로는 안 보이고 `import numpy`로만 보인다.
+> 클론 직후 `python -c "import numpy, torch"`로 반드시 확인할 것.
+
+어느 인터프리터로 갈지는 `./c3 env`가 두 줄로 보여준다(`interpreter` = 카메라 도구,
+`gui` = 스테이션). `$ROVGUI_PY`로 덮어쓸 수 있다.
 
 ## 화면 구성
 
@@ -31,6 +67,19 @@ row 3   TELEOP | PAYLOAD | PROPULS. | SENSORS
 (C3 좌측 mono) / `none`.
 
 영상 패널을 **더블클릭**하면 그 피드가 큰 슬롯으로 올라온다.
+
+### C3 Depth 패널 — 커서가 곧 측정기
+
+depth 패널 위에 마우스를 올리면 **그 픽셀의 실제 거리**가 커서 옆에 뜬다(`0.45 m`).
+색을 눈으로 환산하는 게 아니라, 화면의 그 프레임과 **함께 메일박스를 타고 온 원본
+uint16 밀리미터 맵**을 읽는다 — 값과 그림이 다른 프레임에서 올 수 없는 구조다.
+구멍(스테레오 무효, 0 mm)은 `no data`로 뜬다. 0.00 m로 보여주면 물체가 렌즈에 붙어
+있다는 뜻이 되기 때문이다.
+
+컬러바도 커졌다(패널 높이의 절반까지): 끝 라벨 0.3 m / 6 m에 **1·2·4 m 눈금**이
+있고, 눈금 위치는 색칠과 같은 선형 공식(`imaging.depth_to_bgr`)을 쓴다 — 다른 공식을
+쓰면 범례가 거짓말을 한다. 커서가 depth를 읽는 동안엔 그 값이 컬러바 위에 마커로도
+표시된다.
 
 ### 한 화면에 들어가게 만드는 것은 레이아웃이 아니라 size policy다
 
@@ -246,6 +295,415 @@ TX 20 Hz   AUTOPILOT DRIVING (STABILIZE) — bars show YOUR command only
 > 20으로 바꿨더니 슬라이더는 20%, 라벨은 60%, 실제 배율은 0.60이 됐다 — 조종사가 읽는
 > 값의 3배가 나가는 상태. 지금은 `DEFAULT_OUTPUT_PCT` 하나에서 핸들러를 통해 셋 다
 > 세팅하고, 테스트가 셋의 일치를 지킨다.
+
+## 물체 추적 + 6-DoF pose — `--pose`
+
+C3 RGB 피드에서 물체를 클릭하면 SAM2가 그걸 계속 따라가고, 이어서 6-DoF 자세까지 나온다.
+**기본은 꺼져 있다.** 켰을 때 세 갈래 중 어디로 가는지는 플래그가 정한다:
+
+| | 클릭하면 | GPU 시간 | 작동 거리 |
+|---|---|---|---|
+| `--pose` | 참조뷰 수집 → 재구성 → 자세 | 수집 + ~1–2분 | 0.3~0.8 m |
+| `--pose --pose-mesh M.obj` | 그 메시로 바로 등록 → 자세 | ~0.73 s | 0.3~0.8 m |
+| `--pose --pose-no-build` | 마스크만 | 없음 | 제한 없음 |
+
+```bash
+./c3 gui --source hw --allow-command --pose
+```
+
+패널 오른쪽 위 `TRACK`을 켜고 물체를 **한 번 클릭**하면 된다. 더블클릭은 여전히 피드를 큰
+슬롯으로 승격시킨다.
+
+실측(2026-08-09, RTX 5090, `--pose-model tiny`): 로딩 **1.1초**, 클릭 후 `tracking` 진입,
+**36 Hz**. 모델 크기는 `--pose-model`로 바꾼다(tiny 84.5 fps/777 MB … large 37.1 fps/1523 MB,
+원본 프로젝트 실측).
+
+### 설계상 중요한 것 넷
+
+* **끄면 진짜로 없다.** `--pose` 없이는 torch도 SAM2도 import되지 않고, `C3VideoWorker`는
+  프레임을 **복사조차 하지 않는다**(`_tap_pose`가 메일박스 None을 보고 즉시 리턴).
+* **레이아웃 비용 0.** `TRACK` 버튼은 REC 옆에 절대배치된 패널의 자식이고, 마스크·상태 칩은
+  `paintEvent`의 페인트 패스다 — `legend=`와 같은 방식. 세로 여유가 5 px뿐이라 새 행이
+  불가능한데, 실제로 최소 창은 **1152×763으로 그대로다**(테스트가 켠 상태와 끈 상태를 둘 다
+  검사한다).
+* **마스크가 아니라 윤곽선이 건너온다.** 640×360 bool 마스크는 프레임당 230 kB이고 GUI
+  스레드가 픽셀 단위로 그려야 한다. `findContours` + `approxPolyDP`로 ~1 kB 폴리라인으로
+  만들어서 `QPainterPath`로 그린다 — 같은 그림, GUI 스레드에 픽셀 작업 0.
+* **클릭은 400 ms 지연된다.** Qt는 더블클릭에도 press+release를 **먼저** 보내므로, 단순
+  `mousePressEvent`는 승격 제스처마다 프롬프트를 오발한다. 시스템의 `doubleClickInterval`
+  만큼 미루고 더블클릭이 오면 취소한다. 지연은 안 보인다 — 물체 선택 자체가 즉각적인
+  동작이 아니다.
+
+### 좌표 변환의 함정
+
+패널 클릭 → **소스 픽셀**은 좌표계가 셋이고 가운데가 함정이다:
+
+```
+캔버스 px --(레터박스)--> 표시된 이미지 px --(배율)--> 소스 px
+```
+
+표시된 이미지는 소스가 아니다(워커가 패널 크기로 줄여서 넣는다). 그런데 `scale_to_fit`은
+축소율이 0.85 이상이면 **원본을 그대로 돌려주므로**(`NO_RESIZE_ABOVE`), 그 배율이 창 크기에
+따라 1.0과 다른 값 사이를 오간다. 둘 중 하나를 가정하면 어떤 창 크기에서 조용히 틀린다.
+레터박스 바 위의 클릭은 `None`으로 거부한다.
+
+### 6-DoF pose — `--pose-mesh`
+
+메시를 주면 클릭 후 **약 0.73초**에 자세가 붙고 그 뒤로는 40~60 Hz로 추적한다.
+
+```bash
+./c3 gui --source hw --allow-command --pose \
+         --pose-mesh "~/Desktop/New Folder/ref_views/model/model.obj"
+```
+
+실측(2026-08-09, 저장된 참조뷰 + 그 메시로 재생): 메시 `13444 verts 101×135×165 mm`,
+등록 성공, `T[:3,3] = [0.058, 0.109, 0.413] m`(거리 **0.431 m**), 축 투영 정상, 종료 깨끗.
+
+화면에는 RGB 축(원하면 `--pose-box3d`로 12-edge 박스)과 아래 한 줄이 뜬다:
+
+```
+x +0.084  y +0.020  z +0.581 m    d 0.59 m    42 Hz   reg 1
+```
+
+### 현장 재구성 — 메시가 없을 때 (기본)
+
+`--pose-mesh` 없이 `--pose`만 주면 **클릭 한 번이 전부**다. 스테이션이 알아서 참조 뷰를
+모으고, 메시를 재구성하고, 그 메시로 자세를 추정한다. 원본 도구의 `--pose` 동작과 같다.
+
+```bash
+./c3 gui --source hw --allow-command --pose     # 메시 없이도 pose까지 간다
+```
+
+### 화면이 항상 단계를 말한다
+
+C3 RGB 패널 왼쪽 위에 **두 줄**이 뜬다. 위는 **지금 무슨 단계인지**, 아래는 **왜 안
+넘어가는지**. 둘 다 필요하다 — 수집 중에는 카운터가 안 올라가는 게 정상인지 고장인지를
+아래 줄만이 말해준다.
+
+```
+LOADING SAM2 — 1s
+READY — CLICK AN OBJECT
+COLLECTING VIEWS  7/20    ORBIT 31/75°    0.45 m
+    too close in angle to a view already taken (3 deg)
+COLLECTING VIEWS  3/20    ORBIT 62/75°    1.24 m
+    object too far (124 cm) — bring it to 30-80 cm
+RECONSTRUCTING MESH — 42s
+    BundleSDF is running in a child process
+LOADING FOUNDATIONPOSE — 8s
+REGISTERING POSE...
+POSE TRACKING  44 Hz
+TRACKING  30 Hz — no pose yet          ← pose는 기대하는데 아직 없음
+TRACKING  30 Hz — mask only            ← --pose-no-build. 원래 자세가 없는 모드
+LOST — CLICK THE OBJECT AGAIN
+STOPPED
+    stopped after 74 deg with only 3 usable views (need 6) — turn the object
+    more slowly, keep it 30-80 cm away, then press TRACK again
+```
+
+거리를 칩에 넣은 이유: **0.3~0.8 m를 벗어나면 스테레오 노이즈 때문에 전 프레임이
+거절되는데**, 화면만 봐서는 얼마나 떨어져 있는지 알 수가 없다.
+
+**색도 같은 말을 한다.** 파랑(BUSY) = 진행 중(수집/재구성/등록), 초록 = 자세가 붙어서
+추적 중, 빨강 = 멈춤. 예전엔 수집이 포기하면 조용히 초록으로 돌아가서 **정상 추적과
+구분되지 않았다** — 그게 "갑자기 초록으로 바뀌었다"의 정체였고, 이제 `STOPPED`(빨강)로
+남아 이유를 말하고 `TRACK`을 다시 눌러야 풀린다.
+
+같은 전이가 **LOG 패널에도** 한 줄씩 남는다. 오버레이는 이력이 없어서, 끝나고 나면
+"재구성이 시작은 했었나"를 로그로만 답할 수 있다.
+
+**메시지는 영어로 번역해서 띄운다.** 원본 프로젝트는 조종자에게 한국어로 말하는데
+(`sam2_live/capture.py`), 그 문자열들이 **수집이 왜 안 되는지에 대한 유일한 설명**이라
+번역을 경계(`perception/session.py::english`)에서 한다 — 원본은 읽기 전용이므로.
+
+산출물은 `sessions/pose_meshes/obj_<시각>/`에 남는다(`--pose-ref-dir`). 다음 세션에는 그
+`model/model.obj`를 `--pose-mesh`로 주면 2분을 건너뛴다.
+
+**`TRACK`을 끄면 진짜로 중단된다** — 재구성 자식 프로세스를 `terminate()` 한다. 기체를
+조종하는 프로세스에서 2분짜리 GPU 작업을 못 멈추면 안 되기 때문에, 원본의
+`subprocess.call` 대신 `Popen`으로 다시 썼다(그 외는 전부 원본과 동일).
+
+실측(2026-08-09, 저장된 참조뷰 17장을 재생, 입력 `~/Desktop/New Folder/ref_views`):
+수집이 **8장 / 회전 75.3° / ICP RMSE 6.2 mm**에서 자동 종료 → BundleSDF **25초** →
+메시 **7993 verts, 51×94×167 mm**. 같은 물체의 원본 메시가 `13444 verts 101×135×165 mm`
+이므로 **가장 긴 축은 2 mm 안에서 일치**하고 나머지 두 축이 작다 — 17장 중 8장만 쓴 부분
+모델이라 그렇다. **라이브 수집 실측이 아니라 저장 데이터 재생이다.**
+
+수집 규칙 두 개는 실측 근거가 있고 둘 다 상한이다:
+
+* **누적 회전 75°** (`--pose-max-arc`). 뷰별 카메라 자세를 colored ICP로 만드는데, 오차가
+  80°를 넘으면 완만히 나빠지는 게 아니라 절벽처럼 무너진다 — 원본 합성 실험 기준
+  60° 8.7 mm, 80° 9.7 mm, **100° 87 mm, 120° 283 mm**. 올려도 커버리지가 아니라 틀린
+  메시를 산다.
+* **최소 6장** (`--pose-max-views`는 상한 20). 6장 미만이면 재구성을 **거부하고** 다시
+  하라고 말한다. 10장 이상 권장, 참조 구현은 16장.
+
+그 대가로 메시는 **찍은 각도 범위만 덮는 부분 모델**이다. 반대편에서 보면 자세 추정이
+실패하고, 그건 재등록 감시가 "메시가 이 물체가 아니다"로 잡는다.
+
+마스크만 필요하면 `--pose-no-build`로 재구성 경로 전체를 끈다 — 작동 거리 제약도, GPU
+2분도 없다. 그때는 모든 자세 칸이 비는데, 추적기가 고장난 게 아니라 시킨 일을 하는 것이다.
+
+#### 재등록 감시 — 유일한 되돌림 장치
+
+FoundationPose의 `track_one()`은 **마스크를 안 쓴다.** 그래서 자세가 한 번 물체에서
+미끄러지면 스스로 돌아올 방법이 없다. 매 프레임 메시 실루엣과 SAM2 마스크의 IoU를
+비교하고, 어긋나면 다시 등록한다(`POSE_MIN_IOU 0.25`, 8프레임 연속, 최소 간격 1.5초 —
+`register()` 자체가 0.73초라서). 4번 재시도해도 안 맞으면 매달리지 않고 말한다:
+**"pose does not fit — wrong object, or the mesh is not this one"**.
+
+#### 작동 거리 0.3~0.8 m
+
+FoundationPose는 depth를 먹는다. 원본 README 기준 **2.4 m에서 스테레오 노이즈가 50 mm를
+넘어 등록 자체가 실패**한다. ROV로는 매우 가까운 거리다. 마스크만 쓰는 모드(메시 없이)는
+이 제약을 안 받으므로, 멀리 있는 물체를 그냥 표시만 하고 싶으면 그쪽이 맞다.
+
+C3의 HFOV가 **63.9°**라는 것도 같이 봐야 한다 — 0.5 m에서 시야 폭이 **62 cm**라
+기체가 30 cm만 움직여도 물체가 화면을 벗어난다.
+
+### 3-D pose 맵 — 떠 있는 창
+
+FoundationPose가 올라오는 순간(로딩/등록/추적) **별도 창이 저절로 열리고**, 닫았으면 C3
+RGB 패널의 `MAP` 버튼으로 다시 연다. 메인 창은 세로 여유가 5 px뿐이라 새 패널이
+불가능해서 떠 있는 창이다.
+
+* **카메라 좌표계 그대로**: 카메라가 원점, +Z 전방, +Y 아래(OpenCV) — `T_cam_obj`와 POSE
+  로그가 쓰는 바로 그 프레임이라 플롯과 로그가 다른 말을 할 수 없다.
+* **볼륨 고정**: x,y ±1 m, z 0~2 m (pose가 ~2 m 밖에서는 어차피 존재하지 않는다).
+  자동 스케일이면 등거리도 볼 때마다 다르게 보인다. **뷰는 마우스가 바꾼다** — 드래그
+  궤도, 휠 줌, 더블클릭 리셋.
+* 궤적(최근 3000점) + 현재 자세의 축 삼각대(10 cm), 0.5 m 간격 깊이 눈금.
+* 새 pose가 올 때만(10 Hz) 다시 그린다. OpenGL 없음, QPainter뿐.
+
+### 녹화 영상에 오버레이가 들어간다
+
+`TRACK`이 켜져 있으면 **C3 RGB 피드 녹화(`REC`)에 마스크·3-D 축·단계 줄이 그대로 구워진다.**
+추적 세션을 녹화했는데 추적이 안 보이면 그건 바닥을 녹화한 것이다.
+
+```
+POSE TRACKING  44 Hz
+  (마스크 윤곽 + RGB 축)
+x +0.058  y +0.109  z +0.413 m    d 0.43 m    44 Hz   reg 1
+```
+
+* 화면에 그리는 코드와 **같은 함수**(`_paint_pose`)다 — 영상이 조종자가 못 본 것을 보여줄
+  수 없게. `fit` 인자만 다르다(녹화 프레임은 레터박스가 없어 이미지가 전부).
+* **복사본에 그린다.** 캔버스가 같은 QImage를 들고 그 위에 라이브 오버레이를 또 그리므로,
+  원본에 그리면 모든 선이 두 번 그려진다.
+* **녹화 중이 아니면 복사조차 안 한다**, `TRACK`이 꺼져 있으면 프레임이 그대로 지나간다.
+
+전체 UI 녹화(상단 `REC`)는 원래부터 화면 그대로라 해당 없다.
+
+### 로깅 — C3 Depth 녹화에 얹힌다
+
+`_rov.jsonl` / `_c3_imu.jsonl`과 같은 트리거다. 영상과 같은 stem으로:
+
+```
+c3_depth_….mp4
+c3_depth_…_pose.jsonl   CAMERA(1회) · MESH(1회) · PROMPT(클릭) · EVENT(전이) · TRACK · POSE
+c3_depth_…_pose.json    매니페스트 (by_message, hz_measured)
+c3_depth_…_pose.csv     자세 1개당 1행 — t, frame_seq, x/y/z_m, distance_m,
+                        r00..r22(회전 행), pose_hz, n_register, state
+```
+
+CSV는 **두 번째 형식이지 두 번째 소스가 아니다** — jsonl POSE 행과 같은 `T_cam_obj`에서
+나온 같은 숫자, 같은 캡처 시각이다. pandas/플롯 스크립트가 바로 먹을 수 있게 평평하게
+펴놓은 것뿐이다.
+
+`TRACK` 행에는 **윤곽선 자체**가 들어간다 — SAM2를 다시 돌리지 않고 오프라인 재분석이
+가능하다. 타임스탬프는 **프레임의 캡처 시각**이라 영상과 정렬된다.
+
+`CAMERA` 행에는 내부파라미터와 **그 출처**가 같이 들어간다:
+
+```json
+{"msg":"CAMERA","fx":513.4,…,"medium":"water","rectified":false,
+ "note":"UNDERWATER factory calibration (vendor-confirmed; measured HFOV
+         matches the Snell-underwater prediction, not the in-air spec).
+         Distances ARE metric in water. IN-AIR captures read ~1.33x LONG."}
+```
+
+`MESH` 행은 **자세가 어느 3-D 모델에 대한 진술인지**를 박는다 — 경로, `sha1`, 현장
+재구성이었는지, 참조뷰 디렉터리, 그리고 재구성 직후 검산 줄들(`sc_factor`가 함의하는 장면
+크기, 메시 bbox, `bad_mask#` 범위). 현장 재구성은 매번 다른 모델이라 경로만으로는 식별이
+안 되고, `model.obj`라는 이름은 항상 같다.
+
+`POSE` 행에는 `T_cam_obj` 16개(row-major)와 `pos_m`, `distance_m`가 들어가고, 매니페스트에
+**규약을 글로** 박는다 — 암시하면 6개월 뒤 틀리게 읽힌다:
+
+```
+T_cam_obj maps OBJECT -> CAMERA. OpenCV optical axes: +X right, +Y DOWN,
++Z forward. Metres, row-major. NO camera->body transform is applied.
+```
+
+> **캘리브 방향에 주의 — 공장 캘리브는 수중 값이다** (벤더 확인 + 화각 실측:
+> HFOV 63.7°가 in-air 스펙 95°가 아니라 Snell 수중 예측 67.2°와 일치,
+> `calib/fov_audit.py`, KNOWN_ISSUES 2026-08-04). 그래서 결이 직관과 반대다:
+> **물속 거리가 metric이고, 지상 책상 테스트가 ~1.33배 길게 읽힌다.** 실물 0.5 m가
+> `d ≈ 0.67 m`로 뜨면 정상이다. 마스크만 쓸 땐 무관하다(픽셀 영역일 뿐).
+> (2026-08-10 정정: 이 문서와 CAMERA 레코드가 처음엔 정확히 반대로 적혀 있었고,
+> 그 출처는 감사가 이미 틀렸다고 표시한 `c3_camera/geometry.py`의 낡은 주석이었다.)
+
+### 정류(rectification)를 안 하는 이유
+
+원본 프로젝트는 raw(1280×800)와 정류(640×400) 두 좌표계를 오간다. OAK-D W의 96° 렌즈가
+코너에서 **232 px** 틀어지기 때문이다. C3는 그런 렌즈가 아니다 — 실측:
+
+```
+HFOV 63.9°   핀홀 vs 왜곡: 중앙 0.13 px … 코너 최대 2.08 px = 0.23° = 0.6 m에서 2.4 mm
+```
+
+스테레오 depth 노이즈보다 한 자릿수 작다. 그래서 **RGB·depth·마스크·클릭이 전부 640×360
+하나의 좌표계**에 산다. 버그 한 종류가 통째로 없어진다.
+
+### 원본은 건드리지 않는다
+
+`~/Desktop/New Folder`는 **읽기 전용**이다. `rov_gui/perception/session.py`가 그
+라이브러리(`sam2_live.tracker` 등)를 import해서 오케스트레이션만 다시 쓴다 — 카메라와
+OpenCV 창 없이. 그쪽 `camera.py`(depthai 3.x)는 **import되지 않는다**: 스테이션이 이미
+카메라를 쥐고 있고, DepthAI는 장치당 파이프라인을 하나만 허용한다.
+위치는 `--pose-src` 또는 `$SAM2_LIVE_ROOT`로 바꾼다.
+
+## 폐루프 MPC — `--mpc` (AprilTag 측위 + acados NMPC)
+
+```bash
+./c3 gui --source hw --allow-command --mpc                  # 실기 (wall 기하)
+./c3 gui --source hw --allow-command --mpc --nav-geometry floor
+./c3 gui --source demo --mpc                                 # 합성 plant 폐루프
+~/miniforge3/envs/rovgui-pose/bin/python -m rov_gui.control.smoke   # P0 벤치 게이트
+```
+
+sim의 DOB-MPC(`bluerov2_mujoco_marinegym/dobmpc/`, MuJoCo 무의존이라 **그대로
+import**)를 실기에 붙인 폐루프다. 파이프라인 전체가 이 프로세스 안에 있다 —
+C3도 명령 sink도 단일 소유이기 때문이다:
+
+```
+C3 컬러 프레임 ─► TagNavWorker (pupil_apriltags + solvePnP, 고정 맵, GTSAM 없음)
+                     └► bus.nav_fix  (기체 pose, NED 태그월드)
+ArduSub MAVLink ─► VehicleWorker (--mpc면 20 Hz 틱) ─► bus.vehicle_imu
+                     └► StateAssembler: eta/nu/nudot (NED/FRD, 20 Hz)
+                          └► EAOB + acados NMPC (mpc_bridge, DT_CTRL=50 ms)
+                               └► wrench → MANUAL_CONTROL 4축 (K/M은 버림)
+                                    └► 기존 MavlinkCommandSink — 게이트 전부 상속
+```
+
+설정은 `config/hw_nav.yaml`(태그/기하/extrinsic/지오펜스)과
+`config/hw_mpc.yaml`(모드/축게인/EAOB 시그마/square)이다. 실측 전 수치는 전부
+`[예측]` 태그가 붙어 있다 — 특히 **축 게인은 P4 스텝 캘리브레이션 전까지 추정치**다.
+
+운용 규율 (MPC 패널은 **메인 그리드 안** — 2026-08-14부터 **맨 아랫줄의 2·3열
+전체**(옛 PROPULSION·SENSORS 자리, ~790×376 px)를 차지하고, PROPULSION과
+SENSORS는 3열 SYSTEM HEALTH 아래에 **나란히** 들어간다(세로로 쌓으면 최소
+높이가 1080p 예산을 넘는다 — `test_mpc_panel_lives_...`가 고정). 플롯은 NED
+탑다운에 m 단위 축·눈금이 붙고, **풀 경계(`hw_nav.yaml: pool_ned`)가 실선
+테두리이자 축 스케일의 기준**이다. 이 배치 때문에 `--mpc`의 최소 창 높이는
+768을 넘는다 — 기본 레이아웃의 one-screen(1366×768) 약속은 그대로이고,
+`--mpc`는 1080p 운용 화면을 전제한다):
+
+* **START(hold)가 원버튼 플로우**다: engage → 워밍업 → square 자동 시작, CSV
+  기록은 engage 순간부터. 전제조건은 그대로 전부 검사된다: COMMAND ENABLE·ARMED·
+  비행모드 MANUAL·acados 실시간(프로브 <25 ms)·태그 fix 신선(<0.5 s)·IMU 신선·
+  지오펜스 안(+배치된 square 코너 4점까지). 하나라도 빠지면 사유를 말하고 거부.
+* **HOLD(hold)는 DP 전용 engage**다(캘리브레이션/정점유지용). STOP TRAJ·DISENG·
+  E-STOP은 전부 단일 클릭 — 멈춤에는 게이트가 없다.
+* **AprilTag 감지는 피드별 TAG 버튼**으로 켜고 끈다. **어느 피드가 측위를
+  담당하는지는 `hw_nav.yaml: nav_source`가 정한다**: `main` = C3(공장 수중
+  캘리브 내장), `second` = ROV 기본 RGB(`second_cam` 블록 — **전부 [예측]**,
+  fx가 틀리면 모든 거리가 그 비율로 스케일된다). 측위 피드의 태그는 초록 실선,
+  비측위 피드는 희미한 외곽선. 측위 피드의 TAG를 끄면 stale-fix로 안전하게
+  disengage되고, **다시 켜는 것이 datum 재영점**(아래) 제스처다.
+* **(0,0)·yaw 0 = START(engage)를 누른 순간의 pose다** (미션 datum, 항상 켜짐).
+  engage마다 그 자리에서 재영점되고, square·지오펜스·플롯·CSV가 전부 이 상대
+  좌표계에 산다 — EAOB/NMPC도 이 좌표계에서 태어나므로 도중에 점프하지 않는다.
+  절대(태그 프레임) 복원용 datum은 meta.json `hardware.datum_tag_frame`에 남는다.
+  플롯 좌하단 `fix N Hz · detect M ms`가 측위 갱신률이다 — 느리면
+  `hw_nav.yaml: quad_decimate`(기본 2.0)를 올릴수록 빨라지고 코너 정밀도는
+  소폭 준다. 현재 미션 설정(2026-08-13): **갠트리 tagslam의 47태그 바닥 맵**
+  (`config/tag_map.yaml`, 앵커 = **tag 25** = 맵 원점)을 **C3 RGB**로 multi-tag
+  joint PnP(`geometry: floor`, `nav_source: main`, `min_tags: 2`) — C3는 공장
+  수중 캘리브 내장이라 스케일이 정확하고, 단일 태그의 flip 모호성·중력
+  게이트가 아예 없는 경로다. 어떤 피드가 측위 중인지는 플롯 좌하단
+  `loc C3 RGB · fix N Hz · detect M ms`와 SENSORS의 `TagNav [C3] …` 줄이
+  실시간으로 말해준다. quad_decimate는 피드별(main 1.0 / second 2.0 —
+  640×360 C3는 디시메이션하면 먼 태그를 놓친다). **맵 태그 47개는 옛 tagslam
+  시각화처럼 실제 크기·방향의 사각형**으로 깔리고, **지금 fix를 만든 태그만
+  초록으로 칠해진다**(fix가 1 s 이상 끊기면 소등 — 죽은 측위가 태그를 켜둘 수
+  없다). 비엔게이지 상태에선 fix가 마커를 직접 구동한다(ArduSub 텔레메트리
+  없는 벤치에서도 움직임). 벽 단일 태그(104) 모드는 `geometry: wall`로 복귀.
+  20 cm square @ 0.05 m/s, yaw는 시작 헤딩 고정.
+* **actual 궤적은 나이(시간) 색**이다: viridis 램프(어두운 보라 = 오래됨 →
+  노랑 = 지금), 우하단에 `-90s → now` 범례. 90 s(`trajectory.py:
+  TRAIL_AGE_S`)가 지난 점은 서서히 투명해지며 지워진다 — 교차하는 경로에서도
+  시간 순서가 읽히고, 옛 궤적이 화면을 덮지 않는다. reference 궤적은 파란
+  단색 그대로.
+* **REC NAV(플롯 패널 버튼) = 원시 측위 기록**. engage와 무관하게(수동 조종
+  서베이 포함) `sessions/nav_runs/<stamp>/`에 네 파일을 남긴다: `map.json`
+  (잠긴 태그맵 id→x,y,z,yaw + 태그 크기 + pool + 지오펜스), `fixes.csv`
+  (**태그 프레임 원시 fix** — datum 변환 전, 실패 프레임도 **태그 id와** 사유를
+  함께 기록), 그리고 `detections.csv` + `frames.csv`(**원시 관측** — 검출된
+  모든 태그의 코너 4점과 그 프레임의 카메라 모델). 뒤의 둘이 맵을 다시
+  만들거나 넓히는 재료다 — 풀린 fix만 남기면 코너가 버려져서 아무것도 못 한다.
+  `python -m rov_gui.tools.plot_nav_run sessions/nav_runs/<stamp>`로 같은
+  그림(태그 사각형 + 시간색 경로 + 풀 경계, matplotlib)을 다시 그린다.
+* **중복 태그 id**(2026-08-14 실측): 풀 매트는 20×7=140칸 커스텀 배치이고
+  **12개 id가 두 곳에 있다**(`hw_nav.yaml: duplicate_ids`). 맵은 id당 자세
+  하나뿐이라 "다른 사본"의 코너가 섞이면 joint PnP가 터진다(실측 59~131 px).
+  대응은 **confirm-or-drop**: 유일 태그로 자세를 먼저 확정하고, 중복 태그는
+  맵 자리에서 `dup_confirm_px`(6 px) 안에 떨어질 때만 채택한다. 다른 사본의
+  **위치를 몰라도 되는 게 핵심**(알아보기만 하면 됨)이라 재측량이 필요 없다.
+  한 프레임에 같은 id가 두 번 잡히면 둘 다 폐기 — 신고 안 된 중복이 스스로
+  드러나고, `min_tags`가 유일 id만 세게 된다.
+* **플롯 위 마우스**: 끌면 이동(pan), 휠은 확대/축소, 더블클릭하면 원래 시야로.
+  화면에 글자로 굽지 않고 위젯 툴팁에 있다(2026-08-14 요청). **지오펜스(주황
+  점선)는 engage 중에만** 그린다 — 펜스는 datum 상대("START 누른 자리 ±1.2 m")라
+  engage 전에는 datum이 없어서, 그리면 실제로는 절대 있지 않을 자리에 상자가
+  놓인다.
+* **풀 테두리는 맵에서 파생된다**: `hw_nav.yaml: pool_margin_m`(기본 0.10) =
+  **가장 바깥 태그의 인쇄 가장자리에서 사방 이만큼**. 맵이 중심 좌표를 들고
+  있으므로 반 태그(0.085 m)를 먼저 더한다. 맵을 다시 만들면 벽도 따라 움직인다
+  (손으로 적은 사각형이 낡아 남는 일이 없다). 명시 지정이 필요하면
+  `pool_ned: {x: [..], y: [..]}`가 우선한다. 현재 맵 기준 **2.025 × 4.437 m**.
+* **어느 사본을 쓰는지 화면이 말한다**: 중복 id는 바닥에 사각형이 두 개인데,
+  fix에 실제로 기여한 **그 사본만** 초록으로 칠해진다(`NavFix.tag_insts`).
+  실측 검증: 두 사본이 한 프레임에서 동시에 채택된 경우 **0건**.
+* **맵 넓히기**: `python -m rov_gui.tools.build_tag_map
+  sessions/nav_runs/<stamp> --anchor config/tag_map.yaml -o
+  config/tag_map_full.yaml`. 측량된 47개를 **얼어붙은 앵커**로 두고, 프레임마다
+  아는 태그로 카메라 자세를 잡은 뒤 같은 프레임의 모르는 태그를 푼다. 새 태그는
+  라운드 사이에만 승격되므로(관측 `--min-obs`개가 `--max-spread` 안에서 일치)
+  **경로를 따라 오차가 누적되지 않는다** — 그래프 SLAM이 일그러지는 그 구조가
+  아예 없다. 중복 id는 앵커에서 빼고 재발견해서 **인스턴스 두 개**로 기록한다.
+  촬영 규칙 하나: **모르는 태그가 화면에 들어올 때 아는 태그도 같이 보여야
+  한다.** 승격 못 한 태그는 관측 수와 함께 리포트에 뜬다.
+* **플롯의 로봇 마커는 20 Hz**로 움직인다: 카메라 fix 사이를 상태조립기가
+  속도추정+자이로로 브리징하고(`hw_mpc.yaml: vel_propagation`, 기본 on —
+  가속도 이중적분은 BNO086 스케일/바이어스 때문에 의도적으로 안 씀), 플롯은
+  fix가 아니라 MpcStatus 스트림을 그린다. fix Hz는 별도로 표시되므로 "제어가
+  보는 상태"와 "측위 원천 주기"를 혼동할 일이 없다.
+* **PID 모드**: 모드 콤보 dobmpc | mpc | pid. PID 게인은 sim의 pole-placed
+  `GAINS_HEAVY_GRIPPER`(controller.py) × `hw_mpc.yaml: pid.omega_derate`
+  (기본 0.6, kp·d²/kd·d/ki·d³) [예측]. acados 빌드가 실패해도 PID는 항상
+  가용하다. 동일 CSV 스키마로 기록되므로 sim처럼 PID vs MPC vs DOB-MPC A/B가
+  바로 된다(모드는 meta.json `controller.type`).
+* **조종 입력은 언제나 이긴다.** 스틱/키가 움직이면 그 프레임은 기체로 가지 않고
+  MPC 해제 요청이 된다(창의 `_pilot_gate` — pump·edge 두 경로가 같은 게이트를
+  지난다). E-STOP(헤더·MPC 패널·Esc 어디서든)·DISARM·ENABLE off·태그 상실
+  >0.5 s·지오펜스 이탈·솔버 연속 3실패는 전부 자동 disengage. MpcWorker가 죽어도
+  sink deadman(500 ms)이 중립을 보내고, 창의 mpc 워치독(1.5 s)이 스스로 조종권을
+  회수한다 — 조종사가 죽었을 때와 같은 마지막 방어선.
+* wall 기하에서는 `heading_follow: false`(크랩 square)가 **필수**다. 코너에서
+  기수를 돌리면 벽 태그가 시야에서 사라진다.
+
+기록: engage하면 CSV가 무조건 열린다(`sessions/mpc_runs/…_mpc.csv`, 또는 진행 중인
+녹화 스템에 `_mpc.csv`로 편승). 앞 9열은 sim `runs/traj_*.csv`와 동일 스키마
+(`t,px,py,pz,rx,ry,yaw_deg,pitch_deg,lap`, world FLU)라 기존 분석 도구가 그대로
+읽고, 뒤로 `w_hat×6·u×6·솔버 status/solve_ms·태그 수·reproj px·축 명령` 등이
+붙는다. `.meta.json` 사이드카가 태그맵 sha1, extrinsic, 게인 출처까지 기록한다.
+
+검증 상태 (2026-08-12): `rov_gui/control/smoke.py` — acados가 rovgui-pose(numpy 2)
+에서 SQP-RTI 빌드 1.3 s, EAOB+solve p50 3.1 ms/p99 6.4 ms
+(`sessions/` 아님, 콘솔 출력); demo 폐루프로 square 1랩 완주(솔버 실패 0).
+**실기·수중은 아직 미검증** — KNOWN_ISSUES.md 참조. 수조 절차는 P3(측위만 기록)
+→ P4(DP + 축게인 스텝 캘리브레이션) → P5(square, mpc) → P6(dobmpc A/B) 순서를
+지킬 것.
 
 ## 배터리 잔량 — 셋 중 어느 걸 보고 있는지 화면이 말한다
 
@@ -698,6 +1156,15 @@ c3_depth_..._rov.json / _c3_imu.json  각각의 매니페스트
 **소스마다 파일이 따로**인 건 의도다. ROV IMU와 C3 IMU는 서로 다른 장치이고 시계도
 다르다 — 하나로 합치려면 시계 하나를 골라야 하고, 그 순간 다른 쪽에 대해 거짓말을
 하게 된다. 각 워커가 자기 파일을 자기 스레드에서 쓴다.
+
+> **2026-08-09 정정**: `_c3_imu.jsonl`은 2026-08-06~09 사이에는 **실기에서 한 번도 안
+> 생겼다.** `C3VideoWorker`가 `LoopWorker`인데 요청을 `@Slot`으로 받고 있었고, LoopWorker는
+> `run()`이 블록해서 이벤트 루프에 도달하지 않으므로 **큐잉된 슬롯이 배달되지 않는다.**
+> `_rov.jsonl`은 `VehicleWorker`가 `TimerWorker`라 정상이었고, 데모 백엔드도 TimerWorker라
+> 테스트가 못 잡았다 — 그래서 "반쪽짜리 데이터셋"이 조용히 나왔다.
+> 지금은 평범한 스레드 안전 메서드(`request_sensor_log`) + `DirectConnection`이고,
+> `test_c3_sensor_log_request_reaches_a_loopworker`와 LoopWorker 슬롯을 금지하는 AST 스캔
+> 테스트가 지킨다. **그 기간에 찍은 depth 녹화에는 C3 IMU가 없다.**
 
 CSV가 아니라 **JSONL**인 이유: 필드가 서로 다른 메시지가 대여섯 종류 섞여 들어오므로
 CSV는 빈칸투성이 union 스키마거나 타입별 파일이 되고, union 스키마는 펌웨어가 필드를

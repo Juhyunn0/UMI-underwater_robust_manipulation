@@ -35,8 +35,33 @@ which runs after ``moveToThread``.
 from __future__ import annotations
 
 import threading
+import time
 
 from ..qt import QMetaObject, QObject, Qt, QThread, QTimer, Signal, Slot
+
+# Threads that missed their stop window (a worker blocked in setup()/run()
+# past the wait budget — the MPC worker's first-run acados code generation is
+# the concrete case). They are PARKED here instead of dropped: releasing the
+# last Python reference to a running, parentless QThread destroys the C++
+# object under it, and Qt 5's ~QThread qFatal()s the whole process for that
+# ("QThread: Destroyed while thread is still running"). A bounded leak beats
+# an abort mid-shutdown with a claimed camera. wait_for_orphans() gives them
+# one last, generous chance to finish before the interpreter tears down.
+_ORPHANS: list = []
+
+
+def wait_for_orphans(total_ms: int = 60000) -> int:
+    """Block up to ``total_ms`` for parked threads to finish. Returns how many
+    are STILL running (0 is the normal case — an acados build finishes in
+    seconds; it just does not finish inside one worker-stop budget)."""
+    deadline = time.monotonic() + total_ms / 1000.0
+    for thread, _worker in list(_ORPHANS):
+        remaining_ms = int(max(1.0, (deadline - time.monotonic()) * 1000.0))
+        if thread.isRunning():
+            thread.wait(remaining_ms)
+    still = [(t, w) for (t, w) in _ORPHANS if t.isRunning()]
+    _ORPHANS[:] = still
+    return len(still)
 
 
 class _WorkerBase(QObject):
@@ -70,8 +95,14 @@ class _WorkerBase(QObject):
         if not self._thread.wait(timeout_ms):
             # Never terminate(): a killed thread leaves a half-closed device
             # handle behind, and on DepthAI that means the camera stays claimed
-            # until the process exits. Report it and move on.
+            # until the process exits. Report it and move on — but PARK the
+            # thread rather than dropping the reference: destroying a running
+            # QThread is a process abort, not a warning (see _ORPHANS above;
+            # found 2026-08-12 with the MPC worker's first-run solver build).
             self.failed.emit(f"{self.name}: thread did not exit in {timeout_ms} ms")
+            orphan = self._thread
+            _ORPHANS.append((orphan, self))
+            orphan.finished.connect(orphan.deleteLater)
         self._thread = None
 
     @property
@@ -223,6 +254,15 @@ class Backend:
     def stop(self) -> None:
         for w in reversed(self.workers):
             w.stop()
+        # Anything that missed its individual stop budget gets one shared,
+        # generous drain here, so a slow-but-finite worker (first-run acados
+        # code generation) completes before Python teardown would destroy its
+        # still-running QThread.
+        left = wait_for_orphans(60000)
+        if left:
+            self.bus.log.emit("error", f"{left} worker thread(s) still "
+                                       f"running at shutdown — leaking them "
+                                       f"to avoid a Qt abort")
 
     def describe(self) -> str:
         return self.name
