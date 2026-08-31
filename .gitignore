@@ -33,6 +33,12 @@ build_cache/
 # Large dataset directory (recordings, calibration data, etc.)
 data/
 
+# Experiment data captures (GB-scale videos/images/IMU CSVs; keep on local disk,
+# not in git — GitHub rejects the >100 MB rgb.mp4 files outright)
+c3_camera/datasets/
+c3_camera/recordings/
+bluerov2_mujoco_marinegym/recordings/
+
 # OS
 .DS_Store
 Thumbs.db
