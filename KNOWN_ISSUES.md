@@ -4,6 +4,237 @@
 > 살아있는 목록. 규칙: **고치면 그 항목을 삭제**한다 (고친 기록은 git 히스토리가 담당).
 > 새로 발견하면 날짜와 함께 추가한다. 항목 형식: 증상 → 임시 대응 → 제대로 고치는 법.
 
+## ⚠️ 운용 안전
+
+### C3 수중 depth 오차는 **거리에 비례해 커진다** — 배율 상수로는 원리적으로 못 고친다 (2026-08-24)
+- **증상**: `--depth-scale` 하나로는 한 거리에서만 맞는다. 실측 depth-vs-MAP 원시값이
+  낮은 높이 **1.28**, ~0.9 m **1.56**으로 움직인다(조종사 확인).
+- **샘플링 아티팩트가 아니라는 결정적 증거**(진단 함수가 관여하지 않는 증인):
+  한 메시의 세 축이 **143 x 166 x 187 mm**인데 캘리퍼 실측은 119.73 mm — 축별 1.19 /
+  1.39 / 1.56, **비등방 1.31**
+  [측정: sessions/low_level_controller_data/20260823/0823_210304/mission_log.txt 21:02:29].
+  상수 배율 오차는 **모든 축을 똑같이** 늘린다. 정육면체가 벽돌로 나왔다는 건 오차가
+  거리에 따라 변한다는 뜻이다.
+- **모델**: 오차는 **disparity 도메인**에 있다(disparity가 과소 보고 → depth가 길게,
+  거리에 비례해 악화). `r(Z) ≈ 0.977 + 0.538·Z`
+  [유도: c3_camera/datasets/* 108만 샘플 회귀 — **다른 stereo 설정**(extended ON,
+  MinZ 150)이라 비행 설정(extended OFF, MinZ 300)에서 재적합 필요. 측정치로 인용 금지].
+  Z→0에서 계수가 0.98±0.04 = **근거리에선 metric**, 오차 전체가 거리 비례.
+- **배제된 것들**(각각 특정 숫자로): 순수 배율(1.56배면 fx=244 px → 반화각 52.7°인데
+  Snell 물속 한계 48.75° 초과 = 존재할 수 없는 카메라) · 평면포트 굴절(부호가 반대이고
+  10~30배 작다) · 정수 disparity(truncation 상한이 +1.8%인데 +56%가 필요; 게다가 실제
+  출력은 1 mm 간격으로 조밀해 양자화 격자가 아예 안 보인다) · "스테레오 외부파라미터가
+  공기 중 값" (매질로 안 변하는 양이라 물리적 내용 없음).
+- **임시 대응**: `--depth-scale 0.64`는 **Z ≈ 1.09 m에서만 정확**하고 잔차가 양쪽에서
+  부호를 바꾼다(0.5 m −20%, 1.5 m +14%, 2.0 m +31% [유도]). 유지하려면 **1.0~1.1 m
+  높이에서 날 것**. depth 유래 거리(메시 치수·FoundationPose 거리·object_nav 거리)는
+  **현재 어느 것도 metric이 아니다**. 컬러 AprilTag 경로는 영향 없고 유일한 기준이다.
+- **제대로 고치는 법**: (1) `_check_depth_scale`이 프레임당 만드는 수백 쌍을 **기록**한다
+  (지금은 중앙값 빼고 전부 버린다, window.py:801-811) → nav 폴더에 `depth_check.csv`;
+  (2) 풀에서 한 번: 거리 사다리 5단(0.4~1.8 m) + **피치 팬 ±15°**(이게 없으면 z와
+  화각항이 공선이라 계수가 쓰레기가 된다) + yaw 팬; (3) disparity 공간에서 회귀해
+  `Z_corr = Z/(1 + c·Z)` 적용. **물에 안 들어가고 되는 선행 검사 두 개**:
+  `calib.getFov(sock, useSpec=True/False)`와 `getStereoLeft/RightRectificationRotation()`
+  덤프(정류 회전에 1~2° 상대 yaw가 있으면 오프셋 가설 확정), 그리고 공기 중에서 같은
+  진단을 돌려 **거리 의존이 남는지**(남으면 굴절·매질 원인 완전 배제).
+- **미확정**: 원인(정류 zero-point / homography 정류 / 매칭 편향)은 아무도 장치에서
+  확인 안 했다. **1.7 m 이상은 캘리브 안 됨** — 모든 데이터가 0.10~0.76 m다.
+  화각 의존항(`+0.474·Z·tan²θ`)이 실재하면 **어떤 r(Z) 곡선으로도 못 고치고** 수중
+  스테레오 재캘리브레이션이 필요하다.
+
+### 물체가 태그맵에서 **매트 밑/두 칸 옆**으로 찍히면 아무것도 안 막는다 — map-frame 타당성 검사 부재 (2026-08-24)
+- **증상**: 2026-08-24 오전 두 런 모두 물체(태그 58 위)가 **매트 아래 51~53 cm**,
+  가장 가까운 태그 11/10/52로 보고됐고, follow가 그대로 arm됐다(231 cm / 256 cm).
+  [측정: sessions/low_level_controller_data/20260824/{0824_101807,0824_101251},
+  nav_*/map.json로 재투영 — 과대 배율 1.55x / 1.57x]
+- **그날의 원인은 따로 고쳤다**(`--depth-scale` 미지정 → 기본값 0.64로 승격). 남는 결함은
+  **원인과 무관한 방어가 없다는 것** — 바닥 밑 물체는 물리적으로 불가능한데
+  `object_nav.update`는 pose_state / 카메라 거리 / jump만 보고 map-frame 좌표는 안 본다.
+- **임시 대응**: trajectory 플롯에서 물체 마커가 매트 평면 근처인지 눈으로 확인.
+- **제대로 고치는 법**: `ObjectAnchor.update`에 태그맵 평면 기준 z 밴드(예: 매트 위
+  −0.1~+1.5 m 밖이면 거부)와 풀 볼륨 밖 거부를 추가. 임계는 tag_map의 z 분포에서 유도.
+
+### FoundationPose **재등록 pose 자체에는 아직 연속성 게이트가 없다** (2026-08-24, 부분 수정)
+- **고친 부분**: `object_nav`의 jump gate가 5회 거부 후 자동 reseed하던 것은 그대로지만,
+  **follow 중 reseed가 나면 STATION으로 강등**한다(`workers.py:_tick_follow`, 깊이·헤딩
+  유지·disengage 아님). 2026-08-23 run1의 1.324 m 유령 스냅이 기체를 끌던 경로는 끊겼다.
+  물체 겉보기 속도가 FF 상한의 3배를 1초 넘기면 같은 강등이 걸린다(매끄럽게 미끄러지는
+  유령은 jump gate를 안 건드리므로 별도 방어가 필요했다).
+- **남은 결함**: SAM2 loss→global register는 **여전히 last-known pose와 아무 비교를 안 한다**
+  (`rov_gui/perception/session.py:1012,1018,1045`). "pose does not fit" 포기 카운터도
+  watchdog-trigger 재등록만 세고 정상 프레임 1장에 리셋된다(`session.py:1038-1041`) —
+  run1은 나쁜 스냅 2번을 소비하고도 ~5–6 s 뒤에야 발화했다. 거리 게이트는 **카메라 범위만**
+  보고 map-frame 타당성(풀 볼륨·바닥 근방) 검사는 전무하다.
+- **임시 대응**: stale→재등록 직후 구간의 obj pose는 신뢰 금지. (메시 품질 쪽은
+  2026-08-24에 게이트가 생겼다 — depth smear 비율 2.0 초과 프레임은 수집되지 않고,
+  그런 캡처는 재구성 자체를 거부한다. `SMEAR_MAX_RATIO_*`, session.py.)
+- **제대로 고치는 법**: 재등록 pose에 last-known 대비 위치/yaw 게이트를 perception 쪽에
+  두고, 포기 카운터가 recovered-trigger 재등록도 세게 한다.
+
+### 태그맵의 같은 ID 사본(54, 65)이 급기동 중 wrong-copy 매칭을 일으킨다 (2026-08-24)
+- **증상**: `nav_213749/fixes.csv`에 "wrong-copy tag(s) dropped: 54, 65"(csv_t
+  48.66–48.79, 49.76–50.13) — 정상 추종 650행 베이스라인에서는 0건, 급격한 yaw 스윙
+  중에만 발생. 같은 창에서 full-frame 거부(reproj 3.0 px > 3, t=48.49)와 6.5 cm fix
+  step이 동반돼 run3 말기의 x0 교란에 기여했다(주 원인 아님 — 물체 pose 붕괴의 2.3 s
+  하류). 코드가 감지·드롭은 하지만, 맵에 같은 ID가 두 자리 있다는 것 자체가 공격적
+  기동 때마다 무는 잠복 위험이다(사본 존재는 로그 문구에서 유도 — 물리 확인 필요).
+- **임시 대응**: 54/65 물리 사본 중 하나를 제거/가리거나 맵에서 해당 ID 제외.
+- **제대로 고치는 법**: 맵 빌드에서 중복 ID 거부, 또는 런타임에서 중복 ID를 상시 제외.
+
+### `object_nav.max_distance_m: 10`이 자기 주석과 모순이고 **테스트를 깨고 있다** (2026-08-24)
+- **증상**: `config/hw_mpc.yaml:312`의 값이 `10`인데 바로 옆 주석은
+  "[측정: KNOWN_ISSUES 2026-08-09 — 0.3-0.8 m works, 2.4 m fails to register]"이고,
+  `object_nav.py:102`의 출고 기본값은 **1.20**이다. `test_object_nav.py ::
+  test_the_shipped_config_resolves`가 `max_distance_m <= 3.0`을 단정하므로 **현재 red**
+  (35/36). 이 게이트는 "말도 안 되는 값"을 걸러내는 용도인데 10 m면 풀 전체보다 넓어
+  사실상 아무것도 안 거른다.
+- **왜 안 고쳤나**: 조종사가 의도적으로 넓힌 운용 한계라 조용히 되돌리면 워크플로가
+  바뀐다. 다만 **2026-08-23 유령(카메라 0.44 m)은 1.20이든 10이든 통과**하므로 이 값이
+  그 실패의 원인은 아니다.
+- **제대로 고치는 법**: 실제로 쓰는 최대 거리로 정하고(1.5–3 m) 주석과 일치시키거나,
+  넓혀야 할 이유를 주석에 적고 테스트 한계를 함께 올린다.
+
+### `path_fillet_m: 0.0`이 MPCC 필렛 테스트를 깨고 있다 (2026-08-24)
+- **증상**: `test_mpcc.py :: test_the_fillet_must_exceed_the_cross_track_error`가 red
+  (24/25). 위의 **PID 경로추종 꼭짓점 교착**(2026-08-18) 항목이 임시 대응으로 지목한
+  값이 정확히 `path_fillet_m: 0.15`인데, 현재 작업트리는 `0.0`(waypoint 모드)이다.
+- **임시 대응/고치는 법**: 그 항목을 볼 것. 여기서는 **테스트 스위트가 red인 이유**만
+  기록한다 — 새로 깨진 것으로 오독하지 말 것.
+
+### 갠트리 엔코더 좌표가 태그맵에 **등록돼 있지 않다** (2026-08-23)
+- **증상**: `config/fisheye_calibration.yaml`의 갠트리→지도 변환을 쓰면 답이 틀린다.
+  세 군데가 동시에 깨져 있다.
+  1. `R_gantry_to_slam`은 `src/tools/refine_R_gantry_to_slam.py`가
+     `data/20260528/20260528_215858_recording`에 대해 fit한 값인데, **그 런의 anchor는
+     태그 67**이었다(그 런 `tag_poses.csv`에서 태그 67이 원점, 1e-10). 지도의 anchor는
+     25다. 둘 사이는 **179.81°** 차이다(`config/tag_map.yaml`의 태그 67 자세에서 유도).
+     원인은 `src/gantry_panel.py`의 `_exp_autopick_anchor_tag`가 anchor를 **매 런
+     이미지 중심에 가장 가까운 태그로 재선택**하고 `src/tagslam_core.py`의
+     `_setup_tag_map`이 지도를 그 프레임으로 재표현하기 때문 — 즉 갠트리 런은 매번
+     다른 세계에 떨어진다.
+  2. **평행이동 캘리브가 없다.** `gantry_anchor_offset_mm` 키가 YAML에 아예 없어서
+     대시보드는 "first-sample-zeroed" 폴백으로 도망간다. 원시 ‖p_est − p_gantry‖는
+     p50 **1688.4 mm**(위 런 CSV로 재계산).
+  3. `gantry_to_slam_scale: 1.03574608`이 **비등방**이다 — 축별 신축
+     [0.9891, 1.0465, 1.0440], spread 0.057(위 런 CSV로 재계산). 굴절도 태그 크기도
+     등방이라 범인이 아니다. 게다가 그 fit은 **Z 이동 0 mm**에 camera/gantry 경로비
+     1.78×(툴 자체 경고 임계 1.3×)였다.
+- **임시 대응**: **엔코더 대신 카메라를 쓴다.** 갠트리 패널의 `Tag map position`
+  카드(`src/gantry_map_pose.py`)가 `rov_gui/control/tagnav.py`로 태그맵에 직접 PnP해서
+  anchor-25 좌표를 낸다 — 위 세 값이 경로에 없다. **`R_gantry_to_slam`과
+  `gantry_to_slam_scale`은 시각화 전용이며 어떤 숫자의 근거로도 인용 금지.**
+  (다행히 둘 다 SLAM 해나 `config/tag_map.yaml`이나 `rov_gui/`에 들어간 적이 없어
+  지도 자체는 오염되지 않았다.)
+- **제대로 고치는 법**: anchor를 25로 고정한 뒤(아래 항목) **3축 모두 ≥3 m** 움직인
+  궤적으로 재fit하고, 축별 신축이 등방으로 모일 때만 uniform scale을 믿는다. 그 전에
+  비등방의 두 용의자를 각각 가른다 — `SCALE_MM_PER_UNIT` X=8.25 mm/unit
+  (`src/gantry_runner.py`가 "whisker_dragging.py에서 그대로 복사"라고 자백한다)은
+  1 m 지령 이동 + 줄자로, `fx/fy = 1.0411`(정사각 픽셀이면 1.000이어야 한다)은
+  프레임 수를 늘린 재캘리브로. 평행이동은 카드와 엔코더를 같은 순간에 읽고 빼면
+  나온다 — 주차 한 번이면 되는 10분짜리 절차다.
+
+### 갠트리 Experiment 탭이 anchor를 **매 런 자동 재선택**한다 (2026-08-23)
+- **증상**: `_exp_autopick_anchor_tag`(`src/gantry_panel.py`)가 "이미지 중심에 가장
+  가까운 태그"를 anchor로 잡으므로, 두 런의 `camera_trajectory.csv`가 **서로 다른
+  세계 좌표**에 있고 그 사실이 파일 어디에도 안 적힌다. 기본 anchor 값도 `1`인데
+  (`gantry_panel.py`의 spin box, `tagslam_core.DEFAULT_ANCHOR_TAG_ID`) **태그 1은
+  `config/tag_map.yaml`에 존재하지 않는다**. 덤으로
+  `tagslam_core.DEFAULT_TAG_SIZE_M = 0.085`는 실제 0.170의 **정확히 절반**이라, CLI에서
+  `--tag-size`를 빠뜨리면 0.5배 축척 지도가 조용히 나온다.
+- **임시 대응**: 기존 런의 궤적을 비교할 땐 각 런의 anchor를 `tag_poses.csv`에서
+  찾아(원점에 있는 태그) `config/tag_map.yaml`의 `world_T_anchor`로 anchor-25에
+  올린 뒤 비교한다. `src/tests/test_gantry_map_pose.py`가 정확히 그렇게 한다.
+  라이브 위치가 필요하면 Experiment 탭이 아니라 `Tag map position` 카드를 볼 것
+  (그 경로는 anchor를 아예 안 쓴다 — `TagMap`이 파일의 `anchor_tag_id: 25`를 그대로 쓴다).
+- **제대로 고치는 법**: PnP-only 모드에서는 auto-pick을 끄고 지도의 `anchor_tag_id`를
+  강제한다. `DEFAULT_ANCHOR_TAG_ID`/`DEFAULT_TAG_SIZE_M`은 지도에 없는 값·절반 값이라
+  기본값으로서 위험하니 없애거나 지도에서 읽게 한다.
+
+### 갠트리 hold-to-jog가 **무한 거리**다 (2026-08-23)
+- **증상**: `_start_jog`(`src/gantry_panel.py`)가
+  `jog_single_axis(..., position_units=999999.0 × dir, relative=True)`를 던진다.
+  X는 8.25 mm/unit이므로 **약 8.25 km**. 멈추는 것은 버튼 `released` →
+  `stop_axis(mode=1)` 하나뿐이고, **발행과 정지가 둘 다 GUI 스레드에서 동기 실행**된다.
+  release 시그널이 삼켜지거나 이벤트 루프가 멈추면 축은 펌웨어 소프트리밋이나 물리
+  리밋스위치까지 간다. 패널은 소프트리밋을 더 이상 관리하지 않는다.
+- **임시 대응**: 조그는 짧게 끊어 누른다. **ROV가 갠트리 아래 있는 동안에는 조그 대신
+  waypoint CSV를 쓴다**(`./c3 gantry --waypoints-csv …`).
+- **제대로 고치는 법**: `JOG_MAX_TRAVEL_MM` 상수(예 200 mm)로 이동량을 묶고
+  `QTimer.singleShot(travel/speed + margin, stop)` 워치독을 건다. hold의 의미가
+  "누른 만큼"에서 "한 번에 최대 N mm"로 바뀌므로 조종자 합의가 필요하다. 발행·정지를
+  워커 스레드로 옮기는 안은 **권장하지 않는다** — 내부 뮤텍스가 없는 `.so`에 네 번째
+  동시 호출자를 더하는 쪽이 고치려는 문제보다 나쁘다.
+
+### `c3_camera/tests/test_option_sweep.py`가 20/32 실패한다 — API 드리프트 (2026-08-23)
+- **증상**: `./c3 test`에서 `TypeError: StreamConfig.__init__() got an unexpected
+  keyword argument 'mono_encode'`로 20개가 깨진다. `c3_camera/config.py`의
+  `StreamConfig`에 `mono_encode`가 없는데 테스트가 계속 넘기고 있다. 커밋된 상태이며
+  갠트리 작업과 무관하다(두 파일 다 HEAD와 동일).
+- **임시 대응**: `./c3 test`의 이 파일 결과는 현재 신호가 아니다. 나머지 파일
+  (host_depth 45/45, offline 58/58, preflight 43/43, src/tests 21/21)은 정상이므로
+  그쪽만 보고 판단할 것.
+- **제대로 고치는 법**: `mono_encode`가 언제 왜 빠졌는지 git 로그로 확인해서,
+  테스트에서 지우거나 `StreamConfig`에 되살리거나 둘 중 하나로 정리한다.
+
+
+### 지오펜스를 **완전히 제거**했다 — 풀 벽을 아는 것이 아무것도 없다 (2026-08-14)
+- **무엇을 없앴나** (조종사 명시 요청): 플롯의 주황 점선 `GEOFENCE` 상자,
+  START 전 경로 검사(line 양 끝점 / 사각형 네 모서리 — circle이 생긴 지금
+  이 검사는 꼭짓점 집합으로는 표현이 안 되고 림을 샘플링해야 한다), 주행 중
+  상자 이탈 시 자동 disengage. `hw_nav.yaml`의 `geofence_ned`·`geofence_frame`은 이제 읽지
+  않고, MPC CSV의 `geofence_ok` 열도 빠졌다.
+- **잃은 것**: 이제 **기체 위치를 이유로 멈추는 것이 하나도 없다.** 풀 밖으로
+  9 m 나가는 line도 그대로 arm되고, 주행 중 벽 쪽으로 밀려도 컨트롤러는 계속
+  간다. **circle(2026-08-17)은 입력한 태그에서 가장 멀리 가는 모양이다** —
+  중심이 태그에서 R, 반대쪽 림이 2R(배포 반지름 0.5 m면 1.0 m)이라, 태그 옆에
+  세워 놓고 START를 누르면 기체는 1 m 떨어진 곳까지 간다. 사람이 배치를
+  확인하는 것 말고 막는 수단은 여전히 없다. 남은 보호는 E-STOP(Esc·헤더·MPC 패널) · DISENG · sink deadman(500 ms) ·
+  engage 게이트(ARMED / MANUAL / 신선한 태그 fix·telemetry) · 주행 중 disarm ·
+  telemetry 정지 · 모드 이탈 · 태그 상실 자동 해제 · 축 권한 상한.
+- **임시 대응**: 수조 런에서는 **경로를 배치할 때 사람이 확인**하고, 조종사가
+  E-STOP에 손을 두고 있을 것. 플롯의 `POOL` 실선은 여전히 벽을 그리지만
+  **그림일 뿐 아무것도 강제하지 않는다**.
+- **제대로 고치는 법**: 다시 필요해지면 펜스를 되살리는 것보다, 거부가 아니라
+  **참조를 클램프**하는 쪽이 낫다(`geofence_clamp`가 그 용도로 있었다) — 배치를
+  막지 않으면서 setpoint가 벽을 넘지 못하게 한다. git: 이 커밋 직전 상태.
+
+### PID 경로추종이 **꼭짓점 10 cm 앞에서 영구 교착**한다 — leash × 코너 브레이크 × 데드밴드 (2026-08-18)
+- **증상**: `--mpc` 패널 `pid` + `path_fillet_m: 0.0`(waypoint_vertex_stop) 사각형에서,
+  기체가 한 꼭짓점 10 cm 앞에 서서 **아무 경고 없이 영원히 멈춘다.** solver_status 0,
+  태그 21장·reproj 1.85 px·ambig 0·tag_age 0.15 s·축 포화 0 % — 계기는 전부 정상.
+  2026-08-18 풀 세션에서 **두 런 연속 같은 꼭짓점**에서 발생, 조종사가 손으로 해제할 때까지
+  각각 40 s / 45 s 정지
+  (`sessions/low_level_controller_data/20260818/0818_143802/mpc_143802.csv` s=1.93 정지,
+  `.../mpc_143938.csv` s=5.92 정지 — 둘 다 tag 37 앵커 경로의 s≡2.0 m 꼭짓점, 즉
+  origin tag 대각 반대편 모서리. 정지 중 hull wander p95 1.9 cm).
+- **기구 (세 개가 겹쳐야 성립)**:
+  1. `PathCursor.step`의 leash `cmd = min(cmd, theta + lead_m)` — 선체가 서면 setpoint도
+     선다. → 위치 오차가 `path_lead_m` = 0.10 m에서 **하드 상한**을 갖는다
+     (`e_along` p50 0.099, 관여 tick의 **83.6 %**가 0.095 m 초과 = leash 상시 포화).
+  2. `speed_profile`이 필렛 없는 꼭짓점에서 v_ref를 creep 0.02까지 제동 → setpoint가 꼭짓점을
+     2 cm 넘어서면 **접선이 다음 변으로 90° 돌아간다.** PID의 속도 FF `kd·v_ref_b`가
+     surge 축에서 **0으로 사라진다**(kd_x = 59.7 N·s/m × 0.10 m/s = 5.97 N이 통째로 증발).
+  3. 남은 상한: `kp·0.10 + i_max` = 51.73×0.103 + 4.0 = **9.33 N** [유도] — 실측 uX 평균
+     9.47 N(sd 0.97). 직선 구간에서 움직일 때는 11.3–11.6 N이었다.
+     9.47 N / `axis_gain.surge_n` 60 = ax_surge **0.158**, `pwm_dev_us` 평균 **26 µs**
+     — hw_mpc.yaml이 스스로 적어 둔 T200/Basic ESC 널존 ±25 µs [스펙]와
+     전 루프 실측 `speed = 0.692·(|axis| − 0.096)`의 문턱 바로 위. 실제 속도 0.000 m/s.
+  → **선체가 못 가니 참조가 못 가고, 참조가 못 가니 명령이 못 커지고, 명령이 못 커지니
+     선체가 못 간다.** 안정한 고정점이라 스스로는 절대 못 빠져나온다.
+- **배경 조건**: 이 런은 leash가 처음부터 포화였다 — 지령 0.100 m/s에 실제 0.051 m/s
+  (5.92 m / 116 s). 즉 속도 상자가 아니라 leash가 사실상의 제어법이었고, 코너 FF 손실
+  2 N이 그대로 문턱을 갈랐다.
+- **임시 대응**: `config/hw_mpc.yaml`에서 `path_fillet_m: 0.15`(기록상 최고 런 0817_110145가
+  쓴 값)로 되돌리면 꼭짓점 자체가 사라져 v_ref도 접선도 연속이 된다. 겸해서 속도 상자를
+  0.05–0.06 m/s로 낮출 것(기체가 실제로 내는 값).
+- **제대로 고치는 법**: 두 가지가 따로 필요하다.
+  (a) 적분 클램프 `pid.i_max_n` = [4.0, 5.0, 5.0] N이 **데드밴드 탈출에 필요한 힘보다 낮다** —
+      "정상 오차로 영구 정지"의 교과서적 원인. 최소 8–10 N로 올리거나, leash 포화 상태에서만
+      푸는 조건부 클램프.
+  (b) **교착 워치독이 없다.** `e_along ≥ 0.95·lead_m` && `|v| < ε`가 N초 지속되면 경고/중단
+      해야 한다. 지금은 MPCC 데드락 2건(memory: mpcc-contouring-control)과 똑같이
+      solver status 0으로 조용히 실패한다.
+
 ## 🐛 테스트 / 스크립트 함정
 
 ### 1280×800에서 **컬러 스트림이 디바이스 프레임의 3.3%를 떨어뜨린다** (2026-08-04)
@@ -128,6 +359,42 @@
   (c) 공기 중 작업용 별도 in-air 캘리브레이션을 체커보드로 떠서 매질별로 선택 가능하게 한다.
   (a)만 해도 이 항목의 위험 대부분이 사라지므로 우선순위 높음. 고치면 이 항목 삭제.
 
+### `config/config.yaml`의 수면·풀 깊이가 **ROV 실기록과 모순**한다 (2026-08-23)
+- **증상**: `water.surface_height_m: 0.8255` / `pool.depth_m: 1.143`은 2026-05-25 최초
+  커밋 이후 한 번도 안 바뀌었는데(`git log -- config/config.yaml`), ROV 실기록이 둘 다
+  넘긴다.
+  1. **압력센서가 개입하지 않는 하한**: 채택된 fix의 `z_ned` 최저 **−1.296 m**
+     (p50 −1.138, n=22094 — `sessions/nav_runs/*/fixes.csv`, 2026-08-13/14 집계).
+     바닥 태그 매트가 z=0이고 +z가 아래니까, 기체가 매트 위 1.296 m에서 **잠긴 채**
+     바닥 태그를 보고 있었다는 뜻 → 매트 위 물기둥이 최소 1.3 m.
+  2. **압력에서**: engage마다 `StateAssembler.calibrate_z_offset`이
+     `z_off = z_tag − depth`를 잡는다(`rov_gui/control/state_assembler.py:104-108`).
+     `−z_off`(= 매트 위 수면 높이)를 events.log의 `datum p0` z와 같은 런
+     `*_rov.jsonl`의 `GLOBAL_POSITION_INT.relative_alt`로 복원하면
+     2026-08-18 = 1.386 / 1.409 / 1.415 / 1.418 / 1.440 m,
+     2026-08-17 = 1.641 / 1.654 / 1.664 / 1.686 / 1.722 m.
+  즉 config는 ~0.6 m 얕고, "45 in 풀"이라는 1.143 m조차 하한 1.3 m보다 작다.
+  (`docs/MEASUREMENT_AUDIT.md`가 이미 `claude.md`의 풀 치수 줄을 UNVERIFIED로 찍었고
+  거기 적힌 width도 config와 어긋난다.)
+- **부수 발견 — 같은 물인데 두 세션이 0.24 m 다르다**: ArduSub의 depth 0점이
+  **부팅마다 재설정**되기 때문이다(depth = (ground_pressure − p)/9800/`BARO_SPEC_GRAV`,
+  ground_pressure는 부팅·preflight baro cal 때 재취득). 하루 안에서는 ±3–4 cm로
+  일관하므로 **압력에서 나온 수면 높이는 그 세션 안에서만** 유효하다. Bar30의 절대
+  정확도는 ±200 mbar(≈±2.04 m 담수)라 절대압으로는 아무것도 못 정한다
+  [스펙: bluerobotics.com/store/.../bar-depth-pressure-sensor/].
+- **임시 대응**: config의 두 값을 **어떤 숫자의 근거로도 인용 금지**. 굴절 보정이
+  `water.surface_height_m`를 쓰므로(`src/tagslam_core.py:880`) 갠트리/ZED 굴절 결과도
+  이 값에 매달려 있다 — 물이 찬 날의 굴절 재계산은 신뢰하지 말 것.
+  `rov_gui/backends/hardware.py:1337`의 폴백(절대압 − 1013.25 hPa)은 Bar30 절대
+  오프셋을 그대로 삼키므로 **수위 근거로 쓰면 안 된다**(GLOBAL_POSITION_INT가 살아
+  있으면 그 경로는 안 타지만, 죽으면 조용히 갈아탄다).
+- **제대로 고치는 법**: 줄자로 풀 깊이와 그날 수위를 재서(±3 mm, 10분) 날짜와 함께
+  config에 적는다. ROV 쪽은 ① 기체를 **물 밖에서** 부팅해 0점을 대기압에 잡고,
+  ② engage 때의 `z_off`와 depth를 `*.meta.json`에 기록하면(지금은 events.log +
+  jsonl 조합으로만 복원 가능) 수위가 런마다 기록되는 양이 된다. Bar30의 선체 내 z
+  오프셋(전자부 엔드캡)은 리포 어디에도 실측이 없어 **절대값은 ±5–10 cm이 한계**다 —
+  같은 자리에 앉혀 재는 **변화량**은 lever arm이 소거돼 mm급으로 나온다.
+
 ### `dataset.py` telemetry CSV 스키마가 "첫 메시지 승자독식" — 세션마다 열이 달라짐 (2026-08-03)
 - **발견**: 2026-08-03 (`c3_option_sweep.py` 작성 중 API 매핑 워크플로)
 - **증상**: `DatasetWriter.mavlink_rows`가 그룹(telemetry/imu_rov/control)별로 **처음
@@ -143,6 +410,30 @@
   `metadata.json`의 `mavlink.message_counts`로 교차 확인.
 - **제대로 고치는 법**: 그룹별 헤더를 `ALL_MESSAGES`의 필드 합집합으로 미리 확정하거나,
   메시지 타입별로 파일을 분리(`telemetry_VFR_HUD.csv` …)한다. 고치면 이 항목 삭제.
+
+### `mpc_tuned` meta가 **회전이 실제로 걸렸는지**를 기록하지 않는다 — 등방으로 날고도 "tuned"로 남는다 (2026-08-25)
+- **발견**: 2026-08-25 (mpc_tuned formulation 추출 + 12개 주장 적대적 검증 워크플로)
+- **증상**: `HwDobMpc.meta()`(mpc_bridge.py:641-643)는 `self.tuned`(모드 이름이 `_tuned`로
+  끝나는가) **하나만** 보고 `cost_frame: "path (along/cross split)"` + `path_cost` 블록
+  (q_along 75 / q_cross 1200)을 찍는다. 그런데 가중치 회전이 실제로 솔버에 들어가는 조건은
+  그보다 좁다 — `_apply_stage_weights`(mpc_bridge.py:554-558)는 **path plan이 설치돼 있어야**
+  회전하고, plan의 유일한 생산자(workers.py:1634-1641)는 `cfg.path_following`이 참이고
+  `PathCursor`가 있을 때만 도달한다(workers.py:1613, 2468). 즉 `path_following: false`로
+  `mpc_tuned`를 날리면 **미션 전 구간을 등방 300/300으로 날고도** meta는 tuned라고 적는다.
+  path_cost.py:70-72가 경계하는 바로 그 실패 모드("런은 baseline으로 나는데 meta는 tuned")이고,
+  실제로 회전이 걸렸는지를 아는 `_w_tuned` 플래그는 어디에도 기록되지 않는다.
+- 런타임 확인(heavy_gripper, prebuilt `heavy_gripper_rti`, `solver.cost_get`으로 되읽기):
+  built `[[300,0],[0,300]]` / plan 있는 tuned tick `[[75,0],[0,1200]]` / station tick(plan=None)
+  `[[300,0],[0,300]]`. **산출물 미보존** — 재현은 위 세 상태에서 `cost_get(0,"W")[:2,:2]`.
+- **부수 결함**: mpc_bridge.py:550이 문서화한 세 번째 no-op("plan이 `psi_path`를 안 갖고 있으면
+  추측하지 말고 fall back")은 **죽은 코드**다. `NedPlan.__post_init__`(path_geometry.py:336-342)이
+  `psi_path`를 항상 채우고, 레거시 4-인자 생성이면 `yaw_ned`를 대신 넣는다 — 등방 복귀가 아니라
+  **기체 헤딩으로 조용히 회전**한다(`heading_follow: false`에선 경로 접선과 무관한 각도).
+- **임시 대응**: tuned 런을 인용하기 전에 그 런의 `controller.json`에서 `path_following: true`를
+  확인할 것. 현재 config는 true(hw_mpc.yaml:105)라 정상 경로이고, 아직 tuned 런 자체가 0건이다.
+- **제대로 고치는 법**: `meta()`가 `_w_tuned`(또는 회전이 실제로 쓰인 tick 수)를 같이 기록하고,
+  `_tuned` 모드가 `path_following: false`와 함께 무장되면 거부하거나 최소한 경고한다.
+  `NedPlan`의 `psi_path` 폴백은 조용한 yaw 대입 대신 예외로 바꾼다. 고치면 이 항목 삭제.
 
 ### 📊 compare sweep 재실행 대기 — MPC surge 박스 8 → 30 N 변경 이후 (기록 경계)
 - **발견/변경**: 2026-07-24 (wave-crossover 워크플로에서 벤치마크 불공정 발견 → 같은 날 수정)
@@ -188,6 +479,30 @@
 - **제대로 고치려면**: **미룬 dobmpc NU=6-only 정리와 함께** 진행 — params.py의 NU=4/
   option-b 죽은 경로 제거 + test_dobmpc의 rank-5 trim 단정을 heavy(NU=6)용으로 재작성.
 
+### `verify/verify_hydro.py` — bluerov2 강체 + heavy 계수 혼합 fixture, 39 FAIL (2026-08-13)
+- **발견**: 2026-08-13, `for_jaden/` 인수인계 패키지의 자체 검증 중.
+- **증상**: `python verify/verify_hydro.py --no-plot` → **39 FAIL / 13 PASS**
+  (added mass T5, 복원 진자 T4, transfer-function TL 축, T7-R2 부력 등 광범위).
+  hydro.py의 결함이 아니라 **fixture 불일치**다:
+  - verify_hydro.py:32는 `bluerov.xml`(레거시 rank-5 BlueROV2)을 로드하고,
+    verify_hydro.py:35-45의 ground-truth 상수도 BlueROV2 값(MASS 11.2, VOLUME 0.0113459).
+  - 그런데 verify_hydro.py:61의 `H.Hydrodynamics(model, disturbance=None)`은 계수 YAML
+    기본값 = `RM.YAML_PATH`를 읽고, `ROV_MODEL` 기본값이 heavy라 **BlueROVHeavy.yaml**
+    (VOLUME 0.0116499)이 걸린다.
+  - 부력으로 정확히 확인됨: 기대 997·9.81·0.0113459 = **110.969 N**(테스트 상수) vs
+    측정 997·9.81·0.0116499 = **113.943 N**(실제 로드된 계수). 소수 셋째 자리까지 일치.
+  - 2026-07-21에 `bluerov2` 변종이 레지스트리에서 제거돼 `ROV_MODEL=bluerov2` 우회도 불가
+    (ValueError) — 위 `tests/test_dobmpc.py` 항목과 같은 계열의 잔재.
+- **임시 대응**: 없음. hydro 수치를 이 스크립트로 검증했다고 인용하지 말 것.
+  `tests/test_hydro.py`(중성부력/자기복원/항력 한계속도)는 정상 통과하므로 그쪽이 현재
+  유일하게 유효한 hydro 스모크다.
+- **제대로 고치는 법**: `make_sim()`이 `H.Hydrodynamics(model, disturbance=None,
+  coeff_path=<marinegym_assets/BlueROV.yaml>)`로 계수를 **명시**하게 해서 bluerov.xml
+  fixture와 짝을 맞춘다(ground-truth 상수는 그대로 유효). 또는 fixture 전체를 heavy로
+  옮기고 상단 상수를 BlueROVHeavy.yaml 값으로 재작성한다. `verify_hydro_precise.py`도
+  verify_hydro_precise.py:438에서 같은 기본-계수 경로로 sim을 만들므로 같은 불일치를 가질
+  가능성이 높다 — **미확인**, 함께 점검할 것.
+
 ### dobmpc NU=4 / option-(b) 죽은 경로 (bluerov2 제거 후 도달 불가, deferred)
 - **발견**: 2026-07-21 (bluerov2 변종 제거)
 - **증상**: 모든 잔존 변종이 rank-6(NU=6)이라 `dobmpc/params.py`의 NU=4 분기,
@@ -216,6 +531,44 @@
 - **증상**: Hs/Tp/gamma/s/h/N_omega/N_beta가 스크립트 상수로 복사돼 있음(yaml을 읽지
   않음) → config를 바꾸면 슬라이드 figure가 실제 실험과 **조용히** 어긋남.
 - **제대로 고치려면**: `disturbance.config.load_config`로 yaml을 직접 읽기.
+
+### `water_viz.py` hfield 축이 **행↔열 전치** — 렌더된 파면이 x=y 대각 기준 미러 (2026-08-19)
+- **증상**: `water_viz.py:79-84`는 "row = X, col = Y"로 주석·구현돼 있으나, MuJoCo
+  (3.9.0)에 4×4 합성 hfield를 만들어 `mj_ray`로 직접 찔러 보면 마지막 **행**을 올렸을 때
+  +Y가 뜨고 마지막 **열**을 올렸을 때 +X가 뜬다 — 실제 규약은 row→Y, col→X. 결과적으로
+  화면의 파면·해류 진행 방향이 물리 방향과 **x=y 대각 기준으로 미러**된다. 48-샘플/
+  0.1771 m 축이 물리적으로는 Y, 96-샘플/0.0885 m 축이 X.
+- **영향**: **코스메틱 전용**. hx = hy = 4.25라 지오메트리는 그대로 맞고, hfield는
+  `contype=0 conaffinity=0`이라 동역학 경로가 없다(`tests/test_water_viz.py` Δ=0 무관).
+  단, 영상에서 "파도가 이쪽에서 온다"를 물리와 대조하면 어긋난다.
+- **임시 대응**: 프리뷰 영상으로 파랑 **방향**을 주장하지 말 것(강도·질감만).
+- **제대로 고치는 법**: `water_viz.py:79-84`에서 X를 ncol, Y를 nrow에 걸고
+  `meshgrid(..., indexing="ij")` 축 순서를 맞춘 뒤, 합성 hfield + `mj_ray` 회귀 테스트 추가.
+
+### `water_viz.py` 프리뷰가 실제 해상보다 **잔잔하게** 보인다 — 120-성분 트림 + eta 클리핑 (2026-08-19)
+- **증상 2건**(둘 다 렌더 전용, 어디에도 기록돼 있지 않음):
+  (a) `MAX_MODERN_COMPONENTS = 120`(`water_viz.py:40,138-150`)이 M = 1260–1848 성분 중
+  진폭 상위 120개만 그린다 → elevation 분산 잔존율 **very_rough 74.7% (eta std 0.375 →
+  0.324 m) / moderate 91.1% / gentle 96.8%** [유도: 이번 세션 재계산, 저장 산출물 없음].
+  (b) `d = 0.5 + eta/elev`를 [0,1]로 clip(`water_viz.py:105-107`)하는데 shipped
+  `elev = 0.60`(`bluerov2_mujoco_marinegym/tag_floor.xml:10`)이므로 **|eta| > 0.30 m에서
+  flat-top**. very_rough의 트림 후 eta std가 ~0.32 m라 프리뷰 상당 부분이 잘린다. 그런데
+  `tools/gen_pool_apriltags.py:231,569-570`은 이 값을 "half-range / max|eta| headroom"이라
+  부른다 (실제 headroom은 elev/2).
+- **임시 대응**: 강한 sea state 프리뷰는 `--water-hf-elev`를 2×(예: 1.2 이상)로 재생성.
+- **제대로 고치는 법**: (a) 트림 잔존 분산을 `update()`에서 한 번 로깅, (b) `elev`를
+  실제 반범위로 쓰도록 `d = 0.5 + eta/(2*elev)`로 고치거나 인자명을 바꿀 것.
+
+### `water_viz.py`가 modern env의 **레이어 게이팅을 무시** — C/CD 모드에서 물결이 보인다 (2026-08-19)
+- **증상**: `_eta_modern`/`_current_vec`은 `field.waves`를 직접 읽고
+  `field.use_waves`를 **확인하지 않는다**(`water_viz.py:113-136,183-198`). 호출부는 마스터
+  `enabled`만 넘긴다. 그래서 파도가 꺼진 모드(C, CD)에서도 수면이 출렁인다.
+  `experiments/wave_preview.py:200`은 CLI에 `--mode C/CD`를 노출하고 `:151`은
+  `enabled=True`를 하드코딩한다. (legacy `disturbances.py`는 `enabled`를 제대로 게이트하므로
+  teleop 경로에는 없는 문제.)
+- **영향**: 시각 전용이지만 **오독을 부른다**(C 모드 영상을 파랑 영상으로 착각).
+- **제대로 고치는 법**: `_eta`에서 `getattr(field, "use_waves", True)`를 확인하고,
+  advection도 `use_current`로 게이트.
 
 ### `tools/analyze_square3.py` / `tools/analyze_acados_vs_before.py` — 경로 하드코딩
 - **발견**: 2026-07-06
@@ -289,6 +642,250 @@
 - **제대로 고치려면**: 새 해상 상태 기준으로 EAOB_TAU_DIST 재스윕(0.05–0.1 예상) 또는
   harmonic-EAOB — 어느 쪽이든 실험 설계 결정이라 사용자 판단 필요.
 
+### STATION BRIDGE(태그 dropout 사다리)가 **실기 미검증** (2026-08-18)
+- **무엇**: station 모드에서 태그를 놓쳐도 disengage하지 않는다. 0~`imu_hold_s`(3 s)는
+  전 축을 bridge 추정치로, 그 뒤로는 x/y/yaw를 해제하고 깊이+자세만 **무제한** 유지.
+  `rov_gui/control/station_bridge.py`, 설정 `config/hw_mpc.yaml: station_bridge:`.
+- **검증된 것**: 사다리 로직·화이트리스트·coast의 전선 위 축 값(allocation/cap/slew
+  통과)·다른 인터록 생존·station 한정·meta/CSV 경계까지 `test_station_bridge.py` 15/15,
+  기존 스위트 무회귀(test_control 79/79, test_offline 79/79, test_imu_dr 25/25).
+- **검증 안 된 것**: **물에서 한 번도 안 돌렸다.** 특히 (1) 실제 dropout이 몇 초인지
+  아직 모른다 — 2026-08-18 8개 런에서는 최악 0.55 s로 기존 1.1 s 예산 안이었고,
+  즉 **문제가 재현된 로그를 아직 못 봤다**; (2) `xy_source: auto`가 고르는
+  가속도 적분 경로는 C3 BNO086 캘리브(`config/c3_imu_calib.json`)의 품질에 전적으로
+  달렸는데 그 캘리브 자체가 미검증([[imu-dead-reckoning-experiment]], 40° 틸트 미기입);
+  (3) coast에서 실제로 얼마나 흘러가는지 모른다.
+- **임시 대응**: 첫 수조 세션에서는 **조종사가 E-STOP에 손을 두고**, 패널이 빨갛게
+  `NO TAG — COASTING`으로 바뀌면 그때부터는 사람이 판단한다. 지오펜스가 없어서
+  coast 중 벽으로 흘러가도 막는 것이 없다. 되돌리려면 `station_bridge.enabled: false`
+  한 줄이면 예전 거동으로 정확히 돌아간다(테스트로 고정).
+- **제대로 고치는 법**: (a) 문제가 난 런의 CSV에서 `tag_age_s`/`n_tags`로 dropout
+  길이 분포를 먼저 재고 `imu_hold_s`를 거기에 맞춘다. (b) 복구 로그가 남기는
+  "IMU was N cm off"를 몇 번 모으면 `xy_source: imu`를 신뢰할지 말지가 **측정으로**
+  결정된다 — 지금 3 s/9 cm는 [유도]다. (c) coast가 길어질 때 자동으로 무엇을 할지는
+  아직 결정 안 했다(현재는 영원히 유지 + 사람).
+
+### 물체 추종(`follow` + `object_nav`)이 **실기 미검증**이고 `--pose` 위험을 통째로 상속한다 (2026-08-21)
+- **무엇**: `--pose --mpc`를 함께 켜면 클릭한 물체가 태그맵 좌표로 올라오고(패널 다이아몬드,
+  `bus.object_fix`), 미션 모양 `follow`가 START 순간의 상대 자세(위치 3D + yaw)를 유지한다.
+  `rov_gui/control/object_nav.py`, 설정 `config/hw_mpc.yaml: object_nav:`,
+  문서 `rov_gui/README.md`의 "물체를 따라간다 — follow".
+- **검증된 것**: extrinsic 소거(틀린 extrinsic을 넣어도 물체 위치가 1e-9로 불변) ·
+  프레임 어긋남의 lever-arm 대가 · 오프셋 왕복과 궤도 성질 · yaw 축 고정 · 점프 거부/reseed ·
+  t_capture 기반 속도 · 외삽 클램프 · 짝맞춤 우선순위 · 다섯 가지 arm 거부 ·
+  arm이 기체를 안 움직임 · leash가 1 s tick에서도 유지 · 이탈 클램프 · freeze→station 강등 ·
+  태그 dropout 강등 후 bridge 인계 · 네 곳 lifecycle · CSV 10열/schema 6 —
+  `test_object_nav.py` 28/28, 기존 스위트 무회귀(test_control 81/81, test_offline 79/79,
+  test_station_bridge 15/15, test_imu_dr 27/27), `demo_e2e.py pid follow {still,drift,orbit}`
+  전부 통과(pair_exact 100 %).
+- **검증 안 된 것**: **물에서도 공기 중에서도 한 번도 안 돌렸다.** 그리고 이 기능은
+  아래 "`rov_gui --pose`: 물체 추적/자세추정이 실기에서 한 번도 안 돌았다 (2026-08-09)"
+  항목의 위험을 **통째로 상속한다** — `--pose`가 책상 위 물체에서 `TRACKING`을 못 주면
+  이 기능은 존재하지 않는 것과 같다. demo가 증명하는 것은 배관과 대수뿐이다: demo의
+  `T_cam_obj`는 demo 기체 상태에서 만들어지므로 합성이 **구조적으로** 왕복하고,
+  SAM2 마스크 품질·FoundationPose 지연·드롭아웃 통계·depth 노이즈는 하나도 안 나온다.
+  `object_nav:`의 임계값은 **전부 [예측]**이다.
+- **가장 싼 go/no-go (코드가 아니라 배치 문제일 수 있다)**: `cam_tilt_deg: 43.3`이면
+  C3는 매트를 **내려다본다**. 물체가 태그 ≥2장과 **한 프레임**에, 0.3~0.8 m 거리,
+  HFOV 63.9°(0.5 m에서 시야 폭 62 cm) 안에 들어와야 합성이 성립한다.
+  **태그와 물체가 한 프레임에 공존 못 하면 이 마운트에서는 못 나는 기능이고, 답은
+  코드가 아니라 두 번째 카메라나 재틸트다.** 테이프로 먼저 재 볼 것.
+- **임시 대응 (벤치 → 풀장 순서, 각 단계가 다음을 벌어준다)**:
+  벤치(공기 중, COMMAND ENABLE off, 미장착): ① 위 배치 확인 → ② 클릭하고 다이아몬드를
+  본다. 물체를 손으로 20 cm 밀면 플롯에서도 움직여야 한다. **공기 중 거리는 ~1.33배
+  길게 읽힌다**(C3 공장 캘리브가 **수중** 값 — `calib/FOV_AUDIT.md`, 아래 2026-08-04 항목).
+  **공기 중에서 이걸 "고치면" 안 된다** — 손 병진 검사는 **비율로서** 유효하고, 기록할
+  것은 그 비율이다(실제 20 cm에 그림 26.6 cm면 체인 전체가 맞고 스케일만 알려진 오프셋).
+  → ③ 패널의 `pair` 슬롯이 사실상 0 ms인지. 아니면 두 메일박스의 독립 conflation이
+  공유 stamp를 무력화한 것이고, extrinsic 소거가 멈춰 0.2855 m lever arm이 오차 예산에
+  들어온다 — **풀장 전에** 알아야 한다. → ④ 거부 4종(모드 mpcc / lock 없음 /
+  `nav_source: second` / `--pose` 없음) 발동 확인.
+  풀장: ① **HOLD만, 물체 시야 안, 2분** — 산포·`pair_exact` 비율·`obj_age_s` p50/p95·
+  `PoseTrack.state`가 `tracking`을 벗어나는 빈도. `object_nav:`의 모든 [예측]이 [측정]이
+  되는 런이고, follow를 arm할 가치가 있는지 여기서 결정된다. → ② **정지 물체 follow**:
+  기체가 **움직이면 안 된다**(오프셋을 현재 pose에서 떴으니까). 1초 안에 보인다. →
+  ③ 손으로 천천히 옮기는 물체 1 m 직선 ~0.05 m/s, 칩의 `speed`/`ref_speed` 비교
+  (FF가 안 먹으면 2배 이상 지연으로 보인다). **E-STOP에 손 — 벽을 아는 건 새
+  `max_excursion_m`뿐이고 그건 미검증이다.** → ④ 제자리 회전(궤도 케이스, 잘못된
+  `yaw_axis`가 가장 잘 드러난다) → 그 다음에야 빠른 이동과 긴 이탈.
+  첫 벤치·풀장은 `object_nav.yaw_axis: none`으로 — 물체 yaw를 안 쓰면 실패 클래스
+  하나가 통째로 사라진다. 되돌리려면 shape를 `follow`가 아닌 것으로 두면 되고, 표시
+  절반만 쓰려면 arm하지 않으면 된다(기체에 대한 새 권한이 전혀 없다).
+- **2026-08-23 첫 실기 시도 — 위의 go/no-go에서 걸렸다(코드 아님, 거리)**: 태그와 물체가
+  한 프레임에 들어오기는 했으나 **물체가 1.2~1.56 m**에 있어 `object_nav.max_distance_m:
+  1.20`이 관측을 거의 전부 거부했다. 근거: `pose: collecting reference views — object is
+  1556 mm away`와 메시 캡처 시 `distance 1195-1256 mm`
+  (`sessions/low_level_controller_data/20260823/0823_162548/mission_log.txt`),
+  16:34~16:36 세 런의 `obj_state`가 **전 행 `cold`**(한 번도 lock 안 됨), 16:38 런은
+  단 한 번 lock한 뒤 **전 행 `lost`**로 `obj_age_s`가 9.6 s→202 s까지 자람
+  (`0823_163414/mpc_163512.csv`, `0823_163707/mpc_163809.csv`). 그래서 플롯에
+  다이아몬드가 거의 안 뜨고 `follow`는 arm 자체가 안 된다("no object lock").
+  **1.2~1.5 m는 [미검증] 구간이다** — 0.3~0.8 m는 [측정: KNOWN_ISSUES 2026-08-09] 동작,
+  2.4 m는 [측정] 실패, 그 사이는 아무도 재 본 적이 없다. 물체를 0.3~0.8 m로 가져오는 것이
+  **먼저**이고, 그게 배치상 불가능할 때만 `max_distance_m`를 올리되 그 런은 새 [예측]
+  구간에서 난 것으로 표시할 것.
+- **제대로 고치는 법**: 풀장 ①~④를 통과하면 이 항목을 지우고 `object_nav:`의
+  `[예측]`을 측정치로 바꾼다. ②가 안 되면 원인은 대개 배치이거나 `--pose` 자체다.
+
+### 물체 자세의 **거리가 1.42~1.50배 길다** — 원인 미확정(메시 스케일 vs depth 캘리브) (2026-08-23)
+- **증상**: 매트 위에 놓인 물체가 태그면 **아래 0.42~0.50 m**에 찍히고, 선체→물체 광선이
+  태그면까지 거리 대비 **1.42~1.50배**(p10~p90 1.37~1.60). 방향은 맞고 길이만 늘어난다.
+  [측정: `sessions/low_level_controller_data/20260823/0823_174602/mpc_174638.csv`,
+  `mpc_174657.csv`, `obj_state=live` 행; 태그면 위치는 각 런 meta의
+  `hardware.datum_tag_frame.p0`]
+- **굴절은 아니다(부호가 반대)**: 평면 포트에서 물은 상을 1.33배 크게 만들어 거리를
+  **짧게** 읽히게 한다. 공중 캘리브를 물속에서 쓰면 1.33배 짧고, 수중 캘리브를 공중에서
+  쓰면 1.33배 길다([[c3-calibration-is-underwater]], `calib/FOV_AUDIT.md`). 물속에서
+  길게 읽히는 조합은 없다. 태그 PnP도 독립적으로 반증한다: engage 시 태그 z −1.002 m +
+  압력 depth 0.41 m = 매트 위 수주 **1.41 m**로 실기록 ~1.4 m와 일치한다
+  (1.45배라면 1.86 m여야 한다).
+- **남은 두 후보는 이 데이터로 구별이 안 된다** — 둘 다 "메시가 크고 거리가 멀다"를 만든다:
+  1. **재구성 메시 스케일**. 그날 메시는 8 views / arc 101°(로그가 `only 8 views (10+
+     recommended); the mesh may be poor`라고 경고) → `88 x 175 x 239 mm`. FoundationPose는
+     렌더한 메시가 관측 크기와 맞을 때까지 거리를 밀어내므로 **거리 ∝ 메시 크기**다.
+     참고로 16:32 세션의 같은 계열 물체 메시는 `101 x 114 x 171 mm`(239/171 = 1.40).
+  2. **depth map이 metric이 아니다**. stereo depth는 mono 쌍 + baseline이라 RGB fx와
+     **별개 캘리브 경로**이고, **태그는 depth를 전혀 안 쓴다**. 여기가 1.4배면 BundleSDF
+     재구성도 FoundationPose 추적도 같은 스케일 오차를 물려받고 태그만 멀쩡하다.
+- **판별 수단은 붙여 놨다**: 궤적 readout의 **`depth-vs-TAG n.nnx (N tags)`** 줄
+  (`window._check_depth_scale`). 시야의 매핑된 태그마다 depth map 값과 **fix에서 나온
+  기하학적 카메라→태그 거리**를 비교한 중앙값이다. `1.00x`면 depth는 metric이고 범인은
+  메시, `~1.3x`면 depth 경로다. `test_the_depth_map_is_cross_checked_against_the_tag_pnp`.
+- **2026-08-23 18:26 런이 "일정한 스케일 오차"라는 가설을 반증했다.** 12178개 live 행
+  [측정: `0823_182628/c3_depth_20260823_182645_mpc.csv`]:
+
+  | | 중앙값 | p10 | p90 |
+  |---|---|---|---|
+  | 물체 z (MAP NED, 0 = 매트) | **+0.53 m** | −0.84 | +0.77 |
+  | 광선의 매트 통과 배율 | **1.52x** | 0.51 | 1.75 |
+  | 보고된 선체→물체 거리 | 2.41 m | | |
+
+  배율이 0.5~1.75로 **3배 넘게 흔들린다** — 어떤 캘리브 상수도 이걸 못 만든다. 물체 z도
+  매트 위 84 cm와 아래 77 cm를 오간다. **즉 자세추정 자체가 유효한 해를 못 잡고 있다**:
+  같은 런의 `reg` 카운트가 67→86까지 올라가고 로그가 `pose does not fit — wrong object`와
+  `lost the object`로 도배됐다. 8 views로 만든 수중 광택 물체 메시가 원인 후보 1번이다.
+- **2026-08-23 21:1x 최종 확정: 스테레오 depth가 물속에서 1.56~1.71배 길다 — 조종사의
+  캘리브레이션 가설이 맞았다.** 결정 증거: 깨끗한 캡처(arc 79°, 0.88~0.91 m, 게이트 안)의
+  메시 `143×166×187 mm` vs **캘리퍼 실측 119.73 mm** = **1.562배**
+  [측정: `0823_210304/mission_log.txt` 21:02:29 + 조종사 캘리퍼]. 가까운 캡처 메시들도
+  전부 1.43~1.63배(171/195 mm)로 **일정**하고, 바닥 스윕 `depth-vs-MAP`는 **1.71x**
+  (더 먼 거리 — 오차가 거리 의존일 수 있음). 컬러 PnP는 같은 물에서 mm급이므로
+  **컬러 캘리브는 정상, 스테레오 depth 경로만 non-metric**이다.
+  아래 "물체가 아닌 것을 삼킨다" 분석은 **부분 원인으로 강등**: 거리별 산포 증가(smear)는
+  실측 사실이나, 지배 항은 이 스케일이다. 470 mm 메시 = 스케일 × smear.
+- **대응(2026-08-23 추가)**: `--depth-scale K` — depth 밀리미터를 **소스에서 한 번** 곱해
+  모든 소비자(커서 프로브·캡처·FoundationPose·depth-vs-MAP)가 같은 보정 스트림을 본다.
+  시작값 **0.64**(=1/1.562). 적용하면 depth-vs-MAP가 ~1.0x로 내려와야 하고(그 줄이 보정의
+  검증기가 된다), **메시는 반드시 다시 캡처**(옛 메시는 1.56배라 보정 depth와 안 맞는다).
+  pose CAMERA 레코드에 `depth_scale_applied`로 기록된다. **진짜 수리는 수중 스테레오
+  재캘리브레이션**(c3_camera 쪽 작업, 미착수).
+- **경계**: 이 날짜 이전 depth 유래 거리는 전부 1.4~1.7배 길다 — 물체 위치·hold_m·메시
+  치수·참조뷰 distance 전부 인용 금지.
+- **(이하 과거 분석 기록)** 2026-08-23 20:00 당시 원인 후보였던 것: 재구성이 물체가 아닌
+  것을 삼킨다(스케일 오류가 아니다).**
+  같은 물체 여덟 번 재구성 [측정: `sessions/pose_meshes/*/model/model.obj`, oriented bbox]:
+
+  | verts | bbox (mm) |
+  |---|---|
+  | 18,548 | 101 × 114 × **171** |
+  | 30,147 | 87 × 112 × **195** |
+  | 59,542 | 88 × 175 × **239** |
+  | 101,428 | 108 × 172 × **470** |
+
+  **짧은 두 변은 안정적**(87~108 × 104~175 mm)이고 **긴 변만** 자란다. 재구성은
+  **metric RGB-D 기반이라 크기를 안다** — 틀린 건 스케일이 아니다.
+
+  **범인은 마스크가 아니라 마스크 안의 depth이고, 그 결정 변수는 거리다.**
+  저장된 모든 참조 캡처에서 마스크 안 depth의 p5~p95를 재봤다
+  [측정: `sessions/pose_meshes/*/{depth_enhanced,mask}`]:
+
+  | 캡처 거리 | 마스크 안 depth 산포 | 결과 메시 길이 |
+  |---|---|---|
+  | 510 mm | **102 mm** | 182 mm |
+  | 626 mm | 142 mm | 239 mm |
+  | 1210 mm | 284 mm | 171 mm |
+  | 1369 mm | 265 mm | **470 mm** |
+  | 1358 mm | **714 mm** | (버려짐) |
+
+  물체는 약 110 mm다. **0.5 m에선 산포 ≈ 물체 크기**(정상)인데 **1.4 m에선 2~6배**라
+  융합되는 포인트 클라우드가 뭉개진 덩어리이고, 메시는 그 뭉개짐이 향한 방향으로 길어진다.
+  문제의 470 mm 메시는 **1083~1479 mm에서 캡처**됐다(마스크는 정상, 18장/79°).
+  스테이션이 캡처 중 이미 "30-80 cm"라고 안내하지만, 업스트림 뷰 게이트는 1.5 m까지
+  받아준다 — 그 사이가 이 사고 구간이다.
+- **그래서 균일 리스케일도, 마스크 튜닝도 틀린 처방이다.** 2026-08-23에 리스케일을 한 번
+  잘못 만들었다가 되돌렸다(맞는 두 변을 줄이게 된다). 마스크는 실제로 멀쩡했다.
+- **대응(2026-08-23 추가)**: 캡처가 끝나는 순간 `PoseSession.depth_quality`가
+  **마스크 안 depth 산포 vs 마스크 면적이 함의하는 물체 크기**를 찍는다. 1.5배를 넘으면
+  경고: "마스크는 정상이고 그 안의 depth가 smear다 — 30-80 cm에서 다시 잡아라."
+- **헤딩 의존성**: 태그 56 위 물체가 기체를 +y로 두면 57(+0.22 m y), +x로 두면 55 부근
+  (+0.29 m x)에 찍힌다 — 오차가 **기체가 보는 방향**을 따라간다. extrinsic 버그가 아니다
+  (`TagNav._solution`이 `t_cb`로 나누고 `compose_map_pose`가 다시 곱해 정확히 소거).
+  카메라 프레임의 상수 오차(=광축 방향 거리 오차)가 `R_map_cam`에 실려 회전하는 것이고,
+  "물체가 매트 아래로 들어간다"와 같은 하나의 결함이다.
+- **대응(2026-08-23 추가)**: `--pose-object-size MM`. 물체 최장변을 재서 주면 **빌드 직후**
+  메시 치수와 비교해 경고한다(리스케일 아님). 25% 넘게 길면 "이 메시로 날지 말 것".
+  아래 downstream 증상은 전부 이것의 결과이므로, 이 경고가 뜨는 메시로 난 런은 인용 금지.
+- **앞선 `depth-vs-TAG 1.44x`는 인용하지 말 것 — 그 체크에 샘플링 편향이 있었다.**
+  태그 중심 5x5를 읽었는데 태그 중심은 검은 사각형, 즉 이 장면에서 스테레오가 **유일하게
+  못 맞추는 패치**다. 그래서 태그가 작아질수록(=기체가 높을수록) 구멍과 경계 번짐이 늘어
+  숫자가 태그 개수를 따라 움직였다: 3장 0.94x / 8장 1.17x / 14장 1.46x
+  [측정: 조종사 스크린샷 4장, 18:30~18:35]. **2026-08-23 매트 전체를 훑는 방식으로 교체**
+  (`window._check_depth_scale`: 픽셀 격자 → 태그면 z=0과의 교점 → 기대 Z 대비 depth Z,
+  수백 샘플의 중앙값 + p10~p90 spread). 새 줄은 `depth-vs-MAP n.nnx (+/-s.ss)`이고
+  **spread가 0.15를 넘으면 그 숫자는 상수가 아니다**(= 스케일 문제가 아니라 형상 문제거나
+  매트 말고 다른 게 시야에 있다는 뜻). **아직 새 방식으로 읽은 런이 없다.**
+- **즉시 할 수 있는 확인(코드 없이)**: C3 DEPTH 패널의 커서 프로브를 **물체 위에** 올려
+  mm를 읽고, 같은 순간 파이프라인이 말하는 카메라→물체 거리(SENSORS `Object` 행)와
+  비교한다. 프로브가 짧으면 메시, 같이 길면 depth다.
+
+### `HwMpcc.set_target_ned`가 속도 피드포워드를 **버린다** — `follow`가 mpcc에서 거부되는 이유 (2026-08-21)
+- **증상**: `mpcc_bridge.py`의 `set_target_ned`가 `del v_ned, r_ned`로 시작한다.
+  호출마다 `ArcPath`+`speed_profile`+`window_for`를 새로 만들고 `scenario = None`으로
+  지운다. 20 Hz로 움직이는 setpoint를 주면 **FF 없이 매 tick 경로를 재구축**한다.
+- **왜 중요한가**: FF가 없으면 leash가 사실상의 제어법이 된다 — 실측
+  `kp·lead = 51.7 × 0.35 = 18.1 N` vs `F = 86.7·v + 5.76` → `v ≈ 0.084 m/s`
+  (2026-08-18, memory: approach-speed-leash-limited). DP hold에서는 무해하지만
+  움직이는 목표를 쫓는 어떤 모드에도 못 쓴다.
+- **임시 대응**: `HwMpcc.follow_ok = False` — `follow` 미션이 mpcc/dobmpcc에서
+  **거부**된다(`getattr(..., False)`로 fail-closed). dobmpc/mpc/pid로 날 것.
+- **제대로 고치는 법**: 움직이는 경로에 대한 contouring. theta가 솔버 상태인
+  구조에서 경로 자체가 매 tick 바뀌면 theta의 의미가 유지되지 않으므로, 플래그가
+  아니라 설계 변경이다. 그때까지는 거부가 옳다.
+
+### `HwDobMpc.set_target_ned`의 `r_ned`가 기본 컨트롤러에서 **사실상 no-op** (2026-08-21)
+- **증상**: `set_target_ned(p, yaw, v_ned, r_ned)`가 `r_ref`를 넘기지만
+  `set_target(..., yaw_target=None)`이라 `yaw_target = yaw_ref`가 되고,
+  `_xref_ned`에서 `delta = psi_t - psi0 = 0` → `xref[11,:]`이 **0으로 강제**된다.
+  즉 yaw-rate 피드포워드는 `HwPid`에서만 살아 있다.
+- **왜 중요한가**: 두 컨트롤러가 같은 인자를 받고 **다르게 무시**한다. 이 상태로
+  A/B를 하면 비교가 컨트롤러 비교가 아니게 된다.
+- **임시 대응**: `follow`는 `r_ned`를 **안 넘긴다**(`_issue_follow_target`). 헤딩
+  레이트 제한은 워커 쪽에서 두 컨트롤러에 동일하게 건다.
+- **제대로 고치는 법**: `set_target_ned`가 `r_ned != 0`일 때 `yaw_target`을 함께
+  계산해 넘기거나(예: `yaw + r*preview`), 아니면 인자를 지우고 경로 계획만 쓴다.
+  지금처럼 받아서 조용히 버리는 것이 최악이다.
+
+### `mpc_tuned` / `dobmpc_tuned` (along/cross 비용 분리)가 **실기 미검증** (2026-08-18)
+- **무엇**: tracking NMPC의 2×2 위치 가중치를 매 stage 경로 프레임으로 회전시켜
+  종방향(along)·횡방향(cross)을 따로 벌하는 모드. `rov_gui/control/path_cost.py`,
+  튜닝은 `config/hw_mpc.yaml: mpc_tuned:`.
+- **검증된 것**: 대수(회전 = 오차분리, 등방이면 baseline과 기계정밀도 동일)와
+  오프라인 폐루프 parity·모드전환 오염 없음까지 `rov_gui/tests/test_path_cost.py`
+  15/15. 코너 컷 감소는 **오프라인 예측모델 플랜트에서만** 확인
+  (fillet 0.15·0.10 m/s에서 4.8 → 1.2 mm, `rov_gui/tools/sweep_path_cost.py`).
+- **검증 안 된 것**: 물에서 한 번도 안 날렸다. 그 플랜트는 ESC 데드밴드도 테더도
+  없고 수평 항력이 8~12배 부족하다 — 2026-08-18 진단에서 확인된 실기의 지배적
+  제약(ax_surge 0.158에서 실제 속도 0.000 m/s)을 하나도 담고 있지 않다. 즉
+  **"코너 컷 −74 %"는 기하 예측이지 실기 성능 주장이 아니다.**
+- **임시 대응**: 배포 기본값 `along_scale 0.25 / cross_scale 4.0`은 **[예측]
+  첫 추정치**다. 기본 모드는 여전히 `dobmpc`이고 tuned는 opt-in.
+  fillet 0인 waypoint 미션에서는 효과가 −15 %로 떨어지고 along_scale을 내리면
+  오히려 나빠지므로(+57 %), **fillet 0.15와 같이 쓸 것**.
+- **제대로 고치는 법**: P5/P6 뒤에 baseline `mpc` ↔ `mpc_tuned` 한 쌍을 같은
+  세션에서 날리고 코너 구간 cross-track을 비교한다. run meta의
+  `controller.cost_frame` / `controller.path_cost`가 두 기록의 경계다 —
+  tuned 런의 `Q` 행은 split을 유도한 등방 baseline이지 솔버가 쓴 값이 아니다.
+
 ### `rov_gui --pose`: 물체 추적/자세추정이 **실기에서 한 번도 안 돌았다** (2026-08-09)
 SAM2 추적(1단계), 메시 기반 6-DoF(2단계), 현장 재구성(3단계)을 전부 구현했고,
 **저장된 데이터와 데모로만** 검증했다. C3는 네트워크에 없었고 ROV도 분리돼 있었다.
@@ -322,7 +919,77 @@ SAM2 추적(1단계), 메시 기반 6-DoF(2단계), 현장 재구성(3단계)을
   기체로 가능한 기동인지는 위 3~5로만 알 수 있다. 안 되면 지상에서 미리 메시를 만들어
   `--pose-mesh`로 들고 들어가는 쪽이 현실적인 운용이다.
 
+### C3 틸트 보정의 **병진 성분은 아직 미실측** (2026-08-17)
+- **해결된 것**: `cam_tilt_deg: 43.3`이 들어갔고 실기로 확인됐다 —
+  `rp_residual`이 **43.3° → roll −0.8 / pitch −0.2** 로 떨어졌다
+  `[측정: 2026-08-17, 기체 정지·매트 위, rov_gui GUI 판독]`.
+  두 독립 방증과도 일치(IMU→기체 회전 적합이 축 순열에서 40.7 / 41.3°).
+- **남은 것**: 틸트를 **순수 회전**으로만 적용한다 — 카메라 원점을 축으로 돌리고
+  `cam_t_flu`(레버암 0.2855 m)는 리마운트 전 값 그대로다. 힌지로 숙이면 렌즈
+  중심도 실제로 움직이므로, 그만큼(수 cm 이하로 추정, **미실측**)이 위치에 상수
+  오프셋으로 남는다. `rp_residual`은 회전만 보므로 이걸 잡아내지 못한다.
+- **임시 대응**: 없음. cm 단위가 문제되는 결론을 내리기 전에 줄자로 렌즈 중심을
+  재서 `hw_nav.yaml: cam_t_flu`에 넣을 것.
+- **기록 경계**: `meta.json hardware.cam_tilt_deg`. 이 값이 다른 런끼리 위치·헤딩을
+  합산하지 말 것 — 2026-08-17 이전 기록은 전부 수평 extrinsic으로 날았고, 최대
+  0.21 m 오프셋 + yaw 오염을 안고 있다.
+
+### IMU dead reckoning(`--imu-dr`)이 **실기 미검증** (2026-08-17)
+- C3 BNO086만으로 state를 갱신하는 추정기(`rov_gui/control/imu_dr.py`)와 그
+  closed-loop 모드는 **벤치·데모까지만** 검증됐다: 단위테스트 24개(등속·등가속
+  적분이 1e-9까지 정확, 0.5bt²·(1/6)gβt³ 법칙, AHRS 정상상태 기울기 βτ, Kabsch
+  회전+지연 복원), demo 백엔드 폐루프(주입 바이어스가 예측대로 되돌아옴,
+  shadow/control 양쪽), 오프라인 재추정 왕복.
+- **안 해본 것**: 실제 BNO086 샘플, 실제 마운팅 회전(캘리브 미실행 →
+  `calibration_sha1: null`로 뜬다), 수중, 그리고 **닫힌 루프로 기체를 실제로 몰아본 것**.
+- **가장 위험한 항목**: `--imu-dr control`은 컨트롤러가 표류하는 추정치 쪽으로
+  기체를 **능동적으로 몬다**. 지오펜스가 없으므로(위 항목) 위치를 이유로 세우는
+  수단은 조종사의 E-STOP뿐이다 — 운영자 결정으로 자동 abort는 꺼져 있다
+  (`imu_dr.abort_err_m/abort_max_s: null`, 켜려면 숫자만 넣으면 됨).
+- **순서**: 벤치 캘리브 2종 → 물 밖 트롤리에서 DR 궤적이 태그와 **같은 방향**을
+  가리키는지 → 풀 station shadow → 풀 station control → line/square/circle.
+
+### `demo_e2e.py line`이 드라이버 예산(60 s) 안에 안 끝난다 (2026-08-17, 기존 결함)
+- **증상**: `demo_e2e.py pid line` → `FAIL: line never completed`. **DR과 무관**
+  (`dr` 없이도 재현). station과 square는 통과한다. circle은 드라이버에
+  아직 없다 — 넣는다면 예산은 `2*pi*R*laps/speed`가 아니라
+  `2*pi*R*laps/min(speed, sqrt(a_lat*R))`로 잡아야 이 결함을 그대로 재현하지
+  않는다(작은 반지름에서는 곡률 상한이 지배한다).
+- **원인 추정**: demo 토이 플랜트의 추종오차가 커서(err p95 14 cm) governed
+  path clock이 크게 감속 → 21 s 짜리 경로가 60 s 안에 안 끝난다. 즉 governor가
+  설계대로 동작한 결과이고 드라이버 예산이 짧은 것.
+- **임시 대응**: 없음. line 회귀는 `test_control.py`의
+  `test_line_mission_is_placed_at_a_tag` 등이 덮는다.
+- **제대로 고치는 법**: `demo_e2e`의 60 s 상한을 경로 길이에서 유도하거나, demo
+  `SHAPES["line"]`를 더 짧게. 고치면 이 항목 삭제.
+
 ## 📌 알려진 한계 (당장 고칠 계획 없음, 잊지 말 것)
+
+### replay 미션(plan_stream): **실기 미검증** + jaw 중재·라이브 소스 함정 2건 (2026-08-30)
+- **실기 미검증**: shape `replay`(기록 시연 재비행, `control/plan_stream.py` →
+  `set_path_plan_ned`) 전체가 오프라인(9/9 + 19/19)과 demo_e2e(실제 acados,
+  honest-완주 판정)까지만 검증됐다. safety-code-reviewer 감사(2026-08-30)의
+  CRITICAL(딜맨이 래치된 버튼 비트 미해제)·HIGH(발산 가드 부재)는 **수정 완료**.
+- **jaw 중재 부재(잔존)**: 파일럿 G/H와 replay가 같은 `cmd_gripper_drive`를
+  last-writer-wins로 쓴다. 완화 3중(replay는 상태 변화 에지에서만 방출 + 기본
+  `replay.gripper: false` + 딜맨이 이제 held drive를 놓음)으로 M0엔 충분하다는
+  감사 판단이지만, 파일럿이 **누르고 있는** 중에 replay 에지가 덮으면 릴리스까지
+  파일럿 의도가 밀린다. 제대로: sink에 jaw 전용 중재(파일럿 우선 + 워커 방출 무시
+  창) — `replay.gripper: true`를 상시 쓰기 전에.
+- **라이브 policy 소스 함정**: PlanFilter의 신선도 게이트는 `obs_t=None`이면
+  조용히 skip한다(replay엔 옳다 — 기록 시연에 관측 시각이 없다). 나중에 라이브
+  diffusion-policy 소스를 붙일 때 obs_t를 안 실으면 **0.7 s stale 게이트가 통째로
+  꺼진 채** 돈다. 제대로: 라이브 소스에선 obs_t 부재 = reject로 뒤집을 것
+  (plan_stream.py:201-209 부근).
+
+### 실기 Newton gripper: servo 채널·PWM 레인지·지속 close 거동이 **미기록** (2026-08-30)
+- 리포에 있는 실측은 버튼 기능 번호 둘뿐(BTN0/15 = 77/76, 2026-08-06,
+  `rov_gui/__main__.py:250`). servo9=Newton은 산문 한 줄(c3_camera/dataset.py:904),
+  SERVOn_FUNCTION/MIN/MAX/TRIM은 어디에도 없다 [스펙 미확인]. 지속 close 비트에서의
+  스톨 전류·열·클러치 거동도 미확인 — replay gripper의 `gripper_hold_max_s` 4 s
+  auto-neutral은 UMI-U 관행이지 이 장치의 실측이 아니다 [예측].
+- 제대로: QGC/mavproxy로 SERVO 파라미터 덤프를 받아 여기 기록하고, 벤치에서 지속
+  close 전류를 한 번 재서 hold_max를 그 수치로 교체.
 
 ### `rov_gui --mpc`: 폐루프 MPC 스택 전체가 **실기·수중 미검증** (2026-08-12)
 AprilTag PnP → EAOB+acados NMPC → MANUAL_CONTROL 폐루프(`rov_gui/control/`)는
@@ -368,8 +1035,11 @@ AprilTag PnP → EAOB+acados NMPC → MANUAL_CONTROL 폐루프(`rov_gui/control/
    고쳤다(실기 관측 4건과 일치, `test_pad_buttons_are_translated_to_the_vehicles_numbering`).
    번역 자체는 아직 기체로 확인 못 했다.
    - **확인법**: COMMAND ENABLE만 켜고 **DISARM 상태에서** 버튼을 하나씩 눌러
-     `JOY` 줄의 `btn 커널>기체` 값이 아래와 맞는지 먼저 본다 — LB/RB `6>9`,`7>10` ·
-     View `10>4` · Menu `11>6` · 십자키 `>11..14`. 그 다음에야 arm한다.
+     `JOY` 줄의 `btn 커널>기체` 값을 본다. **화살표 왼쪽(커널 번호)은 케이블에 따라
+     다르다** — BT면 LB/RB `6>9`,`7>10` · View `10>4` · Menu `11>6`,
+     USB면 LB/RB `4>9`,`5>10` · View `6>4` · Menu `7>6`(둘 다 실측 2026-08-17).
+     **오른쪽(기체 번호)이 양쪽 다 같아야 맞는 것**이고, 십자키는 `>11..14`.
+     그 다음에야 arm한다.
      조명은 **한 번에 한 칸**이어야 한다(두 칸이면 칩이 명령을 중복 발행하는 것 →
      `notify=False` 경로 확인).
    - **주의**: 패드 arm은 버튼 한 번이다(화면 ARM만 1.2 s hold). QGC와 같게 한 의도적
@@ -410,19 +1080,57 @@ AprilTag PnP → EAOB+acados NMPC → MANUAL_CONTROL 폐루프(`rov_gui/control/
 - **사실 1**: `getImuToCameraExtrinsics(CAM_A)` → `IMU calibration data is not available
   on device yet.` 공장 캘리브레이션은 카메라만 담고 있어 **T_imu_cam이 미지**다.
   (카메라 intrinsics·스테레오 extrinsics는 정상이니 RGB-D/스테레오는 영향 없음.)
-- **사실 2**: 정지 상태에서 |a| = **11.8 m/s²** (중력 9.81 대비 **+20%**). raw/calibrated
-  둘 다 동일, accuracy 플래그는 UNRELIABLE/MEDIUM. 즉 **IMU intrinsic(스케일/바이어스)이
-  미보정**이다. 축 방향(카메라 광축 대비)도 벤더 미문서화·미확정.
+- **사실 2 — 2026-08-17 정정: "스케일 +20%"는 오독이었다. 실제는 x축 바이어스다.**
+  원래 기록은 "정지 |a| = 11.8 m/s² (중력 대비 +20%) → 스케일 미보정"이었는데,
+  그건 **한 자세(똑바로 세운 상태)에서만** 잰 값이었다. 6자세 텀블로 재보니:
+
+  | | 값 |
+  |---|---|
+  | raw \|a\| (자세별) | **8.37 ~ 11.69** m/s², mean 10.63 |
+  | 적합된 scale | **[1.0013, 1.0071, 1.0092]** — 1에서 **0.9% 이내** |
+  | 적합된 bias | **[1.803, 0.007, −0.064]** m/s² = **0.184 g, 거의 전부 IMU x** |
+  | 보정 후 \|a\| | **9.806 ± 0.050** (중력 9.807) |
+
+  `[측정: sessions/low_level_controller_data/20260817/0817_101511/ +
+  0817_100139/ 의 *_c3_imu.jsonl 2테이크, 21985 정지샘플 6자세;
+  config/c3_imu_calib.json sha1 7081ff43]`
+
+  스케일 오차는 자세에 따라 \|a\|가 8.4↔11.7로 흔들리는 패턴을 만들 수 없다. 똑바로
+  세운 자세에서 중력 방향이 IMU x와 거의 나란해서(gravity dir ≈ [0.83, 0, 0.56])
+  1.8 m/s² 바이어스가 그대로 더해진 것이고, 그게 11.8로 읽혔다.
+- **왜 이 구분이 중요한가**: **고정 바이어스는 매 런의 정착창 정적보정이 자세와
+  무관하게 완전히 제거한다.** 스케일 오차였다면 자세가 바뀔 때마다 `s·g·sinΔ`로
+  다시 샜을 것이다(그 항으로 "2° 피치에서 10 s에 3.4 m"를 계산해 왔는데, 그
+  항 자체가 없다). 추측항법 오차예산이 걱정하던 것보다 낫다.
+- **여전히 사실**: accuracy 플래그는 UNRELIABLE, 축 방향은 벤더 미문서화 —
+  다만 `R_frd_imu`는 이제 실측했다(아래).
 - **영향**: visual-inertial SLAM(VIO)에서 스케일과 중력 정렬이 틀어진다. 더 나쁜 건
   **"알고리즘이 안 맞는 것처럼" 실패**해서 원인을 IMU로 의심하기 어렵다는 점.
   RGB-D SLAM / stereo SLAM만 쓸 거면 무관하다.
 - **임시 대응**: `c3_collect.py`가 두 사실을 모든 데이터셋의 `metadata.txt`에 명시하고,
   샘플마다 accuracy 필드를 남긴다. `c3_dataset_check.py`도 extrinsic 부재를 경고한다.
   → 동료가 모르고 쓰는 일은 없다.
-- **제대로 고치는 법**: (a) Kalibr류로 camera-IMU extrinsic + IMU intrinsic 동시
-  캘리브레이션(체커보드, 공기 중 → 수중 재검), 또는 (b) extrinsic만 기계적 실측 +
-  accel 스케일/바이어스 6-position 캘리브레이션. 완료 후 `calibration.json`에
-  주입하는 경로를 만들고 이 항목 삭제.
+- **2026-08-17: 실행 완료. `config/c3_imu_calib.json` sha1 `0aae3e4d`.**
+  accel scale/bias는 6자세 텀블 2테이크(21985 정지샘플), `R_frd_imu`는 60~100초
+  wiggle 2테이크. 결과는 위 "사실 2" 표.
+  **`R_fit.rms_deg`(6~8°)를 R의 오차로 읽지 말 것** — 그건 C3 원시 자이로 vs
+  ArduSub **필터링된** ATTITUDE를 비교할 때의 잡음 바닥이고, 더 세게 흔들어도
+  안 줄어든다(7.57 → 6.20). R의 실제 정확도는 **독립 2테이크가 0.81° 안에서
+  일치**한다는 것이고, 그게 JSON의 `R_fit.repeatability`에 기록돼 있다.
+  덤: 두 테이크 모두 축 순열에서 **40.7° / 41.3°** 떨어져 나왔다 — 카메라가
+  실제로 ~40° 기울어져 있다는 독립적 방증(태그 쪽 `cam_tilt_deg`는 아직 미기입).
+- **(역사) 처방이 도구가 된 경위**.
+  `rov_gui/tools/calib_c3_imu.py`가 둘 다 잰다 —
+  (a) accel scale/bias는 물 밖 텀블 ellipsoid 적합(`--fit accel`),
+  (b) **IMU→기체** 회전은 C3 자이로 vs ArduSub ATTITUDE의 Kabsch 정렬(`--fit rotation`).
+  (b)가 요점이다: **IMU→카메라 extrinsic이 아예 필요 없어진다**(장치에 없으니) 그리고
+  카메라 틸트가 자동으로 흡수된다. 결과는 `config/c3_imu_calib.json`, sha1이 런
+  meta에 박힌다. 합성 데이터 검증 완료(scale/bias 정확 복원, 회전 <0.5°, 지연
+  <2 ms; `rov_gui/tests/test_imu_dr.py`), **실제 카메라로는 미실행**.
+  도구는 커버리지가 모자란 텀블과 단일축 wiggle을 **거부**한다 — 자신 있게 틀린
+  답을 내는 게 이 캘리브레이션의 진짜 실패 모드라서.
+- **제대로 고치는 법**: 위 두 명령을 실기로 한 번 돌리고, 결과를
+  `c3_collect.py`의 `calibration.json`에도 주입한 뒤 이 항목 삭제.
 
 ### C3 직결(`c3_camera/`): 컬러/depth 촬영시각 skew 약 1 프레임 — 하드웨어 동기 여부 미확인 (2026-07-29)
 - **사실**: `c3_stream.py` 기본(`--pair-mode latest`)에서 컬러(CAM_A)와 depth(CAM_B/C 스테레오)의
@@ -440,6 +1148,11 @@ AprilTag PnP → EAOB+acados NMPC → MANUAL_CONTROL 폐루프(`rov_gui/control/
   판정 전에는 이 항목 삭제하지 말 것.
 
 ### square 참조가 코너에서 동역학적으로 실현 불가 → 지울 수 없는 ~2 cm 코너 오차 바닥 (2026-07-24)
+- **2026-08-16 hardware path mode 대응**: `rov_gui`의 `path_following: true`는 이제
+  active-segment projection + corner gate를 쓰고, 각 꼭짓점에서 참조 속도를 0으로 만든 뒤
+  실제 기체의 위치/속도/dwell capture를 확인해야 다음 변을 공개한다. 따라서 아래 문제는
+  **legacy wall-clock trajectory mode와 simulator benchmark에는 계속 해당**하지만, 새 hardware
+  geometric-path mode에서는 next-leg preview로 코너를 자르는 원인을 차단했다.
 - **사실**: `square_setpoint`의 위치 경로는 각진 사각형이라 코너에서 참조 속도가 한 샘플
   (0.05 s) 만에 90° 뒤집힌다(|Δv|=0.212 m/s → 요구 가속도 사실상 무한). 게다가 yaw 참조는
   60°/s로 슬루(90°에 1.5 s)라 위치 참조와 **서로 모순** — 코너를 실제로 돌 때 필요한 선회율
@@ -481,13 +1194,22 @@ AprilTag PnP → EAOB+acados NMPC → MANUAL_CONTROL 폐루프(`rov_gui/control/
 
 ### 방향 sweep이 seed-0 파랑 실현 하나를 공유 — worst-vertex 통계는 단일-실현 아티팩트
 - 발견 2026-07-21 (`compare_20260720_230025` 코너 기하 분석): 모든 (current, wave) 헤딩쌍
-  run이 **같은 seed-0 파랑 시계열**을 봄(실현 반복 주기 264.8 s ≈ run 길이 266.7 s) →
+  run이 **같은 seed-0 파랑 시계열**을 봄(wave-group **포락선**이 264.8 s마다 재귀 ≈ run
+  길이 266.7 s) →
   특정 절대시각의 wave-group이 매 run 같은 lap/vertex를 때림(dobmpc 400 run 중 181개가
   t=200–210 s에 피크, worst vertex 66%가 V3). 방향 의존 결론은 **per-passage 상대각 통계**
   로만 뽑을 것; vertex별·시각별 주장은 multi-seed 재실행 전에는 출판 불가.
+- **표현 정정 (2026-08-19)**: "실현이 264.8 s마다 **반복**된다"는 **틀렸다**. `waves.py:97`의
+  `omega = linspace(omega_min, omega_max, N)`는 omega_i = omega_min + i·dOmega이고 omega_min이
+  dOmega의 정수배가 아니라(gentle 0.2/0.0237288 = 59/7 = 8.4286), T = 2π/dOmega만큼 밀면 모든
+  성분 위상이 **같은 상수 omega_min·T = 154.29°** 만큼 회전한다 → eta(t+T) ≈ −0.9·eta(t)
+  (gentle 재현: corr −0.899, max|Δ| 0.583 m vs eta std ~0.13 m [유도: 이번 세션 재계산,
+  저장 산출물 없음]). 정확한 반복은 7T = 1853.5 s. 재귀하는 것은 **군(group) 포락선**
+  (|hilbert| corr ≈ 0.995)이고, 위 관측(같은 wave-group이 같은 vertex를 때림)은 그대로
+  유효하다. 인용할 때 "파랑이 반복된다"고 쓰지 말 것.
 - 발견 2026-07-19 (C3 위치 정합 중): 스킨 bbox = 벤더 치수 × 1.0233 (세 축 균일).
 - C3/페이로드 배치는 **실측 metric**(COM 앵커) 기준이라 동역학·카메라는 정확하지만,
   렌더에서 페이로드가 스킨 대비 ~3–5 mm 어긋나 보일 수 있음(코스메틱).
 
 ---
-*마지막 갱신: 2026-07-21*
+*마지막 갱신: 2026-08-19*

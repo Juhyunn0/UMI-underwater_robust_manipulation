@@ -58,8 +58,15 @@ TELEM_MESSAGES = ("ATTITUDE", "SCALED_PRESSURE", "SCALED_PRESSURE2", "VFR_HUD",
                   "AHRS2", "EKF_STATUS_REPORT")
 CONTROL_MESSAGES = ("RC_CHANNELS", "RC_CHANNELS_RAW", "MANUAL_CONTROL",
                     "SERVO_OUTPUT_RAW")
+# STATUSTEXT is the vehicle TALKING, not a periodic sample, and on ArduSub it
+# is the ONLY way a leak is reported ("Leak Detected", MAV_SEVERITY_CRITICAL —
+# see rov_gui/leak.py). Dropping it here is what made the station blind to
+# water in the enclosure. It is rare and small, so passing it through costs
+# nothing; consumers that only want periodic telemetry can ignore it by type.
+EVENT_MESSAGES = ("STATUSTEXT",)
 
-ALL_MESSAGES = tuple(dict.fromkeys(IMU_MESSAGES + TELEM_MESSAGES + CONTROL_MESSAGES))
+ALL_MESSAGES = tuple(dict.fromkeys(IMU_MESSAGES + TELEM_MESSAGES
+                                   + CONTROL_MESSAGES + EVENT_MESSAGES))
 
 # Rates we ask for when --mavlink-set-rates is given. ArduSub's defaults are far
 # too low for anything time-sensitive. The ROV IMU is NOT the primary VIO IMU here

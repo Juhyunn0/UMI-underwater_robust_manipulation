@@ -62,14 +62,17 @@ change, holding a key would look identical to a frozen GUI.
 
 from __future__ import annotations
 
+import math
 import time
 
-from . import theme
+import numpy as np
+
+from . import runstore, theme
 from .bus import DataBus, FrameMailbox, Freshness
 from .imaging import legend_labels
-from .joystick import JoystickReader, apply_deadzone
-from .qt import (QShortcut, QTimer, Qt, QtGui, QtWidgets, preload_platform_libs,
-                 run_app, sanitize_plugin_path)
+from .joystick import JoystickReader, apply_deadzone, default_axis_spec
+from .qt import (QShortcut, QTimer, Qt, QtCore, QtGui, QtWidgets,
+                 preload_platform_libs, run_app, sanitize_plugin_path)
 from .recorder import ScreenRecorder, StreamRecorder
 from .state import (Conn, LinkStat, PayloadState, PilotInput, SensorStat,
                     Telemetry, ThrusterState, now)
@@ -155,7 +158,12 @@ class MainWindow(QtWidgets.QMainWindow):
         arm_mode = str(getattr(opts, "arm_mode", "MANUAL") or "").upper()
         self.teleop.arm_mode = "" if arm_mode in ("", "KEEP", "NONE") else arm_mode
 
-        rec_dir = getattr(opts, "rec_dir", "sessions/ui_recordings")
+        # The fallback matters as much as the argparse default: any opts
+        # object without rec_dir (a test stub, an embedder) would silently
+        # send the UI mp4, all three feed mp4s, every sensor JSONL sidecar
+        # AND the nav run (they chain to this same attribute) back to the
+        # old flat folder, splitting a run across two trees with no warning.
+        rec_dir = getattr(opts, "rec_dir", None) or runstore.DEFAULT_BASE
         self.recorder = ScreenRecorder(self, out_dir=rec_dir,
                                        fps=float(getattr(opts, "rec_fps", 12)))
         self.recorder.state_changed.connect(self._rec_state)
@@ -168,7 +176,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._armed: bool | None = None
         self._mode: str = ""
         self._motor_mean = 0.0
-        self._pose3d = None            # the floating 3-D pose window, lazy
         # Mirrors MpcStatus.engaged. While True the teleop pump yields the
         # command channel to the MPC worker and any pilot axis input is a
         # TAKEOVER (see _pilot_gate) — the single-command-source rule.
@@ -254,7 +261,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if wants_pose:
                 self.videos[key].track_toggled.connect(self.bus.cmd_pose_enable)
                 self.videos[key].prompt_clicked.connect(self._on_prompt)
-                self.videos[key].map_clicked.connect(self._show_pose3d)
 
         self.health = HealthPanel()
         self.sensors = SensorPanel()
@@ -269,22 +275,34 @@ class MainWindow(QtWidgets.QMainWindow):
         # occupy). Without --mpc nothing moves.
         self._traj_panel = None
         self._nav_source = "main"
-        self._map_tags_raw: list = []            # (x, y, yaw, id) tag frame
-        self._pool_raw: list = []                # 4 corners (x, y) tag frame
+        # MAP-frame geometry, pushed to the plot ONCE at build time and never
+        # re-framed: the plot draws in the map frame (trajectory.py set_datum),
+        # so the mat and the pool do not move when a run engages.
+        self._map_tags_raw: list = []            # (x, y, yaw, id, instance)
+        self._tag_xyz: dict = {}                 # (id, inst) -> (x, y, z)
+        self._dup_tag_ids: frozenset = frozenset()
+        self._pool_raw: list = []                # 4 corners (x, y)
         self._nav_map_meta: dict = {}            # map.json payload for REC NAV
+        self._last_fix = None                    # newest NavFix, for the checks
+        self._depth_chk = None                   # (ratio, spread) or None
+        self._depth_chk_t = 0.0
+        self._cam_ext = None                     # (R_frd_cam, t_frd_cam)
         self._nav_rec: dict | None = None        # open REC NAV recording
         if bool(getattr(self.opts, "mpc", False)):
             from .widgets.trajectory import TrajectoryWindow
 
-            fence = None
             cfg = None
             try:
                 from .control.geometry import NavConfig
                 cfg = NavConfig.load(
                     getattr(self.opts, "nav_config", "config/hw_nav.yaml"),
                     geometry_override=getattr(self.opts, "nav_geometry", None))
-                fence = cfg.geofence
                 self._nav_source = cfg.nav_source
+                # The camera extrinsic, kept for `_check_depth_scale`. THE SAME
+                # ONE the localizer divides out and object_nav multiplies back
+                # in (control/geometry.py R_t_frd_cam) — a second definition
+                # here would make the check measure our own bookkeeping.
+                self._cam_ext = cfg.R_t_frd_cam(cfg.nav_source)
                 if cfg.geometry == "floor":
                     # Draw the surveyed map on the plot — the whole point of
                     # having one is seeing the vehicle move ACROSS it. Yaw
@@ -300,6 +318,16 @@ class MainWindow(QtWidgets.QMainWindow):
                          _m.atan2(float(R[1, 0]), float(R[0, 0])), tid, k)
                         for tid, poses in sorted(tm.instances.items())
                         for k, (R, t) in enumerate(poses)]
+                    # THE SAME TAGS WITH THEIR Z. `_map_tags_raw` is what the
+                    # plot draws and it is (x, y, yaw) — a floor plan. The
+                    # depth cross-check needs the real 3-D point, and it needs
+                    # to know which ids are duplicated so it never measures
+                    # against the wrong copy of one.
+                    self._tag_xyz = {
+                        (int(tid), k): (float(t[0]), float(t[1]), float(t[2]))
+                        for tid, poses in sorted(tm.instances.items())
+                        for k, (R, t) in enumerate(poses)}
+                    self._dup_tag_ids = frozenset(tm.duplicate_ids)
                     self._nav_map_meta = {
                         "frame": "tag map NED-like (anchor tag frame, +z down)",
                         "tag_map": str(cfg.tag_map_path),
@@ -326,12 +354,24 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._pool_raw = [(x0, y0), (x0, y1), (x1, y1), (x1, y0)]
                 self._nav_map_meta.update({
                     "geometry": cfg.geometry, "nav_source": cfg.nav_source,
-                    "pool_ned": pool, "geofence_ned": cfg.geofence})
+                    "pool_ned": pool})
             except Exception as e:                               # noqa: BLE001
-                print(f"[warn] mpc panel: no geofence/map ({e})", flush=True)
-            self._traj_panel = TrajectoryWindow(geofence=fence)
+                print(f"[warn] mpc panel: no map ({e})", flush=True)
+            self._traj_panel = TrajectoryWindow()
+            try:                       # seed the mission controls from YAML
+                from .control.geometry import MpcConfig
+                _mcfg = MpcConfig.load(getattr(self.opts, "mpc_config",
+                                               "config/hw_mpc.yaml"))
+                self._traj_panel.set_mission_defaults(_mcfg.square)
+                # ...and the MODE, or the combo shows its first entry while
+                # the worker runs the file's (see set_mode_default).
+                self._traj_panel.set_mode_default(
+                    getattr(self.opts, "mpc_mode", None) or _mcfg.mode)
+            except Exception as e:                           # noqa: BLE001
+                print(f"[warn] mpc panel: mission defaults ({e})", flush=True)
             if cfg is not None:
                 self._traj_panel.view.tag_size_m = float(cfg.tag_size_m)
+                self._traj_panel.view.rov_size_m = tuple(cfg.rov_footprint_m)
             if self._map_tags_raw:
                 self._traj_panel.view.set_map_tags(self._map_tags_raw)
             if self._pool_raw:
@@ -435,6 +475,21 @@ class MainWindow(QtWidgets.QMainWindow):
             "Every value on screen is synthetic. Nothing here is a measurement.")
         lay.addWidget(self.banner)
 
+        # LEAK. The one thing on this bar that means "recover the vehicle now".
+        # It blinks rather than sitting still, for the reason a red label on a
+        # dark dashboard fails: the header already carries an amber banner and
+        # four coloured pills, so static red is one more colour in a busy strip
+        # and motion is what actually catches an eye that is on the video feed.
+        # Blinking is also the only cue here that survives colour-blindness.
+        self.alert = QtWidgets.QLabel("")
+        self.alert.setObjectName("Alert")
+        self.alert.setVisible(False)
+        lay.addWidget(self.alert)
+        self._alert_on = False
+        self._alert_blink = QTimer(self)
+        self._alert_blink.setInterval(500)
+        self._alert_blink.timeout.connect(self._blink_alert)
+
         self.pills = {
             "video": StatusPill("VIDEO", Conn.OFFLINE),
             "vehicle": StatusPill("VEHICLE", Conn.OFFLINE),
@@ -447,6 +502,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self.clock = QtWidgets.QLabel("--:--:--")
         self.clock.setObjectName("Value")
         lay.addWidget(self.clock)
+
+        # Name this recording. Optional: empty keeps the plain ui_<stamp>.mp4
+        # naming, typed text makes it ui_<stamp>_<name>.mp4 so a pool session's
+        # dozen files can be told apart without opening them.
+        #
+        # An always-visible field rather than a prompt at REC time, and that is
+        # a safety choice: the main window is the sole key handler (see
+        # "Keyboard" below), so a modal dialog popping up mid-flight would
+        # swallow W/A/S/D with the vehicle still moving. This field can only
+        # take the keyboard when it is deliberately CLICKED, and hands it
+        # straight back — the same pattern the trajectory panel's number
+        # fields use (widgets/trajectory.py eventFilter).
+        self.rec_name = QtWidgets.QLineEdit()
+        self.rec_name.setPlaceholderText("recording name")
+        self.rec_name.setToolTip(
+            "optional — click here and type a name for the next UI recording\n"
+            "it becomes  ui_<date>_<name>.mp4 ;  empty = ui_<date>.mp4\n"
+            "Esc or Enter gives the keyboard back to the pilot")
+        self.rec_name.setMaximumWidth(150)
+        self.rec_name.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.rec_name.setMaxLength(48)
+        self.rec_name.installEventFilter(self)
+        self.rec_name.returnPressed.connect(self.rec_name.clearFocus)
+        lay.addWidget(self.rec_name)
 
         # Only the window recording lives here; each feed's own toggle sits on
         # the feed (see widgets/video.py), where its name fits.
@@ -497,8 +576,10 @@ class MainWindow(QtWidgets.QMainWindow):
         b.sensor_stat.connect(self._on_sensor_stat)
         b.pose.connect(self._on_pose)
         b.nav_fix.connect(self._on_nav_fix)
+        b.object_fix.connect(self._on_object_fix)
         b.mpc_status.connect(self._on_mpc_status)
         b.tag_overlay.connect(self._on_tag_overlay)
+        b.mpc_event.connect(self._on_mission_event)
         for panel in self.videos.values():
             if panel.tag_btn is not None:
                 panel.tag_toggled.connect(b.cmd_tag_enable)
@@ -509,6 +590,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._traj_panel.mode_requested.connect(b.cmd_mpc_mode)
             self._traj_panel.estop_requested.connect(self.estop)
             self._traj_panel.record_requested.connect(self._toggle_nav_record)
+            self._traj_panel.scenario_requested.connect(b.cmd_mpc_scenario)
 
         # Explicit .connect rather than the `activated=` constructor keyword:
         # that keyword form is a PyQt convenience and is not portable to PySide.
@@ -540,6 +622,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_telemetry(self, t: Telemetry) -> None:
         self.fresh["vehicle"].mark(t.stamp, t.conn)
         self.health.set_telemetry(t)
+        self._set_alert("LEAK DETECTED" if t.leak else "")
         # Rows from other workers (the C3's IMU) are merged in here rather than
         # routed through the vehicle worker, which owns none of them. The
         # vehicle's own conn state must not colour them: a dead tether says
@@ -577,32 +660,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bus.cmd_pose_click.emit(x, y)
         self.bus.log.emit("info", f"pose: prompt at ({x:.0f}, {y:.0f})")
 
-    def _show_pose3d(self) -> None:
-        """Bring the 3-D pose window up (MAP button, or automatically).
-
-        Built on first use, not at startup: the window only means something
-        with --pose, and even then only once a pose pipeline is in play.
-        """
-        if self._pose3d is None:
-            from .widgets.pose3d import Pose3DWindow
-            self._pose3d = Pose3DWindow()
-        self._pose3d.show()
-        self._pose3d.raise_()
-
     def _on_pose(self, t) -> None:
         panel = self.videos.get("main")
         if panel is not None:
             panel.canvas.set_track(t)
-        # The 3-D map opens ITSELF the first time FoundationPose enters the
-        # picture — loading, registering, or an actual pose — and only once:
-        # a window the pilot closed stays closed until the MAP button.
-        pose_active = (t.T_cam_obj is not None
-                       or t.state in ("pose_loading", "registering"))
-        if pose_active and not self._pose3d_shown:
-            self._pose3d_shown = True
-            self._show_pose3d()
-        if self._pose3d is not None:
-            self._pose3d.add(t)
+        # (A floating 3-D window used to open itself here, drawing the object
+        # in the CAMERA frame. Removed 2026-08-21: the trajectory panel's 3D
+        # button shows the same object in the POOL frame, next to the vehicle
+        # it is relative to. It was also crashing — `_pose3d_shown` was never
+        # initialised, so this slot died on the first frame carrying a real
+        # 6-DoF pose, which nothing offline had ever produced.)
         # One row, and it shows the RATE — the value lives on the overlay, next
         # to the thing it describes. SensorPanel's own rule: a number drawn in
         # two places will eventually disagree with itself.
@@ -615,6 +682,13 @@ class MainWindow(QtWidgets.QMainWindow):
             "fault": t.note[:28],
             "failed": t.note[:28] or "stopped",
         }.get(t.state, t.state)
+        # The row's Hz is SAM2's MASK rate (that is what runs whether or not a
+        # mesh exists); the pose's own rate rides the overlay chip beside the
+        # picture it describes. Both are measured arrival rates since
+        # 2026-08-23 — before that both were 1/compute-time, which is why this
+        # row and the chip could read 5 Hz while frames arrived at 19.
+        if t.state == "tracking" and t.pose_hz:
+            detail = f"pose {t.pose_hz:.0f} Hz"
         self._extra_sensors["Pose (C3)"] = SensorStat(
             "Pose (C3)", t.sam_hz or None, t.conn, detail)
         self._refresh_sensors()
@@ -625,16 +699,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sensors.set_sensors(merged, self._tel_conn)
 
     # =========================================================== MPC (opt-in)
-    def _datum_xy(self, x: float, y: float) -> tuple[float, float]:
-        """TAG-frame xy -> the mission (engage-datum) frame the plot uses."""
-        if self._mpc_datum is None:
-            return x, y
-        import math as _m
-        x0, y0, _z0, yaw0 = self._mpc_datum
-        c0, s0 = _m.cos(yaw0), _m.sin(yaw0)
-        dx, dy = x - x0, y - y0
-        return c0 * dx + s0 * dy, -s0 * dx + c0 * dy
-
     def _on_tag_overlay(self, t) -> None:
         panel = self.videos.get(t.panel)
         if panel is not None:
@@ -646,29 +710,116 @@ class MainWindow(QtWidgets.QMainWindow):
         # (rov_gui/tools/build_tag_map.py).
         if self._nav_rec is not None and t.localizes and t.K:
             self._nav_rec_frame(t)
+        if t.localizes:
+            self._check_depth_scale(t)
+
+    def _check_depth_scale(self, t) -> None:
+        """Is the C3's DEPTH MAP metric? Ask the FLOOR, which it never sees.
+
+        THIS IS THE ONE CROSS-CHECK NOTHING ELSE ON THE STATION CAN MAKE, and
+        2026-08-23 is why it exists. The tracked object was landing half a metre
+        BELOW the tag floor it was sitting on, with the ray to it 1.4x too long
+        (0823_174602/mpc_174638.csv) — and two very different faults produce
+        that indistinguishably: a reconstructed mesh that came out too big, or a
+        depth map that is not metric and hands the same scale error to the
+        reconstruction AND the tracker. The tag solution settles it because it
+        shares nothing with the depth path: monocular PnP on the colour image
+        against a known 0.170 m tag.
+
+            1.0x  -> depth is metric; a bad object pose is the mesh's fault
+            1.4x  -> the depth path is long; fix that before anything else
+
+        MEASURED AGAINST THE WHOLE FLOOR, not against the tags themselves. The
+        first version sampled a 5x5 window at each tag's centre and the number
+        it produced drifted with the tag COUNT — 0.94x on 3 tags, 1.17x on 8,
+        1.46x on 14 (operator screenshots, 2026-08-23 18:30-18:35). That is the
+        signature of a sampling bias, not of a calibration: a tag centre is a
+        black square, which is the one patch of this scene stereo cannot match,
+        so the window returned holes and border bleed, and it returned MORE of
+        it the smaller the tags got — i.e. the higher and further the vehicle
+        was. The mat itself is densely textured and fills the view, the tag map
+        says it lies at z = 0, and a grid over it gives hundreds of samples
+        across the whole range span instead of a handful on the worst pixels in
+        the frame.
+
+        Per pixel the comparison collapses to a ratio of two Z-like numbers:
+        the ray's own length cancels, so no lens geometry survives into the
+        result beyond the direction K gives it.
+
+        Cheap on purpose: no worker, no extra copy, no new signal. Every input
+        is already on the GUI thread — the fix, the depth panel's own uint16
+        map (the same one the cursor probe reads), and the extrinsic.
+        """
+        fix, panel = self._last_fix, self.videos.get("depth")
+        if (panel is None or fix is None or not fix.ok or self._cam_ext is None
+                or fix.R_ned_body is None or len(t.K) != 4):
+            return
+        aux = panel.canvas.depth_map()
+        if aux is None or not t.src_w or not t.src_h:
+            return
+        fx, fy, cx, cy = (float(v) for v in t.K)
+        if not (fx > 0 and fy > 0):
+            return
+        R_bc, t_bc = self._cam_ext
+        R_nb = np.asarray(fix.R_ned_body, float).reshape(3, 3)
+        R_mc = R_nb @ np.asarray(R_bc, float).reshape(3, 3)
+        # The CAMERA, not the body — the same composition object_nav uses.
+        p_cam = (np.asarray(fix.p_ned, float)
+                 + R_nb @ np.asarray(t_bc, float).reshape(3))
+        h = float(-p_cam[2])            # height above the tag plane, z = 0
+        if not (0.10 < h < 6.0):
+            return
+        hgt, wid = aux.shape[0], aux.shape[1]
+        # Colour pixel -> depth pixel. Never ASSUME the two grids match: this
+        # session ran colour 640x368 against depth 640x360.
+        sy, sx = hgt / float(t.src_h), wid / float(t.src_w)
+        step = max(4, wid // 40)
+        ratios = []
+        for vy in range(step, hgt - step, step):
+            for ux in range(step, wid - step, step):
+                z_mm = float(aux[vy, ux])
+                if z_mm <= 0.0:
+                    continue            # DepthAI's "no measurement"
+                # Back to COLOUR pixels, which is the frame K describes.
+                a = ((ux / sx) - cx) / fx
+                b = ((vy / sy) - cy) / fy
+                # Where this ray meets the mat. `d[2] <= 0` = pointing at or
+                # above the horizon; there is no floor along it to measure.
+                d = R_mc @ np.array([a, b, 1.0])
+                if d[2] <= 1e-3:
+                    continue
+                z_expect = h / d[2]     # the ray's Z, not its length
+                if not (0.15 < z_expect < 6.0):
+                    continue
+                ratios.append((z_mm / 1000.0) / z_expect)
+        # Hundreds of samples or none. The mat is not the only thing in view —
+        # the vehicle's own frame is in the bottom of every C3 frame and the
+        # pool wall is in some — so this leans entirely on the median, and a
+        # median needs a population.
+        if len(ratios) < 100:
+            return
+        ratios.sort()
+        n = len(ratios)
+        r = float(ratios[n // 2])
+        spread = float(ratios[int(0.9 * n)] - ratios[int(0.1 * n)])
+        # Light EMA: the question is a CALIBRATION constant, so anything that
+        # moves frame to frame is noise on it by definition.
+        prev = self._depth_chk[0] if self._depth_chk else r
+        self._depth_chk = (0.9 * prev + 0.1 * r, spread)
+        self._depth_chk_t = now()
+        if self._traj_panel is not None:
+            self._traj_panel.view.set_depth_check(*self._depth_chk)
 
     def _on_nav_fix(self, f) -> None:
+        self._last_fix = f
         # REC NAV logs the fix as it ARRIVED — raw tag-frame, before the
         # mission-datum transform below, misses included — so the file is a
         # record of what the localizer said, not of how the plot drew it.
         if self._nav_rec is not None:
             self._nav_rec_row(f)
-        # The plot lives in the MISSION frame (engage datum). Fixes arrive in
-        # the TAG frame; transform them with the datum the worker published so
-        # the trail, the reference and the readout can never disagree.
-        if self._mpc_datum is not None and f.ok:
-            from dataclasses import replace
-            import math as _m
-            x0, y0, z0, yaw0 = self._mpc_datum
-            c0, s0 = _m.cos(yaw0), _m.sin(yaw0)
-            dx = f.p_ned[0] - x0
-            dy = f.p_ned[1] - y0
-            f = replace(
-                f,
-                p_ned=(c0 * dx + s0 * dy, -s0 * dx + c0 * dy,
-                       f.p_ned[2] - z0),
-                yaw_ned=(None if f.yaw_ned is None else _m.atan2(
-                    _m.sin(f.yaw_ned - yaw0), _m.cos(f.yaw_ned - yaw0))))
+        # NavFix is already in the TAG/MAP frame, which is the frame the plot
+        # draws in — no transform. (Until 2026-08-14 this rotated fixes into
+        # the engage datum, which is why the world swung on START.)
         if self._traj_panel is not None:
             self._traj_panel.add_fix(f)
         src = {"main": "C3", "second": "RGB"}.get(f.source, f.source or "?")
@@ -678,6 +829,27 @@ class MainWindow(QtWidgets.QMainWindow):
                   else f"[{src}] " + (f.note or "--"))
         self._extra_sensors["TagNav"] = SensorStat("TagNav", f.hz, f.conn,
                                                    detail[:48])
+        self._refresh_sensors()
+
+    def _on_object_fix(self, o) -> None:
+        """The clicked object, placed in the pool (control/object_nav.py).
+
+        Straight to the plot — an ObjectFix is already in the MAP frame this
+        window draws in, so there is nothing to transform. The SENSORS row
+        carries the health instead of a position, the same division the Pose
+        and TagNav rows use: a number drawn in two places will eventually
+        disagree with itself.
+        """
+        if self._traj_panel is not None:
+            self._traj_panel.set_object(o)
+        rng = ("" if o.distance_m is None else f" {o.distance_m:.2f} m")
+        pair = ("" if o.pair_dt_ms is None
+                else ("" if o.pair_exact else
+                      f", pair {o.pair_dt_ms:.0f} ms"))
+        detail = (f"{o.state}{rng}{pair}" if o.p_map is not None
+                  else f"{o.state}: {(o.note or o.pose_state)}")
+        self._extra_sensors["Object"] = SensorStat("Object", None, o.conn,
+                                                  detail[:48])
         self._refresh_sensors()
 
     # REC NAV — raw localization recording (map + every fix), for replotting
@@ -690,6 +862,32 @@ class MainWindow(QtWidgets.QMainWindow):
     _NAV_DET_HEADER = ("frame,t_capture,tag_id,"
                        "x0,y0,x1,y1,x2,y2,x3,y3\n")
     _NAV_FRM_HEADER = ("frame,t_capture,fx,fy,cx,cy,width,height,n_det\n")
+
+    def _save_mission_log(self, run_dir) -> None:
+        """Drop the whole session's MISSION LOG next to what it describes.
+
+        Called whenever a recording stops, and at shutdown. Rewriting the same
+        ``mission_log.txt`` on every stop is deliberate: the file is always the
+        FULL log up to that point, so a run whose video and CSV stopped at
+        different moments still gets one complete story rather than two
+        fragments that have to be stitched.
+        """
+        from pathlib import Path
+
+        if run_dir is None:
+            return
+        text = self.payload.log_text()
+        if not text:
+            return
+        try:
+            p = Path(run_dir)
+            p.mkdir(parents=True, exist_ok=True)
+            (p / "mission_log.txt").write_text(
+                f"# rov_gui mission log — {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"# wall-clock stamps; the same lines the MISSION LOG panel "
+                f"showed\n{text}\n", encoding="utf-8")
+        except OSError as e:
+            self.bus.log.emit("error", f"mission log not saved: {e}")
 
     def _toggle_nav_record(self, on: bool) -> None:
         import json
@@ -704,12 +902,26 @@ class MainWindow(QtWidgets.QMainWindow):
                                   f"nav recording saved: {rec['dir']} "
                                   f"({rec['n']} fixes, {rec['frames']} frames, "
                                   f"{rec['dets']} detections)")
+                # The log belongs with the run it explains. One level up: the
+                # nav files sit in their own nav_<hhmmss>/ subfolder so
+                # plot_nav_run and build_tag_map still see the layout they
+                # expect, but the log describes the whole minute.
+                self._save_mission_log(rec["dir"].parent)
             if self._traj_panel is not None:
                 self._traj_panel.set_recording(False)
             return
         try:
-            base = Path(getattr(self.opts, "nav_rec_dir", "sessions/nav_runs"))
-            run_dir = base / time.strftime("%Y%m%d_%H%M%S")
+            base = Path(getattr(self.opts, "nav_rec_dir", None)
+                        or getattr(self.opts, "rec_dir", None)
+                        or runstore.DEFAULT_BASE)
+            # A DIRECTORY of its own inside the run folder, not loose files:
+            # rov_gui.tools.plot_nav_run and .build_tag_map both take a run
+            # directory and look for map.json / fixes.csv / detections.csv /
+            # frames.csv inside it. Flattening these into the minute folder
+            # would break both tools for every past and future run.
+            run_dir = runstore.run_dir(base) / f"nav_{runstore.stamp('%H%M%S')}"
+            # (stamp's first parameter is the FORMAT — the folder above
+            # already carries the date, so only the seconds are needed here.)
             run_dir.mkdir(parents=True, exist_ok=True)
             meta = dict(self._nav_map_meta)
             meta["recorded_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -725,6 +937,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._nav_rec = {"dir": run_dir, "file": fh, "det": det,
                              "frm": frm, "n": 0, "frames": 0, "dets": 0}
             self.bus.log.emit("info", f"nav recording to {run_dir}")
+            # ...and WHAT WAS FLYING while it recorded. The MpcWorker answers
+            # this on its own thread with controller.json: the plant model
+            # (M, C(nu), D(nu), g) plus the live controller's constants — PID
+            # kp/kd/ki with its gates and limits, or the MPC's N/Q/R/u_max and
+            # EAOB tuning. Operator request 2026-08-14: a PID square and an MPC
+            # square must be distinguishable from their folders alone.
+            self.bus.cmd_mpc_dump_meta.emit(str(run_dir))
         except OSError as e:
             self.bus.log.emit("error", f"nav recording failed: {e}")
             if self._traj_panel is not None:
@@ -776,17 +995,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # (0,0) instead of drawing a jump from the previous frame.
         d = getattr(s, "datum", None)
         if d != self._mpc_datum:
+            # A NEW datum = a new run: clear the trails, and hand the view the
+            # datum so it can put the CONTROLLER's frame back into the map's.
+            # The map tags and the pool never move — that is the whole point
+            # of drawing in the map frame (trajectory.py: set_datum).
             self._mpc_datum = d
             if self._traj_panel is not None:
                 self._traj_panel.view.clear()
-                yaw0 = 0.0 if d is None else float(d[3])
-                if self._map_tags_raw:
-                    self._traj_panel.view.set_map_tags(
-                        [(*self._datum_xy(x, y), yaw - yaw0, tid, k)
-                         for x, y, yaw, tid, k in self._map_tags_raw])
-                if self._pool_raw:
-                    self._traj_panel.view.set_pool(
-                        [self._datum_xy(x, y) for x, y in self._pool_raw])
+                self._traj_panel.view.set_datum(d)
         pilot_takeover = self._mpc_takeover_sent   # read BEFORE clearing
         if not self._mpc_engaged:
             self._mpc_takeover_sent = False
@@ -861,8 +1077,35 @@ class MainWindow(QtWidgets.QMainWindow):
             self._counted_mbps[stat.name] = stat.mbps
 
     def _on_log(self, level: str, message: str) -> None:
-        self.status.showMessage(f"[{level}] {message}", 8000 if level == "info" else 0)
         print(f"[{level}] {message}", flush=True)
+        # LEVEL "debug" IS STDOUT ONLY. Some of what reaches this bus is a
+        # third-party tool's own chatter — the BundleSDF reconstruction prints
+        # its scene scale, its vertex count and its bad-mask threshold, and the
+        # station prints its OWN one-line summary of the same mesh right after
+        # (perception/session.py). Both in the panel is the same fact three
+        # times in two languages, and on 2026-08-23 that was most of what the
+        # MISSION LOG contained while a mesh was building. Keep it on stdout,
+        # where a developer can still read it, and out of the operator's log.
+        if level == "debug":
+            return
+        self.status.showMessage(f"[{level}] {message}", 8000 if level == "info" else 0)
+        # ...and into the MISSION LOG, which is now the only place these
+        # survive on screen. The status bar shows one line for 8 seconds and
+        # then it is gone; stdout is behind whatever terminal launched the
+        # station, and a pool session is usually launched from a desktop icon.
+        # Since the log scrolls (widgets/payload.py), "gone" is no longer an
+        # acceptable place for a warning to go.
+        self.payload.add_event(message if level == "info"
+                               else f"[{level.upper()}] {message}", level)
+
+    def _on_mission_event(self, message: str) -> None:
+        """A MISSION lifecycle line — engage, start, refuse, follow, stop.
+
+        Routed apart from `_on_log` so the panel can set it in bold under a
+        rule: these are the handful of lines that say what the RUN did, and on
+        2026-08-23 the operator could not find them in the wall of pose and
+        device chatter they were mixed into."""
+        self.payload.add_event(message, "mission")
 
     # ================================================================== ticks
     def _tick(self) -> None:
@@ -961,12 +1204,32 @@ class MainWindow(QtWidgets.QMainWindow):
             f"conflated {conflated}{rec}")
 
     # ---------------------------------------------------------------- joystick
-    def _js_axis(self, name: str) -> float:
-        """One mapped axis, with sign, deadzone and scale applied."""
-        spec = int(getattr(self.opts, f"js_axis_{name}", 0) or 0)
-        number, sign = abs(spec), (-1.0 if spec < 0 else 1.0)
+    def _js_axis_spec(self, name: str) -> tuple[int, float]:
+        """(js index, sign) this axis will actually be read from."""
+        spec = getattr(self.opts, f"js_axis_{name}", None)
+        if spec is None:
+            # getattr, not a bare call: a stand-in reader (tests, and anything
+            # that duck-types this) must not be able to crash the poll loop
+            # that also carries the pilot's buttons.
+            resolve = getattr(self.joystick, "axis_spec", default_axis_spec)
+            number, sign = resolve(name)
+        else:
+            spec = int(spec)
+            number, sign = abs(spec), (-1.0 if spec < 0 else 1.0)
         if getattr(self.opts, f"js_invert_{name}", False):
             sign = -sign
+        return number, sign
+
+    def _js_axis(self, name: str) -> float:
+        """One mapped axis, with sign, deadzone and scale applied.
+
+        The axis NUMBER is the DEVICE's unless the operator pinned one with
+        --js-axis-*. It has to be: the same pad enumerates its axes differently
+        over USB than over Bluetooth, so any number baked in here is right for
+        one cable and silently wrong for the other — which on 2026-08-17 put
+        yaw on a dead trigger and heave on the yaw stick (see joystick.py).
+        """
+        number, sign = self._js_axis_spec(name)
         raw = self.joystick.axes.get(number)
         if raw is None:
             return 0.0
@@ -989,6 +1252,22 @@ class MainWindow(QtWidgets.QMainWindow):
             note = (f" — axes {trig} rest at full scale (triggers), auto-zeroed"
                     if trig else "")
             self.bus.log.emit("info", f"joystick: {self.joystick.name}{note}")
+            # Say which physical axis is flying which vehicle axis. The pad
+            # renumbers itself between USB and Bluetooth, so this line is what
+            # tells the pilot BEFORE the dive that yaw is where they think.
+            pinned = {n for n in ("surge", "sway", "heave", "yaw")
+                      if getattr(self.opts, f"js_axis_{n}", None) is not None}
+            shown = ", ".join(
+                f"{n}={'-' if s < 0 else ''}{a}"
+                f"{'*' if n in pinned else ''}"
+                for n, (a, s) in (
+                    (n, self._js_axis_spec(n))
+                    for n in ("surge", "sway", "heave", "yaw")))
+            src = ("read off the device" if getattr(self.joystick, "probed", False)
+                   else "DEFAULTS — the driver would not say, check them")
+            self.bus.log.emit("info", f"joystick axes ({src}): {shown}"
+                                      + ("  [* = pinned by --js-axis-*]"
+                                         if pinned else ""))
             if self._js_remap:
                 pairs = ", ".join(f"{s}->{d}" for s, d in
                                   sorted(self._js_remap.items()))
@@ -1119,13 +1398,26 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.recorder.stats.recording:
             path = self.recorder.stop()
             self.bus.log.emit("info", f"recording saved: {path}")
+            # The log belongs with the video it explains — same run folder.
+            self._save_mission_log(path.parent if path else None)
         else:
-            path = self.recorder.start()
+            # Whatever is in the header field right now. The field is NOT
+            # cleared afterwards: a session is usually several takes of the
+            # same thing, and retyping the name each time is how takes end up
+            # mislabelled.
+            path = self.recorder.start(name=self.rec_name.text())
             if path is None:
                 self.bus.log.emit("error",
                                   f"recording failed: {self.recorder.stats.error}")
             else:
                 self.bus.log.emit("info", f"recording to {path}")
+                # Same rule as REC NAV: a recording that starts also writes
+                # down what was flying (controller.json — plant + gains), into
+                # the run folder this video just landed in.
+                self.bus.cmd_mpc_dump_meta.emit(str(path.parent))
+        # Locked while running: the name is baked into the filename at start,
+        # so an edit mid-recording would describe a file it did not name.
+        self.rec_name.setEnabled(not self.recorder.stats.recording)
         self.rec_btn.setChecked(self.recorder.stats.recording)
 
     def _toggle_feed_record(self, key: str) -> None:
@@ -1156,6 +1448,39 @@ class MainWindow(QtWidgets.QMainWindow):
                         True, str(path.with_suffix("")))
         panel.set_recording(rec.stats.recording, name)
 
+    # ================================================================= alerts
+    def _set_alert(self, text: str) -> None:
+        """The header's flooding banner. Idempotent — called at telemetry rate.
+
+        Deliberately NOT wired to anything that stops the vehicle. A leak is a
+        reason to drive the ROV to the surface and recover it, and cutting the
+        thrusters would do the opposite (it sinks: the heavy variant is
+        negatively buoyant by design). So this informs loudly and leaves the
+        decision with the pilot, which is also what ArduSub's own default does
+        — FS_LEAK_ENABLE=1 is "warn only".
+        """
+        if text:
+            if self.alert.text() != text:
+                self.alert.setText(text)
+                self.alert.setToolTip(
+                    "ArduSub reported water in the enclosure (STATUSTEXT "
+                    "\"Leak Detected\"). Surface and recover.\nClears "
+                    "automatically once the vehicle stops repeating it.")
+            if not self.alert.isVisible():
+                self.alert.setVisible(True)
+                self._alert_blink.start()
+        elif self.alert.isVisible():
+            self.alert.setVisible(False)
+            self._alert_blink.stop()
+
+    def _blink_alert(self) -> None:
+        self._alert_on = not self._alert_on
+        self.alert.setProperty("dim", "true" if self._alert_on else "false")
+        # A Qt property that drives a stylesheet selector only takes effect on
+        # unpolish/polish; setProperty alone changes nothing visible.
+        self.alert.style().unpolish(self.alert)
+        self.alert.style().polish(self.alert)
+
     def _rec_state(self, on: bool) -> None:
         self.rec_btn.setChecked(on)
         if not on:
@@ -1165,6 +1490,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self.showNormal() if self.isFullScreen() else self.showFullScreen()
 
     # =============================================================== keyboard
+    def eventFilter(self, obj, ev):
+        """The recording-name field, and the two rules it may not break.
+
+        1. **Esc is always E-STOP.** A text field swallows Esc by default
+           (Qt uses it to revert an edit), which would make the one key the
+           pilot reaches for in an emergency do nothing while the caret is in
+           this box. So Esc here releases the focus AND falls through to
+           :meth:`keyPressEvent`, which stops the vehicle.
+        2. **No axis may be left latched.** Taking the keyboard means the
+           key-RELEASE for whatever is held never arrives, so focusing this
+           field is treated as a release of everything — the same reflex
+           :meth:`focusOutEvent` has.
+        """
+        if obj is getattr(self, "rec_name", None):
+            kind = ev.type()
+            if kind == QtCore.QEvent.Type.FocusIn:
+                self.teleop.all_stop()
+                self.bus.log.emit(
+                    "info", "typing a recording name — keyboard is NOT flying "
+                            "the vehicle (Esc or Enter to give it back)")
+            elif (kind == QtCore.QEvent.Type.KeyPress
+                  and ev.key() == Qt.Key.Key_Escape):
+                self.rec_name.clearFocus()
+                self.keyPressEvent(ev)          # E-STOP, unconditionally
+                return True
+        return super().eventFilter(obj, ev)
+
     def keyPressEvent(self, ev) -> None:
         if ev.key() == Qt.Key.Key_Escape:
             self.estop()
@@ -1206,13 +1558,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmd_timer.stop()
         self.js_timer.stop()
         self.joystick.close()
+        last_dir = None
         if self.recorder.stats.recording:
-            self.recorder.stop()
+            p = self.recorder.stop()
+            last_dir = p.parent if p else last_dir
         for rec in self.feed_recorders.values():
             if rec.stats.recording:
-                rec.stop()
-        if self._pose3d is not None:
-            self._pose3d.close()       # a floating window must not outlive us
+                p = rec.stop()
+                last_dir = p.parent if p else last_dir
+        # A session killed with a recording still open must still leave its log
+        # behind — that is the case the log is most wanted for.
+        if last_dir is not None:
+            self._save_mission_log(last_dir)
         if self._nav_rec is not None:
             self._toggle_nav_record(False)     # flush + close the fix log
         # (the MPC dock is a child of this window; it dies with it)

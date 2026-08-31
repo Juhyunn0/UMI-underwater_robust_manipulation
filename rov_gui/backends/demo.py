@@ -40,9 +40,9 @@ from ..bus import FrameMailbox
 from ..net import NicMonitor
 from ..qt import Slot
 from ..sensorlog import SensorLog
-from ..state import (Conn, NavFix, PayloadState, PilotInput, PoseTrack,
-                     SensorStat, Telemetry, ThrusterState, VehicleImu,
-                     VideoStat, now)
+from ..state import (Conn, ImuBatch, NavFix, PayloadState, PilotInput,
+                     PoseTrack, SensorStat, Telemetry, ThrusterState,
+                     VehicleImu, VideoStat, now)
 from .base import Backend, TimerWorker
 
 # Demo thruster mixer: rows are the 8 motors of a BlueROV2 Heavy, columns are
@@ -210,17 +210,36 @@ class DemoVehicleWorker(TimerWorker):
         # mistaken for a pool run.
         self.mpc_on = bool(getattr(opts, "mpc", False))
         # NED world position of the toy vehicle. Starts at the origin — the
-        # demo plays the role of a datum'd (first-fix-relative) world, which
-        # keeps it inside hw_nav.yaml's relative geofence so ENGAGE works on
-        # the bench.
+        # demo plays the role of a datum'd (first-fix-relative) world, so a
+        # bench ENGAGE starts from a sane pose.
         self.x = 0.0
         self.y = 0.0
         self._nav_rng = np.random.default_rng(3)
         self._nu_prev = np.zeros(3)
+        # The last synthetic fix, kept so the synthetic OBJECT can be
+        # back-projected through the SAME vehicle pose and the SAME capture
+        # stamp. Sharing the stamp is the point: it makes `pair_exact` a thing
+        # the offline demo actually exercises instead of something only the
+        # pool can ever show.
+        self._nav_t = None
+        self._nav_p = None
+        self._nav_R = None
+        self._navcfg = None                 # NavConfig, for the real extrinsic
+        self._obj_p0 = None                 # object seed, MAP frame
+        self._obj_t0 = 0.0
+        self.demo_object = str(getattr(opts, "demo_object", "still")
+                               or "still")
         if self.mpc_on:
             self.depth0 = 0.4
         else:
             self.depth0 = 0.0
+        # Depth of the tag MAT below the surface. The tag world has z=0 at the
+        # mat with +z DOWN, so a swimming vehicle sits at NEGATIVE tag z —
+        # which is what the real recordings show (-0.54 .. -1.30 m,
+        # sessions/nav_runs/*/fixes.csv). Modelling it keeps the demo in the
+        # same world as the pool instead of one where the vehicle is under
+        # the floor.
+        self.mat_depth = 1.4
 
         # vehicle state
         self.pilot = PilotInput()
@@ -230,9 +249,13 @@ class DemoVehicleWorker(TimerWorker):
         self.yaw = 0.0
         self.roll = 0.0
         self.pitch = 0.0
+        self.rate_p = 0.0
+        self.rate_q = 0.0
+        self._imu_seq = 0
         self.mah = 0.0
         self.grip_cmd = 0.0
         self.grip_fb = 0.0
+        self.grip_drive = 0.0
         self.lights = 0.0
         self.estopped = False
         self.armed = False
@@ -246,6 +269,7 @@ class DemoVehicleWorker(TimerWorker):
         self.pose_on = False
         self.pose_locked = False
         self._log: SensorLog | None = None
+        self._imu_log: SensorLog | None = None
 
     # -------------------------------------------------------------- commands
     @Slot(object)
@@ -255,6 +279,14 @@ class DemoVehicleWorker(TimerWorker):
     @Slot(float)
     def set_gripper(self, v: float) -> None:
         self.grip_cmd = max(0.0, min(1.0, float(v)))
+
+    @Slot(float)
+    def set_gripper_drive(self, direction: float) -> None:
+        """Momentary jaw drive (-1 close / 0 idle / +1 open), HELD like the
+        real BTN 76/77 path — integrated in tick(). Without this slot the demo
+        silently dropped cmd_gripper_drive, so nothing driven through the
+        replay mission's jaw channel could ever be seen offline."""
+        self.grip_drive = float(direction)
 
     @Slot(float)
     def set_lights(self, v: float) -> None:
@@ -308,6 +340,55 @@ class DemoVehicleWorker(TimerWorker):
         t = time.monotonic() - self._t0
         return (0.5 + 0.35 * math.sin(t * 0.25)) * 960.0, 0.55 * 540.0
 
+    def _nav_extrinsic(self):
+        """The REAL ``NavConfig.R_t_frd_cam("main")``, cached.
+
+        The demo object is back-projected through the same extrinsic the
+        station composes with, so the round trip in
+        ``MpcWorker.on_pose`` -> ``object_nav.compose_map_pose`` is exercised
+        end to end offline. Fabricated like the rest of this module — what is
+        real here is the ALGEBRA, not the object.
+        """
+        if self._navcfg is None:
+            from ..control.geometry import NavConfig
+            self._navcfg = NavConfig.load(
+                getattr(self.opts, "nav_config", "config/hw_nav.yaml"),
+                geometry_override=getattr(self.opts, "nav_geometry", None))
+        return self._navcfg.R_t_frd_cam("main")
+
+    def _demo_object_map(self, t: float):
+        """``(p_obj_map, R_map_obj)`` — the synthetic object in the MAP frame.
+
+        Seeded 0.5 m down the camera's OWN optical axis at the first call, so
+        it always starts in front of the lens and inside object_nav's distance
+        gate whatever the extrinsic's tilt happens to be. After that it is a
+        map-frame object with a life of its own:
+
+            still   sits there (the first follow to fly: the vehicle must not
+                    move at all when the offset is captured from its own pose)
+            drift   translates slowly (the feedforward case)
+            orbit   rotates in place (the orbit case, and the one that shows a
+                    wrong yaw_axis fastest)
+        """
+        R_bc, t_bc = self._nav_extrinsic()
+        R_nb = self._nav_R
+        R_mc = R_nb @ R_bc
+        p_cam = self._nav_p + R_nb @ t_bc
+        if self._obj_p0 is None:
+            self._obj_p0 = p_cam + 0.5 * R_mc[:, 2]
+            self._obj_t0 = t
+        dt = t - self._obj_t0
+        p = np.asarray(self._obj_p0, float).copy()
+        yaw = 0.0
+        if self.demo_object == "drift":
+            p[0] += 0.15 * math.sin(0.15 * dt)
+            p[1] += 0.10 * math.sin(0.10 * dt)
+        elif self.demo_object == "orbit":
+            yaw = 0.30 * dt
+        c, sn = math.cos(yaw), math.sin(yaw)
+        R_map_obj = np.array([[c, -sn, 0.0], [sn, c, 0.0], [0.0, 0.0, 1.0]])
+        return p, R_map_obj, R_mc, p_cam
+
     def _publish_pose(self) -> None:
         if not self.pose_on:
             self.bus.pose.emit(PoseTrack(state="off", note="TRACK is off",
@@ -322,22 +403,46 @@ class DemoVehicleWorker(TimerWorker):
         w, h = 70.0, 46.0
         box = ((cx - w, cy - h), (cx + w, cy - h), (cx + w, cy + h),
                (cx - w, cy + h))
-        # A synthetic 6-DoF pose so the axes/box overlay and the POSE log rows
-        # can be exercised without a GPU. FABRICATED, like everything else here.
         t = time.monotonic() - self._t0
-        z = 0.55 + 0.05 * math.sin(t * 0.4)
         ca, sa = math.cos(t * 0.5), math.sin(t * 0.5)
-        T = (ca, -sa, 0.0, (cx - 480.0) / 960.0 * 0.6,
-             sa, ca, 0.0, (cy - 270.0) / 540.0 * 0.4,
-             0.0, 0.0, 1.0, z,
-             0.0, 0.0, 0.0, 1.0)
         axes = ((cx, cy), (cx + 55 * ca, cy + 55 * sa),
                 (cx - 40 * sa, cy + 40 * ca), (cx, cy + 46))
+        # THE 6-DoF POSE, and the pixels above, are two independent fictions:
+        # the contours/axes drive the video overlay and the click path, the
+        # transform below drives object_nav. Only the second one has to be
+        # geometrically consistent, and with --mpc it is — a MAP-frame object
+        # back-projected through the SAME vehicle pose, the SAME real camera
+        # extrinsic and the SAME capture stamp the synthetic NavFix used. That
+        # is what makes the composition, the pairing and a follow mission
+        # testable with no hardware. Without --mpc there is no vehicle pose to
+        # project through, so the old free-floating transform is kept.
+        t_cap = now()
+        if self.mpc_on and self._nav_R is not None:
+            p_obj, R_map_obj, R_mc, p_cam = self._demo_object_map(t)
+            R_co = R_mc.T @ R_map_obj
+            t_co = R_mc.T @ (p_obj - p_cam)
+            T = (R_co[0, 0], R_co[0, 1], R_co[0, 2], t_co[0],
+                 R_co[1, 0], R_co[1, 1], R_co[1, 2], t_co[1],
+                 R_co[2, 0], R_co[2, 1], R_co[2, 2], t_co[2],
+                 0.0, 0.0, 0.0, 1.0)
+            T = tuple(float(v) for v in T)
+            t_cap = float(self._nav_t)
+        else:
+            z = 0.55 + 0.05 * math.sin(t * 0.4)
+            T = (ca, -sa, 0.0, (cx - 480.0) / 960.0 * 0.6,
+                 sa, ca, 0.0, (cy - 270.0) / 540.0 * 0.4,
+                 0.0, 0.0, 1.0, z,
+                 0.0, 0.0, 0.0, 1.0)
         self.bus.pose.emit(PoseTrack(
             state="tracking", contours=(box,), T_cam_obj=T, axes_px=axes,
-            score=7.1, mask_px=int(4 * w * h), sam_hz=28.0, pose_hz=42.0,
-            n_register=1, src_w=960, src_h=540,
-            note="synthetic", conn=Conn.ONLINE, stamp=now()))
+            # The demo emits at the panel's own rate, so the two numbers are
+            # written the way a real run reads them: an ARRIVAL rate capped by
+            # the feed, and a solve time well under the frame interval.
+            score=7.1, mask_px=int(4 * w * h), sam_hz=10.0, sam_solve_ms=12.0,
+            pose_hz=10.0, pose_solve_ms=23.0,
+            n_register=1, src_w=960, src_h=540, t_capture=t_cap,
+            note=f"synthetic ({self.demo_object})", conn=Conn.ONLINE,
+            stamp=now()))
 
     @Slot(bool, str)
     def set_sensor_log(self, on: bool, stem: str) -> None:
@@ -351,11 +456,33 @@ class DemoVehicleWorker(TimerWorker):
             self.bus.log.emit("info", f"demo sensor log closed: "
                                       f"{meta['records']} records")
 
+    @Slot(bool, str)
+    def set_raw_sensor_log(self, on: bool, stem: str) -> None:
+        """The synthetic ``*_c3_imu.jsonl`` a controller run keeps.
+
+        Same file NAME and same record shape the hardware writes, so
+        ``plot_imu_dr --from-jsonl`` — the offline re-estimation that is the
+        whole payoff of logging every sample — can be exercised here instead
+        of first being tried on a pool recording that cost an evening.
+        SYNTHETIC, like everything else in this module.
+        """
+        if on and self._imu_log is None:
+            self._imu_log = SensorLog(Path(f"{stem}_c3_imu.jsonl"), "c3")
+            self.bus.log.emit(
+                "warn", f"demo c3 imu log -> {self._imu_log.path} "
+                        "(SYNTHETIC — no measurement value)")
+        elif not on and self._imu_log is not None:
+            meta = self._imu_log.close()
+            self._imu_log = None
+            self.bus.log.emit("info", f"demo c3 imu log closed: "
+                                      f"{meta['records']} samples")
+
     @Slot(bool)
     def set_enabled(self, on: bool) -> None:
         self.enabled = bool(on)
         if not on:
             self.pilot = PilotInput()
+            self.grip_drive = 0.0     # a held jaw drive dies with the enable
 
     @Slot(bool)
     def set_arm(self, arm: bool) -> None:
@@ -371,6 +498,7 @@ class DemoVehicleWorker(TimerWorker):
         self.estopped = True
         self.pilot = PilotInput()
         self.vel[:] = 0.0
+        self.grip_drive = 0.0         # the real sink zeroes it too (estop())
         self.bus.log.emit("warn", "demo: E-STOP — all axes zeroed")
 
     # ------------------------------------------------------------------ step
@@ -399,8 +527,19 @@ class DemoVehicleWorker(TimerWorker):
                    - self.vel[1] * math.sin(self.yaw)) * dt
         self.y += (self.vel[0] * math.sin(self.yaw)
                    + self.vel[1] * math.cos(self.yaw)) * dt
+        roll0, pitch0 = self.roll, self.pitch
         self.roll = 0.03 * math.sin(t * 0.9) + 0.05 * self.vel[1]
         self.pitch = 0.02 * math.sin(t * 0.6) - 0.04 * self.vel[0]
+        # Body rates that MATCH that attitude. Until 2026-08-17 this plant
+        # reported p = q = 0 while roll and pitch swung through a few degrees
+        # — kinematically impossible, and invisible for years because every
+        # consumer took roll/pitch straight off the message. A dead reckoner
+        # INTEGRATES the rates, so it saw the gravity vector tilt under an
+        # attitude estimate that had been told nothing was turning, and read
+        # the difference as horizontal acceleration. Small-angle, so the Euler
+        # coupling between (p, q) and (roll_dot, pitch_dot) is negligible here.
+        self.rate_p = (self.roll - roll0) / max(dt, 1e-6)
+        self.rate_q = (self.pitch - pitch0) / max(dt, 1e-6)
         if self.mpc_on:
             self._publish_nav(dt)
 
@@ -413,6 +552,15 @@ class DemoVehicleWorker(TimerWorker):
 
         # gripper: first-order lag towards the command, i.e. it takes time and
         # can therefore visibly disagree with the command.
+        # A held momentary DRIVE (cmd_gripper_drive: G/H keys, the replay
+        # mission) integrates the command like the real jaw moves while the
+        # button bit is held — the hardware path this stands in for is
+        # hardware.py's BTN 76/77. +1 = open, -1 = close, 0.9/s = the panel's
+        # simulated rate (payload.GRIPPER_RATE).
+        if self.grip_drive:
+            self.grip_cmd = max(0.0, min(1.0,
+                                         self.grip_cmd
+                                         + self.grip_drive * 0.9 * dt))
         self.grip_fb += (self.grip_cmd - self.grip_fb) * min(1.0, dt * 2.5)
         # mount tilt: a rate, not a position — held buttons drive it and it
         # stops against its stops, like the real one.
@@ -441,11 +589,17 @@ class DemoVehicleWorker(TimerWorker):
         from ..control.state_assembler import rot_zyx
 
         R = rot_zyx(self.roll, self.pitch, self.yaw)
-        p = (np.array([self.x, self.y, self.depth])
+        p = (np.array([self.x, self.y, self.depth - self.mat_depth])
              + self._nav_rng.normal(0.0, 0.01, 3))
         yaw_n = self.yaw + self._nav_rng.normal(0.0, math.radians(0.5))
         Rn = rot_zyx(self.roll, self.pitch, yaw_n)
         t = now()
+        # Kept for the synthetic object: it is back-projected through the
+        # vehicle's TRUE pose (so the fix's own noise flows through the
+        # composition, as it will at the pool) but stamped with the SAME
+        # t_capture, which is what a shared camera frame means.
+        self._nav_t, self._nav_p, self._nav_R = t, np.asarray(
+            [self.x, self.y, self.depth - self.mat_depth], float), R
         self.bus.nav_fix.emit(NavFix(
             t_capture=t, n_tags=1, tag_ids=(25,),
             p_ned=tuple(float(v) for v in p),
@@ -463,14 +617,64 @@ class DemoVehicleWorker(TimerWorker):
         # Specific force consistent with what the assembler inverts:
         # it computes a = f + R^T g - omega x v, so the plant must emit
         # f = (dnu/dt) + omega x v - R^T g. Level & still ~ (0, 0, -9.81).
-        omega = np.array([0.0, 0.0, float(self.vel[3] * 1.4)])
+        omega = np.array([self.rate_p, self.rate_q,
+                          float(self.vel[3] * 1.4)])
         f = a + np.cross(omega, nu) - R.T @ g
         self.bus.vehicle_imu.emit(VehicleImu(
             roll=self.roll, pitch=self.pitch, yaw=self.yaw,
-            p=0.0, q=0.0, r=float(self.vel[3] * 1.4),
+            p=float(self.rate_p), q=float(self.rate_q),
+            r=float(self.vel[3] * 1.4),
             ax=float(f[0]), ay=float(f[1]), az=float(f[2]),
             depth_m=float(self.depth), t_att=t, t_imu=t, t_baro=t,
             conn=Conn.ONLINE, stamp=t))
+        self._publish_camera_imu(f, omega, t, dt)
+
+    # Demo C3 IMU: samples per 20 Hz tick, i.e. 200 Hz like the real BNO086.
+    # The point is not realism, it is that the dead reckoner sees the SAME
+    # specific force the plant is using — so a bias injected here must come
+    # back out of the estimate as exactly 0.5*b*t^2 and the test can say so.
+    IMU_SUBSAMPLES = 10
+
+    def _publish_camera_imu(self, f, omega, t: float, dt: float) -> None:
+        n = self.IMU_SUBSAMPLES
+        b_a = np.asarray(getattr(self.opts, "demo_imu_bias", None)
+                         or (0.0, 0.0, 0.0), float)
+        b_g = np.asarray(getattr(self.opts, "demo_imu_gyro_bias", None)
+                         or (0.0, 0.0, 0.0), float)
+        arr = np.zeros((n, 7))
+        # Held over the tick rather than interpolated: the plant only knows
+        # one acceleration per step, and pretending to a smoother one would
+        # make the demo flatter than the hardware it stands in for.
+        arr[:, 0] = t - dt + (np.arange(1, n + 1) * (dt / n))
+        arr[:, 1:4] = np.asarray(f, float) + b_a
+        arr[:, 4:7] = np.asarray(omega, float) + b_g
+        self.bus.camera_imu.emit(ImuBatch(
+            source="c3", samples=arr, n=n, accuracy="MEDIUM",
+            t_host_drain=t, t_device_last=float(arr[-1, 0]),
+            conn=Conn.ONLINE, stamp=t))
+        if self._imu_log is not None:
+            for k in range(n):
+                self._imu_log.write("IMU", {
+                    "t_device": float(arr[k, 0]), "seq": self._imu_seq,
+                    "ax": float(arr[k, 1]), "ay": float(arr[k, 2]),
+                    "az": float(arr[k, 3]), "gx": float(arr[k, 4]),
+                    "gy": float(arr[k, 5]), "gz": float(arr[k, 6]),
+                    "accel_accuracy": "MEDIUM", "gyro_accuracy": "HIGH",
+                }, t=float(arr[k, 0]))
+                self._imu_seq += 1
+
+    def _leak_now(self) -> bool:
+        """Simulated flooding, for looking at the alert before trusting it.
+
+        Off unless ``--demo-leak-after S`` was passed, and DEMO ONLY: there is
+        no path from this flag to the hardware backend, whose leak state comes
+        from ArduSub's STATUSTEXT and nothing else. It exists because an alarm
+        nobody has ever seen fire is an alarm nobody knows the look of.
+        """
+        after = getattr(self.opts, "demo_leak_after", None)
+        if after is None or float(after) < 0:
+            return False
+        return (now() - self._t0) >= float(after)
 
     def _publish(self, thrust, current, volt, pct) -> None:
         tel = Telemetry(
@@ -482,7 +686,7 @@ class DemoVehicleWorker(TimerWorker):
             water_temp_c=14.2, internal_temp_c=31.0,
             armed=self.armed,
             mode=f"{self.mode} (sim)",
-            leak=False,
+            leak=self._leak_now(),
             sensors={
                 # Two IMUs, named for their owners: the autopilot's and the
                 # C3's BNO086. Different devices, different clocks, different
@@ -492,7 +696,18 @@ class DemoVehicleWorker(TimerWorker):
                 "IMU (C3)": SensorStat("IMU (C3)", 486.0, Conn.ONLINE, "BNO086"),
                 "Barometer": SensorStat("Barometer", 10.0, Conn.ONLINE),
                 "Compass": SensorStat("Compass", 20.0, Conn.ONLINE),
-                "Leak": SensorStat("Leak", None, Conn.ONLINE, "dry"),
+                "Leak": (SensorStat("Leak", None, Conn.FAULT,
+                                    "LEAK DETECTED (simulated)")
+                         if self._leak_now() else
+                         SensorStat("Leak", None, Conn.ONLINE, "dry (sim)")),
+                "Enclosure": SensorStat(
+                    "Enclosure", None,
+                    Conn.FAULT if self._leak_now() else Conn.ONLINE,
+                    # "(sim)" on both, like the Leak row: a bare hPa figure
+                    # beside a real-looking panel is exactly the synthetic
+                    # number that gets quoted later as a measurement.
+                    "1103 hPa internal (sim)  CRITICAL" if self._leak_now()
+                    else "1013 hPa internal (sim)"),
                 "EKF": SensorStat("EKF", None, Conn.ONLINE, "ok"),
                 "Heartbeat": SensorStat("Heartbeat", 1.0, Conn.ONLINE),
             },
@@ -546,7 +761,10 @@ class DemoBackend(Backend):
             self.mpc = MpcWorker(bus, opts)
             self.workers.append(self.mpc)
             bus.nav_fix.connect(self.mpc.on_nav_fix)
+            # The object tracker's second consumer — see the hardware backend.
+            bus.pose.connect(self.mpc.on_pose)
             bus.vehicle_imu.connect(self.mpc.on_vehicle_imu)
+            bus.camera_imu.connect(self.mpc.on_camera_imu)
             bus.telemetry.connect(self.mpc.on_telemetry)
             bus.thrusters.connect(self.mpc.on_thrusters)
             bus.cmd_mpc_engage.connect(self.mpc.set_engaged)
@@ -554,6 +772,7 @@ class DemoBackend(Backend):
             bus.cmd_mpc_start.connect(self.mpc.start_mission)
             bus.cmd_mpc_mode.connect(self.mpc.set_mode)
             bus.cmd_mpc_scenario.connect(self.mpc.set_scenario)
+            bus.cmd_mpc_dump_meta.connect(self.mpc.dump_run_meta)
             bus.cmd_enable.connect(self.mpc.on_enable)
             bus.cmd_estop.connect(self.mpc.estop)
             bus.cmd_log_sensors.connect(self.mpc.set_sensor_log)
@@ -564,6 +783,7 @@ class DemoBackend(Backend):
         # queued connection automatically once the worker is on its thread.
         bus.cmd_pilot.connect(self.vehicle.set_pilot)
         bus.cmd_gripper.connect(self.vehicle.set_gripper)
+        bus.cmd_gripper_drive.connect(self.vehicle.set_gripper_drive)
         bus.cmd_lights.connect(self.vehicle.set_lights)
         bus.cmd_enable.connect(self.vehicle.set_enabled)
         bus.cmd_estop.connect(self.vehicle.estop)
@@ -572,6 +792,8 @@ class DemoBackend(Backend):
         bus.cmd_tilt_center.connect(self.vehicle.tilt_center)
         bus.cmd_buttons.connect(self.vehicle.set_js_buttons)
         bus.cmd_log_sensors.connect(self.vehicle.set_sensor_log)
+        bus.cmd_log_raw_sensors.connect(
+            self.vehicle.set_raw_sensor_log)
         bus.cmd_mode.connect(self.vehicle.set_mode)
         bus.cmd_pose_enable.connect(self.vehicle.set_pose_enabled)
         bus.cmd_pose_click.connect(self.vehicle.set_pose_click)

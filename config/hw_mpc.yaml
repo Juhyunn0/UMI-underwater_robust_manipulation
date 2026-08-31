@@ -5,7 +5,10 @@
 # file only holds what is DIFFERENT on the real vehicle.
 
 rov_model: heavy_gripper    # ROV_MODEL for dobmpc (heavy | heavy_c3 | heavy_gripper)
-mode: dobmpc                # mpc | dobmpc (same solver; dobmpc adds w_hat) | pid
+mode: dobmpc                # mpc | dobmpc | mpc_tuned | dobmpc_tuned | pid
+                            # ONE solver serves the four MPC names: 'dob' adds
+                            # w_hat, '_tuned' splits the position cost into
+                            # along/cross in the path frame (mpc_tuned: below)
 ctrl_hz: 20.0               # MUST equal 1/DT_CTRL — baked into the solver
 
 # PID baseline (mode: pid, or the mode combo in the MPC panel). Gains are the
@@ -26,6 +29,28 @@ vel_propagation: true
 # vehicle's CURRENT pilot gain — never measured on this vehicle. Replace with
 # the P4 step-calibration values. Wrong gains = tracking offset (mpc) or a DC
 # w_hat (dobmpc), bounded either way by axis_cap.
+# The gains are [예측] — derived from the T200 curve and the Heavy mixer
+# geometry, never measured on this vehicle — until a P4 step calibration
+# replaces them. What HAS been measured (2026-08-17, pooling every engaged
+# trajectory tick of 29 hardware runs, r = 0.95) is a whole-loop relation:
+#
+#     speed = 0.692 * (|axis| - 0.096)          [측정]
+#
+# READ THAT CAREFULLY: it is not the thruster gain. It is thrust MINUS whatever
+# opposes motion, and on a tethered vehicle that is dominated by drag the
+# prediction model does not carry — the same relation implies the horizontal
+# drag the controller assumes is 8-12x too low. Feeding its slope in here as
+# axis_gain (6.4 N) was a misattribution and it is on the record what that
+# cost: expressible authority collapsed from axis_cap*gain = 30 N to 3.2 N, so
+# the normalized axis railed on 64-77 % of ticks in
+# .../20260817/{0817_144318, 0817_150426} against under 0.5 % in every other
+# run on file, and cross-track p95 roughly doubled. 60 N is the value every
+# good run used, including the best full mission on record
+# (0817_110145: 5/5 laps, cross-track p95 6.6 cm, zero saturation).
+#
+# The real consequence of that measurement belongs in the PREDICTION MODEL's
+# drag, not here; until that is done the vehicle simply tracks well and slowly
+# (110145 held 0.058 m/s against a 0.20 m/s command).
 axis_gain:
   surge_n: 60.0
   sway_n: 60.0
@@ -33,19 +58,394 @@ axis_gain:
   yaw_nm: 20.0
 axis_cap: 0.5               # |axis| ceiling on everything the MPC sends
 
+# Slew limit on the axis command [1/s]. The yaw axis has been reversing at
+# 1.9-2.7 sign flips/s in EVERY hardware run (2026-08-14 onward), deadband or
+# not, and thrust that reverses faster than the hull can respond is heat and
+# noise rather than control. This bounds how fast a command may move: 1.5/s
+# lets a full-cap swing happen in a third of a second, which is far quicker
+# than the vehicle's own horizontal time constant, while clipping the 20 Hz
+# reversals. 0 disables it (every run before 2026-08-17 had no limit).
+axis_slew_per_s: 1.5
+
+# THRUSTER DEADBAND: known, real, and deliberately NOT compensated here.
+# A T200/Basic ESC produces no thrust until its command clears +/-25 us
+# [스펙, vendor, unmeasured on this vehicle], and small commands do fall into
+# it. An axis-domain inverse was tried on 2026-08-17 and removed the same day
+# — it is the right idea applied at the wrong interface, and it made the
+# vehicle shake (.../20260817/0817_124624: ax_yaw |a| p50 0.012-0.043 ->
+# 0.358, surge on/off toggling 0.00 -> 3.10 /s, pwm_dev 24-31 -> 62 us).
+# Three reasons it cannot work over MANUAL_CONTROL:
+#   * the deadband is per-THRUSTER, downstream of ArduSub's mixer. surge, sway
+#     and yaw all sum into the same four vectored thrusters, so pre-distorting
+#     each axis stacks the offset 2-3x on one thruster: measured on the run
+#     that motivated it, |surge|+|sway|+|yaw| went 0.246 -> 0.685 (x2.78), with
+#     65 % of ticks having all three axes live. It distorts DIRECTION too — a
+#     (0.40, 0.031) request comes out with 4.8x the sway/surge ratio.
+#   * the null zone is a discontinuity, and the real request crosses it about
+#     once a second (0.56-1.37 /s measured), so it pulses rather than pushes.
+#   * the motivation was wrong anyway: axis_gain is roughly right. Depth hold
+#     is a steady-state balance against net buoyancy, and across 29 runs the
+#     median |ax_heave| of 0.100 implies heave_n ~ 57 N against the 60 N
+#     assumed [유도; net buoyancy -5.7 N is itself a model number].
+# If it is ever revisited it belongs per-thruster, which means leaving
+# MANUAL_CONTROL for a direct thruster interface.
+
+# GEOMETRIC PATH FOLLOWING. The PID gets a spatial reference: the measured
+# hull is projected onto the active segment and its setpoint sits at most
+# path_lead_m ahead of that projection. False restores the legacy wall-clock
+# trajectory tracker.
+#
+# The CORNER GATE that lived here until 2026-08-16 (path_corner_tol_m /
+# _speed_m_s / _dwell_s / path_brake_accel_m_s2) is GONE at the operator's
+# request. It stopped the reference dead 10 cm before every vertex and refused
+# to reveal the next leg until the hull had parked inside 5 cm below 0.03 m/s
+# for 0.30 s — a stop-and-go square, and the reason no MPC horizon could ever
+# look round a corner. Runs recorded before 2026-08-16 flew that gate; their
+# corner behaviour is not comparable with anything after it.
+path_following: true
+path_lead_m: 0.10
+traj_timeout_factor: 3.0    # wall-clock backstop
+
+# MPCC PATH SHAPING (mode: mpcc). The mission stops being a polygon and becomes
+# a C1 curve: rectangle corners are replaced by circular fillets of
+# path_fillet_m, so the heading is continuous through them and the NMPC horizon
+# can plan across the corner instead of into it.
+# The two accelerations define the FEASIBLE speed profile baked into the path:
+#   v <= sqrt(path_lat_accel_m_s2 * R)   through a fillet
+#   |dv/dt| <= path_long_accel_m_s2      so the reference brakes BEFORE a corner
+# path_turn_radius_m rounds an out-and-back LINE's turnarounds into a stadium;
+# 0 keeps the mission's exact geometry and reverses in place (the vehicle has
+# to stop to reverse anyway).
+# path_creep_m_s is a deadlock guard, not a tuning knob: v_ref is the target
+# for theta_dot, so a v_ref of exactly zero is a fixed point the optimizer
+# never leaves — the mission would never start, with a healthy solver status.
+# fillet 0.10 = a corner you have to look for on the plot (10 % of a 1 m
+# side), so an MPCC square and a PID square are visually the same rectangle
+# and the comparison is about the CONTROLLER.
+#
+# It is a FLOOR, not a preference. Projection onto a curve is degenerate once
+# the vehicle is inside the arc's centre of curvature, i.e. once |e_cross| > R
+# on the concave side — the nearest point then sweeps across the arc and the
+# reference darts forward. That is not hypothetical: at R = 0.06 with the
+# uncorrected axis_gain, 17 % of arc ticks had |e_cross| > R and the reference
+# outran the hull by more than 3x on 12 % of them, which is exactly the
+# "cross speeds up in the corner" the operator reported
+# (.../20260817/0817_135600/mpc_140502.csv). KEEP R WELL ABOVE THE CROSS-TRACK
+# ERROR YOU ACTUALLY GET: with the gain fixed the error falls to ~1 cm, so
+# 0.10 leaves a 10x margin and 0.06 would also be defensible.
+# WAYPOINT MODE: set path_fillet_m to 0.0 and the mission becomes the exact
+# rectangle the operator typed, with the reference braking to a crawl at each
+# vertex and accelerating out (path_geometry.speed_profile detects the heading
+# discontinuity and pins the speed there). Because the reference arrives
+# stopped, every horizon stage collapses onto the vertex while it sits there —
+# setpoint regulation at the corner, reached continuously instead of by
+# switching modes. Runs flown that way are labelled
+# reference_clock.strategy = "waypoint_vertex_stop" and must not be pooled with
+# filleted ones. 0.15 is the value the best recorded mission used
+# (0817_110145) and what MPCC wants, since its contouring frame needs a
+# tangent; keep it there unless you are deliberately flying waypoints.
+path_fillet_m: 0.0
+path_turn_radius_m: 0.0
+# a_lat / a_long shape the feasible speed profile. Both are back at 0.05
+# (2026-08-17): they were raised to 0.30/0.15 to chase speed, and the hardware
+# audit says the best full mission on record flew 0.05/0.05
+# (0817_110145, cross-track p95 6.6 cm over 5/5 laps). For scale the vehicle's
+# own lateral limit is axis_cap*axis_gain/m_eff_sway = 0.5*60/26.42 = 1.14
+# m/s^2 [예측 — axis_gain is unmeasured], so 0.05 is very conservative; raise
+# it only with a run to compare against.
+path_lat_accel_m_s2: 0.05
+path_long_accel_m_s2: 0.05
+path_creep_m_s: 0.02
+
+# ALONG/CROSS COST SPLIT — read ONLY by mode `mpc_tuned` / `dobmpc_tuned`.
+#
+# The tracking NMPC penalises position error with a diagonal Q in the WORLD
+# frame (Q[0]=Q[1]=300 on the heavy), so a centimetre OFF the path costs
+# exactly what a centimetre BEHIND on it costs. At a corner the optimiser
+# spends the cheap one to buy the expensive one — it cuts the corner — and
+# that is optimal for that cost, not a bug. These modes rotate the same 2x2
+# block into the PATH frame at every stage:
+#
+#     cost = q_along * (t_hat . e)^2  +  q_cross * (n_hat . e)^2
+#     i.e.  W = Rz(psi_path) diag(q_along, q_cross) Rz(psi_path)^T
+#
+# A rotation is orthogonal, so along_scale == cross_scale reproduces the
+# isotropic diagonal to machine precision — which is the parity test that
+# pins the machinery (rov_gui/tests/test_path_cost.py). acados takes the
+# per-stage W with cost_set on the ALREADY generated OCP, so `mpc` and
+# `mpc_tuned` are one compiled solver and one build.
+#
+# The angle is NedPlan.psi_path, the path's own tangent — never the vehicle
+# heading. Under heading_follow: false the vehicle crabs, so the two are
+# unrelated, and the reference VELOCITY cannot stand in for the tangent
+# either because speed_profile brakes it to a crawl at exactly the corners
+# this exists for.
+#
+# READ WITH path_lead_m. PathCursor already caps along-track error at the
+# leash (0.10 m), so lowering along_scale cannot let the reference run away —
+# it changes how much authority the NMPC spends closing a gap that is bounded
+# anyway. On 2026-08-18 that leash was saturated on 83.6 % of engaged ticks
+# (sessions/low_level_controller_data/20260818/0818_143802/mpc_143938.csv),
+# i.e. the vehicle already could not keep up; in that regime a lower
+# along_scale buys cross-track accuracy by going slower still.
+#
+# 0.25 / 4.0 (a 16x anisotropy) is a FIRST GUESS [예측], not a measured
+# optimum, and no tuned run has been flown in water. Sweep it offline first:
+#   python -m rov_gui.tools.sweep_path_cost --grid
+mpc_tuned:
+  along_scale: 0.25      # q_along = along_scale * 300
+  cross_scale: 4.0       # q_cross = cross_scale * 300
+  # q_along: 75.0        # absolute overrides; null = use the scales above
+  # q_cross: 1200.0
+  apply_terminal: true   # rotate QN too (off re-admits cutting at the horizon end)
+  split_velocity: false  # also split the linear-velocity weight (see path_cost.py)
+  v_along_scale: 1.0
+  v_cross_scale: 1.0
+
 # Per-axis w_hat clip [X,Y,Z,K,M,N] (N / N·m) applied BEFORE the solver — the
 # KNOWN_ISSUES replacement for the scalar ±50 backstop in mpc_acados.py.
 w_hat_clip: [15, 45, 45, 5, 5, 8]
+
+# STATION BRIDGE — a tag dropout is not a reason to stop controlling.
+# STATION MODE ONLY (rov_gui/control/station_bridge.py).
+#
+# THE PROBLEM. A disturbance kick blurs the camera or swings the tags out of
+# frame; the localizer stops producing a fix; ~1.1 s later (tag_stale_s 0.7 +
+# tag_stale_hold_s 0.4) the loop DISENGAGES. That drops DEPTH hold too, and
+# this vehicle is negatively buoyant (net -5.7 N), so it starts sinking —
+# which changes the view and makes re-acquisition LESS likely. Turning on
+# imu_dr does not help: MpcWorker._runtime_fault reads `meas` (the tag
+# solution, deliberately kept as ground truth), not the state the controller
+# eats, so the interlock fires whatever the estimator is doing.
+#
+# THE LADDER. Which axes may be carried, and for how long, is four questions,
+# because the sensors behind them differ:
+#
+#     z            barometer          ABSOLUTE, no drift
+#     roll/pitch   ArduSub AHRS       ABSOLUTE, no drift
+#     yaw          gyro integration   slow drift (0.02 rad/s = 70 deg/min)
+#     x, y         accel double-int   t^2, fast
+#
+#   fix fresh          everything, as always
+#   0 .. imu_hold_s    all axes on the bridge estimate, full authority
+#   after imu_hold_s   x/y/yaw RELEASED; depth + attitude held INDEFINITELY
+#
+# The last tier is deliberately NOT a disengage. Pushing on a drifting
+# horizontal estimate actively drives the vehicle somewhere wrong and nothing
+# here stops it by position any more (the geofence was removed 2026-08-14);
+# releasing lets it drift with the water, which at pool speeds is slow, while
+# the two axes that never drift keep it at depth and level — the state most
+# likely to get the tags back. Safe to sit in forever, so it does.
+#
+# The bridge estimator is its OWN ImuDeadReckoner, RE-ANCHORED on every fresh
+# fix (imu_dr's is not, on purpose — its whole point is to measure drift) and
+# using attitude="vehicle" (autopilot roll/pitch, absolute).
+#
+# EVERY OTHER INTERLOCK STILL FIRES: disarm, flight-mode change, telemetry
+# loss, solver failure, tick overrun, E-STOP — and the two staleness faults
+# the bridge would otherwise fly blind on ("imu stale", "pressure depth
+# stale"), because those are the sensors it would be flying ON.
+#
+# Each recovery logs how far the estimate had drifted when truth came back.
+# That is the free measurement this feature produces, and it is the number
+# that turns the IMU budget from [예측] into [측정].
+#
+# **실기 미검증** (2026-08-18) — KNOWN_ISSUES.md.
+station_bridge:
+  enabled: true
+  imu_hold_s: 3.0        # all axes on the estimate this long, then release x/y/yaw
+  # auto = integrate the accelerometer ONLY when imu_dr.calibration loaded,
+  # else freeze x/y at the last fix. A RAW C3 accelerometer carries a measured
+  # 1.8 m/s^2 bias — 8 m of drift in 3 s — so `auto` is not a convenience.
+  xy_source: auto        # auto | imu | hold
+  axis_cap: null         # null = the normal axis_cap (operator decision 2026-08-18)
+
+# OBJECT FOLLOW — put the --pose tracked object into the pool's frame, and
+# (shape: follow) hold the relative pose START was pressed at.
+# rov_gui/control/object_nav.py. Needs --pose AND --mpc.
+#
+# WHAT IT DOES. The object tracker reports T_cam_obj (object -> CAMERA); the
+# tag localizer reports the VEHICLE in the map frame. Composed from ONE camera
+# frame, the camera extrinsic cancels exactly:
+#
+#     R_map_cam = R_ned_body . R_frd_cam       <- extrinsic-free
+#     p_map_cam = p_ned + R_ned_body . t_frd_cam
+#
+# and that is load-bearing, because the C3 re-mount is only half measured: the
+# 43.3 deg tilt is applied as a PURE rotation and the translation a real hinge
+# also moves (cam_t_flu, a 0.2855 m lever arm [측정: c3_payload_frames.json,
+# Onshape 2026-07-19]) is still unmeasured (KNOWN_ISSUES 2026-08-17). Pair the
+# two estimates ACROSS frames and that unknown comes straight back:
+# |t_frd_cam| * 2*sin(theta/2), i.e. 2.5 cm at 5 deg of yaw between them.
+# `pair_exact` on the panel and in the CSV is the ONLY warning that the
+# cancellation has stopped — watch it on the bench before the pool.
+#
+# WHAT `follow` HOLDS. The offset is captured at START, in the OBJECT's yaw
+# frame: the object translates and the vehicle translates with it; the object
+# yaws and the vehicle ORBITS to keep the same face; the object rolls or
+# pitches and nothing happens (MANUAL_CONTROL has no K/M axis, so a roll it
+# tried to answer would be dropped by the allocation anyway). Because the
+# offset is taken from the vehicle's CURRENT pose, arming a follow never moves
+# the vehicle — that is a property, not an omission.
+#
+# EVERY NUMBER HERE IS [예측] until the first pool run (a hold-only pass with
+# the object in view produces all of them at once). The two that are not:
+# the 0.3-0.8 m working range and the 2.4 m registration failure are
+# [측정: KNOWN_ISSUES 2026-08-09, stored data], and in AIR the C3's factory
+# UNDERWATER calibration reads distances ~1.33x long
+# [측정: calib/FOV_AUDIT.md] — do NOT "fix" that on the bench.
+#
+# **실기 미검증** (2026-08-21), and it inherits the whole of --pose's own
+# "never run on hardware" risk (KNOWN_ISSUES 2026-08-09).
+object_nav:
+  pair_tol_s: 0.08          # [유도] 0.2855 m lever arm x 0.5 rad/s ~ 1.1 cm
+  nav_source_required: main # the object leg is ALWAYS the C3
+  yaw_axis: none            # auto | x | y | z | none
+  # `none` ignores the object's heading entirely and keeps the offset in the
+  # MAP frame. One whole failure class disappears with it, so fly the first
+  # bench and pool passes that way and only then turn the orbit on.
+  yaw_min_horiz: 0.25       # axis within 14.5 deg of vertical -> yaw undefined
+  max_jump_m: 0.35          # [예측]
+  max_yaw_jump_deg: 45.0    # [예측]
+  reseed_after_n: 5         # this many rejections in a row = it really moved
+  min_distance_m: 0.15      # [측정: KNOWN_ISSUES 2026-08-09 — 0.3-0.8 m works,
+  max_distance_m: 10      #  2.4 m fails to register]
+  pos_lp_alpha: 0.5         # [예측]
+  vel_lp_alpha: 0.3         # [예측]
+  max_extrap_s: 0.30        # [예측] past this the point STOPS, honestly
+  stale_s: 0.50             # past this the panel marker goes hollow
+  hold_s: 2.00              # not live this long -> demote to a station hold
+  max_excursion_m: 1.50     # reference CLAMP from the arm point (operator)
+
+# IMU DEAD RECKONING — "how far can the IMU carry us on its own".
+#
+# At the end of the mission settle the C3's BNO086 is anchored to the tag
+# solution and integrates alone from there; the AprilTag pose keeps running as
+# GROUND TRUTH and as the second marker on the trajectory plot. The gap between
+# the two markers is the measurement.
+#
+# OFF by default. With enabled: false the control tick is byte-identical to a
+# build without any of this (pinned by test_control's shadow-parity test).
+#
+# UNKNOWN KEYS IN THIS BLOCK RAISE at startup, unlike everywhere else in this
+# file. `imu-dr:` for `imu_dr:` is otherwise ignored in silence, and the
+# operator flies a pool session believing an estimator is running.
+imu_dr:
+  enabled: false
+  # shadow  = the controller stays on the tag state; the estimate is only
+  #           drawn and recorded. Safe to leave on; measures drift honestly.
+  # control = the controller flies on the ESTIMATE. This is the experiment the
+  #           operator asked for (2026-08-16), and it needs --imu-dr-control on
+  #           the command line as well — see the safety note below.
+  mode: shadow
+  source: c3                  # the C3 BNO086; the ROV IMU is not wired up
+  # gyro    pure integration. The strictest reading of "IMU only", and the
+  #         one whose error grows as t^3.
+  # ahrs    gyro + gravity levelling of roll/pitch, yaw gyro-only. RECOMMENDED
+  #         and the operator's choice: still 100% IMU, and at 0.05 m/s the
+  #         linear acceleration is under 0.02 m/s^2 so levelling is nearly
+  #         exact. Turns the t^3 attitude term into a bounded t^2 one.
+  # vehicle roll/pitch from ArduSub, yaw still ours — isolates position error.
+  attitude: ahrs
+  # Levelling time constant. The trade, both directions [유도]: a gyro bias
+  # beta settles at a standing tilt of beta*tau, so smaller is better for
+  # bias; but frequencies below 1/tau of REAL horizontal acceleration are
+  # rejected as tilt, and this vehicle's whole signal is 1 s ramps at
+  # 0.05 m/s^2. Also note levelling only beats pure gyro for t >> 3*tau.
+  # 3.0, not the 10.0 first shipped. MEASURED on this vehicle's own settle
+  # windows (2026-08-18, bias uncertainty 0.0253 deg/s after differencing
+  # against the autopilot): predicted drift at 19 s is 7.8 m at tau=10,
+  # 2.3 m at tau=3, and 4.95 m with no levelling at all. That ordering is
+  # exactly the "levelling only wins for t >> 3*tau" rule this file already
+  # states — 10 s violated it for the 20-60 s windows these runs actually use.
+  ahrs_tau_s: 3.0
+  # Skip levelling when |accel| is this far off gravity — a thruster kick is
+  # not gravity moving. Should almost never fire at mission speeds; if the run
+  # meta reports a large `ungated`, look at the mounting before the drift.
+  accel_trust_m_s2: 0.15
+  # DEPTH IS NOT DEAD RECKONED (operator decision 2026-08-16). z and heave
+  # rate come from the barometer — a different sensor, so it survives a tag
+  # dropout — and only the horizontal plane plus yaw come from the IMU. An
+  # integrated vertical channel would drive heave commands into the mat or the
+  # surface, and the question being asked is about horizontal drift. The IMU's
+  # own integrated depth is still logged as dr_pz_imu for the comparison.
+  z_source: pressure
+  # The last N seconds of the 10 s settle become the static window: gyro bias
+  # and the accel offset are measured there. gyro_static_std_max rejects a
+  # window the vehicle was not actually still for — a DP hold has live
+  # thrusters, so this fires more often than it sounds like it should.
+  static_window_s: 8.0
+  # Gyro bias is gated on the PRECISION OF ITS MEAN, not on how much the gyro
+  # wobbled: a vehicle holding station at 0.1 cm/s shows ~1.4 deg/s of gyro
+  # std (thruster vibration) while its mean is determined to 0.026 deg/s. The
+  # old std gate rejected every real settle window, no bias was subtracted,
+  # and the 0.128 deg/s that survived became 37.6 m of drift in 19 s.
+  gyro_bias_sem_max: 0.005      # rad/s; measured windows land near 0.00044
+  accel_static_sd_max: 0.15     # m/s^2 steadiness; measured 0.032 on a settle
+  gyro_static_std_max: 0.02     # only used when no autopilot rates are given
+  # Bench calibration (accel scale/bias by tumble, IMU->body rotation by
+  # Kabsch against the autopilot's rates). Its sha1 goes in the run meta;
+  # a run with calibration_sha1 null was flown on the RAW sensor, which reads
+  # ~+20% of gravity and has an unknown mounting rotation.
+  #   python -m rov_gui.tools.calib_c3_imu <run>/..._c3_imu.jsonl --fit accel
+  calibration: config/c3_imu_calib.json
+  max_dt_s: 0.1               # bigger sample gaps are dropped, not integrated
+  # NO AUTOMATIC ABORT (operator decision 2026-08-16: "I'll stop it by hand").
+  # Worth knowing what that means: the geofence was removed on 2026-08-14, so
+  # NOTHING stops this vehicle for being in the wrong place. Under `control`
+  # the loop actively drives toward wherever the IMU thinks it is, and the
+  # plot's `DR xx cm` readout is the instrument the pilot watches. Set either
+  # of these to a number to turn the corresponding guard on.
+  abort_err_m: null           # disengage when |p_dr - p_tag| exceeds this
+  abort_max_s: null           # ...or after this long under DR control
+  axis_cap_dr: null           # null = use axis_cap above
 
 # nudot for the EAOB: 'imu' = SCALED_IMU2 specific force (+gravity, -omega x v);
 # 'fd' = finite-difference of nu (the sim's definition — much noisier here
 # because nu itself comes from differentiated tag positions).
 nudot_source: imu
-vel_lp_alpha: 0.35          # low-pass on the tag-derived world velocity
+
+# Low-pass on the tag-derived world velocity (state_assembler.py). The ROV has
+# no velocity sensor, so nu comes from differencing consecutive tag fixes, and
+# this smooths that difference:
+#
+#     v <- (1 - alpha) * v  +  alpha * (p_now - p_prev) / (t_now - t_prev)
+#
+# alpha is a NOISE-vs-LAG trade, and it is recursive: 1 - alpha of the old
+# value survives every step, so the output is a decaying average of the past
+# whose centre of mass sits (1 - alpha)/alpha frames back.
+#
+# RAISED 0.35 -> 0.6 on 2026-08-14, because the noise it was sized against
+# turned out to be 25x smaller than assumed. MEASURED on the last pool session
+# (sessions/low_level_controller_data/20260814/2120/nav_212035/fixes.csv,
+# 10815 accepted fixes over 612 s, high-frequency residual against a local
+# quadratic fit): sigma_pos = 0.8 / 0.7 / 0.6 mm in x/y/z and 0.04 deg in yaw,
+# solved from 20-58 tags at once, reproj_rms p50 1.58 px, 0 ambiguous.
+# CAVEAT: that is the WHITE component only — a slowly varying bias (tag map,
+# camera calibration) is invisible to that test.
+#
+# What the change costs and buys, at the measured 0.0666 s fix interval [유도]:
+#     alpha   sigma_v     lag
+#      0.35   0.78 cm/s   124 ms      <- was
+#      0.60   1.11 cm/s    44 ms      <- is
+# Mission speed is 0.05 m/s, so both noise figures are well under the signal;
+# the 80 ms comes straight off the PID's D-term path (kd_x = 59.7 N.s/m) and
+# off the MPC's velocity state. The remaining lag is transport: tag_age p50
+# 0.191 s (sessions/low_level_controller_data/20260814/2131/mpc_213128.csv),
+# which is a camera-pipeline problem, not a filter one.
+vel_lp_alpha: 0.6
 
 # Honest hardware sigmas for the EAOB 'perf' profile (overrides params.EAOB_SIG_*).
 # [예측] until the P3 residual fit: pose from single-tag PnP at 1.5-3 m is
 # centimetres, not the sim's 5 mm; velocity is differentiated position.
+#
+# NOTE (2026-08-14): `pos` is now known to be ~25x LOOSER than the measured
+# white noise above (0.8 mm vs 20 mm), i.e. the EAOB is told the tag is far
+# worse than it is and leans on its model instead. Deliberately NOT changed
+# here: R must cover the CORRELATED error too (tag map, calibration,
+# refraction), which the residual test cannot see. That is exactly what the P3
+# residual fit this comment already asks for is supposed to produce — until
+# then a tighter R would be a guess in the other direction.
 eaob_sigmas:
   pos: [0.02, 0.02, 0.01]
   ang_deg: [0.5, 0.5, 1.5]
@@ -59,24 +459,147 @@ eaob_sigmas:
 # vehicle is holding when the trajectory starts, so START right after the
 # datum zeroes = a 0.2 m square from (0,0) at the initial heading.
 square:
+  # THE MISSION. shape: "line" = out-and-back along dir_deg (one lap = there
+  # AND back); "square" = a rectangle, size = x side, size_y = y side;
+  # "circle" = a closed loop of `radius` (one lap = one revolution).
+  # origin_tag anchors the path to a physical tag id — the vehicle must be
+  # within engage.start_err_max_m of it when START is pressed, so it never
+  # lunges across the pool. The trajectory panel writes these fields (shape /
+  # origin_tag / distances / speed) live; everything else comes from here.
+  # STATION FIRST. If the vehicle cannot hold a point it cannot track a line,
+  # and every number a line run produced would be measuring that instead.
+  shape: station
+  # LINE: 2 m along +y (dir_deg 90 in the tag-map frame) from tag 79,
+  # 5 round trips. ramp_s is the cosine speed ramp at each turnaround —
+  # without it the reference reverses in one sample and floors the tracking
+  # error the way the square's corners do (memory: square-corner-error-floor).
+  length: 2.0
+  dir_deg: 90.0
+  ramp_s: 1.0
+  origin_tag: 79
+  # SQUARE/rectangle sides (size_y: null = square of side `size`). The
+  # rectangle is placed in the MAP frame: origin_tag is its min-x / min-y
+  # corner (bottom LEFT of the top-down plot) and the sides run along the tag
+  # map's x and y axes, so `size` is the +x side and `size_y` the +y side.
+  # rot_deg below tilts it AWAY from that; it is a MAP rotation, not a
+  # datum one, so the same number means the same physical rectangle every run.
+  size_y: null
   size: 0.2                 # 20 cm x 20 cm (2026-08-12 mission)
-  speed: 0.05               # 16 s per lap — slow enough for the RTP-feed lag
-  laps: 2
+  # CIRCLE: the entered tag is a point on the RIM — its minimum-x point, which
+  # is the BOTTOM of the top-down plot — and the centre sits one radius along
+  # the map's +x from it (rot_deg swings the centre around the tag). Same
+  # promise the rectangle makes about its own tag: what you point at on the
+  # floor is where the vehicle starts, not a place it only orbits.
+  #
+  # A circle is the only mission here with nothing unrealizable in it: no
+  # 90-deg vertex (memory: square-corner-error-floor) and no 180-deg reversal.
+  # The price is that its curvature limit applies to the WHOLE lap, not just
+  # to corners: v <= sqrt(path_lat_accel_m_s2 * R), so at the 0.05 shipped
+  # above a 0.5 m circle caps at 0.158 m/s and a 0.3 m one at 0.122 m/s
+  # whatever the speed box says.
+  # [유도: v = sqrt(path_lat_accel_m_s2 * R); pinned by
+  #  rov_gui/tests/test_mpcc.py ::
+  #  test_circle_speed_is_curvature_limited_over_the_whole_lap. NOT measured
+  #  in water — no circle has been flown yet.]
+  # The worker logs a warning when that cap binds, so the number in the speed
+  # box is never quietly overridden by the geometry.
+  radius: 0.5
+  speed: 0.05               # panel seed (m/s box); 16 s per lap here — slow
+                            # enough for the RTP-feed lag
+  laps: 5                   # LINE: 5 round trips; SQUARE/CIRCLE: 5 circuits
   depth_ned: null           # null = hold the engage depth
   heading_follow: false     # yaw stays at the START heading (crab square)
   yaw_rate_deg_s: 60
   origin: current           # current | [x_ned, y_ned]
-  rot_deg: 0.0
+  rot_deg: 0.0              # MAP-frame tilt of the rectangle (0 = axis-aligned);
+                            # for a CIRCLE it is the bearing from the tag to
+                            # the centre (0 = centre at +x, tag at the bottom)
   yaw_fixed_deg: current    # current | degrees (NED), used when not heading_follow
+  # ABSOLUTE heading in the tag-map frame, degrees (90 = facing +y). This is
+  # what "sit on the tag facing +y" means; yaw_fixed_deg is datum-relative and
+  # therefore means something different every time you engage. null = use
+  # yaw_fixed_deg.
+  yaw_map_deg: 90.0
 
 engage:
   require_mode: MANUAL      # the flight mode the vehicle must be in
   probe_ms_max: 25.0        # solver probe worse than this refuses engage
-  tag_stale_s: 0.5
+  # tag_age is DOMINATED BY CAMERA LATENCY, not by the fix rate: measured
+  # 2026-08-14 it sits at 0.14 s (p95 0.19, max 0.22) under mpc/pid and
+  # 0.26 s (p95 0.40) under dobmpc — whose solve spikes to 17-32 ms and slows
+  # the shared process. At 0.5 s dobmpc had ZERO headroom and both runs died
+  # on one late frame. 0.7 s costs 3.5 cm of position knowledge at the 0.05
+  # m/s mission speed, which vel_propagation already bridges.
+  tag_stale_s: 0.7
+  # ...and the gate must HOLD this long before it disengages. Every other
+  # interl  ock debounces (max_solver_fails: 3); this one did not.
+  tag_stale_hold_s: 0.4
   imu_stale_s: 0.3
   warmup_s: 1.5             # DP-hold EAOB warm-up before START TRAJ unlocks
-  start_err_max_m: 0.3      # max distance to the square origin at start
+  # How close counts as "over the path origin". START no longer REFUSES when
+  # the vehicle is further than this — it flies there under DP first (the tag
+  # the path is anchored to is usually not where you engaged) — this is the
+  # arrival tolerance for that approach.
+  start_err_max_m: 0.3
+  settle_s: 10.0            # hold over the origin this long before the PATH runs
+  # STATION does not use settle_s. The settle holds the vehicle in the SLOWER
+  # regime (the setpoint is still leashed to approach_lead_m) for another ten
+  # seconds, and there is nothing to start afterwards — the armed station
+  # target is the same point the approach was already walking to. Arming
+  # EARLIER is what makes it arrive, because that is what drops the leash.
+  # The one thing the settle buys is imu_dr's static window, so when that
+  # experiment is enabled the full settle_s comes back automatically.
+  settle_station_s: 0.0
+  approach_max_s: 180.0     # give up approaching after this and hold position
+  # The approach moves the SETPOINT toward the tag at this speed instead of
+  # stepping it there: a position controller chases whatever error it is
+  # handed, so a setpoint that teleports 2 m is a full-authority lunge — which
+  # is what made the vehicle overshoot and wallow on 2026-08-14. approach_lead_m
+  # additionally leashes the setpoint to that distance ahead of the hull, so a
+  # slow tick or a stall cannot let it run away.
+  # RAISED 0.10 -> 0.20 and 0.35 -> 0.50 on 2026-08-18, and the two go
+  # TOGETHER or neither does anything. Measured over 4 approaches that day:
+  # |axis| p50 0.18 against the 0.50 cap, ZERO ticks at the cap — the vehicle
+  # was using a third of its authority. What actually set the speed was the
+  # LEASH, not this number:
+  #
+  #     kp*lead = 51.7 * 0.35 = 18.1 N,  and the whole-loop fit above says
+  #     F = 86.7*v + 5.76      ->  v = 0.084 m/s   [유도]
+  #
+  # against a measured 0.079-0.102 m/s. Raising approach_speed_m_s alone
+  # would have been another number outside the loop (the 2026-08-17 lesson).
+  # With lead 0.50 the same algebra gives 0.232 m/s, so 0.20 is what the
+  # geometry can now deliver; the peak command is kp*0.50 = 25.9 N = axis
+  # 0.43, still inside the cap, with brief excursions to it while
+  # accelerating. _tick_approach also now passes the setpoint's OWN velocity
+  # as a feedforward, which it never did (the path follower always has).
+  approach_speed_m_s: 0.20
+  approach_lead_m: 0.50
+  # FOLLOW's feedforward ceiling. The follow hands the controller the goal's
+  # own velocity (object velocity + orbit term) and `_xref_ned` extrapolates
+  # the ENTIRE horizon along it, so an unbounded value moves the far end of the
+  # reference, not the near end — invisible in the CSV's stage-0 rx/ry/rz.
+  # 2026-08-23 a mis-registered object drove it to 3.15 m/s (dragging the
+  # vehicle 0.54 m) and then to 2.97 m/s against a static position target,
+  # which is the reference acados failed with status 4.
+  # The cap is the vehicle's own ceiling — above it the request is not
+  # information: [유도] the whole-loop fit above, F = 86.7*v + 5.76 N, at
+  # U_MAX 30 N gives v = 0.28 m/s. Clipping is logged, because the only thing
+  # that asks for more is a broken pose.
+  follow_ff_max_m_s: 0.30
   max_solver_fails: 3       # consecutive acados failures before disengage
   tick_overrun_ms: 100.0
 
-log_dir: sessions/mpc_runs  # auto-opened CSV when no recording stem is active
+# ROOT of the dated run tree (rov_gui/runstore.py), NOT the folder written to.
+# NOTE: `--rec-dir` OVERRIDES this, so one run always lands in one tree — the
+# worker says so in the log when it happens. Set `mpc_log_dir` on the opts if
+# you genuinely want the CSV somewhere else.
+#
+# the CSV lands in <log_dir>/YYYYMMDD/MMDD_HHMMSS/mpc_<hhmmss>.csv, beside the UI
+# recording and the nav recording of the same run. events.log goes in the same
+# folder. Auto-opened at engage when no recording stem is active.
+# (The leaf folder gained its MMDD_ prefix on 2026-08-14 — operator request;
+# older runs keep the bare HHMM name and were not migrated.)
+# (Was sessions/mpc_runs — flat, one folder for every run ever. Past runs are
+# still there; nothing was moved.)
+log_dir: sessions/low_level_controller_data

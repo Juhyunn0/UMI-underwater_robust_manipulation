@@ -1,0 +1,102 @@
+# BlueROV2 Heavy + Newton Subsea Gripper + MarineSitu C3 stereo camera (heavy_gripper).
+#
+# Derived from BlueROVHeavy.yaml (2026-07-12). ONLY volume and coBM change:
+#   volume: 0.0116499 + gripper 2.578e-4 (524-267 g / rho 997) + C3 1.274e-3
+#           (1700-430 g / rho) = 0.0131815 m^3   -> net buoyancy ~ -5.7 N (SINKS;
+#           the real payload is negatively buoyant and no trim foam is modeled,
+#           per the 2026-07-12 decision).
+#   coBM:   volume-weighted CB_z minus TOTAL-COM_z = +0.01625 m
+#           (compute_payload_inertia.py; the generated MJCF re-origins the body frame
+#           at the total COM. Updated 2026-07-19: C3 moved to its measured front-
+#           BOTTOM mount (Onshape assembly), which lowers the COM and raises coBM.
+#           hydro.py models only this z offset — the CB_x-COM_x mismatch leaves
+#           ~1.4 N*m static pitch moment unmodeled, countered by the PID
+#           rp-leveling / the NMPC's EAOB).
+#
+# added_mass / damping are the UNCHANGED heavy (Wu 2018) set — DELIBERATE:
+#   DNV-RP-C205 component build-up estimates for the payload increments are small
+#   vs the 30-100% spread between published BlueROV2 coefficient sets, so they are
+#   documented here but NOT applied (same HOLD-until-own-system-ID policy as the
+#   heavy rotational added mass):
+#     gripper (cyl D36 x 303 mm, Ca=1 cross-flow): dYv' = dZw' ~ rho*pi*r^2*L
+#       ~ +0.31 kg (+2.4% sway / +2.1% heave); axial dXu' ~ 0.
+#     C3 (box 95x165x89 mm, level, lens fwd):     dXu'/dZw' ~ +0.5..0.9 kg
+#       (+9%/+6% worst-case), dYv' ~ +0.4 kg (+3%).
+#     drag: frontal-area build-up dD_NL,x ~ +0.5*rho*Cd*A ~ +7 N s^2/m^2 (Cd~1,
+#       A~0.015 m^2 combined) vs 18.18 baseline — significant fraction but within
+#       the 8x spread between published quadratic-drag sets.
+#   -> revisit all of the above with in-situ system ID (free-decay / thrust steps).
+name: BlueROVHeavyGripper
+
+drag_coef: 0.3
+volume: 0.0131815
+coBM: 0.01625
+hydro_coef:
+  added_mass:
+  - 5.5
+  - 12.7
+  - 14.57
+  - 0.12
+  - 0.12
+  - 0.12
+  linear_damping:
+  - 4.03
+  - 6.22
+  - 5.18
+  - 0.07
+  - 0.07
+  - 0.07
+  quadratic_damping:
+  - 18.18
+  - 21.66
+  - 36.99
+  - 1.55
+  - 1.55
+  - 1.55
+rotor_configuration:
+  directions:
+  - 1.0
+  - -1.0
+  - 1.0
+  - -1.0
+  - 1.0
+  - -1.0
+  - 1.0
+  - -1.0
+  time_constants:
+  - 0.01
+  - 0.01
+  - 0.01
+  - 0.01
+  - 0.01
+  - 0.01
+  - 0.01
+  - 0.01
+  force_constants:
+  - 4.4e-07
+  - 4.4e-07
+  - 4.4e-07
+  - 4.4e-07
+  - 4.4e-07
+  - 4.4e-07
+  - 4.4e-07
+  - 4.4e-07
+  max_rotation_velocities:
+  - 3900
+  - 3900
+  - 3900
+  - 3900
+  - 3900
+  - 3900
+  - 3900
+  - 3900
+  moment_constants:
+  - 1.3677728816219314e-09
+  - 1.3677728816219314e-09
+  - 1.3677728816219314e-09
+  - 1.3677728816219314e-09
+  - 1.3677728816219314e-09
+  - 1.3677728816219314e-09
+  - 1.3677728816219314e-09
+  - 1.3677728816219314e-09
+  num_rotors: 8

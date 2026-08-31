@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""plot_nav_run.py — replot a REC NAV recording (sessions/nav_runs/<stamp>/).
+"""plot_nav_run.py — replot a REC NAV recording (a nav_<hhmmss>/ folder).
 
-    python -m rov_gui.tools.plot_nav_run sessions/nav_runs/20260814_101500
+    python -m rov_gui.tools.plot_nav_run \
+        sessions/low_level_controller_data/20260814/1841/nav_184148
+    (runs before 2026-08-14 live in sessions/nav_runs/<stamp>/ instead)
     python -m rov_gui.tools.plot_nav_run <run dir> --show
     python -m rov_gui.tools.plot_nav_run <run dir> -o custom.png
 
 The recording is two files the GUI's REC NAV button wrote (window.py):
 
     map.json    the locked tag map (id -> x, y, z, yaw), tag size, pool
-                boundary, geofence — the world as the run knew it
+                boundary — the world as the run knew it
     fixes.csv   every localizer result, RAW tag-frame, misses included
 
 This draws the old tagslam-style top-down view: tags as green squares with
@@ -40,7 +42,9 @@ def load_run(run_dir: Path) -> tuple[dict, list[dict]]:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("run_dir", type=Path, help="sessions/nav_runs/<stamp>/")
+    ap.add_argument("run_dir", type=Path,
+                    help="a nav_<hhmmss>/ folder inside a run folder "
+                         "(or sessions/nav_runs/<stamp>/ for pre-2026-08-14 runs)")
     ap.add_argument("-o", "--out", type=Path, default=None,
                     help="output image (default <run_dir>/trajectory.png)")
     ap.add_argument("--show", action="store_true", help="open a window too")
@@ -66,22 +70,18 @@ def main(argv=None) -> int:
 
     fig, ax = plt.subplots(figsize=(8, 9))
 
-    # Pool boundary + geofence (display frames match the GUI plot: the map
-    # frame's y is the horizontal axis, x the vertical one).
+    # Pool boundary (display frames match the GUI plot: the map frame's y is
+    # the horizontal axis, x the vertical one). A geofence rectangle used to
+    # be drawn here too; the fence was removed on 2026-08-14, and runs
+    # recorded before that still carry geofence_ned in map.json — it is no
+    # longer plotted, because a box on the picture reads as a limit and there
+    # is no limit any more.
     pool = meta.get("pool_ned")
     if pool:
         ax.add_patch(patches.Rectangle(
             (pool["y"][0], pool["x"][0]),
             pool["y"][1] - pool["y"][0], pool["x"][1] - pool["x"][0],
             fill=False, edgecolor="0.35", linewidth=1.8, label="pool"))
-    fence = meta.get("geofence_ned")
-    if fence:
-        ax.add_patch(patches.Rectangle(
-            (fence["y"][0], fence["x"][0]),
-            fence["y"][1] - fence["y"][0], fence["x"][1] - fence["x"][0],
-            fill=False, edgecolor="orange", linestyle="--", linewidth=0.9,
-            alpha=0.7, label="geofence"))
-
     # Tags: oriented green squares with ids — the old tagslam visualization.
     size = float(meta.get("tag_size_m", 0.17))
     used_any = set()

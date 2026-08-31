@@ -1,0 +1,20 @@
+# traj_plots.yaml — which pool runs become presentation figures.
+#
+#     ./c3 plots                  # this file
+#     ./c3 plots --list           # 뭘 그릴지만 먼저 본다
+#
+# 적을 것은 날짜뿐이다.
+#
+#     20260814          그 날 전부
+#     20260814_2120     그 런 폴더만
+#     20260823_195927   그 CSV 하나만
+#     all | latest
+#
+# 그림은 figures/trajectories/<날짜>/<날짜>_<런>_<컨트롤러>_<시분초>.png 로 떨어진다.
+# 선은 시간에 따라 밝음→어두움으로 물든다(파랑=기체, 주황=추적 물체). 나머지
+# 손잡이(축 박스, segment, error, object 필터, time_color, theme, ...)는 전부
+# 코드의 기본값이고 필요하면 여기에 키를 더하거나 CLI로 덮으면 된다 —
+# `./c3 plots --help`.
+
+dates:
+  - 20260824

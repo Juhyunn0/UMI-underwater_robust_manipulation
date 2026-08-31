@@ -26,6 +26,12 @@ Reading is non-blocking and drains everything pending, so this can be polled
 from the GUI thread's timer: it is a handful of 8-byte reads per tick, not a
 device transaction. No worker thread, no lock, no way for a wedged joystick to
 stall the UI — a disconnected device just returns nothing and the panel says so.
+
+Neither the axis numbers nor the button numbers mean anything on their own, and
+they are wrong in DIFFERENT ways: buttons are reordered by SDL (what the vehicle
+expects), and axes are renumbered by the kernel driver (USB vs Bluetooth are not
+the same pad as far as ``js0`` is concerned). Both are therefore asked for, not
+assumed — see the two numbered sections below.
 """
 
 from __future__ import annotations
@@ -103,9 +109,94 @@ HAT_AXIS_X, HAT_AXIS_Y = 6, 7
 HAT_TO_SDL = {"up": 11, "down": 12, "left": 13, "right": 14}
 HAT_THRESHOLD = 0.5
 
+# =============================================================================
+# Axis numbering: it changes with the CABLE
+# =============================================================================
+# The buttons above are reordered by SDL. The AXES are worse: the same physical
+# pad enumerates its axes differently depending on how it is connected, because
+# a different kernel driver is speaking.
+#
+#   over Bluetooth (hid-generic)  0,1 left stick   2,3 right stick  4,5 triggers
+#   over USB       (xpad)         0,1 left stick   3,4 right stick  2,5 triggers
+#
+# So a mapping pinned to axis NUMBERS is only correct for one transport. On
+# 2026-08-17 the pilot plugged the pad in and the right stick's horizontal —
+# yaw — started commanding HEAVE while yaw did nothing at all: heave was pinned
+# to axis 3 (which USB calls right-stick-X) and yaw to axis 2 (which USB calls
+# the LEFT TRIGGER, auto-zeroed at rest, hence dead).
+#
+# The kernel will simply tell us, so we ask instead of guessing. JSIOCGAXMAP
+# returns the ABS_* code behind every js axis index, and the codes are stable
+# across drivers even when the indices are not:
+#
+#   xpad (USB)      ABS_X ABS_Y ABS_Z  ABS_RX ABS_RY ABS_RZ  ABS_HAT0X/Y
+#                   Lx    Ly    LT     Rx     Ry     RT
+#   hid-generic(BT) ABS_X ABS_Y ABS_Z  ABS_RZ ...            ABS_HAT0X/Y
+#                   Lx    Ly    Rx     Ry
+#
+# The disambiguation is one rule: if the pad reports BOTH ABS_RX and ABS_RY
+# they are the right stick and Z/RZ are triggers; otherwise Z/RZ are the right
+# stick. Either way the right stick is found by name, not by number.
+ABS_X, ABS_Y, ABS_Z = 0x00, 0x01, 0x02
+ABS_RX, ABS_RY, ABS_RZ = 0x03, 0x04, 0x05
+ABS_HAT0X, ABS_HAT0Y = 0x10, 0x11
+ABS_CNT = 0x40
+
+# vehicle axis -> (stick, sign). The signs are the flying convention this panel
+# has always used: stick up is +surge / +heave (both sticks read negative up),
+# stick right is +sway / +yaw.
+AXIS_ROLES = {
+    "surge": ("left_y", -1.0),
+    "sway":  ("left_x", +1.0),
+    "yaw":   ("right_x", +1.0),
+    "heave": ("right_y", -1.0),
+}
+
+# What the numbers were before this was detected: the Bluetooth pad probed on
+# 2026-08-06. Used only when the ioctl fails, so an unreadable pad behaves
+# exactly as it did before rather than not at all.
+DEFAULT_STICKS = {"left_x": 0, "left_y": 1, "right_x": 2, "right_y": 3}
+
+# BTN_* code -> SDL_GameControllerButton. This is the same table as
+# XBOX_WIRELESS_JS_TO_SDL above, expressed in the kernel's stable BTN_* codes
+# instead of the driver's shifting indices — feeding the Bluetooth pad's own
+# btnmap through it reproduces that hand-measured table exactly, gaps included
+# (pinned by test_offline.py), and it also covers the USB pad, whose kernel
+# indices are packed 0..10 with no gaps at all.
+BTN_TO_SDL = {
+    0x130: 0,    # BTN_A
+    0x131: 1,    # BTN_B
+    0x133: 2,    # BTN_X
+    0x134: 3,    # BTN_Y
+    0x13a: 4,    # BTN_SELECT  -> BACK  (View)
+    0x13c: 5,    # BTN_MODE    -> GUIDE (Xbox)
+    0x13b: 6,    # BTN_START   -> START (Menu)
+    0x13d: 7,    # BTN_THUMBL
+    0x13e: 8,    # BTN_THUMBR
+    0x136: 9,    # BTN_TL      -> LEFTSHOULDER
+    0x137: 10,   # BTN_TR      -> RIGHTSHOULDER
+    0x220: 11,   # BTN_DPAD_UP
+    0x221: 12,   # BTN_DPAD_DOWN
+    0x222: 13,   # BTN_DPAD_LEFT
+    0x223: 14,   # BTN_DPAD_RIGHT
+}
+KEY_MAX, BTN_MISC = 0x2FF, 0x100
+
+
 # JSIOCGNAME(len): _IOC(_IOC_READ, 'j', 0x13, len)
 def _jsiocgname(length: int) -> int:
     return (2 << 30) | (length << 16) | (ord("j") << 8) | 0x13
+
+
+def _jsioc_read(nr: int, size: int) -> int:
+    """_IOC(_IOC_READ, 'j', nr, size) — JSIOCGAXES/AXMAP/BTNMAP."""
+    return (2 << 30) | (size << 16) | (ord("j") << 8) | nr
+
+
+def default_axis_spec(name: str) -> tuple[int, float]:
+    """(js index, sign) for a vehicle axis with no device to ask."""
+    stick, sign = AXIS_ROLES[name]
+    return DEFAULT_STICKS[stick], sign
 
 
 def devices() -> list[Path]:
@@ -116,6 +207,14 @@ def devices() -> list[Path]:
 class Joystick:
     """One device. Poll it; read :attr:`axes` and :attr:`buttons`."""
 
+    # Class-level fallbacks, so an instance whose probe failed — or one built
+    # without a device at all, as the tests do — behaves like the pad these
+    # numbers were measured on instead of raising.
+    sticks: dict[str, int] = dict(DEFAULT_STICKS)
+    hat_x, hat_y = HAT_AXIS_X, HAT_AXIS_Y
+    derived_map: dict[int, int] = {}
+    probed = False
+
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.fd = os.open(str(self.path), os.O_RDONLY | os.O_NONBLOCK)
@@ -125,6 +224,7 @@ class Joystick:
         self.buttons: dict[int, bool] = {}
         self.name = self._read_name()
         self.events = 0
+        self._probe()
 
     def _read_name(self) -> str:
         buf = array.array("B", [0] * 128)
@@ -133,6 +233,81 @@ class Joystick:
         except OSError:
             return self.path.name
         return buf.tobytes().split(b"\x00")[0].decode("utf-8", "replace") or self.path.name
+
+    # ------------------------------------------------------- what IS each axis
+    def _probe(self) -> None:
+        """Ask the driver what its axes and buttons actually ARE.
+
+        Everything here is per-instance and falls back to the class defaults, so
+        a driver that refuses the ioctls (or a pad behind an adapter) still
+        flies on the old hard-coded numbers rather than not at all.
+        """
+        axmap = self._axis_codes()
+        if axmap:
+            self.probed = True
+            self.sticks = self._sticks_from(axmap)
+            where = {code: i for i, code in enumerate(axmap)}
+            self.hat_x = where.get(ABS_HAT0X, HAT_AXIS_X)
+            self.hat_y = where.get(ABS_HAT0Y, HAT_AXIS_Y)
+        btnmap = self._button_codes()
+        if btnmap:
+            self.derived_map = {i: BTN_TO_SDL[code]
+                                for i, code in enumerate(btnmap)
+                                if code in BTN_TO_SDL}
+
+    def _axis_codes(self) -> list[int]:
+        """ABS_* code behind every js axis index, in index order."""
+        try:
+            n = array.array("B", [0])
+            fcntl.ioctl(self.fd, _jsioc_read(0x11, 1), n)      # JSIOCGAXES
+            buf = array.array("B", [0] * ABS_CNT)
+            fcntl.ioctl(self.fd, _jsioc_read(0x32, ABS_CNT), buf)  # JSIOCGAXMAP
+        except OSError:
+            return []
+        return list(buf[:min(n[0], ABS_CNT)])
+
+    def _button_codes(self) -> list[int]:
+        """BTN_* code behind every js button index, in index order."""
+        size = KEY_MAX - BTN_MISC + 1
+        try:
+            n = array.array("B", [0])
+            fcntl.ioctl(self.fd, _jsioc_read(0x12, 1), n)      # JSIOCGBUTTONS
+            buf = array.array("H", [0] * size)
+            fcntl.ioctl(self.fd, _jsioc_read(0x34, size * 2), buf)  # JSIOCGBTNMAP
+        except OSError:
+            return []
+        return list(buf[:min(n[0], size)])
+
+    @staticmethod
+    def _sticks_from(axmap: list[int]) -> dict[str, int]:
+        """Which js index is which physical stick half.
+
+        The one rule that separates the two Xbox layouts: a pad that reports
+        ABS_RX *and* ABS_RY has its right stick there and its triggers on
+        Z/RZ (xpad, USB); a pad that does not has its right stick on Z/RZ
+        (hid-generic, Bluetooth). Anything unrecognised keeps its default,
+        which is what the numbers used to be hard-coded to.
+        """
+        where = {code: i for i, code in enumerate(axmap)}
+        sticks = dict(DEFAULT_STICKS)
+        if ABS_X in where:
+            sticks["left_x"] = where[ABS_X]
+        if ABS_Y in where:
+            sticks["left_y"] = where[ABS_Y]
+        if ABS_RX in where and ABS_RY in where:
+            sticks["right_x"], sticks["right_y"] = where[ABS_RX], where[ABS_RY]
+        elif ABS_Z in where and ABS_RZ in where:
+            sticks["right_x"], sticks["right_y"] = where[ABS_Z], where[ABS_RZ]
+        return sticks
+
+    def axis_spec(self, name: str) -> tuple[int, float]:
+        """(js index, sign) for a VEHICLE axis — surge/sway/heave/yaw."""
+        stick, sign = AXIS_ROLES[name]
+        return self.sticks.get(stick, DEFAULT_STICKS[stick]), sign
+
+    def layout(self) -> dict[str, tuple[int, float]]:
+        """Every vehicle axis at once, for logging and for the window."""
+        return {name: self.axis_spec(name) for name in AXIS_ROLES}
 
     def poll(self) -> bool:
         """Drain pending events. True if anything changed, False if idle.
@@ -186,14 +361,20 @@ class Joystick:
     # ------------------------------------------------------- vehicle numbering
     @property
     def button_map(self) -> dict[int, int]:
-        """kernel index -> SDL index for this pad, or {} if we do not know it."""
-        return BUTTON_MAPS.get(self.name, {})
+        """kernel index -> SDL index for this pad, or {} if we do not know it.
+
+        Derived from the driver's own BTN_* map when it gave us one — that is
+        the only version that is right on BOTH transports, since the USB pad
+        packs its buttons 0..10 where the Bluetooth pad leaves gaps at 2/5/8/9.
+        The name table is the fallback for a driver that refuses the ioctl.
+        """
+        return self.derived_map or BUTTON_MAPS.get(self.name, {})
 
     def hat_buttons(self) -> set[int]:
         """The D-pad hat, as the four SDL buttons SDL would report."""
         out: set[int] = set()
-        x = self.raw.get(HAT_AXIS_X, 0.0)
-        y = self.raw.get(HAT_AXIS_Y, 0.0)
+        x = self.raw.get(self.hat_x, 0.0)
+        y = self.raw.get(self.hat_y, 0.0)
         if x <= -HAT_THRESHOLD:
             out.add(HAT_TO_SDL["left"])
         elif x >= HAT_THRESHOLD:
@@ -291,6 +472,21 @@ class JoystickReader:
     @property
     def has_map(self) -> bool:
         return bool(self.js is not None and self.js.button_map)
+
+    @property
+    def probed(self) -> bool:
+        """True when the driver told us what its axes are, rather than us guessing."""
+        return bool(self.js is not None and self.js.probed)
+
+    def axis_spec(self, name: str) -> tuple[int, float]:
+        """(js index, sign) for a vehicle axis, detected from the device."""
+        if self.js is None:
+            stick, sign = AXIS_ROLES[name]
+            return DEFAULT_STICKS[stick], sign
+        return self.js.axis_spec(name)
+
+    def layout(self) -> dict[str, tuple[int, float]]:
+        return {name: self.axis_spec(name) for name in AXIS_ROLES}
 
     def vehicle_buttons(self, translate: bool = True) -> set[int]:
         return self.js.vehicle_buttons(translate) if self.js is not None else set()

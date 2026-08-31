@@ -62,11 +62,26 @@ dark theme and a worker-per-task threading model.
 ### Launching
 
 ```bash
+./c3 gantry                           # 권장 — robust 인터프리터 + repo 루트 cwd를 잡아 준다
+./c3 gantry --mock                    # 하드웨어 없이 클릭해 볼 수 있는 시뮬레이션
+./c3 gantry --connect-test            # 컨트롤러가 닿는지만 확인, 모션 없음
+./c3 gantry --waypoints-csv <파일>    # 패널 없이 헤드리스 재생 (CLI로 넘어간다)
+```
+
+`./c3 gantry`는 인자가 없으면 패널, 있으면 `gantry_runner.py`의 CLI로 간다
+(`--mock`/`--mock-camera`/`--light`만 패널 전용이라 따로 라우팅된다). 직접 부르는
+길도 그대로 살아 있다:
+
+```bash
 python src/gantry_panel.py            # real controller
 python src/gantry_panel.py --mock     # in-process simulation, safe to click around
 python src/gantry_panel.py --light    # skip the dark theme
 python src/gantry_runner.py           # same as the first one (no-args dispatch)
 ```
+
+> **cwd가 중요하다.** `--trajectory-dir` 기본값이 cwd 상대 `Path("data")`이고,
+> 패널도 `Path("data")`를 직접 쓰며, 태그맵·캘리브 경로도 repo 상대다. `./c3`는
+> `cd $REPO`를 대신 해 준다.
 
 ### Optional dependencies
 
@@ -499,6 +514,22 @@ Columns `speed_mm_s` and `dwell_s` are optional (fall back to `--speed-mm-s`
 and 0 respectively). The validator refuses any waypoint outside the device
 soft limits (or your `--soft-limit-min-mm`/`--soft-limit-max-mm` overrides).
 
+함정 두 개:
+
+* **주석을 쓸 수 없다.** `_parse_waypoints_csv`가 `csv.DictReader`를 그냥 쓰기
+  때문에 `#`로 시작하는 줄도 데이터 행이 되고 `float()`이 터진다 —
+  `SystemExit: Bad waypoint row N`. 출처나 설명은 CSV가 아니라 이 문서에 남길 것.
+* **반복 플래그가 없다.** `--laps` 같은 건 없으므로 왕복 3회를 원하면 여섯 구간을
+  다 적어야 한다.
+
+그리고 **좌표계가 패널과 다르다.** CLI의 `x_mm`은 **절대 기계 프레임**이고
+(`mm_to_units`는 순수 스케일이다), 패널이 보여 주는 mm은 **사용자 프레임**이다
+(`user_mm_to_abs_mm` = `mm_user × axis_sign + home_offset`). 패널 표시값을 그대로
+CSV에 옮겨 적으면 home 오프셋만큼 어긋난 점을 지령하게 된다 — 실제 기록된 예로
+`home_reference_abs_mm.X = -1612.43 mm`
+(`data/20260528/20260528_212728_recording/run_metadata.json`). CSV에 넣을 절대
+좌표는 `./c3 gantry --connect-test`가 찍어 주는 현재 위치에서 읽을 것.
+
 ---
 
 ## Example commands
@@ -572,6 +603,114 @@ data/YYYYMMDD/YYYYMMDD_HHMMSS_fisheye_gantry/
   trajectory_plot.png
   frames/                   # only when --record-trajectory is set
 ```
+
+---
+
+## ROV와 나란히 운용 — 태그맵 프레임 위치 (`Tag map position`)
+
+ROV를 날리면서 갠트리로 타깃을 움직일 때, 갠트리 패널 왼쪽 아래 **Tag map
+position** 카드가 어안 카메라가 지금 **ROV와 같은 좌표계 어디에 있는지**를 10 Hz로
+보여 준다.
+
+```
+┌─ Tag map position ──────────────────────┐
+│  x +0.412 m   y -1.083 m   z -0.834 m   │
+│  tags 11  reproj 0.94 px  10.0 Hz       │
+│  ● locked (anchor 25 map frame)         │
+└─────────────────────────────────────────┘
+```
+
+### 왜 이게 "ROV와 같은 좌표계"인가
+
+`config/tag_map.yaml`(anchor 태그 25, 47개)은 **이 갠트리 리그가 2026-05-29에 만든
+지도**이고, ROV는 그 47개를 FROZEN으로 품은 `config/tag_map_full.yaml`에 대해
+자기 위치를 낸다. 같은 원점, 같은 축이다.
+
+그리고 리드아웃은 그 사실에 기대는 데 그치지 않고 **ROV가 쓰는 코드를 그대로
+쓴다** — `rov_gui/control/tagnav.py`의 `TagDetector` + `TagNav`. 재구현이 아니라
+같은 모듈이라, 코너 순서·태그 오브젝트 포인트·중복 ID 처리·`datum="map"`이 전부
+자동으로 일치한다. 프레임 동일성이 *검증할 것*이 아니라 *구성상의 성질*이 된다.
+`tagnav`는 stdlib+numpy만 import하므로(cv2/pupil_apriltags는 지연) gtsam도 torch도
+끌고 오지 않는다. 조립은 `src/gantry_map_pose.py`에 있다.
+
+### 왜 엔코더를 안 쓰나 — 쓰면 안 된다
+
+엔코더 XYZ를 `R_gantry_to_slam` / `gantry_to_slam_scale`로 지도에 올리는 길이
+있어 보이지만, **그 경로는 세 군데가 깨져 있다**(KNOWN_ISSUES 참조): `R`이 런별
+anchor(태그 67) 기준이라 태그 25 대비 **179.81° 틀렸고**,
+`gantry_anchor_offset_mm`(평행이동)은 YAML에 **아예 없으며**, scale 1.0357은
+축별로 다르다(0.9891 / 1.0465 / 1.0440). 셋 다 *엔코더* 프레임을 지도에 잇는
+물건이라, **카메라로 재면 셋 다 경로에서 빠진다.**
+
+그래서 이 카드는 **워크스페이스 맵과 합쳐 그리지 않는다.** 워크스페이스 맵은
+홈 기준 사용자 프레임 **밀리미터**, 이 카드는 anchor-25 지도 **미터**다. 원점도
+축도 단위도 다르고 둘은 아직 서로 등록돼 있지 않다 — 겹쳐 그리면 측정한 적 없는
+관계를 발명하는 셈이 된다.
+
+### 읽는 법
+
+| 상태 | 뜻 |
+|---|---|
+| `● locked (anchor 25 map frame)` | 정상. 숫자는 **렌즈**의 지도 좌표 |
+| `● AMBIGUOUS (single-tag flip unresolved)` | 태그가 하나뿐이라 IPPE 플립을 못 가렸다. 갠트리엔 자세 힌트가 없어 중재자가 없다 — 태그가 둘 이상 보이게 옮길 것 |
+| `● CalibrationMismatch: …` | 카메라 해상도가 캘리브 해상도와 다르다. **조용히 틀린 숫자 대신 거부한 것** — 해상도를 1280×720으로 되돌리고 다시 연결 |
+| `● no tags in view` | 태그가 안 보인다. 마지막 위치는 유지되고 숫자가 지워지지는 않는다 |
+
+`z`는 태그면 위에서 **음수**다(지도가 NED-like, +z가 아래). 서베이 당시 카메라는
+0.807–0.869 m 위에 있었다(`data/20260528/20260528_202333_survey/camera_trajectory.csv`).
+
+### 숫자가 뜻하지 않는 것
+
+* **렌즈 위치이지 페이로드 위치가 아니다.** `T_gantry_camera`는 지금 단위행렬,
+  즉 "렌즈가 갠트리 툴포인트와 같은 점"이라는 **미측정 가정**이다. 리드아웃 자체는
+  엔코더를 안 쓰므로 영향이 없지만, 이 값을 "타깃이 어디 있나"로 쓰려면 렌즈→타깃
+  lever arm을 먼저 재야 한다.
+* **굴절 보정은 양쪽 다 꺼져 있다.** ROV의 C3는 공장 캘리브가 수중값이라 의도된
+  것이고, 갠트리 서베이는 마른 풀이었을 것으로 보이지만 **그날 물 상태가 어디에도
+  기록돼 있지 않다** — 서베이 카메라 높이(0.807–0.869 m)가 설정된 수면
+  0.8255 m(`config/config.yaml`)에 딱 걸쳐 있다. 지도 자체의 문제라 여기서 고칠 수
+  있는 것은 아니지만, 알고 있을 것.
+
+### 검증된 것
+
+오프라인 회귀(`src/tests/test_gantry_map_pose.py`)가 두 층으로 확인한다.
+**합성**: 지도 태그를 가상 카메라에 투영해 코너를 되먹이면 놓은 자세가 그대로
+복원된다(다중 태그 ~1 nm, 단일 태그 ~2 µm) — 프레임 규약 전체가 동시에 맞아야만
+성립한다. **실기록**: 2026-05-28 런 8개의 저장 프레임을 재생해 각 런의 궤적과
+비교하면 **p50 9–16 mm, p90 16–18 mm, 640 프레임 중 미해결 0**
+(측정 2026-08-23). 그 잔차는 리드아웃의 정확도가 **아니다** — 이쪽은 축소된
+JPEG에 cv2 joint solvePnP, 저쪽은 원해상도 라이브 프레임에 GTSAM iSAM2다. 서로
+다른 추정기가 5–20 mm로 고정된 지도 위에서 1 cm 안에 든다는 것은 조립이 맞다는
+뜻이지 센서가 그만큼 좋다는 뜻이 아니다.
+
+### 런북 — 창 두 개
+
+갠트리와 스테이션은 **별도 프로세스**다. 임베드하지 않은 이유 셋(각각 단독으로
+충분): ① `libFMC4030-Lib.so`가 프로세스 전역 `DeviceManager`를 두고 내부 뮤텍스가
+없어 **프로세스당 연결 1개**가 라이브러리의 계약이다, ② 패널은 `robust`(pyqtgraph,
+qdarkstyle), 스테이션은 `rovgui-pose`(torch, numpy 2)라 **env가 다르다**,
+③ 갠트리 프로세스의 Ctrl-C가 자기 SIGINT 핸들러로 들어가 세 축에
+`stop_axis(mode=2)`를 때린다 — **독립된 비상정지**.
+
+```bash
+# 열기 전 — 아무것도 움직이지 않는 점검
+./c3 env                    # 인터프리터 둘 + 갠트리 .so 존재
+./c3 preflight              # ROV 쪽만 본다 (갠트리는 안 본다)
+./c3 gantry --connect-test  # 갠트리: 펌웨어 + 소프트리밋 + 현재 절대 위치
+
+# 터미널 1 (화면 왼쪽) — 갠트리
+./c3 gantry                 # 카메라 연결하면 Tag map position 카드가 산다
+
+# 터미널 2 (오른쪽) — 스테이션
+./c3 gui --pose --mpc
+```
+
+네트워크는 안 겹친다: 갠트리 `192.168.0.30:8088`(wlan), C3/ROV
+`192.168.2.x`(테더). 창은 갠트리 최소 1200×700, 스테이션 최소 986×763이라
+2560 폭이면 나란히 들어간다.
+
+**헤드리스 재생을 쓸 거면 패널을 먼저 닫는다** — 패널이 `.so`가 허용하는 유일한
+연결을 쥐고 있어서, 열어 둔 채 CLI를 돌리면 `addDevice`가 −5로 거절한다.
 
 ---
 
@@ -1063,6 +1202,12 @@ dashboard after `--write` to see the gantry GT and camera curves overlap.
 * Acceleration column in `gantry_telemetry.csv` is a 5-sample SMA-smoothed  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
   central finite difference of velocity — the FMC4030 has no acceleration
   readout. Treat it as a smoothed estimate, not a sensor value.
+* **Hold-to-jog는 거리 제한이 없다.** `_start_jog`가 `999999` units을 상대 이동으로
+  던지는데, X는 8.25 mm/unit이라 **약 8.25 km**다. 멈추는 것은 버튼 release 하나뿐이고
+  발행과 정지가 **둘 다 GUI 스레드에서 동기 실행**되므로, release 시그널이 삼켜지거나
+  이벤트 루프가 멈추면 축은 펌웨어 소프트리밋이나 물리 리밋스위치까지 간다.
+  → **운용 규칙: ROV가 갠트리 아래 있는 동안에는 조그 대신 waypoint CSV를 쓴다.**
+  조그가 필요하면 짧게 끊어 누를 것. (미수정, KNOWN_ISSUES에 항목 있음.)
 
 
 <!-- MEASUREMENT AUDIT (2026-08-04): the following numbers appear inside code

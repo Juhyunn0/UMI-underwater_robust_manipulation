@@ -40,9 +40,13 @@ from pathlib import Path
 
 import numpy as np
 
+from . import runstore
 from .qt import QImage, QObject, QTimer, Signal, import_cv2
 
-DEFAULT_DIR = Path("sessions/ui_recordings")
+# The BASE of the dated tree, not the folder written to: both recorders ask
+# runstore.run_dir() at start() so their files land in the same minute folder
+# as the nav recording and the controller CSV of the same run.
+DEFAULT_DIR = runstore.DEFAULT_BASE
 
 
 @dataclass
@@ -55,6 +59,7 @@ class RecStats:
     size: tuple[int, int] = (0, 0)
     fps: float = 0.0
     error: str = ""
+    name: str = ""            # the operator's label for this recording, if any
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
@@ -125,9 +130,10 @@ class StreamRecorder(QObject):
         # write what actually happened into the sidecar, so anything timed off
         # the file can be corrected rather than silently wrong.
         fps = float(max(5.0, min(60.0, fps or 15.0)))
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        path = Path(path) if path else self.out_dir / f"{self.name}_{stamp}.mp4"
+        path = (Path(path) if path else
+                runstore.run_dir(self.out_dir)
+                / f"{self.name}_{runstore.stamp()}.mp4")
+        path.parent.mkdir(parents=True, exist_ok=True)
         self.stats = RecStats(recording=True, path=path,
                               started_at=time.monotonic(), fps=fps)
         self._q = queue.Queue(maxsize=self._q.maxsize)
@@ -212,11 +218,20 @@ class ScreenRecorder(QObject):
         self._timer.timeout.connect(self._grab)
 
     # ------------------------------------------------------------- lifecycle
-    def toggle(self) -> bool:
-        self.stop() if self.stats.recording else self.start()
+    def toggle(self, name: str = "") -> bool:
+        self.stop() if self.stats.recording else self.start(name=name)
         return self.stats.recording
 
-    def start(self, path: Path | None = None) -> Path | None:
+    def start(self, path: Path | None = None, name: str = "") -> Path | None:
+        """Open a recording. ``name`` is the operator's own label for this run
+        (header field in window.py): it becomes ``ui_<stamp>_<name>.mp4``, and
+        an empty one leaves the plain ``ui_<stamp>.mp4`` naming untouched.
+
+        Sanitised through :func:`runstore.slug`, because this string is typed
+        during a session and arrives with spaces, slashes and dots in it — and
+        a dot would make ``with_suffix('.json')`` overwrite part of the name
+        instead of adding the sidecar.
+        """
         if self.stats.recording:
             return self.stats.path
         cv2 = import_cv2()
@@ -230,9 +245,12 @@ class ScreenRecorder(QObject):
             self.stats.error = f"widget is {w}x{h}, too small to record"
             return None
 
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        path = Path(path) if path else self.out_dir / f"ui_{stamp}.mp4"
+        if path is None:
+            tag = runstore.slug(name)
+            path = (runstore.run_dir(self.out_dir)
+                    / f"ui_{runstore.stamp()}{'_' + tag if tag else ''}.mp4")
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
         writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"),
                                  self.fps, (w, h))
         if not writer.isOpened():
@@ -240,7 +258,8 @@ class ScreenRecorder(QObject):
             return None
 
         self.stats = RecStats(recording=True, path=path, started_at=time.monotonic(),
-                              size=(w, h), fps=self.fps)
+                              size=(w, h), fps=self.fps,
+                              name=str(name or "").strip())
         self._q = queue.Queue(maxsize=self._q.maxsize)
         self._thread = threading.Thread(target=self._encode, args=(writer, cv2, w, h),
                                         name="ui-encoder", daemon=True)
@@ -314,6 +333,11 @@ def _write_sidecar(stats: RecStats, source: str) -> None:
         return
     meta = {
         "file": stats.path.name,
+        # What the operator called this run. In the sidecar as well as the
+        # filename because a slug loses characters (spaces, punctuation) and
+        # the JSON can keep them — but only the SLUG went into the name, so
+        # the two are recorded separately rather than one standing for both.
+        "name": stats.name or None,
         "requested_fps": stats.fps,
         "frames_written": stats.frames,
         "frames_dropped": stats.dropped,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """build_tag_map.py — grow the surveyed tag map over a whole mat, from one pass.
 
-    python -m rov_gui.tools.build_tag_map sessions/nav_runs/<stamp> \
+    python -m rov_gui.tools.build_tag_map <run folder>/nav_<hhmmss> \
         --anchor config/tag_map.yaml -o config/tag_map_full.yaml
 
 WHAT IT DOES, and why it cannot drift
@@ -358,7 +358,9 @@ def refine(frames, known, frozen_ids, obj_tag, args, log=print):
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("run_dir", type=Path, help="sessions/nav_runs/<stamp>/")
+    ap.add_argument("run_dir", type=Path,
+                    help="a nav_<hhmmss>/ folder inside a run folder "
+                         "(or sessions/nav_runs/<stamp>/ for pre-2026-08-14 runs)")
     ap.add_argument("--anchor", type=Path, default=Path("config/tag_map.yaml"),
                     help="the surveyed map to grow from (stays frozen)")
     ap.add_argument("-o", "--out", type=Path,

@@ -19,11 +19,22 @@ Two measured caveats the dataset must disclose
    "IMU calibration data is not available on device yet." The factory calibration
    covers the cameras only, so T_imu_cam is unknown and a consumer must either
    calibrate it (Kalibr) or measure it mechanically.
-2. **The accelerometer scale is off.** Static magnitude measured 11.82 m/s^2 where
-   gravity is 9.81 — about 20% high — on both the raw and the calibrated report,
-   with the accuracy flag reading UNRELIABLE/MEDIUM. So the raw numbers need an
-   intrinsic calibration before use. We record the accuracy flag on every sample
-   so this is visible rather than hidden.
+2. **The accelerometer needs an intrinsic calibration** — but NOT the one this
+   file used to describe. Static magnitude measured 11.82 m/s^2 against gravity
+   9.81, accuracy flag UNRELIABLE/MEDIUM, and that was recorded here as "about
+   20% high", i.e. a SCALE error. **2026-08-17: that was a misreading.** It was
+   one attitude. Over a six-attitude tumble the scale comes out within 0.9% of
+   unity and the real defect is a **1.80 m/s^2 (0.184 g) BIAS, almost entirely
+   on IMU x** — which in the upright pose lies nearly along gravity and so adds
+   straight onto it. Raw |a| across attitudes runs 8.37-11.69; corrected,
+   9.806 +/- 0.050.
+   [측정: sessions/low_level_controller_data/20260817/0817_101511 + _100139,
+   21985 still samples, 6 attitudes; config/c3_imu_calib.json sha1 7081ff43]
+   The distinction is not academic: a constant body-frame bias is removed
+   completely by a static correction taken at any attitude, whereas a scale
+   error keeps leaking as the attitude changes. Fit it with
+   ``python -m rov_gui.tools.calib_c3_imu <jsonl> --fit accel``.
+   We record the accuracy flag on every sample so this stays visible.
 
 Both are written into the dataset metadata, because a VIO result built on
 uncalibrated IMU intrinsics and a guessed extrinsic fails in ways that look like

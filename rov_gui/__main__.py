@@ -145,15 +145,49 @@ def build_parser() -> argparse.ArgumentParser:
                         "2026-08-06: default 2-3 Hz; request 50 -> 62, 100 -> "
                         "125, 200 -> 208, and 400 or 1000 -> still 208. ~208 Hz "
                         "is the ceiling, and costs about 0.2 Mbit/s.")
-    g.add_argument("--c3-imu-rate", type=int, default=500,
+    g.add_argument("--c3-imu-rate", type=int, default=200,
                    help="rate to ask the C3's BNO086 for (default: %(default)s "
-                        "Hz). Accelerometer+gyroscope only reach ~486 Hz "
-                        "measured (c3_camera/config.py); asking for more does "
-                        "not raise it. Enabling the fused ROTATION_VECTOR or the "
-                        "magnetometer collapses EVERY IMU stream to ~40 Hz, "
-                        "which is why this station streams accel+gyro alone.")
+                        "Hz). Asking for MORE gets less: 200 requested measured "
+                        "194 Hz standalone (c3_camera/pipeline.py:67) while 500 "
+                        "requested measured 234.9 Hz in this station "
+                        "(sessions/ui_recordings/c3_depth_20260809_202409_"
+                        "c3_imu.json) — the extra request costs throughput "
+                        "instead of buying it, which is why the default moved "
+                        "500 -> 200 on 2026-08-17. Only accel+gyro are "
+                        "streamed. (An earlier version of this help said "
+                        "ROTATION_VECTOR collapses every stream to ~40 Hz; the "
+                        "measured table in pipeline.py:71 says there is no "
+                        "penalty at an EQUAL rate — it is the magnetometer, and "
+                        "a rotation vector requested SLOWER than accel/gyro, "
+                        "that drag the rest down.)")
     g.add_argument("--no-c3-imu", dest="c3_imu", action="store_false",
                    help="do not stream the C3's IMU at all")
+    g.add_argument("--imu-dr", choices=("off", "shadow", "control"),
+                   default=None,
+                   help="IMU dead reckoning: integrate the C3's BNO086 on its "
+                        "own from the end of the mission settle and draw the "
+                        "result beside the AprilTag pose, which plays ground "
+                        "truth. 'shadow' leaves the controller on the tag "
+                        "state; 'control' makes the controller fly on the "
+                        "ESTIMATE and needs --imu-dr-control as well. Overrides "
+                        "hw_mpc.yaml imu_dr.enabled/mode.")
+    g.add_argument("--imu-dr-attitude", choices=("gyro", "ahrs", "vehicle"),
+                   default=None,
+                   help="how the dead reckoner gets roll/pitch/yaw. 'ahrs' "
+                        "(the config default) integrates the gyro and levels "
+                        "roll/pitch against gravity, yaw gyro-only; 'gyro' is "
+                        "pure integration; 'vehicle' borrows roll/pitch from "
+                        "the autopilot to isolate position-only error.")
+    g.add_argument("--imu-dr-control", action="store_true",
+                   help="arm the closed loop when hw_mpc.yaml already says "
+                        "imu_dr.mode: control. NOT needed alongside "
+                        "`--imu-dr control`, which is explicit on its own — "
+                        "this exists so a config file left in that state "
+                        "cannot arm a closed loop on dead reckoning with "
+                        "nobody asking for it. Either way, know what it "
+                        "means: the controller drives the vehicle toward "
+                        "where the IMU thinks it is, and this station has no "
+                        "geofence, so the pilot's E-STOP is the stop.")
     g.add_argument("--battery-capacity-mah", type=float, default=0.0,
                    help="pack capacity in mAh, e.g. 18000 for the BlueROV2 "
                         "stock Li-ion (default: %(default)s = unknown). Given "
@@ -293,19 +327,18 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--js-scale", type=float, default=1.0,
                    help="multiplier on every stick axis, applied before the "
                         "panel's OUTPUT slider (default: %(default)s)")
-    # Defaults are an Xbox-style pad on the Linux js API. Negative = inverted,
-    # which is what the vertical sticks need (up reads negative). The teleop
-    # panel prints live axis and button numbers, so remapping is a matter of
-    # moving the stick and reading the line.
-    # Probed on this desktop 2026-08-06 with an "Xbox Wireless Controller":
-    #   0,1 left stick   2,3 right stick   4,5 TRIGGERS (rest at -1)   6,7 d-pad
-    # Triggers are auto-zeroed anyway (see joystick.py), but pointing an axis at
-    # one by default would still give the pilot half a control surface.
-    for axis, default in (("surge", -1), ("sway", 0), ("yaw", 2), ("heave", -3)):
-        g.add_argument(f"--js-axis-{axis}", type=int, default=default,
-                       help=f"axis number driving {axis}; negative inverts "
-                            f"(default: %(default)s). 0 cannot be inverted — use "
-                            f"--js-invert-{axis} for axis 0.")
+    # These DEFAULT TO THE DEVICE, not to a number, and that is deliberate: the
+    # same Xbox pad enumerates its axes one way over Bluetooth (2,3 = right
+    # stick) and another over USB (3,4 = right stick, 2 = left trigger), so a
+    # number baked in here is correct for one cable and silently wrong for the
+    # other. Pinned numbers on 2026-08-17 sent the yaw stick to HEAVE and left
+    # yaw on a trigger. joystick.py asks the driver instead (JSIOCGAXMAP), and
+    # the startup log prints what it found. Pass a number to override.
+    for axis in ("surge", "sway", "yaw", "heave"):
+        g.add_argument(f"--js-axis-{axis}", type=int, default=None,
+                       help=f"pin the axis number driving {axis}; negative "
+                            f"inverts. Default is auto-detected from the pad. "
+                            f"0 cannot be inverted — use --js-invert-{axis}.")
     for axis in ("surge", "sway", "yaw", "heave"):
         g.add_argument(f"--js-invert-{axis}", action="store_true",
                        help=f"invert {axis}, for when the axis number is 0")
@@ -408,10 +441,69 @@ def build_parser() -> argparse.ArgumentParser:
                         "80 deg, 87 mm at 100 and 283 mm at 120 — it does not "
                         "degrade, it falls off a cliff. Raising this does not "
                         "buy more coverage, it buys a wrong mesh.")
+    g.add_argument("--depth-scale", type=float, default=0.64, metavar="K",
+                   help="multiply the C3 depth stream's millimetres by this, "
+                        "at the source, before ANY consumer (panel probe, "
+                        "reference capture, FoundationPose, depth-vs-MAP). "
+                        "Interim correction for the stereo depth reading LONG "
+                        "in water: measured 2026-08-23, mesh 187 mm from a "
+                        "caliper-measured 119.73 mm object (1.56x) and "
+                        "depth-vs-MAP 1.71x over the mat, while colour PnP "
+                        "was mm-accurate. ON BY DEFAULT (%(default)s = 1/1.56) "
+                        "since 2026-08-24: it used to default to 1.0 and "
+                        "forgetting it was silent — the 10:11 and 10:19 runs "
+                        "that day placed the object 1.55-1.57x down the camera "
+                        "ray, two tag rows past the object and half a metre "
+                        "UNDER the mat, with nothing in the log saying the "
+                        "correction was off. Read depth-vs-MAP to confirm: "
+                        "~1.0x means it holds. Pass 1.0 to disable — which is "
+                        "what an IN-AIR bench test wants, since this factor is "
+                        "the in-water one. NOTE a mesh bakes in whatever scale "
+                        "was in force when its reference views were captured, "
+                        "so changing this invalidates existing meshes: turn it "
+                        "on FIRST, then re-capture, then fly. The real fix is "
+                        "an in-water stereo recalibration.")
+    g.add_argument("--pose-object-size", type=float, default=None,
+                   metavar="MM",
+                   help="the object's LONGEST dimension, measured with a "
+                        "tape. Used to CHECK a reconstruction the moment it is "
+                        "built, never to rescale it: this path reconstructs "
+                        "from metric RGB-D, so the mesh already has a size and "
+                        "scaling it uniformly would shrink the dimensions that "
+                        "are right to fix the one that is wrong. Eight "
+                        "reconstructions of one object on 2026-08-23 kept the "
+                        "same ~100 x 170 mm cross-section and grew only in "
+                        "LENGTH, 171 -> 470 mm, in step with the vertex count "
+                        "— a mask swallowing floor and shadow, not a scale "
+                        "error. The only symptom downstream is FoundationPose "
+                        "failing to hold a pose hours later, so this catches "
+                        "it at the build. OPTIONAL since 2026-08-24: without "
+                        "it the same failure is caught automatically against "
+                        "the largest silhouette the reference views observed "
+                        "(a tape-free metric bound), and a mesh past either "
+                        "limit is REFUSED, not just warned about. Give the "
+                        "tape number when you have it — it is the stricter "
+                        "check. Ignored with --pose-mesh.")
     g.add_argument("--pose-max-views", type=int, default=20, metavar="N",
                    help="reference-view budget (default: %(default)s). Under "
                         "6 the station refuses to reconstruct; 10+ is "
                         "recommended; the reference implementation uses 16.")
+    g.add_argument("--pose-lost-timeout", type=float, default=15.0,
+                   metavar="S",
+                   help="how long the tracker keeps trying to REACQUIRE an "
+                        "object it lost before giving up and asking for "
+                        "another click (default: %(default)s). Underwater, "
+                        "motion blur and a moving hull lose the mask far more "
+                        "often than a bench does — raise this if the run is "
+                        "ending in 'could not reacquire' rather than in a "
+                        "finished reconstruction. Costs nothing but patience: "
+                        "while it is reacquiring nothing is recorded and "
+                        "nothing is thrown away.")
+    g.add_argument("--pose-lost-grace", type=float, default=3.0, metavar="S",
+                   help="how long a lost mask is tolerated before the overlay "
+                        "calls it lost at all (default: %(default)s). Raising "
+                        "it hides brief dropouts instead of surviving long "
+                        "ones — --pose-lost-timeout is the knob for that.")
     g.add_argument("--pose-box3d", action="store_true",
                    help="draw the full 12-edge oriented box instead of the "
                         "three axes only")
@@ -442,13 +534,25 @@ def build_parser() -> argparse.ArgumentParser:
                         "the pool wall, forward-level camera, crab square; "
                         "'floor' = the surveyed floor map, camera remounted "
                         "DOWN (needs a re-measured extrinsic in hw_nav.yaml)")
-    g.add_argument("--mpc-mode", default=None, choices=("mpc", "dobmpc"),
-                   help="override hw_mpc.yaml mode (same solver either way; "
-                        "dobmpc adds the EAOB disturbance feedforward)")
+    g.add_argument("--mpc-mode", default=None,
+                   choices=("mpc", "dobmpc", "mpc_tuned", "dobmpc_tuned",
+                            "pid"),
+                   help="override hw_mpc.yaml mode. One solver serves all "
+                        "four MPC names: the 'dob' prefix adds the EAOB "
+                        "disturbance feedforward, the '_tuned' suffix splits "
+                        "the position cost into along-track (cheap) and "
+                        "cross-track (expensive) in the path frame "
+                        "(hw_mpc.yaml mpc_tuned:)")
     g.add_argument("--rov-model", default=None,
                    choices=("heavy", "heavy_c3", "heavy_gripper"),
                    help="override hw_mpc.yaml rov_model (which dobmpc plant "
                         "parameters the controller carries)")
+    g.add_argument("--replay-session", default=None, metavar="DIR",
+                   help="override hw_mpc.yaml replay.session: the demo folder "
+                        "the `replay` mission shape re-flies (must hold "
+                        "poses.npy from `python -m umi_handheld."
+                        "extract_pose`). Speed cap, blend and the gripper "
+                        "switch stay in the replay: block.")
 
     g = p.add_argument_group("ui")
     g.add_argument("--ui-fps", type=float, default=60.0,
@@ -456,10 +560,31 @@ def build_parser() -> argparse.ArgumentParser:
                         "display latency: at 30 Hz a frame waits up to 33 ms "
                         "for the next paint, on top of the camera's own 34 ms.")
     g.add_argument("--fullscreen", action="store_true")
-    g.add_argument("--rec-dir", default="sessions/ui_recordings",
-                   help="where UI screen recordings go (default: %(default)s)")
+    g.add_argument("--rec-dir", default="sessions/low_level_controller_data",
+                   help="ROOT of the dated run tree (default: %(default)s). "
+                        "Everything one run produces — the UI recording, the "
+                        "feed recordings, the nav recording, the controller "
+                        "CSV and events.log — lands together in "
+                        "<rec-dir>/YYYYMMDD/MMDD_HHMMSS/. See "
+                        "rov_gui/runstore.py.")
     g.add_argument("--rec-fps", type=float, default=12.0,
                    help="UI recording frame rate (default: %(default)s)")
+    g.add_argument("--demo-object", default="still",
+                   choices=("still", "drift", "orbit"),
+                   help="--source demo --pose --mpc only: how the SYNTHETIC "
+                        "tracked object behaves in the pool frame. still = "
+                        "sits there (arming a follow must not move the "
+                        "vehicle); drift = translates slowly (the "
+                        "feedforward case); orbit = rotates in place (the "
+                        "orbit case, and the one a wrong object_nav.yaw_axis "
+                        "shows up in fastest). Default: %(default)s.")
+    g.add_argument("--demo-leak-after", type=float, default=None,
+                   metavar="S",
+                   help="--source demo only: fake a flooding enclosure S "
+                        "seconds in, so the LEAK banner and sensor row can be "
+                        "seen before anyone has to trust them. Has no effect "
+                        "on hardware, where leak comes from ArduSub's "
+                        "\"Leak Detected\" STATUSTEXT and nothing else.")
 
     g = p.add_argument_group("preflight (hardware source only)")
     g.add_argument("--no-preflight", action="store_true",

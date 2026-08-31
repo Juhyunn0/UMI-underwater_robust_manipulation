@@ -1,0 +1,119 @@
+{
+ "source_c3_jsonl": [
+  "sessions/low_level_controller_data/20260817/0817_102759/c3_depth_20260817_102759_c3_imu.jsonl"
+ ],
+ "cam_tilt_deg_at_fit": 40.0,
+ "accel": {
+  "model": "diag",
+  "samples": 21985,
+  "rejected_moving": 16995,
+  "gate": {
+   "gyro_max_rad_s": 0.05,
+   "accel_sd_max_m_s2": 0.1
+  },
+  "bins": 11,
+  "residual_rms_before": 1.2347249459825445,
+  "axis_coverage": {
+   "+x": 3262,
+   "-x": 1175,
+   "+y": 1091,
+   "-y": 2149,
+   "+z": 1810,
+   "-z": 12498
+  },
+  "coverage_frame": "body FRD (R_frd_imu applied)",
+  "note": "only 11/64 sphere bins, but all six half-axes are covered, which is what a diagonal scale+bias needs",
+  "null_gap": 0.05827339045935059,
+  "cond": 298.13602534487984,
+  "residual_rms_after": 0.05030849529226969,
+  "scale": [
+   1.001300454268809,
+   1.0071219001228444,
+   1.0091731671880733
+  ],
+  "bias": [
+   1.8029775449671217,
+   0.0068971708764166625,
+   -0.06433495992756928
+  ],
+  "mean_magnitude_before": 10.630463891769109,
+  "takes": 2
+ },
+ "R_fit": {
+  "method": "kabsch on angular velocity",
+  "lag_ms": 60.00000000000094,
+  "lag_correlation": 0.9927777319511406,
+  "rate_hz": 100.0,
+  "samples": 9921,
+  "singular_values": [
+   25280.90100507038,
+   11672.37970492493,
+   10840.246938855542
+  ],
+  "rms_deg": 6.200103720606105,
+  "R_frd_imu": [
+   [
+    0.6590143373988091,
+    -0.03258806974414856,
+    -0.751424061907229
+   ],
+   [
+    -0.009550904590858998,
+    -0.9993429483200154,
+    0.034963579115350626
+   ],
+   [
+    -0.752069733019688,
+    -0.01586472040124197,
+    -0.6588925764662139
+   ]
+  ],
+  "nearest_axis_permutation_deg": 41.28660856552827,
+  "repeatability": {
+   "independent_takes": 2,
+   "sources": [
+    "c3_depth_20260817_094733 (09:47 wiggle)",
+    "c3_depth_20260817_102759 (10:27 wiggle)"
+   ],
+   "angle_between_fits_deg": 0.81,
+   "note": "This, not R_fit.rms_deg, is the evidence for how accurate R_frd_imu is. The rms_deg residual (6-8 deg) is the noise floor of comparing the C3's RAW gyro against ArduSub's FILTERED ATTITUDE rates - different filters, different phase, MAVLink arrival jitter - and it does not shrink with a better wiggle. Two independent takes agreeing to 0.81 deg is what says the rotation itself is solid."
+  }
+ },
+ "R_frd_imu": [
+  [
+   0.6590143373988091,
+   -0.03258806974414856,
+   -0.751424061907229
+  ],
+  [
+   -0.009550904590858998,
+   -0.9993429483200154,
+   0.034963579115350626
+  ],
+  [
+   -0.752069733019688,
+   -0.01586472040124197,
+   -0.6588925764662139
+  ]
+ ],
+ "gravity_check": {
+  "still_samples": 7415,
+  "reference": "autopilot ATTITUDE",
+  "still_attitude_deg": [
+   -1.6992740871957286,
+   4.212346228907683
+  ],
+  "mean_body_accel": [
+   1.5252935653763666,
+   0.20427328942449594,
+   -11.076466790561598
+  ],
+  "expected_body_accel": [
+   0.7203288341668913,
+   0.2900167290055391,
+   -9.775858064132514
+  ],
+  "angle_from_expected_deg": 3.6828580739183745
+ },
+ "schema": 1
+}

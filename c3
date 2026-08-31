@@ -5,6 +5,8 @@
 #     ./c3 collect --profile research_near
 #     ./c3 collect --profile research_near --dry-run
 #     ./c3 discover --probe
+#     ./c3 gantry                   # FMC4030 gantry panel (jog, move, tag-map position)
+#     ./c3 gantry --connect-test    # is the controller reachable? (no motion)
 #     ./c3 test                     # the no-camera regression suite
 #     ./c3 env                      # which interpreter, which versions
 #
@@ -55,6 +57,20 @@
 #
 # If rovgui-pose is absent the GUI falls back to the normal interpreter and runs
 # fine WITHOUT --pose; it says so rather than failing.
+#
+# `./c3 gantry` stays on `robust` and is a SEPARATE PROCESS from `./c3 gui` on
+# purpose. Two independent reasons, either sufficient on its own:
+#   1. libFMC4030-Lib.so keeps ONE process-global DeviceManager and has no
+#      internal mutex — a second registration of the same id returns -4, of the
+#      same ip:port -5, and every python call site wraps its own RLock. One
+#      connection per process is the library's contract, not our convention.
+#   2. The panel's optional deps (pyqtgraph, qdarkstyle, qtawesome) live in
+#      `robust`; the station needs `rovgui-pose` (torch, numpy 2.x). Two
+#      processes means neither env has to grow toward the other.
+# Nothing collides at run time either: the gantry is 192.168.0.30:8088 over
+# wlan, the C3 and the ROV are 192.168.2.x over the tether, and a Ctrl-C in the
+# gantry process reaches its own SIGINT handler (stop_axis(mode=2) on all three
+# axes) instead of being one more thing the station has to survive.
 #
 # `robust` is first as of 2026-08-06, when it was moved from python 3.14.4 to
 # 3.12.13. That is not a cosmetic version bump: on 3.14 there is no numpy 1.26
@@ -117,6 +133,8 @@ tools:
   extract-rgb      pull RGB frames out of an encoded capture
   madrona          start/stop the RPi video service
   gui              topside control-station dashboard    (python -m rov_gui)
+  plots            trajectory figures from a run date   (rov_gui/tools/plot_runs.py)
+  gantry           FMC4030 gantry: panel (no args) or CLI (src/gantry_runner.py)
   test             run every no-camera test file
   env              print the interpreter and versions this wrapper resolved
   <module>         any other c3_camera module name, passed through
@@ -157,6 +175,34 @@ case "$tool" in
     cd "$REPO"
     exec "$GUI_PY" -m rov_gui "$@"
     ;;
+  plots)
+    # Offline replotting of the run folders. Unlike `gui` this needs NO Qt and
+    # no depthai — matplotlib + numpy + yaml only — so it stays on $PY (robust),
+    # and the cd matters as much as ever: the config, the tag map and the
+    # session tree are all repo-relative.
+    cd "$REPO"
+    exec "$PY" -m rov_gui.tools.plot_runs "$@"
+    ;;
+  gantry)
+    # No args -> gantry_runner.py dispatches to the PyQt5 panel itself
+    # (gantry_runner.py, end of main()). Any other flag -> its headless CLI
+    # (--waypoints-csv / --connect-test / --dry-run / ...), which installs a
+    # SIGINT handler that calls stop_axis(mode=2) on every axis. That is a real
+    # emergency stop, and only a standalone process can have one.
+    #
+    # --mock / --mock-camera / --light are PANEL-only flags: they live in
+    # gantry_panel.parse_args, not in gantry_runner.build_argparser, which
+    # would argparse-error on them. So those three route straight to the panel.
+    #
+    # The cd is load-bearing three times over: --trajectory-dir defaults to the
+    # cwd-relative Path("data"), the panel writes Path("data") directly, and the
+    # tag map / fisheye calibration it reads are repo-relative.
+    cd "$REPO"
+    case "${1:-}" in
+      --mock|--mock-camera|--light) exec "$PY" src/gantry_panel.py  "$@" ;;
+      *)                            exec "$PY" src/gantry_runner.py "$@" ;;
+    esac
+    ;;
   env)
     cd "$REPO"
     echo "interpreter : $PY"
@@ -169,6 +215,16 @@ case "$tool" in
       echo "gui         : $PY  (rovgui-pose absent — --pose unavailable)"
     fi
     echo "repo        : $REPO"
+    # The FMC4030 SDK is vendored but gitignored (.gitignore: vendor/), so it
+    # exists on the machine that unpacked it and nowhere else. Its absence is
+    # the most likely "it worked yesterday" for ./c3 gantry, so say so here
+    # rather than letting the panel fail at Connect.
+    GANTRY_SO="$REPO/src/gantry/vendor/ubuntu/lib/64/libFMC4030-Lib.so"
+    if [[ -f "$GANTRY_SO" ]]; then
+      echo "gantry lib  : $GANTRY_SO"
+    else
+      echo "gantry lib  : MISSING — ./c3 gantry cannot connect (vendor/ is gitignored)"
+    fi
     "$PY" - <<'PY'
 import sys
 print(f"python      : {sys.version.split()[0]}")
@@ -201,6 +257,15 @@ PY
     for t in c3_camera/tests/test_*.py; do
       echo "== $t"
       "$PY" "$t" || rc=1
+    done
+    # src/tests are the gantry-side no-camera tests. They import gantry_panel,
+    # which imports PyQt5 and builds widgets, so they need a platform plugin —
+    # offscreen, because this must run over ssh and in a headless shell too.
+    # (rov_gui/tests stays out: it is run on its own, see rov_gui/README.md.)
+    for t in src/tests/test_*.py; do
+      [[ -e "$t" ]] || continue
+      echo "== $t"
+      QT_QPA_PLATFORM=offscreen "$PY" "$t" || rc=1
     done
     exit $rc
     ;;

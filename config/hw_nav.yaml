@@ -12,6 +12,11 @@
 #   floor  the surveyed 47-tag map; any camera that sees the floor tags
 #          (default RGB via nav_source: second — set second_cam.tilt_deg to
 #          whatever the mount is ACTUALLY at).
+#          (a crab CIRCLE holds heading too, but TRANSLATES — 0..2R in range
+#          and +/-R laterally away from that one tag, i.e. 1.0 m and +/-0.5 m
+#          at the shipped radius. That is a harder demand on a single-tag
+#          geometry than any corner; fly circles on `floor` first
+#          [예측, 미검증].)
 #   wall   ONE upright tag on the pool wall, crab square (heading_follow:
 #          false in hw_mpc.yaml) so the camera never turns away from it.
 geometry: floor
@@ -28,7 +33,7 @@ nav_source: main
 # Localizer-side datum: 'map' = the tag frame as-is (normal); 'first_fix' =
 # re-zero at the first accepted fix. NOTE the MISSION datum is separate and
 # always on: at every ENGAGE the current pose becomes (0,0,0)/yaw 0 for the
-# controller, square, geofence, plot and CSV — "(0,0) is where START was
+# controller, square, plot and CSV — "(0,0) is where START was
 # pressed". Keep this at 'map' unless you specifically want the raw
 # localizer stream re-zeroed too.
 datum: map
@@ -130,6 +135,30 @@ nav_stream: color
 # C3 extrinsic, FLU body frame (origin = vehicle COM). Source: the sim's
 # measured registration (Onshape 2026-07-19). Used when nav_source: main.
 cam_extrinsic_json: bluerov2_mujoco_marinegym/meshes/c3_payload_frames.json
+
+# Degrees the C3 is pitched DOWN from the extrinsic above (which is the
+# FORWARD-LEVEL Onshape registration — its implied pitch is 0.32 deg UP).
+#
+# [측정 2026-08-17]: 43.3 deg, read off `rp_residual_deg` — the tag-implied
+# roll/pitch vs the autopilot's ATTITUDE — with the vehicle resting still on
+# the mat. That residual IS the quantity this key corrects, which is why the
+# measured 43.3 is used rather than the nominal 40 the mount was built to.
+# Corroborated independently: the IMU->body rotation fit lands 40.7 / 41.3 deg
+# from the nearest axis permutation across two takes, and the IMU is rigid to
+# the camera (config/c3_imu_calib.json, R_fit).
+#
+# A RECORD BOUNDARY. Every run before this line existed was flown with an
+# effectively level extrinsic, so its reported positions carry a near-constant
+# offset of up to 2*|t_cb|*sin(21.6 deg) = 0.21 m and a corrupted yaw. Do not
+# pool positions or headings across runs whose meta.json
+# `hardware.cam_tilt_deg` differs. (It does NOT affect reprojection error —
+# solvePnP recovers the CAMERA pose and the extrinsic only maps camera->body
+# afterwards — which is why the old reproj numbers looked healthy throughout.)
+#
+# Applied as a PURE ROTATION about the camera origin, so cam_t_flu is assumed
+# unmoved by the re-mount. A hinge moves the lens too; if that matters at the
+# centimetre level, measure it and set cam_t_flu below.
+cam_tilt_deg: 43.3
 # cam_t_flu: [0.23949, 0.00547, -0.15537]
 # cam_xyaxes_flu: [0.0, -1.0, 0.0, -0.0056, 0.0, 0.99998]
 
@@ -158,14 +187,25 @@ second_cam:
   height: 1080
   dist: []
 
-# Soft operating box, NED metres, in the ENGAGE-datum frame (START pose =
-# origin): "±1.2 m around where the run began, ±1 m of depth change". [예측]
-# — walk the pool and tighten before the first engage.
-geofence_ned:
-  x: [-1.2, 1.2]
-  y: [-1.2, 1.2]
-  z: [-1.0, 1.0]
-  margin: 0.3
+# GEOFENCE — REMOVED 2026-08-14 (operator request).
+#
+# What used to live here: a soft operating box (geofence_ned + geofence_frame)
+# that START TRAJ checked every line endpoint / rectangle corner against before
+# arming, and that disengaged the controller at runtime when the vehicle left
+# box + margin. Both are gone; rov_gui/control/geometry.py no longer reads
+# these keys, and leaving them in an old copy of this file is harmless.
+#
+# What still stops the vehicle: E-STOP (Esc / the two panel buttons), DISENGAGE,
+# the command sink's 500 ms deadman, the engage gates (armed, MANUAL, fresh
+# telemetry, fresh tag fix) and the runtime aborts for disarm / stale telemetry /
+# mode change / tag loss. NOTHING now knows where the pool WALL is — pool_ned
+# below is drawn on the plot but enforces nothing.
+#
+# For the record, the last values in force were, in the MAP frame:
+#   x [-0.57, 1.15]  y [-1.97, 2.17]  z [-1.8, 0.15]  margin 0.3
+# with z the TAG-FRAME z (floor tags are z=0, +z DOWN, so a swimming vehicle is
+# NEGATIVE) sized to the measured operating band -1.30 .. -0.54 m across four
+# runs (sessions/nav_runs/*/fixes.csv, z_ned of accepted fixes).
 
 pool_draw_flu: [4.877, 1.8]   # display only
 
@@ -182,3 +222,10 @@ pool_draw_flu: [4.877, 1.8]   # display only
 # To pin an explicit rectangle instead, set pool_ned: {x: [..], y: [..]} —
 # that wins over this.
 pool_margin_m: 0.10
+
+# The vehicle's footprint (ALONG-heading, ACROSS) in metres, DISPLAY ONLY: the
+# trajectory plot draws this rectangle around the position instead of a bare
+# dot, so what you watch clear the wall is the hull. 17 x 21 inch
+# [측정: operator, 2026-08-14] = 0.4318 x 0.5334 m; the heading direction is
+# the 17 inch side.
+rov_footprint_m: [0.4318, 0.5334]

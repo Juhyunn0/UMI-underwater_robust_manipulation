@@ -267,8 +267,21 @@ class PoseTrack:
     box_px: tuple = ()              # 8 corners of the oriented box
     score: float | None = None      # SAM2 object-score logit; >0 visible
     mask_px: int = 0
+    # TWO DIFFERENT QUESTIONS, and they were one number until 2026-08-23.
+    #   *_hz        MEASURED update rate: how often a new mask / a new pose
+    #               actually arrives (perception/session.py _RateMeter).
+    #   *_solve_ms  how long the GPU takes on ONE frame — the upstream
+    #               trackers' own `hz`, inverted back into the milliseconds it
+    #               always was.
+    # They differ whenever the pipeline is not the bottleneck (a 20 ms solve
+    # fed 13 frames a second is 13 Hz, not 50) and they differ WILDLY across a
+    # re-registration, which costs ~0.7 s of solve and produces exactly one
+    # pose. A record written before 2026-08-23 has the old meaning in `pose_hz`
+    # — the pose CSV renamed its column to say so.
     sam_hz: float = 0.0
+    sam_solve_ms: float = 0.0
     pose_hz: float = 0.0
+    pose_solve_ms: float = 0.0
     n_register: int = 0
     frame_seq: int = 0
     # The frame these pixels belong to. The overlay scales by this, so a change
@@ -286,11 +299,26 @@ class PoseTrack:
     max_views: int = 0
     build_s: float = 0.0
     distance_m: float = 0.0         # camera->object during capture, metres
+    # HOW SMEARED THE DEPTH IS, as a multiple of the object's own size — the
+    # measurement that predicts whether the reconstruction will come out long
+    # (perception/session.py:_frame_depth_quality). None means "not enough
+    # pixels to say". Live during capture, so the pilot can fix it by moving
+    # closer while the orbit is still happening rather than reading it in the
+    # summary after the mesh is already wrong.
+    smear_ratio: float | None = None
+    smear_max: float = 0.0          # the frame gate this is judged against
     fp_load_s: float = 0.0          # FoundationPose bring-up, seconds so far
     # Whether a 6-DoF pose is expected at all. Without this the overlay cannot
     # tell "no pose because you asked for a mask" from "no pose because
     # something went wrong", and those need to look different.
     pose_expected: bool = False
+    # WHEN THE FRAME THIS POSE CAME FROM WAS TRUE. Not ``stamp`` (which is
+    # when the snapshot was built) and not 0.0. It is the same float
+    # ``C3VideoWorker._tap_pose`` put into the NAV mailbox for the same colour
+    # frame, which is what lets ``object_nav`` pair a pose with the tag fix
+    # from that exact frame and cancel the camera extrinsic out of the
+    # composition. Without it the pairing has nothing to compare.
+    t_capture: float = 0.0
     note: str = ""
     conn: Conn = Conn.OFFLINE
     stamp: float = field(default_factory=now)
@@ -346,6 +374,49 @@ class NavFix:
     @property
     def ok(self) -> bool:
         return self.p_ned is not None and self.R_ned_body is not None
+
+
+@dataclass
+class ObjectFix:
+    """The tracked OBJECT, placed in the pool — one composition of a
+    :class:`PoseTrack` with the :class:`NavFix` from the SAME camera frame.
+
+    THE FRAME IS THE MAP FRAME: the tag-map NED world (x north-ish, +z DOWN)
+    that the pool rectangle, the tag mat and the trajectory plot are drawn in.
+    It is deliberately NOT the engage-datum frame :class:`MpcStatus` uses and
+    NOT world FLU. The object exists before anything engages and must not move
+    on screen when START is pressed — which is exactly the bug the datum
+    conversion caused once already (trajectory.py: "the whole mat visibly
+    swung round the moment START was pressed").
+
+    ``pair_dt_ms`` / ``pair_exact`` are the health of the composition itself.
+    The camera extrinsic cancels EXACTLY when the object pose and the tag fix
+    come from one frame (``pair_exact``); paired across frames, the unmeasured
+    0.2855 m camera lever arm re-enters the error budget. A run whose
+    ``pair_exact`` ratio is not ~1.0 must not have object-position statistics
+    pooled with one whose is.
+    """
+
+    t_capture: float = 0.0           # the frame BOTH estimates came from
+    ok: bool = False                 # is p_map worth drawing/using?
+    state: str = "cold"              # cold | live | stale | lost
+    p_map: tuple | None = None       # (x, y, z) metres, MAP frame
+    yaw_map: float | None = None     # rad, chosen object axis projected flat
+    R_map_obj: tuple | None = None   # 9 floats row-major, object -> map
+    v_map: tuple | None = None       # (3,) m/s, MAP frame
+    r_map: float | None = None       # rad/s about map +z (DOWN)
+    distance_m: float | None = None  # camera -> object, straight off the pose
+    age_s: float | None = None       # now - t_capture
+    extrapolated_s: float = 0.0      # of that age, how much was extrapolated
+    pair_dt_ms: float | None = None  # |t_pose - t_fix|; 0 on an exact pair
+    pair_exact: bool = False
+    yaw_axis: str = ""               # which object axis carries the heading
+    pose_state: str = ""             # the PoseTrack state behind this
+    n_obs: int = 0
+    n_reject: int = 0
+    note: str = ""
+    conn: Conn = Conn.OFFLINE
+    stamp: float = field(default_factory=now)
 
 
 @dataclass
@@ -410,6 +481,36 @@ class VehicleImu:
 
 
 @dataclass
+class ImuBatch:
+    """Every C3 BNO086 sample since the last drain — a DIFFERENT sensor from
+    ``VehicleImu``, on a different board and a different clock.
+
+    ``samples`` is an (N, 7) float64 array in ``imu_dr.SAMPLE_COLS`` order
+    ``(t, ax, ay, az, gx, gy, gz)``: accel m/s^2, gyro rad/s, both in the IMU's
+    own axes (the mounting rotation is the estimator's business, not the
+    transport's). An array rather than a list of ``c3_camera.imu.ImuSample``
+    for two reasons — ``rov_gui.state`` must import with no depthai present,
+    and the consumer slices this far more often than it inspects a field.
+
+    ``t`` is the DEVICE timestamp, which on this host shares a clock with the
+    image frames and with ``time.monotonic()``. That is the whole reason this
+    IMU is worth the wiring, so ``t_host_drain`` and ``t_device_last`` are kept
+    side by side: their difference is the running check that the two clocks
+    still agree, and a dead reckoner integrating a wrong dt fails silently.
+    """
+
+    source: str = "c3"
+    samples: object = None           # (N, 7) float64, or None
+    n: int = 0
+    dropped: int = 0                 # sequence numbers missing in this batch
+    accuracy: str = ""               # worst accel/gyro flag in the batch
+    t_host_drain: float = 0.0
+    t_device_last: float = 0.0
+    conn: Conn = Conn.OFFLINE
+    stamp: float = field(default_factory=now)
+
+
+@dataclass
 class MpcStatus:
     """One MPC control tick, as the UI and the CSV see it.
 
@@ -424,6 +525,9 @@ class MpcStatus:
     engaged: bool = False
     traj_on: bool = False
     mode: str = ""                   # "mpc" | "dobmpc"
+    # The armed mission, PER SHAPE — a circle carries `radius` and no
+    # `size`/`size_y`, a line carries `length`/`dir_deg`. Switch on
+    # `scenario["kind"]` before touching a dimension key (meta schema 4).
     scenario: dict | None = None     # square params once the trajectory starts
     solver: str = ""                 # "acados" | "ipopt" | "stub" | ""
     solver_status: int = 0
@@ -436,19 +540,87 @@ class MpcStatus:
     ref_flu: tuple | None = None     # reference position, world FLU
     yaw_flu_deg: float | None = None
     err_xy: float | None = None      # |p - ref| horizontal, metres
+    # err_xy split along the path's own tangent, metres (MpcWorker._path_split
+    # owns the conventions). err_along is LAG: + = the vehicle is behind the
+    # virtual target. err_cross is which SIDE of the path it is on: + = left
+    # of the direction of travel. The two
+    # answer different questions and only one of them is path following's
+    # business: stage 0 deliberately sits ahead of the active-segment
+    # projection, so quoting |p - ref| alone hides the result (2026-08-14 line
+    # run: 12.5 cm err = 11 cm lag + 1 cm off the line).
+    err_cross: float | None = None
+    err_along: float | None = None
+    # Speed, live. The operator sets a path speed and until 2026-08-17 had no
+    # way to see what the vehicle was doing with it — the run that exposed the
+    # PID's disconnected speed box (0.2 m/s asked, 0.026 m/s covered) could
+    # have been read off the screen in seconds.
+    speed_m_s: float | None = None       # measured horizontal ground speed
+    ref_speed_m_s: float | None = None   # what the reference is asking for
     n_tags: int = 0
     tag_age_s: float | None = None
     imu_age_s: float | None = None
-    geofence_ok: bool = True
     warmup_left_s: float = 0.0
+    # WHICH part of a mission is running, so the operator never has to guess
+    # whether the vehicle is still on its way to the start tag or already
+    # flying the path: "" (idle) | "warmup" | "approach" | "settle" |
+    # "station" | "line" | "square".
+    phase: str = ""
+    phase_detail: str = ""           # "0.83 m to go", "6 s", "lap 2/5"
     # The mission datum, set at ENGAGE: (x, y, z, yaw) of the engage pose in
     # the TAG frame. Everything in this status (and the CSV, and the square,
-    # and the geofence) is relative to it — (0,0) is where START was pressed.
+    # and the square) is relative to it — (0,0) is where START was pressed.
     # None = no engagement yet this session.
     datum: tuple | None = None
     lap: int = 0
     t_traj: float | None = None      # seconds since the trajectory clock began
     reason: str = ""                 # why the last engage/disengage happened
+    # ---- IMU dead reckoning (the "how far can the IMU carry us" experiment)
+    # p_dr_flu is world FLU in the datum frame, exactly like p_flu, so the two
+    # can be subtracted without thinking. p_flu stays the TAG solution even
+    # when the controller is flying on the dead reckoner: the plot's actual
+    # trail and the CSV's px/py must always be ground truth, or the run
+    # measures nothing.
+    p_dr_flu: tuple | None = None
+    yaw_dr_flu_deg: float | None = None
+    dr_err_m: float | None = None    # |p_dr - p_tag| horizontal
+    dr_err_z_m: float | None = None
+    dr_elapsed_s: float | None = None    # since the anchor
+    dr_source: str = ""              # "c3"
+    dr_attitude: str = ""            # "gyro" | "ahrs" | "vehicle"
+    dr_mode: str = ""                # "" | "shadow" | "control"
+    dr_hz: float | None = None
+    dr_n: int = 0                    # samples integrated since the anchor
+    # False whenever the estimate must not be believed — INCLUDING when the
+    # sample stream died. A starved dead reckoner looks perfect (a frozen
+    # point drifting not at all), so this is the field that has to be loud.
+    dr_ok: bool = False
+    dr_note: str = ""
+    # STATION BRIDGE (control/station_bridge.py). "none" while the tag fix is
+    # fresh; "imu" while every axis is being carried on the bridge estimate;
+    # "coast" once the horizontal axes have been released and only depth and
+    # attitude are still held. `bridge_s` is how long the fix has been gone.
+    # A run whose CSV shows a non-zero bridge_s was NOT flying on the tag for
+    # those ticks — do not pool them with clean ones.
+    bridge_tier: str = "none"
+    bridge_s: float = 0.0
+    # OBJECT FOLLOW (control/object_nav.py). Three statements about the
+    # CONTROL LOOP, which is why they ride here and the object's own position
+    # rides :class:`ObjectFix` instead: this row is one control tick and goes
+    # straight into the run CSV, while the object exists whether or not
+    # anything is engaged and lives in the map frame, not this one.
+    # "" while no follow is armed; otherwise following | leashed | stale |
+    # lost. `follow_err_m` is |vehicle - the walked setpoint|.
+    follow_state: str = ""
+    follow_age_s: float | None = None
+    follow_err_m: float | None = None
+    # Tag-implied roll/pitch vs the autopilot's ATTITUDE. Computed since the
+    # station was built and never surfaced until now: it is the check that the
+    # camera extrinsic (position AND tilt) is right, and a wrong mount angle
+    # reads here as that angle while the vehicle sits level.
+    rp_residual_deg: float | None = None
+    # ...and signed, split into (roll, pitch). The magnitude alone
+    # cannot be acted on: cam_tilt_deg corrects a PITCH.
+    rp_residual_rp_deg: tuple | None = None
     conn: Conn = Conn.OFFLINE
     stamp: float = field(default_factory=now)
 

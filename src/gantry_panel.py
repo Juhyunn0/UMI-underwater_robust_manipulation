@@ -1501,6 +1501,200 @@ class FisheyePreviewWidget(QWidget):
         _gp_save_section("gantry_panel", payload)
 
 
+class _MapPoseWorker(QObject):
+    """Camera frames -> position in the surveyed AprilTag map, off the GUI thread.
+
+    Same drop-if-busy contract as _TagDetectionWorker: never queue, always
+    answer with the newest frame we could actually keep up with.
+
+    The estimator itself lives in gantry_map_pose.py and borrows the ROV's own
+    detection + PnP (rov_gui/control/tagnav.py), so what this reports is in the
+    SAME frame as the station's fixes rather than merely similar to it. See that
+    module's docstring for why the encoder path is not used instead.
+    """
+
+    # (MapPose | None, status string)
+    pose_ready = pyqtSignal(object, str)
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._est: Any = None
+        self._busy = False
+        self._cfg: tuple = ()          # (calib_path, tag_map_path, tag_size_m)
+        self._fatal = ""               # config error: report once, stop retrying
+
+    def configure(self, calib_path: str, tag_map_path: str,
+                  tag_size_m: float) -> None:
+        """Rebuild on the worker's own thread. Always clears the latched error:
+        the usual reason for one is a frame size the calibration does not cover,
+        which the operator fixes by changing the resolution and reconnecting —
+        with the calibration, map and tag size all unchanged. Keying the reset
+        on cfg-changed would leave the readout dead after exactly that fix.
+        """
+        self._cfg = (str(calib_path), str(tag_map_path), float(tag_size_m))
+        self._est = None
+        self._fatal = ""
+
+    def on_frame(self, frame_bgr: Any, _t_mono: float) -> None:
+        if self._busy or frame_bgr is None or self._fatal or not self._cfg:
+            return
+        self._busy = True
+        try:
+            if self._est is None:
+                try:
+                    # _SRC_DIR is already on sys.path (module header shim).
+                    from gantry_map_pose import MapPoseEstimator
+                    self._est = MapPoseEstimator(self._cfg[0], self._cfg[1],
+                                                 self._cfg[2])
+                except Exception as exc:                       # noqa: BLE001
+                    self._fatal = f"{type(exc).__name__}: {exc}"
+                    self.pose_ready.emit(None, self._fatal)
+                    return
+            try:
+                sol = self._est.process(frame_bgr)
+            except Exception as exc:                           # noqa: BLE001
+                # A CalibrationMismatch is a setup error, not a bad frame:
+                # latch it so the operator sees the reason instead of a
+                # flickering "no fix".
+                self._fatal = f"{type(exc).__name__}: {exc}"
+                self.pose_ready.emit(None, self._fatal)
+                return
+            if sol is None:
+                self.pose_ready.emit(None, self._est.last_reject or "no tags in view")
+                return
+            from gantry_map_pose import MapPose
+            self.pose_ready.emit(MapPose.from_solution(sol), "")
+        finally:
+            self._busy = False
+
+
+class MapPosePanel(QWidget):
+    """"Where am I, in the ROV's world?" — a compact live readout.
+
+    Deliberately NOT drawn into WorkspaceMap: that plot is gantry user-frame
+    millimetres relative to the captured home reference, this is metres in the
+    anchor-25 tag map. Different origin, different axes, different units. The
+    two are not registered to each other today (KNOWN_ISSUES), and overlaying
+    them would invent a relationship that has not been measured.
+    """
+
+    POSE_HZ = 10.0        # measured 13.2 ms/frame at 1280x720 -> ~13% of a core
+
+    _forward_frame = pyqtSignal(object, float)
+    _configure_req = pyqtSignal(str, str, float)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._last_forward_t = 0.0
+        self._last_pose: Any = None
+        self._n_since_fix = 0
+        self._fix_times: deque = deque(maxlen=20)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(2)
+
+        box = SectionFrame("Tag map position")
+        v = QVBoxLayout(box.content())
+        v.setContentsMargins(8, 6, 8, 6)
+        v.setSpacing(3)
+
+        self.pos_label = QLabel("x —   y —   z —")
+        self.pos_label.setStyleSheet(
+            "color: #e0e0e0; font-size: 13px; font-weight: 600; "
+            "font-family: monospace;"
+        )
+        _fit_label(self.pos_label, "x -0.000 m   y -0.000 m   z -0.000 m")
+        v.addWidget(self.pos_label)
+
+        self.detail_label = QLabel("—")
+        self.detail_label.setStyleSheet("color: #888; font-size: 11px;")
+        _fit_label(self.detail_label, "tags 99  reproj 9.99 px  10.0 Hz")
+        v.addWidget(self.detail_label)
+
+        self.status_label = QLabel("● camera off")
+        self.status_label.setStyleSheet("color: #666; font-size: 11px;")
+        _fit_label(self.status_label, "● both IPPE poses tilt >20 deg off gravity")
+        v.addWidget(self.status_label)
+
+        outer.addWidget(box)
+
+        self._thread = QThread(self)
+        self._worker = _MapPoseWorker()
+        self._worker.moveToThread(self._thread)
+        self._forward_frame.connect(self._worker.on_frame)
+        # Connecting to a bound method of a QObject that lives on another thread
+        # gives an auto->queued connection, so the worker only ever mutates its
+        # own state on its own thread and cannot be reconfigured mid-frame.
+        self._configure_req.connect(self._worker.configure)
+        self._worker.pose_ready.connect(self._on_pose_ready)
+        self._thread.start()
+
+    # ------------------------------------------------------------------ inputs
+    def configure(self, calib_path, tag_map_path, tag_size_m: float) -> None:
+        """Point the estimator at a calibration + map. Safe to call repeatedly;
+        the worker only rebuilds when something actually changed."""
+        self._configure_req.emit(str(calib_path), str(tag_map_path),
+                                 float(tag_size_m))
+
+    def on_frame(self, frame_bgr: Any, t_mono: float) -> None:
+        """Slot for FisheyeCameraSession.frame_ready, throttled to POSE_HZ."""
+        now = time.monotonic()
+        if now - self._last_forward_t < 1.0 / self.POSE_HZ:
+            return
+        self._last_forward_t = now
+        self._forward_frame.emit(frame_bgr, t_mono)
+
+    def set_state(self, state: str) -> None:
+        if state == "disconnected":
+            self._last_pose = None
+            self._fix_times.clear()
+            self.pos_label.setText("x —   y —   z —")
+            self.detail_label.setText("—")
+            self._set_status("● camera off", "#666")
+
+    def shutdown(self) -> None:
+        try:
+            self._thread.quit()
+            self._thread.wait(1000)
+        except Exception:
+            pass
+
+    # ----------------------------------------------------------------- outputs
+    def latest(self):
+        """The last accepted MapPose, or None. For the recorder/status bar."""
+        return self._last_pose
+
+    def _set_status(self, text: str, color: str) -> None:
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(f"color: {color}; font-size: 11px;")
+
+    def _on_pose_ready(self, pose: Any, why: str) -> None:
+        if pose is None:
+            self._n_since_fix += 1
+            # One dropped frame is normal (the camera panned off the tags);
+            # a run of them is worth colouring.
+            colour = "#ffa726" if self._n_since_fix > 5 else "#888"
+            self._set_status(f"● {why or 'no fix'}", colour)
+            return
+        self._n_since_fix = 0
+        self._last_pose = pose
+        self._fix_times.append(time.monotonic())
+        self.pos_label.setText(
+            f"x {pose.x_m:+.3f} m   y {pose.y_m:+.3f} m   z {pose.z_m:+.3f} m")
+        hz = 0.0
+        if len(self._fix_times) >= 2:
+            span = self._fix_times[-1] - self._fix_times[0]
+            if span > 0:
+                hz = (len(self._fix_times) - 1) / span
+        self.detail_label.setText(
+            f"tags {pose.n_tags}  reproj {pose.reproj_rms_px:.2f} px  {hz:.1f} Hz")
+        if pose.ambiguous:
+            self._set_status("● AMBIGUOUS (single-tag flip unresolved)", "#ffa726")
+        else:
+            self._set_status("● locked (anchor 25 map frame)", "#66bb6a")
+
+
 class LivePlotWidget(QWidget):
     """30-second rolling position-vs-time plot. pyqtgraph if available."""
 
@@ -2194,16 +2388,32 @@ _GP_SETTINGS_PATH = Path.home() / ".umi_gui_state.json"
 def _gp_load_settings() -> dict:
     try:
         import json
-        return json.loads(_GP_SETTINGS_PATH.read_text())
+        data = json.loads(_GP_SETTINGS_PATH.read_text())
+        return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
 def _gp_save_section(key: str, payload: dict) -> None:
+    """MERGE `payload` into the section `key`. Keys absent from `payload` are
+    left alone.
+
+    This used to be a whole-section REPLACE, and `_on_tab_changed` passed a bare
+    ``{"active_tab": idx}`` — so switching tabs silently erased `axis_sign` and
+    `home_position_mm`. Those two are the ONLY link between the panel's
+    user-frame mm and the absolute machine mm the SDK is commanded in
+    (`user_mm_to_abs_mm`), so losing them across launches mis-commands every
+    target. Merging here closes the trap for future call sites too; no caller
+    deletes a key by omitting it.
+    """
     try:
         import json
         data = _gp_load_settings()
-        data[key] = payload
+        section = data.get(key)
+        if not isinstance(section, dict):     # absent, or corrupted to a non-dict
+            section = {}
+            data[key] = section
+        section.update(payload)
         _GP_SETTINGS_PATH.write_text(json.dumps(data, indent=2))
     except OSError:
         pass
@@ -2570,6 +2780,13 @@ class GantryPanel(QMainWindow):
         self._left_splitter.splitterMoved.connect(self._on_left_splitter_moved)
 
         v.addWidget(self._left_splitter, stretch=1)
+
+        # ── section 3: where we are in the ROV's world ─────────────────────────
+        # Outside the splitter on purpose: it is three lines, it should not
+        # compete for height, and the persisted left_splitter_sizes is a
+        # 2-element list that a third pane would invalidate.
+        self.map_pose_panel = MapPosePanel()
+        v.addWidget(self.map_pose_panel)
 
         # Scroll wrapper — horizontal scroll disabled; vertical scroll auto.
         scroll = QScrollArea()
@@ -5433,6 +5650,8 @@ class GantryPanel(QMainWindow):
             self._camera = FisheyeCameraSession(self)
             self._camera.state_changed.connect(self._on_camera_state_changed)
             self._camera.frame_ready.connect(self._fisheye_preview.on_frame)
+            if getattr(self, "map_pose_panel", None) is not None:
+                self._camera.frame_ready.connect(self.map_pose_panel.on_frame)
             self._camera.stats.connect(self._on_camera_stats)
             self._camera.error.connect(self._on_camera_error)
 
@@ -5444,6 +5663,19 @@ class GantryPanel(QMainWindow):
 
         calib_path = _resolve_calib_path(self._cam_calib_edit.text())
         mock = self._is_mock_camera
+
+        if getattr(self, "map_pose_panel", None) is not None and calib_path:
+            # Same calibration the session is opened with. The tag map and tag
+            # size come from the Experiment tab so there is ONE place to change
+            # them; the defaults there are config/tag_map.yaml and 0.170 m.
+            tm_path = _resolve_calib_path(self._exp_tag_map_edit.text().strip()) \
+                if hasattr(self, "_exp_tag_map_edit") else None
+            self.map_pose_panel.configure(
+                calib_path,
+                tm_path or (_REPO_ROOT / "config" / "tag_map.yaml"),
+                self._exp_tag_size_spin.value()
+                if hasattr(self, "_exp_tag_size_spin") else 0.170,
+            )
 
         self._cam_connect_btn.setEnabled(False)
         self._cam_connect_btn.setText("Connecting…")
@@ -5468,6 +5700,8 @@ class GantryPanel(QMainWindow):
             self._cam_status_label.setStyleSheet("color: #ef5350; font-weight: bold;")
             if hasattr(self, "_fisheye_preview"):
                 self._fisheye_preview.set_state("disconnected")
+            if getattr(self, "map_pose_panel", None) is not None:
+                self.map_pose_panel.set_state("disconnected")
         elif state == "connecting":
             self._cam_connect_btn.setText("Connecting…")
             self._cam_connect_btn.setEnabled(False)
@@ -5540,6 +5774,9 @@ class GantryPanel(QMainWindow):
     # Tab persistence + clipping audit
     # ------------------------------------------------------------------
     def _on_tab_changed(self, idx: int) -> None:
+        # Safe as a bare one-key payload only because _gp_save_section MERGES
+        # (:2202). When it replaced the section this line erased axis_sign and
+        # home_position_mm on every tab switch.
         _gp_save_section("gantry_panel", {"active_tab": int(idx)})
 
     def _audit_clipping(self) -> None:
@@ -5617,6 +5854,11 @@ class GantryPanel(QMainWindow):
         if hasattr(self, "_fisheye_preview"):
             try:
                 self._fisheye_preview.shutdown()
+            except Exception:
+                pass
+        if getattr(self, "map_pose_panel", None) is not None:
+            try:
+                self.map_pose_panel.shutdown()
             except Exception:
                 pass
         super().closeEvent(event)

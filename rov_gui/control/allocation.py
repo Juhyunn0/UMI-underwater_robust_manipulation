@@ -7,7 +7,11 @@ per-axis gain: ``axis = wrench / gain``, where ``gain`` is the wrench the
 vehicle produces at FULL deflection. Roll (K) and pitch (M) have no
 MANUAL_CONTROL axis and are DROPPED — the Heavy is passively stable and the
 sim's square runs them near zero anyway; this is a documented limitation of
-the MANUAL-mode experiment, not an oversight.
+the MANUAL-mode experiment, not an oversight. (The evidence for "near zero" is
+a SQUARE. A heading-following CIRCLE is the first mission to hold a non-zero
+yaw rate for a whole lap — v/R, 34 deg/s at 0.12 m/s and R 0.2 — so the
+sustained Coriolis coupling into K and M on one is outside what that covers
+[예측, 미검증].)
 
 The gains in ``config/hw_mpc.yaml`` are [예측] — derived from the T200 curve
 and mixer geometry, never measured on this vehicle — until the P4 step
@@ -24,6 +28,8 @@ Sign map (PilotInput docstring in state.py vs NED/FRD):
 """
 
 from __future__ import annotations
+
+import math
 
 from ..state import PilotInput, now
 
@@ -49,6 +55,32 @@ def wrench_to_axes(u_ned, gains: dict, cap: float = 0.5,
         source="mpc",
         stamp=now() if stamp is None else stamp,
     ).clamped()
+
+
+def slew_axes(cmd: PilotInput, prev, max_rate: float, dt: float) -> PilotInput:
+    """Bound how fast each axis may move, per second.
+
+    Thrust that reverses faster than the hull can answer is heat and noise, not
+    control — and the yaw axis has been doing exactly that in every hardware
+    run on record (1.9-2.7 sign flips per second, 2026-08-14 onward, with and
+    without deadband compensation). This is the one anti-chatter measure that
+    does not depend on a model of the actuator: whatever the controller asks
+    for, the command that leaves the station moves no faster than the vehicle
+    can usefully follow.
+
+    ``prev`` is the previously SENT axis tuple (or None to pass through).
+    Returns a new PilotInput; the caller keeps the tuple for next tick."""
+    if prev is None or not (max_rate > 0.0) or not (dt > 0.0):
+        return cmd
+    step = float(max_rate) * float(dt)
+
+    def lim(new: float, old: float) -> float:
+        return old + max(-step, min(step, float(new) - float(old)))
+
+    return PilotInput(
+        surge=lim(cmd.surge, prev[0]), sway=lim(cmd.sway, prev[1]),
+        heave=lim(cmd.heave, prev[2]), yaw=lim(cmd.yaw, prev[3]),
+        active=cmd.active, source=cmd.source, stamp=cmd.stamp).clamped()
 
 
 def axes_to_wrench(cmd: PilotInput, gains: dict):

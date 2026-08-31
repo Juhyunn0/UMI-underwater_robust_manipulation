@@ -31,7 +31,7 @@ from ..state import Conn, LinkStat, SensorStat, Telemetry
 from .indicators import (ElidedLabel, MeterBar, Panel, Sparkline, StatusDot,
                          StatusPill, Tile)
 
-MAX_SENSOR_ROWS = 8
+MAX_SENSOR_ROWS = 10
 
 # The order sensors are shown in when present. Anything not listed lands after
 # these, in arrival order, until the cap is hit.
@@ -39,8 +39,17 @@ MAX_SENSOR_ROWS = 8
 # BNO086 are different devices on different clocks with different rates, and the
 # single "IMU" row that used to be here made it impossible to tell which one had
 # gone quiet — or which one a downstream pipeline was actually fusing.
-SENSOR_ORDER = ("IMU (ROV)", "IMU (C3)", "Barometer", "Compass", "Leak", "EKF",
-                "Heartbeat", "Pose (C3)", "GPS")
+# "Leak" and "Enclosure" sit high on purpose: they are the two rows that mean
+# "stop the dive", and a row nobody scrolls to is a row nobody reads.
+# TagNav and Object sit high for the Leak/Enclosure reason: with --mpc the
+# localizer IS the instrument, and its row carries the WHY of a refused fix
+# ("2/2 unique tags", "reproj 4.1px > 3px") that appears nowhere else. Landing
+# them in arrival order put them past the cap, so on 2026-08-21 an operator
+# watched nine mapped tags outlined in the video with no position on the plot
+# and no row on screen saying which gate had rejected them.
+SENSOR_ORDER = ("Leak", "Enclosure", "TagNav", "Object", "Pose (C3)",
+                "IMU (ROV)", "IMU (C3)", "Barometer", "Compass", "EKF",
+                "Heartbeat", "MPC", "GPS")
 
 
 def _caption(text: str) -> QtWidgets.QLabel:
@@ -228,6 +237,10 @@ class HealthPanel(Panel):
             f"  {theme.fmt(t.water_temp_c, '.1f', '°C')}"
             f"  {armed} {t.mode or ''}")
         self.vehicle_line.set_colour(theme.FAIL if t.armed else theme.TEXT_DIM)
+        # bool(None) is False, and that is correct here: an UNKNOWN leak
+        # state must not paint the panel as if the vehicle were flooding.
+        # The 'we cannot tell' case is carried by the Leak sensor row
+        # (DEGRADED + its reason), not by this alarm border.
         self.set_alarm(bool(t.leak) or (pct is not None and pct < 10))
 
     def set_conn(self, conn: Conn, detail: str = "") -> None:
@@ -292,6 +305,16 @@ class SensorPanel(Panel):
                 self._rows[name] = row
                 self._rows_box.addWidget(row)
             row.update_from(sensors[name])
+            row.setVisible(True)
+        # A row that falls OUT of the cap has to go, or it sits there showing
+        # the last value it ever had while the counter says it is not shown —
+        # a frozen number is the one thing this panel must never display
+        # (bus.py's freshness rule). Rows were only ever added until
+        # 2026-08-21, which is why the panel could show more rows than the cap.
+        keep = set(shown)
+        for name, row in self._rows.items():
+            if name not in keep:
+                row.setVisible(False)
         hidden = len(ordered) - len(shown)
         self.overflow.setVisible(hidden > 0)
         if hidden > 0:

@@ -21,8 +21,11 @@ at module scope — only ``mpc_bridge`` does, inside functions — so the demo
 backend and the offline tests run on a machine with no acados at all.
 
 The controller mathematics is NOT reimplemented here. ``dobmpc/`` (verified
-MuJoCo-free) is imported as-is from ``bluerov2_mujoco_marinegym/``; the square
-reference generators are byte-for-byte copies (see reference.py provenance);
+MuJoCo-free) is imported as-is from ``bluerov2_mujoco_marinegym/``; the SQUARE
+reference generators are byte-for-byte copies (see reference.py provenance) —
+the rectangle, the line and the circle beside them are hardware additions with
+no simulator original, so a result flown on one of those inherits none of the
+sim's validation;
 the frame conversions go through ``dobmpc.frames`` so this package inherits
 the sim-validated FLU<->NED path instead of growing a second one.
 """

@@ -12,8 +12,8 @@ in the controller's native NED/FRD, from the two sensors the vehicle has:
                          than a grazing-angle tag PnP for these two)
     eta[5]   yaw         tag PnP (the compass is a consistency check ONLY —
                          steel pool walls and thruster currents corrupt it)
-    nu[0:3]  u, v, w     finite-difference of the tag position, low-passed,
-                         rotated into the body frame
+    nu[0:3]  u, v, w     finite-difference of the tag position, low-passed
+                         (vel_lp_alpha), rotated into the body frame
     nu[3:6]  p, q, r     ArduSub gyro (ATTITUDE rollspeed/pitchspeed/yawspeed)
     nudot    a           SCALED_IMU2 specific force + gravity - omega x v
                          ("imu" mode), or finite-difference of nu ("fd" mode
@@ -54,7 +54,7 @@ class StateAssembler:
     previous samples. One instance per engage session is the intended use;
     ``reset()`` returns it to cold."""
 
-    def __init__(self, z_source: str = "pressure", vel_lp_alpha: float = 0.35,
+    def __init__(self, z_source: str = "pressure", vel_lp_alpha: float = 0.6,
                  nudot_source: str = "imu", tag_stale_s: float = 0.5,
                  imu_stale_s: float = 0.3, propagate: bool = True):
         assert z_source in ("pressure", "tag"), z_source
@@ -68,8 +68,15 @@ class StateAssembler:
         # velocity. Without it the position the loop (and the plot) sees is a
         # per-frame ZOH — visibly "slow" at 10-20 Hz fix rates. Velocity-hold
         # over <=stale_s gaps errs by |v_err|*gap (~5 mm at 0.05 m/s, 100 ms);
-        # accelerometer double-integration is deliberately NOT used (BNO086
-        # scale +20%, biases — drift would exceed the gap error).
+        # accelerometer double-integration is deliberately NOT used (the
+        # BNO086 carries a measured 1.80 m/s^2 bias — drift would
+        # exceed the gap error).
+        #
+        # Still true HERE, and NOT contradicted by imu_dr.py, which does
+        # double-integrate: this is a 100 ms hole in a stream that keeps being
+        # corrected, that is an unaided run of tens of seconds whose
+        # divergence is the quantity being measured. Different question, and a
+        # much larger expected answer.
         self.propagate = bool(propagate)
         self.reset()
 
@@ -81,8 +88,18 @@ class StateAssembler:
         self._prev_nu = None
         self._z_off = None                  # z_tag_world - depth_pressure
         self.rp_residual_deg = None         # tag-vs-ATTITUDE roll/pitch check
+        self.rp_residual_rp_deg = None      # ...signed, (roll, pitch)
 
     # ------------------------------------------------------------------ z
+    @property
+    def z_offset(self) -> float | None:
+        """``z_world_tag - depth_pressure``, once anchored. Public because the
+        dead reckoner (imu_dr.py) needs the SAME offset to put the barometer
+        in the same world — two independent anchors would put the two
+        estimates at two different depths and the comparison would be of the
+        anchoring, not of the IMU."""
+        return self._z_off
+
     def calibrate_z_offset(self, fix, imu) -> bool:
         """Anchor pressure depth to the tag world once (call at engage, at
         rest). z_world = depth_pressure + z_off thereafter."""
@@ -134,8 +151,14 @@ class StateAssembler:
         # as a bad trajectory. Reported, never fused.
         th_tag = math.asin(max(-1.0, min(1.0, -float(R_tag[2, 0]))))
         ph_tag = math.atan2(float(R_tag[2, 1]), float(R_tag[2, 2]))
-        self.rp_residual_deg = math.degrees(
-            max(abs(_wrap(ph_tag - phi)), abs(_wrap(th_tag - theta))))
+        d_phi, d_th = _wrap(ph_tag - phi), _wrap(th_tag - theta)
+        self.rp_residual_deg = math.degrees(max(abs(d_phi), abs(d_th)))
+        # SIGNED and SEPARATE, because the magnitude alone cannot be acted on:
+        # `cam_tilt_deg` corrects a PITCH, so an operator reading 43 deg needs
+        # to know whether that is 43 of pitch (enter it) or a mix with roll
+        # (the mount is skewed as well as tilted, and one number will not fix
+        # it). The max() above is kept because the CSV and older readers use it.
+        self.rp_residual_rp_deg = (math.degrees(d_phi), math.degrees(d_th))
 
         # ---- position (z per config)
         z = float(p_tag[2])
@@ -157,6 +180,15 @@ class StateAssembler:
         p = np.array([p_tag[0], p_tag[1], z])
 
         # ---- world velocity from tag deltas (only on a NEW camera frame)
+        #
+        # The low-pass is RECURSIVE, so alpha is not a weighting — it decides
+        # how long the past lingers. (1 - alpha) survives every step, which
+        # puts the output's centre of mass (1 - alpha)/alpha frames back:
+        # 124 ms at the old 0.35, 44 ms at 0.6 (fix interval 0.0666 s
+        # measured). That lag is multiplied by kd = 59.7 N.s/m in the PID and
+        # is the estimator's dominant error at this vehicle's speeds — the
+        # measured position noise is 0.8 mm, so smoothing was buying almost
+        # nothing for it. Provenance for both numbers: config/hw_mpc.yaml.
         tc = float(fix.t_capture)
         if self._prev_fix_t is not None and tc > self._prev_fix_t + 1e-6:
             dtc = tc - self._prev_fix_t
@@ -201,6 +233,7 @@ class StateAssembler:
         h["ok"] = True
         h["z_src"] = z_src
         h["rp_residual_deg"] = self.rp_residual_deg
+        h["rp_residual_rp_deg"] = self.rp_residual_rp_deg
         return {"eta": eta, "nu": nu, "nudot": nudot}, h
 
 

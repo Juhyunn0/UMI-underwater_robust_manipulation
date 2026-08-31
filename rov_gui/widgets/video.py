@@ -372,29 +372,15 @@ class VideoCanvas(QtWidgets.QLabel):
                     p.setPen(QtGui.QPen(QtGui.QColor(col), 2))
                     p.drawLine(origin, _pt(t.axes_px[i + 1]))
 
-        # Pose numbers, above the bottom HUD strip. Only when there IS a pose:
-        # drawing "--" for every field would say the tracker is broken when it
-        # is merely doing the job it was given (tracking without a mesh).
-        if t.T_cam_obj is not None:
-            T = t.T_cam_obj
-            dist = (T[3] ** 2 + T[7] ** 2 + T[11] ** 2) ** 0.5
-            p.setFont(self._hud_font)
-            fm2 = p.fontMetrics()
-            line = (f"x {T[3]:+.3f}  y {T[7]:+.3f}  z {T[11]:+.3f} m"
-                    f"    d {dist:.2f} m    {t.pose_hz:.0f} Hz"
-                    + (f"   reg {t.n_register}" if t.n_register else ""))
-            # ABOVE the bottom HUD strip, not on it: that strip carries the
-            # resolution and latency, and burying them under the pose would
-            # trade one reading for another.
-            bar_h = fm2.height() + 6
-            y = rect.bottom() - bar_h - fm2.height() - 8
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QtGui.QColor(0, 0, 0, 150))
-            p.drawRoundedRect(
-                QRectF(rect.left() + 8, y - 2,
-                       fm2.horizontalAdvance(line) + 12, fm2.height() + 4), 3, 3)
-            p.setPen(_c(theme.TEXT))
-            p.drawText(int(rect.left() + 14), int(y + fm2.ascent()), line)
+        # NO POSE NUMBERS HERE (removed 2026-08-23, operator request). The
+        # x/y/z/d block that used to sit above the HUD strip was the object in
+        # the CAMERA frame — a frame nothing else on this station works in, so
+        # it could not be compared with anything and could not be flown on.
+        # The object's position now appears in ONE place, the trajectory plot's
+        # readout, in the MAP frame the pool and the vehicle are drawn in
+        # (widgets/trajectory.py, "THE OBJECT READOUT"). The rate and the
+        # registration count stay on this panel's own state chip below, so
+        # nothing that was a HEALTH number was lost with them.
 
         # Status block, under the title strip so it never covers the HUD.
         #
@@ -443,10 +429,19 @@ class VideoCanvas(QtWidgets.QLabel):
             # whether this can work at all: outside 0.3-0.8 m the stereo depth
             # is too noisy to register and every frame will be rejected, and
             # from the picture alone the pilot cannot tell how far away it is.
+            # SMEAR rides beside the range because it is the thing the range is
+            # only a proxy for, and it is the number that decides whether the
+            # mesh comes out right. Live, so it can be fixed by moving closer
+            # mid-orbit instead of being read in the post-mortem.
             "capturing": (f"COLLECTING VIEWS  {t.n_views}/{t.max_views}"
                           f"    ORBIT {t.arc_deg:.0f}/{t.max_arc:.0f}°"
                           + (f"    {t.distance_m:.2f} m"
-                             if t.distance_m else "")),
+                             if t.distance_m else "")
+                          + (f"    SMEAR {t.smear_ratio:.1f}x"
+                             + ("!" if (t.smear_max
+                                        and t.smear_ratio > t.smear_max)
+                                else "")
+                             if t.smear_ratio is not None else "")),
             "building": f"RECONSTRUCTING MESH — {t.build_s:.0f}s",
             "pose_loading": f"LOADING FOUNDATIONPOSE — {t.fp_load_s:.0f}s",
             "registering": "REGISTERING POSE...",
@@ -455,11 +450,32 @@ class VideoCanvas(QtWidgets.QLabel):
             "fault": "FAULT",
         }.get(t.state)
         if stage is None:                                  # i.e. "tracking"
-            stage = (f"POSE TRACKING  {t.pose_hz:.0f} Hz"
+            # THREE NUMBERS, and they answer three different questions.
+            #   n Hz        how often a new pose ARRIVES — the rate anything
+            #               downstream actually gets (measured; see
+            #               perception/session.py _RateMeter)
+            #   solve n ms  how long the GPU takes on one frame. This is the
+            #               upstream tracker's own `hz` put back into the
+            #               milliseconds it always was: until 2026-08-23 its
+            #               reciprocal was printed here AS the rate, which is
+            #               why the chip read "5 Hz" and then "9 Hz" while the
+            #               object sat still — one 0.7 s re-registration in the
+            #               30-sample window and thirty jobs to climb back out.
+            #   reg n       how many times the estimator had to re-register,
+            #               i.e. how often the pose slid off the object.
+            # Together they say WHERE a slow rate comes from: solve >> 1/rate
+            # means the GPU is the bottleneck, solve << 1/rate means it is the
+            # camera or the mask.
+            reg = f"    reg {t.n_register}" if t.n_register else ""
+            solve = (f"    solve {t.pose_solve_ms:.0f} ms"
+                     if t.pose_solve_ms else "")
+            sam_solve = (f"    solve {t.sam_solve_ms:.0f} ms"
+                         if t.sam_solve_ms else "")
+            stage = (f"POSE TRACKING  {t.pose_hz:.0f} Hz{solve}{reg}"
                      if t.T_cam_obj is not None else
-                     (f"TRACKING  {t.sam_hz:.0f} Hz — no pose yet"
+                     (f"TRACKING  {t.sam_hz:.0f} Hz{sam_solve} — no pose yet"
                       if t.pose_expected else
-                      f"TRACKING  {t.sam_hz:.0f} Hz — mask only"))
+                      f"TRACKING  {t.sam_hz:.0f} Hz{sam_solve} — mask only"))
         reason = t.note.strip()
         if not reason:
             reason = {
@@ -592,6 +608,15 @@ class VideoCanvas(QtWidgets.QLabel):
         self._hover = None
         super().leaveEvent(ev)
 
+    def depth_map(self):
+        """The raw uint16 millimetre map behind this frame, or None.
+
+        Public because the DEPTH stream is the one quantity on this station
+        with no independent witness of its own — the tag solution never touches
+        it — so `window._check_depth_scale` has to reach in and compare the two
+        (see the "depth-vs-TAG" line on the trajectory readout)."""
+        return self._aux
+
     def depth_at(self, pos) -> float | None:
         """Millimetres under a canvas point, or None.
 
@@ -665,7 +690,6 @@ class VideoPanel(QtWidgets.QFrame):
     track_toggled = Signal(bool)
     tag_toggled = Signal(str, bool)          # (panel name, on)
     prompt_clicked = Signal(float, float)
-    map_clicked = Signal()
 
     def __init__(self, name: str, title: str, mailbox: FrameMailbox,
                  expected_fps: float = 15.0,
@@ -705,7 +729,11 @@ class VideoPanel(QtWidgets.QFrame):
         # station has about 5 px of vertical headroom against its one-screen
         # promise. Only built when this panel can actually be tracked on.
         self.track_btn = None
-        self.map_btn = None
+        # (A MAP button used to sit here, opening a floating 3-D window that
+        # drew the object in the CAMERA frame. Removed 2026-08-21 at the
+        # operator's request — the trajectory panel's own 3D button shows the
+        # same object in the POOL frame, beside the vehicle it is relative to,
+        # which is the picture anyone actually wanted.)
         if pose:
             self.track_btn = QtWidgets.QPushButton("TRACK", self)
             self.track_btn.setObjectName("Rec")
@@ -719,17 +747,6 @@ class VideoPanel(QtWidgets.QFrame):
                 "double click still promotes the feed to the big slot.")
             self.track_btn.toggled.connect(self._track_toggled)
             self.track_btn.raise_()
-            # The 3-D pose window's handle. It opens by itself when a pose
-            # first exists, but a window the pilot closed needs a way back
-            # that is not "restart the station".
-            self.map_btn = QtWidgets.QPushButton("MAP", self)
-            self.map_btn.setObjectName("Rec")
-            self.map_btn.setStyleSheet(
-                "QPushButton{font-size:10px; padding:1px 7px; border-radius:3px;}")
-            self.map_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            self.map_btn.setToolTip("show the 3-D pose map window")
-            self.map_btn.clicked.connect(self.map_clicked)
-            self.map_btn.raise_()
 
         # TAG: per-feed AprilTag detection toggle, same absolute-positioning
         # trick as REC/TRACK (zero layout height). Only built for feeds a
@@ -795,17 +812,11 @@ class VideoPanel(QtWidgets.QFrame):
                                   self.track_btn.height())
             self.track_btn.move(
                 self.rec_btn.x() - self.track_btn.width() - 6, 26)
-        if self.map_btn is not None:
-            self.map_btn.adjustSize()
-            self.map_btn.resize(self.map_btn.width() + 10,
-                                self.map_btn.height())
-            self.map_btn.move(
-                self.track_btn.x() - self.map_btn.width() - 6, 26)
         if self.tag_btn is not None:
             self.tag_btn.adjustSize()
             self.tag_btn.resize(self.tag_btn.width() + 10,
                                 self.tag_btn.height())
-            left = self.map_btn or self.track_btn or self.rec_btn
+            left = self.track_btn or self.rec_btn
             self.tag_btn.move(left.x() - self.tag_btn.width() - 6, 26)
 
     def resizeEvent(self, ev):

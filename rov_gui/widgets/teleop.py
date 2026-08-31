@@ -79,11 +79,12 @@ ACTION_KEYS = {
 
 # Two rows, not one per axis pair: the visualiser competes with the video feeds
 # for vertical space, and every row it takes is a row the pilot's picture loses.
-# Output multiplier the panel starts at. Low on purpose: this scales every axis,
-# and the first thing a pilot does after connecting is nudge a stick to see
-# whether anything moves. That nudge should not be a third of full thrust in a
-# confined tank or next to a diver.
-DEFAULT_OUTPUT_PCT = 20
+# Output multiplier the panel starts at. It scales EVERY axis, so the first
+# nudge after connecting is worth this much thrust — keep it modest next to a
+# diver. Raised 20 -> 50 on 2026-08-14 (operator): 20% barely moved the
+# vehicle against real water drag, which is its own hazard because the pilot
+# then reaches for a bigger stick input instead of a bigger scale.
+DEFAULT_OUTPUT_PCT = 50
 
 CHIP_ROWS = (
     [("Q", "yaw port"), ("W", "forward"), ("E", "yaw stbd"),

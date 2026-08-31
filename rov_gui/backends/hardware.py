@@ -59,11 +59,13 @@ from pathlib import Path
 import numpy as np
 
 from .. import imaging
+from ..leak import PRESSURE_REPEAT_S, LeakMonitor
 from ..net import NicMonitor
 from ..qt import Qt, Slot, import_cv2
 from ..sensorlog import SensorLog
-from ..state import (Conn, PayloadState, PilotInput, PoseTrack, SensorStat,
-                     Telemetry, ThrusterState, VehicleImu, VideoStat, now)
+from ..state import (Conn, ImuBatch, PayloadState, PilotInput, PoseTrack,
+                     SensorStat, Telemetry, ThrusterState, VehicleImu,
+                     VideoStat, now)
 from ..widgets.propulsion import pwm_to_norm
 from .base import Backend, LoopWorker, TimerWorker
 
@@ -106,6 +108,31 @@ def _parse_size(text) -> tuple[int, int] | None:
 # Which mailbox each C3 stream feeds. "second" is either the C3's left mono
 # image or the ROV's own RGB camera, chosen with --panel2.
 STREAM_TO_PANEL = {"color": "main", "left": "second", "depth": "depth"}
+
+#: THE DEPTH CORRECTION, and it is ON unless someone turns it off.
+#: The C3's stereo depth reads LONG in water [측정: 2026-08-23 — mesh longest
+#: axis 187 mm against a caliper-measured 119.73 mm object = 1.56x;
+#: sessions/low_level_controller_data/20260823/0823_210304/mission_log.txt
+#: 21:02:29 "메시 73770 verts, 143 x 166 x 187 mm"], while colour PnP stays
+#: mm-accurate. 0.64 = 1/1.56.
+#: WARNING — 0.64 IS A SCALAR AND THE ERROR IS NOT. The same mesh line reads
+#: 143 x 166 x 187 against one caliper number, i.e. 1.19 / 1.39 / 1.56 on three
+#: axes: a constant scale error stretches every axis EQUALLY, so an anisotropy
+#: of 1.31 is proof the error GROWS WITH RANGE. The operator confirmed
+#: 2026-08-24 that depth-vs-MAP tracks vehicle height (1.28 low, 1.56 at
+#: ~0.9 m). This constant is therefore exact at ONE range only — near 1.0-1.1 m
+#: [유도] — and its residual changes sign either side. It is a stopgap that
+#: keeps the station usable, NOT a model. The fix is a disparity-domain
+#: correction fitted at the pool; see KNOWN_ISSUES 2026-08-24.
+#: It defaulted to 1.0 until 2026-08-24, which made forgetting it SILENT: two
+#: runs that morning placed the object 1.55-1.57x down the camera ray — two tag
+#: rows past it and half a metre under the mat — and nothing in the log said the
+#: correction was absent [측정: sessions/low_level_controller_data/20260824/
+#: {0824_101807,0824_101251}, object at tag 58 reported nearest tags 11/10/52].
+#: The flag still exists; `--depth-scale 1.0` is what an IN-AIR bench wants.
+#: Kept here rather than only in __main__ so a hand-built opts object (a test,
+#: an embedder) gets the same correction the CLI does.
+DEPTH_SCALE_DEFAULT = 0.64
 
 # ArduSub JSButton::button_function_t values for the payload functions this
 # station drives. Read back from the vehicle at startup and compared against
@@ -209,6 +236,24 @@ def soc_from_voltage(volt: float, cells: int) -> float:
 G = 9.80665
 SEA_LEVEL_HPA = 1013.25
 
+# BNO086 report accuracy, worst first. Reported per sample and carried on the
+# batch as the WORST in it, because this camera's accelerometer has read
+# UNRELIABLE/MEDIUM every time it has been looked at (KNOWN_ISSUES.md:452-468)
+# and a dead-reckoning run needs that visible in its own record rather than in
+# a document someone has to remember.
+_ACCURACY_ORDER = ("", "UNRELIABLE", "LOW", "MEDIUM", "HIGH")
+
+
+def _worse_accuracy(a: str, b: str) -> str:
+    """The less trustworthy of two accuracy flags. An unknown name wins (is
+    treated as worst): a firmware that starts reporting something new must not
+    be silently upgraded to trustworthy."""
+    if not a:
+        return b
+    if a not in _ACCURACY_ORDER or b not in _ACCURACY_ORDER:
+        return a if a not in _ACCURACY_ORDER else b
+    return a if _ACCURACY_ORDER.index(a) <= _ACCURACY_ORDER.index(b) else b
+
 
 # =============================================================================
 # video
@@ -249,9 +294,27 @@ class C3VideoWorker(LoopWorker):
         self._last_stat = 0.0
         self._imu_marks: deque[float] = deque(maxlen=512)
         self._last_imu_pub = 0.0
+        self._last_imu_seq: int | None = None
         self._imu_log = None
         # Thread-safe hand-off from the GUI thread; see request_sensor_log.
         self._log_q: queue.SimpleQueue = queue.SimpleQueue()
+        # DEPTH SCALE CORRECTION (--depth-scale). Applied to the raw
+        # millimetres ONCE, at the moment a depth frame arrives, so every
+        # consumer — the panel and its cursor probe, the reference-view
+        # capture, FoundationPose, the depth-vs-MAP check — sees the same
+        # corrected stream and the check VERIFIES the correction instead of
+        # measuring around it. Why it exists: 2026-08-23, the C3's stereo
+        # depth measured 1.56x LONG in water against a caliper (mesh 187 mm
+        # from an object measuring 119.73 mm) and 1.71x against the tag
+        # solution over the whole mat — while the colour camera's PnP was
+        # millimetre-accurate. The colour intrinsics are underwater-calibrated;
+        # whatever the stereo pair's are, they do not produce metric water
+        # ranges. This knob is the interim; the fix is an in-water stereo
+        # recalibration (KNOWN_ISSUES).
+        self._depth_scale = float(getattr(opts, "depth_scale",
+                                          DEPTH_SCALE_DEFAULT)
+                                  or DEPTH_SCALE_DEFAULT)
+        self._depth_scale_said = False
         # Set by HardwareBackend when --pose is on. None = perception off, and
         # then _tap_pose does not even copy a frame.
         self.pose_mb = None
@@ -435,6 +498,26 @@ class C3VideoWorker(LoopWorker):
             self._drain_imu()
             if bundle is None:
                 continue                      # timeout: the loop re-checks stop
+            # Only when FRESH: `bundle.frames` carries the latest of every
+            # stream across passes, so an unconditional multiply would scale
+            # the same frame once per pass until the next one arrived.
+            if self._depth_scale != 1.0 and "depth" in bundle.fresh:
+                df = bundle.frames.get("depth")
+                if df is not None and df.image is not None:
+                    df.image = self._scale_depth(df.image, self._depth_scale)
+                if not self._depth_scale_said:
+                    self._depth_scale_said = True
+                    # Say WHERE the number came from. It is on by default now,
+                    # so "(--depth-scale)" alone would credit the operator for
+                    # a correction they may never have typed — and the whole
+                    # 2026-08-24 failure was not knowing whether it was armed.
+                    src = ("default" if self._depth_scale == DEPTH_SCALE_DEFAULT
+                           else "--depth-scale")
+                    self.bus.log.emit(
+                        "warn", f"c3: DEPTH SCALED x{self._depth_scale:g} "
+                                f"({src}) — every consumer sees the "
+                                f"corrected millimetres; depth-vs-MAP should "
+                                f"now read ~1.0x")
             for stream in bundle.fresh:
                 panel = STREAM_TO_PANEL.get(stream)
                 if panel is None or panel not in self.mailboxes:
@@ -444,6 +527,15 @@ class C3VideoWorker(LoopWorker):
                     continue                  # encoded passthrough, not decoded
                 self._publish(panel, stream, frame)
             self._tap_pose(bundle)
+
+    @staticmethod
+    def _scale_depth(img, k: float):
+        """uint16 millimetres, scaled. Zeros stay zero — 0 is DepthAI's
+        "no measurement" and a hole must not become a distance."""
+        out = img.astype(np.float32)
+        out *= float(k)
+        np.clip(out, 0.0, 65535.0, out=out)
+        return out.astype(np.uint16)
 
     # ------------------------------------------------------------ pose tap
     def _tap_pose(self, bundle) -> None:
@@ -538,6 +630,9 @@ class C3VideoWorker(LoopWorker):
         except Exception:                                        # noqa: BLE001
             return                      # the frame path already reports faults
         t = time.monotonic()
+        rows = []
+        worst = ""
+        dropped = 0
         for s in samples:
             self._imu_marks.append(t)
             if self._imu_log is not None:
@@ -545,7 +640,30 @@ class C3VideoWorker(LoopWorker):
                     "t_device": s.t_device, "seq": s.seq,
                     "ax": s.ax, "ay": s.ay, "az": s.az,
                     "gx": s.gx, "gy": s.gy, "gz": s.gz,
+                    "accel_accuracy": s.accel_accuracy,
+                    "gyro_accuracy": s.gyro_accuracy,
                 }, t=t)
+            # A packet can legitimately carry only one of the two reports;
+            # half a sample cannot be integrated, so it is dropped here rather
+            # than becoming a NaN somewhere downstream.
+            row = (s.t_device, s.ax, s.ay, s.az, s.gx, s.gy, s.gz)
+            if any(v != v for v in row):                         # NaN check
+                continue
+            if self._last_imu_seq is not None:
+                gap = int(s.seq) - self._last_imu_seq - 1
+                if 0 < gap < 1000:
+                    dropped += gap
+            self._last_imu_seq = int(s.seq)
+            rows.append(row)
+            for acc in (s.accel_accuracy, s.gyro_accuracy):
+                if acc:
+                    worst = _worse_accuracy(worst, acc)
+        if rows:
+            arr = np.asarray(rows, dtype=np.float64)
+            self.bus.camera_imu.emit(ImuBatch(
+                source="c3", samples=arr, n=arr.shape[0], dropped=dropped,
+                accuracy=worst, t_host_drain=t,
+                t_device_last=float(arr[-1, 0]), conn=Conn.ONLINE))
         if t - self._last_imu_pub < 0.5:
             return
         self._last_imu_pub = t
@@ -1142,7 +1260,21 @@ class VehicleWorker(TimerWorker):
                           "SCALED_PRESSURE", "SCALED_PRESSURE2", "ATTITUDE",
                           "AHRS2", "VFR_HUD", "GLOBAL_POSITION_INT",
                           "LOCAL_POSITION_NED", "BATTERY_STATUS", "SYS_STATUS",
-                          "EKF_STATUS_REPORT", "MOUNT_STATUS", "SERVO_OUTPUT_RAW")
+                          "EKF_STATUS_REPORT", "MOUNT_STATUS", "SERVO_OUTPUT_RAW",
+                          # what the vehicle SAID, incl. "Leak Detected" — a
+                          # recording that cannot show the leak warning is a
+                          # recording that cannot explain the recovery
+                          "STATUSTEXT")
+        # Water in the enclosure. See rov_gui/leak.py: ArduSub reports it only
+        # as STATUSTEXT, so this is fed from tick() rather than from _latest.
+        # `leak_cfg_fn` is injected by HardwareBackend from the command sink,
+        # which is the object that may read parameters (this worker is a
+        # passive observer and never transmits) — same pattern as the MPC
+        # worker's sink_status_fn.
+        self._leak = LeakMonitor()
+        self._leak_reported = 0
+        self._press_reported = 0.0
+        self.leak_cfg_fn = None
 
     def setup(self) -> None:
         from c3_camera.mavlink_log import MavlinkLogger
@@ -1176,6 +1308,12 @@ class VehicleWorker(TimerWorker):
             if (rec["msg_type"] == "HEARTBEAT"
                     and rec.get("_srccomp") not in (None, 1)):
                 continue
+            # STATUSTEXT is an EVENT stream, so it cannot go through _latest
+            # like everything else: keeping only the newest one means a "Leak
+            # Detected" is erased by the next mode-change message that happens
+            # to arrive first. Every record is inspected on the way past.
+            if rec["msg_type"] == "STATUSTEXT":
+                self._note_statustext(rec)
             self._latest[rec["msg_type"]] = rec
             if self._log is not None and rec["msg_type"] in self._log_msgs:
                 self._log.write(rec["msg_type"], rec)
@@ -1190,6 +1328,49 @@ class VehicleWorker(TimerWorker):
         if t - self._last_link > 1.0:
             self._last_link = t
             self.bus.link.emit(self.nic.sample())
+
+    # ----------------------------------------------------------------- leak
+    def _note_statustext(self, rec: dict) -> None:
+        """One STATUSTEXT: into the leak monitor, and onto the log if loud.
+
+        ArduSub repeats "Leak Detected" every 20 s while wet, so this must not
+        emit a log line per message — the mission log would fill with one
+        sentence. The first report of an event is loud; the repeats only
+        refresh the hold inside :class:`~rov_gui.leak.LeakMonitor`.
+        """
+        text = str(rec.get("text", "") or "").replace("\x00", "").strip()
+        sev = rec.get("severity")
+        kind = self._leak.note_statustext(text, sev, t=now())
+        if kind == "leak":
+            if self._leak.leaks_seen != self._leak_reported:
+                self._leak_reported = self._leak.leaks_seen
+                self.bus.log.emit(
+                    "error", "LEAK DETECTED — water in the enclosure. "
+                             "Surface and recover the vehicle.")
+        elif kind == "pressure":
+            if now() - self._press_reported > PRESSURE_REPEAT_S:
+                self._press_reported = now()
+                self.bus.log.emit(
+                    "error", "internal pressure critical (ArduSub "
+                             "FS_PRESS_MAX) — an enclosure is filling")
+        elif kind == "config":
+            self.bus.log.emit("warn", f"vehicle: {text}")
+        elif text and int(sev or 6) <= 4:
+            # Any other WARNING-or-worse the vehicle says. These were being
+            # dropped one layer down until 2026-08-14, which is why prearm
+            # refusals never appeared on this station.
+            self.bus.log.emit("warn", f"vehicle: {text[:80]}")
+
+    def _internal_pressure_hpa(self) -> float | None:
+        """The ENCLOSURE barometer, absolute hPa.
+
+        ``SCALED_PRESSURE`` (id 29) is the autopilot's own baro, inside the
+        electronics tube; ``SCALED_PRESSURE2`` (id 137) is the external Bar30
+        that measures depth. Rising internal pressure is the early sign of a
+        breach, and it is also what ArduSub's FS_PRESS failsafe watches.
+        """
+        hpa = self._get("SCALED_PRESSURE", "press_abs")
+        return None if hpa is None else float(hpa)
 
     # -------------------------------------------------------------- decoding
     def _get(self, msg: str, field: str, default=None):
@@ -1212,9 +1393,16 @@ class VehicleWorker(TimerWorker):
         alt_mm = self._get("GLOBAL_POSITION_INT", "relative_alt")
         if alt_mm is not None:
             return -float(alt_mm) / 1000.0
+        # SCALED_PRESSURE2 (id 137) ONLY — the external Bar30. There used to be
+        # a fallback to SCALED_PRESSURE (id 29) here, and that message is the
+        # autopilot's own barometer INSIDE the electronics tube: a dropped
+        # Bar30 would have silently turned enclosure pressure into a depth,
+        # and that number does not stop at the display — it feeds
+        # VehicleImu.depth_m and therefore the MPC's z whenever
+        # hw_nav.yaml has z_source: pressure. A missing depth sensor must read
+        # as missing (the panel shows "--", the state assembler goes stale and
+        # says why), never as a plausible wrong depth. Removed 2026-08-14.
         hpa = self._get("SCALED_PRESSURE2", "press_abs")
-        if hpa is None:
-            hpa = self._get("SCALED_PRESSURE", "press_abs")
         if hpa is None:
             return None
         return max(0.0, (float(hpa) - SEA_LEVEL_HPA) * 100.0 / (self._rho * G))
@@ -1257,6 +1445,24 @@ class VehicleWorker(TimerWorker):
             "Compass": SensorStat("Compass", att, state(att, 5.0), detail(att)),
             "Heartbeat": SensorStat("Heartbeat", hb, state(hb, 0.5), detail(hb)),
         }
+        # Leak — the row QGC does not have and this station now does. Its
+        # state comes from STATUSTEXT (never from a rate), and it is DEGRADED
+        # rather than green whenever the station cannot prove the vehicle
+        # would report a leak at all. See rov_gui/leak.py.
+        if self.leak_cfg_fn is not None:
+            self._leak.note_config(**self.leak_cfg_fn())
+        ls = self._leak.state()
+        out["Leak"] = SensorStat("Leak", None, ls.conn, ls.detail)
+        # ...and the enclosure barometer beside it, because a leak pad is a
+        # LATE signal: it only trips once water reaches that spot, while
+        # internal pressure starts moving as soon as the seal goes.
+        p_int = self._internal_pressure_hpa()
+        if p_int is not None:
+            out["Enclosure"] = SensorStat(
+                "Enclosure", None,
+                Conn.FAULT if ls.pressure_alarm else Conn.ONLINE,
+                f"{p_int:.0f} hPa internal"
+                + ("  CRITICAL" if ls.pressure_alarm else ""))
         ekf = self._latest.get("EKF_STATUS_REPORT")
         if ekf is not None:
             var = max(float(ekf.get(k, 0.0) or 0.0) for k in
@@ -1325,6 +1531,9 @@ class VehicleWorker(TimerWorker):
                          else (math.degrees(yaw) % 360.0 if yaw is not None else None)),
             water_temp_c=temp_c,
             armed=armed, mode=mode,
+            # Tri-state on purpose: None means "this vehicle would not tell
+            # us", which is NOT the same as dry and must not paint like it.
+            leak=self._leak.state().leak,
             sensors=self._sensors(),
             conn=Conn.ONLINE if connected else Conn.OFFLINE,
             stamp=now())
@@ -1679,6 +1888,10 @@ class MavlinkCommandSink(TimerWorker):
         # 0 and would address "everyone". State it instead of inferring it.
         self.sysid = int(getattr(opts, "cmd_sysid", 255) or 255)
         self.sysid_mygcs: float | None = None    # the vehicle's, once we read it
+        # ArduSub's leak-detector configuration, read back so the Leak row can
+        # distinguish "dry" from "would never say" (rov_gui/leak.py).
+        self._leak_cfg: dict = {}
+        self.leak_cfg_read = False
         self._param_asked = 0.0
         self.target_sys = int(getattr(opts, "target_sysid", 1) or 1)
         self.target_comp = 1                          # MAV_COMP_ID_AUTOPILOT1
@@ -1958,9 +2171,21 @@ class MavlinkCommandSink(TimerWorker):
         cmd = PilotInput() if stale else self.pilot
         if stale and not self._neutral_latched:
             self._neutral_latched = True
+            # THE HELD DRIVES DIE WITH THE DEADMAN, not just the axes. They
+            # are latched LEVELS (set_gripper_drive/set_tilt): whoever set one
+            # non-zero must set it back, and a worker that died mid-hold never
+            # will — while this sink thread keeps heartbeating, so ArduSub's
+            # GCS failsafe never trips either. Before 2026-08-30 a dead
+            # MpcWorker with a replay jaw CLOSE latched would have kept the
+            # close bit on the wire at 20 Hz forever (safety review, replay
+            # change set). Fresh pilot input re-latches whatever is still
+            # being held, so a live G/H key simply re-asserts on the next
+            # frame.
+            self.grip_drive = 0.0
+            self.tilt_drive = 0.0
             self.bus.log.emit("warn",
                               f"deadman: no input for {self.deadman_s * 1000:.0f} ms "
-                              f"— sending neutral")
+                              f"— sending neutral (held drives released)")
         elif not stale:
             self._neutral_latched = False
         self._send(cmd, buttons=self._buttons())
@@ -1992,13 +2217,20 @@ class MavlinkCommandSink(TimerWorker):
         if self.master is None:
             return
         if (self.sysid_mygcs is not None
+                and self.leak_cfg_read
                 and len(self._btn_checked) >= len(self._mapped_buttons())):
             return
         t = time.monotonic()
         if t - self._param_asked > 3.0:
             self._param_asked = t
             try:
-                for name in (b"SYSID_MYGCS", b"JS_LIGHTS_STEPS"):
+                # FS_LEAK_ENABLE / LEAK1_PIN answer the question a leak
+                # indicator cannot answer for itself: would this vehicle say
+                # anything if it flooded? Either at its disabling value makes
+                # a flood completely silent on the link (rov_gui/leak.py), so
+                # without them the panel can only say "unknown", never "dry".
+                for name in (b"SYSID_MYGCS", b"JS_LIGHTS_STEPS",
+                             b"FS_LEAK_ENABLE", b"LEAK1_PIN"):
                     self.master.mav.param_request_read_send(
                         self.target_sys, self.target_comp, name, -1)
                 for key, bit in self._mapped_buttons().items():
@@ -2067,6 +2299,24 @@ class MavlinkCommandSink(TimerWorker):
                 self._note_button_function(int(pid[3:-9]), int(msg.param_value))
             except ValueError:
                 pass
+            return
+        if pid in ("FS_LEAK_ENABLE", "LEAK1_PIN"):
+            self._leak_cfg[pid] = int(msg.param_value)
+            if len(self._leak_cfg) >= 2 and not self.leak_cfg_read:
+                self.leak_cfg_read = True
+                fs = self._leak_cfg.get("FS_LEAK_ENABLE")
+                pin = self._leak_cfg.get("LEAK1_PIN")
+                if fs == 0 or (pin is not None and pin < 0):
+                    self.bus.log.emit(
+                        "warn",
+                        f"leak detector is NOT armed on this vehicle "
+                        f"(FS_LEAK_ENABLE={fs}, LEAK1_PIN={pin}) — a flood "
+                        f"would be silent. Set LEAK1_PIN=27 (Navigator "
+                        f"built-in) and FS_LEAK_ENABLE=1 in QGC to arm it.")
+                else:
+                    self.bus.log.emit(
+                        "info", f"leak detector armed (FS_LEAK_ENABLE={fs}, "
+                                f"LEAK1_PIN={pin})")
             return
         if pid == "JS_LIGHTS_STEPS":
             steps = max(1, int(msg.param_value))
@@ -2213,6 +2463,17 @@ class MavlinkCommandSink(TimerWorker):
             buttons)
         self._sent += 1
 
+    def leak_config(self) -> dict:
+        """ArduSub's leak-detector parameters as far as they have been read.
+
+        Handed to VehicleWorker by HardwareBackend. Plain-attribute read of
+        ints written by this thread — no lock, for the same reason
+        :meth:`status` needs none: a torn read of an int is not a thing
+        CPython does, and a one-tick-stale value costs a repaint.
+        """
+        return {"fs_leak_enable": self._leak_cfg.get("FS_LEAK_ENABLE"),
+                "leak1_pin": self._leak_cfg.get("LEAK1_PIN")}
+
     def status(self) -> tuple[Conn, str]:
         if (self.sysid_mygcs is not None
                 and int(self.sysid_mygcs) != self.sysid):
@@ -2304,7 +2565,14 @@ class PoseWorker(TimerWorker):
             build=build,
             ref_dir=getattr(self.opts, "pose_ref_dir", None) or None,
             max_arc=float(getattr(self.opts, "pose_max_arc", 75.0)),
-            max_views=int(getattr(self.opts, "pose_max_views", 20)))
+            max_views=int(getattr(self.opts, "pose_max_views", 20)),
+            object_size_mm=getattr(self.opts, "pose_object_size", None),
+            # Both were hard-coded until 2026-08-21. Underwater the mask is
+            # lost far more often than on a bench, and a 15 s reacquire budget
+            # spent mid-orbit ends the whole collection in "click again" —
+            # which is not a knob anyone could reach.
+            lost_grace=float(getattr(self.opts, "pose_lost_grace", 3.0)),
+            lost_timeout=float(getattr(self.opts, "pose_lost_timeout", 15.0)))
         # Load eagerly. The model takes seconds to tens of seconds, and doing it
         # on the first click would make the click feel broken; doing it now
         # overlaps with the pilot's setup instead. An idle tracker costs VRAM
@@ -2389,9 +2657,14 @@ class PoseWorker(TimerWorker):
     # is what a plotting script or pandas wants to eat. Same numbers, same
     # capture-time stamps as the POSE rows — a second FORMAT, never a second
     # source (health.py's rule about drawing one number in two places).
+    # `pose_hz` became `pose_hz_measured` on 2026-08-23 and `solve_ms` arrived
+    # beside it. THE RENAME IS THE POINT: files written before that date have a
+    # column called pose_hz holding 1/mean-compute-time, and a reader that looks
+    # up "pose_hz" in a new file must fail loudly rather than quietly read a
+    # different quantity under a familiar name.
     _CSV_HEADER = ("t,frame_seq,x_m,y_m,z_m,distance_m,"
                    "r00,r01,r02,r10,r11,r12,r20,r21,r22,"
-                   "pose_hz,n_register,state\n")
+                   "pose_hz_measured,solve_ms,n_register,state\n")
 
     def _open_csv(self, path: Path) -> None:
         try:
@@ -2421,7 +2694,8 @@ class PoseWorker(TimerWorker):
                f"{T[0]:.6f}", f"{T[1]:.6f}", f"{T[2]:.6f}",
                f"{T[4]:.6f}", f"{T[5]:.6f}", f"{T[6]:.6f}",
                f"{T[8]:.6f}", f"{T[9]:.6f}", f"{T[10]:.6f}",
-               f"{track.pose_hz:.2f}", str(track.n_register), track.state]
+               f"{track.pose_hz:.2f}", f"{track.pose_solve_ms:.1f}",
+               str(track.n_register), track.state]
         self._csv.write(",".join(row) + "\n")
 
     def _write_camera_record(self) -> None:
@@ -2470,6 +2744,12 @@ class PoseWorker(TimerWorker):
                      "camera->body transform is applied; the vehicle's own "
                      "pose is not in this file.",
             "mesh": str(getattr(self.opts, "pose_mesh", "") or ""),
+            # The correction the depth in THIS file's poses was multiplied by
+            # before anything consumed it (C3VideoWorker, --depth-scale).
+            # 1.0 = raw sensor millimetres.
+            "depth_scale_applied": float(
+                getattr(self.opts, "depth_scale", DEPTH_SCALE_DEFAULT)
+                or DEPTH_SCALE_DEFAULT),
         }
         fields.update({"fx": i.fx, "fy": i.fy, "cx": i.cx, "cy": i.cy,
                        "width": i.width, "height": i.height,
@@ -2497,11 +2777,22 @@ class PoseWorker(TimerWorker):
                      item.get("t_capture", 0.0), item.get("seq", 0),
                      K=self._K_matrix(item.get("K")), on_log=self._say)
             self._log_mesh_once(s)
+        # WHICH FRAME THE POSE BELONGS TO. `_step_pipeline` runs inline inside
+        # `submit`, so the pose published below was estimated from the frame
+        # just submitted; on the ticks between camera frames (the 10 Hz
+        # publish gate is independent of frame arrival) it is still that
+        # frame's. One definition, used by the log rows, the CSV and — the
+        # reason it moved onto the dataclass — the object/tag frame pairing in
+        # MpcWorker.on_pose, which needs the SAME float C3VideoWorker._tap_pose
+        # put into the nav mailbox.
+        if item is not None and item.get("t_capture"):
+            self._last_t_cap = float(item["t_capture"])
         t = now()
         if t - self._last_pub < 0.1:          # publish at 10 Hz, not 50
             return
         self._last_pub = t
         track = self._snapshot(s)
+        track.t_capture = float(self._last_t_cap)
         self.bus.pose.emit(track)
         self._announce(track)
         self._log_track(track, item)
@@ -2520,13 +2811,34 @@ class PoseWorker(TimerWorker):
         "fault": ("error", "fault"),
     }
 
+    @staticmethod
+    def _trim_note(word: str, note: str) -> str:
+        """Drop the part of the note that merely repeats the stage word.
+
+        The tracker's note and this table's word are written independently and
+        say the same thing often enough that the log filled with lines like
+        "pose: reconstructing the mesh — reconstructing the mesh (about 2
+        minutes)" and "pose: lost the object — lost — reacquiring (0 s)"
+        (mission_log.txt, 2026-08-23). Strip the overlap rather than the note:
+        the tail ("about 2 minutes", "reacquiring") is the half with the
+        information in it.
+        """
+        n = (note or "").strip()
+        if not n:
+            return ""
+        for lead in (word, word.split()[0] if word else ""):
+            if lead and n.lower().startswith(lead.lower()):
+                n = n[len(lead):].lstrip(" —-:").strip()
+        return n
+
     def _announce(self, track: PoseTrack) -> None:
         if track.state == self._last_state:
             return
         self._last_state = track.state
         level, word = self._STAGE_WORDS.get(track.state, (None, ""))
         if level is not None:
-            note = f" — {track.note}" if track.note else ""
+            trimmed = self._trim_note(word, track.note)
+            note = f" — {trimmed}" if trimmed else ""
             self.bus.log.emit(level, f"pose: {word}{note}")
 
     def _log_mesh_once(self, s) -> None:
@@ -2587,16 +2899,12 @@ class PoseWorker(TimerWorker):
             self._last_event_state = track.state
         if track.state not in ("tracking", "lost", "idle", "live"):
             return
-        # The 10 Hz publish gate is independent of frame arrival, so item is
-        # None on the ticks between camera frames. The pose on those ticks is
-        # still the one estimated from the LAST frame, so it gets that frame's
-        # capture time — not 0.0 (which sorted every such CSV row to the epoch)
-        # and not now() (which is the clock rule sensorlog.py exists to stop).
-        t_cap = float(item.get("t_capture") or 0.0) if item else 0.0
-        if t_cap:
-            self._last_t_cap = t_cap
-        else:
-            t_cap = self._last_t_cap
+        # The frame's CAPTURE time, resolved ONCE in tick() and carried on the
+        # snapshot — not 0.0 (which sorted every such row to the epoch) and not
+        # now() (the clock rule sensorlog.py exists to stop). It used to be
+        # re-derived here from `item`, which meant two definitions of the same
+        # stamp; the pairing in object_nav needs exactly one.
+        t_cap = float(track.t_capture or 0.0)
         if track.T_cam_obj is not None:
             T = track.T_cam_obj
             self._log.write("POSE", {
@@ -2608,7 +2916,8 @@ class PoseWorker(TimerWorker):
                 "pos_m": [round(T[3], 5), round(T[7], 5), round(T[11], 5)],
                 "distance_m": round(float(
                     (T[3] ** 2 + T[7] ** 2 + T[11] ** 2) ** 0.5), 5),
-                "pose_hz": round(track.pose_hz, 2),
+                "pose_hz_measured": round(track.pose_hz, 2),
+                "solve_ms": round(track.pose_solve_ms, 1),
                 "n_register": track.n_register,
                 "mask_px": track.mask_px,
             }, t=t_cap or None)
@@ -2616,7 +2925,10 @@ class PoseWorker(TimerWorker):
         self._log.write("TRACK", {
             "state": track.state, "frame_seq": track.frame_seq,
             "mask_px": track.mask_px, "score": track.score,
-            "sam_hz": round(track.sam_hz, 2),
+            # Renamed with pose_hz and for the same reason: this used to be
+            # SAM2's 1/compute-time and is now the measured mask rate.
+            "sam_hz_measured": round(track.sam_hz, 2),
+            "sam_solve_ms": round(track.sam_solve_ms, 1),
             "skew_ms": round(float(item.get("skew_ms") or 0.0), 2) if item else None,
             "src_w": track.src_w, "src_h": track.src_h,
             # The outline itself, so a recording can be re-analysed offline
@@ -2662,7 +2974,9 @@ class PoseWorker(TimerWorker):
             axes_px=raw.get("axes_px", ()), box_px=raw.get("box_px", ()),
             score=raw.get("score"), mask_px=int(raw.get("mask_px", 0)),
             sam_hz=float(raw.get("sam_hz", 0.0)),
+            sam_solve_ms=float(raw.get("sam_solve_ms", 0.0)),
             pose_hz=float(raw.get("pose_hz", 0.0)),
+            pose_solve_ms=float(raw.get("pose_solve_ms", 0.0)),
             n_register=int(raw.get("n_register", 0)),
             frame_seq=int(raw.get("frame_seq", 0)),
             src_w=int(raw.get("src_w", 0)), src_h=int(raw.get("src_h", 0)),
@@ -2672,6 +2986,11 @@ class PoseWorker(TimerWorker):
             max_views=int(raw.get("max_views", 0)),
             build_s=float(raw.get("build_s", 0.0)),
             distance_m=float(raw.get("distance_m", 0.0)),
+            # None means "not enough pixels to say" and the panel must show
+            # that as "--", never as 0.0 (which reads as perfect).
+            smear_ratio=(float(raw["smear_ratio"])
+                         if raw.get("smear_ratio") is not None else None),
+            smear_max=float(raw.get("smear_max", 0.0)),
             fp_load_s=float(raw.get("fp_load_s", 0.0)),
             pose_expected=bool(raw.get("pose_expected", False)),
             note=raw.get("message", ""), conn=conn, stamp=now())
@@ -2722,6 +3041,12 @@ class HardwareBackend(Backend):
         allow = bool(getattr(opts, "allow_command", False))
         self.sink = (MavlinkCommandSink(bus, opts) if allow
                      else NullCommandSink(bus, opts))
+        # The vehicle worker never transmits (source_system 200, a passive
+        # observer), so the parameter readback that tells the Leak row whether
+        # the detector is even armed has to come from the sink. Same injection
+        # pattern as mpc.sink_status_fn below.
+        if hasattr(self.sink, "leak_config"):
+            self.vehicle.leak_cfg_fn = self.sink.leak_config
         self.workers = [self.video, self.vehicle, self.sink]
         # Object tracking: opt-in, and when it is off nothing is constructed,
         # nothing is imported, and C3VideoWorker does not even copy a frame.
@@ -2794,6 +3119,13 @@ class HardwareBackend(Backend):
         # DIRECT — it runs on the GUI thread and only puts to a queue.
         bus.cmd_log_sensors.connect(self.video.request_sensor_log,
                                     Qt.ConnectionType.DirectConnection)
+        # ...and the same two sinks again for a CONTROLLER run's raw logs
+        # (MpcWorker emits this one when its CSV opens). Same Direct/Auto
+        # asymmetry, for the same reason, and it is an asymmetry of the
+        # RECEIVERS — do not "tidy" one of them to match the other.
+        bus.cmd_log_raw_sensors.connect(self.vehicle.set_sensor_log)
+        bus.cmd_log_raw_sensors.connect(self.video.request_sensor_log,
+                                        Qt.ConnectionType.DirectConnection)
         if self.pose is not None:
             # PoseWorker IS a TimerWorker, so these queued slots are delivered.
             bus.cmd_pose_enable.connect(self.pose.set_enabled)
@@ -2804,7 +3136,18 @@ class HardwareBackend(Backend):
             # Sensor fan-in (worker -> bus -> worker: each hop is a queued
             # snapshot, so the MPC thread never touches another thread's data).
             bus.nav_fix.connect(self.mpc.on_nav_fix)
+            # The object tracker's second consumer. TimerWorker -> TimerWorker,
+            # so this queued slot IS delivered (backends/base.py rule). Wired
+            # unconditionally: with no --pose nothing is emitted, and with no
+            # --pose MpcWorker builds no anchor, so the slot is a no-op twice
+            # over rather than a hidden dependency between two opt-in flags.
+            bus.pose.connect(self.mpc.on_pose)
             bus.vehicle_imu.connect(self.mpc.on_vehicle_imu)
+            # The C3's BNO086, in batches. Emitter is a LoopWorker and the
+            # receiver a TimerWorker, so AutoConnection resolves to Queued and
+            # IS delivered — the mirror image of the cmd_log_sensors case
+            # above, where the LoopWorker was the receiver.
+            bus.camera_imu.connect(self.mpc.on_camera_imu)
             bus.telemetry.connect(self.mpc.on_telemetry)
             bus.thrusters.connect(self.mpc.on_thrusters)
             bus.vehicle_imu.connect(self.tagnav.set_imu_hint)
@@ -2819,6 +3162,7 @@ class HardwareBackend(Backend):
             bus.cmd_mpc_start.connect(self.mpc.start_mission)
             bus.cmd_mpc_mode.connect(self.mpc.set_mode)
             bus.cmd_mpc_scenario.connect(self.mpc.set_scenario)
+            bus.cmd_mpc_dump_meta.connect(self.mpc.dump_run_meta)
             bus.cmd_enable.connect(self.mpc.on_enable)
             bus.cmd_estop.connect(self.mpc.estop)
             bus.cmd_log_sensors.connect(self.mpc.set_sensor_log)

@@ -46,6 +46,7 @@ import os
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -92,6 +93,76 @@ PHASE_FAILED = "failed"
 # plausible and is wrong (``capture.py:61``, MIN_VIEWS). Saying so beats
 # spending two minutes of GPU to find out.
 MIN_REF_VIEWS = 6
+
+# HOW FAR THE OBJECT MAY BE WHILE REFERENCE VIEWS ARE COLLECTED, metres.
+# The pipeline is MEASURED to register at 0.3-0.8 m and to fail at 2.4 m
+# (KNOWN_ISSUES 2026-08-09); upstream's own gate is 0.15-1.5 m, which is the
+# range NeRF will not throw the pixels away in, not the range this works in.
+# The outer bound here is the one past which nothing has ever produced a
+# usable mesh: 2026-08-23 captured at 1.20-1.26, 1.28-1.40 and 1.47-1.49 m and
+# every one of them slipped past the ICP arc budget (121, 104, 160 deg) and
+# built a mesh FoundationPose could not hold a pose on. Frames outside this
+# are not collected AT ALL — they are not merely warned about, which is what
+# happened on all three of those runs. Nothing times out while it waits: the
+# arc only advances on frames that were submitted, so the counter simply sits
+# still with the reason on screen until the object comes closer.
+CAPTURE_RANGE_M = (0.25, 1.00)
+
+# HOW SMEARED THE DEPTH MAY BE AND STILL BE USED, as the ratio of the depth
+# spread inside the mask to the object size that same mask implies
+# (`_frame_depth_quality`). Distance is only a PROXY for this — a dark object
+# smears at 60 cm and a bright one survives 90 — so this measures the thing
+# itself and CAPTURE_RANGE_M stays as the cheap outer bound.
+#
+# 2.0 is not a guess. Every reference capture this station has ever stored was
+# re-scored with `_frame_depth_quality` and grouped by what its mesh turned out
+# to be [측정: sessions/pose_meshes/*/{depth_enhanced,mask,K.txt}, 14 captures,
+# up to 40 frames each; verdicts from `_check_mesh_size`'s table and the
+# 2026-08-24 post-mortem]:
+#
+#     capture                  verdict    p50    frames over 2.0
+#     obj_20260823_210036      usable    0.66          0%
+#     obj_20260809_182250      usable    0.82          0%
+#     obj_20260823_210135      usable    1.05          0%
+#     obj_20260823_205955      usable    1.32          0%
+#     obj_20260823_170438      usable    1.49          0%
+#     obj_20260823_174418      usable    1.53          0%
+#     obj_20260823_195605     unusable   2.44         94%
+#     obj_20260823_163151     unusable   2.78        100%
+#     obj_20260823_195115     unusable   3.03         88%
+#     obj_20260823_213114     unusable   3.35        100%   <- the flown one
+#
+# The usable ones top out at 1.53 and the unusable ones start at 2.44, so the
+# capture verdict belongs in that gap. Per FRAME the separation is cleaner
+# still: at 2.0 every usable capture loses NOTHING and every unusable one loses
+# 88-100% of its frames, which is why the same number serves both.
+#
+# NOTE the ratio is scale-free — spread and size both scale with depth — so
+# `--depth-scale` does not move it, and neither does the object's true size.
+SMEAR_MAX_RATIO_FRAME = 2.0
+# ...and the verdict on the assembled capture. Past this nothing reconstructs:
+# the 33 s of GPU would produce a mesh whose own size check then says "do NOT
+# fly this", which is two warnings and no refusal — exactly what happened on
+# 2026-08-23. Mostly implied by the frame gate above, deliberately: it is the
+# only defence for frames submitted before the intrinsics arrived (the frame
+# gate needs fx and skips when `_np_K` is still None).
+SMEAR_MAX_RATIO_CAPTURE = 2.0
+
+# HOW MUCH LONGER THAN ANYTHING THE CAMERA SAW a mesh may be. A reconstruction
+# from metric RGB-D can only KNOW extents it observed; the longest silhouette
+# across the reference views is a hard lower bound on the object, and a mesh
+# far past it has swallowed something that is not the object (leaking mask,
+# floor shadow, smear extrusion). This is the TAPE-FREE version of the
+# `--pose-object-size` check — the workflow is novel objects, so the automatic
+# bound is the one that is always armed and the tape is optional confirmation.
+#
+# 2.0 splits the archive's gap [측정: scratchpad extrude audit 2026-08-24 over
+# sessions/pose_meshes/* — mesh longest / max observed silhouette]:
+#
+#     usable meshes:   1.08  1.38  1.39  1.52  1.59   (a 3D bound box exceeds
+#                                                      any single projection)
+#     runaway meshes:  2.25 (431 mm), 2.72 (330 mm — the flown one)
+MESH_MAX_SILHOUETTE_RATIO = 2.0
 
 
 # Upstream speaks Korean to its operator; this station's UI is English
@@ -172,6 +243,64 @@ def english(msg: str) -> str:
     return msg
 
 
+class _RateMeter:
+    """How often a NEW result actually appears, on the host clock.
+
+    THIS IS NOT WHAT THE UPSTREAM TRACKERS CALL ``hz``. Both of them —
+    ``sam2_live/tracker.py:507-512`` and ``sam2_live/pose.py:357-365`` — publish
+    ``1 / mean(last 30 job durations)``, i.e. the INVERSE OF COMPUTE TIME: how
+    fast the GPU solves one frame if it is fed back to back. That is a useful
+    number and it is not a rate. Two things make it read wrong on a station
+    panel:
+
+      * a 0.73 s registration and a 20 ms track share one 30-sample window, so
+        one re-acquire drags the figure down and it climbs back over the next
+        thirty jobs — the operator sees "5 Hz ... 9 Hz ... 5 Hz" and reads it
+        as the object being tracked erratically (2026-08-23);
+      * it says nothing about how often a pose actually ARRIVES, which is what
+        anything downstream (the overlay, the object anchor, a follow) gets.
+
+    So this counts arrivals instead. ``note`` takes the result OBJECT: both
+    trackers assign a freshly allocated array on every solve and leave the old
+    one in place when a solve fails or is skipped, so identity — not equality —
+    is the exact test for "this is a new one". Equality would also call a
+    perfectly still object's repeated identical pose a non-event.
+
+    ``hz`` divides by the time to NOW rather than to the last arrival, so the
+    figure decays the moment results stop instead of freezing at whatever the
+    rate was when they did.
+    """
+
+    def __init__(self, window_s: float = 2.0, cap: int = 256):
+        self.window_s = float(window_s)
+        self._stamps = deque(maxlen=int(cap))
+        self._last = None
+
+    def note(self, result, t: float) -> bool:
+        """Record one observation. True if it was a NEW result."""
+        if result is None:
+            self._last = None
+            return False
+        if result is self._last:
+            return False
+        self._last = result
+        self._stamps.append(float(t))
+        return True
+
+    def hz(self, t: float) -> float:
+        cut = float(t) - self.window_s
+        while self._stamps and self._stamps[0] < cut:
+            self._stamps.popleft()
+        if len(self._stamps) < 2:
+            return 0.0
+        span = float(t) - self._stamps[0]
+        return (len(self._stamps) - 1) / span if span > 0 else 0.0
+
+    def reset(self) -> None:
+        self._stamps.clear()
+        self._last = None
+
+
 class PoseSessionError(RuntimeError):
     """Raised by start() only. Everything after that is reported, not raised."""
 
@@ -198,7 +327,8 @@ class PoseSession:
                  mesh: str | None = None,
                  lost_grace: float = 3.0, lost_timeout: float = 15.0,
                  build: bool = False, ref_dir: Path | str | None = None,
-                 max_arc: float = 75.0, max_views: int = 20):
+                 max_arc: float = 75.0, max_views: int = 20,
+                 object_size_mm: float | None = None):
         self.src_dir = Path(src_dir) if src_dir else DEFAULT_SRC
         self.model = model
         self.ckpt = ckpt
@@ -207,6 +337,10 @@ class PoseSession:
         self.lost_timeout = float(lost_timeout)
         self.ref_root = Path(ref_dir) if ref_dir else Path("sessions/pose_meshes")
         self.max_arc = float(max_arc)
+        # The operator's tape measure, or None. Used to CHECK the
+        # reconstruction, never to rescale it — see _check_mesh_size.
+        self.object_size_mm = (float(object_size_mm)
+                               if object_size_mm else None)
         self.max_views = int(max_views)
 
         # A mesh short-circuits the first two phases; asking to build without
@@ -225,6 +359,15 @@ class PoseSession:
         self._build_t0 = 0.0
         self._build_s = 0.0
         self._cap_dist = 0.0           # camera->object, m, during capture
+        # Depth-smear ratio: the LIVE one (the running median over accepted
+        # frames, or the offending value while a frame is being refused) and
+        # the accepted history it is taken from. This is the number that
+        # predicts the mesh, so it belongs on screen while the orbit can still
+        # be changed — not only in the summary after it is over.
+        self._smear = None
+        self._smear_hist: deque = deque(maxlen=64)
+        self._smear_reject = 0         # frames refused by the smear gate
+        self._silh_mm = None           # longest silhouette seen, mm (max)
         self._mesh_lines: tuple = ()
 
         self._live = None              # sam2_live.tracker.LiveTracker
@@ -244,6 +387,11 @@ class PoseSession:
         self._pending_click: tuple[float, float] | None = None
         # pose watchdog state (see the constants above)
         self._prev_sam_state = ""
+        # MEASURED update rates — how often a new mask / a new pose actually
+        # arrives. Deliberately separate from what the trackers publish as
+        # `hz`, which is 1/compute-time (see _RateMeter).
+        self._sam_rate = _RateMeter()
+        self._pose_rate = _RateMeter()
         self._bad_iou = 0
         self._failed_reg = 0
         self._last_reg = 0.0
@@ -417,6 +565,8 @@ class PoseSession:
                 pass
         self._prev_sam_state = ""
         self._bad_iou = self._failed_reg = 0
+        self._sam_rate.reset()
+        self._pose_rate.reset()
         self._pose_note = ""
         self._abandon_build(on_log)
         # Back to the top of whichever pipeline this session was configured for.
@@ -427,7 +577,10 @@ class PoseSession:
         if self.phase in (PHASE_CAPTURE, PHASE_BUILD, PHASE_FAILED):
             self.phase = PHASE_CAPTURE if self._wants_build else PHASE_OFF
             self._n_views, self._arc_deg, self._build_s = 0, 0.0, 0.0
-            self._phase_note = ""
+            self._smear, self._phase_note = None, ""
+            self._smear_hist.clear()
+            self._smear_reject = 0
+            self._silh_mm = None
 
     def _abandon_build(self, on_log=None) -> None:
         with self._lock:
@@ -458,6 +611,29 @@ class PoseSession:
             return
         live.submit(color, click=click)
         self._step_pipeline(color, depth, on_log)
+        self._note_rates(live)
+
+    def _note_rates(self, live) -> None:
+        """Sample both trackers' latest result, ONCE PER SUBMITTED FRAME.
+
+        This is the right sampling point and not merely a convenient one:
+        neither tracker can produce more than one result per frame handed to it
+        (each keeps a single job slot and overwrites it), so one look per
+        `submit` cannot miss an arrival, and `poll` — which the station calls at
+        its 10 Hz publish gate — would alias anything faster than that.
+        """
+        t = time.monotonic()
+        try:
+            self._sam_rate.note(live.snapshot().get("mask"), t)
+        except Exception:                                        # noqa: BLE001
+            pass
+        with self._lock:
+            fp = self._pose
+        if fp is not None:
+            try:
+                self._pose_rate.note(fp.snapshot().get("pose"), t)
+            except Exception:                                    # noqa: BLE001
+                pass
 
     # -------------------------------------------------------------- pipeline
     def _step_pipeline(self, color, depth, on_log=None) -> None:
@@ -525,6 +701,48 @@ class PoseSession:
             if cap is None:
                 return
         if mask.any():
+            d = _masked_depth_m(depth, mask)
+            lo, hi = CAPTURE_RANGE_M
+            if d is not None and not (lo <= d <= hi):
+                self._n_views = int(cap.snapshot().get("n", 0))
+                self._cap_dist = d
+                self._phase_note = (
+                    f"object {d * 100:.0f} cm away — collecting nothing until "
+                    f"it is {lo * 100:.0f}-{hi * 100:.0f} cm "
+                    f"(it registers at 30-80 cm)")
+                return
+            # THE SMEAR GATE, on the frame rather than on the mesh it would
+            # have produced. Until 2026-08-24 this measurement existed but ran
+            # ONCE, in _finish_capture, as a warning nobody could act on any
+            # more: the orbit was over, and the next thing to happen was 33 s
+            # of GPU building the mesh it had just predicted would be wrong.
+            # Judging each frame instead means a smeared capture cannot be
+            # assembled at all — the counter simply stops advancing, which is
+            # the same story the distance gate above already tells and the one
+            # the pilot already knows how to read.
+            with self._lock:
+                K = self._np_K
+            q = (_frame_depth_quality(depth, mask, K[0, 0])
+                 if K is not None else None)
+            if q is not None:
+                ratio = q[0] / q[1]
+                if ratio > SMEAR_MAX_RATIO_FRAME:
+                    self._n_views = int(cap.snapshot().get("n", 0))
+                    if d is not None:
+                        self._cap_dist = d
+                    self._smear = float(ratio)
+                    self._smear_reject += 1
+                    self._phase_note = (
+                        f"depth is a {ratio:.1f}x smear ({q[0]:.0f} mm deep on "
+                        f"a {q[1]:.0f} mm object) — collecting nothing until it "
+                        f"is under {SMEAR_MAX_RATIO_FRAME:.1f}x. Get closer "
+                        f"(30-80 cm), steadier, and off a reflective floor.")
+                    return
+                # Accepted: keep the running median, which is what the whole
+                # capture will be judged by and so the only honest thing to
+                # show while the pilot can still change it.
+                self._smear_hist.append(float(ratio))
+                self._smear = float(np.median(self._smear_hist))
             cap.submit(color, depth, mask)
 
         cs = cap.snapshot()
@@ -553,22 +771,102 @@ class PoseSession:
         self._arc_deg = float(getattr(rec, "arc", self._arc_deg) or 0.0)
         if on_log:
             on_log("info", f"pose: views {english(rec.summary())}")
+        # THE NUMBER THAT EXPLAINS THE MESH, printed before the mesh exists.
+        # Everything downstream — a long mesh, an object placed metres away,
+        # a position that swings with heading — is this one measurement, and
+        # until 2026-08-23 nothing said it out loud.
+        with self._lock:
+            K = self._np_K
+        q = (self.depth_quality(rec.frames, K[0, 0])
+             if K is not None and getattr(rec, "frames", None) else None)
+        # ...and the largest silhouette any view actually saw — the lower
+        # bound the finished mesh will be judged against (`_check_mesh_size`)
+        # when no tape measurement was given.
+        if K is not None and getattr(rec, "frames", None):
+            silhs = [_frame_silhouette_mm(it[1], it[2], K[0, 0])
+                     for it in rec.frames]
+            silhs = [x for x in silhs if x]
+            self._silh_mm = max(silhs) if silhs else None
+        bad = False
+        if q is not None:
+            spread, size = q
+            ratio = spread / max(size, 1e-6)
+            self._smear = float(ratio)
+            bad = ratio > SMEAR_MAX_RATIO_CAPTURE
+            if on_log:
+                on_log("warn" if bad else "info",
+                       f"pose: depth inside the mask spreads {spread:.0f} mm on "
+                       f"an object that measures {size:.0f} mm across"
+                       + (f" — {ratio:.1f}x. The mask is fine; the DEPTH in it "
+                          f"is a smear, and the mesh would come out long in "
+                          f"whichever direction it points."
+                          if bad else " — good"))
+        if bad:
+            # AND THAT IS A REFUSAL, not a note. This measurement predicts the
+            # mesh: on 2026-08-23 it said 3.3x here, 33 s of GPU then built a
+            # 333 mm mesh of a 120 mm object, the mesh check said "do NOT fly
+            # this mesh", and it was flown — two warnings, no gate, and the
+            # failure landed five minutes later as a vehicle chasing a phantom.
+            # Stopping costs the pilot one more orbit and costs the run nothing.
+            self.phase = PHASE_FAILED
+            self._phase_note = (
+                f"depth in these views is a {self._smear:.1f}x smear (limit "
+                f"{SMEAR_MAX_RATIO_CAPTURE:.1f}x) — not reconstructing, the "
+                f"mesh would come out long. Get closer (30-80 cm), turn more "
+                f"slowly, then press TRACK again")
+            if on_log:
+                on_log("warn", f"pose: {self._phase_note}")
+            return
         if rec.n < MIN_REF_VIEWS:
             self.phase = PHASE_FAILED
             # Say what ran out, not just that something did. The arc is a
             # budget spent by ROTATION, so the usual cause is turning too fast:
             # 75 deg goes by while most frames are still being rejected, and
             # the count never reaches six.
+            # ...and if the SMEAR gate is what ate them, say that instead of
+            # "turn more slowly": the counter and the cure are different. A
+            # capture starved by smear is one the pilot fixes by closing the
+            # distance, and "only 3 usable views" alone points at the orbit.
             self._phase_note = (
                 f"stopped after {self._arc_deg:.0f} deg with only {rec.n} "
-                f"usable views (need {MIN_REF_VIEWS}) — turn the object more "
-                f"slowly, keep it 30-80 cm away, then press TRACK again")
+                f"usable views (need {MIN_REF_VIEWS}) — "
+                + (f"{self._smear_reject} frames refused for depth smear"
+                   + (f" (worst {self._smear:.1f}x)" if self._smear else "")
+                   + ": get closer, 30-80 cm, and off a reflective floor"
+                   if self._smear_reject else
+                   "turn the object more slowly, keep it 30-80 cm away")
+                + ", then press TRACK again")
             if on_log:
                 on_log("warn", f"pose: {self._phase_note}")
             return
+        # THE ARC IS THE BUDGET THAT MATTERS, and it is the one nothing warned
+        # about. Collection ends on ROTATION, not on view count — capture.py
+        # says so in as many words ("뷰 수와 무관하다") — because the per-view
+        # camera pose comes from colored ICP against the accumulated cloud and
+        # upstream measured where that falls apart: 9.7 mm at 80 deg, 87 mm at
+        # 100, 283 mm at 120 (capture.py:7-20). So a capture that ENDED at 101
+        # or 160 deg did not merely stop early, it built its mesh out of views
+        # whose poses are wrong by centimetres — and the only symptom
+        # downstream is FoundationPose failing to hold a pose on the result.
+        #
+        # Overshooting the 75 deg cap by that much is itself the tell: `arc` is
+        # the absolute rotation from the START pose, so it can only jump when
+        # the ICP slips. Turning more slowly does not fix a slip.
+        # 2026-08-23: three captures in a row ended at 101 / 104 / 160 deg and
+        # the "only N views" line was the only thing said about any of them.
+        if self._arc_deg > 85.0 and on_log:
+            on_log("warn",
+                   f"pose: this mesh was built at {self._arc_deg:.0f} deg of "
+                   f"accumulated rotation — the ICP budget is 75 deg (per-view "
+                   f"pose error: 9.7 mm at 80 deg, 87 mm at 100, 283 mm at "
+                   f"120). The arc can only jump like that when registration "
+                   f"slips, so expect the pose to be unreliable. Re-run with "
+                   f"the object matte and well lit, and watch the reject line.")
         if rec.n < 10 and on_log:
-            on_log("warn", f"pose: only {rec.n} views (10+ recommended); the "
-                           f"mesh may be poor")
+            on_log("warn", f"pose: only {rec.n} views (10+ recommended). NOTE: "
+                           f"collection ends on ROTATION, not on count — more "
+                           f"views have to come from fewer REJECTED frames "
+                           f"inside the 75 deg arc, not from turning further")
         path = rec.write()
         if on_log:
             on_log("info", f"pose: reference views -> {path}")
@@ -672,13 +970,162 @@ class PoseSession:
         # (``nerf.py:7-13``). These lines are the only warning anyone gets.
         lines = tuple(self._verify(b.ref_dir, b.mesh_path))
         self._mesh_lines = lines
-        if on_log:
-            for ln in lines:
-                on_log("info", f"pose: {ln}")
+        # ONE line, not one per check (2026-08-23). These stay in the operator
+        # log rather than dropping to `debug` — they are the only warning that
+        # a reconstruction failed quietly — but three consecutive lines of
+        # upstream Korean diagnostics next to the station's own English mesh
+        # summary was most of what the MISSION LOG held while a mesh built.
+        if on_log and lines:
+            on_log("info", "pose: mesh check — " + "  |  ".join(lines))
         self.mesh = b.mesh_path
+        # ...and the size gate has the LAST word. Before 2026-08-24 this only
+        # warned, and 0823_213109 flew the very mesh it had just condemned.
+        if not self._check_mesh_size(self.mesh, on_log):
+            return
         self.phase = PHASE_POSE
         self._phase_note = ""
         self._start_pose_if_needed(on_log)
+
+    @staticmethod
+    def depth_quality(frames, fx: float):
+        """(median depth spread, implied object size), millimetres, or None.
+
+        THE MASK IS USUALLY FINE AND IT IS NOT THE QUESTION. What goes into the
+        reconstruction is the DEPTH inside that mask, and on this camera that
+        degrades with RANGE far faster than the picture does. Measured over
+        every reference capture stored on 2026-08-23
+        (`sessions/pose_meshes/*/`, p5-p95 of the depth inside the mask):
+
+            capture range   spread inside the mask   mesh length
+              510 mm            102 mm                  182 mm
+              626 mm            142 mm                  239 mm
+             1210 mm            284 mm                  171 mm
+             1369 mm            265 mm                  470 mm
+             1358 mm            714 mm                  -
+
+        The object is about 110 mm across. At half a metre the spread is the
+        object; at 1.4 m it is two to six times the object, so the point cloud
+        being fused is a smear, and the mesh comes out long in the direction
+        that smear points. That is the whole failure: not scale, not the mask,
+        DISTANCE. The station's own capture guidance already says 30-80 cm; the
+        upstream view gate accepts anything out to 1.5 m, which is where these
+        captures were taken.
+
+        The size is implied from the mask AREA at the measured range, so both
+        numbers come from the same frames and can be compared directly.
+        """
+        spreads, sizes = [], []
+        for item in frames:
+            q = _frame_depth_quality(item[1], item[2], fx)
+            if q is None:
+                continue
+            spreads.append(q[0])
+            sizes.append(q[1])
+        if not spreads:
+            return None
+        return float(np.median(spreads)), float(np.median(sizes))
+
+    def _check_mesh_size(self, mesh_path, on_log=None) -> bool:
+        """Compare the reconstruction's dimensions with the operator's tape.
+
+        NOT a rescale, and the difference matters. This path reconstructs from
+        METRIC RGB-D, so the mesh already has a size and there is nothing to
+        anchor — scaling it uniformly would shrink the dimensions that are
+        RIGHT in order to fix the one that is wrong. What eight reconstructions
+        of one object on 2026-08-23 actually show (`sessions/pose_meshes/`):
+
+            verts    oriented bbox (mm)
+            18548    101 x 114 x 171
+            30147     87 x 112 x 195
+            59542     88 x 175 x 239
+           101428    108 x 172 x 470
+
+        The two short sides are stable to a couple of centimetres. Only the
+        LONG one grows, and it grows with the vertex count — the reconstruction
+        is picking up geometry that is not the object (a leaking mask, a
+        shadow, a smear from pose drift), not getting the scale wrong. The
+        19:56 capture's own mask says so independently: 1782 px at 1.28 m is
+        111 cm^2 of visible object, which is an ~11 cm face, not a 47 cm one.
+
+        So the measurement's job here is to CATCH that, loudly, at the moment
+        the mesh is built — because the only symptom downstream is
+        FoundationPose failing to hold a pose, hours later.
+        """
+        try:
+            import trimesh
+
+            m = trimesh.load(str(mesh_path), force="mesh")
+            _T, extents = trimesh.bounds.oriented_bounds(m)
+            longest = float(max(extents)) * 1000.0
+        except Exception:                                        # noqa: BLE001
+            return True                # cannot measure -> cannot refuse
+        # NO TAPE, and none needed: the workflow is NOVEL objects — reference
+        # views are the whole input, so the always-armed check is the metric
+        # envelope those views define. The longest silhouette any view saw is
+        # a hard lower bound on the object; a mesh far past it swallowed
+        # something that is not the object. The tape branch below is stricter
+        # and wins when a measurement was volunteered.
+        if not self.object_size_mm:
+            if not self._silh_mm:
+                return True            # nothing to judge against
+            ratio = longest / float(self._silh_mm)
+            if ratio > MESH_MAX_SILHOUETTE_RATIO:
+                return self._refuse_mesh(
+                    f"this mesh is {longest:.0f} mm long but the largest "
+                    f"silhouette any reference view saw is "
+                    f"{self._silh_mm:.0f} mm ({ratio:.1f}x, limit "
+                    f"{MESH_MAX_SILHOUETTE_RATIO:.1f}x) — it has swallowed "
+                    f"something that is not the object (leaking mask / shadow "
+                    f"/ pose smear). Not flying it: press TRACK again with "
+                    f"the object better separated from the floor",
+                    on_log)
+            if on_log:
+                on_log("info",
+                       f"pose: mesh size checks out — {longest:.0f} mm "
+                       f"against a {self._silh_mm:.0f} mm max observed "
+                       f"silhouette ({ratio:.1f}x, metric envelope)")
+            return True
+        ratio = longest / float(self.object_size_mm)
+        if ratio > 1.25:
+            # A REFUSAL since 2026-08-24, not a warning. 0823_213109 printed
+            # exactly this message ("Do NOT fly this mesh"), nothing enforced
+            # it, and the mesh was flown into the follow failure it predicted.
+            return self._refuse_mesh(
+                f"this mesh is {longest:.0f} mm long but you measured "
+                f"{self.object_size_mm:.0f} mm ({ratio:.1f}x). The "
+                f"reconstruction is METRIC, so it has not mis-scaled — it "
+                f"has swallowed something that is not the object (leaking "
+                f"mask / shadow / pose smear). Not flying it: press TRACK "
+                f"again and re-run with the object better separated from "
+                f"the floor",
+                on_log)
+        if on_log is None:
+            return True
+        if ratio < 0.8:
+            on_log("warn",
+                   f"pose: this mesh is only {longest:.0f} mm long against "
+                   f"your measured {self.object_size_mm:.0f} mm — the "
+                   f"reconstruction covered part of the object. Poses will "
+                   f"work only from the angles it did cover.")
+        else:
+            on_log("info", f"pose: mesh size checks out — {longest:.0f} mm "
+                           f"against your measured {self.object_size_mm:.0f} mm")
+        return True
+
+    def _refuse_mesh(self, why: str, on_log=None) -> bool:
+        """A mesh the size check condemned does not get flown, full stop.
+
+        Clearing ``self.mesh`` matters as much as the phase: a re-click after
+        PHASE_FAILED restarts the capture, and a mesh left behind here would
+        be picked up by "a mesh, once reconstructed, is kept" and re-registered
+        against — the exact fly-the-condemned-mesh path this refusal exists to
+        close."""
+        self.mesh = None
+        self.phase = PHASE_FAILED
+        self._phase_note = why
+        if on_log:
+            on_log("warn", f"pose: {why}")
+        return False
 
     def _verify(self, ref_dir, mesh_path) -> list:
         try:
@@ -816,7 +1263,13 @@ class PoseSession:
             "contours": contours,
             "score": _finite(snap.get("score")),
             "mask_px": int(mask.sum()) if mask is not None else 0,
-            "sam_hz": float(snap.get("hz") or 0.0),
+            # MEASURED, not 1/compute-time — see _RateMeter. The trackers'
+            # own `hz` still travels, as `*_solve_ms`, because "how long does
+            # the GPU take on this object" is a real question; it is just not
+            # the one a number labelled Hz answers.
+            "sam_hz": self._sam_rate.hz(time.monotonic()),
+            "sam_solve_ms": (1000.0 / float(snap["hz"])
+                             if snap.get("hz") else 0.0),
             "message": english(str(snap.get("message") or "")),
             "frame_seq": seq,
             "src_w": w,
@@ -825,6 +1278,7 @@ class PoseSession:
             "axes_px": (),
             "box_px": (),
             "pose_hz": 0.0,
+            "pose_solve_ms": 0.0,
             "n_register": 0,
             "iou": None,
             "mesh": self._mesh_desc,
@@ -835,6 +1289,10 @@ class PoseSession:
             "max_views": self.max_views,
             "build_s": self._build_s,
             "distance_m": self._cap_dist,
+            # The number that predicts the mesh, live. None until enough
+            # pixels have been seen to mean anything.
+            "smear_ratio": self._smear,
+            "smear_max": SMEAR_MAX_RATIO_FRAME,
             "fp_load_s": 0.0,
             # Whether a 6-DoF pose is even expected. Without it the overlay
             # cannot tell "no pose because you asked for a mask" apart from
@@ -854,7 +1312,9 @@ class PoseSession:
                 # view into something the worker is about to overwrite.
                 out["T_cam_obj"] = tuple(float(v)
                                          for v in np.asarray(T).reshape(-1))
-            out["pose_hz"] = float(ps.get("hz") or 0.0)
+            out["pose_hz"] = self._pose_rate.hz(time.monotonic())
+            out["pose_solve_ms"] = (1000.0 / float(ps["hz"])
+                                    if ps.get("hz") else 0.0)
             out["n_register"] = int(ps.get("n_register") or 0)
             fp_ready = bool(fp.ready.is_set()) and not fp.fatal
             if not fp_ready and fp_t0:
@@ -1094,6 +1554,89 @@ def _project(pts, K) -> tuple:
         out.append((float(fx * p[i, 0] / z[i] + cx),
                     float(fy * p[i, 1] / z[i] + cy)))
     return tuple(out)
+
+
+def _frame_depth_quality(depth_mm, mask, fx: float):
+    """ONE frame's ``(depth spread, implied object size)`` in millimetres.
+
+    Both numbers come from the same pixels, so they can be divided: the spread
+    is p5-p95 of the depth inside the mask, and the size is the width that
+    mask's AREA implies at that range (``sqrt(area) * median_depth / fx``). The
+    ratio is therefore "how many object-widths deep does the sensor think this
+    object is" — 1 means the point cloud is the object, 3 means it is a smear
+    three times longer than the thing, and the mesh comes out long in whatever
+    direction the smear points.
+
+    Needs no ICP, no pose and no tape measure, which is what makes it usable as
+    a GATE on a frame that has not been registered yet — the same property that
+    makes ``_masked_depth_m`` usable, and a strictly better question than the
+    range it gates on.
+    """
+    if depth_mm is None or mask is None or not fx:
+        return None
+    try:
+        d = np.asarray(depth_mm)
+        m = np.asarray(mask)
+        if d.shape != m.shape:
+            return None
+        k = (m > 0) & (d > 0)
+        v = d[k].astype(float)
+        if v.size < 50:
+            return None                  # a handful of pixels is not a shape
+        spread = float(np.percentile(v, 95) - np.percentile(v, 5))
+        size = math.sqrt(float(k.sum())) * float(np.median(v)) / float(fx)
+        if not (math.isfinite(spread) and math.isfinite(size) and size > 0.0):
+            return None
+        return spread, size
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _frame_silhouette_mm(depth_mm, mask, fx: float) -> float | None:
+    """ONE frame's longest silhouette side, millimetres: the mask's bounding
+    box, converted at the mask's own median range (mm/px = z / fx).
+
+    This is the largest extent the camera actually OBSERVED in that frame, so
+    the max over a capture is a hard lower bound on the object — and the bound
+    a finished mesh is judged against when no tape measurement was given
+    (MESH_MAX_SILHOUETTE_RATIO)."""
+    if depth_mm is None or mask is None or not fx:
+        return None
+    try:
+        d = np.asarray(depth_mm)
+        m = np.asarray(mask)
+        if d.shape != m.shape:
+            return None
+        k = (m > 0) & (d > 0)
+        v = d[k].astype(float)
+        if v.size < 50:
+            return None
+        ys, xs = np.nonzero(m > 0)
+        px = float(max(ys.max() - ys.min() + 1, xs.max() - xs.min() + 1))
+        out = px * float(np.median(v)) / float(fx)
+        return out if math.isfinite(out) and out > 0.0 else None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _masked_depth_m(depth_mm, mask) -> float | None:
+    """Median depth over the mask, metres — or None if there is nothing to
+    measure. The raw sensor's own statement of how far the object is, needing
+    no ICP and no pose, which is what makes it usable as a GATE on frames that
+    have not been registered yet."""
+    if depth_mm is None or mask is None:
+        return None
+    try:
+        d = np.asarray(depth_mm)
+        m = np.asarray(mask).astype(bool)
+        if d.shape != m.shape:
+            return None
+        good = d[m & (d > 0)]
+        if good.size < 50:
+            return None                  # a handful of pixels is not a range
+        return float(np.median(good)) / 1000.0
+    except Exception:                                            # noqa: BLE001
+        return None
 
 
 def _finite(v) -> float | None:

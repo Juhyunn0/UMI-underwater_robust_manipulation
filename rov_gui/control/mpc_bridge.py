@@ -39,6 +39,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .state_assembler import rot_zyx
+
 _MARINEGYM = Path(__file__).resolve().parents[2] / "bluerov2_mujoco_marinegym"
 
 _dob = None          # dict of the imported dobmpc modules, once
@@ -140,9 +142,28 @@ def _Rz_flu(yaw):
 class HwDobMpc:
     """The hardware twin of the sim's DOBMPCController (see module docstring)."""
 
+    #: every mode this ONE solver serves. The ``dob`` prefix decides whether
+    #: the EAOB's w_hat reaches the solver; the ``_tuned`` suffix decides
+    #: whether the position weight is rotated into the path frame
+    #: (path_cost.py). Both are runtime flags on the same generated OCP —
+    #: neither costs a second acados build.
+    MODES = ("mpc", "dobmpc", "mpc_tuned", "dobmpc_tuned")
+
+    #: May a ``follow`` mission be armed on this controller? Yes: this bridge
+    #: takes a MOVING setpoint with a velocity feedforward (``set_target_ned``
+    #: keeps ``v_ned`` and extrapolates it across the horizon), which is
+    #: exactly what following a moving object needs. Contrast HwMpcc, which
+    #: discards it. Read fail-closed by MpcWorker via ``getattr(..., False)``,
+    #: so a controller that has not thought about this cannot be followed on.
+    follow_ok = True
+
     def __init__(self, mode: str, mpc_cfg, log=print):
-        assert mode in ("mpc", "dobmpc"), mode
-        self.mode = mode
+        assert mode in self.MODES, mode
+        self._mode = mode
+        self.dob = mode.startswith("dobmpc")
+        self.tuned = mode.endswith("_tuned")
+        self._w_tuned = False       # is a rotated W currently in the solver?
+        self._wt = None
         self.cfg = mpc_cfg
         d = import_dobmpc(mpc_cfg.rov_model)
         self.frames = d["frames"]
@@ -165,7 +186,39 @@ class HwDobMpc:
         self.build_s = time.perf_counter() - t0
         self.solver_kind = ("acados" if type(self.nmpc).__name__ == "AcadosNMPC"
                             else "ipopt")
+        # NO IPOPT INSIDE THE 20 Hz TICK. acados' failure path builds the
+        # casadi IPOPT NMPC lazily and solves it to full convergence, in the
+        # calling thread. The sim can afford that; this loop cannot. 2026-08-23
+        # one status-4 solve blocked the MPC worker ~6.5 s, and the sink's
+        # 500 ms deadman plus the window's 1.5 s freshness watchdog released
+        # control to the pilot in the middle of a follow. Holding the previous
+        # wrench is the bounded answer, and `max_solver_fails` still disengages
+        # on the third consecutive failure.
+        if hasattr(self.nmpc, "disable_fallback"):
+            self.nmpc.disable_fallback("real-time station loop")
+            log("mpc: acados IPOPT fallback DISABLED — a failed solve holds "
+                "the previous wrench; 3 in a row disengage")
         self.w_clip = np.asarray(mpc_cfg.w_hat_clip, float)
+        # The along/cross split. Built for EVERY mode, not just the tuned
+        # ones, so the baseline W is always on hand to write back and so the
+        # meta can state what the tuned modes WOULD have used.
+        from .path_cost import PathFrameWeights
+
+        self._wt = PathFrameWeights(P.MPC_Q, P.MPC_R, P.MPC_QN,
+                                    getattr(mpc_cfg, "mpc_tuned", None))
+        if self.tuned and self.solver_kind != "acados":
+            raise RuntimeError(
+                f"{mode} needs the acados solver (the per-stage weight is an "
+                f"acados cost_set); make_nmpc fell back to {self.solver_kind}")
+        if self.tuned:
+            log(f"mpc: {mode} — path-frame Q, q_along {self._wt.q_along:.1f} "
+                f"/ q_cross {self._wt.q_cross:.1f} "
+                f"(x{self._wt.anisotropy:.1f}) on a {self._wt.q_xy:.1f} "
+                f"isotropic baseline"
+                + ("" if self._wt.tune["apply_terminal"]
+                   else "; TERMINAL LEFT ISOTROPIC")
+                + ("; velocity split ON" if self._wt.tune["split_velocity"]
+                   else ""))
 
         # references (world FLU — the sim wrapper's convention, kept verbatim)
         self.p_ref = np.zeros(3)
@@ -174,6 +227,7 @@ class HwDobMpc:
         self.r_ref = 0.0
         self.yaw_target = 0.0
         self._ref_traj = None
+        self._path_plan = None
         self.scenario: dict | None = None
 
         self.eaob = None
@@ -188,6 +242,29 @@ class HwDobMpc:
         self._probe(log)
 
     # ------------------------------------------------------------------ probe
+    # ``MpcWorker.set_mode`` assigns ``ctrl.mode = mode`` to flip between the
+    # modes this one object serves, so the flags must move with it — and the
+    # solver must not keep a rotated W after a switch back to the baseline.
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    @mode.setter
+    def mode(self, value: str) -> None:
+        value = str(value)
+        if value not in self.MODES:
+            raise ValueError(f"mode must be one of {self.MODES}, got {value!r}")
+        if value.endswith("_tuned") and self.solver_kind != "acados":
+            raise RuntimeError(
+                "mpc_tuned needs the acados solver (the per-stage weight is "
+                f"an acados cost_set); this build fell back to "
+                f"{self.solver_kind}")
+        self._mode = value
+        self.dob = value.startswith("dobmpc")
+        self.tuned = value.endswith("_tuned")
+        if not self.tuned:
+            self._restore_base_weights()
+
     def _probe(self, log) -> None:
         """One throwaway solve so 'which solver, how fast' is a fact, not a
         hope — make_nmpc downgrades to IPOPT silently on any acados problem."""
@@ -222,14 +299,18 @@ class HwDobMpc:
         if r_ref is not None:
             self.r_ref = float(r_ref)
         self.yaw_target = float(yaw_target) if yaw_target is not None else self.yaw_ref
+        self._path_plan = None
 
     # PORTED from dobmpc_controller.py:141
     def set_reference_traj(self, fn):
         """fn(ts (K,)) -> p (3,K), yaw (K,), v (3,K), r (K,) — ALL WORLD FLU."""
         self._ref_traj = fn
+        self._path_plan = None
 
     # PORTED from dobmpc_controller.py:183 (docstring compressed)
     def _xref_ned(self, t=None):
+        if getattr(self, "_path_plan", None) is not None:
+            return self._xref_ned_plan(self._path_plan)
         if getattr(self, "_ref_traj", None) is not None and t is not None:
             return self._xref_ned_traj(float(t))
         frames, P, wrap_angle = self.frames, self.P, self.wrap_angle
@@ -284,6 +365,30 @@ class HwDobMpc:
         xref[11, :] = -r_w
         return xref
 
+    def _xref_ned_plan(self, plan):
+        """Convert the worker's shared world-NED path plan to NMPC state xref."""
+        N = self.nmpc.N
+        p = np.asarray(plan.p_ned, float)
+        yaw = np.asarray(plan.yaw_ned, float).ravel()
+        v = np.asarray(plan.v_ned, float)
+        r = np.asarray(plan.r_ned, float).ravel()
+        expected = N + 1
+        if (p.shape != (3, expected) or v.shape != (3, expected)
+                or yaw.size != expected or r.size != expected):
+            raise ValueError(
+                f"MPC path plan must contain {expected} stages, got "
+                f"p={p.shape}, v={v.shape}, yaw={yaw.size}, r={r.size}")
+        xref = np.zeros((12, expected))
+        xref[0:3, :] = p
+        psi_prev = self._psi_ned_now
+        for k in range(expected):
+            psi_prev += self.wrap_angle(float(yaw[k]) - psi_prev)
+            xref[5, k] = psi_prev
+            Rk = rot_zyx(0.0, 0.0, psi_prev)
+            xref[6:9, k] = Rk.T @ v[:, k]
+        xref[11, :] = r
+        return xref
+
     # ------------------------------------------------------- NED-facing helpers
     # The station's world is NED (the tag map); the ported methods above speak
     # the sim's world-FLU. The mirror is frames.S applied ONCE, here.
@@ -296,43 +401,90 @@ class HwDobMpc:
                         r_ref=-float(r_ned))
         self._ref_traj = None
 
+    @property
+    def path_plan_steps(self) -> int:
+        return int(self.nmpc.N) + 1
+
+    @property
+    def path_plan_dt(self) -> float:
+        return float(self.P.DT_CTRL)
+
+    def set_path_plan_ned(self, plan) -> None:
+        """Install the geometry-driven plan produced once by MpcWorker."""
+        if plan is not None:
+            expected = self.path_plan_steps
+            if np.asarray(plan.p_ned).shape != (3, expected):
+                raise ValueError(f"MPC path plan needs {expected} stages")
+        self._path_plan = plan
+
     def set_square_ned(self, square: dict, origin_ned_xy, yaw_fixed_ned: float,
                        depth_ned: float):
         """Arm the tracking sampler with the square placed in NED. Returns the
-        resolved scenario dict (recorded in meta / drawn by the UI)."""
-        from .reference import make_square_ref_world
+        resolved scenario dict (recorded in meta / drawn by the UI).
 
-        size = float(square.get("size", 1.0))
-        speed = float(square.get("speed", 0.12))
-        laps = int(square.get("laps", 3))
-        follow = bool(square.get("heading_follow", False))
-        yaw_rate = float(np.radians(float(square.get("yaw_rate_deg_s", 60.0))))
-        rot_ned = float(np.radians(float(square.get("rot_deg", 0.0))))
-        T_run = laps * 4.0 * size / max(1e-6, speed)
-        horizon_s = self.nmpc.N * self.P.DT_CTRL
-        # NED -> sim-FLU mirror: y flips, angles negate, depth z_flu = -z_ned.
-        fn = make_square_ref_world(
-            size=size, speed=speed, depth=-float(depth_ned),
-            heading_follow=follow, yaw_rate=yaw_rate, dt=self.P.DT_CTRL,
-            T_total=T_run + horizon_s + 1.0,
-            origin_xy=(float(origin_ned_xy[0]), -float(origin_ned_xy[1])),
-            rot_rad=-rot_ned, yaw_fixed=-float(yaw_fixed_ned))
+        ``rot_deg`` rotates the rectangle in the MAP frame; 0 means the sides
+        are parallel to the tag map's x and y axes, and the origin (the
+        entered tag) is the min-x / min-y corner — bottom left of the
+        top-down plot. Both properties come from ``mirror_y=True`` plus the
+        map->datum rotation the caller folds into ``rot_deg``."""
+        from .reference import place_square_ned
+
+        fn, self.scenario = place_square_ned(
+            square, origin_ned_xy, yaw_fixed_ned, depth_ned,
+            dt=self.P.DT_CTRL, preview_s=self.nmpc.N * self.P.DT_CTRL)
         self.set_reference_traj(fn)
-        self.scenario = {"kind": "square", "size": size, "speed": speed,
-                         "laps": laps, "depth_ned": float(depth_ned),
-                         "heading_follow": follow,
-                         "yaw_rate_deg_s": float(square.get("yaw_rate_deg_s", 60.0)),
-                         "origin_ned": [float(origin_ned_xy[0]),
-                                        float(origin_ned_xy[1])],
-                         "rot_deg": float(square.get("rot_deg", 0.0)),
-                         "yaw_fixed_ned_deg": float(np.degrees(yaw_fixed_ned)),
-                         "T_run_s": T_run}
         return self.scenario
 
-    def ref_ned_at(self, t: float) -> tuple[np.ndarray, float]:
-        """(p_ned, yaw_ned) of the CURRENT reference — stage 0 of the horizon."""
+    def set_line_ned(self, line: dict, origin_ned_xy, yaw_fixed_ned: float,
+                     depth_ned: float):
+        """Arm the tracking sampler with an OUT-AND-BACK line placed in NED.
+
+        ``line["dir_deg"]`` is the heading of the outbound leg in the NED map
+        frame (0 = +x, 90 = +y), so "2 m along +y from tag 79" is dir_deg 90.
+        Heading is held at ``yaw_fixed_ned`` throughout — the vehicle crabs,
+        it does not turn around, so the camera keeps the same floor patch and
+        the localizer's tag set stays continuous."""
+        from .reference import place_line_ned
+
+        fn, self.scenario = place_line_ned(
+            line, origin_ned_xy, yaw_fixed_ned, depth_ned,
+            dt=self.P.DT_CTRL, preview_s=self.nmpc.N * self.P.DT_CTRL)
+        self.set_reference_traj(fn)
+        return self.scenario
+
+    def set_circle_ned(self, circle: dict, origin_ned_xy, yaw_fixed_ned: float,
+                       depth_ned: float):
+        """Arm the tracking sampler with a CIRCLE placed in NED.
+
+        ``origin_ned_xy`` is a point on the RIM — the tag the operator entered
+        — and ``circle["radius"]`` is the radius; the centre sits one radius
+        along ``rot_deg`` from the tag, so rot 0 makes the tag the circle's
+        minimum-x point (the bottom of the top-down plot). Placement is
+        ``reference.place_circle_ned``, the same single definition HwPid and
+        HwMpcc call, so the three controllers fly one geometry."""
+        from .reference import place_circle_ned
+
+        fn, self.scenario = place_circle_ned(
+            circle, origin_ned_xy, yaw_fixed_ned, depth_ned,
+            dt=self.P.DT_CTRL, preview_s=self.nmpc.N * self.P.DT_CTRL)
+        self.set_reference_traj(fn)
+        return self.scenario
+
+    def ref_ned_at(self, t: float) -> tuple[np.ndarray, float, np.ndarray]:
+        """Current ``(position, yaw, world velocity)`` reference in NED.
+
+        NMPC stores linear velocity in the reference body frame, so rotate
+        stage 0 back into world NED for this public NED-facing helper.
+        """
+        if getattr(self, "_path_plan", None) is not None:
+            plan = self._path_plan
+            return (np.asarray(plan.p_ned[:, 0], float).copy(),
+                    float(plan.yaw_ned[0]),
+                    np.asarray(plan.v_ned[:, 0], float).copy())
         xref = self._xref_ned(t)
-        return xref[0:3, 0].copy(), float(xref[5, 0])
+        phi, theta, psi = (float(v) for v in xref[3:6, 0])
+        v_ref_ned = rot_zyx(phi, theta, psi) @ xref[6:9, 0]
+        return xref[0:3, 0].copy(), psi, v_ref_ned.copy()
 
     # ------------------------------------------------------------------ control
     def step(self, eta_ned, nu_ned, nudot_ned, t: float):
@@ -342,7 +494,7 @@ class HwDobMpc:
         nu = np.asarray(nu_ned, float)
         if self.eaob is None:
             self.eaob = self._EAOB(eta0=eta, nu0=nu, profile="perf")
-        if self.mode == "dobmpc":
+        if self.dob:
             _eh, _nh, w = self.eaob.update(
                 {"eta": eta, "nu": nu, "nudot": np.asarray(nudot_ned, float)},
                 self._tau_ned_cmd)
@@ -350,6 +502,7 @@ class HwDobMpc:
         else:
             self.w_hat = np.zeros(6)
         self._psi_ned_now = float(eta[5])
+        self._apply_stage_weights()
         t0 = time.perf_counter()
         u = self.nmpc.solve(np.concatenate([eta, nu]), self.w_hat,
                             self._xref_ned(t))
@@ -368,6 +521,72 @@ class HwDobMpc:
             "nis": (float(self.eaob.last_nis) if self.eaob is not None else 0.0),
         }
 
+    # ------------------------------------------------------- path-frame cost
+    def set_path_cost(self, tune: dict | None) -> None:
+        """Re-tune the along/cross split without rebuilding anything.
+
+        The weights are a runtime ``cost_set``, so a sweep over q_along /
+        q_cross costs ONE acados build for the whole sweep — which is the
+        difference between a knob that gets swept and a knob that gets
+        guessed at (rov_gui/tools/sweep_path_cost.py). Restores the baseline
+        diagonal first, so a half-written sweep cannot leave the previous
+        variant's weight in a stage the next one does not overwrite."""
+        from .path_cost import PathFrameWeights
+
+        self._restore_base_weights()
+        P = self.P
+        self._wt = PathFrameWeights(P.MPC_Q, P.MPC_R, P.MPC_QN, tune)
+
+    def _apply_stage_weights(self) -> None:
+        """Rotate each stage's position weight into the path frame.
+
+        Called every tick, before the solve. Three ways this is a no-op, and
+        each of them matters:
+          * not a ``_tuned`` mode — the baseline diagonal is what was built;
+          * no path plan (DP hold, the approach, the 10 s settle) — there is
+            no path, so there is no along/cross to split. Station keeping with
+            an anisotropic weight would mean "hold this point, but only in one
+            direction", which is not what station mode promises;
+          * the plan predates ``psi_path`` — fall back rather than guess.
+        In all three the previously written weights are restored first, so a
+        rotated W can never outlive the mode or the mission that asked for it.
+        """
+        plan = getattr(self, "_path_plan", None)
+        psi = None if plan is None else getattr(plan, "psi_path", None)
+        if not self.tuned or psi is None:
+            self._restore_base_weights()
+            return
+        solver = getattr(self.nmpc, "solver", None)
+        if solver is None:                      # IPOPT fallback: nothing to set
+            return
+        N = int(self.nmpc.N)
+        psi = np.asarray(psi, float).ravel()
+        yaw = np.asarray(plan.yaw_ned, float).ravel()
+        if psi.size != N + 1:
+            raise ValueError(f"path plan psi_path must be {N + 1} stages, "
+                             f"got {psi.size}")
+        for k in range(N):
+            solver.cost_set(k, "W", self._wt.stage_W(psi[k], yaw[k]),
+                            api="new")
+        solver.cost_set(N, "W", self._wt.terminal_W(psi[N], yaw[N]),
+                        api="new")
+        self._w_tuned = True
+
+    def _restore_base_weights(self) -> None:
+        """Put the isotropic diagonal back. Idempotent and cheap when it is
+        already there, because it runs on the untuned tick path."""
+        if not self._w_tuned:
+            return
+        solver = getattr(getattr(self, "nmpc", None), "solver", None)
+        if solver is None:
+            self._w_tuned = False
+            return
+        N = int(self.nmpc.N)
+        for k in range(N):
+            solver.cost_set(k, "W", self._wt.W_base, api="new")
+        solver.cost_set(N, "W", self._wt.We_base, api="new")
+        self._w_tuned = False
+
     def note_applied(self, tau_ned_est) -> None:
         """The wrench the allocation believes the vehicle realized (axis caps
         applied, K/M zeroed). This is what the EAOB must see next tick —
@@ -376,10 +595,12 @@ class HwDobMpc:
         self._tau_ned_cmd = np.asarray(tau_ned_est, float).copy()
 
     def reset(self) -> None:
+        self._restore_base_weights()
         self.eaob = None
         self.w_hat = np.zeros(6)
         self._tau_ned_cmd = np.zeros(6)
         self._ref_traj = None
+        self._path_plan = None
         self.scenario = None
         self.r_ref = 0.0
         self.nmpc.reset()
@@ -394,17 +615,62 @@ class HwDobMpc:
         return p_flu, yaw, pitch
 
     def meta(self) -> dict:
+        """EVERY constant this controller was flown with — the operator's
+        counterpart to HwPid.meta() (2026-08-14). The stage weights are the
+        MPC's equivalent of kp/kd/ki: they are what gets turned between runs,
+        so a run whose meta omits them cannot be told apart from a run at
+        different weights."""
         P = self.P
         m = {"type": self.mode, "solver": self.solver_kind,
-             "ctrl_hz": float(self.cfg.ctrl_hz), "N": int(P.MPC_N),
+             "ctrl_hz": float(self.cfg.ctrl_hz), "dt_s": float(P.DT_CTRL),
+             "N": int(P.MPC_N), "horizon_s": round(P.MPC_N * P.DT_CTRL, 4),
              "u_max": [float(v) for v in P.U_MAX],
+             "v_max_m_s": float(P.V_MAX),
+             # x = [x y z, phi theta psi, u v w, p q r]
+             "Q": [float(v) for v in P.MPC_Q],
+             "QN": [float(v) for v in P.MPC_QN],
+             "R": [float(v) for v in P.MPC_R],
+             "state_order": "x = [x y z, phi theta psi, u v w, p q r] (NED/FRD)",
+             "u_order": "u = [X Y Z K M N] (body wrench, N / N*m)",
              "w_hat_clip": [float(v) for v in self.w_clip],
+             # THE COST SHAPE, not just its magnitudes. `cost_frame` is the
+             # boundary between the tuned and the baseline records: a tuned
+             # run's Q above is the isotropic baseline the split was derived
+             # FROM, not what the solver ran, so pooling the two families on
+             # the strength of the Q row alone would be wrong.
+             "cost_frame": ("path (along/cross split)" if self.tuned
+                            else "world (isotropic Q)"),
+             "path_cost": (self._wt.meta() if self.tuned else None),
+             # RECORD BOUNDARY as of 2026-08-24: the sim keeps acados' IPOPT
+             # recovery, this station refuses it (a lazy multi-second build
+             # inside a 20 Hz tick), so the same solver behaves differently on
+             # failure in the two places. A run that cannot say which is not
+             # comparable with one that can.
+             "ipopt_fallback": bool(getattr(self.nmpc, "_fallback_enabled",
+                                            False)),
+             "ipopt_fallback_off_reason": str(
+                 getattr(self.nmpc, "_fallback_off_reason", "")),
              "rov_model": P.MODEL, "ref_preview": True,
+             "path_reference": "shared spatial plan, full horizon",
              "mpc_state_source": "meas",
              "probe_ms": self.probe_ms, "build_s": round(self.build_s, 2),
              "eaob_sigma_overrides": self.sigma_applied}
+        # The EAOB is what mpc and dobmpc DIFFER by, so its tuning belongs in
+        # the record whether or not one has been constructed yet (it is built
+        # lazily, at the first tick of an engagement).
+        m["eaob"] = {
+            "active": bool(self.dob),
+            "profile": "perf", "tau_dist_s": float(P.EAOB_TAU_DIST),
+            "nis_gate": float(P.EAOB_NIS_GATE),
+            "gate_on": bool(P.EAOB_GATE_ON),
+            "sigma_pos": [float(v) for v in P.EAOB_SIG_POS],
+            "sigma_ang_deg": [float(np.degrees(v)) for v in P.EAOB_SIG_ANG],
+            "sigma_lvel": [float(v) for v in P.EAOB_SIG_LVEL],
+            "sigma_avel": [float(v) for v in P.EAOB_SIG_AVEL],
+            "sigma_acc": float(P.EAOB_SIG_ACC),
+            "sigma_aacc": float(P.EAOB_SIG_AACC),
+            "sigma_alloc": [float(v) for v in P.EAOB_SIG_ALLOC]}
         if self.eaob is not None:
-            m["eaob"] = {"profile": "perf", "tau_dist": float(P.EAOB_TAU_DIST),
-                         "n_upd": int(self.eaob.n_upd),
-                         "n_gated": int(self.eaob.n_gated)}
+            m["eaob"].update({"n_upd": int(self.eaob.n_upd),
+                              "n_gated": int(self.eaob.n_gated)})
         return m

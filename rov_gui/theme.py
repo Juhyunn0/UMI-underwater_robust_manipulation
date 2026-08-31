@@ -153,6 +153,22 @@ QLabel#Banner {{
     border-radius: 3px;
     padding: 2px 8px;
 }}
+/* The leak / flooding banner. Same shape as #Banner but FAIL-coloured and on
+   white, because it has to win a glance against a header that already has an
+   amber SIMULATED DATA label and four status pills on it. window.py blinks it
+   rather than relying on colour alone. */
+QLabel#Alert {{
+    background: {FAIL};
+    color: #ffffff;
+    font-weight: 700;
+    letter-spacing: 1px;
+    border-radius: 3px;
+    padding: 2px 8px;
+}}
+QLabel#Alert[dim="true"] {{
+    background: {PANEL_HI};
+    color: {FAIL};
+}}
 
 QPushButton {{
     background: {PANEL_HI};
@@ -174,6 +190,16 @@ QPushButton:disabled {{
     border-color: {BORDER};
     background: {PANEL};
 }}
+/* A button that shares its row with something else (the lights presets beside
+   their slider). Only the padding changes — colour, border and the pressed /
+   checked language stay the button language, which is the whole reason this is
+   an objectName rule here rather than a per-widget stylesheet: a widget-level
+   sheet REPLACES the application sheet for that widget and would drop these
+   four back to Qt's pale default. */
+QPushButton#Compact {{
+    padding: 1px 3px;
+    font-size: 11px;
+}}
 QPushButton#Danger {{
     background: #3a1214;
     border: 1px solid {FAIL};
@@ -183,6 +209,145 @@ QPushButton#Danger {{
 }}
 QPushButton#Danger:pressed {{ background: {FAIL}; color: #1a0505; }}
 QPushButton#Rec:checked {{ background: {FAIL}; border-color: {FAIL}; color: #200; }}
+
+/* Combo boxes and spin boxes. Written out because Qt's defaults are a LIGHT
+   widget: on this palette they render as pale grey slabs with near-invisible
+   text, which is exactly what the mission row looked like before
+   2026-08-14. They follow the button language instead — panel fill, the same
+   border, accent on hover — so a control reads as a control. */
+QComboBox, QAbstractSpinBox {{
+    background: {PANEL_HI};
+    border: 1px solid {BORDER_HI};
+    border-radius: 4px;
+    padding: 2px 6px;
+    color: {TEXT};
+    selection-background-color: {ACCENT};
+    selection-color: #04121b;
+}}
+QComboBox:hover, QAbstractSpinBox:hover {{ border-color: {ACCENT}; }}
+/* A typed-into field must be obviously the thing the keyboard is talking to:
+   everything else here is NoFocus, so a focus ring is rare and meaningful. */
+QAbstractSpinBox:focus {{
+    border: 1px solid {ACCENT};
+    background: {PANEL};
+}}
+QComboBox:disabled, QAbstractSpinBox:disabled {{
+    color: {TEXT_FAINT};
+    border-color: {BORDER};
+    background: {PANEL};
+}}
+/* Text entry — the header's RECORDING NAME box. Same language as the combo and
+   the spin boxes above, and for the same reason they were written out: left to
+   Qt's default a QLineEdit is a WHITE slab, which on this palette is the
+   brightest thing on the whole station and sits two centimetres from the video
+   feed the operator's dark adaptation is for (operator, 2026-08-14). */
+QLineEdit {{
+    background: {PANEL_HI};
+    border: 1px solid {BORDER_HI};
+    border-radius: 4px;
+    padding: 2px 6px;
+    color: {TEXT};
+    selection-background-color: {ACCENT};
+    selection-color: #04121b;
+}}
+QLineEdit:hover {{ border-color: {ACCENT}; }}
+QLineEdit:focus {{ border: 1px solid {ACCENT}; background: {PANEL}; }}
+QLineEdit:disabled {{
+    color: {TEXT_FAINT};
+    border-color: {BORDER};
+    background: {PANEL};
+}}
+/* Read-only text views (the MISSION LOG). Inset — background one step DARKER
+   than the panel, like the progress bars and the plot — so a scrolling region
+   reads as a well rather than as another raised control. */
+QPlainTextEdit, QTextEdit {{
+    background: {BG};
+    border: 1px solid {BORDER};
+    border-radius: 4px;
+    color: {TEXT_DIM};
+    selection-background-color: {ACCENT};
+    selection-color: #04121b;
+}}
+
+/* Scroll bars. The application sheet styles these even inside a widget that
+   carries its OWN sheet (the log view does), which is exactly why they belong
+   here: unstyled, Qt paints a light-grey trough with a white handle, and that
+   pale strip down the side of the mission log was the second half of the same
+   2026-08-14 complaint as the white name box. Thin, no arrow buttons — a log
+   is scrolled with the wheel, not by clicking 9-pixel triangles. */
+QScrollBar:vertical {{
+    background: transparent;
+    width: 9px;
+    margin: 0;
+    border: none;
+}}
+QScrollBar:horizontal {{
+    background: transparent;
+    height: 9px;
+    margin: 0;
+    border: none;
+}}
+QScrollBar::handle:vertical {{
+    background: {BORDER_HI};
+    border-radius: 4px;
+    min-height: 24px;
+}}
+QScrollBar::handle:horizontal {{
+    background: {BORDER_HI};
+    border-radius: 4px;
+    min-width: 24px;
+}}
+QScrollBar::handle:hover {{ background: {TEXT_FAINT}; }}
+QScrollBar::add-line, QScrollBar::sub-line {{
+    width: 0; height: 0; border: none; background: none;
+}}
+QScrollBar::add-page, QScrollBar::sub-page {{ background: none; }}
+QAbstractScrollArea::corner {{ background: transparent; border: none; }}
+QComboBox::drop-down {{
+    border: none;
+    width: 16px;
+}}
+QComboBox::down-arrow {{
+    /* Qt has no built-in glyph once the widget is restyled; a small CSS
+       triangle keeps the affordance without shipping an icon file. */
+    image: none;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid {TEXT_DIM};
+    width: 0; height: 0;
+    margin-right: 4px;
+}}
+QComboBox::down-arrow:hover {{ border-top-color: {ACCENT}; }}
+QComboBox QAbstractItemView {{
+    background: {PANEL_HI};
+    border: 1px solid {BORDER_HI};
+    color: {TEXT};
+    selection-background-color: {ACCENT};
+    selection-color: #04121b;
+    outline: none;
+}}
+QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {{
+    background: {PANEL};
+    border-left: 1px solid {BORDER};
+    width: 13px;
+}}
+QAbstractSpinBox::up-button:hover, QAbstractSpinBox::down-button:hover {{
+    background: {BORDER_HI};
+}}
+QAbstractSpinBox::up-arrow {{
+    image: none;
+    border-left: 3px solid transparent;
+    border-right: 3px solid transparent;
+    border-bottom: 4px solid {TEXT_DIM};
+    width: 0; height: 0;
+}}
+QAbstractSpinBox::down-arrow {{
+    image: none;
+    border-left: 3px solid transparent;
+    border-right: 3px solid transparent;
+    border-top: 4px solid {TEXT_DIM};
+    width: 0; height: 0;
+}}
 
 QCheckBox {{ spacing: 6px; }}
 QCheckBox::indicator {{

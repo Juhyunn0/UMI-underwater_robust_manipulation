@@ -160,8 +160,16 @@ class AcadosNMPC:
         # NaN cascades (RTI warm-starts from the corrupted iterate and diverges; see
         # the 2026-06-16 seed-3 finding). Built lazily so the IPOPT cost is paid only
         # if a failure ever happens.
-        self._fallback_enabled = bool(fallback_ipopt) # if acados fails, then try Interior Point OPTimzer (IPOPT) to recover by JJ 
-        self._fallback = None 
+        self._fallback_enabled = bool(fallback_ipopt) # if acados fails, then try Interior Point OPTimzer (IPOPT) to recover by JJ
+        self._fallback = None
+        # ...which is exactly the wrong place to pay it when the caller is a
+        # real-time loop: the lazy build is a multi-second casadi graph
+        # construction, and it runs INSIDE the tick that failed. On hardware
+        # 2026-08-23 that blocked the 20 Hz MPC worker ~6.5 s after one status-4
+        # solve; the sink's deadman and the window's freshness watchdog handed
+        # control back to the pilot mid-flight. `disable_fallback` lets a
+        # real-time caller opt out; the sim keeps the recovery.
+        self._fallback_off_reason = ""
 
     # ----------------------------------------------------------------- solve
     def solve(self, x, w_hat, xref_traj):
@@ -215,6 +223,18 @@ class AcadosNMPC:
                 return self._u_prev.copy()
 
         return self._u_prev.copy()
+
+    def disable_fallback(self, reason=""):
+        """Refuse the IPOPT recovery solve — for REAL-TIME callers.
+
+        The fallback is built lazily inside the failing tick, so its first use
+        costs seconds, not milliseconds. In a fixed-rate loop that is worse
+        than the failure it recovers from: holding the previous wrench (what
+        this method leaves in place) is bounded, and the caller's own
+        consecutive-failure interlock still escalates to a disengage.
+        """
+        self._fallback_enabled = False
+        self._fallback_off_reason = str(reason)
 
     def _ipopt_fallback(self, x, w_hat, xref):
         """One IPOPT (full-convergence) solve to recover from an acados failure.

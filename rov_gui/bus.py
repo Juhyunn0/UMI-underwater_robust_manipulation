@@ -80,9 +80,29 @@ class DataBus(QObject):
     # not a mailbox because they are small immutable snapshots at <= 20-30 Hz —
     # exactly the traffic shape DataBus is for (module docstring, mechanism 1).
     nav_fix = Signal(object)          # state.NavFix
+    # The clicked OBJECT, placed in the MAP frame — one composition of a
+    # PoseTrack with the NavFix from the same camera frame (MpcWorker.on_pose,
+    # control/object_nav.py). A SEPARATE signal from mpc_status on purpose:
+    # this exists with no engagement at all (clicking an object and seeing
+    # where it is in the pool needs no authority over the vehicle), and it is
+    # in the MAP frame while MpcStatus is in the engage-datum frame.
+    object_fix = Signal(object)       # state.ObjectFix
     vehicle_imu = Signal(object)      # state.VehicleImu
     mpc_status = Signal(object)       # state.MpcStatus
+    # The C3's own BNO086, in BATCHES — one emit per camera-worker drain,
+    # carrying every sample since the last one. Batched and not per-sample
+    # because the sensor runs at ~200 Hz against a bus sized for <= 30 Hz
+    # snapshots: 30 emits/s of a (7,7) array is the traffic shape above, and
+    # 200 emits/s of a scalar row is not. The consumer (the dead reckoner)
+    # wants the whole array anyway — decimating to the 20 Hz control tick
+    # would throw away the only thing this IMU has over the autopilot's.
+    camera_imu = Signal(object)       # state.ImuBatch
     tag_overlay = Signal(object)      # state.TagOverlay (per video feed)
+    # One SHORT line per mission event ("going to tag 79", "hold done ->
+    # LINE"), for the on-screen log. Separate from `log` on purpose: `log` is
+    # the developer's running commentary and scrolls past, this is the
+    # timestamped record an operator reads back against a video afterwards.
+    mpc_event = Signal(str)
 
     # ---- commands (UI -> backend) -----------------------------------------
     # Connected with Qt.QueuedConnection so the send happens in the worker's
@@ -122,6 +142,17 @@ class DataBus(QObject):
     # Start/stop the raw sensor log that accompanies a depth recording.
     # (enabled, path stem) — the stem matches the video file it belongs to.
     cmd_log_sensors = Signal(bool, str)
+    # The same raw logs, but tied to a CONTROLLER run instead of to a depth
+    # video: the dead-reckoning experiment needs every IMU sample of the run
+    # kept, so a better estimator can be re-run over it offline afterwards,
+    # and a run with no depth recording would otherwise keep none of them.
+    #
+    # A SEPARATE signal rather than a second emitter of cmd_log_sensors,
+    # because MpcWorker is itself a CONSUMER of that one (set_sensor_log) —
+    # emitting it from inside the worker would re-enter the worker. The
+    # re-entry happens to be harmless today, which is exactly the kind of
+    # thing that stops being true quietly.
+    cmd_log_raw_sensors = Signal(bool, str)
     # Object tracking. `cmd_pose_click` carries SOURCE image pixels, not panel
     # pixels — the canvas converts before emitting, so nothing downstream needs
     # to know how the video happened to be letterboxed.
@@ -141,7 +172,17 @@ class DataBus(QObject):
     # DP-only hold (calibration, station-keeping tests) still exists.
     cmd_mpc_start = Signal()
     cmd_mpc_mode = Signal(str)        # "mpc" | "dobmpc"
+    # Payload keys are PER SHAPE: station {} | line {length} |
+    # square {size, size_y} | circle {radius}, all beside {shape, origin_tag,
+    # speed}. Merged over hw_mpc.yaml's `square:` block by the worker.
     cmd_mpc_scenario = Signal(object) # dict of square overrides (size, speed, ...)
+    # "Write your constants into THIS folder" — the argument is a directory,
+    # and MpcWorker answers with controller.json (the plant's M/C/D/g plus the
+    # controller's own gains and limits). Emitted by the window when a REC
+    # button opens a recording, so the numbers land beside the data they
+    # explain rather than only in the controller's own CSV sidecar — which does
+    # not exist at all for a hand-flown pass with the MPC never engaged.
+    cmd_mpc_dump_meta = Signal(str)
     # Per-feed AprilTag detection toggle: (video panel key, on). Turning the
     # C3 feed off mid-engagement starves the localizer and the MPC disengages
     # on the stale-fix gate — that is the intended, safe consequence.

@@ -54,3 +54,8 @@ run.log
 # One reconstruction is tens of MB and is a per-run artifact, not a source one —
 # the path lands in the _pose.jsonl MESH record instead.
 sessions/
+
+# Regenerated figures (rov_gui/tools/plot_runs.py). Derived from sessions/,
+# which is itself ignored: committing the pictures would outlive the data they
+# came from and turn into unreproducible claims. Rerun `./c3 plots` instead.
+figures/
