@@ -1,0 +1,26 @@
+reference: /home/bdml/Desktop/umi_underwater_robust_control/rov_gui/tests/data/dp_policy_ref.npz
+  written with torch 2.9.1+cu128 from /home/bdml/Desktop/universal_manipulation_interface/data/outputs/2026.09.01/21.15.26_train_diffusion_transformer_timm_umi_depth/checkpoints/epoch=0050-train_loss=0.029.ckpt
+  ckpt sha1 head fa7aeb3d92b6, seed 0, steps 16, timesteps [45, 42, 39, 36, 33, 30, 27, 24, 21, 18, 15, 12, 9, 6, 3, 0]
+  DP policy: loading selected.ckpt (identity transforms, 16 DDIM steps)
+  DP policy ready in 1.5 s (warm-up 123 ms, 106 tokens, sha1 fa7aeb3d92b6, obs_dt 66.7 ms from dataset zip .zattrs)
+
+station: torch 2.11.0+cu128, diffusers 0.40.0, timm 1.0.29, device cuda
+  ok     checkpoint sha1 head               fa7aeb3d92b6 vs ref fa7aeb3d92b6
+  ok     DDIM timesteps                     [45, 42, 39, 36, 33, 30, 27, 24, 21, 18, 15, 12, 9, 6, 3, 0]
+  ok     normalize camera0_depth            max|diff| 0.00e+00
+  ok     normalize robot0_eef_pos           max|diff| 0.00e+00
+  ok     normalize robot0_eef_rot_axis_angle max|diff| 0.00e+00
+  ok     normalize robot0_gripper_width     max|diff| 0.00e+00
+  ok     normalize robot0_eef_rot_axis_angle_wrt_start max|diff| 0.00e+00
+  ok     encoder tokens                     (1, 106, 768) max|diff| 2.42e-03 (tol 0.005, TF32 floor; see (*))
+  agree  tokens vs fp64 CPU (noise floor)   ref-fp64 3.61e-03, station-fp64 5.08e-03
+  ok     denoiser eps0 (ref tokens)         max|diff| 0.00e+00 (tol 0.001)
+  ok     denoiser eps0 (own tokens)         max|diff| 5.10e-05 (tol 0.001)
+  ok     DDIM step0 (ref eps0)              max|diff| 0.00e+00 (tol 0.001)
+  agree  randn stream (seed) vs reference   identical
+  agree  full seeded sample (action)        max|diff| 8.37e-05 m/rot6d/m, 23.6 ms
+  agree  full seeded sample (nsample)       max|diff| 1.96e-04
+  ok     center: two predicts identical     max|diff| 0.00e+00, 23.2 / 23.1 ms
+  agree  center: unseeded predict differs   max|diff| vs seeded 4.68e-02 (diffusion noise; informational)
+
+RESULT: PARITY — deterministic stages agree within tolerance

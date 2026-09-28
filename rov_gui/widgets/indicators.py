@@ -185,6 +185,15 @@ class HoldToConfirmButton(QtWidgets.QPushButton):
     own progress, so the operator can abort by simply letting go.
 
     Releasing early cancels and resets — there is no partial credit.
+
+    ``hold_ms=0`` makes it an ORDINARY button: one click fires ``confirmed``
+    immediately, with no progress fill and no hold. That is not a weaker
+    version of the same widget, it is the opposite trade — it exists so a
+    caller that must not make the operator wait (an action whose cost of a
+    late start exceeds the cost of a stray click) can keep the same object,
+    the same signal and the same wiring instead of swapping in a QPushButton.
+    Use :meth:`set_hold_ms` to move between the two at runtime, which is how
+    one shared button can be a hold for one mission and instant for another.
     """
 
     confirmed = Signal()
@@ -192,7 +201,7 @@ class HoldToConfirmButton(QtWidgets.QPushButton):
     def __init__(self, text: str, hold_ms: int = 1000, tooltip: str = ""):
         super().__init__(text)
         self._label = text
-        self._hold_ms = max(200, int(hold_ms))
+        self._hold_ms = self._clamp_hold(hold_ms)
         self._elapsed = 0
         self.setToolTip(tooltip)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -201,8 +210,41 @@ class HoldToConfirmButton(QtWidgets.QPushButton):
         self._timer.timeout.connect(self._step)
         self.pressed.connect(self._start)
         self.released.connect(self._cancel)
+        # Instant mode fires on CLICK, not on press: a click is press and
+        # release inside the button, so the operator can still slide off to
+        # abort — the one escape a hold gives that a bare `pressed` would not.
+        self.clicked.connect(self._clicked)
+
+    @staticmethod
+    def _clamp_hold(hold_ms) -> int:
+        """0 stays 0 (instant); anything else is at least 200 ms.
+
+        The floor exists so a caller cannot ask for a 30 ms "hold" that is a
+        stray click in everything but name. 0 is not a short hold, it is a
+        different mode, so it is passed through rather than clamped up.
+        """
+        v = int(hold_ms)
+        return 0 if v <= 0 else max(200, v)
+
+    @property
+    def instant(self) -> bool:
+        return self._hold_ms == 0
+
+    def set_hold_ms(self, hold_ms: int) -> None:
+        """Switch between hold and instant. Cancels any hold in progress."""
+        v = self._clamp_hold(hold_ms)
+        if v == self._hold_ms:
+            return
+        self._hold_ms = v
+        self._cancel()
+
+    def _clicked(self) -> None:
+        if self.instant:
+            self.confirmed.emit()
 
     def _start(self) -> None:
+        if self.instant:
+            return
         self._elapsed = 0
         self._timer.start()
 
@@ -228,7 +270,11 @@ class HoldToConfirmButton(QtWidgets.QPushButton):
 
     def paintEvent(self, ev) -> None:
         super().paintEvent(ev)
-        if not self._elapsed:
+        # `_elapsed` cannot advance in instant mode (the timer never starts),
+        # but the guard is on `_hold_ms` too: set_hold_ms can arrive from a
+        # shape change mid-hold, and a repaint between that and _cancel would
+        # divide by zero on the way to drawing a fill nobody asked for.
+        if not self._elapsed or self.instant:
             return
         frac = min(1.0, self._elapsed / self._hold_ms)
         p = QPainter(self)

@@ -331,8 +331,52 @@ class NedPlan:
     # from ``v_ned`` fails wherever the speed profile brakes to zero, i.e.
     # exactly at the corners the split exists for.
     psi_path: np.ndarray = None     # (K,)
+    # Per-stage COST MASK in [0, 1], or None (= every stage weighs 1). The
+    # policy mission's hold tail (v2 A10): a streamed 1 s plan sits inside a
+    # 3 s NMPC horizon, and the stitcher holds the endpoint with v = 0 past
+    # the last knot. Tracking those hold stages at full weight makes the
+    # solver BRAKE 0.3-0.4 s before every plan end — a 10-50 % speed loss and
+    # a proprio distribution shift the policy never saw [유도: control
+    # review]. With ``w_stage[k] = 0`` the position and linear-velocity rows
+    # of stage k's weight vanish, so the horizon past the plan is free
+    # (heading, depth-attitude and rates keep their weight — the vehicle
+    # still holds level and heading). Honoured by ``HwDobMpc`` only; the PID
+    # consumes one stage and the MPCC owns its own reference, both ignore it.
+    w_stage: np.ndarray = None      # (K,) in [0, 1], or None
+    # ATTITUDE REFERENCE (2026-09-26, the 6-DoF variant). ``rp_ned`` is the
+    # per-stage ABSOLUTE engage-datum NED body (roll, pitch) in radians,
+    # ``rp_rate_ned`` the matching Euler rates (rad/s; the consumer turns
+    # them into body rates through T(phi, theta)^-1). BOTH None = today's
+    # plan: the consumer levels (xref[3:5] = 0, xref[9:11] = 0) and its
+    # output is byte-identical to a build that predates these fields. Only
+    # the policy stream (PlanStitcher.sample_att) ever fills them; the
+    # geometric shapes and a replay stay level. NOTE ``w_stage`` masks the
+    # position / linear-velocity rows ONLY (HwDobMpc.W_STAGE_ROWS), so the
+    # attitude rows keep their full weight through a masked hold tail: the
+    # hold tail tracks the plan's ENDPOINT attitude, never a level step
+    # (meta controller.attitude_ref.hold_tail == "endpoint").
+    rp_ned: np.ndarray = None       # (2, K) rad [roll; pitch], or None
+    rp_rate_ned: np.ndarray = None  # (2, K) rad/s Euler rates, or None
 
     def __post_init__(self):
+        if self.w_stage is not None:
+            ws = np.asarray(self.w_stage, float).ravel()
+            if not np.all(np.isfinite(ws)):
+                raise ValueError("NedPlan.w_stage must be finite")
+            object.__setattr__(self, "w_stage", np.clip(ws, 0.0, 1.0))
+        K = int(np.asarray(self.p_ned).shape[1]) if np.asarray(self.p_ned).ndim == 2 else None
+        for name in ("rp_ned", "rp_rate_ned"):
+            v = getattr(self, name)
+            if v is None:
+                continue
+            a = np.asarray(v, float)
+            if a.ndim != 2 or a.shape[0] != 2 or (K is not None and a.shape[1] != K):
+                raise ValueError(f"NedPlan.{name} must be (2, K={K}), got {a.shape}")
+            if not np.all(np.isfinite(a)):
+                raise ValueError(f"NedPlan.{name} must be finite")
+            object.__setattr__(self, name, a)
+        if self.rp_rate_ned is not None and self.rp_ned is None:
+            raise ValueError("NedPlan.rp_rate_ned without rp_ned")
         if self.psi_path is None:
             # Legacy construction (4 positional args). Fall back to the
             # heading, which is correct under heading_follow and the best
@@ -453,7 +497,7 @@ class PathCursor:
 
         TWO cursors, and conflating them is what made the operator's speed box
         do nothing (measured 2026-08-17: 0.2 m/s commanded, 0.026 m/s of path
-        actually covered — sessions/low_level_controller_data/20260817/
+        actually covered — data/20260817/
         0817_103431/mpc_103624.csv).
 
         ``theta`` is where the HULL is: the monotonic projection, and the

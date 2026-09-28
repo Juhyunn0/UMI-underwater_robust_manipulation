@@ -20,6 +20,7 @@ vendor/
 # onshape-to-robot export meshes (258 MB of per-part STLs; robot.xml + config.json ARE
 # tracked — the poses used by the sim are frozen in process_c3_mesh.py)
 assets/CAD files/onshape_export/assets/
+assets/CAD files/onshape_export_20260909/assets/
 
 # acados generated C code (regenerated on solver construction; not a source artifact)
 **/dobmpc/_acados_gen/
@@ -30,7 +31,12 @@ MUJOCO_LOG.TXT
 # Local build cache
 build_cache/
 
-# Large dataset directory (recordings, calibration data, etc.)
+# THE data root (2026-09-14: one dated tree, data/YYYYMMDD/<run>[_kind]/ —
+# rov_gui/runstore.py): gantry/ZED/survey captures, every rov_gui run record
+# (screen/feed recordings, nav, controller CSVs, policy plans, on-site object
+# reconstructions), diffusion-policy training runs and data/checkpoints/.
+# One run is MB..GB; a reconstruction is tens of MB; a training run is ~28 GB.
+# The path of a record lands in the meta / the _pose.jsonl MESH row instead.
 data/
 
 # Experiment data captures (GB-scale videos/images/IMU CSVs; keep on local disk,
@@ -55,13 +61,13 @@ Thumbs.db
 MUJOCO_LOG.TXT
 run.log
 
-# rov_gui session output: screen/feed recordings, and the on-site object
-# reconstructions (reference views + BundleSDF training log + model/model.obj).
-# One reconstruction is tens of MB and is a per-run artifact, not a source one —
-# the path lands in the _pose.jsonl MESH record instead.
+# (sessions/ — the old rov_gui output root — was folded into data/ on
+# 2026-09-14 by tools/migrate_data_layout_20260914.py; the mapping is
+# data/MIGRATION_20260914.json. Kept ignored so a stray recreation never lands
+# in git.)
 sessions/
 
-# Regenerated figures (rov_gui/tools/plot_runs.py). Derived from sessions/,
+# Regenerated figures (rov_gui/tools/plot_runs.py). Derived from data/,
 # which is itself ignored: committing the pictures would outlive the data they
 # came from and turn into unreproducible claims. Rerun `./c3 plots` instead.
 figures/

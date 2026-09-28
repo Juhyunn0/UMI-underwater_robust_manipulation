@@ -1,0 +1,101 @@
+# rov_gui --source hw --fstereo --mavlink-transport none  (no command sink,
+# no --pose, no --mpc) on the real C3 + BlueROV, 2026-09-02 11:30-11:33.
+# Driver: an offscreen build of window.build_and_run that screenshots the panels
+# (display :0 belongs to gdm, so the station cannot be shown on a monitor from
+# a non-graphical session). Run A = --depth-fps 15 (shipped), run B = 10.
+# c3[...] lines are c3_camera.metrics per stream: delivered fps, dropped/total,
+# Mb/s. Screenshots: ~/Desktop/fstereo_*.png
+
+########## A: --depth-fps 15 (shipped default) ##########
+[11:30:25] opts: source=hw fstereo=True iters=8 scale=0.5 size=None graph=True align=400x250 depth_fps=15.0 allow_command=False mavlink=none
+[11:30:25] running for 75 s; shots at [25, 45, 65]
+[11:30:25]   log[info] c3: target 192.168.2.191 streams=['color', 'left', 'right'] — 71 Mbit/s (color=10, left=31, right=31) = 79% of the ~90 Mbit/s PoE budget [tight] [C3 link only]
+[11:30:25]   log[info] fstereo: learned depth is THIS RUN'S depth source — iters=8 scale=0.5, cuda graph on, projected onto 400x250. The camera's own depth stream is not requested.
+[11:30:25]   log[info] fstereo: loading FoundationStereo from /home/bdml/Desktop/FoundationStereo/FoundationStereo (this takes a few seconds)
+[11:30:25]   log[info] mavlink: connected (none)
+[11:30:30]   log[info] fstereo: vitl @ 23-51-11 ready in 5.5 s (iters=8 scale=0.5, cuda graph on)
+[11:30:30]   log[warn] fstereo: no mono pair yet — this run has no other depth source, so the depth panel is dark until pairs resume
+[11:30:35]   log[warn] fstereo: no mono pair yet — this run has no other depth source, so the depth panel is dark until pairs resume
+[11:30:37]   log[info] fstereo: rig ready — fx_rect 365.63 px (raw EEPROM fx differs by -3.42%), baseline 75.0 mm, K 27418 mm*px; depth projected onto 400x250
+[11:30:37]   log[info] c3: connected
+[11:30:39]   log[info] fstereo: forward captured as one CUDA graph in 1328 ms (input 320x224, iters 8)
+[11:30:49]   c3[color]  30.2 fps  drop  1.1% (4/355)    9.3 Mb/s
+[11:30:49]   c3[left ]  15.0 fps  drop  0.0% (0/177)   30.7 Mb/s
+[11:30:49]   c3[right]  15.0 fps  drop  0.0% (0/177)   30.7 Mb/s
+[11:30:49]   c3[total]  70.7 Mb/s of the ~90 Mbit/s PoE budget
+[11:30:49]   FS chip: FOUNDATIONSTEREO  15.0 Hz  46 ms  valid 98%→95%
+[11:30:49]   FS state: live=True frames=157 hz=14.98 solve_ms=46.3 native=97.6% out=95.4% eager=False err='' note=''
+[11:30:49]   panel[depth] 640x360 14.9 fps lat=105.7 ms instrument='foundationstereo' conn=Conn.ONLINE note='valid 97% native -> 95% grid   45 ms'
+[11:30:49]   panel[main] 640x360 29.8 fps lat=52.1 ms instrument='' conn=Conn.ONLINE note=''
+[11:30:49]   panel[second] 1280x720 20.0 fps lat=None ms instrument='' conn=Conn.ONLINE note=''
+[11:30:49]   -> saved station_a15_025s.png / depth_a15_025s.png
+[11:31:09]   c3[color]  30.2 fps  drop  0.7% (7/955)    9.2 Mb/s
+[11:31:09]   c3[left ]  15.0 fps  drop  0.2% (1/477)   30.7 Mb/s
+[11:31:09]   c3[right]  15.0 fps  drop  0.2% (1/477)   30.7 Mb/s
+[11:31:09]   c3[total]  70.7 Mb/s of the ~90 Mbit/s PoE budget
+[11:31:09]   FS chip: FOUNDATIONSTEREO  15.0 Hz  47 ms  valid 97%→95%
+[11:31:09]   FS state: live=True frames=456 hz=14.98 solve_ms=46.7 native=97.0% out=95.2% eager=False err='' note=''
+[11:31:09]   panel[depth] 640x360 15.1 fps lat=101.6 ms instrument='foundationstereo' conn=Conn.ONLINE note='valid 97% native -> 95% grid   46 ms'
+[11:31:09]   panel[main] 640x360 30.1 fps lat=51.8 ms instrument='' conn=Conn.ONLINE note=''
+[11:31:09]   panel[second] 1280x720 19.8 fps lat=None ms instrument='' conn=Conn.ONLINE note=''
+[11:31:09]   -> saved station_a15_045s.png / depth_a15_045s.png
+[11:31:29]   c3[color]  29.8 fps  drop  0.6% (10/1554)    9.1 Mb/s
+[11:31:29]   c3[left ]  15.0 fps  drop  0.3% (2/777)   30.7 Mb/s
+[11:31:29]   c3[right]  15.0 fps  drop  0.3% (2/777)   30.7 Mb/s
+[11:31:29]   c3[total]  70.5 Mb/s of the ~90 Mbit/s PoE budget
+[11:31:29]   FS chip: FOUNDATIONSTEREO  15.0 Hz  47 ms  valid 97%→95%
+[11:31:29]   FS state: live=True frames=755 hz=15.02 solve_ms=47.2 native=97.2% out=95.4% eager=False err='' note=''
+[11:31:29]   panel[depth] 640x360 15.1 fps lat=103.4 ms instrument='foundationstereo' conn=Conn.ONLINE note='valid 97% native -> 95% grid   47 ms'
+[11:31:29]   panel[main] 640x360 29.8 fps lat=61.8 ms instrument='' conn=Conn.ONLINE note=''
+[11:31:29]   panel[second] 1280x720 19.8 fps lat=None ms instrument='' conn=Conn.ONLINE note=''
+[11:31:29]   -> saved station_a15_065s.png / depth_a15_065s.png
+[11:31:41] exited rc=0 after 76 s
+
+########## B: --depth-fps 10 ##########
+[11:31:41] opts: source=hw fstereo=True iters=8 scale=0.5 size=None graph=True align=400x250 depth_fps=10.0 allow_command=False mavlink=none
+[11:31:41] running for 75 s; shots at [25, 45, 65]
+[11:31:41]   log[info] c3: target 192.168.2.191 streams=['color', 'left', 'right'] — 51 Mbit/s (color=10, left=20, right=20) = 56% of the ~90 Mbit/s PoE budget [ok] [C3 link only]
+[11:31:41]   log[info] fstereo: learned depth is THIS RUN'S depth source — iters=8 scale=0.5, cuda graph on, projected onto 400x250. The camera's own depth stream is not requested.
+[11:31:41]   log[info] mavlink: telemetry DISABLED (--mavlink-transport none) — nothing is sent to or read from the vehicle
+[11:31:41]   log[info] fstereo: loading FoundationStereo from /home/bdml/Desktop/FoundationStereo/FoundationStereo (this takes a few seconds)
+[11:31:46]   log[info] fstereo: vitl @ 23-51-11 ready in 4.7 s (iters=8 scale=0.5, cuda graph on)
+[11:31:46]   log[warn] fstereo: no mono pair yet — this run has no other depth source, so the depth panel is dark until pairs resume
+[11:31:51]   log[warn] fstereo: no mono pair yet — this run has no other depth source, so the depth panel is dark until pairs resume
+[11:31:56]   log[warn] fstereo: no mono pair yet — this run has no other depth source, so the depth panel is dark until pairs resume
+[11:32:01]   log[warn] fstereo: no mono pair yet — this run has no other depth source, so the depth panel is dark until pairs resume
+[11:32:02]   log[info] fstereo: rig ready — fx_rect 365.63 px (raw EEPROM fx differs by -3.42%), baseline 75.0 mm, K 27418 mm*px; depth projected onto 400x250
+[11:32:02]   log[info] c3: connected
+[11:32:04]   log[info] fstereo: forward captured as one CUDA graph in 1328 ms (input 320x224, iters 8)
+[11:32:06]   c3[color]  30.1 fps  drop  0.0% (0/112)    9.3 Mb/s
+[11:32:06]   c3[left ]  10.1 fps  drop  0.0% (0/38)   20.7 Mb/s
+[11:32:06]   c3[right]  10.1 fps  drop  0.0% (0/38)   20.7 Mb/s
+[11:32:06]   c3[total]  50.8 Mb/s of the ~90 Mbit/s PoE budget
+[11:32:06]   FS chip: FOUNDATIONSTEREO  10.1 Hz  46 ms  valid 97%→95%
+[11:32:06]   FS state: live=True frames=25 hz=10.13 solve_ms=46.4 native=97.1% out=95.4% eager=False err='' note=''
+[11:32:06]   panel[depth] 640x360 10.1 fps lat=111.6 ms instrument='foundationstereo' conn=Conn.ONLINE note='valid 97% native -> 95% grid   46 ms'
+[11:32:06]   panel[main] 640x360 30.0 fps lat=35.9 ms instrument='' conn=Conn.ONLINE note=''
+[11:32:06]   panel[second] 1280x720 20.0 fps lat=None ms instrument='' conn=Conn.ONLINE note=''
+[11:32:06]   -> saved station_b10_025s.png / depth_b10_025s.png
+[11:32:26]   c3[color]  30.3 fps  drop  0.4% (3/712)    9.3 Mb/s
+[11:32:26]   c3[left ]  10.0 fps  drop  0.4% (1/238)   20.5 Mb/s
+[11:32:26]   c3[right]  10.0 fps  drop  0.4% (1/238)   20.5 Mb/s
+[11:32:26]   c3[total]  50.2 Mb/s of the ~90 Mbit/s PoE budget
+[11:32:26]   FS chip: FOUNDATIONSTEREO  10.0 Hz  47 ms  valid 97%→95%
+[11:32:26]   FS state: live=True frames=224 hz=10.03 solve_ms=46.6 native=97.3% out=95.4% eager=False err='' note=''
+[11:32:26]   panel[depth] 640x360 10.0 fps lat=110.8 ms instrument='foundationstereo' conn=Conn.ONLINE note='valid 97% native -> 95% grid   47 ms'
+[11:32:26]   panel[main] 640x360 30.3 fps lat=31.7 ms instrument='' conn=Conn.ONLINE note=''
+[11:32:26]   panel[second] 1280x720 19.7 fps lat=None ms instrument='' conn=Conn.ONLINE note=''
+[11:32:26]   -> saved station_b10_045s.png / depth_b10_045s.png
+[11:32:46]   c3[color]  30.3 fps  drop  0.5% (7/1312)    9.3 Mb/s
+[11:32:46]   c3[left ]  10.0 fps  drop  0.5% (2/438)   20.5 Mb/s
+[11:32:46]   c3[right]  10.0 fps  drop  0.5% (2/438)   20.5 Mb/s
+[11:32:46]   c3[total]  50.2 Mb/s of the ~90 Mbit/s PoE budget
+[11:32:46]   FS chip: FOUNDATIONSTEREO  10.0 Hz  46 ms  valid 97%→95%
+[11:32:46]   FS state: live=True frames=423 hz=10.00 solve_ms=45.9 native=97.4% out=95.4% eager=False err='' note=''
+[11:32:46]   panel[depth] 640x360 10.0 fps lat=104.8 ms instrument='foundationstereo' conn=Conn.ONLINE note='valid 97% native -> 95% grid   47 ms'
+[11:32:46]   panel[main] 640x360 30.3 fps lat=26.1 ms instrument='' conn=Conn.ONLINE note=''
+[11:32:46]   panel[second] 1280x720 19.8 fps lat=None ms instrument='' conn=Conn.ONLINE note=''
+[11:32:46]   -> saved station_b10_065s.png / depth_b10_065s.png
+[11:32:58] exited rc=0 after 76 s
+
+[exited with code 0]

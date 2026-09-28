@@ -585,8 +585,34 @@ are headless (no flags).
 | `python verify/verify_acados.py` | acados NMPC ≡ IPOPT NMPC: equivalence (worst max\|Δu\| < 0.25 N on interior states) + SQP-RTI timing vs the 50 ms @ 20 Hz budget. First run code-generates the solver into `dobmpc/_acados_gen/` |
 | `python verify/verify_eaob.py` | EAOB observer validation: runs a disturbed DP hold twice (`profile="verify"` clean-deadbeat vs `profile="perf"` + injected sensor noise) and scores the OBSERVER — per-axis RMSE of `w_hat` vs the model-residual `w_true` (cross-checked against hydro's `diag_wtrue`), mean NIS/NEES vs the χ²₁₈ target ~18, gated frames, and a motion-correlation diagnostic (residual vs \|nu\|). Flags: `--mode {NONE..CDW}`, `--tau-dist`, `--profiles`, `--T`, `--seed`, `--no-plot`. At the default `EAOB_TAU_DIST=0.2` the perf profile passes NIS+NEES in CDW and NIS in CD (CD NEES ~9 = deliberate real-hardware conservatism). Exit 1 on perf FAIL [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md] |
 | `python verify/verify_state_source.py` | closed-loop A/B of `mpc_state_source` over {truth, meas, estimate} × {C,CD,CDW} × {dp,square} with FIXED seeds: radRMS/dc, startup transient, effort + chatter (Σ\|ΔF\| per tick), saturation, in-the-loop NIS/NEES, yaw-continuity check. Flags: `--sources`, `--modes`, `--scenarios`, `--T`, `--laps`, `--config`. Exit 1 if any imperfect-source run diverges, NIS leaves 14–24, or NEES exceeds 24 (below-range = documented conservatism, non-gating). NB: quantifies the raw-noise-x0 chatter cost |
+| `python verify/verify_attitude_hold.py` | **attitude-reference twin of the station NMPC** (2026-09-26): closes the loop on the heavy plant with `set_target(roll_ref=, pitch_ref=)` / a 6-tuple sampler and scores roll/pitch tracking — S2 hold grid `(roll,pitch) × {mpc,dobmpc} × mode` (e_roll/e_pitch mean/RMS/max, position coupling, K/M, per-thruster max\|f\| + saturation ticks, Σ\|f_i\| thrust cost vs the level hold, w_hat[3:5]), plus `step` / `ramp` (overshoot, settling, lag), `dropped` (K/M zeroed after the solver while the EAOB is credited; reference `--dropped-deg` 20° = station `rp_max_deg` vs interlock `--div-deg` 15° = station `div_max_rp_deg` → div_rp trip tick (0.5 s streak complete); refused when div ≥ dropped, the degenerate 174607 case), `signinv` (sign-inverted K/M → 35° ceiling + neutral recovery; exempt from the exit gate), `gain` (0.5×/2× applied torque), `deadband` (per-thruster knee plugin → limit cycle), `headroom` (CDW at tilt: X/Z headroom, heave-trim residual), `rate` (body-rate rows `none` vs `fd_horizon_T_inv` — the sim's np.gradient-over-the-horizon Euler rates through T⁻¹; the station's stitcher-rate method carries its own `fd_euler_T_inv` label, never pool the two). Steady window: t ≥ `--settle`; step/ramp/rate score t ≥ `--t-step` + `--settle` (transient in `extra`, effective start `extra steady_from_s` / meta `run.steady_from_s`); `max_abs_f_n`/`sat_ticks`/`e_rp_max_all_deg` are whole-run. Flags: `--scenarios`, `--ctrls`, `--modes`, `--grid "0,0;15,0;0,15"`, `--T`, `--settle`, `--t-step`, `--step-deg`, `--rate`, `--div-deg`, `--dropped-deg`, `--jobs`, `--out`. Writes `recordings/<day>/attitude_hold_<ts>/{results.csv, runs/traj_*.csv, runs/meta_*.json, meta.json}`; exit 1 on a non-finite run or n_fail > 0 |
 | `python verify/verify_meta.py` | the recorder sidecar manifest is complete: the disturbance snapshot round-trips (kicks/waves reproduced exactly), CSV header matches, solver + effective PID gains captured. Run from the package dir |
 | `/home/bdml/miniforge3/envs/robust-mjx/bin/python verify/verify_gpu_mjx.py` | Phase-0 GPU env check (**`robust-mjx` env, NOT `robust`**): JAX sees the CUDA GPU and a jitted MJX rollout actually runs on it; loading bluerov.xml under MJX is a non-gating bonus check (the CPU passive-callback hydro does not run under MJX) |
+
+**자세 기준 검증 실행법 (2026-09-26).** `dobmpc_controller.py`의 `set_target(roll_ref=, pitch_ref=)`(FLU rad, 기본 0 = 수평)와
+6-tuple 궤적 샘플러 `(p, yaw, v, r, roll, pitch)`가 NMPC에 roll/pitch 기준을 넘긴다. FLU 각도를 NED 타일에 손으로 옮기지 않고
+`R_zyx_flu → frames.flu_to_ned_eta`(S-켤레)를 통과시키므로 **FLU +10° roll → `xref[3]` = +0.1745, FLU +10° pitch → `xref[4]` = −0.1745**
+[유도: frames.py:37; 단위 테스트 `tests/test_dobmpc.py::test_xref_attitude_sign`]. 기준이 0/0이고 4-tuple 샘플러면 이전 코드 경로가
+바이트 단위로 동일하다(같은 테스트가 고정 사본과 비교). `main()`은 heavy에서 알려진 대로 실패하므로 함수 이름을 인자로 준다:
+`python tests/test_dobmpc.py test_xref_attitude_sign test_body_rates_T_inv test_xref_traj_attitude test_ref_traj_has_att_cleared`. 폐루프 검증은
+`python verify/verify_attitude_hold.py`(heavy 기본, S2 hold 격자 NONE, mpc+dobmpc, T 30 s, `--jobs`로 병렬; acados를 한 번 빌드한 뒤
+워커가 `DOBMPC_ACADOS_BUILD=0`으로 로드) — 산출물은 `recordings/<YYYYMMDD>/attitude_hold_<HHMMSS>/results.csv`이고 모든 수치는
+이 경로를 인용한다. 2026-09-26 첫 실행: heavy S2 격자 {(0,0),(15,0),(0,15),(0,−15),(10,10)}° × {mpc,dobmpc} × NONE에서 정상상태
+|e_roll|,|e_pitch| RMS 0.07–0.08°, 최대 스러스터 힘 18.4 N, 포화 0, n_fail 0, 수평 대비 Σ|f| 추가 pitch 15° +1.0–1.1 N / roll 15° +0.4 N
+(`recordings/20260926/attitude_hold_174544/results.csv`); heavy_gripper (0,20)°에서 plain mpc의 정상상태 pitch 오차 −0.15°(수평 유지
++0.29°)가 dobmpc에서 −0.04°로 줄고 `w_hat[4]`가 −0.22 N·m(수평)/+0.08 N·m(20°)을 흡수 — 예측했던 "정상 기울기"는 부호·기전은 맞지만
+크기는 1° 미만(NMPC의 자세 가중치 80이 대부분을 닫음) (`recordings/20260926/attitude_hold_174602_gripper/results.csv`);
+확장 시나리오 S3–S7은 `recordings/20260926/attitude_hold_174607/results.csv` (step 15°: 오버슈트 1.0 %, 1° 정착 1.0 s; 6-tuple 램프
+0.35 rad/s에서 body-rate 행 `none` 3.1° vs `fd_horizon_T_inv` 0.29° 피크 오차 — 이 산출물의 variant 열은 구 라벨 `fd_euler_T_inv`로
+기록돼 있다; 부호 반전 시 0.4–0.45 s에 35° 천장, 중립 후 5.4–7.6 s에 복귀; dobmpc 2× 토크 이득에서
+포화 234 tick — DOB 곱셈 불확실성 한계의 첫 근거). 단 174607의 step/ramp/rate 행은 정상상태 창(t ≥ settle = t_step = 10 s)에
+과도응답이 들어가 e_pitch_rms 1.65°·accept 0으로 기록됐고, dropped 행은 기준 15° = `--div-deg` 15°로 퇴화(문턱 위 잡음 교차:
+mpc 3.4 s, dobmpc 트립 없음)라 두 항목 모두 인용하지 않는다. 2026-09-26 (2) 수정 후 step/ramp/rate는 t ≥ t_step + settle = 20 s로
+채점: mpc step e_pitch_rms 0.088°, accept 1 (`recordings/20260926/attitude_hold_211813/results.csv`), ramp/rate mpc 0.09°, accept 3/3
+(`recordings/20260926/attitude_hold_211921/results.csv`); dropped는 기준 `--dropped-deg` 20°(station `rp_max_deg`) vs 문턱 15°(station
+`div_max_rp_deg`)로 mpc·dobmpc 모두 0.45 s(10 tick 스트릭이 완성되는 tick)에 트립하고, dobmpc는 도착하지 않은 K/M을 EAOB가 인정한 채
+6.83° 기울어 정상상태 |e| 13.2° < 15°(mpc는 수평 유지, |e| 20°) (`recordings/20260926/attitude_hold_211917/results.csv`). 마지막 두 항목은 `ROV_MODEL=heavy` 기본값이므로 `heavy_gripper`는
+`ROV_MODEL=heavy_gripper python verify/verify_attitude_hold.py --grid "0,0;0,20"`로 따로 돌린다.
 
 ### 7. Asset & figure generators (occasional)
 

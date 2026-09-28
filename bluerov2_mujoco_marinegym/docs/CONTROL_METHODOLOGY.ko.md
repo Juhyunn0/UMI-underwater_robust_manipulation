@@ -1316,3 +1316,62 @@ engage → DP 워밍업 → square 1랩 → 완주 → DP → 해제 전 과정 
 **기록 경계**: 하드웨어 CSV(`*_mpc.csv`)는 sim의 9열 접두를 공유하지만 **다른 모집단**이다 —
 meta.json에 `source: "hardware rov_gui.control"`, 태그맵 sha1, 축 게인 출처가 박힌다.
 sim `runs/traj_*.csv`와 절대 합산하지 말 것.
+
+## 2026-09-26 — 6-DoF 변형: 정책이 roll/pitch를 내고 NMPC가 추종한다 (기본 OFF)
+
+교체가 아니라 설정 + 체크포인트로 선택하는 새 변형. 확산 정책이 `[dx, dy, dz, dyaw, droll, dpitch, width]`
+(`action_repr: pos_rpy_width`, 폭 7)를 낼 수 있다 — 라벨 인코더 `umi/common/yaw_action.py::encode_pos_rpy`
+(`R_bt R_rel R_bt^T`의 ZYX 오일러, dyaw 열은 5-dim 라벨과 비트 동일). 스테이션은 디코더를 `policy_frames.py`에
+전사(경로 기준 패리티 테스트), `compose_plan(track_rp=True)`가 knot마다 절대 NED roll/pitch를 실어
+(`PlanMsg.rp`, `policy.rp_max_deg`에서 T1 클립), 필터는 크기·오일러 각속도·점프를 게이트, 스티처는 자세+각속도를
+샘플(`sample_att`), `HwDobMpc._xref_ned_plan`은 플랜에 rp가 있을 때만 xref[3:5]와 `T(phi,theta)^-1`을 거친
+body rate 행 xref[9:11](+ xref[11])을 채운다. K/M 토크는 engage 게이트 `engage.attitude_axes` 뒤에서
+MANUAL_CONTROL 확장 축(`s` = pitch, `t` = roll, `enabled_extensions=0b11`; MAVLink 2 전용)으로 ArduSub에
+가며, `axis_gain.roll_nm 13.2 / pitch_nm 7.2` [유도]로 스케일하고 0.2 / 0.3 [예측]으로 캡. 시뮬 래퍼
+(`dobmpc_controller.set_target(roll_ref, pitch_ref)`, 6-튜플 샘플러)도 같은 레퍼런스 경로;
+`verify/verify_attitude_hold.py`가 hold 그리드 + step/ramp/dropped/부호반전/gain/deadband/headroom 시나리오를 돈다.
+
+기억할 결정:
+* **변형 OFF = 4-DoF 경로 바이트 동일.** `compose_plan` / `PlanFilter` / `PlanStitcher`의 golden sha256 핀
+  (test_policy_frames, test_plan_stream), 동결된 레거시 복사본 대비 `_xref_ned` / `_xref_ned_plan` 타일 비트 동일
+  (test_attitude_axes, 시뮬 tests/test_dobmpc.py), 23바이트 MAVLink 프레임 동일, 변형 키를 뺀
+  `config/hw_mpc.yaml` 해석 결과의 키별 동일.
+* **rp가 사라지면 스텝이 아니라 hold 램프** (`_rp_hold`가 tick당 `pq_max_rad_s`·DT로 감쇠).
+* **rate 행은 T^-1 경유**: 0.35 rad/s 램프에서 수평 rate 레퍼런스는 피크 3.105 deg 지연, T^-1 행은 0.287 deg;
+  램프 피크 오차 7.252 deg
+  (`bluerov2_mujoco_marinegym/recordings/20260926/attitude_hold_211921/results.csv`, `rate_*` / `ramp_*` 행).
+  방법도 라벨도 둘 — **하나의 `rate_source`로 합산 금지**: 시뮬 `attitude_meta.rate_source`는 `fd_horizon_T_inv`
+  (샘플한 호라이즌 위 np.gradient), 스테이션 `HwDobMpc` 라벨은 `stitcher_rate_T_inv`(스티처가 샘플한 오일러 rate를 T^-1로).
+* **정상상태 창은 t_step + settle = 20 s부터**(`steady_from_s=20`): step 15 deg, plain mpc, e_pitch RMS 0.0884 deg,
+  오버슈트 0.9991 %, 1-deg 정착 1.0 s, accept 1 (`recordings/20260926/attitude_hold_211813/results.csv`, `step,mpc` 행).
+  이전 `attitude_hold_174607`의 step/ramp/rate/dropped 행은 창이 과도를 포함해 정상상태 값으로 **인용 불가**(과도 값은 동일).
+* **dobmpc는 계속 게이트(`dobmpc_allowed: false`)**: 토크 게인 2배 오차에서 EAOB가 수직 스러스터를 포화
+  (234 tick, max|f| 52 N), 평범한 MPC는 정상 오차 +0.22 deg (`recordings/20260926/attitude_hold_174607/results.csv`,
+  `gain_*` 행); K/M이 조용히 버려질 때(참조 20 deg = `policy.rp_max_deg`, 임계 15 deg = `policy.div_max_rp_deg`) mpc·dobmpc
+  모두 0.45 s에 `div_rp` 트립 — 임계 초과 연속 10 샘플 = 스테이션 0.5 s 디바운스, 선체는 20 deg에 접근하지 않음 — 그리고
+  dobmpc는 크레딧되었으나 미전달된 K/M으로 pitch 6.83 deg까지 흘러 rad_max 14.5 cm
+  (`recordings/20260926/attitude_hold_211917/results.csv`, `dropped_*` 행). 174607의 `dropped_*` 행은 임계 = 참조 크기라
+  퇴화 — 인용 금지.
+* heavy hold 그리드(mpc, dobmpc; NONE): e_roll/e_pitch RMS 0.07–0.08 deg, 15 deg에서 K/M 0.29/0.30 N·m,
+  sat_ticks 0 (`recordings/20260926/attitude_hold_174544/results.csv`). heavy_gripper (0,20) deg: plain mpc
+  정상상태 pitch 오차 −0.15 deg(수평에서 +0.29 deg) vs dobmpc −0.04 deg — 예측했던 ZG·W vs B·coBM 정상 기울기는
+  부호만 확인, 크기는 Q_att 80이 대부분 닫아 1 deg 미만 (`recordings/20260926/attitude_hold_174602_gripper/results.csv`).
+* **캡 계층(바깥이 마지막)** [인용 없는 값은 예측]: T0 라벨 범위(normaliser + DDIM clip) → T1 `compose_plan` 클립
+  `rp_max_deg` 20 → T2 PlanFilter(`rp_reject_deg` 30 hard, `pq_max_rad_s` 0.35 dilation, `rp_jump_max_deg` 5 soft)
+  → T3 `set_path_plan_ned` ValueError(`rp_reject` 초과) → T4 선 캡 `cap_roll 0.2 / cap_pitch 0.3`(첫 물 세션은
+  `first_water_caps [0.1, 0.15]`). T1/T2의 근거 라벨 통계: |dpitch| p99.9 16.7–18.6 deg, max 21.1–27.2 deg; |droll|
+  p99.9 7.8–9.3 deg (`data/20260926/rp_label_stats_174358.txt`, `rp_label_stats_174535.txt`); 피크 오일러 각속도
+  |p|,|q| p90 0.453 rad/s(두 축 합산 최대, 원 66.7 ms 격자)라 0.35 rad/s 게이트가 200 ms 격자에서 2/1721 청크를 dilation
+  (`data/20260926/0926_175145_offline/gate_pos_rpy_width.log`).
+* **MANUAL 전용.** STABILIZE에선 펌웨어가 s/t를 lean-angle 목표로 재해석해 자체 자세 루프를 돌리므로 스테이션의
+  K/M 토크는 같은 축 위의 두 번째 제어기가 된다; `attitude_axes.enabled`면 STABILIZE engage를 거부한다
+  (lean-angle 캐스케이드는 범위 제외).
+* **순서: plain mpc → 토크 게인 보정 → dobmpc.** `roll_nm 13.2 / pitch_nm 7.2`는 heave_n × 레버암에서 유도한 값
+  [유도]이지 측정이 아니다; 첫 물 시험은 정책 없는 plain mpc 자세 STEP으로 게인을 맞추고, 그 다음에야
+  `dobmpc_allowed`를 검토한다 — EAOB는 선이 나르지 않는 토크를 크레딧하기 때문(위 `gain_*` / `dropped_*` 근거).
+
+기록: 미션 CSV 끝에 `rroll_deg, rpitch_deg, ax_roll, ax_pitch, rp_track`(OFF면 nan/0), `policy_plan.csv`는
+`,reason,roll_deg,pitch_deg`로 끝남, meta schema 15 → 16에 `run.attitude_axes`, `trajectory.attitude_track`,
+`policy.action_repr`, `controller.attitude_ref`. 범위 제외: `transport: rc_override`, STABILIZE lean-angle
+캐스케이드, PID roll/pitch 루프, run_compare 자세 시나리오, 수중 arm 부호 프로브 미션은 이번 컷에 없음.
+**실기 0런**: 펌웨어의 s/t 소비, K/M 부호, 토크 게인 전부 미확인(KNOWN_ISSUES.md 2026-09-26).

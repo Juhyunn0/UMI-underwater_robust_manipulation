@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """extract_pose.py — offline 6-DoF pose labels for a handheld demonstration session.
 
-Reads a recorded session (``sessions/demonstration_NNNN/``: ``left/<t>.png``
+Reads a recorded session (``data/<YYYYMMDD>/demonstration_NNNN/``: ``left/<t>.png``
 mono8 rectified-left frames + ``frames.csv`` + ``session.json``) and emits a
 per-frame pose in the tag-map NED frame by running AprilTag PnP against a
 surveyed tag map. The output is the training/replay label track for the
@@ -14,7 +14,7 @@ diffusion-policy pipeline:
                  with no accepted fix is all-NaN except t_unix.
     poses.json   schema "umi_handheld_poses/1": full provenance + run stats.
 
-    python -m umi_handheld.extract_pose sessions/demonstration_0026
+    python -m umi_handheld.extract_pose data/20260831/demonstration_0026
 
 WHAT IT REUSES, AND WHY
 -----------------------
@@ -340,7 +340,7 @@ def make_parser() -> argparse.ArgumentParser:
         prog="python -m umi_handheld.extract_pose",
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("session_dir", type=Path,
-                    help="sessions/demonstration_NNNN directory")
+                    help="data/<YYYYMMDD>/demonstration_NNNN directory")
     ap.add_argument("--tag-map", default="config/tag_map.yaml",
                     help="surveyed tag map (default config/tag_map.yaml). Do "
                          "NOT point at tag_map_full.yaml casually: it holds "

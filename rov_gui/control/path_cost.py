@@ -42,7 +42,7 @@ bounds along-track error at ``path_lead_m`` (the leash), so lowering
 ``q_along`` does not let the reference run away — it cannot. What it changes
 is how much authority the NMPC spends closing a gap that is bounded anyway.
 On 2026-08-18 that leash was saturated on 83.6 % of engaged ticks
-(sessions/low_level_controller_data/20260818/0818_143802/mpc_143938.csv), i.e.
+(data/20260818/0818_143802/mpc_143938.csv), i.e.
 the vehicle was already unable to keep up; tuning q_along DOWN in that regime
 buys cross-track accuracy at the price of going even slower. Read the two
 knobs together, not separately.
@@ -66,6 +66,18 @@ import numpy as np
 # x = [x y z, phi theta psi, u v w, p q r]  (NED / FRD) — the sim's state order
 IDX_POS_XY = (0, 1)
 IDX_VEL_XY = (6, 7)
+# ATTITUDE ROWS (2026-09-26, the 6-DoF variant): rows 3, 4 (phi, theta) and
+# 9, 10 (p, q) are NEVER rotated into the path frame, never masked by
+# NedPlan.w_stage (HwDobMpc.W_STAGE_ROWS covers 0,1,2,6,7,8 only) and never
+# scaled by policy.q_scale / along_scale. Consequence under the variant: a
+# masked hold tail still tracks the plan's ENDPOINT attitude at full weight
+# (the follower does not go level when the position rows go free), and the
+# tuned path-frame split leaves roll/pitch tracking exactly as the isotropic
+# baseline had it. ``PLAN_SCALE_RP_ROWS`` is the optional hook for a future
+# policy.attitude_q_scale (default 1.0 = these rows untouched); nothing in
+# this file multiplies them today.
+IDX_ATT_RP = (3, 4)
+PLAN_SCALE_RP_ROWS = (3, 4)
 
 # Every key `mpc_tuned:` accepts. A typo here is the imu_dr failure mode: the
 # run flies the BASELINE weights while its meta says "tuned", and the two
@@ -200,7 +212,13 @@ class PathFrameWeights:
         W[i, j] = W[j, i] = block[0, 1]
 
     def stage_W(self, psi_path: float, psi_body: float | None = None):
-        """Running-cost weight (ny x ny, ny = nx + nu) at one stage."""
+        """Running-cost weight (ny x ny, ny = nx + nu) at one stage.
+
+        Only the (x, y) block and, with ``split_velocity``, the (u, v) block
+        are rewritten; the attitude rows 3, 4 / 9, 10 (``IDX_ATT_RP``) keep
+        ``W_base`` verbatim, so a 6-DoF attitude reference is weighed the
+        same under mpc_tuned as under mpc.
+        """
         W = self.W_base.copy()
         self._write_block(W, IDX_POS_XY,
                           path_frame_block(self.q_along, self.q_cross,

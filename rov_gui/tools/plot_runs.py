@@ -6,10 +6,14 @@
     python -m rov_gui.tools.plot_runs --dates 20260814_212021   # one run
     python -m rov_gui.tools.plot_runs --dates 20260814 --list
 
-Give it DATES — that is the whole config. It finds every controller run
-recorded under ``sessions/low_level_controller_data/<YYYYMMDD>/<run>/``
-(rov_gui/runstore.py), draws one figure per run, and says plainly which entries
-produced nothing and why. Everything else — the frame, the axis limits, the
+Give it DATES — that is the whole config. It finds every WATER controller run
+recorded under ``data/<YYYYMMDD>/<run>/`` (rov_gui/runstore.py), draws one
+figure per run, and says plainly which entries produced nothing and why. A
+run folder of another KIND — ``..._observe`` (LOW level None, nothing
+commanded), ``..._landdry`` (bench, in air), ``..._dryrun`` (synthetic plant)
+— shares the date directory since 2026-09-14 and is skipped unless the config
+names that kind (``kind: observe``): the kind is the pooling guard, and a
+figure of an open-loop or in-air record beside a pool run would read as one. Everything else — the frame, the axis limits, the
 colours — is fixed so that two figures from two different days can be put side
 by side on a slide and compared by eye without reading the axes.
 
@@ -169,7 +173,8 @@ def _rel(p: Path) -> str:
 DEFAULTS = {
     # ---- what to plot: this is the only key the config file normally carries
     "dates": [],                 # "20260814" | "20260814_212021" | all | latest
-    "base": "sessions/low_level_controller_data",
+    "base": "data",
+    "kind": "",                  # "" = water runs only; "observe" / "landdry" / "dryrun"
     "out_dir": "figures/trajectories",
     "controllers": [],           # ["mpc", "pid", "dobmpc"]; empty = all
     "segment": "auto",           # auto | traj | engaged | all
@@ -569,7 +574,11 @@ _NUM = ("t", "px", "py", "pz", "rx", "ry", "rz", "yaw_deg", "ryaw_deg",
         "dr_px", "dr_py", "dr_pz", "dr_pz_imu", "dr_err_m", "dr_err_z_m",
         "dr_t_s", "dr_hz", "dr_ok",
         "roll_deg", "pitch_deg", "tag_age_s",
-        "obj_px", "obj_py", "obj_pz", "obj_age_s", "obj_pair_exact")
+        "obj_px", "obj_py", "obj_pz", "obj_age_s", "obj_pair_exact",
+        # schema 16 (2026-09-26, the 6-DoF variant): attitude reference in
+        # the SAME world-FLU signs as roll_deg / pitch_deg, the K/M axes
+        # sent, and the per-row boundary bit. Absent before 16.
+        "rroll_deg", "rpitch_deg", "ax_roll", "ax_pitch", "rp_track")
 
 #: The columns that are words, not numbers.
 _TXT = ("mode", "obj_state", "follow_state", "bridge_tier")
@@ -833,6 +842,17 @@ def load_run(date: str, run_dir: Path, meta_path: Path, cfg: dict):
                                .get("path_following", False)),
         "lead_cm": lead * 100.0, "err_src": err_src,
     }
+    # ATTITUDE TRACKING (schema 16): roll/pitch RMS against the reference,
+    # ONLY over rows flown with the attitude axes SENT (rp_track == 1) and
+    # only when the columns exist. A 4-DoF run gets no key at all — the
+    # figures and every existing statistic above are untouched.
+    if "rroll_deg" in col and "rp_track" in col and "roll_deg" in col \
+            and "rpitch_deg" in col and "pitch_deg" in col:
+        tr = m & (col["rp_track"] == 1) & np.isfinite(col["rroll_deg"])
+        if int(tr.sum()) >= 3:
+            run.stats["roll_rms_deg"] = _rms(col["roll_deg"][tr] - col["rroll_deg"][tr])
+            run.stats["pitch_rms_deg"] = _rms(col["pitch_deg"][tr] - col["rpitch_deg"][tr])
+            run.stats["rp_track_n"] = int(tr.sum())
     return run, None
 
 
@@ -843,12 +863,21 @@ def discover(base: Path, specs: list[tuple[str, str]], cfg: dict):
     say so by its own name — silently plotting the rest of the day would look
     like success.
     """
+    from .. import runstore
+    want_kind = str(cfg.get("kind") or "")
     runs, skips, seen = [], [], set()
     for date, token in specs:
         day = base / date
         entry = f"{date}_{token}" if token else date
         found_any = False
         for run_dir in sorted(d for d in day.iterdir() if d.is_dir()):
+            # The KIND filter (see the module doc): a leaf of another kind is
+            # not this figure's data even though it has a meta.json. A name
+            # runstore does not recognise (a training run, a gantry capture)
+            # falls through to the meta.json test as before.
+            kind = runstore.leaf_kind(run_dir.name)
+            if kind is not None and kind != want_kind:
+                continue
             metas = sorted(run_dir.glob("*.meta.json"))
             if token:
                 metas = [m for m in metas

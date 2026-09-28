@@ -2,8 +2,8 @@
 """plot_nav_run.py — replot a REC NAV recording (a nav_<hhmmss>/ folder).
 
     python -m rov_gui.tools.plot_nav_run \
-        sessions/low_level_controller_data/20260814/1841/nav_184148
-    (runs before 2026-08-14 live in sessions/nav_runs/<stamp>/ instead)
+        data/20260814/1841/nav_184148
+    (runs before 2026-08-14 live in data/YYYYMMDD/MMDD_HHMMSS/nav_<hhmmss>/ instead)
     python -m rov_gui.tools.plot_nav_run <run dir> --show
     python -m rov_gui.tools.plot_nav_run <run dir> -o custom.png
 
@@ -44,7 +44,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("run_dir", type=Path,
                     help="a nav_<hhmmss>/ folder inside a run folder "
-                         "(or sessions/nav_runs/<stamp>/ for pre-2026-08-14 runs)")
+                         "(or data/YYYYMMDD/MMDD_HHMMSS/nav_<hhmmss>/ for pre-2026-08-14 runs)")
     ap.add_argument("-o", "--out", type=Path, default=None,
                     help="output image (default <run_dir>/trajectory.png)")
     ap.add_argument("--show", action="store_true", help="open a window too")

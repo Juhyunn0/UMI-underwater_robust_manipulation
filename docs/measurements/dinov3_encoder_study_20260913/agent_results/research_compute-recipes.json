@@ -1,0 +1,111 @@
+{
+ "summary": "Compute recipes for DINOv3 ViT-L/16, ViT-H+/16 and ViT-7B/16 as the diffusion-policy image encoder on one RTX 5090 (32 GB), from (a) reading the installed timm 1.0.29 source in the rovgui-pose env, (b) a local random-init benchmark on the idle 5090 (scratchpad artifacts dinov3_bench*_result.json), and (c) web sources. Bottom line: timm's vit_*_patch16_dinov3 take 224 input silently (dynamic_img_size=True baked in, RoPE regenerated per forward; forward_features -> [B,201,D] with num_prefix_tokens=5 = CLS+4 registers included), use F.scaled_dot_product_attention by default, and support set_grad_checkpointing(True). Measured on the 5090 with the project's 128-image step (batch 64 x 2 frames, bf16 autocast, AdamW, encoder only): ViT-L full FT needs grad-checkpointing (7.3 GiB, 0.58 s/step; without ckpt OOM at 128, 17.9 GiB at 64 images); ViT-H+ full FT with ckpt 16.5 GiB, 1.4 s/step (without ckpt 27 GiB at 32 images, OOM at 64); baseline CLIP ViT-B is 9.5 GiB, 0.23 s/step without ckpt. ViT-7B cannot be fully fine-tuned (fp32 master+AdamW ~107 GB [derived]); bf16 weights alone are 12.5 GiB, frozen no-grad feature extraction of 128 images fits in 14.7 GiB at 1.7 s, and a frozen-base+tiny-trainable-set (LoRA-like) step with ckpt fits at 64 images (18.6 GiB, 2.8 s) with ~25 GiB / ~5.5 s predicted at 128 images. Inference batch 2 @224 bf16 eager+SDPA on the 5090: L 4.9 ms, H+ 8.4 ms, 7B 43 ms (vs CLIP-B ~1-2 ms unsourced); no web-published 4090/5090 latency for these sizes was found. Meta's own guidance is frozen features first and fine-tuning \"as a last resort\", ViT-L \"achieves performance close to that of the original 7B teacher\"; the only DINOv3+diffusion-policy paper used ViT-S/16 at 76x76; a domain-shifted benchmark (chest X-ray) found the frozen 7B linear probe 3-7 pp worse than a fully fine-tuned ViT-B and LoRA 1.3-5.1 pp worse than full FT. Practical constraints: peft/bitsandbytes are installed in neither umi2 nor rovgui-pose; timm's 7B checkpoint is a single 25 GB fp32 safetensors (not gated on the timm/ hub repos, gated 'manual' on facebook/), so it must be loaded on CPU and cast to bf16.",
+ "claims": [
+  {
+   "claim": "timm 1.0.29's vit_{large,huge_plus,7b}_patch16_dinov3 constructors hard-code dynamic_img_size=True, use_abs_pos_emb=False and rope_type='dinov3' (eva.py:3002-3025, 3058-3084, 3118-3145), so a 224x224 input is accepted with zero warnings even though the pretrained cfg says input_size (3,256,256)/fixed_input_size=True (eva.py:1379-1400; _builder.py:319 only sets img_size=256 for patch_embed.grid_size, RoPE is regenerated per forward via self.rope.get_embed(shape=(H,W)) at eva.py:878-892). forward_features returns the FULL token sequence including prefix tokens: at 224 the measured shape is [2,201,1024] (L), [2,201,1280] (H+), [2,201,4096] (7B) with model.num_prefix_tokens == 5 (1 CLS + 4 registers, eva.py:648 `(1 if class_token else 0) + num_reg_tokens`); at 256 the HF model cards quote (1,261,D). Registers are never stripped by forward_features; forward_intermediates/global_pool_nlc strip them with num_prefix_tokens (eva.py:991-994, 1033). Note timm defaults global_pool='avg' whereas upstream DINOv3 pools the CLS token; pass global_pool='token' to match (docstring eva.py:1379-1385).",
+   "sources": [
+    "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/timm/models/eva.py:648,878-892,991-994,1036-1071,1379-1400,3002-3025,3058-3084,3118-3145",
+    "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/timm/models/_builder.py:319-330",
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/dinov3_bench_result.json (warnings_224: [], forward_features_shape_224, num_prefix_tokens)",
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/dinov3_bench_7b_result.json",
+    "https://huggingface.co/timm/vit_large_patch16_dinov3.lvd1689m",
+    "https://huggingface.co/timm/vit_7b_patch16_dinov3.lvd1689m",
+    "https://huggingface.co/docs/transformers/model_doc/dinov3 (num_register_tokens=4; last_hidden_state = 1 + 4 + patches)"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "TransformerObsEncoder currently consumes 197 CLIP tokens (1 CLS + 196); with DINOv3 the token count becomes 201 and the first 5 tokens are non-spatial (CLS + 4 registers). Any code that assumes token[0] is CLS and tokens[1:] form a 14x14 grid must slice [5:] instead of [1:]; the projection/attention-pool layers must be resized to 1024/1280/4096-d. No image-size change (224 stays) and no timm warning suppression is needed."
+  },
+  {
+   "claim": "timm's Eva attention uses F.scaled_dot_product_attention whenever use_fused_attn() is true, which is the default (TIMM_FUSED_ATTN unset -> _USE_FUSED_ATTN=1; eva.py:168,256-262; layers/config.py:32-35,137-143); measured model.blocks[0].attn.fused_attn == True for L/H+/7B on torch 2.11. RoPE is applied to patch tokens only and prefix tokens are concatenated back before SDPA (eva.py:250-254). head_dim is 64 for L and H+ (1024/16, 1280/20) and 128 for 7B (4096/32), all within the flash/mem-efficient SDPA kernel limits, and torch reports flash_sdp_enabled and mem_efficient_sdp_enabled == True in the rovgui-pose env. There is no separate flash_attn package path in timm (unlike HF transformers' attn_implementation='flash_attention_2', which needs the flash_attn wheel and silently falls back to SDPA otherwise). Gradient checkpointing is model.set_grad_checkpointing(True) (eva.py:818-820), applied per block with torch.utils.checkpoint (eva.py:1060-1069).",
+   "sources": [
+    "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/timm/models/eva.py:168,250-262,818-820,1060-1069",
+    "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/timm/layers/config.py:32-35,137-156",
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/dinov3_bench_result.json (fused_attn: true)",
+    "https://huggingface.co/docs/transformers/attention_interface",
+    "https://huggingface.co/docs/transformers/main/perf_infer_gpu_one"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "Nothing extra to install for fast attention in either env; the only switch the encoder wrapper needs is set_grad_checkpointing(True) (the umi2 timm 0.9.7 must be upgraded to >=1.0.20 anyway to get the dinov3 registrations, per the orchestrator's premise and timm release v1.0.20)."
+  },
+  {
+   "claim": "Measured on the idle RTX 5090 (driver 570.211, torch 2.11.0+cu128, timm 1.0.29, random-init weights, encoder-only step: fp32 master weights + bf16 autocast + AdamW on forward_features(...).mean(), 224x224 input; peak torch.cuda.max_memory_allocated): baseline vit_base_patch16_clip_224: 128 img no-ckpt 9.53 GiB / 227 ms, with ckpt 2.88 GiB / 127 ms. vit_large_patch16_dinov3 full FT: 32 img 10.96 GiB/115 ms, 64 img 17.92 GiB/222 ms, 128 img OOM without checkpointing; with set_grad_checkpointing(True): 128 img 7.31 GiB / 577 ms. vit_huge_plus_patch16_dinov3 full FT: 32 img 27.15 GiB/291 ms, 64 img OOM without ckpt; with ckpt 128 img 16.51 GiB / 1375 ms (the ~16 GB floor is 840 M params x 16 B for fp32 weights+grads+AdamW states). Frozen-base 'LoRA-like' (only LayerScale gammas trainable, ckpt on, 128 img): L 4.74 GiB/457 ms, H+ 9.44 GiB (step time 2293 ms is noisy, treat as ~1.4-2.3 s). Frozen no_grad feature pass of 128 img: L 1.91 GiB/140 ms, H+ 4.67 GiB/703 ms. Add the policy head/decoder, EMA copy (another fp32 weight copy: +1.2 GB for L, +3.4 GB for H+) and dataloader on top of these encoder-only figures.",
+   "sources": [
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/dinov3_bench2_result.json",
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/dinov3_bench2.py",
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/dinov3_bench_result.json"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "At the project's batch 64 x horizon 2 = 128 images/step: ViT-L full FT is feasible on the 5090 only with gradient checkpointing (~2.5x the CLIP-B step time, ~7-9 GB encoder VRAM); ViT-H+ full FT with checkpointing fits (~17-20 GB with EMA) but is ~6x slower per step than today (1.4 s vs 0.23 s), i.e. 200 epochs become a multi-day run. Without checkpointing both L and H+ OOM at 128 images. Web-sourced VRAM tables for DINOv3 L/H+ at 224 were not found; these are local measurements [측정] not literature values."
+  },
+  {
+   "claim": "ViT-7B/16 (6716 M params, GMACs 1775 @256; timm checkpoint is a single 25.02 GiB fp32 model.safetensors) cannot be fully fine-tuned on 32 GB: fp32 master + grads + AdamW = ~16 B/param = ~107 GB before activations [derived, not measured]; a dinov3 GitHub issue reports OOM at batch_size=1 on an 80 GB A100 with the official 7B training config (issue #266, no maintainer answer). What fits, measured on the 5090 with bf16 weights (12.51 GiB): inference batch 2 @224 43.1 ms; frozen no_grad feature extraction of 128 images 14.72 GiB peak / 1727 ms; frozen-base + tiny trainable set (0.33 M LayerScale gammas, stand-in for LoRA adapter memory) with set_grad_checkpointing(True): 8 img 13.31 GiB/388 ms, 16 img 14.04 GiB/692 ms, 32 img 15.54 GiB/1366 ms, 64 img 18.56 GiB/2782 ms -> 128 img extrapolates to ~25 GiB and ~5.5 s/step [예측]. Practical 7B routes people use: (a) freeze and linear/MLP-probe the 4096-d features (chest-X-ray paper trained a 2.1 M-param 'DINO-Net' head on frozen 7B features, single L40S 48 GB), (b) cache frozen features offline (the 4096-d CLS + 196 patch tokens per frame is 201x4096x2 B = 1.6 MB/frame in bf16), (c) weight-only int4 via torchao as shown in the HF transformers DINOv3 docs for the 7B (inference only). Loading: timm's 25 GB fp32 file must be materialised on CPU (host has 60 GB RAM) and cast to bf16 before .cuda(); creating the model under torch.set_default_dtype(bfloat16) avoids a 27 GB fp32 GPU copy.",
+   "sources": [
+    "https://huggingface.co/timm/vit_7b_patch16_dinov3.lvd1689m",
+    "https://github.com/facebookresearch/dinov3/issues/266",
+    "https://huggingface.co/docs/transformers/model_doc/dinov3 (torchao Int4WeightOnlyConfig example on facebook/dinov3-vit7b16-pretrain-lvd1689m)",
+    "https://arxiv.org/pdf/2510.07191 (Methods: 'Frozen-feature probing with DINOv3-7B', L40S 48 GB)",
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/dinov3_bench_7b_result.json",
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/dinov3_bench_7b.py",
+    "HF API https://huggingface.co/api/models/timm/vit_7b_patch16_dinov3.lvd1689m?blobs=true (model.safetensors 25.02 GiB, gated: False)"
+   ],
+   "confidence": "medium",
+   "why_it_matters_here": "The 'official/largest' size is only usable here as a frozen (or LoRA-adapted with checkpointing at reduced batch) feature extractor. A frozen-7B run at 128 img/step costs ~1.7 s of encoder forward per step (7-8x today's whole step) unless features are cached offline, which is incompatible with per-sample random crop / ColorJitter-style augmentation of the depth image; the deploy latency of 43 ms per 2-frame observation also eats most of a 20 Hz control budget before DDIM. The LoRA-like numbers exclude real LoRA adapter weights/optimizer states (small, <1 GB for r<=16 on qkv/proj/fc) and the peft library, which is not installed in umi2 or rovgui-pose."
+  },
+  {
+   "claim": "Inference latency for a batch of 2 images at 224x224, bf16 weights, eager PyTorch with SDPA, no torch.compile/CUDA graphs, measured on the RTX 5090 (median of 50 runs after warm-up): ViT-L 4.92 ms (p90 4.95; fp32 weights + autocast 5.35 ms), ViT-H+ 8.43 ms (autocast 9.05 ms), ViT-7B 43.09 ms (bf16 weights, 12.56 GiB resident). No published 4090/5090 batch-2 latency for DINOv3 L/H+/7B was found on the web; the closest sourced figures are 27.7 FPS FP16 for a DINOv3-L-backbone segmentation model on an RTX 3090 and ~2.1-3.3 ms for DINOv3 ViT-B/16 under bf16 AMP (search-result snippets, model/resolution/batch not fully specified) [unsourced beyond snippets]. Paper GFLOPs at 256: ViT-L 163, ViT-H+ 450, ViT-7B 3550 (search-result snippet of the DINOv3 paper table; not independently verified from the PDF).",
+   "sources": [
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/dinov3_bench_result.json",
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/dinov3_bench_7b_result.json",
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/dinov3_bench.py",
+    "https://huggingface.co/timm/vit_large_patch16_dinov3.lvd1689m (GMACs 82.4 @256)",
+    "https://arxiv.org/abs/2508.10104"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "The deploy path (rov_gui, rovgui-pose env, same 5090 or a laptop-class GPU) runs the encoder on 2 frames per policy call: L adds ~5 ms, H+ ~8-9 ms, 7B ~43 ms plus 12.5 GB of resident VRAM that competes with FoundationStereo/SAM2/FoundationPose in the same process. On a weaker deploy GPU scale these numbers by the GPU's bf16 throughput ratio; the 5090 numbers are the floor."
+  },
+  {
+   "claim": "Meta's official guidance and the paper both position DINOv3 as a frozen backbone: the facebook/dinov3-vit7b16 model card says fine-tuning 'is recommended to keep this option as a last resort: the frozen features are expected to provide good performance out-of-the-box'; the paper states 'Throughout our experiments, unless otherwise specified, we keep DINOv3 frozen and solely use its representations', trains at 256x256 with 4 registers, and says 'the efficient and widely adopted ViT-L model achieves performance close to that of the original 7B teacher across a variety of tasks'. The B/L/H+ checkpoints are distillations of the 7B (timm model cards: 'distilled from the DINOv3 ViT-7B model'); the distilled models ended up with all-zero QKV biases so timm ships qkv_bias=False variants by default and _qkvb variants with zero biases (timm model card).",
+   "sources": [
+    "https://huggingface.co/facebook/dinov3-vit7b16-pretrain-lvd1689m",
+    "https://arxiv.org/pdf/2508.10104",
+    "https://github.com/facebookresearch/dinov3",
+    "https://huggingface.co/timm/vit_large_patch16_dinov3.lvd1689m"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "Argues against making the 7B the first experiment: the vendor's own recommendation is frozen features, and ViT-L is the size the authors characterise as near-teacher. If the goal is 'largest official size', the honest reading is 7B frozen (or feature-cached) vs L/H+ fine-tuned, not 7B fine-tuned."
+  },
+  {
+   "claim": "Empirical evidence on a domain-shifted input (grayscale chest radiographs, arguably closer to this project's 3-channel depth encoding than natural RGB): the frozen DINOv3-7B + 2.1 M-param MLP head 'consistently underperformed the best fine-tuned mid-sized models' (ViT-B/16, ConvNeXt-B) by 4.6-7.4 pp AUROC at 224x224 and ~3-5 pp at 512x512 across seven datasets; LoRA (rank 16, alpha 32, dropout 0.05, on q/v projections, head trainable, AdamW 1e-4, bs 32) 'reduced AUROC relative to full fine-tuning' by 1.3-5.1 pp for ViT-B/16 and 2.1-4.1 pp for ConvNeXt-B; DINOv3 'did not consistently outperform DINOv2 at 224x224'. Their full FT ran fp32 on a single L40S 48 GB at batch 128 @224. Separately, the only DINOv3-as-diffusion-policy-encoder paper (DINOv3-Diffusion Policy, arXiv 2509.17684) used the distilled ViT-Small/16 at 76x76 crops on an RTX A6000 48 GB, reports up to +10 % absolute success on 'Can' vs ResNet-18 and that 'frozen DINOv3 remains competitive'; it did not scale to L/H+/7B.",
+   "sources": [
+    "https://arxiv.org/pdf/2510.07191 (sections 'Frozen billion-parameter features remain inferior…', 'Parameter-efficient adaptation with LoRA', Methods)",
+    "https://arxiv.org/abs/2510.07191",
+    "https://arxiv.org/html/2509.17684v1",
+    "https://arxiv.org/abs/2509.17684"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "For an out-of-distribution modality (depth colormap, 75 land episodes) the literature signal is that adapting a mid-sized encoder end-to-end beats a frozen giant, and LoRA costs a few points vs full FT. This supports L (full FT with checkpointing) as the highest-value first experiment, with 7B frozen as a control rather than the main bet; it also warns that 224 input may not be where DINOv3 shows its advantage."
+  },
+  {
+   "claim": "LoRA on timm DINOv3 ViTs is done with HF peft's generic path: LoraConfig(target_modules=<regex or names>, modules_to_save=[...]) + get_peft_model works on any timm model (peft docs 'Custom models', timm example with regex r'.*\\.mlp\\.fc\\d', trainable ~1.9 %). The matching Linear names in timm's dinov3 blocks (measured via named_modules) are 'attn.qkv', 'attn.proj', 'mlp.fc1', 'mlp.fc2' for ViT-L, and 'attn.qkv', 'attn.proj', 'mlp.fc1_g', 'mlp.fc1_x', 'mlp.fc2' for ViT-H+ (SwiGLU; 7B also SwiGLU with mlp_ratio=2, swiglu_align_to=64 per eva.py:3126-3135). qkv is a single fused Linear, so 'q/v only' LoRA needs peft's fan_in_fan_out-free full-qkv target (rank applies to the 3D-wide output) or a custom split. Community DINOv3 LoRA repos (RobvanGastel/dinov3-finetune) target the qkv projection and report ViT-B/L/H results (Pascal VOC 71.8 mIoU for L with LoRA + 1x1 decoder) but publish no VRAM numbers. peft is NOT installed in umi2 or rovgui-pose (ModuleNotFoundError), nor bitsandbytes (so 8-bit/QLoRA is not available without new dependencies; torchao int4 weight-only is the route shown in HF docs).",
+   "sources": [
+    "https://huggingface.co/docs/peft/developer_guides/custom_models",
+    "https://github.com/RobvanGastel/dinov3-finetune",
+    "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/timm/models/eva.py:3058-3084,3118-3145",
+    "local named_modules listing (rovgui-pose python, timm 1.0.29): L -> ['attn.proj','attn.qkv','mlp.fc1','mlp.fc2'], H+ -> ['attn.proj','attn.qkv','mlp.fc1_g','mlp.fc1_x','mlp.fc2']",
+    "local check: `python -c 'import peft'` fails in both umi2 and rovgui-pose; `import bitsandbytes` fails in umi2"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "If LoRA is chosen for H+ or 7B, peft must be added to umi2 (training) and the adapter must be merged (peft merge_and_unload) or peft added to rovgui-pose for deploy; the target-module strings differ between L (GELU MLP fc1/fc2) and H+/7B (SwiGLU fc1_g/fc1_x), so a single regex like r'blocks\\.\\d+\\.(attn\\.qkv|attn\\.proj|mlp\\.fc\\w*)' is needed. Memory for LoRA is dominated by activations, not adapter states, so gradient checkpointing remains mandatory at 128 images for H+/7B (see measured frozen-base numbers)."
+  }
+ ],
+ "gaps": [
+  "No web-published VRAM/throughput tables for DINOv3 ViT-L/H+/7B fine-tuning at 224-256 on a 24-32 GB consumer GPU were found; all VRAM/step-time figures above are local random-init measurements (encoder-only, synthetic loss) and exclude the diffusion head, EMA weight copy, second camera stream, proprio encoder and dataloader overhead. Re-measure inside the real training loop before committing.",
+  "No web-published batch-2 @224 inference latency for DINOv3 L/H+/7B on a 4090/5090 was found; the 5090 numbers here are eager-mode and un-compiled (torch.compile / CUDA graphs would lower them, as the project already does for FoundationStereo).",
+  "The 7B 'LoRA-like' measurement trained only LayerScale gammas as a memory stand-in; true peft LoRA (r=8-16 on qkv/proj/fc, ~tens of M params) adds adapter weights + AdamW states (<1 GB) and peft overhead that were not measured because peft is not installed. 8-bit/QLoRA for DINOv3 7B: no DINOv3-specific report found; bitsandbytes not installed; only torchao int4 weight-only (inference) is documented by HF.",
+  "No source addresses DINOv3 features on colour-mapped DEPTH images (3-channel depth encoding); the chest-X-ray paper is the nearest domain-shift proxy. Whether registers/RoPE behave well on smooth depth gradients is untested.",
+  "The 128-image, ckpt-on step times for H+ (1.35-1.4 s) and 7B (~5.5 s predicted) were not converted to epoch/run wall-clock because the number of samples per epoch for the 75-episode dataset was not looked up; multiply by (steps/epoch x 200).",
+  "dinov3 GitHub issue #266 (7B OOM at bs=1 on 80 GB A100) has no maintainer response and does not state resolution or whether the run was training or evaluation; treat as anecdotal.",
+  "DINOv3 paper GFLOPs table values (L 163 / H+ 450 / 7B 3550 @256) come from a search-result snippet; the PDF exceeded the fetch size limit so they were not verified against the table.",
+  "Local measurement caveat: timm 1.0.29 in rovgui-pose was used for all benchmarks; the training env umi2 (timm 0.9.7) has no dinov3 registrations and its torch 2.9.1 SDPA kernels may differ slightly in speed; the pretrained-weight load path (25 GB fp32 file for 7B, HF hub download, timm/ repos not gated) was not exercised."
+ ]
+}

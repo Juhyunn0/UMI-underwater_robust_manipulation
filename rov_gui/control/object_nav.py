@@ -29,8 +29,9 @@ operations are exact inverses:
 
 which matters because the C3's re-mount is only half measured: the 43.3 deg
 tilt is applied as a PURE ROTATION and the translation that a real hinge also
-moves (``cam_t_flu``, a 0.2855 m lever arm) is still unmeasured
-(KNOWN_ISSUES 2026-08-17). Same-frame pairing makes that unknown drop out
+moves (``cam_t_flu``, a ~0.32 m lever arm [유도: |[0.30584, 0, 0.10501]|]) is
+still not measured — its x/z are SUSPECT by ~9 cm / ~5 cm (KNOWN_ISSUES
+2026-09-08 "cam_t_flu x/z"). Same-frame pairing makes that unknown drop out
 entirely. Pair ACROSS frames and it comes straight back: a yaw difference of
 theta between the two frames leaves a residual of
 ``|t_frd_cam| * 2*sin(theta/2)`` — 2.5 cm at 5 deg. That is what
@@ -71,8 +72,8 @@ TRACKING = "tracking"
 
 DEFAULTS = {
     # How far apart the object frame and the tag frame may be and still be
-    # called "the same frame". [유도] 0.2855 m lever arm x 0.5 rad/s of yaw
-    # rate is ~1.1 cm of residual at 0.08 s. Exact matches are preferred
+    # called "the same frame". [유도] ~0.32 m lever arm x 0.5 rad/s of yaw
+    # rate is ~1.3 cm of residual at 0.08 s. Exact matches are preferred
     # whatever this says — see pick_fix.
     "pair_tol_s": 0.08,
     # The object leg is ALWAYS the C3: it is the only camera whose extrinsic

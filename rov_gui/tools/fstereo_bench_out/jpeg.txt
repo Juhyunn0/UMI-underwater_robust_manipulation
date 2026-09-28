@@ -1,0 +1,11 @@
+# fstereo_bench.py jpeg — 2026-09-02 10:42:45
+# gpu: NVIDIA GeForce RTX 5090, torch 2.11.0+cu128, other compute processes at start: none
+# frames: /home/bdml/Desktop/data collection/videos episodes ('61', '66', '12') frames (10, 90, 170)
+# JPEG: OpenCV libjpeg-turbo, a proxy for the device encoder
+
+9 real pairs; shipped setting (iters 8, scale 0.5, graph); disparity after a JPEG round-trip of BOTH images vs the raw-input disparity, 640-px units
+  q | med|d|    p90    p99 |  >1px  >2px
+ 80 |  0.032  0.213  2.091 |  2.1%  1.1%
+ 90 |  0.025  0.141  0.527 |  0.4%  0.2%
+ 95 |  0.018  0.101  0.632 |  0.6%  0.2%
+for scale: the shipped setting's own disagreement with the reference setting is med 0.165 px, >1 px on 11.1% (see sweep.txt)

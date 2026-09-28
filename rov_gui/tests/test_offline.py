@@ -26,6 +26,7 @@ import json
 import os
 import sys
 import tempfile
+import textwrap
 import time
 import types
 from pathlib import Path
@@ -53,6 +54,15 @@ class Opts:
     rec_dir = tempfile.mkdtemp(prefix="rov_gui_rec_")
     rec_fps = 12.0
     fullscreen = False
+    #: NOT "auto". This suite is the no-hardware one, and `auto` opens the
+    #: first /dev/input/js* it finds — so on a machine with the pilot's pad
+    #: plugged in, a stick resting off centre commands the demo vehicle and
+    #: `test_arm_puts_the_vehicle_in_manual_first` fails with "armed in MANUAL
+    #: with no stick input, but the vehicle is moving". Measured 2026-09-06:
+    #: identical flow gives vel [0,0,0,0] with the pad disabled and non-zero
+    #: with js0 present. A test suite that passes only when nothing is plugged
+    #: in is a test suite that will be ignored the day it matters.
+    joystick = "none"
 
 
 _APP = None
@@ -140,6 +150,75 @@ def test_depth_colourisation_marks_holes_black():
     bgr = depth_to_bgr(depth)
     assert tuple(bgr[0, 0]) == (0, 0, 0)
     assert tuple(bgr[4, 4]) != (0, 0, 0)
+
+
+def test_umi_depth_rule_is_the_land_rule_and_never_adapts():
+    """The station's FoundationStereo panel and the land videos, one function.
+
+    The claim this pins down is the whole reason the rule was extracted: a
+    colour on the station means the same distance as that colour in
+    ``data_collection/make_depth_trajectory_video.py``. Both call
+    ``rov_gui.depth_colour``; this asserts the live wrapper does not drift from
+    it, that the polarity is warm = NEAR, and — the part the old adaptive
+    palette failed — that the SAME millimetre gets the SAME colour in two
+    different scenes.
+    """
+    from rov_gui import depth_colour
+    from rov_gui.imaging import UMI_Z_FAR_MM, UMI_Z_NEAR_MM, depth_to_bgr_umi
+
+    d = np.array([[0, 200, 1000, 3000, 9000]], np.uint16)
+    live = depth_to_bgr_umi(d)
+    assert np.array_equal(live, depth_colour.depth_mm_to_bgr(d, "obs")), \
+        "the live panel must paint with the shared rule, not a copy of it"
+
+    assert tuple(live[0, 0]) == (0, 0, 0)            # no measurement is BLACK
+    near, far = live[0, 1].astype(int), live[0, 3].astype(int)
+    assert near[2] > near[0], "0.2 m must be the WARM end (red > blue)"
+    assert far[0] > far[2], "3.0 m must be the COOL end (blue > red)"
+    assert tuple(live[0, 4]) == tuple(live[0, 3]), \
+        "past z_far must clamp, not wrap round the palette"
+
+    # Two scenes, one shared value: the adaptive palette would colour 500 mm
+    # differently in each because its range and its knots come from the frame.
+    a = depth_to_bgr_umi(np.array([[500, 600]], np.uint16))
+    b = depth_to_bgr_umi(np.array([[500, 2900]], np.uint16))
+    assert tuple(a[0, 0]) == tuple(b[0, 0])
+
+    assert (UMI_Z_NEAR_MM, UMI_Z_FAR_MM) == (200.0, 3000.0)
+
+
+def test_umi_colour_bar_is_placed_by_the_picture_formula():
+    """The legend's ticks come from the same function as the pixels.
+
+    ``depth_fraction(..., domain=...)`` is what the bar calls; if it ever stops
+    agreeing with ``palette_pos`` the bar starts labelling distances the picture
+    does not mean, which is the failure mode the legend exists to prevent.
+    """
+    from rov_gui.depth_colour import palette_pos
+    from rov_gui.imaging import UMI_Z_FAR_MM, UMI_Z_NEAR_MM, depth_fraction
+
+    for mm in (200.0, 300.0, 1000.0, 3000.0):
+        got = float(depth_fraction(np.float32(mm), None, UMI_Z_NEAR_MM,
+                                   UMI_Z_FAR_MM, domain="obs"))
+        want = float(palette_pos(np.array([mm / 1000.0], np.float32), "obs")[0])
+        assert abs(got - want) < 1e-6, f"{mm} mm: bar {got} vs picture {want}"
+
+    # Inverse spacing, not linear: 1.0 m sits at 0.143 of the ramp, well below
+    # the 0.71 a linear scale would put it at. A bar drawn linearly over an
+    # inverse picture is exactly how a tick ends up on the wrong colour.
+    t = float(depth_fraction(np.float32(1000.0), None, UMI_Z_NEAR_MM,
+                             UMI_Z_FAR_MM, domain="obs"))
+    assert 0.14 < t < 0.15
+
+    # And the fixed-rule branch wins over knots rather than blending with them.
+    knots = np.linspace(200.0, 3000.0, 64)
+    assert float(depth_fraction(np.float32(1000.0), knots, UMI_Z_NEAR_MM,
+                                UMI_Z_FAR_MM, domain="obs")) == t
+
+
+def test_video_stat_defaults_to_no_colour_rule():
+    """A producer that says nothing keeps the legacy legend, not the new one."""
+    assert VideoStat(name="depth").depth_rule == ""
 
 
 def test_pwm_to_norm_is_clamped_and_centred():
@@ -2040,6 +2119,8 @@ def test_a_repeated_log_line_is_counted_instead_of_repeated():
     """Four identical refusals are one event, not four lines.
 
     2026-08-23 16:34:21-43: "engage refused: flight mode is mode -1" four
+    (that "mode -1" was STABILIZE = custom_mode 0 misread by `or -1`; fixed
+    2026-09-08, see test_heartbeat_custom_mode_zero_is_stabilize_not_unknown)
     times, each one pushing a line of real history off a nine-line panel.
     """
     from rov_gui.widgets.payload import PayloadPanel
@@ -2076,6 +2157,8 @@ def test_the_depth_map_is_cross_checked_against_the_map_floor():
     figure drift with tag count (0.94x on 3 tags, 1.46x on 14) because a tag
     centre is the one patch of this scene stereo cannot match.
     """
+    import types
+
     import numpy as np
 
     from rov_gui.state import Conn, NavFix, TagOverlay
@@ -2098,6 +2181,10 @@ def test_the_depth_map_is_cross_checked_against_the_map_floor():
     class _Panel:
         def __init__(self, aux):
             self.canvas = _Canvas(aux)
+            # A dead feed keeps its last picture, so the check refuses to
+            # measure a map older than DEPTH_MAP_STALE_S. This fixture is a
+            # live frame.
+            self.fresh = types.SimpleNamespace(age=0.0)
 
     def _run(scale, aux=None):
         if aux is None:
@@ -2116,7 +2203,18 @@ def test_the_depth_map_is_cross_checked_against_the_map_floor():
         stub._cam_ext = (R_bc, np.zeros(3))
         stub._depth_chk = None
         stub._depth_chk_t = 0.0
+        # The learned-depth accumulator is a SEPARATE instrument (--fstereo).
+        # It stays empty here: this test is about the camera's own depth, and
+        # only one of the two can be measuring at a time because there is only
+        # ever one depth map on the panel.
+        stub._depth_chk_fs = None
+        stub._depth_chk_fs_t = 0.0
+        stub._fstereo_live = False
         stub._traj_panel = None
+        stub.DEPTH_CHK_HOLD_S = MainWindow.DEPTH_CHK_HOLD_S
+        stub.DEPTH_CHK_FRESH_S = MainWindow.DEPTH_CHK_FRESH_S
+        stub.DEPTH_MAP_STALE_S = MainWindow.DEPTH_MAP_STALE_S
+        stub._push_depth_checks = lambda: MainWindow._push_depth_checks(stub)
         MainWindow._check_depth_scale(stub, TagOverlay(
             panel="main", quads=(), ids=(), mapped=(), src_w=640, src_h=360,
             localizes=True, K=K))
@@ -2459,7 +2557,7 @@ def test_a_long_mesh_is_refused_without_a_tape_by_the_silhouette_bound():
     The longest silhouette any view saw is a hard lower bound on the object; a
     mesh far past it swallowed something that is not the object.
 
-    Thresholds from the archive [측정: extrude audit over sessions/pose_meshes/*
+    Thresholds from the archive [측정: extrude audit over data/*/*_obj
     2026-08-24]: usable meshes sit at 1.08-1.59x their max silhouette, the two
     runaways at 2.25x and 2.72x — the gate at 2.0 splits the gap. The tape
     (`--pose-object-size`) stays as an OPTIONAL stricter layer."""
@@ -2558,14 +2656,14 @@ def test_follow_shows_no_tag_field_because_it_uses_no_tag():
     seen = []
     w.scenario_requested.connect(seen.append)
 
-    w.shape_box.setCurrentText("follow")
+    w.set_shape("follow")
     assert w.tag_box.isHidden() and w.lbl_tag.isHidden(), "tag field survived"
     assert w.len_box.isHidden(), "the distance field survived a follow"
     assert not w.spd_box.isHidden(), "a follow still caps the setpoint speed"
     assert "origin_tag" not in seen[-1], seen[-1]
 
     # ...and it comes back for the shapes that are anchored to a tag.
-    w.shape_box.setCurrentText("station")
+    w.set_shape("station")
     assert not w.tag_box.isHidden() and not w.lbl_tag.isHidden()
     assert "origin_tag" in seen[-1], seen[-1]
     w.close()
@@ -3217,13 +3315,13 @@ def test_trajectory_panel_carries_the_speed():
     assert got and got[-1]["speed"] == 0.08 and got[-1]["length"] == 2.0
     panel.spd_box.setValue(0.25)
     assert got[-1]["speed"] == 0.25
-    panel.shape_box.setCurrentText("square")
+    panel.set_shape("square")
     assert got[-1]["speed"] == 0.25, "speed must survive a shape change"
     assert got[-1]["size"] == 2.0 and "length" not in got[-1]
-    panel.shape_box.setCurrentText("station")
+    panel.set_shape("station")
     assert "speed" not in got[-1], "a station hold must not carry a speed"
     assert not panel.spd_box.isVisibleTo(panel)
-    panel.shape_box.setCurrentText("line")
+    panel.set_shape("line")
     panel.add_status(MpcStatus(engaged=True, traj_on=True))
     assert not panel.spd_box.isEnabled(), "mission frozen while flying"
     # ...and frozen from START, not from take-off: the worker snapshots the
@@ -3252,6 +3350,577 @@ def test_trajectory_panel_carries_the_speed():
     assert started and started[0] == len(got), "scenario must precede START"
 
 
+def test_start_is_instant_for_policy_and_a_hold_for_every_other_shape():
+    """2026-09-02, operator request: `policy` starts on ONE CLICK.
+
+    The hold exists so a stray click cannot launch a geometric mission that
+    flies the vehicle somewhere immediately. Arming a policy mission moves
+    nothing by itself (a plan has to arrive, pass the filter and be installed
+    first), and the operator is watching a live scene, so the second of hold
+    costs more than it buys. Pinned in both directions: the other shapes must
+    KEEP their hold, and switching back and forth must keep working — the
+    button is shared, so a one-way flip would silently disarm the gate for
+    every mission flown after a policy run.
+    """
+    from rov_gui.widgets.trajectory import TrajectoryWindow
+
+    _app()
+    p = TrajectoryWindow()
+    fired: list = []
+    p.mission_requested.connect(lambda: fired.append(p.current_shape()))
+
+    p.set_shape("policy")
+    assert p.btn_start.instant, "policy START must not be a hold"
+    p.btn_start.click()
+    assert fired == ["policy"], f"one click on policy START did not start it: {fired}"
+
+    # Every other shape keeps the hold: a click must do NOTHING.
+    for shape in ("square", "line", "circle", "station", "follow", "replay"):
+        p.set_shape(shape)
+        assert not p.btn_start.instant, f"{shape} START lost its hold"
+        p.btn_start.click()
+        assert fired == ["policy"], f"{shape} started on a bare click: {fired}"
+
+    # ...and back again, because the button is reused across shapes.
+    p.set_shape("policy")
+    assert p.btn_start.instant
+    p.btn_start.click()
+    assert fired == ["policy", "policy"], fired
+
+
+def test_trajectory_panel_high_low_combos_speak_keys_and_show_labels():
+    """2026-09-11, operator request: HIGH (the mission — Diffusion Policy /
+    Station / Line ...) and LOW (the follower — None / PID / MPC ...) with
+    readable labels. The KEYS are unchanged: the worker, the scenario dict,
+    the YAML and every record keep speaking `policy`/`dobmpc`, so a consumer
+    that read the combo's TEXT would now get a label. Pinned: items are
+    (label, key) in the designed order, `set_shape`/`current_shape` and
+    `set_mode_default`/`current_mode` speak keys, and `mode_requested` /
+    `scenario_requested` emit keys."""
+    from rov_gui.control.geometry import SHAPES
+    from rov_gui.widgets.trajectory import (MODE_LABELS, SHAPE_LABELS,
+                                            TrajectoryWindow)
+
+    _app()
+    p = TrajectoryWindow()
+    # HIGH: (label, key) in geometry.SHAPES order — station first
+    items = [(p.shape_box.itemText(i), p.shape_box.itemData(i))
+             for i in range(p.shape_box.count())]
+    assert [k for _, k in items] == list(SHAPES), items
+    assert items[0] == ("Station", "station")
+    assert {k: lbl for lbl, k in items} == SHAPE_LABELS
+    assert SHAPE_LABELS["policy"] == "Diffusion Policy"
+    assert set(SHAPE_LABELS) == set(SHAPES)
+    # a bare panel: station, a HOLD start, no ckpt widgets
+    assert p.current_shape() == "station"
+    assert not p.btn_start.instant
+    assert all(w.isHidden() for w in p.ckpt_widgets)
+    # LOW: keys in the designed order, None first, labels as designed
+    modes = [(p.mode_box.itemText(i), p.mode_box.itemData(i))
+             for i in range(p.mode_box.count())]
+    assert [k for _, k in modes] == ["none", "pid", "mpc", "mpc_tuned",
+                                     "dobmpc", "dobmpc_tuned", "mpcc",
+                                     "dobmpcc", "rl"], modes
+    assert modes[0] == ("None", "none")
+    assert {k: lbl for lbl, k in modes} == MODE_LABELS
+    # set_mode_default selects by KEY and never emits (honesty rule)
+    asked: list = []
+    p.mode_requested.connect(asked.append)
+    p.set_mode_default("dobmpc")
+    assert p.current_mode() == "dobmpc"
+    assert p.mode_box.currentText() == "DOBMPC"
+    p.set_mode_default("none")
+    assert p.current_mode() == "none" and asked == []
+    p.set_mode_default("banana")
+    assert p.current_mode() == "none", "an unknown mode must not move it"
+    # the operator's pick emits the KEY, never the label
+    p.mode_box.setCurrentIndex(p.mode_box.findData("mpc_tuned"))
+    assert asked == ["mpc_tuned"], asked
+    # ...and the scenario carries the shape KEY
+    seen: list = []
+    p.scenario_requested.connect(seen.append)
+    p.set_shape("policy")
+    assert p.current_shape() == "policy"
+    assert p.shape_box.currentText() == "Diffusion Policy"
+    assert seen[-1]["shape"] == "policy"
+    assert p.btn_start.instant and not any(w.isHidden() for w in p.ckpt_widgets)
+    p.set_shape("circle")
+    assert seen[-1]["shape"] == "circle" and all(w.isHidden() for w in p.ckpt_widgets)
+    p.set_shape("nonsense")
+    assert p.current_shape() == "circle", "an unknown shape must not move it"
+    p.close()
+
+
+def test_trajectory_panel_low_combo_reflects_the_worker():
+    """LOW honesty rule (review 2026-09-11): the combo shows the mode the
+    WORKER is on. A pick the worker refused (engaged, controller CSV open,
+    still building) never changes MpcStatus.mode, so the combo has to snap
+    back within one status — otherwise the panel would stand there promising
+    a teleop run while a controller is armed. And it is dead while engaged
+    and while a CSV is open, because the worker refuses both."""
+    from rov_gui.state import MpcStatus
+    from rov_gui.widgets.trajectory import TrajectoryWindow
+
+    _app()
+    p = TrajectoryWindow()
+    p.set_mode_default("dobmpc")
+    asked: list = []
+    p.mode_requested.connect(asked.append)
+    p.mode_box.setCurrentIndex(p.mode_box.findData("none"))     # the user
+    assert asked == ["none"] and p.current_mode() == "none"
+    p.add_status(MpcStatus(mode="dobmpc"))                      # the worker
+    assert p.current_mode() == "dobmpc", "a refused pick must snap back"
+    assert p.mode_box.currentText() == "DOBMPC"
+    assert asked == ["none"], "reflecting the worker must not re-request"
+    # a status with no mode, or an unknown one, leaves the combo alone
+    p.add_status(MpcStatus(mode=""))
+    p.add_status(MpcStatus(mode="banana"))
+    assert p.current_mode() == "dobmpc"
+    # frozen while engaged, and while a controller CSV is open outside one
+    p.add_status(MpcStatus(engaged=True, mode="dobmpc"))
+    assert not p.mode_box.isEnabled() and not p.btn_ckpt.isEnabled()
+    p.add_status(MpcStatus(engaged=False, csv_open=True, mode="dobmpc"))
+    assert not p.mode_box.isEnabled(), "a REC-opened CSV pins the run tree"
+    # ...and the picker too (review 2026-09-11): that CSV's meta names ONE
+    # checkpoint, so a swap under it is refused at the button like the LOW
+    # combo, not merely recorded afterwards.
+    assert not p.btn_ckpt.isEnabled(), "a REC-opened CSV must freeze the picker"
+    p.add_status(MpcStatus(engaged=False, csv_open=False, mode="dobmpc"))
+    assert p.mode_box.isEnabled() and p.btn_ckpt.isEnabled()
+    p.close()
+
+
+def test_trajectory_panel_ckpt_row_is_the_workers_truth():
+    """The checkpoint picker (2026-09-11, replaces --policy-ckpt). The row
+    exists only for Diffusion Policy; the `…` button only ASKS for the dialog
+    (the window owns it); a choice shows as `→ name` and goes out on
+    `policy_ckpt_requested`; the CONFIRMED name and loading…/READY/ERROR come
+    only from PolicyStatus; a crash status with an empty ckpt keeps the last
+    name beside the ERROR; a refused pick is shown in red for 6 s and then
+    the row falls back; engaged disables the button."""
+    from rov_gui.state import MpcStatus, PolicyStatus
+    from rov_gui.widgets.trajectory import TrajectoryWindow
+
+    _app()
+    p = TrajectoryWindow()
+    assert all(w.isHidden() for w in p.ckpt_widgets)
+    p.set_shape("policy")
+    assert not any(w.isHidden() for w in p.ckpt_widgets)
+    p.set_policy_ckpt_default("/cfg/seed.ckpt")
+    assert p.ckpt_name.text() == "seed.ckpt"
+    assert p.ckpt_name.toolTip() == "/cfg/seed.ckpt"
+    assert p.current_ckpt() == "/cfg/seed.ckpt"
+
+    picked: list = []
+    p.policy_ckpt_requested.connect(picked.append)
+    pressed: list = []
+    p.policy_ckpt_pick_requested.connect(lambda: pressed.append(1))
+    p.btn_ckpt.click()
+    assert pressed == [1] and picked == [], "the button asks; it never chooses"
+    p._apply_ckpt_choice("/x/a.ckpt")
+    assert picked == ["/x/a.ckpt"]
+    assert p.ckpt_name.text() == "→ a.ckpt", p.ckpt_name.text()
+    assert p.current_ckpt() == "/cfg/seed.ckpt", "a request is not a fact"
+    p._apply_ckpt_choice("")                                    # cancelled
+    assert picked == ["/x/a.ckpt"]
+
+    # loading / READY / ERROR, and the held name, from the status
+    p.set_policy_status(PolicyStatus(ckpt="/x/a.ckpt", loading=True))
+    assert p.ckpt_name.text() == "a.ckpt" and p.current_ckpt() == "/x/a.ckpt"
+    assert p.ckpt_state.text() == "loading…"
+    assert theme.WARN in p.ckpt_state.styleSheet()
+    p.set_policy_status(PolicyStatus(ckpt="/x/a.ckpt", ready=True))
+    assert p.ckpt_state.text() == "READY" and theme.OK in p.ckpt_state.styleSheet()
+    p.set_policy_status(PolicyStatus(ckpt="", error="CUDA out of memory"))
+    assert p.ckpt_state.text().startswith("ERROR") and "CUDA" in p.ckpt_state.text()
+    assert theme.FAIL in p.ckpt_state.styleSheet()
+    assert p.ckpt_name.text() == "a.ckpt", "an empty ckpt must not blank the name"
+    assert p.current_ckpt() == "/x/a.ckpt"
+
+    # a REFUSED pick reaches the row in red, the name snaps back, and it ages
+    p._apply_ckpt_choice("/x/b.ckpt")
+    assert p.ckpt_name.text() == "→ b.ckpt"
+    why = "checkpoint swap REFUSED — DISENG first (a mission may be armed)"
+    p.set_policy_status(PolicyStatus(ckpt="/x/a.ckpt", ready=True, ckpt_note=why))
+    assert p.ckpt_name.text() == "a.ckpt", "the name is what the worker holds"
+    assert "REFUSED" in p.ckpt_state.text() and theme.FAIL in p.ckpt_state.styleSheet()
+    assert p.ckpt_state.toolTip() == why, "the whole sentence lives in the tooltip"
+    p.set_policy_status(PolicyStatus(ckpt="/x/a.ckpt", ready=True, ckpt_note=why))
+    assert "REFUSED" in p.ckpt_state.text(), "the same note keeps its 6 s"
+    p._ckpt_note_t -= 10.0
+    p.set_policy_status(PolicyStatus(ckpt="/x/a.ckpt", ready=True, ckpt_note=why))
+    assert p.ckpt_state.text() == "READY", p.ckpt_state.text()
+    # the same sentence after a success (note cleared) is a NEW refusal
+    p.set_policy_status(PolicyStatus(ckpt="/x/a.ckpt", ready=True, ckpt_note=""))
+    assert p.ckpt_state.text() == "READY"
+    p.set_policy_status(PolicyStatus(ckpt="/x/a.ckpt", ready=True, ckpt_note=why))
+    assert "REFUSED" in p.ckpt_state.text()
+    # the SAME sentence to a SECOND pick with NO success in between (review
+    # 2026-09-11): the worker keeps its note across picks and `_refuse_ckpt`
+    # rewrites it verbatim, so the VALUE never changes — the new REQUEST is
+    # what makes the answer news, or the row silently snapped back to READY
+    p._ckpt_note_t -= 10.0
+    p.set_policy_status(PolicyStatus(ckpt="/x/a.ckpt", ready=True, ckpt_note=why))
+    assert p.ckpt_state.text() == "READY", "aged out"
+    p._apply_ckpt_choice("/x/b.ckpt")                           # picked AGAIN
+    assert p.ckpt_name.text() == "→ b.ckpt"
+    p.set_policy_status(PolicyStatus(ckpt="/x/a.ckpt", ready=True, ckpt_note=why))
+    assert "REFUSED" in p.ckpt_state.text(), "an identical second refusal is shown"
+    assert theme.FAIL in p.ckpt_state.styleSheet()
+    assert p.ckpt_name.text() == "a.ckpt"
+    # a pick the worker TAKES withdraws the note: never red over "loading…",
+    # even inside the previous refusal's 6 s
+    p._apply_ckpt_choice("/x/c.ckpt")
+    p.set_policy_status(PolicyStatus(ckpt="/x/c.ckpt", loading=True, ckpt_note=""))
+    assert p.ckpt_state.text() == "loading…" and p.ckpt_name.text() == "c.ckpt"
+    assert theme.WARN in p.ckpt_state.styleSheet()
+    # ...also when a 1 Hz idle status still carrying the OLD note lands
+    # between the pick and the answer (it may restart the red ~1 s early —
+    # the same sentence, still the worker's last word — and the answer
+    # withdraws it)
+    p.set_policy_status(PolicyStatus(ckpt="/x/c.ckpt", ready=True, ckpt_note=""))
+    p.set_policy_status(PolicyStatus(ckpt="/x/c.ckpt", ready=True, ckpt_note=why))
+    assert "REFUSED" in p.ckpt_state.text()
+    p._apply_ckpt_choice("/x/d.ckpt")
+    p.set_policy_status(PolicyStatus(ckpt="/x/c.ckpt", ready=True, ckpt_note=why))
+    assert "REFUSED" in p.ckpt_state.text(), "the stale idle note, briefly"
+    p.set_policy_status(PolicyStatus(ckpt="/x/d.ckpt", loading=True, ckpt_note=""))
+    assert p.ckpt_state.text() == "loading…" and p.ckpt_name.text() == "d.ckpt"
+
+    # engaged disables the button (the worker refuses a swap mid-engagement)
+    p.add_status(MpcStatus(engaged=True))
+    assert not p.btn_ckpt.isEnabled() and not p.mode_box.isEnabled()
+    p.add_status(MpcStatus(engaged=False))
+    assert p.btn_ckpt.isEnabled() and p.mode_box.isEnabled()
+
+    # a long name is elided on the row and whole in the tooltip: the panel is
+    # a fixed grid cell and must not grow with a checkpoint's file name. The
+    # MIDDLE is elided (2026-09-14): data/checkpoints/ entries carry the run
+    # stamp at the front and the experiment label at the back, and both must
+    # survive on the row.
+    long_path = "/o/" + "x" * 30 + "y" * 30 + ".ckpt"
+    p.set_policy_status(PolicyStatus(ckpt=long_path, ready=True))
+    shown = p.ckpt_name.text()
+    assert len(shown) <= 36 and "…" in shown and shown.startswith("xxx") \
+        and shown.endswith("y.ckpt"), shown
+    assert p.ckpt_name.toolTip() == long_path
+    p.close()
+
+
+def test_trajectory_panel_mission_label_says_what_low_none_will_do():
+    """LOW None changes what START DOES, so the mission label says it before
+    the button is pressed: a Diffusion Policy START then only infers and
+    draws (the pilot flies); a geometric shape / follow will be REFUSED by
+    the worker (teleop runs only Diffusion Policy / Replay). Re-worded on a
+    LOW change WITHOUT re-sending the scenario, and on the worker's own
+    mode too (add_status re-sync)."""
+    from rov_gui.state import MpcStatus
+    from rov_gui.widgets.trajectory import TrajectoryWindow
+
+    _app()
+    p = TrajectoryWindow()
+    p.set_mode_default("dobmpc")
+    sent: list = []
+    p.scenario_requested.connect(sent.append)
+    p.set_shape("policy")
+    assert "ckpt from the picker" in p.mission_lbl.text(), p.mission_lbl.text()
+    assert "LOW None" not in p.mission_lbl.text()
+    n = len(sent)
+    p.mode_box.setCurrentIndex(p.mode_box.findData("none"))     # the user
+    assert p.mission_lbl.text().startswith("LOW None (teleop)"), p.mission_lbl.text()
+    assert "YOU fly" in p.mission_lbl.text()
+    assert len(sent) == n, "a LOW change must not re-send the scenario"
+    p.set_shape("square")
+    assert "START will be refused" in p.mission_lbl.text(), p.mission_lbl.text()
+    assert "Diffusion Policy / Replay" in p.mission_lbl.text()
+    p.set_shape("replay")
+    assert "refused" not in p.mission_lbl.text(), p.mission_lbl.text()
+    p.set_shape("station")
+    assert p.mission_lbl.text().startswith("hold here, facing +y · LOW None"), \
+        p.mission_lbl.text()
+    # the worker did not take the pick: the combo snaps back and so does the label
+    p.add_status(MpcStatus(mode="dobmpc"))
+    assert p.mission_lbl.text() == "hold here, facing +y", p.mission_lbl.text()
+    # the window's seeding order: mission defaults FIRST (bare panel = LOW
+    # None), the file's mode SECOND through the blocked set_mode_default — the
+    # label must follow the mode it shows, not the one it was worded under
+    q = TrajectoryWindow()
+    q.set_mission_defaults({"shape": "station", "origin_tag": 47,
+                            "heading_tag": 97})
+    assert "LOW None" in q.mission_lbl.text()
+    q.set_mode_default("dobmpc")
+    assert q.mission_lbl.text() == "hold on tag 47, facing tag 97", q.mission_lbl.text()
+    # ...and a long sentence never sets the panel's minimum width: it elides
+    q.set_mode_default("none")
+    q.set_shape("square")
+    assert len(q.mission_lbl.text()) > 80
+    assert q.mission_lbl.minimumSizeHint().width() == 0
+    assert q.mission_lbl.toolTip() == q.mission_lbl.text()
+    q.close()
+    p.close()
+
+
+def test_ckpt_dialog_escape_is_estop_and_closes():
+    """The checkpoint picker is a modal file dialog and, while it is up, the
+    keyboard is its. Esc there must be what Esc is everywhere else in the
+    station — E-STOP — as well as closing the dialog, which is why it is a
+    NON-NATIVE dialog (a portal dialog never runs our code). The window
+    connects `estop_requested` to `estop`.
+
+    WHICHEVER child has the focus (review 2026-09-11): Qt's non-native
+    QFileDialog opens in Detail view, and its file list (the private
+    QFileDialogTreeView, objectName "treeView") answers Esc ITSELF — it calls
+    reject() and accepts the event, so a dialog-level keyPressEvent never ran
+    once the operator had clicked a file, the dialog's most common state; and
+    the filename completer's popup eats the first Esc to close itself. The
+    dialog therefore catches Esc with an application-level filter while it
+    is visible: every case below fires the signal from ONE Esc, a popup does
+    not outlive the dialog, and the filter is gone once the dialog is."""
+    import importlib
+
+    from rov_gui.qt import QT_API, QtGui
+    from rov_gui.widgets.trajectory import CkptDialog
+
+    QTest = importlib.import_module(f"{QT_API}.QtTest").QTest
+    app = _app()
+    d = tempfile.mkdtemp()
+    Path(d, "a.ckpt").write_bytes(b"x")
+    filt = "Checkpoints (*.ckpt);;All files (*)"
+
+    def _open():
+        dlg = CkptDialog(None, "Diffusion policy checkpoint", d, filt)
+        assert dlg.testOption(QtWidgets.QFileDialog.Option.DontUseNativeDialog)
+        fired: list = []
+        dlg.estop_requested.connect(lambda: fired.append(1))
+        rejected: list = []
+        dlg.rejected.connect(lambda: rejected.append(1))
+        dlg.show()
+        _pump(app, 30)
+        assert dlg.isVisible() and dlg._filtering
+        return dlg, fired, rejected
+
+    def _closed(dlg, fired, rejected):
+        assert fired == [1], "Esc in the picker must be E-STOP"
+        assert rejected == [1] and not dlg.isVisible()
+        assert int(dlg.result()) == int(QtWidgets.QDialog.DialogCode.Rejected)
+        assert not dlg._filtering, "the app filter must not outlive the dialog"
+        dlg.deleteLater()
+        _pump(app, 30)
+
+    # 1. a key event sent to the dialog itself (the original contract)
+    dlg, fired, rejected = _open()
+    ev = QtGui.QKeyEvent(QtCore.QEvent.Type.KeyPress, int(Qt.Key.Key_Escape),
+                         Qt.KeyboardModifier.NoModifier)
+    QtWidgets.QApplication.sendEvent(dlg, ev)
+    _pump(app, 30)
+    _closed(dlg, fired, rejected)
+
+    # 2. the operator clicked a file in the list (focus = treeView), then Esc
+    dlg, fired, rejected = _open()
+    assert int(dlg.viewMode()) == int(QtWidgets.QFileDialog.ViewMode.Detail)
+    tv = dlg.findChild(QtWidgets.QTreeView, "treeView")
+    assert tv is not None and tv.isVisible()
+    model, root = tv.model(), tv.rootIndex()
+    for _ in range(40):                          # QFileSystemModel fills async
+        if model.rowCount(root) >= 1:
+            break
+        _pump(app, 50)
+    idx = model.index(0, 0, root)
+    assert str(model.data(idx)) == "a.ckpt", model.data(idx)
+    QTest.mouseClick(tv.viewport(), Qt.MouseButton.LeftButton,
+                     Qt.KeyboardModifier.NoModifier, tv.visualRect(idx).center())
+    _pump(app, 30)
+    assert app.focusWidget() is not None
+    assert app.focusWidget().objectName() == "treeView", app.focusWidget()
+    assert dlg.selectedFiles() and dlg.selectedFiles()[0].endswith("a.ckpt")
+    QTest.keyClick(tv, Qt.Key.Key_Escape)
+    _pump(app, 30)
+    _closed(dlg, fired, rejected)
+
+    # 3. the filename completer popup is open: ONE Esc, not two — and the
+    #    popup does not outlive the dialog as an orphan window
+    dlg, fired, rejected = _open()
+    le = dlg.findChild(QtWidgets.QLineEdit, "fileNameEdit")
+    assert le is not None
+    le.setFocus()
+    QTest.keyClicks(le, "a")
+    _pump(app, 200)
+    pop = le.completer().popup()
+    assert pop.isVisible() and app.activePopupWidget() is pop
+    QTest.keyClick(pop, Qt.Key.Key_Escape)
+    _pump(app, 30)
+    assert not pop.isVisible() and app.activePopupWidget() is None
+    _closed(dlg, fired, rejected)
+
+    # 4. with the dialog gone, Esc elsewhere is no longer its business
+    other = QtWidgets.QWidget()
+    other.show()
+    _pump(app, 30)
+    QTest.keyClick(other, Qt.Key.Key_Escape)
+    _pump(app, 30)
+    assert fired == [1]
+    other.close()
+
+
+def test_trajectory_panel_ckpt_widgets_share_the_high_row_and_add_no_height():
+    """M1 (review 2026-09-11): the checkpoint widgets sit ON the HIGH row,
+    right after the shape combo — for Diffusion Policy every numeric field
+    of that row is hidden, so there is room — instead of on a row of their
+    own, so a panel seeded on policy is exactly as tall as one seeded on
+    station (the window has ~6 px of height budget under test_control's
+    1000 px bound, and the separate row cost 22 px of panel minimum height).
+    The name and the state prefer their text but never drive the panel's
+    minimum width; the mission label is what yields when the row is short;
+    the 11 px font and the sheet's colours survive the eliding paint."""
+    from rov_gui.state import PolicyStatus
+    from rov_gui.widgets.trajectory import ElidingLabel, TrajectoryWindow
+
+    app = _app()
+    p = TrajectoryWindow()
+    p.resize(800, 400)
+    p.show()
+    _pump(app, 50)
+    p.set_shape("station")
+    _pump(app, 30)
+    h_station = p.minimumSizeHint().height()
+    w_station = p.minimumSizeHint().width()
+    p.set_shape("policy")
+    _pump(app, 30)
+    assert p.minimumSizeHint().height() == h_station, "policy must add no row"
+    # the same row as the HIGH combo, and the LOW row is below them
+    assert p.lbl_ckpt.y() == p.shape_box.y() == p.ckpt_name.y() == p.ckpt_state.y()
+    assert p.mode_box.y() > p.btn_ckpt.y() + p.btn_ckpt.height() - 1
+    assert p.lbl_ckpt.x() > p.shape_box.x(), "right after the HIGH combo"
+    assert p.btn_ckpt.x() < p.mission_lbl.x()
+    for w in (p.lbl_tag, p.tag_box, p.lbl_face, p.face_box, p.len_box,
+              p.lbl_y, p.leny_box, p.spd_box):
+        assert w.isHidden(), "every numeric field of row0 is hidden for policy"
+    # a long name AND a 48-char refusal leave the panel's minimum width alone
+    p.set_policy_status(PolicyStatus(
+        ckpt="/o/" + "x" * 60 + ".ckpt", ready=True,
+        ckpt_note="checkpoint swap REFUSED — " + "y" * 40))
+    _pump(app, 30)
+    assert isinstance(p.ckpt_name, ElidingLabel)
+    assert isinstance(p.ckpt_state, ElidingLabel)
+    assert p.ckpt_name.minimumSizeHint().width() == 0
+    assert p.ckpt_state.minimumSizeHint().width() == 0
+    assert p.minimumSizeHint().width() <= w_station
+    assert p.minimumSizeHint().height() == h_station
+    # the name keeps its (36-char) width; the explanation is what elides
+    assert p.ckpt_name.width() >= p.ckpt_name.sizeHint().width()
+    assert p.mission_lbl.width() < p.mission_lbl.sizeHint().width()
+    assert p.mission_lbl.toolTip() == p.mission_lbl.text()
+    # 11 px, in the sheet's colours, through the polished palette
+    assert p.ckpt_name.font().pixelSize() == 11
+    assert p.ckpt_state.font().pixelSize() == 11
+    fg = p.ckpt_state.palette().color(p.ckpt_state.foregroundRole()).name()
+    assert fg.lower() == theme.FAIL.lower(), (fg, theme.FAIL)
+    p._ckpt_note_t -= 10.0
+    p.set_policy_status(PolicyStatus(ckpt="/o/a.ckpt", ready=True))
+    _pump(app, 30)
+    fg = p.ckpt_state.palette().color(p.ckpt_state.foregroundRole()).name()
+    assert fg.lower() == theme.OK.lower(), (fg, theme.OK)
+    p.close()
+
+
+def test_window_wires_the_ckpt_picker_and_seeds_it_from_the_yaml():
+    """--mpc builds the panel; the window seeds the ckpt row from hw_mpc.yaml
+    policy.ckpt (the launch seed, beside the mission defaults and the LOW
+    mode), routes a choice to bus.cmd_policy_ckpt, and feeds bus.policy_status
+    back to the row. Without --policy the `…` button opens NO dialog — nothing
+    could load the file — and says so in the log."""
+    from rov_gui.control.geometry import MpcConfig
+    from rov_gui.state import PolicyStatus
+    from rov_gui.window import MainWindow
+
+    root = Path(__file__).resolve().parents[2]
+
+    class MpcOpts(Opts):
+        mpc = True
+        mpc_config = str(root / "config" / "hw_mpc.yaml")
+        nav_config = str(root / "config" / "hw_nav.yaml")
+        nav_geometry = None
+
+    app = _app()
+    win = MainWindow(MpcOpts())
+    panel = win._traj_panel
+    assert panel is not None
+    cfg = MpcConfig.load(MpcOpts.mpc_config)
+    assert panel.current_ckpt() == str(cfg.policy["ckpt"])
+    from rov_gui.widgets.trajectory import elide_ckpt_name
+    assert panel.ckpt_name.text() == elide_ckpt_name(
+        os.path.basename(str(cfg.policy["ckpt"])))
+    assert panel.ckpt_name.toolTip() == str(cfg.policy["ckpt"]), "full path in the tooltip"
+    assert panel.current_mode() == str(cfg.mode).lower(), "LOW seeded from the file"
+    got: list = []
+    win.bus.cmd_policy_ckpt.connect(got.append)
+    panel._apply_ckpt_choice("/gui/picked.ckpt")
+    _pump(app, 30)
+    assert got == ["/gui/picked.ckpt"], got
+    win.bus.policy_status.emit(PolicyStatus(ckpt="/gui/picked.ckpt", ready=True))
+    _pump(app, 30)
+    assert panel.ckpt_name.text() == "picked.ckpt"
+    assert panel.ckpt_state.text() == "READY"
+    logs: list = []
+    win.bus.log.connect(lambda lvl, msg: logs.append((lvl, msg)))
+    panel.btn_ckpt.click()                     # no --policy: no dialog
+    _pump(app, 30)
+    assert any("no policy worker" in m for _, m in logs), logs
+    win.shutdown()
+
+
+def test_land_dry_run_cannot_transmit_and_cannot_be_pooled_with_a_water_run():
+    """--land-dry-run relaxes the ARM and flight-mode engage gates. That is
+    only defensible while transmission is impossible and the record is
+    unmistakable, so both are pinned here rather than left to review.
+
+    Four properties:
+      1. a TYPED --allow-command is overridden, not merged — the mode is what
+         licenses the relaxed gates, so nothing may take the licence back;
+      2. the one MAVLink transmit that lives OUTSIDE the command sink (the
+         telemetry rate request) is off too;
+      3. the sink choice reads land_dry_run directly, so an opts built by hand
+         cannot get relaxed gates and a live sink;
+      4. the run tree is separate — runstore joins any folder younger than
+         JOIN_WINDOW_S, so a bench run started soon after a water run would
+         otherwise append to its plans.jsonl, and no meta field distinguishes
+         them (`source`/`policy.synthetic` read only opts.source).
+    """
+    import inspect
+
+    from rov_gui.__main__ import build_parser, resolve_defaults
+    from rov_gui.backends.hardware import HardwareBackend
+    from rov_gui.control.workers import MpcWorker
+
+    a = resolve_defaults(build_parser().parse_args(
+        ["--source", "hw", "--allow-command", "--mpc", "--policy",
+         "--fstereo", "--land-dry-run"]))
+    assert a.land_dry_run is True
+    assert a.allow_command is False, "a typed --allow-command survived"
+    assert a.mavlink_set_rates is False, "the non-sink transmit survived"
+
+    assert "land_dry_run" in inspect.getsource(HardwareBackend.__init__), \
+        "the sink choice does not read land_dry_run"
+
+    # The relaxations, each still fenced by the flag.
+    eng = inspect.getsource(MpcWorker._engage_refusal)
+    # POLICY OBSERVE (2026-09-03) joined the same fence, so the guard now
+    # reads `not self.land_dry_run and not self.observe`. What this test is
+    # pinning is unchanged: the vehicle gates are behind the flag, and the
+    # LOCALIZER gate is not.
+    fence = "if not self.land_dry_run and not self.observe:"
+    assert fence in eng
+    assert eng.index(fence) < eng.index('"no tag fix"'), \
+        "the localizer gate must still apply — the synthetic fix satisfies it"
+    assert fence in inspect.getsource(MpcWorker._runtime_fault)
+    assert '"landdry"' in inspect.getsource(MpcWorker._run_tree), \
+        "a land run would share the water kind (folder) — the leaf suffix is the guard"
+
+    # ...and OFF by default, so none of this touches an ordinary run.
+    b = resolve_defaults(build_parser().parse_args(["--source", "hw", "--mpc"]))
+    assert b.land_dry_run is False and b.mavlink_set_rates is True
+
+
 def test_the_plot_draws_the_curve_that_is_actually_flown():
     """Honesty rule: the panel may only show what the run is doing. Once the
     mission is a filleted MPCC curve, drawing the sharp rectangle the operator
@@ -3275,6 +3944,366 @@ def test_the_plot_draws_the_curve_that_is_actually_flown():
     # about the fillet radius, never zero
     d = float(np.hypot(pts[:, 0] - 2.0, pts[:, 1] - 0.0).min())
     assert 0.03 < d < 0.15, f"closest approach to the sharp vertex {d:.3f} m"
+
+
+def test_the_plot_keeps_only_the_current_and_previous_dp_plan():
+    """Operator, 2026-09-03, after the first pool run: with 60 proposals on
+    screen (218 arrived in that run) the network's output was
+    indistinguishable from the hull's own motion. TWO — current and the one
+    before it — and the older one goes the instant a third arrives."""
+    from rov_gui.state import PolicyPlanViz
+    from rov_gui.widgets.trajectory import POLICY_PLAN_KEEP, TrajectoryView
+
+    _app()
+    assert POLICY_PLAN_KEEP == 2, "the history is current + previous, no more"
+    v = TrajectoryView()
+
+    def plan(pid):
+        n = 5
+        return PolicyPlanViz(
+            plan_id=pid, status="accept",
+            p_ned=(tuple(0.1 * k for k in range(n)),
+                   tuple(0.01 * pid for _ in range(n)),
+                   tuple(-0.2 for _ in range(n))),
+            yaw=tuple(0.0 for _ in range(n)), t0=0.0, dt=0.2)
+
+    # 2026-09-26: a 4-DoF plan carries no attitude — the trailing field
+    # defaults to None (the 6-DoF variant fills a ((roll...), (pitch...)))
+    assert plan(0).rp is None
+    for pid in range(6):
+        v.add_policy_plan(plan(pid))
+        assert len(v.policy_plans) <= 2
+    assert [pl["id"] for pl in v.policy_plans] == [4, 5], \
+        "the two kept must be the newest two, newest last"
+    # ...and the mode must not change the depth: an observe run gets the same
+    # two, because the smear it caused is what motivated the change.
+    from rov_gui.state import MpcStatus
+    v.add_status(MpcStatus(engaged=True, observe=True, commanding=False))
+    for pid in range(6, 10):
+        v.add_policy_plan(plan(pid))
+    assert len(v.policy_plans) == 2 and v.observe is True
+
+
+def test_the_dp_plan_is_painted_last_so_the_hull_cannot_cover_it():
+    """The operator's actual complaint (2026-09-03): the reference was hidden
+    behind the live ROV. It was drawn BEFORE the trails and therefore before
+    the hull — a 0.43 x 0.53 m body with filled faces, sitting exactly where
+    the plan is composed (the plan's anchor IS the jaw). Colour and width
+    could not have fixed that; paint order is the fix, so it is what this
+    test pins."""
+    import inspect
+
+    from rov_gui.widgets import trajectory as T
+
+    src = inspect.getsource(T.TrajectoryView.paintEvent)
+    i_plan = src.index("POLICY_PLAN_COLOR")
+    for later_than in ("self.trail_ref", "_draw_rov(p, (self.p_act",
+                       "THE OBJECT: a DIAMOND"):
+        assert src.index(later_than) < i_plan, \
+            f"the plans must be painted AFTER {later_than!r}"
+
+
+def test_the_dp_plan_is_thick_red_and_dashed():
+    """Red, wide, dashed — operator's choice after two rounds. Fluorescent
+    yellow lost to the trail ramp's yellow-green `now` end AND to the green
+    hull; `theme.FAIL` already carries the 1 px tracking-error line, so the
+    plan is a purer red and several times as wide, and WIDTH is what
+    separates the two."""
+    import inspect
+
+    from rov_gui.widgets import trajectory as T
+
+    assert T.POLICY_PLAN_COLOR.lower() == "#ff1f1f"
+    assert T.POLICY_PLAN_W >= 4 and T.POLICY_PLAN_W_PREV >= 2
+    assert T.POLICY_PLAN_W > T.POLICY_PLAN_W_PREV, \
+        "the current plan must be the heavier of the two"
+    src = inspect.getsource(T.TrajectoryView.paintEvent)
+    i_plan = src.index("POLICY_PLAN_COLOR")
+    assert "DashLine" in src[i_plan - 200:i_plan + 400]
+    # the inset is gone: one plot, as asked
+    assert not hasattr(T.TrajectoryView, "_paint_policy_inset")
+    assert "_paint_policy_inset" not in inspect.getsource(T)
+
+
+def test_the_trails_only_go_back_a_few_seconds():
+    """90 s of the vehicle's own history filled the plot and buried the ~1 s
+    proposal the panel is currently for (operator, 2026-09-03). Pinned as a
+    RANGE, not the exact value, so retuning it does not fail the test — what
+    must not come back is a minute of tail."""
+    import time
+
+    from rov_gui.widgets import trajectory as T
+    from rov_gui.widgets.trajectory import TrajectoryView
+
+    assert 1.0 <= T.TRAIL_AGE_S <= 10.0, T.TRAIL_AGE_S
+    _app()
+    v = TrajectoryView()
+    now_t = time.monotonic()
+    # OLDEST FIRST — a trail is chronological, and `_prune_trails` popleft()s
+    # from the front and stops at the first fresh point. Appending newest
+    # first (the first draft here) leaves the stale ones behind the fresh
+    # one, where nothing will ever look at them.
+    for age in (60.0, T.TRAIL_AGE_S + 5.0, 2.5, 1.0, 0.1):
+        v.trail_act.append((now_t - age, 0.0, 0.0, 0.0))
+    v._prune_trails()
+    ages = [now_t - t for t, *_ in v.trail_act]
+    assert ages and max(ages) <= T.TRAIL_AGE_S + 1e-6, ages
+    assert len(ages) == 3, "the three fresh points must survive"
+
+
+def test_the_3d_view_has_a_z_ruler_and_the_top_down_one_does_not():
+    """`3D` gains a depth scale (operator, 2026-09-03). Top-down has no z to
+    show, so it must not draw one — and the ruler's deep end has to be the
+    one `_px` puts at the BOTTOM, or its caption contradicts its own ticks."""
+    from rov_gui.qt import QtGui
+    from rov_gui.widgets.trajectory import TrajectoryView
+
+    _app()
+    v = TrajectoryView()
+    v.resize(600, 460)
+    v._set_p_act((0.0, 0.0, -0.17))
+    calls = []
+    v._paint_z_axis = lambda *a, **k: calls.append(1)      # type: ignore
+    img = QtGui.QImage(v.size(), QtGui.QImage.Format.Format_RGB32)
+    img.fill(QtGui.QColor("#000000"))
+    v.three_d = False
+    v.render(img)
+    assert calls == [], "a top-down plot drew a z ruler"
+    v.three_d = True
+    v.render(img)
+    assert calls == [1], "the 3-D plot drew no z ruler"
+
+    # DEEP IS DOWN: NED z is down-positive and `_px`'s up-vector has a
+    # negative z component, so a larger z must land LOWER on the screen.
+    v.azimuth_deg, v.elev_deg = 25.0, 30.0
+    shallow = v._px(0.0, 0.0, -0.4)
+    deep = v._px(0.0, 0.0, +0.2)
+    assert deep.y() > shallow.y(), "the ruler's caption would be inverted"
+
+
+def test_the_z_gauge_does_not_move_with_the_vehicle():
+    """Operator, 2026-09-07: "z축이 같이 움직이는데 ... 고정되어있으면 좋겠어."
+
+    The ruler this replaces was drawn THROUGH the projection, anchored 118 px
+    screen-left of `p_act` and re-centred every frame on the live z band, so
+    it moved in three independent ways — measured before the change at
+    700x500, az 0, el 55, zoom 1: 1.0 m east + 0.5 m north slid it 53 px
+    across and 87 px UP (horizontal travel drags a projected point tan(el) =
+    1.43x further than depth does), and a 0.6 m descent renumbered the ticks
+    from -0.10..+0.70 to -0.10..+1.30.
+
+    Pinned as a PROPERTY rather than a pixel diff, because that is the actual
+    request: the scale's inputs contain no pose AND no `pan`. `pan` is in here
+    with the poses on purpose — `rov_gui/tools/replay_run.py` centres the view
+    on the vehicle every frame (`_centre_on_vehicle`, `follow` on by default),
+    so under replay a pan-dependent scale is a pose-dependent scale wearing a
+    different name, and that is the one way this could regress while every
+    live check still passed.
+    """
+    from rov_gui.qt import QtCore
+    from rov_gui.state import MpcStatus
+    from rov_gui.widgets import trajectory as T
+    from rov_gui.widgets.trajectory import TrajectoryView
+
+    _app()
+    v = TrajectoryView()
+    v.resize(700, 500)
+    v.set_pool([(-2, -2), (-2, 2), (2, 2), (2, -2)])
+    v.set_three_d(True)
+    v.add_status(MpcStatus(engaged=True, p_flu=(0.0, 0.0, 0.17)))
+    v.grab()
+    base = v._z_gauge()
+    assert base is not None, "the 3-D view drew no depth gauge"
+
+    # Every series the old ruler read, moved together and far.
+    for pose in ((1.0, 0.5, 0.17), (1.0, 0.5, 0.62), (-0.4, 1.8, 0.05)):
+        v.add_status(MpcStatus(engaged=True, p_flu=pose))
+        v.grab()
+        assert v._z_gauge() == base, f"the gauge moved with the vehicle at {pose}"
+
+    # ...and under everything the OPERATOR moves, which must also not
+    # renumber it: only the widget's own size may.
+    for zoom in (0.3, 1.0, 3.0, 8.0):
+        v.zoom = zoom
+        for az, el in ((0.0, 55.0), (135.0, 20.0), (300.0, 89.0)):
+            v.azimuth_deg, v.elev_deg = az, el
+            assert v._z_gauge() == base, f"the gauge moved at zoom {zoom} az {az} el {el}"
+    v.zoom, v.azimuth_deg, v.elev_deg = 1.0, 0.0, 55.0
+    for pan in ((0.0, 0.0), (1848.0, 1054.0), (-3000.0, 3000.0)):
+        v.pan = QtCore.QPointF(*pan)
+        assert v._z_gauge() == base, f"the gauge moved with pan {pan}"
+
+    # THE ONE THING THAT MAY MOVE IT: the window latches WIDER when something
+    # drawn leaves it, and never narrower — the operator chose a growing band
+    # over a hard one so the needle can never fall off the scale.
+    assert v._z_window == T.Z_GAUGE_WINDOW_M
+    v.add_status(MpcStatus(engaged=True, p_flu=(0.0, 0.0, 1.6)))   # map z -1.6
+    v.grab()
+    lo, hi = v._z_window
+    assert lo <= -1.6 and hi == T.Z_GAUGE_WINDOW_M[1], (lo, hi)
+    v.add_status(MpcStatus(engaged=True, p_flu=(0.0, 0.0, 0.17)))  # back inside
+    v.grab()
+    assert v._z_window == (lo, hi), "the window shrank back — it must be monotone"
+    v.clear()
+    assert v._z_window == T.Z_GAUGE_WINDOW_M, "clear() must reset the latch"
+
+    # A hidden series must not stretch a scale nobody is reading it on. The
+    # old ruler took p_dr and the object with no visibility check while the
+    # DRAWING of both is gated.
+    from rov_gui.state import ObjectFix
+    v.set_object(ObjectFix(ok=True, state="cold", p_map=(0.0, 0.0, 9.0)))
+    v.grab()
+    assert v._z_window == T.Z_GAUGE_WINDOW_M, "a COLD object stretched the gauge"
+
+    # The docked panel is WIDE AND SHORT — 583x110 at the 1100x640 minimum
+    # window and saturating at 338 px tall from 1920x1080 up (window.py's
+    # grid row 3 is setRowStretch(3, 0)), measured 2026-09-07. The gauge has
+    # to survive that, and stay inside the widget.
+    for w, h in ((583, 110), (936, 338), (1896, 338)):
+        v.resize(w, h)
+        g = v._z_gauge()
+        assert g is not None, f"no gauge at the real panel size {w}x{h}"
+        assert 0.5 * w < g[0] < w, f"the gauge left the widget at {w}x{h}: x={g[0]}"
+
+
+def test_the_heading_line_is_drawn_both_ways_and_the_ray_only_in_3d():
+    """Operator request 2026-09-07: the dotted line on the vehicle must run
+    along the heading THROUGH the body, ahead and behind — not just the
+    optical-axis ray from the lens forward. From above the ray and the
+    heading line are collinear, so top-down draws the heading line alone
+    (two dot patterns on one segment read as a marker of their own); in
+    3-D the ray pitches down and both are drawn. The dead-reckoned ghost
+    draws neither, so it stays subordinate to the truth marker."""
+    from rov_gui.qt import QtGui
+    from rov_gui.widgets.trajectory import TrajectoryView
+
+    _app()
+    v = TrajectoryView()
+    v.resize(600, 460)
+    v._set_p_act((0.0, 0.0, -0.17))
+    v.yaw_ned = 0.7
+    v.p_dr, v.yaw_dr = (0.05, 0.02, -0.17), 0.7
+    v._dr_visible = lambda: True                                 # type: ignore
+    calls = []
+    orig_h, orig_o = v._draw_rov_heading, v._draw_rov_optic
+
+    def _h(painter, p_ned, yaw, base, ghost):
+        calls.append(("heading", bool(ghost)))
+        return orig_h(painter, p_ned, yaw, base, ghost)
+
+    def _o(painter, p_ned, yaw, base, ghost):
+        calls.append(("optic", bool(ghost)))
+        return orig_o(painter, p_ned, yaw, base, ghost)
+
+    v._draw_rov_heading, v._draw_rov_optic = _h, _o             # type: ignore
+    img = QtGui.QImage(v.size(), QtGui.QImage.Format.Format_RGB32)
+    img.fill(QtGui.QColor("#000000"))
+
+    v.three_d = False
+    v.render(img)
+    assert ("heading", False) in calls, "top-down drew no heading line"
+    assert not any(k == "optic" for k, _g in calls), \
+        "top-down drew the ray on top of the heading line"
+
+    calls.clear()
+    v.three_d = True
+    v.render(img)
+    assert ("heading", False) in calls and ("optic", False) in calls, calls
+
+    # the ghost is asked for the ray (same body, same code path) but must
+    # draw nothing: the helper returns before touching the painter.
+    assert ("optic", True) in calls, "the DR ghost never went through _draw_rov"
+
+    # ZOOMED OUT (hull < 14 px, the flat fallback in either mode) the sight
+    # line must survive — that is the zoom it is for — while the ray, part
+    # of the body detail, does not.
+    calls.clear()
+    v.zoom = 0.3
+    v.three_d = False
+    v.render(img)
+    assert ("heading", False) in calls, "zoomed out, the heading line vanished"
+    assert not any(k == "optic" for k, _g in calls)
+
+    # ...and with NO heading there is no line: an axis pointing north by
+    # default would be a claim the localizer never made.
+    calls.clear()
+    v.zoom = 1.0
+    v.yaw_ned = None
+    v.render(img)
+    assert not any(k == "heading" for k, _g in calls), calls
+
+
+def test_the_replay_tool_round_trips_a_run_into_the_real_panel():
+    """`rov_gui/tools/replay_run.py` reads a recorded run back and feeds the
+    LIVE TrajectoryView. Synthesised here rather than pointed at
+    data/ — a test that needs a particular recording to exist stops
+    running the day someone tidies the tree (and this repo has lost 25 GB to
+    exactly that once).
+
+    What it pins is the frame chain, which is the only part that can be
+    silently wrong: the recorded datum must put the vehicle where it flew IN
+    THE MAP FRAME, not at the plot origin."""
+    import csv as _csv
+    import json as _json
+    import math as _m
+    import tempfile
+    from pathlib import Path as _P
+
+    from rov_gui.tools.replay_run import Run, feed_plan, feed_tick
+    from rov_gui.widgets.trajectory import TrajectoryView
+
+    _app()
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _P(tmp)
+        # a datum a long way from the tag origin, and ROTATED — an identity
+        # one would hide a dropped transform on either axis
+        p0, yaw0 = [2.0, -1.0, 0.4], 90.0
+        (d / "mpc_120000.meta.json").write_text(_json.dumps({
+            "schema_version": 13,
+            "trajectory": {"kind": "policy"},
+            "hardware": {"datum_tag_frame": {"p0": p0, "yaw0_deg": yaw0},
+                         "tag_size_m": 0.17}}))
+        with open(d / "mpc_120000.csv", "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(["t", "px", "py", "pz", "rx", "ry", "rz", "yaw_deg",
+                        "t_traj", "mode", "engaged", "traj_on", "observe",
+                        "speed_m_s", "plan_id"])
+            for i in range(10):
+                # world FLU in the DATUM frame: 1 m ahead of the datum
+                w.writerow([0.05 * i, 1.0, 0.0, 0.0, "nan", "nan", "nan",
+                            0.0, 0.05 * i, "dobmpc", 1, 1, 1, 0.02, 0])
+        with open(d / "policy_plan.csv", "w", newline="") as f:
+            w = _csv.writer(f)
+            # schema 16 (2026-09-26): roll_deg,pitch_deg ALWAYS trail
+            # `reason` (nan when the plan carries no attitude) — readers go
+            # by name, so the fixture carries the current header
+            w.writerow(["plan_id", "status", "follower", "t_rel", "k",
+                        "t_knot", "x_ned", "y_ned", "z_ned", "yaw_deg",
+                        "reason", "roll_deg", "pitch_deg"])
+            for k in range(4):
+                w.writerow([7, "accept", "observe", 0.10, k, 0.2 * k,
+                            1.0 + 0.05 * k, 0.0, 0.0, 0.0, "", "nan", "nan"])
+
+        run = Run(d)
+        assert len(run.ticks) == 10 and len(run.plans) == 1
+        assert run.datum is not None
+        assert abs(run.datum[3] - _m.radians(yaw0)) < 1e-9
+        g = run.plans[0]
+        assert g["plan_id"] == 7 and g["status"] == "accept"
+        assert abs(g["dt"] - 0.2) < 1e-9 and len(g["p_ned"][0]) == 4
+
+        v = TrajectoryView()
+        feed_tick(v, run.datum, run.ticks[-1])
+        feed_plan(v, g)
+        # THE POINT: 1 m ahead of a datum that sits at (2,-1) facing EAST
+        # lands at (2, 0) in the MAP frame, not at (1, 0) and not at (0, 0).
+        assert v.p_act is not None
+        assert abs(v.p_act[0] - 2.0) < 1e-6, v.p_act
+        assert abs(v.p_act[1] - 0.0) < 1e-6, v.p_act
+        assert len(v.policy_plans) == 1
+        # ...and the plan followed the vehicle through the same transform
+        px, py, _pz = v.policy_plans[0]["pts"][0]
+        assert abs(px - 2.0) < 1e-6 and abs(py - 0.0) < 1e-6, (px, py)
 
 
 def test_the_plot_draws_the_dead_reckoned_series_beside_the_tag_one():
@@ -3395,6 +4424,151 @@ def test_the_dr_overlay_is_on_by_default_and_a_runaway_cannot_bury_the_plot():
                            dr_ok=True, p_flu=(0.0, 0.0, -1.0),
                            p_dr_flu=(0.1, 0.0, -1.0)))
     assert v._dr_visible(), "you may not hide the thing you are flying on"
+
+
+def test_every_signal_the_backend_wires_exists_on_both_command_sinks():
+    """HardwareBackend.__init__ connects bus signals to sink slots by NAME.
+
+    A missing slot is not caught by import, by any other test, or by the
+    --allow-command path: it raises AttributeError inside the backend
+    constructor, so the station dies at startup — and only for the runs that do
+    NOT pass --allow-command, which is every read-only run. That happened for
+    real: an edit anchored on "def set_enabled" matched NullCommandSink (the
+    first occurrence in the file) and took the tail of that class with it,
+    leaving MavlinkCommandSink complete and NullCommandSink five slots short.
+
+    So this reads the connections out of the source and checks both classes
+    against them, rather than trusting either class to look complete.
+    """
+    import ast
+    import inspect
+    from rov_gui.backends import hardware
+
+    src = inspect.getsource(hardware.HardwareBackend.__init__)
+    tree = ast.parse(textwrap.dedent(src))
+    wanted = set()
+    for node in ast.walk(tree):
+        # bus.<signal>.connect(self.sink.<slot>)
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "connect" and node.args):
+            continue
+        arg = node.args[0]
+        if not isinstance(arg, ast.Attribute):
+            continue
+        owner = arg.value
+        if (isinstance(owner, ast.Attribute) and owner.attr == "sink"
+                and isinstance(owner.value, ast.Name) and owner.value.id == "self"):
+            wanted.add(arg.attr)
+
+    assert "set_enabled" in wanted, (
+        "the wiring scan found nothing to check — the parser, not the sinks, "
+        f"is what broke (found {sorted(wanted)})")
+    for cls in (hardware.NullCommandSink, hardware.MavlinkCommandSink):
+        missing = sorted(n for n in wanted if not hasattr(cls, n))
+        assert not missing, f"{cls.__name__} is missing {missing}"
+
+    # The null sink must also answer everything the UI asks of a sink, and it
+    # must never grow a transmit path: it is what a run without
+    # --allow-command gets, and the reason that run cannot move the vehicle.
+    for name in ("tick", "status", "estop", "set_arm", "set_pilot",
+                 # 2026-09-26: the 6-DoF variant's switch + the telemetry
+                 # producer's state hook, on BOTH sinks (the backend injects
+                 # attitude_axes_state like leak_config)
+                 "set_attitude_axes", "attitude_axes_state"):
+        assert hasattr(hardware.NullCommandSink, name), name
+        assert hasattr(hardware.MavlinkCommandSink, name), name
+    null_src = inspect.getsource(hardware.NullCommandSink)
+    for forbidden in ("manual_control_send", "mav.", "arducopter_arm",
+                      "command_long_send"):
+        assert forbidden not in null_src, (
+            f"NullCommandSink mentions {forbidden!r}; it must transmit nothing")
+
+
+def test_mavlink_transport_none_opens_no_link_and_sends_nothing():
+    """--mavlink-transport none must mean none.
+
+    MavlinkLogger only special-cases "rest" and treats every other value as
+    udp, so honouring "none" is the CALLER's job — c3_collect.py:592 and
+    c3_option_sweep.py:1296 both guard it, and the station did not. The result
+    was a station started deliberately vehicle-free that opened the UDP
+    listener and, because --mavlink-set-rates defaults on, transmitted
+    SET_MESSAGE_INTERVAL to the autopilot anyway (2026-09-02, caught on the
+    real rig: telemetry was live on a run whose whole point was that it
+    should not be).
+    """
+    from rov_gui.backends import hardware
+
+    built = []
+
+    class Boom:
+        def __init__(self, *a, **kw):
+            built.append(kw)
+            raise AssertionError("MavlinkLogger must not be constructed for "
+                                 "--mavlink-transport none")
+
+    logged = []
+    w = hardware.VehicleWorker.__new__(hardware.VehicleWorker)
+    w.opts = types.SimpleNamespace(mavlink_transport="none")
+    w.bus = types.SimpleNamespace(log=types.SimpleNamespace(emit=lambda *a: logged.append(a)))
+    w.logger = "not-none-yet"
+
+    import c3_camera.mavlink_log as ml
+    real = ml.MavlinkLogger
+    ml.MavlinkLogger = Boom
+    try:
+        hardware.VehicleWorker.setup(w)
+    finally:
+        ml.MavlinkLogger = real
+
+    assert not built, built
+    assert w.logger is None
+    assert any("DISABLED" in msg for _lvl, msg in logged), logged
+
+    # ... and tick() must survive the absence rather than raising into the
+    # worker's failed-log every 100 ms.
+    published = []
+    w._publish = lambda: published.append(True)
+    hardware.VehicleWorker.tick(w)
+    assert published == [True]
+
+    # The other two values still build a logger (this test must not be what
+    # makes the vehicle silently unreachable).
+    for transport in ("udp", "rest"):
+        w2 = hardware.VehicleWorker.__new__(hardware.VehicleWorker)
+        w2.opts = types.SimpleNamespace(mavlink_transport=transport)
+        assert getattr(w2.opts, "mavlink_transport") != "none"
+
+
+# ------------------------------------------------ HEARTBEAT flight-mode decode
+def test_heartbeat_custom_mode_zero_is_stabilize_not_unknown():
+    """ArduSub STABILIZE is custom_mode 0. The decoder used `or -1`, so every
+    STABILIZE heartbeat read as "mode -1" and the engage gate refused it as
+    an unknown mode (2026-09-08 pool: 'flight mode is mode -1, need
+    MANUAL|STABILIZE'; the 2026-08-23 refusals were the same misread). Only a
+    MISSING custom_mode may read as unknown."""
+    from types import SimpleNamespace
+
+    from pymavlink import mavutil
+
+    from rov_gui.backends.hardware import VehicleWorker
+    from rov_gui.state import now
+
+    armed_flag = mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+    def state(**hb):
+        rec = {"t_host": now(), "type": 12, "base_mode": armed_flag}
+        rec.update(hb)
+        return VehicleWorker._arm_state(SimpleNamespace(_latest={"HEARTBEAT": rec}))
+
+    assert state(custom_mode=0) == (True, "STABILIZE")
+    assert state(custom_mode=19) == (True, "MANUAL")
+    assert state(custom_mode=2) == (True, "ALT_HOLD")
+    assert state() == (True, "mode -1")                       # field missing
+    assert state(custom_mode=0, base_mode=0) == (False, "STABILIZE")
+    # a stale record is not a mode at all
+    stale = VehicleWorker._arm_state(SimpleNamespace(_latest={"HEARTBEAT": {
+        "t_host": now() - 5.0, "type": 12, "base_mode": armed_flag, "custom_mode": 0}}))
+    assert stale == (None, "")
 
 
 def main() -> int:

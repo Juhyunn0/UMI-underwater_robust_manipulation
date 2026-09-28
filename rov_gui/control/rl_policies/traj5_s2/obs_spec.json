@@ -1,0 +1,91 @@
+{
+  "checkpoint": "logs/rsl_rl/rov_posehold/2026-09-21_16-53-50_traj5_s2/model_1199.pt",
+  "obs_dim": 100,
+  "act_dim": 4,
+  "history_len": 4,
+  "obs_goal_velocity": true,
+  "frame_dim": 25,
+  "core_obs_dim": 17,
+  "num_actions": 4,
+  "frame_layout": [
+    "q_des(w,x,y,z)",
+    "offset_b(3)",
+    "q_est(w,x,y,z)",
+    "v_b_est(3)",
+    "gyro_b(3)",
+    "goal_v_b(3)",
+    "goal_yaw_rate(1)",
+    "prev_action(4)"
+  ],
+  "moving_goal": {
+    "enabled": true,
+    "p_static": 0.3,
+    "speed_range": [
+      0.02,
+      0.25
+    ],
+    "vz_max": 0.03,
+    "turn_rate_max": 0.6,
+    "p_follow": 0.5,
+    "yaw_rate_max": 0.4,
+    "margin": 0.3
+  },
+  "episode_length_s": 20.0,
+  "history_order": "newest first",
+  "obs_offset_clip": 1.0,
+  "obs_quat_unique": true,
+  "control_dt": 0.05,
+  "action_convention": "MANUAL_CONTROL [surge(+fwd), sway(+right), heave(+up), yaw(+cw from above)] in [-1,1]; x=1000a0 y=1000a1 z=500+500a2 r=1000a3",
+  "pilot_gain_assumed": 0.5,
+  "output": {
+    "kind": "wrench",
+    "frame": "body NED/FRD (station MpcWorker convention; Z positive down, N positive clockwise)",
+    "order": [
+      "X",
+      "Y",
+      "Z",
+      "K",
+      "M",
+      "N"
+    ],
+    "units": [
+      "N",
+      "N",
+      "N",
+      "N*m",
+      "N*m",
+      "N*m"
+    ],
+    "actuated": [
+      1,
+      1,
+      1,
+      0,
+      0,
+      1
+    ],
+    "axis_gain": {
+      "surge_n": 60.0,
+      "sway_n": 60.0,
+      "heave_n": 60.0,
+      "yaw_nm": 20.0
+    },
+    "from_actions": "X = a0*surge_n, Y = a1*sway_n, Z = -a2*heave_n, K = M = 0, N = a3*yaw_nm (deploy/wrench.py)",
+    "files": {
+      "policy.onnx": "actions (1,4) in [-1,1]",
+      "policy_wrench.onnx": "wrench (1,6) N / N*m"
+    }
+  },
+  "frames": "body FLU, world z-up; deploy/obs_builder.py converts the station's NED/FRD state",
+  "estimator": {
+    "vel_lp_alpha": 0.6,
+    "propagate": true,
+    "stale_s": 0.5,
+    "min_fix_dt": 0.02
+  },
+  "dr_preset": "traj5",
+  "ang_error_mode": "full",
+  "activation": "elu",
+  "obs_normalizer": false,
+  "rsl_rl_iteration": 1199
+}

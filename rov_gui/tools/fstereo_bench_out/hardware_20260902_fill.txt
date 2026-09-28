@@ -1,0 +1,26 @@
+# Scatter-gap fill on THREE REAL C3 frames captured 2026-09-02 11:49
+# (raw mono pairs + the live rectification rig, saved from a camera-only run;
+# the fill itself needs no camera). iters=0 is the raw forward scatter.
+# "measured px changed" is the count of pixels that already had a depth and
+# came out different — it must be 0, that is the whole contract.
+#
+# Attribution of the black on the same frames:
+#   rectification    0.00%  (alpha=0 crops to the valid region: rect-valid 100.00%)
+#   network zeros    3.06%  but ALL outside the colour frame — filling every
+#                           source pixel leaves the output fill unchanged at 95.32%
+#   scatter gaps     4.68%  in 539 connected components, all thin curves
+# Reproduce: scratchpad attribute_black.py / where_black.py / try_fill.py
+
+frame iters |  fill % recovered | measured px changed |    ms
+    0     0 |   95.32         - |                   - |     -
+    0     1 |   99.86     4.54% |                   0 |  0.15
+    0     2 |  100.00     4.68% |                   0 |  0.16
+    0     3 |  100.00     4.68% |                   0 |  0.21
+    1     0 |   95.32         - |                   - |     -
+    1     1 |   99.86     4.54% |                   0 |  0.10
+    1     2 |  100.00     4.68% |                   0 |  0.13
+    1     3 |  100.00     4.68% |                   0 |  0.18
+    2     0 |   95.39         - |                   - |     -
+    2     1 |   99.88     4.49% |                   0 |  0.09
+    2     2 |  100.00     4.61% |                   0 |  0.13
+    2     3 |  100.00     4.61% |                   0 |  0.18

@@ -1,0 +1,1148 @@
+{
+ "schema_version": 10,
+ "source": "demo rov_gui.control (SYNTHETIC plant, no measurement value)",
+ "meta_trigger": "csv",
+ "written": "2026-09-02 14:06:02",
+ "rov_model": "heavy_gripper",
+ "run": {
+  "started": "2026-09-02 14:05:19",
+  "log_hz": 20.0,
+  "csv": "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/dc9b6faf-ed43-4ced-8799-350b00fec295/scratchpad/dryrun_integ/dryrun_20260902_140513/20260902/0902_140519/mpc_140519.csv",
+  "rows": 846,
+  "engaged": false,
+  "traj_on": false,
+  "phase": "",
+  "reason": "disengaged: released",
+  "frame_note": "px,py,pz / rx,ry,rz are world FLU (sim-compatible); w*/u* are NED body"
+ },
+ "controller": {
+  "type": "dobmpc",
+  "solver": "acados",
+  "ctrl_hz": 20.0,
+  "dt_s": 0.05,
+  "N": 60,
+  "horizon_s": 3.0,
+  "u_max": [
+   30.0,
+   30.0,
+   30.0,
+   8.0,
+   8.0,
+   10.0
+  ],
+  "v_max_m_s": 1.5,
+  "Q": [
+   300.0,
+   300.0,
+   150.0,
+   80.0,
+   80.0,
+   150.0,
+   10.0,
+   10.0,
+   10.0,
+   10.0,
+   10.0,
+   10.0
+  ],
+  "QN": [
+   300.0,
+   300.0,
+   150.0,
+   80.0,
+   80.0,
+   150.0,
+   10.0,
+   10.0,
+   10.0,
+   10.0,
+   10.0,
+   10.0
+  ],
+  "R": [
+   0.05,
+   0.05,
+   0.05,
+   0.01,
+   0.01,
+   0.005
+  ],
+  "state_order": "x = [x y z, phi theta psi, u v w, p q r] (NED/FRD)",
+  "u_order": "u = [X Y Z K M N] (body wrench, N / N*m)",
+  "w_hat_clip": [
+   15.0,
+   45.0,
+   45.0,
+   5.0,
+   5.0,
+   8.0
+  ],
+  "cost_frame": "world (isotropic Q)",
+  "path_cost": null,
+  "ipopt_fallback": false,
+  "ipopt_fallback_off_reason": "real-time station loop",
+  "rov_model": "heavy_gripper",
+  "ref_preview": true,
+  "path_reference": "shared spatial plan, full horizon",
+  "mpc_state_source": "meas",
+  "probe_ms": 6.365786999595002,
+  "build_s": 1.98,
+  "eaob_sigma_overrides": {
+   "pos": [
+    0.02,
+    0.02,
+    0.01
+   ],
+   "ang_deg": [
+    0.5,
+    0.5,
+    1.5000000000000002
+   ],
+   "lvel": [
+    0.05,
+    0.05,
+    0.05
+   ],
+   "avel": [
+    0.005,
+    0.005,
+    0.005
+   ],
+   "acc": 0.5
+  },
+  "eaob": {
+   "active": true,
+   "profile": "perf",
+   "tau_dist_s": 0.2,
+   "nis_gate": 42.3124,
+   "gate_on": false,
+   "sigma_pos": [
+    0.02,
+    0.02,
+    0.01
+   ],
+   "sigma_ang_deg": [
+    0.5,
+    0.5,
+    1.5000000000000002
+   ],
+   "sigma_lvel": [
+    0.05,
+    0.05,
+    0.05
+   ],
+   "sigma_avel": [
+    0.005,
+    0.005,
+    0.005
+   ],
+   "sigma_acc": 0.5,
+   "sigma_aacc": 0.08485281374238571,
+   "sigma_alloc": [
+    0.3,
+    0.3,
+    0.3,
+    0.05,
+    0.05,
+    0.05
+   ],
+   "n_upd": 846,
+   "n_gated": 0
+  }
+ },
+ "plant": {
+  "source": "bluerov2_mujoco_marinegym/dobmpc/params.py + fossen.py (imported, not copied — the same modules the controller runs)",
+  "equation": "M nu_dot + C(nu) nu + D(nu) nu + g(eta) = tau + w",
+  "frame": "NED world / FRD body (Fossen); eta=[x y z phi theta psi], nu=[u v w p q r]",
+  "rov_model_requested": "heavy_gripper",
+  "rov_model_loaded": "heavy_gripper",
+  "fully_actuated": true,
+  "rigid_body": {
+   "mass_kg": 13.724,
+   "inertia_kgm2": [
+    0.38154,
+    0.7778,
+    0.70954
+   ],
+   "volume_m3": 0.0131815,
+   "rho_kg_m3": 997.0,
+   "weight_n": 134.63244,
+   "buoyancy_n": 128.922583455,
+   "net_buoyancy_n": -5.709856545000008,
+   "zg_restoring_m": 0.01,
+   "zg_mass_coupling_m": 0.0
+  },
+  "M": {
+   "note": "M = M_RB + M_A, constant (kg / kg*m^2); the m*zg off-diagonals are ZG_MASS, zero on this plant because the COM sits at the body origin",
+   "matrix": [
+    [
+     19.224,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     26.424,
+     0.0,
+     -0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     28.294,
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     -0.0,
+     0.0,
+     0.50154,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.8978,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.82954
+    ]
+   ],
+   "rb_diag": [
+    13.724,
+    13.724,
+    13.724,
+    0.38154,
+    0.7778,
+    0.70954
+   ],
+   "added_mass_diag": [
+    5.5,
+    12.7,
+    14.57,
+    0.12,
+    0.12,
+    0.12
+   ]
+  },
+  "C": {
+   "note": "C(nu) = C_RB(nu) + C_A(nu), skew-symmetric, generated from mass/inertia and added_mass_diag above (fossen.coriolis_rb / coriolis_added)",
+   "C_rb_at_nu": [
+    [
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.544073685,
+     1.13684686
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     -0.544073685,
+     0.0,
+     0.37861057
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     -1.13684686,
+     -0.37861057,
+     0.0
+    ],
+    [
+     0.0,
+     0.544073685,
+     1.13684686,
+     0.0,
+     -0.055567602,
+     0.011703025
+    ],
+    [
+     -0.544073685,
+     0.0,
+     0.37861057,
+     0.055567602,
+     0.0,
+     0.011452942
+    ],
+    [
+     -1.13684686,
+     -0.37861057,
+     0.0,
+     -0.011703025,
+     -0.011452942,
+     0.0
+    ]
+   ],
+   "C_a_at_nu": [
+    [
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.577612474,
+     1.052022379
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     -0.577612474,
+     0.0,
+     0.151731138
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     -1.052022379,
+     -0.151731138,
+     0.0
+    ],
+    [
+     0.0,
+     0.577612474,
+     1.052022379,
+     0.0,
+     -0.009397796,
+     0.001805558
+    ],
+    [
+     -0.577612474,
+     0.0,
+     0.151731138,
+     0.009397796,
+     0.0,
+     0.003602121
+    ],
+    [
+     -1.052022379,
+     -0.151731138,
+     0.0,
+     -0.001805558,
+     -0.003602121,
+     0.0
+    ]
+   ],
+   "check_max_abs_err": 0.0
+  },
+  "D": {
+   "note": "D(nu) = diag(linear) + diag(quadratic * |nu|), positive (dissipative). params.py stores DL/DNL negated; these are the positive marinegym coefficients.",
+   "linear": [
+    4.03,
+    6.22,
+    5.18,
+    0.07,
+    0.07,
+    0.07
+   ],
+   "quadratic": [
+    18.18,
+    21.66,
+    36.99,
+    1.55,
+    1.55,
+    1.55
+   ],
+   "D_at_nu": [
+    [
+     4.531540379,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     8.014236592,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     6.64643002,
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     0.11652739,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.09332179,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.191388199
+    ]
+   ],
+   "check_max_abs_err": 0.0
+  },
+  "g": {
+   "note": "g(eta), restoring, N / N*m (fossen.restoring)",
+   "g_at_eta": [
+    -0.094016427,
+    0.08344276,
+    -5.708472649,
+    -0.019674929,
+    -0.022168089,
+    0.0
+   ]
+  },
+  "evaluated_at": {
+   "nu": [
+    0.02758748,
+    -0.082836408,
+    0.039643958,
+    0.030017671,
+    -0.015046316,
+    -0.078314967
+   ],
+   "eta": [
+    0.378373856,
+    -0.322374428,
+    4.319812113,
+    -0.014616312,
+    -0.016466381,
+    0.648135933
+   ],
+   "note": "C, D and g are STATE-DEPENDENT — the matrices above are samples at this state, not constants"
+  },
+  "actuation": {
+   "nu_dim": 6,
+   "u_max": [
+    30.0,
+    30.0,
+    30.0,
+    8.0,
+    8.0,
+    10.0
+   ],
+   "v_max_m_s": 1.5,
+   "note": "u is the BODY WRENCH the allocation is asked to realize; u_max is the solver's box"
+  },
+  "timing": {
+   "dt_ctrl_s": 0.05
+  },
+  "provenance": "[스펙/유도] marinegym_assets/BlueROV.yaml + bluerov.xml via rov_model.py — a SIM plant identification, not a system ID of this physical vehicle (memory: heavy-added-mass-provenance)"
+ },
+ "trajectory": {
+  "kind": "policy",
+  "ckpt": "/home/bdml/Desktop/universal_manipulation_interface/data/outputs/2026.09.01/21.15.26_train_diffusion_transformer_timm_umi_depth/checkpoints/selected.ckpt",
+  "epoch": 20,
+  "obs_dt_s": 0.06666666666666667,
+  "knot_dt_s": 0.2,
+  "period_s": 0.5,
+  "anchor": "leash",
+  "anchor_leash_m": 0.05,
+  "hold_tail": "mask",
+  "v_max_m_s": 0.08,
+  "blend_s": 0.4,
+  "origin_ned": [
+   0.364486843155219,
+   -0.33118975885473895
+  ],
+  "depth_ned": 4.301962278660449,
+  "yaw_fixed_ned_deg": 38.312937198700844,
+  "gripper": false,
+  "T_run_s": 120.0,
+  "path_timeout_s": 360.0
+ },
+ "mission": {
+  "config_square": {
+   "shape": "station",
+   "size": 0.2,
+   "size_y": null,
+   "speed": 0.05,
+   "laps": 5,
+   "length": 2.0,
+   "dir_deg": 90.0,
+   "ramp_s": 1.0,
+   "radius": 0.5,
+   "depth_ned": null,
+   "heading_follow": false,
+   "yaw_rate_deg_s": 60,
+   "origin": "current",
+   "origin_tag": 79,
+   "rot_deg": 0.0,
+   "yaw_fixed_deg": "current",
+   "yaw_map_deg": 90.0
+  },
+  "panel_override": {
+   "shape": "policy"
+  }
+ },
+ "reference_clock": {
+  "path_following": true,
+  "path_lead_m": 0.1,
+  "strategy": "plan_stream_policy",
+  "fillet_m": 0.0,
+  "turn_radius_m": 0.0,
+  "lat_accel_m_s2": 0.05,
+  "long_accel_m_s2": 0.05
+ },
+ "disturbance": null,
+ "hardware": {
+  "geometry": "floor",
+  "tag_map": "/home/bdml/Desktop/umi_underwater_robust_control/config/tag_map_full.yaml",
+  "tag_map_sha1": "5573783edad4",
+  "tag_size_m": 0.17,
+  "cam_t_flu": [
+   0.23949,
+   0.00547,
+   -0.15537
+  ],
+  "cam_xyaxes_flu": [
+   -0.0,
+   -1.0,
+   -0.0,
+   -0.0056,
+   0.0,
+   0.99998
+  ],
+  "cam_tilt_deg": 43.3,
+  "z_source": "pressure",
+  "axis_gain": {
+   "surge_n": 60.0,
+   "sway_n": 60.0,
+   "heave_n": 60.0,
+   "yaw_nm": 20.0
+  },
+  "axis_cap": 0.5,
+  "axis_slew_per_s": 1.5,
+  "axis_cap_used": 0.5,
+  "axis_gain_provenance": "[예측] T200 curve + mixer geometry — replace after the P4 step calibration",
+  "intrinsics": "C3 EEPROM factory calibration (UNDERWATER; calib/FOV_AUDIT.md)",
+  "datum_tag_frame": {
+   "p0": [
+    -0.006983180131877972,
+    -0.0008319466924015172,
+    -1.0011925099258088
+   ],
+   "yaw0_deg": 0.8666701900640598
+  }
+ },
+ "imu_dr": {
+  "enabled": false,
+  "mode": "shadow",
+  "source": "c3",
+  "requested_rate_hz": 200,
+  "abort_err_m": null,
+  "abort_max_s": null,
+  "axis_cap_dr": null,
+  "anchor": "once, at the end of settle (no re-anchoring)",
+  "raw_log": false
+ },
+ "station_bridge": {
+  "enabled": true,
+  "imu_hold_s": 3.0,
+  "xy_source": "auto",
+  "axis_cap": null,
+  "dropouts": 0,
+  "reached_coast": 0,
+  "worst_dropout_s": 0.0,
+  "last_recovery": null,
+  "scope": "station hold only (an object follow is demoted to a station hold first, then carried here)",
+  "released_in_coast": "X, Y, N (heave and attitude kept)"
+ },
+ "plan_stream": {
+  "enabled": true,
+  "config": {
+   "session": "",
+   "v_max_m_s": 0.12,
+   "blend_s": 0.4,
+   "stream_period_s": 0.0,
+   "horizon_s": 4.0,
+   "anchor_max_m": 0.3,
+   "jump_max_m": 0.2,
+   "workspace_box_ned": null,
+   "gripper": false
+  },
+  "run": {
+   "kind": "policy",
+   "session": null,
+   "poses_sha1": null,
+   "n_plans": 0,
+   "released": 0,
+   "installed": 0,
+   "clipped": 0,
+   "rejected": 0,
+   "period_s": 0.5,
+   "time_dilation": null,
+   "duration_s": 120.0,
+   "gripper_on": false,
+   "grip_events": 0
+  }
+ },
+ "object_nav": {
+  "enabled": false,
+  "why": "no --pose"
+ },
+ "fstereo": {
+  "enabled": false,
+  "why": "no --fstereo"
+ },
+ "policy": {
+  "enabled": true,
+  "why": "",
+  "source": "demo",
+  "synthetic": true,
+  "config": {
+   "a_max_m_s2": 0.2,
+   "anchor": "leash",
+   "anchor_leash_m": 0.05,
+   "anchor_leash_yaw_deg": 10.0,
+   "anchor_max_m": 0.15,
+   "blend_a_max_m_s2": 1.0,
+   "blend_s": 0.4,
+   "blend_v_max_m_s": 0.16,
+   "ckpt": "/home/bdml/Desktop/universal_manipulation_interface/data/outputs/2026.09.01/21.15.26_train_diffusion_transformer_timm_umi_depth/checkpoints/selected.ckpt",
+   "dataset_fps": 30.0,
+   "div_max_m": 0.25,
+   "eval_transforms": "center",
+   "gripper": false,
+   "gripper_close_below": 0.3,
+   "gripper_hold_max_s": 4.0,
+   "gripper_open_above": 0.67,
+   "gripper_travel_s": 2.0,
+   "gripper_width_closed_m": 0.042,
+   "gripper_width_init_m": 0.069,
+   "gripper_width_open_m": 0.069,
+   "hold_tail": "mask",
+   "hold_tail_taper_s": 0.0,
+   "jump_max_m": 0.06,
+   "knot_dt_s": 0.2,
+   "max_run_s": 120.0,
+   "min_obs_coverage": 0.985,
+   "num_inference_steps": 16,
+   "obs_max_age_s": 0.4,
+   "obs_res": 224,
+   "period_s": 0.5,
+   "r_max_rad_s": 0.5,
+   "repo": "/home/bdml/Desktop/universal_manipulation_interface",
+   "stale_s": 1.5,
+   "target_model": "configs/target_camera_underwater.yaml",
+   "tcp_body_flu_m": [
+    0.4165,
+    0.0,
+    -0.17
+   ],
+   "tcp_offset_cam_m": null,
+   "v_max_m_s": 0.08,
+   "workspace_box_ned": [
+    [
+     -1.0,
+     -1.0,
+     -0.5
+    ],
+    [
+     1.0,
+     1.0,
+     0.5
+    ]
+   ],
+   "yaw_jump_max_deg": 8.0,
+   "z_far_m": 3.0,
+   "z_near_m": 0.2
+  },
+  "config_provenance": {
+   "dataset_fps": "[측정: dataset .zattrs fps 30 (spec v1 §0)]",
+   "num_inference_steps": "[스펙: training cfg num_inference_steps 16]",
+   "period_s": "[유도: n_action_steps 8 x obs_dt 66.7 ms = 0.533 s (spec v1 D4)]",
+   "knot_dt_s": "[예측] (v2 A5: FD-accel gain 61·σ at 0.2 s vs 551·σ at 1/15 s)",
+   "obs_max_age_s": "[유도: control review — plan life at install >= 0.6 s >= blend_s + 0.2 (v2 A7)]",
+   "stale_s": "[예측]",
+   "max_run_s": "[예측]",
+   "anchor_leash_m": "[예측: below the 62 mm jaw opening (gen_gripper_variant.py:47 vendor spec), above the ~0.04 m one-period lag at 0.08 m/s (v2 A4)]",
+   "anchor_leash_yaw_deg": "[예측]",
+   "v_max_m_s": "[유도: best measured mission speed 0.058 m/s vs 0.20 command, config/hw_mpc.yaml:53 (v2 A21)]",
+   "a_max_m_s2": "[예측]",
+   "r_max_rad_s": "[예측]",
+   "anchor_max_m": "[예측]",
+   "jump_max_m": "[예측]",
+   "yaw_jump_max_deg": "[유도: r_max·blend_s·2/π ≈ 0.13 rad (v2 A11)]",
+   "div_max_m": "[예측]",
+   "blend_s": "[예측]",
+   "blend_v_max_m_s": "[예측: 2·v_max (v2 A11)]",
+   "blend_a_max_m_s2": "[예측]",
+   "hold_tail_taper_s": "[예측] 0 = hard mask",
+   "workspace_box_ned": "[예측] datum-relative; None -> REFUSAL for shape policy",
+   "tcp_body_flu_m": "[유도: sim model jaw-pair centre, bluerov2_mujoco_marinegym/compute_payload_inertia.py:95 JAW_POS; NOT measured on the vehicle (v2 A3)]",
+   "tcp_offset_cam_m": "None = derived from tcp_body_flu_m through the C3 extrinsic (v2 A3)",
+   "min_obs_coverage": "[유도: training validity min 0.9878, mean 0.9999 — depth-parity review (v2 A16)]",
+   "z_near_m": "[스펙: dataset depth recipe normalise_depth z_near (spec v1 §0)]",
+   "z_far_m": "[스펙: dataset depth recipe normalise_depth z_far (spec v1 §0)]",
+   "obs_res": "[스펙: shape_meta camera0_depth 224 (spec v1 §0)]",
+   "gripper_close_below": "[유도: = width 0.050 m on the dataset levels (v2 A12)]",
+   "gripper_open_above": "[유도: = width 0.060 m on the dataset levels (v2 A12)]",
+   "gripper_hold_max_s": "[예측: UMI-U used 4 s]",
+   "gripper_width_open_m": "[측정: /home/bdml/Desktop/data collection/slam/actions_summary.json reports[*].gripper_command.open_level_m ≈ 0.062–0.069]",
+   "gripper_width_closed_m": "[측정: same file, closed_level_m ≈ 0.040–0.045]",
+   "gripper_width_init_m": "[가정: jaw OPEN at process start — logged, not sensed (v2 A12)]",
+   "gripper_travel_s": "[예측]"
+  },
+  "down_sample_steps": 2,
+  "obs_dt_s": 0.06666666666666667,
+  "anchor_mode": "leash",
+  "hold_tail": "mask",
+  "tcp": {
+   "tcp_body_flu_m": [
+    0.4165,
+    0.0,
+    -0.17
+   ],
+   "tcp_offset_cam_m_override": null,
+   "tcp_offset_cam_m_used": [
+    0.00547,
+    -0.10997005443031,
+    0.13947460029910336
+   ],
+   "handheld_tcp_offset_cam_m": [
+    0.0355,
+    0.1293,
+    0.3186
+   ],
+   "T_body_tcp": [
+    [
+     0.0,
+     -0.6817320540699252,
+     0.7316019453593604,
+     0.4165
+    ],
+    [
+     1.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.7316019453593604,
+     0.6817320540699253,
+     0.17
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "t_body_tcp_norm_m": 0.4498580331615742,
+   "note": "TCP = the ROV's OWN jaw [유도: sim JAW_POS], NOT measured on the vehicle; the handheld value is a comparison only (v2 A3). First pool run is a pipeline smoke, not a grasp test."
+  },
+  "estimator": {
+   "w_open_m": 0.069,
+   "w_closed_m": 0.042,
+   "travel_s": 2.0,
+   "w_init_m": 0.069,
+   "width_now_m": 0.069,
+   "n_drives": 1,
+   "assumption": "jaw OPEN (w_init) at process start — there is no jaw feedback; the width is what the policy was TOLD, not what the jaw did"
+  },
+  "epoch": 20,
+  "drops_outside_mission": {
+   "drop_epoch": 0,
+   "drop_old": 0,
+   "drop_inactive": 0,
+   "received": 0
+  },
+  "depth_src": "identity",
+  "status": {
+   "ready": true,
+   "loading": false,
+   "error": "",
+   "hz": 1.41376066402578,
+   "infer_ms": 27.856337001139764,
+   "note": "plan 61 (near)",
+   "n_plans": 61,
+   "n_skip": 89,
+   "age_s": 0.04472963899934257
+  },
+  "worker": {
+   "enabled": true,
+   "synthetic": true,
+   "source": "demo",
+   "policy_block_source": "MpcConfig.policy",
+   "session": {
+    "stub": false,
+    "ckpt": "/home/bdml/Desktop/universal_manipulation_interface/data/outputs/2026.09.01/21.15.26_train_diffusion_transformer_timm_umi_depth/checkpoints/selected.ckpt",
+    "ckpt_resolved": "/home/bdml/Desktop/universal_manipulation_interface/data/outputs/2026.09.01/21.15.26_train_diffusion_transformer_timm_umi_depth/checkpoints/epoch=0050-train_loss=0.029.ckpt",
+    "ckpt_sha1_head": "fa7aeb3d92b6228fefa98640504ee833640e7992",
+    "cfg_fingerprint": "309028fe9a77c2d1b4c2d546c63729dcc608c0d1",
+    "policy_target": "diffusion_policy.policy.diffusion_transformer_timm_policy.DiffusionTransformerTimmPolicy",
+    "model_name": "resnet34.a1_in1k",
+    "encoder_batchnorm_kept": true,
+    "num_inference_steps": 16,
+    "num_train_timesteps": 50,
+    "timesteps": [
+     45,
+     42,
+     39,
+     36,
+     33,
+     30,
+     27,
+     24,
+     21,
+     18,
+     15,
+     12,
+     9,
+     6,
+     3,
+     0
+    ],
+    "scheduler": {
+     "num_train_timesteps": 50,
+     "beta_start": 0.0001,
+     "beta_end": 0.02,
+     "beta_schedule": "squaredcos_cap_v2",
+     "clip_sample": true,
+     "set_alpha_to_one": true,
+     "steps_offset": 0,
+     "prediction_type": "epsilon"
+    },
+    "eval_transforms": "center",
+    "transforms": [
+     "CenterCrop(size=(212, 212))",
+     "Resize(size=224, interpolation=bilinear, max_size=None, antialias=True)"
+    ],
+    "crop_px": 212,
+    "n_obs_tokens": 106,
+    "device": "cuda",
+    "torch": "2.11.0+cu128",
+    "diffusers": "0.40.0",
+    "timm": "1.0.29",
+    "normalizer_input_stats": {
+     "robot0_eef_pos": {
+      "min": [
+       -0.013910421170294285,
+       -0.01416352391242981,
+       -0.03364962339401245
+      ],
+      "max": [
+       0.025048894807696342,
+       0.033461421728134155,
+       0.024650096893310547
+      ]
+     },
+     "robot0_gripper_width": {
+      "min": [
+       0.024562379345297813
+      ],
+      "max": [
+       0.08799999952316284
+      ]
+     }
+    },
+    "normalizer_image_identity": true,
+    "dataset_path": "/home/bdml/Desktop/data collection/dataset_depth.zarr.zip",
+    "ready": true,
+    "loading": false,
+    "error": "",
+    "load_s": 4.026492228000279,
+    "warmup_ms": 152.51938799883646,
+    "n_predict": 61,
+    "infer_ms_p50": 75.54142899971339,
+    "infer_ms_max": 159.42679999898246,
+    "contract": {
+     "obs_keys": [
+      "camera0_depth",
+      "robot0_eef_pos",
+      "robot0_eef_rot_axis_angle",
+      "robot0_gripper_width",
+      "robot0_eef_rot_axis_angle_wrt_start"
+     ],
+     "image_key": "camera0_depth",
+     "obs_horizon": 2,
+     "action_horizon": 16,
+     "action_dim": 10,
+     "down_sample_steps": 2,
+     "obs_dt_s": 0.06666666666666667,
+     "fps": 30.0,
+     "fps_source": "dataset zip .zattrs (/home/bdml/Desktop/data collection/dataset_depth.zarr.zip)",
+     "image_shape": [
+      3,
+      224,
+      224
+     ],
+     "lowdim_shapes": {
+      "robot0_eef_pos": [
+       3
+      ],
+      "robot0_eef_rot_axis_angle": [
+       6
+      ],
+      "robot0_gripper_width": [
+       1
+      ],
+      "robot0_eef_rot_axis_angle_wrt_start": [
+       6
+      ]
+     }
+    }
+   },
+   "obs": {
+    "recipe": [
+     "depth (uint16 mm) on the producer's grid",
+     "grid adapter -> raw CAM_B 640x400 target grid (nearest, no averaging)",
+     "centre crop to square (y0=0, x0=120 for 640x400)",
+     "cv2.resize to out_res x out_res, INTER_NEAREST",
+     "normalise_depth(z_near, z_far) -> [0,1], near = 1",
+     "u8 = clip(v*255 + 0.5); channel 1 = 255 where mm > 0; channels (u8, valid, u8)"
+    ],
+    "target_model": {
+     "config": "configs/target_camera_underwater.yaml",
+     "name": "marinesitu_c3_cam_b",
+     "role": "target",
+     "medium": "water",
+     "verified": true,
+     "rectified": false,
+     "image_size": [
+      1280,
+      800
+     ],
+     "fx": 757.12,
+     "fy": 757.51,
+     "cx": 648.87,
+     "cy": 381.28,
+     "distortion": [
+      -1.40532,
+      -0.62655,
+      -1e-05,
+      -0.00152,
+      2.0006,
+      -1.17453,
+      -1.18481,
+      2.4386
+     ],
+     "baseline_m": 0.075
+    },
+    "target_rays": "umi_handheld.camera_model.CameraModel.unproject(px, W, H) (verbatim umi_handheld/warp.py WarpStage._build)",
+    "warp_size": [
+     640,
+     400
+    ],
+    "crop": {
+     "y0": 0,
+     "x0": 120,
+     "size": 400
+    },
+    "out_res": 224,
+    "z_near_m": 0.2,
+    "z_far_m": 3.0,
+    "rays_behind_camera": 0,
+    "grid_kind": "identity",
+    "grid_fingerprint": "39c71e96d1afb691",
+    "coverage": 1.0,
+    "min_coverage": 0.985,
+    "usable": true,
+    "why": "",
+    "fill_iters": 0,
+    "n_builds": 122,
+    "n_set_grid": 1,
+    "grid": {
+     "size": [
+      640,
+      400
+     ]
+    }
+   },
+   "depth_src": "identity",
+   "depth_scale_applied": null,
+   "grid_fault": "",
+   "obs_dt_s": 0.06666666666666667,
+   "period_s": 0.5,
+   "tcp": {
+    "tcp_body_flu_m": [
+     0.4165,
+     0.0,
+     -0.17
+    ],
+    "tcp_offset_cam_m": [
+     0.00547,
+     -0.10997005443031,
+     0.13947460029910336
+    ],
+    "tcp_offset_cam_m_explicit": false,
+    "handheld_tcp_offset_cam_m": [
+     0.0355,
+     0.1293,
+     0.3186
+    ],
+    "t_body_tcp_frd_m": [
+     0.4165,
+     0.0,
+     0.17
+    ],
+    "t_body_tcp_norm_m": 0.4498580331615742,
+    "T_body_tcp": [
+     [
+      0.0,
+      -0.6817320540699252,
+      0.7316019453593604,
+      0.4165
+     ],
+     [
+      1.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      0.7316019453593604,
+      0.6817320540699253,
+      0.17
+     ],
+     [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   },
+   "fstereo": {
+    "requested": {
+     "iters": 16,
+     "scale": 1.0,
+     "size": null,
+     "alpha": 0.5
+    },
+    "worker": null,
+    "training": {
+     "status": "ok",
+     "ckpt": "/home/bdml/Desktop/universal_manipulation_interface/data/outputs/2026.09.01/21.15.26_train_diffusion_transformer_timm_umi_depth/checkpoints/selected.ckpt",
+     "hydra_config": "/home/bdml/Desktop/universal_manipulation_interface/data/outputs/2026.09.01/21.15.26_train_diffusion_transformer_timm_umi_depth/.hydra/config.yaml",
+     "dataset_path": "/home/bdml/Desktop/data collection/dataset_depth.zarr.zip",
+     "iters": 16,
+     "scale": 1.0,
+     "checkpoint": "/home/bdml/Desktop/FoundationStereo/FoundationStereo/pretrained_models/23-51-11/model_best_bp2.pth",
+     "depth_scale_applied": 1.0,
+     "tool": "UMI_Underwater/replay_foundation_stereo.py",
+     "fps": 30.0
+    },
+    "allow_mismatch": false
+   },
+   "ready_after_s": 4.037458561000676,
+   "counters": {
+    "plans": 61,
+    "skip_degenerate": 3,
+    "skip_pair": 0,
+    "skip_fresh": 0,
+    "skip_history": 86,
+    "skip_no_depth": 0,
+    "skip_stale_depth": 0,
+    "skip_no_start": 0,
+    "skip_grid": 0,
+    "skip_not_ready": 0,
+    "pair_dup": 0,
+    "pair_fallback": 0,
+    "pair_near": 61,
+    "infer_errors": 0,
+    "epoch_changes": 19,
+    "depth_frames": 730,
+    "states": 846,
+    "history_rows": 675
+   },
+   "pairing": {
+    "n": 61,
+    "dt_p50_s": 0.06400277400098275,
+    "dt_max_s": 0.08520718200088595,
+    "dup": 0,
+    "fallback": 0,
+    "near": 61,
+    "skip": 0,
+    "tol": 0.6,
+    "fallback_max": 2.5
+   },
+   "infer_ms": {
+    "p50": 75.54142899971339,
+    "max": 159.42679999898246,
+    "n": 61
+   },
+   "depth_hz": 15.500069734816368,
+   "mailbox": {
+    "put": 753,
+    "taken": 730,
+    "dropped_src": 0,
+    "dropped_unwanted": 0,
+    "grid_set": 1,
+    "grid_refused": 0
+   },
+   "plan_hz": 1.41376066402578,
+   "state_stale_s": 1.0
+  },
+  "run": {
+   "epoch": 20,
+   "n_plans": 0,
+   "received": 1,
+   "released": 0,
+   "installed": 0,
+   "clipped": 0,
+   "rejected": 0,
+   "late": 0,
+   "skip_bridge": 0,
+   "skip_halted": 0,
+   "drop_epoch": 0,
+   "drop_old": 0,
+   "reject_compose": 0,
+   "reject_blend": 0,
+   "stale_events": 0,
+   "halted": "",
+   "end_reason": "stop",
+   "period_s": 0.5,
+   "duration_s": 120.0,
+   "obs_dt_s": 0.06666666666666667,
+   "anchor_mode": "leash",
+   "hold_tail": "mask",
+   "gripper_on": false,
+   "grip_events": 0,
+   "grip_w_at_arm": 0.069,
+   "t_last_accept": null,
+   "hold_frac_last": null,
+   "infer_ms_p50": null,
+   "infer_ms_max": null,
+   "live": false
+  }
+ }
+}

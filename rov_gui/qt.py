@@ -223,6 +223,57 @@ sanitize_plugin_path()
 preload_platform_libs()
 
 
+def install_slot_guard(log=None):
+    """Keep ONE broken slot from killing the station. Loudly.
+
+    PyQt calls ``qFatal`` on an unhandled exception in a slot, which aborts
+    the process — core dump, no shutdown, no DISARM. That happened in the
+    2026-09-02 pool run: a depth panel that had not received its first frame
+    raised a TypeError inside a tag-overlay slot and took the whole station
+    down while the vehicle was in the water.
+
+    For a window whose job includes the DISARM and E-STOP buttons, surviving a
+    painting or overlay bug beats dying correctly: the operator keeps the
+    controls either way, and every worker that actually drives the vehicle has
+    its own try/except and disengage path already.
+
+    It is deliberately NOT quiet — the traceback goes to stderr and to the
+    station log, every time, with a running count. A swallowed exception that
+    nobody sees is how a station ends up flying on a half-broken UI, which is
+    the failure this must not trade for.
+    """
+    import sys
+    import traceback
+
+    state = {"n": 0}
+    previous = sys.excepthook
+
+    def hook(exc_type, exc, tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            previous(exc_type, exc, tb)
+            return
+        state["n"] += 1
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        sys.stderr.write(
+            f"\n=== UNHANDLED EXCEPTION IN A SLOT (#{state['n']}) — the "
+            f"station is STILL RUNNING; treat what it shows as suspect ===\n"
+            f"{text}\n")
+        sys.stderr.flush()
+        if log is not None:
+            try:
+                where = traceback.extract_tb(tb)[-1] if tb else None
+                site = (f"{where.filename.split('/')[-1]}:{where.lineno} "
+                        f"in {where.name}" if where else "?")
+                log("error", f"UI FAULT #{state['n']} — {exc_type.__name__}: "
+                             f"{exc} ({site}). The station kept running; this "
+                             f"panel may be wrong. See the terminal.")
+            except Exception:                                    # noqa: BLE001
+                pass                    # the guard must never raise
+
+    sys.excepthook = hook
+    return state
+
+
 def run_app(app) -> int:
     """``app.exec()`` on Qt6, ``app.exec_()`` on Qt5, without the caller caring."""
     runner = getattr(app, "exec", None)
@@ -238,6 +289,7 @@ def import_cv2():
     ``cv2 = import_cv2()`` and are otherwise unchanged.
     """
     saved = os.environ.get("QT_QPA_PLATFORM_PLUGIN_PATH")
+    orig_path = sys.path                     # the list OBJECT, not a copy
     try:
         import cv2  # noqa: PLC0415 - deliberately late and guarded
     finally:
@@ -245,6 +297,25 @@ def import_cv2():
             os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH", None)
         else:
             os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = saved
+        # cv2's bootstrap (opencv __init__.py: ``save_sys_path =
+        # copy.copy(sys.path)`` ... ``sys.path = save_sys_path``) REPLACES
+        # sys.path with a snapshot taken before the import. Any entry another
+        # thread inserted meanwhile (mpc_bridge.import_dobmpc putting the
+        # marinegym tree first, racing the PolicyWorker's import of this
+        # module) was discarded and its ``import rov_model`` failed
+        # (demo_e2e ``mpc policy`` 2/3 runs, 2026-09-26). The old list object
+        # still holds those inserts, so put back what is missing, at its
+        # old position, skipping cv2's own binary dirs (which it removed on
+        # purpose).
+        if sys.path is not orig_path:
+            cv2_dir = os.path.dirname(getattr(sys.modules.get("cv2"),
+                                              "__file__", "") or "")
+            for i, entry in enumerate(orig_path):
+                if entry in sys.path:
+                    continue
+                if cv2_dir and str(entry).startswith(cv2_dir):
+                    continue
+                sys.path.insert(min(i, len(sys.path)), entry)
     return cv2
 
 

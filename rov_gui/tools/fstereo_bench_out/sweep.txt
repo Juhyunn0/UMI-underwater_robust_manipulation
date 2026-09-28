@@ -1,0 +1,17 @@
+# fstereo_bench.py sweep — 2026-09-02 10:44:51
+# gpu: NVIDIA GeForce RTX 5090, torch 2.11.0+cu128, other compute processes at start: none
+# frames: /home/bdml/Desktop/data collection/videos episodes ('61', '66', '12') frames (10, 90, 170)
+
+9 real pairs; eager forward; disagreement vs reference (iters 16, 640x400) in 640-px units, 20-px border excluded
+    input    padded it | wall ms kernels | med|d|    p90    p99 |  >1px  >2px | note
+ 640x400   640x416  16 |   140.2    9862 |  0.000  0.000  0.000 |  0.0%  0.0% | reference
+ 640x400   640x416   8 |   113.3    6854 |  0.029  0.275  1.289 |  1.8%  0.4% | scale 1.0
+ 480x300   480x320   8 |    74.9    6839 |  0.099  0.747  4.113 |  7.0%  2.7% | scale 0.75
+ 320x200   320x224  16 |    58.8    9580 |  0.161  1.045  6.302 | 10.6%  4.5% | scale 0.5, iters 16
+ 320x200   320x224   8 |    44.2    6572 |  0.165  1.095  5.593 | 11.1%  4.7% | scale 0.5 (shipped)
+ 320x200   320x224   4 |    36.8    5068 |  0.184  1.098  5.021 | 11.3%  4.4% | scale 0.5
+ 256x160   256x160   8 |    37.8    6427 |  0.228  1.224  6.094 | 12.8%  5.6% | scale 0.4
+ 224x140   224x160   8 |    37.7    6355 |  0.299  1.730  8.906 | 17.0%  8.4% | 224 wide, isotropic
+ 224x140   224x160   4 |    30.2    4827 |  0.329  1.808  7.100 | 18.9%  8.9% | 224 wide, isotropic
+ 224x224   224x224   8 |    39.1    6347 |  0.222  1.213  4.978 | 12.3%  4.8% | 224x224 anisotropic
+ 160x100   160x128   8 |    37.1    6167 |  1.028  9.489 21.320 | 50.6% 36.7% | scale 0.25

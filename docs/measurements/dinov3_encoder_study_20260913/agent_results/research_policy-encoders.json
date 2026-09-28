@@ -1,0 +1,92 @@
+{
+ "summary": "Web evidence (2022–2026) on DINO-family encoders in imitation-learning / diffusion policies, checked against primary sources (arXiv HTML text and released repos). Bottom line for this project (UMI-style TransformerObsEncoder, all-token ViT path at external/UMI_aquatic/diffusion_policy/model/vision/transformer_obs_encoder.py:139-146 and :237-244, encoder lr 3e-5 at config/train_diffusion_transformer_umi_depth_vit_workspace.yaml:128, ~75 land episodes, 3-channel depth encoding): (1) NO paper sweeps DINOv3 S/B/L/H+/7B as a policy encoder; the only \"DINOv3 in Diffusion Policy\" paper used ViT-S/16 at a 76x76 crop. (2) The closest analogue (Data Scaling Laws, UMI data + DP + timm encoder + encoder lr 3e-5 + EMA) shows DINOv2 ViT-S/B/L = 0.66/0.81/0.90 when FULLY fine-tuned, frozen = 0.00, LoRA r=8 = 0.72 — but with ~800 demos and CLS pooling. (3) Every policy study that froze a large DINO encoder on small real datasets (Theia 48–101 demos, OpenVLA 10–150 demos, DSPv2 100 demos, DSL) found freezing hurts badly; LoRA matched full FT for OpenVLA/DSPv2 but not for DSL. (4) On depth-as-3-channel input (DeFM), DINOv3 ViT-L/16 is only +0.45 pt over DINOv2 ViT-L/14 (69.15 vs 68.70 linear probe), frozen DINOv3 features collapse under a sensor-noise shift (0.6532 -> 0.2075) unless fine-tuned (0.8243 -> 0.7837), and the authors state DINOv3 \"treats depth simply as another intensity channel\". (5) DINOv3's own Table 14 shows ViT-L ~= ViT-H+ on dense tasks (ADE20k 54.9 vs 54.8, NYU 0.352 vs 0.352); the 7B teacher's gains are on global tasks. (6) 2026 works that use DINOv3 at <=100 demos chose ViT-B + LoRA or froze it; ViT-H+ appears only with 400–27,500 demos on 8–32 A100s (Enfold). Net: the literature supports \"pretrained ViT, fine-tuned at ~3e-5, all/spatial tokens\" (what the code already does) and supports trying DINOv3 ViT-L (not H+/7B) fully fine-tuned or LoRA-tuned as an A/B; it gives no evidence that the largest DINOv3 helps a 75-episode depth-input policy, and specific evidence that frozen use on depth is fragile.",
+ "claims": [
+  {
+   "claim": "[DINOv2] In the closest published analogue to this project (UMI handheld data, Diffusion Policy, timm ViT encoder, encoder lr 3e-5 = 0.1 x policy lr 3e-4, EMA on, GroupNorm), Lin et al. 'Data Scaling Laws in Imitation Learning' (ICLR 2025) Table 2 reports on Pour Water: fully fine-tuned DINOv2 ViT-S/14 0.66, ViT-B/14 0.81, ViT-L/14 0.90; Learning-from-Scratch ViT-L/14 0.03; frozen DINOv2 0.00; LoRA DINOv2 (rank 8) 0.72. Text: 'Both pre-training and full fine-tuning are essential for the visual encoder ... frozen DINOv2 pre-trained features achieve scores close to zero ... LoRA (rank=8) do not match the performance of full fine-tuning' and 'scaling the visual encoder from ViT-Small to ViT-Large leads to a steady improvement'. The released recipe (train_scripts/pour_water.sh + train_diffusion_unet_timm_umi_workspace.yaml) is model_name 'vit_large_patch14_dinov2.lvd142m', feature_aggregation 'cls_token' (UNet head, NOT all tokens), batch 32, 150 epochs, encoder_lr_coefficient 0.1, use_ema True; LoRA = peft r=8, lora_alpha=8, target_modules=['qkv']. Training set = 32 environment-object pairs x 50% of ~50 demos each (~800 demos).",
+   "sources": [
+    "https://arxiv.org/html/2410.18647",
+    "https://raw.githubusercontent.com/Fanqi-Lin/Data-Scaling-Laws/master/train_scripts/pour_water.sh",
+    "https://raw.githubusercontent.com/Fanqi-Lin/Data-Scaling-Laws/master/diffusion_policy/config/train_diffusion_unet_timm_umi_workspace.yaml",
+    "https://raw.githubusercontent.com/Fanqi-Lin/Data-Scaling-Laws/master/diffusion_policy/model/vision/timm_obs_encoder.py"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "This is the only UMI-setting size sweep and it favours the larger DINO encoder — but only when fully fine-tuned at 3e-5 (the project's obs_encoder_lr at config/train_diffusion_transformer_umi_depth_vit_workspace.yaml:128 already matches), with ~10x this project's demo count, RGB input, and CLS pooling rather than the all-token path at transformer_obs_encoder.py:237-244. It says 'frozen = catastrophic' and 'LoRA-qkv-r8 loses 0.18', so a DINOv3 A/B here should be full fine-tune (or LoRA with more modules), not frozen."
+  },
+  {
+   "claim": "[DINOv2] Freezing a large pretrained encoder is repeatedly harmful in the 10–150-demo regime, and LoRA can match full fine-tuning: OpenVLA (DINOv2 ViT-L/14 + SigLIP fused channel-wise, 600M-param encoder) Table 1 on Franka-Tabletop (10–150 demos): full FT 69.7+-7.2%, 'Frozen vision' 47.0+-6.9%, last-layer-only 30.3%, 'Sandwich' 62.1%, LoRA r=32 68.2+-7.5% (1.4% of params), r=64 68.2%; Appendix D.3: 'fine-tuning the vision encoder leads to 80.0% average success versus 46.7% average success from leaving it frozen', with some frozen runs discontinued for 'near-zero performance and unstable robot behaviors'; hypothesis: 'the pretrained vision backbone may not capture sufficient fine-grained spatial details'. Full-FT lr 2e-5 fixed, no warmup; removing the DINOv2 half costs ~5% vs ~30% for removing OpenX data (Table 9). DSPv2 (DINOv2-base, 100 demos, Cart Pushing): frozen 70%/60%, LoRA 90%/80%, fully fine-tuned 90%/60% (original / scene-generalisation) — LoRA kept precision and generalised better than full FT.",
+   "sources": [
+    "https://arxiv.org/html/2406.09246",
+    "https://arxiv.org/html/2509.16063"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "Three independent small-data results (OpenVLA, DSPv2, plus DSL above) all say do NOT freeze DINO; they disagree on LoRA vs full FT (OpenVLA/DSPv2: LoRA ~= full and better OOD; DSL: LoRA r8-qkv worse). With 75 episodes and a land->water shift, LoRA on all linear layers (OpenVLA r=32 style) is a defensible middle option the vendored TimmObsEncoder does not implement (transformer_obs_encoder.py has only 'frozen')."
+  },
+  {
+   "claim": "[DINOv2] Theia (RAI Institute, CoRL 2024) real-robot BC with 48/63/101/50 demos: a frozen DINOv2-L (303M) got Door-Opening 46%/12% and Pick-and-Place 10%/0%; a FINE-TUNED DINOv2-L got Toy-Microwave 20/10/2% and Drawer-Opening (diffusion policy on Spot, 50 demos) 35%/20%, versus Theia-B (86M) 92/66, 85/75, 58/52/40, 85/100 and ViT-H 45/85 on Drawer. Caveat: the Spot fine-tune used a single lr 3e-4 for everything (Table 11), 10x the UMI encoder lr. In frozen CortexBench sims: 'providing spatial tokens is consistently better than using the [CLS] token for robot learning' (applies to MVP, VC-1, DINOv2, CLIP), and 'most models ... achieve better performance with larger sizes' but 'scale at varying rates'; higher entropy of feature norms correlates with policy performance (R=0.943 regular models).",
+   "sources": [
+    "https://arxiv.org/html/2407.20179"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "Direct counter-evidence that a 300M DINO encoder is automatically better at ~50 demos: with a naive recipe DINOv2-L lost badly to an 86M distilled model. It also supports the project's existing all-token design (feature_aggregation: null at config ...umi_depth_vit_workspace.yaml:60) over CLS pooling."
+  },
+  {
+   "claim": "[DINOv3] The only paper titled around DINOv3 + Diffusion Policy (Egbe et al., arXiv 2509.17684, Sep 2025) tested ONLY 'facebook/dinov3-vits16-pretrain-lvd1689m' (ViT-S/16, 21M) at crop_shape [76,76] (4x4 patches) through MultiImageObsEncoder (pooled feature, UNet DP), single lr 1e-4, batch 16, 100 epochs, EMA on, RTX A6000. Table I test success — frozen vs finetuned DINOv3-S: PushT 0.39 vs 0.84, Lift 1.00 vs 1.00, Can 0.50 vs 0.90, Square 0.60 vs 0.90; finetuned ResNet-18: 0.89 / 1.00 / 0.80 / 1.00. 'Training beyond 500 epochs showed clear signs of overfitting on the validation loss'. No ViT-B/L/H+/7B, no DINOv2 or CLIP baseline, no token-handling ablation.",
+   "sources": [
+    "https://arxiv.org/html/2509.17684",
+    "https://arxiv.org/abs/2509.17684"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "It does not answer the 'largest DINOv3' question at all, and its setup (76 px crop, pooled feature) is far from this project's 224 px all-token path; what it does show is frozen DINOv3 << fine-tuned DINOv3 even at ViT-S, and overfitting past ~500 epochs on Robomimic-sized data (project trains 200)."
+  },
+  {
+   "claim": "[DINOv3] 2026 policy/world-model papers that adopt DINOv3 do so without any size or encoder ablation, and at <=100 demos they pick ViT-B or freeze it: GHOST (2606.10025) — 'a frozen DINOv3 encoder, producing KxC patch tokens' (size unstated), each token augmented with an MLP of the depth-unprojected 3-D patch centre, 17–100 demos, only ablation is vs an 11M ViT from scratch (100% vs 70% fold-onesie), low-level policy uses ResNet-18 from scratch; Multi-Camera View Scaling (2604.00557) — 'pretrained DINOV3-base model ... finetuned with a LoRA module', diffusion policy, N=10/25/50 demos (Can single-view 0.18/0.54/0.72), no encoder ablation, LoRA rank/lr unreported; LaWAM (2606.15768) — frozen 'distilled DINOv3 ViT-B/16', patch tokens flattened into one sequence, 150–280 real demos; Enfold (2607.26657) — DINOv3 ViT-H+/16 trained as a 'predictive encoder' (Cosmos-Reason1-7B text features concatenated into the DINO stream from block 8; 'the action head reads projected patch tokens from the final DINO block'), AdamW 1e-4, bf16, 8–32x A100-40GB, 1712 (LIBERO) / 400 (real) / 27,500 (RoboTwin) demos, 134 ms per action chunk on A100.",
+   "sources": [
+    "https://arxiv.org/html/2606.10025",
+    "https://arxiv.org/html/2604.00557",
+    "https://arxiv.org/html/2606.15768",
+    "https://arxiv.org/html/2607.26657"
+   ],
+   "confidence": "medium",
+   "why_it_matters_here": "No published precedent for DINOv3-L/H+/7B in a ~75-episode single-task DP; the one H+ deployment used 400–27,500 demos and multi-node A100s. Also, GHOST's depth-unprojected 3-D positional embedding is a concrete way to exploit the project's depth channel with DINOv3 patch tokens without changing the encoder. Confidence 'medium' because sizes/LoRA settings are unreported in two of the four papers."
+  },
+  {
+   "claim": "[DINOv3 vs DINOv2 on DEPTH input] DeFM (arXiv 2601.18923, Jan 2026) fed RGB-pretrained encoders depth preprocessed exactly as this project's kind of 3-channel encoding ('min-max normalization to the depth image, stack it into three channels, and finally normalize using the standard ImageNet mean and standard deviation'). ImageNet-1k-Depth linear probe (Table II): DINOv2 ViT-L/14 68.70, DINOv3 ViT-L/16 69.15, DeFM-L/14 71.72; ViT-S: DINOv2 55.06, DINOv3 50.86 (DINOv3-S is WORSE than DINOv2-S on depth), DeFM-S 61.54. Dexterous-grasping policy (Table IX, all ResNet-18 backbones, success normalised to teacher; 'Training noise' / 'Kinect noise'): frozen ImageNet 0.6576/0.0043, frozen DINOv3 0.6532/0.2075, frozen DeFM 0.8089/0.4860; fine-tuned Scratch 0.7774/0.7247, ImageNet 0.7950/0.7366, DINOv3 0.8243/0.7837, DeFM 0.8936/0.8763. Authors: 'frozen models experience a significant performance drop, likely because the MLP on top of frozen features overfits to the training depth images' and, on navigation (DINOv3 83.64% vs DeFM 90.31%), 'DINOv3 treats depth simply as another intensity channel'.",
+   "sources": [
+    "https://arxiv.org/html/2601.18923"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "This is the most relevant datapoint for a depth-encoded observation: DINOv3's headline dense-feature gains over DINOv2 on RGB (+6 mIoU ADE20k, DINOv3 Table 14) shrink to +0.45 pt on depth at ViT-L and invert at ViT-S, and frozen RGB-pretrained features on depth collapse under a sensor-noise shift (land OAK-D-W -> underwater C3 is exactly such a shift), while fine-tuning recovers most of it. Note the policy table is RL/teacher-student with ResNet-18, not IL with a ViT."
+  },
+  {
+   "claim": "[pre-DINOv2 / frozen-PVR literature] Burns et al. (CoRL 2024, 'What makes pre-trained visual representations successful for robust manipulation'): 15 FROZEN encoders + MLP BC on 10 demos; 'out of the seven pre-trained models that perform best out-of-distribution six are ViTs'; ViT variants of DINO and INSUP are 'much stronger out-of-distribution than the ResNet variant'; emergent segmentation (Jaccard of last-block attention on VOC) predicts OOD success better than ImageNet accuracy or shape bias; manipulation-specific models (MVP, R3M, VIP) do not generalise better and MVP's larger size did not help; the distilled DINOv2 ViT-S 'sees worse in- and out-of-domain performance ... in spite of being distilled from a larger model trained on a bigger dataset'; ALOHA real-world with 50 demos + ACT: MoCo-v3 ViT-B 40% vs MVP ViT-B 0%. VC-1 (2303.18240): ViT-L (307M) > ViT-B on CortexBench average, frozen mean 68.7%, '[CLS] token as input to the policy', E2E fine-tuning +7.4/+11.3/+10.8 (ObjectNav/ImageNav/Mobile Pick), frozen CLIP ViT-B 11.7 pts below VC-1. Hansen et al. (ICML 2023, LfS) and Hu et al. (2304.04591, 'Not all policy learning methods are created equal', 14 frozen models): a from-scratch shallow ConvNet with augmentation is competitive with frozen PVRs, the pre-training domain gap 'is alleviated by finetuning', frozen ResNets tend to beat frozen ViTs under BC, and rankings flip between RL and BC.",
+   "sources": [
+    "https://arxiv.org/html/2312.12444",
+    "https://arxiv.org/html/2303.18240",
+    "https://arxiv.org/abs/2212.05749",
+    "https://arxiv.org/html/2304.04591"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "The 'ViT/DINO is more robust to distribution shift' argument comes from frozen-feature studies on appearance shifts (lighting/texture/distractors) in RGB; this project's shift is a sensor/modality shift on depth, where the same literature says fine-tuning matters more than backbone family, that a newer/bigger DINO is not automatically better frozen (DINOv2-S < DINO-S), and that CLS-token frozen evaluations underrate ViTs relative to spatial-token use."
+  },
+  {
+   "claim": "[DINOv3 spec] DINOv3 paper (Siméoni et al., arXiv 2508.10104): distilled family ViT-S 21M, S+ 29M, B 86M, L 0.3B, H+ 0.8B from the 6.7B teacher (4096-d, patch 16, RoPE, 4 register tokens); 'the efficient and widely adopted ViT-L model achieves performance close to that of the original 7B teacher across a variety of tasks'. Table 14 (frozen, token-count-matched): ViT-L vs ViT-H+ on dense tasks — ADE20k 54.9 vs 54.8 mIoU, NYU depth 0.352 vs 0.352 RMSE, DAVIS 79.9 vs 79.3, NAVI 62.3 vs 63.3, SPair 61.2 vs 56.3; H+ only wins on global tasks (IN-R 88.1 -> 90.0, ObjectNet 74.8 -> 78.6, Oxford-H 63.1 -> 64.5). DINOv3-L beats DINOv2-L by +6.1 ADE20k mIoU (54.9 vs 48.8) and NYU 0.352 vs 0.394. All DINOv3 evaluations in the paper are frozen; no robotics/embodied experiment is included.",
+   "sources": [
+    "https://arxiv.org/html/2508.10104",
+    "https://arxiv.org/abs/2508.10104"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "For a patch-token (dense) consumer like TransformerObsEncoder, the model's own benchmarks show no dense-feature gain from H+ over L, so 'largest/official' = 7B or H+ buys global-classification accuracy the policy does not use, at 2.8x–22x the parameters. [유도] On one 32 GB RTX 5090 with batch 64 x 2 frames = 128 images/step, full AdamW fine-tuning of ViT-L (303M, ~4.8 GB of fp32 params+grads+moments before activations) is feasible; ViT-H+ (840M, ~13.4 GB states) is marginal; 7B (6.7B, ~13.4 GB bf16 weights alone) is only usable frozen or LoRA/quantised, which the depth evidence (claim 6) argues against."
+  }
+ ],
+ "gaps": [
+  "No paper found that sweeps DINOv3 sizes (S/B/L/H+/7B) as a policy encoder, nor any DINOv3-vs-DINOv2-vs-CLIP head-to-head inside an imitation-learning policy; the only size-scaling evidence in a UMI/DP setting is DINOv2 (Data Scaling Laws) at ~800 demos with CLS pooling and a UNet head.",
+  "No report found that feeds ALL DINOv3 tokens (196 patches + CLS + 4 registers = 201 at 224 px) into a UMI-style transformer diffusion policy; Enfold feeds final-block H+ patch tokens into a flow-matching head, LaWAM flattens patch tokens for a world model. Whether register tokens should be dropped before the policy transformer (they are non-spatial by construction) is unaddressed anywhere.",
+  "No paper found that uses DINOv3 (or DINOv2) on a colormapped/3-channel DEPTH image inside an IL policy; DeFM's depth numbers are linear probes plus an RL/teacher-student grasping policy with ResNet-18 backbones (the meaning of a 'DINOv3'-pretrained ResNet-18 in DeFM Table IX — presumably their own distillation — was not clarified in the text I read).",
+  "Frozen-vs-LoRA-vs-full recipes for DINO in policies conflict: DSL (LoRA r=8 on qkv only) lost 0.18 to full FT, OpenVLA (LoRA r=32 on all linear layers) matched full FT, DSPv2 (rank/lr unreported) matched in-distribution and beat full FT OOD; nobody reports layer-wise lr decay or partial freezing for a DINO policy encoder (the DSL config has layer_decay 1.0, i.e. unused).",
+  "Theia's negative result for fine-tuned DINOv2-L (35%/20% drawer) used a single lr 3e-4; whether the 3e-5 UMI recipe would have rescued it is untested.",
+  "UMI's own encoder ablation (CLIP ViT-B/16 ~70% vs ResNet-34 no-pretrain 0% on Dish Washing) surfaced only in a search summary and was NOT verified against the UMI PDF (arXiv 2402.10329).",
+  "Training-env feasibility not researched here: the training env's timm 0.9.7 has no dinov3 models (orchestrator fact), so any experiment needs timm >= 1.0.x or the HF 'facebook/dinov3-*' weights loaded through a different path; the DINOv3 model license (timm tag 'dinov3-license') terms were not reviewed in this pass.",
+  "The compute/memory numbers in claim 8 are derivations ([유도]) from parameter counts, not measurements; a sibling agent's bench files (dinov3_bench_result.json, dinov3_bench_7b_result.json in the scratchpad) exist and should be preferred as the measured source.",
+  "Non-robotics DINOv3 small-data fine-tuning reports (e.g. 'Efficient Fine-Tuning of DINOv3' arXiv 2508.21041; dynamic-depth LoRA for DINOv3, MDPI Sensors 26:5285) claim LoRA > full FT on small labelled sets; not verified here and domain differs."
+ ]
+}

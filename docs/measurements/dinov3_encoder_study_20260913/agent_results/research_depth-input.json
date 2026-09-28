@@ -1,0 +1,91 @@
+{
+ "summary": "Web + local-code study on using RGB-pretrained DINOv2/DINOv3 features when the policy observation is a 3-channel depth encoding. Literature consensus: (a) frozen RGB-pretrained DINO features on depth maps are poorly aligned with RGB semantics (cosine 0.285 vs 0.198 for unrelated scenes) and lose ~20 points vs RGB when depth is stacked as pseudo-RGB into an ImageNet ViT, but partial/full fine-tuning (last blocks, LoRA, or full FT at ~1e-5) recovers most of it in a few tens of thousands of steps; (b) the recommended recipe is NOT patch-embedding-only training but keep the pretrained embedding, optionally add a light conv/sinusoidal stem, and fine-tune the body; (c) every RGB-D foundation model (Omnivore, DFormer, ImageBind, Vanishing Depth) gives depth its own embedding or pretraining, and the depth-encoding scheme (surface normals / sinusoidal multi-channel vs linear-normalised depth) matters as much as backbone; (d) DINOv3 web models expect ImageNet mean/std (verified in timm 1.0.29 cfg), while this repo's TransformerObsEncoder feeds [0,1] images with no mean/std (the CLIP baseline already runs off-spec and relies on fine-tuning to absorb it); (e) the precursors' CLIP ViT-B/16 choice was validated only against ResNet-from-scratch and inherited unchanged into UMI-Underwater's depth+affordance observation - no CLIP-vs-DINO evidence exists for underwater or depth inputs; Burns et al. suggests DINO-objective ViTs generalise OOD better than manipulation-specific encoders on RGB.",
+ "claims": [
+  {
+   "claim": "Frozen RGB-pretrained DINOv2 (ViT-B/14) features of a depth map live in a subspace nearly disjoint from the RGB features of the same scene: on ScanNet the RGB-depth cosine similarity is 0.285 vs 0.198 for unrelated images, and cross-modal retrieval R@1 is 4.6% (median rank 401.8). Fine-tuning only the last 4 of 12 blocks with an InfoNCE+anchoring loss (20k steps, batch 512, ~1h14m on TPU v4) lifts R@1 to 46.1% (median rank 2.0) while ImageNet linear accuracy rises 80.4->83.8%. The authors deliberately avoid grayscale/jet colormaps because they 'allow the encoder to shortcut the alignment task by relying on low-level channel statistics'.",
+   "sources": [
+    "https://arxiv.org/html/2602.24181v1"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "The project's observation is colourised depth fed to an RGB-pretrained ViT (task/umi_depth.yaml:18 shape [3,224,224], type rgb). A DINOv3 backbone will not interpret depth semantically out of the box, but adapting a small upper fraction of the blocks (comparable to the current encoder lr 3e-5 fine-tune, train_diffusion_transformer_umi_depth_vit_workspace.yaml:128) is enough to close most of the gap - argues for fine-tuning, not a frozen backbone, and warns that a jet-style colourmap invites channel-statistics shortcuts."
+  },
+  {
+   "claim": "Depth-as-pseudo-RGB into an ImageNet-pretrained ViT works but with a large frozen-feature penalty that fine-tuning only partly recovers. On Washington RGB-D Objects (ViT-T, ImageNet-1k pretrained), raw depth clipped and 'stacked three instances ... to convert it to RGB' gives k-NN 59.7 / linear 62.0 / fine-tune 69.9% vs RGB 79.5 / 80.2 / 83.0%; HHA gives 65.1/67.8/73.2 and surface-normal colourisation 66.3/69.9/76.7 (Table I). The colourised depth goes through 'the same resize-crop-normalization preprocessing as in RGB'. Separate patch embeddings for the two modalities beat a joint embedding (82.1 vs 81.0 early fusion).",
+   "sources": [
+    "https://arxiv.org/pdf/2210.00843"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "Quantifies the modality-shift cost (~20 points frozen, ~13 points after full FT) and shows the depth->3-channel encoding choice (normals/HHA vs plain replicated depth) moves results by 7 points - as much as switching backbones. The project's per-frame anchor-scaled linear depth (umi_aquatic_dataset.py:349-386) is the weakest 'raw' variant in this comparison."
+  },
+  {
+   "claim": "Vanishing Depth (2025) adapts DINOv2 (and tests DINOv3 and EVA-02) to depth by initialising the depth encoder 'with the same pretrained RGB encoder weights (all but the first depth encoder layer, depending on the input dimension)', freezing the RGB encoder, and fully training the depth encoder + adapters for 100 epochs x 20k samples at 224 px, batch 128, lr 1e-5. Depth is fed as a 32-channel sinusoidal encoding (SDP) bounded in [-1,1]; plain normalised depth is brittle under depth-distribution shift ('catastrophic turbulence within the encoders when exposed to noise or input density shifts'; Table 2 depth-completion RMSE: Norm Disp. 3765.0 mm / Norm 5+-5 3652.6 mm vs GSDP-32c 3041.8 mm; Cityscapes 6018.2 vs 2995.6 mm). Replacing DINOv2 by DINOv3 as base gave comparable results (Void 3366.8 mm). They chose ViT-B because robotics needs 'high frequency and low latency'.",
+   "sources": [
+    "https://arxiv.org/html/2503.19947",
+    "https://arxiv.org/abs/2503.19947"
+   ],
+   "confidence": "medium",
+   "why_it_matters_here": "Three direct implications: (1) RGB-pretrained DINO weights are a good initialisation for a depth encoder but need real training (~2M samples), i.e. patch-embed-only tuning is not the published recipe; (2) the project's anchor-normalised [0,10 m]->[0,1] depth (umi_aquatic_dataset.py:377-386) is exactly the 'norm'-style input shown to be fragile when the depth distribution shifts (land handheld -> underwater ROV); (3) a robotics group with the same DINOv3 option explicitly stayed at ViT-B for latency."
+  },
+  {
+   "claim": "Cross-modal fine-tuning literature recommends keeping the pretrained patch embedding and adding a light alignment stem, then fine-tuning the body - not training only the patch embedding. SimCMF (SAM ViT-B -> depth/HHA/thermal/polarization/NIR): 'using the frozen pretrained embedding layer is key to obtaining satisfying fine-tuning performance, even if the signals captured from the new modality are quite different from natural images'; random-init embedding 58.89% mIoU vs frozen pretrained embedding + 2-layer conv stem 72.69% (polarization); for depth: from scratch 22.38%, full fine-tune 43.98%, LoRA 45.09%, MLP adapter 44.36%. ORCA (ICML 2023) formalises the same order: first learn an embedder that aligns the target feature distribution to the source, then fine-tune the pretrained body.",
+   "sources": [
+    "https://arxiv.org/html/2411.18669",
+    "https://arxiv.org/abs/2302.05738"
+   ],
+   "confidence": "medium",
+   "why_it_matters_here": "Answers 'does patch-embedding-only fine-tuning work': no published evidence supports it; the winning pattern is frozen pretrained embed + small stem + body fine-tune (LoRA ~ full FT). For a 303M-6.7B DINOv3 on one 32 GB GPU, LoRA/last-blocks tuning is the literature-backed way to get the adaptation without full-FT memory."
+  },
+  {
+   "claim": "No major RGB-D foundation model feeds depth to an unmodified RGB ViT: Omnivore uses 'a separate linear+LN layer to embed the depth-channel patches' (depth converted to clamped/normalised disparity; separate depth embed beats a 4-channel conv by 2.2 points on SUN RGB-D); DFormer (ICLR 2024) states RGB-pretrained backbones give 'mismatched encoding of the 3D geometry relationships in depth maps' and instead pretrains on ImageNet-1K RGB + estimated depth for 300 epochs; ImageBind treats depth as a one-channel disparity image encoded by a ViT-B trained from scratch (not initialised from CLIP), and still gains ~7% depth classification when the frozen RGB teacher grows ViT-B -> ViT-H ('stronger visual features can improve recognition performance even on non-visual modalities').",
+   "sources": [
+    "https://ar5iv.labs.arxiv.org/html/2201.08377",
+    "https://arxiv.org/abs/2309.09668",
+    "https://arxiv.org/html/2305.05665v2"
+   ],
+   "confidence": "medium",
+   "why_it_matters_here": "Sets expectations for a 'bigger DINOv3' bet: scale helps depth mainly as a teacher/alignment target, and every RGB-D system adds depth-specific embedding or pretraining. Swapping CLIP-B for DINOv3-L/H+ without touching the depth input path changes only the RGB prior, not the modality mismatch."
+  },
+  {
+   "claim": "DINOv3 LVD-1689M ViTs expect ImageNet normalisation: timm 1.0.29 pretrained cfg (read in the rovgui-pose env) for vit_large/huge_plus/7b_patch16_dinov3.lvd1689m is mean (0.485,0.456,0.406), std (0.229,0.224,0.225), input_size (3,256,256), crop_pct 1.0, bicubic, license 'dinov3-license' (SAT-493M variants use mean (0.430,0.411,0.296)/std (0.213,0.156,0.143)); the official README uses the same values with resize_size 256. The project's TransformerObsEncoder applies NO mean/std at all: transforms are only RandomCrop(0.95)+RandomRotation (transformer_obs_encoder.py:170-178; config :65-72), the dataset uses an identity image normaliser (umi_aquatic_dataset.py:232-234, normalize_util.py:39-51), and forward() passes [0,1] tensors straight into timm (transformer_obs_encoder.py:272-280) - unlike timm_obs_encoder.py:143-146, which reads pretrained_cfg mean/std when imagenet_norm is set. The current CLIP baseline therefore already runs off-spec (CLIP expects mean ~0.481/std ~0.269). [유도] Because the patch embedding is linear, a global affine input shift can be absorbed exactly by fine-tuning the patch-embed weights/bias (encoder lr 3e-5, 200 epochs, config :128,:140), so for a fine-tuned encoder it is a hyper-parameter; for a frozen DINOv3 it is a real distribution shift ([0,1] inputs sit ~2 std off the expected zero-mean input). No controlled ablation on skipping DINOv2/3 input normalisation was found; the only datapoint (aesthetic assessment, fine-tuned) reports removing normalisation helped that task.",
+   "sources": [
+    "https://github.com/facebookresearch/dinov3/blob/main/README.md",
+    "https://github.com/facebookresearch/dinov3/issues/61",
+    "https://arxiv.org/pdf/2504.02522",
+    "/home/bdml/Desktop/umi_underwater_robust_control/external/UMI_aquatic/diffusion_policy/model/vision/transformer_obs_encoder.py",
+    "/home/bdml/Desktop/umi_underwater_robust_control/external/UMI_aquatic/diffusion_policy/model/vision/timm_obs_encoder.py",
+    "/home/bdml/Desktop/umi_underwater_robust_control/external/UMI_aquatic/diffusion_policy/dataset/umi_aquatic_dataset.py",
+    "/home/bdml/Desktop/umi_underwater_robust_control/external/UMI_aquatic/diffusion_policy/common/normalize_util.py"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "If DINOv3 is used frozen or with a tiny lr, a torchvision Normalize(ImageNet) must be appended to `transforms` (or the timm_obs_encoder imagenet_norm path reused); if fully fine-tuned as today, it is an optional but cheap consistency fix. Also note the pretrained cfg is 256 px while the obs is 224 px (201 tokens) - timm handles this by pos-embed interpolation, not an error."
+  },
+  {
+   "claim": "The precursors' CLIP ViT-B/16 choice was never validated against DINO or on depth/underwater inputs. UMI justified it only against ResNet-34 from scratch ('we found training ResNet-34 from scratch to be insufficient'; 0/10 dish-washing, policy 'ignored any variation in plate or sponge position'), fine-tuned CLIP with a learning rate '10 times smaller', and noted ViT-L 'can further enhance ... the in-the-wild cup arrangement task'. UMI-Underwater keeps 'a pretrained vision backbone (ViT-B/16 CLIP)' but feeds it '(i) predicted affordance heatmap, (ii) monocular depth map predicted from RGB [Depth Anything V2], and (iii) low-dimensional robot status signals' - i.e. CLIP on non-RGB channels - with no encoder ablation and no stated rationale; its only domain-shift evidence is that 'RGB-input affordance models trained on on-land UMI-Aquatic data transfer poorly to underwater imagery due to severe appearance shift', which motivated depth, not the encoder.",
+   "sources": [
+    "https://arxiv.org/html/2402.10329v3",
+    "https://arxiv.org/html/2603.27012"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "There is no positive evidence for CLIP over DINO in either precursor, so switching to DINOv3 contradicts nothing published; equally, the precursor showing CLIP ViT-B working on depth+heatmap channels is existence proof that an RGB ViT fine-tuned end-to-end can consume non-RGB observations - the same regime this repo already runs."
+  },
+  {
+   "claim": "Among RGB pretrained encoders for policy learning, DINO-objective ViTs generalise best OOD: Burns et al. (CoRL 2024) evaluated 15 pretrained models over 10 tasks and found 'emergent segmentation ability [Jaccard of attention maps] is a strong predictor of out-of-distribution generalization among ViT models', that ImageNet linear-probe accuracy 'poorly predicts generalization performance for ViTs', that 'out of the seven pre-trained models that perform best out-of-distribution six are ViTs', and that the DINO-trained model 'outperforms all three models that are designed for manipulation'; segmentation score also predicted real ALOHA success with 50 demos. DINOv3 (2025) specifically optimises dense/patch feature quality (Gram anchoring) and notes that the final LayerNorm scales down high-magnitude outlier dimensions, so the normed features should be used downstream (timm forward_features already applies the final norm).",
+   "sources": [
+    "https://arxiv.org/html/2312.12444",
+    "https://kayburns.github.io/segmentingfeatures/",
+    "https://arxiv.org/html/2508.10104v1"
+   ],
+   "confidence": "medium",
+   "why_it_matters_here": "This is the best mechanistic argument FOR DINOv3 over CLIP in a policy encoder (object-centric attention -> robustness to distractors/appearance), but all of it was measured on RGB; whether DINO's emergent segmentation survives on colourised depth input is unmeasured, and per-model CLIP numbers in Burns are only in figures (not extracted)."
+  }
+ ],
+ "gaps": [
+  "No paper found that feeds depth (or colourised depth) into DINOv3 specifically for a robot policy; all depth-input evidence is DINOv2, SAM, or ImageNet-supervised ViTs, and only Vanishing Depth reports a DINOv3-base number (depth completion, not policy).",
+  "No controlled ablation of omitting ImageNet mean/std for DINOv2/DINOv3 features was found; the claim that fine-tuning absorbs the affine shift is a derivation [유도], not a measurement.",
+  "SimCMF depth numbers (22.38/43.98/45.09%) were extracted without the benchmark name; verify the dataset before quoting them as a general depth result.",
+  "Burns et al. per-model ranking of CLIP ViT-B/16 vs DINO ViT-B is only shown in figures (Fig. 5/6); the text-level claim is 'DINO > manipulation-specific models', not an explicit CLIP-vs-DINO number.",
+  "No literature matches this project's exact 3-channel layout (depth channels + validity-mask channel); published encodings are 3x replicated depth, HHA, surface normals, natural-colourised bins, or 16-64-channel sinusoidal - the mask-channel effect on an RGB-pretrained patch embed is unstudied.",
+  "Omnivore fetch produced a doubtful sentence ('model trained from scratch performs better') that could not be verified; it was excluded. Whether Vanishing Depth's DINOv3 base was ViT-B or ViT-L was not confirmed.",
+  "UMI-Underwater does not state whether its CLIP encoder is frozen or fine-tuned, nor how depth+heatmap are packed into channels; the exact input packing could not be extracted."
+ ]
+}

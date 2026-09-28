@@ -203,9 +203,12 @@ def test_replay_arms_at_current_pose_and_completes():
                  (run_dir / "plans.jsonl").read_text().splitlines()]
         assert len(lines) == 1 and lines[0]["status"] in ("accept", "clip")
         assert lines[0]["margins"], "filter margins missing from plans.jsonl"
-        # meta: schema 8, the always-written plan_stream block, the boundary
+        # meta: the always-written plan_stream block, the boundary. Schema
+        # 10 (2026-09-02): + policy block / grip_w_est,hold_frac columns —
+        # a replay run still reads plan_stream_replay, never _policy.
         meta = w._run_meta()
-        assert meta["schema_version"] == 8
+        assert meta["schema_version"] == 16     # 16: + 6-DoF attitude axes (2026-09-26); 15: + top-level mode / LOW None holder (2026-09-11)
+        assert meta["policy"]["enabled"] is False        # always written
         assert meta["plan_stream"]["enabled"] is True
         assert meta["plan_stream"]["run"]["installed"] >= 1
         assert meta["trajectory"]["kind"] == "replay"
@@ -213,7 +216,9 @@ def test_replay_arms_at_current_pose_and_completes():
         # CSV: the three schema-8 columns are present and populated
         w.teardown()
         head = (w._csv_path or run_dir / "x").read_text().splitlines()
-        assert head[0].endswith("plan_id,ref_src,grip_cmd")
+        # BY NAME: schema 14 appended the per-thruster block after `observe`
+        assert (",plan_id,ref_src,grip_cmd,grip_w_est,grip_g,hold_frac,"
+                "observe," in head[0])
         assert any(",plan," in row or ",hold," in row for row in head[1:]), \
             "no row recorded a plan/hold reference source"
 
@@ -430,3 +435,66 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# =============================================================================
+# THE 6-DoF VARIANT (2026-09-26): replay.track_attitude
+# =============================================================================
+def test_replay_track_attitude_needs_the_axes_live_and_carries_rp():
+    """replay.track_attitude: with the attitude axes OFF the replay flies
+    level exactly as before (rp None on the follower's plan, attitude_track
+    false in the record); with the axes LIVE the demo's roll/pitch ride
+    the plan (identity quaternions here, so a (2, K) of zeros) and the
+    record says so."""
+    from rov_gui.tests.test_control import (_alloc_has_attitude, _att_worker,
+                                            _feed_att)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sess = _fake_session(tmp)
+        w, bus, pilots, logs = _armed_replay_worker(tmp, sess,
+                                                    track_attitude=True)
+        w.set_traj(True)
+        assert w.traj_on, w.reason
+        assert w.replay["attitude_track"] is False
+        assert w.ctrl.scenario["attitude_track"] is False
+        for _ in range(3):
+            _feed_good_state(w)
+            w.tick()
+        assert w.ctrl._path_plan is not None and w.ctrl._path_plan.rp_ned is None
+        m = w._run_meta()
+        assert m["plan_stream"]["config"]["track_attitude"] is True
+        assert m["plan_stream"]["run"]["attitude_track"] is False
+        assert m["run"]["attitude_axes"]["enabled"] is False
+        w.teardown()
+    if not _alloc_has_attitude():
+        import pytest
+        pytest.skip("allocation without the attitude path (output group)")
+    with tempfile.TemporaryDirectory() as tmp:
+        sess = _fake_session(tmp)
+        w, bus, pilots, logs, st = _att_worker(tmp, mode="mpc")
+        w.cfg.replay["session"] = str(sess)
+        w.cfg.replay["v_max_m_s"] = 0.20
+        w.cfg.replay["track_attitude"] = True
+        w.set_scenario({"shape": "replay"})
+        w.on_enable(True)
+        _feed_att(w)
+        w.set_engaged(True)
+        assert w.engaged and w._attitude_axes, w.reason
+        for _ in range(4):
+            _feed_att(w)
+            w.tick()
+        w.set_traj(True)
+        assert w.traj_on, w.reason
+        assert w.replay["attitude_track"] is True
+        for _ in range(3):
+            _feed_att(w)
+            w.tick()
+        plan = w.ctrl._path_plan
+        assert plan is not None and plan.rp_ned is not None
+        assert plan.rp_ned.shape == (2, w.ctrl.path_plan_steps)
+        assert float(np.abs(plan.rp_ned).max()) < 1e-9      # identity quats
+        m = w._run_meta()
+        assert m["plan_stream"]["run"]["attitude_track"] is True
+        assert m["trajectory"]["attitude_track"] is True
+        w.teardown()
+

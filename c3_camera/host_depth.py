@@ -487,7 +487,12 @@ class StereoRig:
         D_l = np.asarray(dist_left, dtype=np.float64).ravel()
         D_r = np.asarray(dist_right, dtype=np.float64).ravel()
         R = np.asarray(R_left_to_right, dtype=np.float64).reshape(3, 3)
-        T = np.asarray(T_left_to_right_mm, dtype=np.float64).ravel()
+        # (3, 1), NOT (3,). OpenCV 4.x accepts a flat translation here and 5.x
+        # does not: it reaches gemm with a 1x3 and aborts with
+        # "a_size.width == len". The station's GUI env (rovgui-pose) ships
+        # cv2 5.0.0 while `robust` has 4.10, so a flat vector works in the
+        # tests and fails on the vehicle -- the worst split there is.
+        T = np.asarray(T_left_to_right_mm, dtype=np.float64).reshape(3, 1)
 
         for name, D in (("left", D_l), ("right", D_r)):
             if D.size not in (0, 4, 5, 8, 12, 14):
@@ -523,7 +528,7 @@ class StereoRig:
                 100.0 * (fx_rect - float(K_l[0, 0])) / float(K_l[0, 0]),
             "fx_rect_vs_right_raw_pct":
                 100.0 * (fx_rect - float(K_r[0, 0])) / float(K_r[0, 0]),
-            "T_left_to_right_mm": [float(x) for x in T],
+            "T_left_to_right_mm": [float(x) for x in T.ravel()],
             "R1": R1.tolist(), "P1": P1.tolist(), "P2": P2.tolist(),
         }
         if note:
@@ -1003,6 +1008,58 @@ def warp_depth_to_color(depth_mm: np.ndarray, rig: StereoRig) -> np.ndarray:
     return out
 
 
+def fill_scatter_gaps(depth_mm: np.ndarray, iters: int = 2) -> np.ndarray:
+    """Close the thin holes ``warp_depth_to_color`` leaves, without inventing a distance.
+
+    THE PROBLEM. The forward scatter writes one destination pixel per source
+    pixel. Where the surface is slanted or steps in depth, two adjacent source
+    pixels land more than one pixel apart in the destination and the pixel
+    between them is never written. The result is a web of 1-3 px black curves
+    tracing every depth gradient — measured on real C3 frames as **4.68% of the
+    colour grid**, in 539 connected components that are all thin lines, not
+    blobs (2026-09-02). It is a resampling artifact, not missing information:
+    the surface either side of the gap was measured.
+
+    THE RULE THIS MUST NOT BREAK. ``resize_depth_nearest`` exists because
+    averaging two depths that straddle an edge produces a distance at which
+    nothing exists. So this does not average, blur or inpaint. It is a
+    grayscale dilation written back ONLY where the map is empty, so every
+    filled pixel carries some real sample's millimetres and no measured pixel
+    is touched (asserted in the tests, and measured as 0 changed pixels on
+    three real frames).
+
+    WHY THE FARTHEST NEIGHBOUR (dilation takes the max). A hole is one of two
+    things. If it is a resampling gap, its neighbours are all at the same
+    distance and the choice does not matter. If it is a genuine disocclusion —
+    a place the colour camera can see and the left mono camera cannot, because
+    something near is in the way — then the truth there is the BACKGROUND, and
+    the background is the farther neighbour. Taking the nearest would smear the
+    foreground object outward over ground it does not occupy.
+
+    Two iterations reach 100.00% fill on real frames (one reaches 99.86%) for
+    0.14 ms at 400x250 [측정: rov_gui/tools/fstereo_bench_out/hardware_20260902_fill.txt].
+    ``iters=0`` returns the input unchanged, which is what every caller written
+    before this function existed gets.
+
+    Not folded into ``warp_depth_to_color`` because the two answer different
+    questions — that one asks "where does this measurement land", this one asks
+    "what do I show where nothing landed" — and a caller building a point cloud
+    may legitimately want only the first.
+    """
+    if depth_mm.dtype != np.uint16:
+        raise TypeError(f"depth must be uint16 millimetres, got {depth_mm.dtype}")
+    if iters <= 0:
+        return depth_mm
+    out = depth_mm
+    kernel = np.ones((3, 3), np.uint8)
+    for _ in range(int(iters)):
+        holes = out == 0
+        if not holes.any():
+            break
+        out = np.where(holes, cv2.dilate(out, kernel), out)
+    return out
+
+
 def _project_with_distortion(pts_cam: np.ndarray, K: np.ndarray,
                              dist: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Project camera-frame points through K and the OpenCV distortion model.
@@ -1021,7 +1078,7 @@ def _project_with_distortion(pts_cam: np.ndarray, K: np.ndarray,
 
     if taux != 0.0 or tauy != 0.0:
         uv, _ = cv2.projectPoints(pts_cam.reshape(-1, 1, 3),
-                                  np.zeros(3), np.zeros(3),
+                                  np.zeros((3, 1)), np.zeros((3, 1)),
                                   np.asarray(K, np.float64), d)
         uv = uv.reshape(-1, 2)
         return uv[:, 0], uv[:, 1]

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""DOB-MPC controller for the marinegym BlueROV2 sim (FLU).
+"""DOB-MPC controller for the marinegym BlueROV2 Heavy sim (FLU).
 
 Wraps the validated NED EAOB + NMPC (dobmpc/ subpackage) as a drop-in alternative
-to PoseController: same set_target / compute / apply interface, same rank-5
-thrusters.py allocation, so teleop.py and the mission classes drive it unchanged.
+to PoseController: same set_target / compute / apply interface, same thrusters.py
+allocation (rank-6 on the Heavy family), so teleop.py and the mission classes drive
+it unchanged.
 
 Per control tick (20 Hz, ZOH between ticks over 25 physics substeps):
   1. read FLU state (mj_objectVelocity local=1 for body-frame nu -- NOT qvel[:3])
@@ -11,14 +12,22 @@ Per control tick (20 Hz, ZOH between ticks over 25 physics substeps):
      over the CONTROL tick (never data.qacc -- marinegym applies added mass as an
      external force, so qacc would double-count it in the EAOB measurement model)
   3. EAOB.update(meas, tau_cmd_ned)  (dobmpc mode) -> w_hat ; plain MPC -> w_hat=0
-  4. NMPC.solve(x_ned, w_hat, xref_ned) -> u = [X, Y, Z, N]
-  5. tau_ned = [X,Y,Z,0,0,N] -> frames.ned_wrench_to_flu -> tau_FLU (ZOH)
-  6. thrusters.set_wrench_command (rank-5 pinv projects out the uncommanded pitch)
+  4. NMPC.solve(x_ned, w_hat, xref_ned) -> u = [X, Y, Z, K, M, N]  (NU=6, heavy)
+  5. tau_ned -> frames.ned_wrench_to_flu -> tau_FLU (ZOH)
+  6. thrusters.set_wrench_command (rank-6 pinv realizes the full wrench incl. K/M)
 
-Design notes (control-theory-advisor validated): pitch is left to float to its
-physical trim (MPC_Q pitch-weight 0, the EAOB absorbs the steady surge->pitch
-coupling into w); the disturbance model is w_dot=0, so the DC current is rejected
-strongly while the JONSWAP wave band / kicks are only partially rejected.
+Attitude reference (2026-09-26): set_target(roll_ref=, pitch_ref=) in FLU rad
+(default 0.0 = level) and a 6-tuple trajectory sampler (p, yaw, v, r, roll, pitch)
+give the NMPC a roll/pitch reference, so the Heavy's K/M channels TRACK an attitude
+instead of only levelling. The FLU angles are never hand-copied into the NED tile:
+R_ref = R_zyx_flu(roll, pitch, yaw) goes through frames.flu_to_ned_eta (the S
+conjugation gives NED phi = +roll_FLU, theta = -pitch_FLU [유도: frames.py:37],
+pinned by tests/test_dobmpc.py::test_xref_attitude_sign). roll_ref = pitch_ref = 0
+and a 4-tuple sampler take the pre-existing code path byte-for-byte.
+
+(The legacy rank-5 bluerov2 branch -- MPC_Q pitch weight 0, pitch floating to its
+trim, u=[X,Y,Z,N] -- survives only in the FULLY_ACTUATED=False branch of
+_control_step; every loadable ROV_MODEL is heavy/rank-6 since 2026-07-21.)
 """
 import os
 import sys
@@ -40,11 +49,57 @@ def _Rz_flu(yaw):
     return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
 
+def _Ry_flu(pitch):
+    c, s = np.cos(pitch), np.sin(pitch)
+    return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
+
+
+def _Rx_flu(roll):
+    c, s = np.cos(roll), np.sin(roll)
+    return np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]])
+
+
+def R_zyx_flu(roll, pitch, yaw):
+    """Body->world FLU rotation Rz(yaw) Ry(pitch) Rx(roll) (ZYX, FLU right-hand:
+    +roll = port up, +pitch = nose DOWN in FLU (y-left axis), +yaw = CCW from above).
+    Built as the matrix PRODUCT so that R_zyx_flu(0, 0, yaw) equals _Rz_flu(yaw)
+    (np.array_equal over every yaw; bit-identical except the -0.0 that _Rz_flu
+    itself carries in [0,1] at yaw == 0.0). _xref_ned still dispatches to _Rz_flu
+    when both angles are exactly 0.0, so the level tile is byte-identical by
+    construction, not by this property. The NED angles come out of
+    frames.flu_to_ned_eta as (phi, theta, psi) = (+roll, -pitch, -yaw)
+    [유도: S-conjugation, frames.py:37; pinned by tests/test_dobmpc.py]."""
+    return _Rz_flu(yaw) @ _Ry_flu(pitch) @ _Rx_flu(roll)
+
+
+def body_rates_from_euler(phi, theta, phid, thetad, psid):
+    """NED body rates (p, q, r) from ZYX Euler angles + Euler-angle rates, i.e.
+    T(phi, theta)^-1 @ [phid, thetad, psid] with T from fossen.t_euler (Eq. 4):
+        p = phid - psid*sin(theta)
+        q = thetad*cos(phi) + psid*cos(theta)*sin(phi)
+        r = -thetad*sin(phi) + psid*cos(theta)*cos(phi)
+    At phi = theta = 0 this is the identity (p, q, r) = (phid, thetad, psid).
+    Vectorized over trailing axes (all args broadcast). Same formula as the
+    station's HwDobMpc._xref_ned_plan rate rows (design D6)."""
+    phi = np.asarray(phi, float); theta = np.asarray(theta, float)
+    phid = np.asarray(phid, float); thetad = np.asarray(thetad, float)
+    psid = np.asarray(psid, float)
+    sph, cph = np.sin(phi), np.cos(phi)
+    sth, cth = np.sin(theta), np.cos(theta)
+    p = phid - psid * sth
+    q = thetad * cph + psid * cth * sph
+    r = -thetad * sph + psid * cth * cph
+    return p, q, r
+
+
+ATT_RATE_SOURCES = ("none", "fd_horizon_T_inv")
+
+
 class DOBMPCController:
     def __init__(self, model, hydro=None, mode="dobmpc", setpoint=(0.0, 0.0, 0.0),
                  yaw_ref=0.0, body="base_link", ctrl_hz=20.0, N=P.MPC_N, actuator=None,
                  eaob_profile="perf", meas_noise=None, noise_seed=0,
-                 mpc_state_source=None):
+                 mpc_state_source=None, att_rate_source="fd_horizon_T_inv"):
         """eaob_profile: EAOB tuning ("perf" = sensor-sigma covariances + NIS gate,
         "verify" = legacy near-deadbeat DT templates). meas_noise: corrupt the
         EAOB's eta/nu/nudot with Gaussian noise from params.EAOB_SIG_* (the same
@@ -65,8 +120,22 @@ class DOBMPCController:
         None -> params.MPC_STATE_SOURCE when measurement noise is active, else
         "truth". Whatever the source, it feeds ONLY the MPC x0 + its yaw-ref
         anchor -- measurement generation, the EAOB's inputs, and every
-        truth-logging surface stay on the plant readout."""
+        truth-logging surface stay on the plant readout.
+        att_rate_source: how the body-rate rows xref[9:12] are filled when a
+        6-tuple trajectory sampler (p, yaw, v, r, roll, pitch) carries an attitude
+        reference -- "fd_horizon_T_inv" (default): finite-difference the sampled
+        NED Euler angles OVER THE HORIZON (np.gradient across the N+1 stages) and
+        map (phid, thetad, psid) through T(phi, theta)^-1 (body_rates_from_euler).
+        Same T^-1 map as the station's D6 rule, but the station differentiates
+        its plan-stitcher rate, not a horizon sample -- hence the distinct label
+        (never pool the two under one rate_source);
+        "none": xref[9:11] = 0 and xref[11] = -r (the level rows, S7 ablation).
+        Irrelevant to the 4-tuple sampler (unchanged) and to the setpoint body,
+        whose tilted rate rows are analytic (constant attitude, T^-1 of the
+        yaw-rate FF only; see _xref_ned)."""
         assert mode in ("dobmpc", "mpc"), mode
+        assert att_rate_source in ATT_RATE_SOURCES, att_rate_source
+        self.att_rate_source = att_rate_source
         assert eaob_profile in ("perf", "verify"), eaob_profile
         self.meas_noise = (eaob_profile == "perf") if meas_noise is None else bool(meas_noise)
         if mpc_state_source is None:
@@ -89,7 +158,7 @@ class DOBMPCController:
         self._sig_nudot = np.concatenate([np.full(3, P.EAOB_SIG_ACC),
                                           np.full(3, P.EAOB_SIG_AACC)])
         self.bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body)
-        self.B, _ = T.allocation_matrix(model)   # constant rank-5 body geometry
+        self.B, _ = T.allocation_matrix(model)   # constant rank-6 body geometry (heavy)
 
         self.dt_sim = float(model.opt.timestep)
         self.ctrl_dt = 1.0 / float(ctrl_hz)
@@ -105,7 +174,13 @@ class DOBMPCController:
         self.v_ref = np.zeros(3)                 # world-FLU reference velocity (DP: 0)
         self.r_ref = 0.0                         # reference yaw rate (heading-follow FF)
         self.yaw_target = float(yaw_ref)         # final edge heading for the yaw preview
+        # attitude reference (world-FLU ZYX roll/pitch, rad; 0.0 = level = the
+        # pre-2026-09-26 tile). NOT touched by reset(): a mission that set an
+        # attitude keeps it across the same reset that keeps p_ref / yaw_ref.
+        self.roll_ref = 0.0
+        self.pitch_ref = 0.0
         self._ref_traj = None                    # mission trajectory sampler (tracking)
+        self._ref_traj_has_att = False           # sampler returned a 6-tuple last tick
 
         self.nmpc = make_nmpc(N=N, dt=P.DT_CTRL)   # acados (fast) or ipopt (ref)
         self.eaob = None                         # lazy-init at first tick (needs eta0)
@@ -124,7 +199,15 @@ class DOBMPCController:
 
     # ----------------------------------------------------- interface parity
     def set_target(self, p_ref=None, yaw_ref=None, v_ref=None, r_ref=None,
-                   yaw_target=None):
+                   yaw_target=None, roll_ref=None, pitch_ref=None):
+        """roll_ref / pitch_ref: attitude reference in world-FLU ZYX radians
+        (+roll = port side up, +pitch = nose down in FLU; None = keep the current
+        value, initially 0.0 = level). Constant over the horizon; the NED tile gets
+        them through R_zyx_flu -> frames.flu_to_ned_eta (never a hand-copied sign)."""
+        if roll_ref is not None:
+            self.roll_ref = float(roll_ref)
+        if pitch_ref is not None:
+            self.pitch_ref = float(pitch_ref)
         if p_ref is not None:
             self.p_ref = np.asarray(p_ref, float)
         if yaw_ref is not None:
@@ -145,6 +228,10 @@ class DOBMPCController:
         reference at those times, all in world FLU (same conventions as set_target):
             p   (3, K)  position          yaw (K,)  heading command
             v   (3, K)  path velocity     r   (K,)  heading slew rate
+        or, for an attitude-carrying mission, the 6-tuple
+            (p, yaw, v, r, roll (K,), pitch (K,))   roll/pitch world-FLU ZYX rad
+        (the 4-tuple path is byte-identical to before the 6-tuple existed; see
+        _xref_ned_traj for how the attitude and its rates enter the tile).
         With a sampler set, every control tick fills the acados stage references
         yref_k from fn(t + k*dt), k = 0..N -- the standard receding-horizon
         reference preview of trajectory-tracking MPC -- so corners (position,
@@ -154,14 +241,17 @@ class DOBMPCController:
         remains the DP / teleop / station-keeping path (point stabilization and
         trajectory tracking are deliberately separate reference modes). reset()
         also clears the sampler -- re-arm it after reset, as run_compare/run_viewer
-        do."""
+        do. Either way the "sampler carried an attitude" flag (attitude_meta
+        tracked/source traj6) is cleared here and re-derived at the next tick."""
         self._ref_traj = fn
+        self._ref_traj_has_att = False
 
     def reset(self):
         self.eaob = None
         self._noise_rng = np.random.default_rng(self.noise_seed)   # reproducible runs
         self.r_ref = 0.0
         self._ref_traj = None                    # tracking sampler does not survive reset
+        self._ref_traj_has_att = False           # ... nor its attitude flag (attitude_meta)
         self._tau_flu = np.zeros(6)
         self._tau_ned_cmd = np.zeros(6)
         self._nu_prev_ned = None
@@ -205,12 +295,32 @@ class DOBMPCController:
         v_ref = 0 AND r_ref = 0 reduces it EXACTLY to the old constant-pose tile (the
         unwrap is a no-op when |psi_ref - psi_now| < pi), so DP / station-keeping is
         unchanged.
+          * attitude reference (2026-09-26): roll_ref / pitch_ref (FLU) enter as the
+            full R_zyx_flu through flu_to_ned_eta -> xref[3:5] constant over the
+            horizon. Rate rows in the TILT branch: a constant attitude has zero
+            Euler roll/pitch rates, but the yaw-preview row is an Euler rate
+            psi_dot, so (0, 0, psi_dot) is mapped through T(phi, theta)^-1
+            (body_rates_from_euler) into xref[9:12] = (-psi_dot sin(theta),
+            psi_dot cos(theta) sin(phi), psi_dot cos(theta) cos(phi)) -- the same
+            rows the 6-tuple sampler gets for a constant attitude + yaw rate. With
+            r_ref = 0 every rate row is 0 either way. Both angles zero => the
+            pre-change tile bit-for-bit (same _Rz_flu call, tilt branch skipped).
         """
         if getattr(self, "_ref_traj", None) is not None and t is not None:
             return self._xref_ned_traj(float(t))
         N = self.nmpc.N
         dt = P.DT_CTRL
-        R_ref = _Rz_flu(self.yaw_ref)
+        roll_ref = getattr(self, "roll_ref", 0.0)
+        pitch_ref = getattr(self, "pitch_ref", 0.0)
+        level = (roll_ref == 0.0 and pitch_ref == 0.0)
+        if level:
+            R_ref = _Rz_flu(self.yaw_ref)                    # level: the original tile
+        else:
+            # attitude reference: FULL FLU rotation through the S-conjugation, so
+            # xref[3:5] = (+roll_FLU, -pitch_FLU) falls out of flu_to_ned_eta
+            # (never hand-copy the FLU pitch into xref[4]). Also rotates the
+            # velocity feed-forward below into the tilted body frame.
+            R_ref = R_zyx_flu(roll_ref, pitch_ref, self.yaw_ref)
         # orientation (constant over horizon): NED euler with yaw unwrapped vs now
         eta0 = frames.flu_to_ned_eta(self.p_ref, R_ref)
         eta0[5] = self._psi_ned_now + wrap_angle(eta0[5] - self._psi_ned_now)
@@ -238,6 +348,13 @@ class DOBMPCController:
             step = np.clip(r_ned * ks * dt, min(0.0, delta), max(0.0, delta))
             xref[5, :] = psi0 + step                # yaw-angle preview  (Q weight 150)
             xref[11, :] = np.where(np.abs(step) < abs(delta) - 1e-12, r_ned, 0.0)  # rate FF (Q 10)
+        if not level:
+            # tilted reference: the row above is the Euler yaw rate psi_dot, not the
+            # body rate r. (phid, thetad, psid) = (0, 0, psi_dot) -> T^-1 -> (p, q, r).
+            # Zero rows stay zero, so r_ref == 0 is unaffected; the level branch
+            # never enters here (bit-identical tile).
+            xref[9, :], xref[10, :], xref[11, :] = body_rates_from_euler(
+                eta0[3], eta0[4], 0.0, 0.0, xref[11, :])
         return xref
 
     def _xref_ned_traj(self, t0):
@@ -255,11 +372,29 @@ class DOBMPCController:
         via S; world +yaw-rate -> NED r with the S sign flip. Yaw is unwrapped
         stage-to-stage anchored at the current measured yaw (_psi_ned_now), so the
         no-wrap NMPC cost always turns the short way across +-pi and stays
-        continuous along the horizon."""
+        continuous along the horizon.
+
+        A 6-tuple sampler (p, yaw, v, r, roll, pitch) additionally fills the
+        attitude rows xref[3:5] per stage (through R_zyx_flu + the S conjugation)
+        and, with att_rate_source == "fd_horizon_T_inv", the body-rate rows
+        xref[9:12] from finite-differenced Euler rates mapped through
+        T(phi,theta)^-1 (body_rates_from_euler). The 4-tuple branch is the
+        pre-2026-09-26 loop verbatim (bit-identical tile)."""
         N = self.nmpc.N
         dt = P.DT_CTRL
         ts = t0 + np.arange(N + 1) * dt
-        p_w, yaw_w, v_w, r_w = self._ref_traj(ts)          # world FLU, vectorized
+        out = self._ref_traj(ts)                             # world FLU, vectorized
+        if len(out) == 6:                                    # attitude-carrying sampler
+            p_w, yaw_w, v_w, r_w, roll_w, pitch_w = out
+            roll_w = np.asarray(roll_w, float).ravel()
+            pitch_w = np.asarray(pitch_w, float).ravel()
+            assert roll_w.size == N + 1 and pitch_w.size == N + 1, \
+                f"sampler must return {N + 1} roll/pitch samples, got {roll_w.size}/{pitch_w.size}"
+            self._ref_traj_has_att = True
+        else:
+            p_w, yaw_w, v_w, r_w = out
+            roll_w = pitch_w = None
+            self._ref_traj_has_att = False
         p_w = np.asarray(p_w, float)
         v_w = np.asarray(v_w, float)
         yaw_w = np.asarray(yaw_w, float).ravel()
@@ -274,14 +409,38 @@ class DOBMPCController:
         xref = np.zeros((12, N + 1))
         xref[0:3, :] = frames.S @ p_w
         psi_prev = self._psi_ned_now
+        if roll_w is None:                                   # 4-tuple: original loop
+            for k in range(N + 1):
+                Rk = _Rz_flu(yaw_w[k])
+                eta_k = frames.flu_to_ned_eta(p_w[:, k], Rk)
+                psi_prev = psi_prev + wrap_angle(eta_k[5] - psi_prev)   # short-way unwrap
+                xref[3:5, k] = eta_k[3:5]
+                xref[5, k] = psi_prev
+                xref[6:9, k] = frames.S @ (Rk.T @ v_w[:, k])   # body-FLU lin vel -> FRD
+            xref[11, :] = -r_w                                  # world +yaw-rate -> NED r
+            return xref
+
+        # 6-tuple: per-stage FULL rotation R_zyx_flu(roll, pitch, yaw) through the S
+        # conjugation -> xref[3:5, k] = (+roll, -pitch) NED, and the body-velocity
+        # reference rotated into the TILTED body frame (Rk^T v).
         for k in range(N + 1):
-            Rk = _Rz_flu(yaw_w[k])
+            Rk = R_zyx_flu(roll_w[k], pitch_w[k], yaw_w[k])
             eta_k = frames.flu_to_ned_eta(p_w[:, k], Rk)
             psi_prev = psi_prev + wrap_angle(eta_k[5] - psi_prev)   # short-way unwrap
             xref[3:5, k] = eta_k[3:5]
             xref[5, k] = psi_prev
             xref[6:9, k] = frames.S @ (Rk.T @ v_w[:, k])   # body-FLU lin vel -> FRD
-        xref[11, :] = -r_w                                  # world +yaw-rate -> NED r
+        psid = -r_w                                          # world +yaw-rate -> NED psi_dot
+        if getattr(self, "att_rate_source", "fd_horizon_T_inv") == "fd_horizon_T_inv":
+            # Euler-angle rates by finite difference of the sampled NED angles over
+            # the horizon (central; one-sided at the ends), then T(phi,theta)^-1 ->
+            # body rates p,q,r (design D6; at level reduces to (0, 0, -r)).
+            phid = np.gradient(xref[3, :], dt)
+            thetad = np.gradient(xref[4, :], dt)
+            xref[9, :], xref[10, :], xref[11, :] = body_rates_from_euler(
+                xref[3, :], xref[4, :], phid, thetad, psid)
+        else:                                                # "none": level rows (S7)
+            xref[11, :] = psid
         return xref
 
     # --------------------------------------------------------- control tick
@@ -393,6 +552,28 @@ class DOBMPCController:
             m["n_upd"] = int(self.eaob.n_upd)
             m["n_gated"] = int(self.eaob.n_gated)
         return m
+
+    def attitude_meta(self):
+        """Provenance dict for run meta sidecars (trajectory.attitude_ref_deg /
+        controller.attitude_ref). Records recorded before this key existed are all
+        level-reference (0, 0) + rate_source "none" equivalent. rate_source names
+        HOW the Euler rates behind xref[9:12] were obtained: "fd_horizon_T_inv" =
+        this sim's np.gradient over the sampled horizon (6-tuple sampler only);
+        the station writes its own label for its stitcher-rate method -- do not
+        pool the two. The setpoint body reports "none" (no Euler-rate source: its
+        tilted rows are T^-1 of the yaw-rate FF alone, zero whenever r_ref = 0).
+        `source`/`tracked` follow the sampler flag, which set_reference_traj and
+        reset() clear, so a run whose sampler is gone reports setpoint/level."""
+        tracked = bool(self.roll_ref != 0.0 or self.pitch_ref != 0.0
+                       or self._ref_traj_has_att)
+        return dict(roll_ref_deg=float(np.degrees(self.roll_ref)),
+                    pitch_ref_deg=float(np.degrees(self.pitch_ref)),
+                    tracked=tracked,
+                    source=("traj6" if self._ref_traj_has_att
+                            else ("setpoint" if tracked else "level")),
+                    rate_source=(self.att_rate_source if self._ref_traj_has_att
+                                 else "none"),
+                    frame="flu_zyx_via_S_conjugation")
 
     def status(self):
         tag = "DOB-MPC" if self.mode == "dobmpc" else "MPC"

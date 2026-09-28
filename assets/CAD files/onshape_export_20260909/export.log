@@ -1,0 +1,421 @@
+[34m* onshape-to-robot version 1.8.2[0m
+[1m* Using configuration workspace ID df32e328d7a365038adad0ac ...[0m
+[1m* Using configuration element ID f14f660b0db034ddc56b903b ...[0m
+[1m* Retrieving assembly with id f14f660b0db034ddc56b903b[0m
+[32m* Found total 0 degrees of freedom[0m
+[32m* Found 9 root nodes:[0m
+[32m  - Assembly 4 <1>[0m
+[32m  - NEWTON-M-MOUNT-INSIDE-R3 <1>[0m
+[32m  - NEWTON-M-MOUNT-KNURLED SCREW-R3_92095A212 <1>[0m
+[32m  - NEWTON-M-MOUNT-OUTSIDE-R3 <1>[0m
+[32m  - NEWTON-GRIPPER-ASSEM-R3-PUBLIC <1>[0m
+[32m  - C3-BR-JUNE2025 <2>[0m
+[32m  - Part 1 <4>[0m
+[32m  - Part 1 <5>[0m
+[32m  - Part 3 <1>[0m
+
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <75>[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <163>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__2"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <5>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__3"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <26>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__4"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <142>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__5"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <139>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__6"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <191>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__7"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <120>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__8"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <17>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__9"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <27>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__10"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <71>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__11"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <136>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__12"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <60>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__13"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <48>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__14"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <132>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__15"[0m
+[33mWARNING: Part 'BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <79>' has no partId[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <88>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__16"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <63>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__17"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <133>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__18"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <161>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__19"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <25>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__20"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <168>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__21"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <117>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__22"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <146>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__23"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <100>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__24"[0m
+[33mWARNING: Part 'BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <32>' has no partId[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <42>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__25"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <35>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__26"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <103>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__27"[0m
+[33mWARNING: Part 'BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <34>' has no partId[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <154>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__28"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <155>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__29"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <162>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__30"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <23>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__31"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <169>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__32"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <105>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__33"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <44>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__34"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <156>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__35"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <174>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__36"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <58>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__37"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <62>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__38"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <73>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__39"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <76>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__40"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <141>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__41"[0m
+[33mWARNING: Part 'BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <30>' has no partId[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <10>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__42"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <157>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__43"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <192>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__44"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <186>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__45"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <1>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__46"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <16>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__47"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <9>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__48"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <19>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__49"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <176>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__50"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <112>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__51"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <167>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__52"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <69>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__53"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <40>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__54"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <177>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__55"[0m
+[33mWARNING: Part 'BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <22>' has no partId[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <121>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__56"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <7>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__57"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <38>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__58"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <184>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__59"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <135>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__60"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <72>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__61"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <74>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__62"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <65>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__63"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <83>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__64"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <41>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__65"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <86>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__66"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <49>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__67"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <101>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__68"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <170>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__69"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <151>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__70"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <160>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__71"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <150>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__72"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <111>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__73"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <24>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__74"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <153>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__75"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <85>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__76"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <115>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__77"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <53>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__78"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <36>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__79"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <145>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__80"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <92>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__81"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <185>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__82"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <51>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__83"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <190>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__84"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <116>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__85"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <14>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__86"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <50>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__87"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <118>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__88"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <3>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__89"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <123>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__90"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <54>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__91"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <47>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__92"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <55>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__93"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <180>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__94"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <128>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__95"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <29>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__96"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <21>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__97"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <179>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__98"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <183>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__99"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <175>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__100"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <94>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__101"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <109>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__102"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <158>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__103"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <39>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__104"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <67>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__105"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <2>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__106"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <113>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__107"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <45>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__108"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <152>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__109"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <172>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__110"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <15>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__111"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <64>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__112"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <187>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__113"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <28>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__114"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <114>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__115"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <182>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__116"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <37>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__117"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <52>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__118"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <131>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__119"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <46>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__120"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <102>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__121"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <89>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__122"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <59>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__123"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <18>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__124"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <147>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__125"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <149>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__126"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <98>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__127"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <148>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__128"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <90>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__129"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <6>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__130"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <159>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__131"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <91>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__132"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <181>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__133"[0m
+[33mWARNING: Part 'BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <95>' has no partId[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <164>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__134"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <108>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__135"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <171>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__136"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <143>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__137"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <188>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__138"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <104>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__139"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <61>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__140"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <106>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__141"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <87>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__142"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <43>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__143"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <129>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__144"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <33>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__145"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <93>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__146"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <138>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__147"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <20>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__148"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <166>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__149"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <173>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__150"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <165>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__151"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <56>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__152"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <4>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__153"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <119>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__154"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <80>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__155"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <140>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__156"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <178>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__157"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <96>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__158"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <122>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__159"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <82>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__160"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <77>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__161"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <81>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__162"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <68>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__163"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <97>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__164"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <137>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__165"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <78>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__166"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <11>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__167"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <134>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__168"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <31>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__169"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <12>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__170"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <84>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__171"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <110>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__172"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <193>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__173"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <130>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__174"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <107>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__175"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <8>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__176"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <13>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__177"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <66>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__178"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <57>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__179"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <189>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__180"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <99>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__181"[0m
+[32m+ Adding part BROV2-HEAVY-ASM-BROV2-HEAVY-R1 <70>[0m
+[33mWARNING: Parts with same name "brov2_heavy_asm_brov2_heavy_r1", incrementing STL name to "brov2_heavy_asm_brov2_heavy_r1__182"[0m
+[32m+ Adding part NEWTON-M-MOUNT-INSIDE-R3 <1>[0m
+[32m+ Adding part NEWTON-M-MOUNT-KNURLED SCREW-R3_92095A212 <1>[0m
+[32m+ Adding part NEWTON-M-MOUNT-OUTSIDE-R3 <1>[0m
+[32m+ Adding part ORING-021-BUNA-70A <2>[0m
+[32m+ Adding part WLP-M06-4.5MM-PUBLIC <2>[0m
+[32m+ Adding part NEWTON-GRIPPER-M-BASE-R4 <1>[0m
+[32m+ Adding part M3X0.5-8-SS316-BUTTON-HEAD-CAP-SCREW <2>[0m
+[32m+ Adding part M3X0.5-8-SS316-BUTTON-HEAD-CAP-SCREW <3>[0m
+[32m+ Adding part M3X0.5-6-BUTTON-HEAD-CAP-SCREW <2>[0m
+[32m+ Adding part M3X0.5-6-BUTTON-HEAD-CAP-SCREW <3>[0m
+[32m+ Adding part NEWTON-GRIPPER-M-JAW-AXIAL-BEARING-SCREW-15-R3 <2>[0m
+[32m+ Adding part M3X0.5-8-SS316-BUTTON-HEAD-CAP-SCREW <1>[0m
+[32m+ Adding part NEWTON-M-HOUSING-PUBLIC--R3 <1>[0m
+[32m+ Adding part NEWTON-GRIPPER-M-JAW-AXIAL-BEARING-SCREW-15-R3 <3>[0m
+[32m+ Adding part M3X0.5-8-SS316-BUTTON-HEAD-CAP-SCREW <4>[0m
+[32m+ Adding part M3X0.5-6-BUTTON-HEAD-CAP-SCREW <4>[0m
+[32m+ Adding part ORING-021-BUNA-70A <1>[0m
+[32m+ Adding part NEWTON-GRIPPER-P-JAW-OUTER-R2 <1>[0m
+[32m+ Adding part WLP-M06-4.5MM-PUBLIC <1>[0m
+[33mWARNING: Parts with same name "wlp_m06_4_5mm_public", incrementing STL name to "wlp_m06_4_5mm_public__2"[0m
+[32m+ Adding part WLP-M06-4.5MM-PUBLIC <3>[0m
+[33mWARNING: Parts with same name "wlp_m06_4_5mm_public", incrementing STL name to "wlp_m06_4_5mm_public__3"[0m
+[32m+ Adding part NEWTON-GRIPPER-M-JAW-AXIAL-BEARING-SCREW-15-R3 <1>[0m
+[32m+ Adding part NEWTON-GRIPPER-M-PUSHER-R3 <1>[0m
+[32m+ Adding part M4X0.7-8-SS316-BUTTON-HEAD-CAP-SCREW <1>[0m
+[32m+ Adding part NEWTON-M-FLANGE-CAP-R3 <1>[0m
+[32m+ Adding part NEWTON-GRIPPER-P-JAW-INNER-R2 <1>[0m
+[32m+ Adding part M3X0.5-6-BUTTON-HEAD-CAP-SCREW <1>[0m
+[32m+ Adding part NEWTON-M-PISTON-PUBLIC <1>[0m
+[32m+ Adding part C3-BR-JUNE2025 <2>[0m
+[32m+ Adding part Part 1 <4>[0m
+[32m+ Adding part Part 1 <5>[0m
+[33mWARNING: Parts with same name "part_1", incrementing STL name to "part_1__2"[0m
+[32m+ Adding part Part 3 <1>[0m
+[32m* Writing robot.xml[0m
+[32m* Writing scene.xml[0m

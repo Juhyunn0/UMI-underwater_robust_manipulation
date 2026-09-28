@@ -8,6 +8,13 @@
 #4 EAOB    : disturbance estimate is unbiased under a steady force when the
              acceleration is finite-differenced (no qacc double-count).
 plus: the copied CasADi MPC model matches the copied NumPy fossen model.
+xref (attitude reference, 2026-09-26): FLU roll/pitch reference -> NED tile sign
+             oracle, level tile bit-identical to the frozen pre-change body,
+             T(phi,theta)^-1 body-rate rows, 6-tuple trajectory sampler.
+
+main() is KNOWN to fail on the heavy plant (test_casadi_matches_numpy /
+test_pitch_aware assume the removed rank-5 bluerov2, KNOWN_ISSUES.md) -- run the
+functions individually:  python tests/test_dobmpc.py test_xref_attitude_sign ...
 """
 import os
 import sys
@@ -215,6 +222,8 @@ def test_xref_yaw_preview():
         s.yaw_target = yaw_target
         s.r_ref = r_ref
         s._psi_ned_now = psi_now
+        s.roll_ref = 0.0                 # level (2026-09-26 attitude reference off)
+        s.pitch_ref = 0.0
         return s
 
     # (a) DP-equivalence: no motion, no turn -> velocity/rate rows 0, orientation constant
@@ -266,7 +275,8 @@ def test_xref_traj_preview():
 
     sp = types.SimpleNamespace(nmpc=types.SimpleNamespace(N=N), p_ref=p0,
                                v_ref=np.zeros(3), yaw_ref=yaw0, yaw_target=yaw0,
-                               r_ref=0.0, _psi_ned_now=-0.3, _ref_traj=None)
+                               r_ref=0.0, _psi_ned_now=-0.3, _ref_traj=None,
+                               roll_ref=0.0, pitch_ref=0.0)
     x_dp = DOBMPCController._xref_ned(sp)                          # setpoint body
     x_tr = DOBMPCController._xref_ned_traj(stub(const_traj, psi_now=-0.3), 5.0)
     assert np.allclose(x_dp, x_tr, atol=1e-12), "constant sampler must equal the DP tile"
@@ -347,6 +357,279 @@ def test_square_ref_matches_live_loop():
           "(p/v exact, yaw/r < 1e-9)")
 
 
+# ============================================= attitude reference (2026-09-26)
+def _legacy_xref_ned(self):
+    """FROZEN copy of DOBMPCController._xref_ned as of 2026-09-25 (pre attitude
+    reference). The byte-identity oracle for the level (roll_ref = pitch_ref = 0)
+    path -- do NOT "fix" this copy when the live body changes."""
+    from dobmpc_controller import _Rz_flu
+    from dobmpc.fossen import wrap_angle
+    N = self.nmpc.N
+    dt = P.DT_CTRL
+    R_ref = _Rz_flu(self.yaw_ref)
+    eta0 = frames.flu_to_ned_eta(self.p_ref, R_ref)
+    eta0[5] = self._psi_ned_now + wrap_angle(eta0[5] - self._psi_ned_now)
+    nu_ned = np.concatenate([frames.S @ (R_ref.T @ self.v_ref), np.zeros(3)])
+    ks = np.arange(N + 1)
+    pos_world = self.p_ref[:, None] + np.outer(self.v_ref, ks * dt)
+    xref = np.zeros((12, N + 1))
+    xref[0:3, :] = frames.S @ pos_world
+    xref[3:6, :] = eta0[3:6][:, None]
+    xref[6:12, :] = nu_ned[:, None]
+    if self.r_ref != 0.0:
+        r_ned = -self.r_ref
+        psi0 = eta0[5]
+        eta_t = frames.flu_to_ned_eta(self.p_ref, _Rz_flu(self.yaw_target))
+        psi_t = psi0 + wrap_angle(eta_t[5] - psi0)
+        delta = psi_t - psi0
+        step = np.clip(r_ned * ks * dt, min(0.0, delta), max(0.0, delta))
+        xref[5, :] = psi0 + step
+        xref[11, :] = np.where(np.abs(step) < abs(delta) - 1e-12, r_ned, 0.0)
+    return xref
+
+
+def _legacy_xref_ned_traj(self, t0):
+    """FROZEN copy of DOBMPCController._xref_ned_traj as of 2026-09-25 (4-tuple
+    sampler only). Byte-identity oracle for the 4-tuple path."""
+    from dobmpc_controller import _Rz_flu
+    from dobmpc.fossen import wrap_angle
+    N = self.nmpc.N
+    dt = P.DT_CTRL
+    ts = t0 + np.arange(N + 1) * dt
+    p_w, yaw_w, v_w, r_w = self._ref_traj(ts)
+    p_w = np.asarray(p_w, float)
+    v_w = np.asarray(v_w, float)
+    yaw_w = np.asarray(yaw_w, float).ravel()
+    r_w = np.asarray(r_w, float).ravel()
+    xref = np.zeros((12, N + 1))
+    xref[0:3, :] = frames.S @ p_w
+    psi_prev = self._psi_ned_now
+    for k in range(N + 1):
+        Rk = _Rz_flu(yaw_w[k])
+        eta_k = frames.flu_to_ned_eta(p_w[:, k], Rk)
+        psi_prev = psi_prev + wrap_angle(eta_k[5] - psi_prev)
+        xref[3:5, k] = eta_k[3:5]
+        xref[5, k] = psi_prev
+        xref[6:9, k] = frames.S @ (Rk.T @ v_w[:, k])
+    xref[11, :] = -r_w
+    return xref
+
+
+def _att_stub(roll=0.0, pitch=0.0, yaw=0.0, r_ref=0.0, yaw_target=None,
+              v_ref=(0, 0, 0), p_ref=(0, 0, 0), psi_now=0.0, N=60):
+    import types
+    s = types.SimpleNamespace()
+    s.nmpc = types.SimpleNamespace(N=N)
+    s.p_ref = np.asarray(p_ref, float)
+    s.v_ref = np.asarray(v_ref, float)
+    s.yaw_ref = float(yaw)
+    s.yaw_target = float(yaw if yaw_target is None else yaw_target)
+    s.r_ref = float(r_ref)
+    s._psi_ned_now = float(psi_now)
+    s._ref_traj = None
+    s.roll_ref = float(roll)
+    s.pitch_ref = float(pitch)
+    return s
+
+
+def test_xref_attitude_sign():
+    """Sign oracle + level byte-identity of the setpoint tile (design S1):
+    (a) FLU +10 deg roll  -> xref[3] = +0.1745 (NED phi = +roll_FLU),
+        FLU +10 deg pitch -> xref[4] = -0.1745 (NED theta = -pitch_FLU),
+        both through frames.flu_to_ned_eta (S-conjugation, frames.py:37);
+    (b) roll_ref = pitch_ref = 0 -> xref BYTE-identical to the frozen pre-change
+        body over 200 random setpoint stubs (incl. yaw preview + velocity FF);
+    (c) R_zyx_flu(0, 0, yaw) == _Rz_flu(yaw) over 1001 yaws (np.array_equal;
+        bit-identical for every yaw != 0 -- _Rz_flu itself carries a -0.0 at 0);
+    (d) a combined (10, 10, 30) deg FLU tilt lands as (+0.1745, -0.1745, -0.5236)
+        and the velocity feed-forward is rotated into the tilted body frame;
+    (e) tilt + heading-follow turn (r_ref != 0): the rate rows are T^-1 of the
+        yaw-preview Euler rate, xref[9:12] = body_rates_from_euler(phi, theta,
+        0, 0, -r) while ramping and 0 once clamped -- identical to what the
+        6-tuple sampler gives for a constant attitude + yaw rate."""
+    from dobmpc_controller import DOBMPCController, _Rz_flu, R_zyx_flu, body_rates_from_euler
+    a = np.radians(10.0)
+    # (a) sign oracle
+    x = DOBMPCController._xref_ned(_att_stub(roll=a))
+    assert np.isclose(x[3, 0], +a) and np.allclose(x[4:6, 0], 0.0), \
+        f"FLU +10 deg roll must give NED phi = +0.1745, got {x[3:6, 0]}"
+    assert np.allclose(x[3, :], x[3, 0]), "attitude reference must be constant over the horizon"
+    x = DOBMPCController._xref_ned(_att_stub(pitch=a))
+    assert np.isclose(x[4, 0], -a) and np.isclose(x[3, 0], 0.0) and np.isclose(x[5, 0], 0.0), \
+        f"FLU +10 deg pitch must give NED theta = -0.1745, got {x[3:6, 0]}"
+    # (b) level byte-identity vs the frozen body
+    rng = np.random.default_rng(7)
+    for _ in range(200):
+        st = _att_stub(roll=0.0, pitch=0.0, yaw=rng.uniform(-3.1, 3.1),
+                       yaw_target=rng.uniform(-3.1, 3.1),
+                       r_ref=float(rng.choice([0.0, 1.047, -0.6])),
+                       v_ref=rng.standard_normal(3) * 0.2,
+                       p_ref=rng.standard_normal(3), psi_now=rng.uniform(-3.1, 3.1))
+        live = DOBMPCController._xref_ned(st)
+        assert live.tobytes() == _legacy_xref_ned(st).tobytes(), \
+            "level setpoint tile is not byte-identical to the pre-change body"
+    # (c) R_zyx_flu reduces to _Rz_flu at level
+    for y in np.linspace(-np.pi, np.pi, 1001):
+        assert np.array_equal(R_zyx_flu(0.0, 0.0, y), _Rz_flu(y)), f"R_zyx_flu(0,0,{y}) != _Rz_flu"
+        if y != 0.0:
+            assert R_zyx_flu(0.0, 0.0, y).tobytes() == _Rz_flu(y).tobytes()
+    # (d) combined tilt + velocity FF rotated by the FULL R
+    yaw = np.radians(30.0)
+    v = np.array([0.3, 0.0, 0.0])
+    st = _att_stub(roll=a, pitch=a, yaw=yaw, v_ref=v)
+    x = DOBMPCController._xref_ned(st)
+    assert np.allclose(x[3:6, 0], [a, -a, -yaw], atol=1e-12), f"combined tilt {x[3:6, 0]}"
+    R = R_zyx_flu(a, a, yaw)
+    assert np.allclose(x[6:9, 0], frames.S @ (R.T @ v)), "velocity FF must use the tilted R"
+    assert not np.allclose(x[6:9, 0], frames.S @ (_Rz_flu(yaw).T @ v)), \
+        "velocity FF unchanged by the tilt -- R_ref is not the full rotation"
+    # (e) tilt + turn: rate rows through T^-1 of the yaw-rate FF (setpoint body)
+    r, b = 1.047, np.radians(-15.0)
+    st = _att_stub(roll=a, pitch=b, yaw=0.0, yaw_target=np.pi / 2, r_ref=r)
+    x = DOBMPCController._xref_ned(st)
+    x_lvl = DOBMPCController._xref_ned(_att_stub(yaw=0.0, yaw_target=np.pi / 2, r_ref=r))
+    ramping = x_lvl[11, :] != 0.0                 # the level preview's rate-FF stages
+    assert ramping[1] and not ramping[-1], "test needs both a ramping and a clamped stage"
+    want = np.array(body_rates_from_euler(+a, -b, 0.0, 0.0, -r))
+    assert np.allclose(x[9:12, ramping], want[:, None], atol=1e-12), \
+        f"tilt+turn rate rows {x[9:12, 1]} want T^-1(0,0,-r) = {want}"
+    assert not np.isclose(x[11, 1], -r) and not np.isclose(x[9, 1], 0.0), \
+        "tilted yaw-rate FF must carry cos(theta)cos(phi) and a p = -psid sin(theta) row"
+    assert np.allclose(x[9:12, ~ramping], 0.0), "clamped stages must have zero rate rows"
+    assert np.allclose(x[0:3, :], x_lvl[0:3, :]) and np.allclose(x[5, :], x_lvl[5, :]), \
+        "tilt must not change the position rows or the yaw preview"
+    assert np.allclose(x[3:5, :], [[a], [-b]]), "attitude rows must stay constant over the horizon"
+    x_r0 = DOBMPCController._xref_ned(_att_stub(roll=a, pitch=b, yaw=0.0, r_ref=0.0))
+    assert np.array_equal(x_r0[9:12, :], np.zeros((3, x_r0.shape[1]))), "r_ref=0 tilt: zero rate rows"
+    print("[xref-attitude] OK  +10 deg roll -> +0.1745, +10 deg pitch -> -0.1745; level tile "
+          "byte-identical (200 stubs); R_zyx_flu(0,0,yaw) == _Rz_flu (1001 yaws); FF rotated; "
+          "tilt+turn rate rows = T^-1(0,0,-r)")
+
+
+def test_ref_traj_has_att_cleared():
+    """attitude_meta() must not report tracked / source "traj6" after the 6-tuple
+    sampler is gone: set_reference_traj(None) and reset() both clear the flag."""
+    import types
+    from dobmpc_controller import DOBMPCController
+    st = types.SimpleNamespace(nmpc=types.SimpleNamespace(N=60, reset=lambda: None),
+                               actuator=None, noise_seed=0, roll_ref=0.0, pitch_ref=0.0,
+                               att_rate_source="fd_horizon_T_inv", _ref_traj=None,
+                               _ref_traj_has_att=True)
+    DOBMPCController.set_reference_traj(st, None)
+    m = DOBMPCController.attitude_meta(st)
+    assert st._ref_traj_has_att is False and not m["tracked"] and m["source"] == "level" \
+        and m["rate_source"] == "none", f"set_reference_traj(None) left {m}"
+    st._ref_traj_has_att = True
+    DOBMPCController.reset(st)
+    m = DOBMPCController.attitude_meta(st)
+    assert st._ref_traj_has_att is False and st._ref_traj is None and not m["tracked"], \
+        f"reset() left {m}"
+    print("[has-att-clear] OK  set_reference_traj(None) and reset() clear the traj6 flag")
+
+
+def test_body_rates_T_inv():
+    """body_rates_from_euler == T(phi,theta)^-1 (numeric inverse of fossen.t_euler):
+    level -> (p,q,r) = (phid, thetad, psid) exactly; 500 random non-level cases
+    to 1e-12; vectorized call matches the scalar loop."""
+    from dobmpc_controller import body_rates_from_euler
+    p, q, r = body_rates_from_euler(0.0, 0.0, 0.3, -0.2, 0.7)
+    assert (p, q, r) == (0.3, -0.2, 0.7), "level must be the identity map"
+    rng = np.random.default_rng(11)
+    worst = 0.0
+    phis = rng.uniform(-1.2, 1.2, 500); ths = rng.uniform(-1.2, 1.2, 500)
+    rates = rng.standard_normal((3, 500))
+    P_, Q_, R_ = body_rates_from_euler(phis, ths, rates[0], rates[1], rates[2])
+    for i in range(500):
+        want = np.linalg.inv(fossen.t_euler(phis[i], ths[i])) @ rates[:, i]
+        got = np.array(body_rates_from_euler(phis[i], ths[i], *rates[:, i]))
+        worst = max(worst, np.abs(want - got).max(), abs(P_[i] - got[0]),
+                    abs(Q_[i] - got[1]), abs(R_[i] - got[2]))
+    assert worst < 1e-12, f"T^-1 mismatch {worst:.2e}"
+    print(f"[T-inv] OK  body rates == inv(t_euler) @ euler rates (max |diff| {worst:.1e})")
+
+
+def test_xref_traj_attitude():
+    """6-tuple trajectory sampler (p, yaw, v, r, roll, pitch):
+    (a) the 4-tuple path is BYTE-identical to the frozen pre-change loop,
+    (b) a constant (roll, pitch) sampler puts (+roll, -pitch) in xref[3:5] at every
+        stage and equals the setpoint tile with the same attitude,
+    (c) rate rows: constant attitude + yaw rate r -> xref[9:12] = T^-1 (0, 0, -r)
+        (fd_horizon_T_inv); att_rate_source "none" -> xref[9:11] = 0, xref[11] = -r,
+    (d) a pitch ramp at +w (FLU) shows up as xref[10] ~ -w at level roll
+        (NED theta_dot = -pitch_dot_FLU) and xref[4] ramps with the -sign."""
+    import types
+    from dobmpc_controller import DOBMPCController, body_rates_from_euler
+    N, dt = 60, P.DT_CTRL
+
+    def stub(traj, psi_now=0.0, rate_source="fd_horizon_T_inv"):
+        s = types.SimpleNamespace(nmpc=types.SimpleNamespace(N=N), _ref_traj=traj,
+                                  _psi_ned_now=psi_now, att_rate_source=rate_source,
+                                  _ref_traj_has_att=False)
+        return s
+
+    def traj4(ts):
+        ts = np.asarray(ts, float); K = ts.size
+        p = np.vstack([0.15 * ts, 0.1 * np.sin(ts), 0.02 * ts])
+        v = np.vstack([0.15 * np.ones(K), 0.1 * np.cos(ts), 0.02 * np.ones(K)])
+        return p, np.radians(170.0) + 0.3 * ts, v, 0.3 * np.ones(K)
+
+    # (a) 4-tuple byte-identity
+    for t0 in (0.0, 2.0, 7.3):
+        st = stub(traj4, psi_now=-np.radians(170.0))
+        assert DOBMPCController._xref_ned_traj(st, t0).tobytes() == \
+            _legacy_xref_ned_traj(st, t0).tobytes(), "4-tuple path not byte-identical"
+        assert st._ref_traj_has_att is False
+
+    # (b) constant attitude, no yaw motion -> equals the setpoint tile
+    a, b = np.radians(15.0), np.radians(-10.0)
+    p0, yaw0 = np.array([0.4, -0.3, 0.2]), 0.3
+
+    def const6(ts):
+        K = np.asarray(ts).size
+        return (np.tile(p0[:, None], (1, K)), np.full(K, yaw0), np.zeros((3, K)),
+                np.zeros(K), np.full(K, a), np.full(K, b))
+
+    st = stub(const6, psi_now=-0.3)
+    x = DOBMPCController._xref_ned_traj(st, 5.0)
+    assert st._ref_traj_has_att is True
+    assert np.allclose(x[3, :], +a) and np.allclose(x[4, :], -b), \
+        f"6-tuple attitude rows wrong: {x[3:5, 0]} want {(+a, -b)}"
+    x_sp = DOBMPCController._xref_ned(_att_stub(roll=a, pitch=b, yaw=yaw0, p_ref=p0, psi_now=-0.3))
+    assert np.allclose(x, x_sp, atol=1e-12), "constant 6-tuple must equal the setpoint tile"
+
+    # (c) constant attitude + yaw rate: rate rows through T^-1
+    w = 0.4
+
+    def turn6(ts):
+        ts = np.asarray(ts, float); K = ts.size
+        return (np.zeros((3, K)), w * ts, np.zeros((3, K)), np.full(K, w),
+                np.full(K, a), np.full(K, b))
+
+    x = DOBMPCController._xref_ned_traj(stub(turn6), 0.0)
+    want = np.array(body_rates_from_euler(+a, -b, 0.0, 0.0, -w))
+    assert np.allclose(x[9:12, 1:-1], want[:, None], atol=1e-9), \
+        f"rate rows {x[9:12, 5]} want T^-1(0,0,-r) = {want}"
+    assert not np.isclose(x[11, 5], -w), "xref[11] must carry cos(theta)cos(phi) at tilt"
+    xn = DOBMPCController._xref_ned_traj(stub(turn6, rate_source="none"), 0.0)
+    assert np.allclose(xn[9:11, :], 0.0) and np.allclose(xn[11, :], -w), "rate_source none"
+    assert np.allclose(xn[0:9, :], x[0:9, :]), "rate_source must only touch rows 9..11"
+
+    # (d) pitch ramp
+    wp = 0.35                                            # rad/s (pq_max [예측])
+
+    def ramp6(ts):
+        ts = np.asarray(ts, float); K = ts.size
+        return (np.zeros((3, K)), np.zeros(K), np.zeros((3, K)), np.zeros(K),
+                np.zeros(K), wp * ts)
+
+    x = DOBMPCController._xref_ned_traj(stub(ramp6), 0.0)
+    assert np.allclose(np.diff(x[4, :]) / dt, -wp), "NED theta must ramp at -pitch_dot_FLU"
+    assert np.allclose(x[10, :], -wp, atol=1e-9), f"q row must be theta_dot = -w: {x[10, :3]}"
+    assert np.allclose(x[9, :], 0.0) and np.allclose(x[11, :], 0.0)
+    print("[traj-attitude] OK  4-tuple byte-identical; 6-tuple (+roll,-pitch) rows == setpoint "
+          "tile; rate rows T^-1 / none ablation; pitch ramp -> q = -w")
+
+
 def main():
     test_frames()
     test_predictor()
@@ -355,9 +638,21 @@ def main():
     test_pitch_aware()
     test_xref_yaw_preview()
     test_xref_traj_preview()
+    test_xref_attitude_sign()
+    test_body_rates_T_inv()
+    test_xref_traj_attitude()
+    test_ref_traj_has_att_cleared()
     test_square_ref_matches_live_loop()
     print("\nDOBMPC UNIT TESTS PASSED")
 
 
 if __name__ == "__main__":
-    main()
+    # `python tests/test_dobmpc.py test_a test_b` runs the named tests only (main()
+    # is known to fail on heavy at test_casadi_matches_numpy, KNOWN_ISSUES.md).
+    _names = [a for a in sys.argv[1:] if a.startswith("test_")]
+    if _names:
+        for _n in _names:
+            globals()[_n]()
+        print(f"\n{len(_names)} named test(s) PASSED")
+    else:
+        main()

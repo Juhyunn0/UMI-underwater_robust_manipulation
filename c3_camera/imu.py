@@ -28,7 +28,7 @@ Two measured caveats the dataset must disclose
    on IMU x** — which in the upright pose lies nearly along gravity and so adds
    straight onto it. Raw |a| across attitudes runs 8.37-11.69; corrected,
    9.806 +/- 0.050.
-   [측정: sessions/low_level_controller_data/20260817/0817_101511 + _100139,
+   [측정: data/20260817/0817_101511 + _100139,
    21985 still samples, 6 attitudes; config/c3_imu_calib.json sha1 7081ff43]
    The distinction is not academic: a constant body-frame bias is removed
    completely by a static correction taken at any attitude, whereas a scale

@@ -1477,3 +1477,75 @@ wall-tag preset) are tracked in the repo-root KNOWN_ISSUES.md entry of the same 
 **Records boundary:** hardware CSVs (`*_mpc.csv`) share the sim's 9-column prefix but are a NEW
 population — `meta.json` carries `source: "hardware rov_gui.control"`, the tag-map sha1 and the
 axis-gain provenance; never pool them with `runs/traj_*.csv` sim records.
+
+## 2026-09-26 — 6-DoF variant: the policy emits roll/pitch and the NMPC tracks them (OFF by default)
+
+A NEW variant selected by config + checkpoint, not a replacement. The diffusion policy may emit
+`[dx, dy, dz, dyaw, droll, dpitch, width]` (`action_repr: pos_rpy_width`, width 7; label encoder
+`umi/common/yaw_action.py::encode_pos_rpy`, ZYX Euler of `R_bt R_rel R_bt^T`, the dyaw column
+bit-identical to the 5-dim label). The station transcribes the decoder in `policy_frames.py`
+(parity-tested by path), `compose_plan(track_rp=True)` carries an ABSOLUTE NED roll/pitch per knot
+(`PlanMsg.rp`, T1-clipped at `policy.rp_max_deg`), the filter gates magnitude / Euler rate / jump,
+the stitcher samples attitude + rate (`sample_att`), and `HwDobMpc._xref_ned_plan` fills
+xref[3:5] and the body-rate rows xref[9:11] (+ xref[11]) through `T(phi,theta)^-1` only when a plan
+carries rp. The K/M torques reach ArduSub through MANUAL_CONTROL's extension axes (`s` = pitch,
+`t` = roll, `enabled_extensions=0b11`; MAVLink 2 only) behind the engage gate `engage.attitude_axes`,
+scaled by `axis_gain.roll_nm 13.2 / pitch_nm 7.2` [유도] and capped at 0.2 / 0.3 [예측]. The sim
+wrapper (`dobmpc_controller.set_target(roll_ref, pitch_ref)`, 6-tuple sampler) got the same
+reference path; `verify/verify_attitude_hold.py` runs the hold grid + step/ramp/dropped/sign-inversion/
+gain/deadband/headroom scenarios.
+
+Decisions worth keeping:
+* **Variant OFF = byte-identical 4-DoF path.** Golden sha256 pins on `compose_plan` / `PlanFilter` /
+  `PlanStitcher` (test_policy_frames, test_plan_stream), bitwise `_xref_ned` / `_xref_ned_plan` tiles
+  vs a frozen legacy copy (test_attitude_axes, sim tests/test_dobmpc.py), 23-byte MAVLink frame
+  equality, and the resolved `config/hw_mpc.yaml` compared key-for-key with the variant keys stripped.
+* **Hold ramp, not a step, when rp disappears** (`_rp_hold` decays at `pq_max_rad_s`·DT per tick).
+* **Rate rows through T^-1**: on a 0.35 rad/s ramp the level-rate reference lags 3.105 deg peak vs
+  0.287 deg with the T^-1 rows; ramp peak error 7.252 deg
+  (`bluerov2_mujoco_marinegym/recordings/20260926/attitude_hold_211921/results.csv`, rows `rate_*` / `ramp_*`).
+  Two methods, two labels, **never pooled under one `rate_source`**: the sim's `attitude_meta.rate_source`
+  is `fd_horizon_T_inv` (np.gradient over the sampled horizon); the station's `HwDobMpc` label is
+  `stitcher_rate_T_inv` (the stitcher's sampled Euler rate through T^-1).
+* **Steady window starts at t_step + settle = 20 s** (`steady_from_s=20`): step 15 deg, plain mpc, e_pitch
+  RMS 0.0884 deg, overshoot 0.9991 %, 1-deg settle 1.0 s, accept 1
+  (`recordings/20260926/attitude_hold_211813/results.csv`, row `step,mpc`). The earlier
+  `attitude_hold_174607` step/ramp/rate/dropped rows are NOT citable for steady values (their window
+  contained the transient; transients unchanged).
+* **dobmpc stays gated (`dobmpc_allowed: false`)**: with a 2x torque-gain error the EAOB saturates the
+  verticals (234 ticks, max|f| 52 N) where plain MPC shows +0.22 deg steady error
+  (`recordings/20260926/attitude_hold_174607/results.csv`, rows `gain_*`); with K/M silently dropped
+  (reference 20 deg = `policy.rp_max_deg`, threshold 15 deg = `policy.div_max_rp_deg`) both mpc and dobmpc
+  trip `div_rp` at 0.45 s — the tick where the over-threshold streak reaches 10 samples = the station's
+  0.5 s debounce; the hull never approaches 20 deg — and dobmpc drifts to 6.83 deg pitch through the
+  credited-but-undelivered K/M, rad_max 14.5 cm
+  (`recordings/20260926/attitude_hold_211917/results.csv`, rows `dropped_*`). The 174607 `dropped_*` rows
+  had threshold = reference size and are degenerate — do not cite them.
+* Heavy hold grid (mpc, dobmpc; NONE): e_roll/e_pitch RMS 0.07–0.08 deg, K/M 0.29/0.30 N·m at 15 deg,
+  sat_ticks 0 (`recordings/20260926/attitude_hold_174544/results.csv`). heavy_gripper (0,20) deg: plain
+  mpc steady pitch error −0.15 deg (+0.29 deg at level) vs dobmpc −0.04 deg, i.e. the predicted ZG·W vs
+  B·coBM steady tilt is confirmed in sign only, sub-degree because Q_att 80 closes most of it
+  (`recordings/20260926/attitude_hold_174602_gripper/results.csv`).
+* **Cap tiers, outermost last** [예측 unless cited]: T0 label range (normaliser + DDIM clip) → T1
+  `compose_plan` clip `rp_max_deg` 20 → T2 PlanFilter (`rp_reject_deg` 30 hard, `pq_max_rad_s` 0.35
+  dilation, `rp_jump_max_deg` 5 soft) → T3 `set_path_plan_ned` ValueError above `rp_reject` → T4 wire
+  caps `cap_roll 0.2 / cap_pitch 0.3` (`first_water_caps [0.1, 0.15]` for the first water session).
+  The label statistics behind T1/T2: |dpitch| p99.9 16.7–18.6 deg, max 21.1–27.2 deg; |droll| p99.9
+  7.8–9.3 deg (`data/20260926/rp_label_stats_174358.txt`, `rp_label_stats_174535.txt`); peak Euler rate
+  |p|,|q| p90 0.453 rad/s (max over both axes) on the raw 66.7 ms grid, so the 0.35 rad/s rate gate dilates 2/1721 chunks at
+  200 ms (`data/20260926/0926_175145_offline/gate_pos_rpy_width.log`).
+* **MANUAL only.** In STABILIZE the firmware reinterprets s/t as lean-angle targets and runs its own
+  attitude loop, so the station's K/M torque would be a second controller on the same axes; STABILIZE
+  engage is refused whenever `attitude_axes.enabled` (the lean-angle cascade is a scope trim).
+* **Ordering: plain mpc → torque-gain calibration → dobmpc.** `roll_nm 13.2 / pitch_nm 7.2` are derived
+  from heave_n × lever arm [유도], never measured; the first water step is a policy-less plain-mpc
+  attitude STEP that fits the gains, and only then may `dobmpc_allowed` be considered, because the EAOB
+  credits a torque the wire does not carry (the `gain_*` / `dropped_*` evidence above).
+
+Records: mission CSV gains trailing `rroll_deg, rpitch_deg, ax_roll, ax_pitch, rp_track`
+(nan/0 when off), `policy_plan.csv` ends `,reason,roll_deg,pitch_deg`, meta schema 15 → 16 with
+`run.attitude_axes`, `trajectory.attitude_track`, `policy.action_repr`, `controller.attitude_ref`.
+Scope trims: `transport: rc_override`, the STABILIZE lean-angle cascade, the PID roll/pitch loop,
+the run_compare attitude scenario and the armed in-water sign-probe mission are NOT in this cut.
+**Zero hardware runs**: firmware s/t consumption, the K/M sign and the torque gains are unconfirmed
+(KNOWN_ISSUES.md 2026-09-26).

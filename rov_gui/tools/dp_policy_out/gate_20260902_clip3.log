@@ -1,0 +1,15 @@
+blosc backend: subprocess helper /home/bdml/miniforge3/envs/umi2/bin/python (numcodecs)
+store: zip /home/bdml/Desktop/data collection/dataset_depth.zarr.zip: 15746 frames, 75 episodes, fps 30.0 (0.3 s to load the tables)
+windows: 1721 (stride 8 frames, >= 500 wanted), obs_dt 66.7 ms, T_bt = axis permutation, zero lever arm; limits {"v_max_m_s": 0.08, "a_max_m_s2": 0.2, "r_max_rad_s": 0.5, "anchor_max_m": 0.15, "jump_max_m": 0.06, "yaw_jump_max_deg": 8.0, "obs_max_age_s": 0.4, "knot_dt_s": 0.2, "gripper_width_open_m": 0.069, "gripper_width_closed_m": 0.042, "clip_ratio_max": 3.0} box [[-1.0, -1.0, -0.5], [1.0, 1.0, 0.5]]
+
+[GT demos] knot_dt 66.7 ms — 1721 chunks (0 failed to compose)
+  accept 0 (0.0%)  clip 1190 (69.1%)  reject 531 (30.9%)  reject by gate: {'kinematics': 531}
+  need (dilation the kinematic gate wants; <=1 passes, <=3.0 clips): p50 2.39  p90 4.46  max 8.27  | applied alpha p50 2.15
+  jitter_rms_mm (raw 2nd differences): p50 2.59  p90 4.81
+  peak speed m/s: p50 0.147  p90 0.344  (cap 0.08)   peak accel m/s^2: p50 1.060  p90 2.187  (cap 0.2)   peak yaw rate rad/s: p50 0.151  p90 0.276  (cap 0.5)
+
+[GT demos] knot_dt 200.0 ms — 1721 chunks (0 failed to compose)
+  accept 296 (17.2%)  clip 1173 (68.2%)  reject 252 (14.6%)  reject by gate: {'kinematics': 252}
+  need (dilation the kinematic gate wants; <=1 passes, <=3.0 clips): p50 1.50  p90 3.44  max 7.16  | applied alpha p50 1.53
+  jitter_rms_mm (raw 2nd differences): p50 2.59  p90 4.81
+  peak speed m/s: p50 0.118  p90 0.275  (cap 0.08)   peak accel m/s^2: p50 0.245  p90 0.679  (cap 0.2)   peak yaw rate rad/s: p50 0.082  p90 0.172  (cap 0.5)

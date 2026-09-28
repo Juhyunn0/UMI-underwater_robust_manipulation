@@ -31,7 +31,7 @@ DUPLICATED IDS (2026-08-14). The pool mat reuses 12 ids at a second physical
 place, while the map holds ONE pose per id — so a detection of the "other"
 copy contributes corners that belong somewhere else entirely, and the joint
 solve splits the difference (measured 59-131 px against a 3 px gate, two
-thirds of the rejections in sessions/nav_runs/20260813_17*). The mat is NOT
+thirds of the rejections in data/20260813/0813_17*/nav_*). The mat is NOT
 a repeated sheet, though: the operator's cell-by-cell survey shows the two
 copies of an id share NO neighbour except their own pair partner, so the
 tags detected ALONGSIDE a duplicated id say which copy it is. That is what
@@ -40,6 +40,21 @@ duplicated tag only if it reprojects where the map says it should
 (``dup_confirm_px``). Confirm-or-drop, never guess: the wrong copy lands
 many centimetres away and is thrown out, and no new survey is needed
 because we only ever have to RECOGNISE the wrong copy, not locate it.
+
+MIRROR POSE (2026-09-14). A planar target has an EXACT duplicate PnP
+solution: negate every point's camera-frame coordinates and the pinhole
+projection is unchanged (x/z = -x/-z), and for coplanar points that negation
+is a proper pose — R·Rz(180°) with -t, the camera reflected through the tag
+plane with its yaw flipped. Every tag then sits BEHIND the camera, which is
+the one thing a reprojection error cannot see. solvePnP's cold start lands
+there freely, and once it is the warm start it stays there: 42 consecutive
+two-tag frames of data/20260914/0914_163103/nav_163112 (t 88.5-92.1 s)
+reported the vehicle 0.44 m BELOW the floor, 0.7 m away and 180° round, at
+2.2 px against a 3 px gate, and the NMPC chased it to full thrust. The
+same frames solve to the true pose at 2.2 px from the IPPE seed. So every
+joint fit is now CHEIRALITY-gated — a start whose points are not all in
+front of the camera can neither win nor pass — and the mirror can never
+become a warm start. No knob: a tag that was imaged is in front of the lens.
 """
 
 from __future__ import annotations
@@ -157,6 +172,18 @@ class Detection:
     tag_id: int
     corners: np.ndarray               # (4,2) float32, pupil-apriltags order
     decision_margin: float = 0.0
+    # Signed pixels from the NEAREST corner to the image rectangle: positive
+    # = the whole quad is inside, NEGATIVE = at least one corner lies outside
+    # the frame, i.e. the detector EXTRAPOLATED it past the sensor edge and
+    # those coordinates are not a measurement. Measured cost of trusting one:
+    # 16 of the 18 reprojection-gate rejections on 2026-09-06 were carried by
+    # a clipped quad, e.g. frame 1198 of
+    # data/20260906/0906_194856/nav_194856,
+    # where tag 27's corner sits at y=362.5 in a 360-row image and reprojects
+    # at 7.12 px while the other six tags average 1.9 px.
+    # ``inf`` = not measured (a Detection built by hand, e.g. in tests); such
+    # a detection is never demoted for clipping.
+    edge_px: float = float("inf")
 
 
 class TagDetector:
@@ -200,6 +227,15 @@ class TagDetector:
             self._aruco = cv2.aruco.ArucoDetector(dic, par)
             self.backend = "cv2.aruco"
 
+    @staticmethod
+    def _edge_px(corners: np.ndarray, shape) -> float:
+        """Distance from the nearest corner to the image rectangle (see
+        ``Detection.edge_px``). Negative when a corner is off the sensor."""
+        h, w = int(shape[0]), int(shape[1])
+        c = np.asarray(corners, np.float64)
+        return float(min(c[:, 0].min(), c[:, 1].min(),
+                         (w - 1) - c[:, 0].max(), (h - 1) - c[:, 1].max()))
+
     def detect(self, gray: np.ndarray) -> list[Detection]:
         if self._pupil is not None:
             out = []
@@ -208,9 +244,10 @@ class TagDetector:
                     continue
                 if float(d.decision_margin) < self.min_decision_margin:
                     continue
-                out.append(Detection(int(d.tag_id),
-                                     np.asarray(d.corners, np.float32).reshape(4, 2),
-                                     float(d.decision_margin)))
+                cs = np.asarray(d.corners, np.float32).reshape(4, 2)
+                out.append(Detection(int(d.tag_id), cs,
+                                     float(d.decision_margin),
+                                     self._edge_px(cs, gray.shape)))
             return out
         corners, ids, _rej = self._aruco.detectMarkers(gray)
         if ids is None:
@@ -218,8 +255,9 @@ class TagDetector:
         out = []
         for cs, tid in zip(corners, ids.ravel()):
             # TL,TR,BR,BL -> BL,BR,TR,TL (the pupil order; module docstring)
-            out.append(Detection(int(tid),
-                                 np.asarray(cs, np.float32).reshape(4, 2)[::-1].copy()))
+            cs = np.asarray(cs, np.float32).reshape(4, 2)[::-1].copy()
+            out.append(Detection(int(tid), cs, 0.0,
+                                 self._edge_px(cs, gray.shape)))
         return out
 
 
@@ -254,6 +292,26 @@ def _reproj_rms(obj_pts, img_pts, rvec, tvec, K, dist) -> float:
     return float(np.sqrt(np.mean(np.sum(err * err, axis=1))))
 
 
+def _all_in_front(obj_pts, rvec, tvec) -> bool:
+    """Cheirality: is every object point in FRONT of the camera (z_cam > 0)?
+    The pinhole projection cannot tell a point from its reflection through
+    the lens, so this is the test the reprojection error lacks (module
+    docstring, MIRROR POSE)."""
+    import cv2
+    R, _ = cv2.Rodrigues(np.asarray(rvec, float))
+    z = (R @ np.asarray(obj_pts, float).reshape(-1, 3).T
+         + np.asarray(tvec, float).reshape(3, 1))[2]
+    return bool(np.all(z > 0.0))
+
+
+def _quad_area(corners) -> float:
+    """Shoelace area of a detection's quad, in px² — the stand-in for "which
+    tag is nearest / best conditioned" when picking a seed."""
+    c = np.asarray(corners, np.float64)
+    x, y = c[:, 0], c[:, 1]
+    return 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+
 def _rp_from_R_ned_body(R: np.ndarray) -> tuple[float, float]:
     """ZYX roll/pitch, same extraction as dobmpc.frames._euler_from_R."""
     theta = math.asin(max(-1.0, min(1.0, -float(R[2, 0]))))
@@ -273,7 +331,10 @@ class TagNav:
                  min_tags: int = 1,
                  datum: str = "map",
                  duplicate_ids=(),
-                 dup_confirm_px: float = 6.0):
+                 dup_confirm_px: float = 6.0,
+                 outlier_max_frac: float = 0.30,
+                 outlier_min_ratio: float = 1.8,
+                 min_border_px: float | None = 0.0):
         self.map = tag_map
         self.obj_tag = tag_object_points(tag_size_m).astype(np.float64)
         # camera(optical) -> body(FRD): x_body = R_frd_cam x_cam + t_frd_cam
@@ -295,8 +356,21 @@ class TagNav:
         self.duplicate_ids = (frozenset(int(i) for i in duplicate_ids)
                               | tag_map.duplicate_ids)
         self.dup_confirm_px = float(dup_confirm_px)
+        # OUTLIER RESCUE (see _drop_outliers). The joint fit pools its RMS
+        # over every corner, so ONE tag with bad corners rejects a frame whose
+        # other tags agree to ~1 px. Rather than loosen the gate, drop the
+        # worst tag and refit — bounded so a uniformly-bad frame can never be
+        # peeled down to a lucky subset that passes with a wrong pose.
+        self.outlier_max_frac = float(outlier_max_frac)
+        self.outlier_min_ratio = float(outlier_min_ratio)
+        # Demote a detection whose quad reaches within this many pixels of the
+        # image edge (0.0 = only quads that actually cross it; None = off).
+        self.min_border_px = (None if min_border_px is None
+                              else float(min_border_px))
         # Per-frame bookkeeping for the operator's screen.
         self.last_dropped: tuple = ()
+        self.last_outliers: tuple = ()     # (tag_id, px) dropped by the rescue
+        self.last_clipped: tuple = ()      # tag ids dropped at the image edge
         # datum="first_fix": the first accepted solve defines the world's
         # origin AND yaw zero — every later pose is expressed relative to
         # where (and which way) the run began. A pure horizontal isometry, so
@@ -308,6 +382,7 @@ class TagNav:
         self._datum_Rz = None                   # Rz(-yaw0)
         self._rvec = None                       # camera_T_map warm start
         self._tvec = None
+        self._pnp_fail = ""                     # why _joint_pnp returned None
         # WHY the last solve returned None. "tags seen, none usable" with no
         # reason is undebuggable at the pool — this string reaches the sensor
         # row and the plot chip (found live 2026-08-12: the gravity gate was
@@ -317,6 +392,23 @@ class TagNav:
     def reset_datum(self) -> None:
         self._datum_p0 = None
         self._datum_Rz = None
+
+    def datum_transform(self):
+        """(Rz, p0) of the first-fix datum, or None (none yet / datum map).
+        A second solver on another camera applies THIS one's datum so both
+        report in one world (control/nav_fusion.py)."""
+        if self.datum != "first_fix" or self._datum_p0 is None:
+            return None
+        return self._datum_Rz.copy(), self._datum_p0.copy()
+
+    def set_extrinsic(self, R_frd_cam, t_frd_cam) -> None:
+        """Re-point the camera->body extrinsic at runtime — the ROV RGB rides
+        a tilt mount, so its extrinsic follows the tracked mount angle. The
+        PnP warm start is camera_T_map and does not depend on this."""
+        self.R_bc = np.asarray(R_frd_cam, float)
+        self.t_bc = np.asarray(t_frd_cam, float)
+        self.R_cb = self.R_bc.T
+        self.t_cb = -self.R_bc.T @ self.t_bc
 
     def _apply_datum(self, sol: "NavSolution | None") -> "NavSolution | None":
         if sol is None or self.datum != "first_fix":
@@ -365,30 +457,96 @@ class TagNav:
         return (np.concatenate(obj).astype(np.float64),
                 np.concatenate(img).astype(np.float64))
 
-    def _joint_pnp(self, dets, K, dist, rvec0=None, tvec0=None, insts=None):
-        """One joint solvePnP -> (rvec, tvec, rms), or None if it failed.
+    def _seed_from_tag(self, dets, K, dist, insts=None):
+        """Initial guesses for camera_T_map from the LARGEST tag's IPPE square,
+        composed with that tag's map pose. Both IPPE branches are returned —
+        the joint fit over the other tags is what decides between them."""
+        import cv2
 
-        A wildly wrong warm start can wedge LM in a bad basin, so a solve
-        that starts warm and lands outside the gate gets ONE cold retry."""
+        k = int(np.argmax([_quad_area(d.corners) for d in dets]))
+        d = dets[k]
+        try:
+            n_sol, rvecs, tvecs, _e = cv2.solvePnPGeneric(
+                self.obj_tag, d.corners.astype(np.float64), K, dist,
+                flags=cv2.SOLVEPNP_IPPE_SQUARE)
+        except cv2.error:
+            return []
+        R_mt, t_mt = self.map.instances[d.tag_id][0 if insts is None
+                                                  else insts[k]]
+        out = []
+        for i in range(n_sol):
+            R_ct, _ = cv2.Rodrigues(rvecs[i])
+            R_cm = R_ct @ R_mt.T
+            rvec, _ = cv2.Rodrigues(R_cm)
+            out.append((rvec, (tvecs[i].ravel() - R_cm @ t_mt).reshape(3, 1)))
+        return out
+
+    def _joint_pnp(self, dets, K, dist, rvec0=None, tvec0=None, insts=None):
+        """Joint solvePnP over every given tag -> (rvec, tvec, rms) or None.
+
+        BEST of up to three starts, in order and stopping as soon as one
+        clears the gate: the caller's warm start, a cold solve, and a seed
+        built from one tag's IPPE square (``_seed_from_tag``).
+
+        Why three. A wildly wrong warm start can wedge LM in a bad basin, so a
+        warm solve outside the gate is retried cold — but the COLD start has
+        its own failure, and on a two-tag coplanar frame it is spectacular:
+        492 px on frame 1214 of data/20260907/
+        0907_133858/nav_134116, a frame whose own tags agree to 0.94 px. The
+        old code only ever survived that by happening to hold a warm start
+        from the previous frame. Seeding from a single tag's IPPE pose is the
+        well-posed way to start a planar fit, so it is the last resort here.
+
+        Why BEST rather than last: the cold retry used to REPLACE the warm
+        answer unconditionally, so a 3.5 px warm solve could be overwritten by
+        a 492 px cold one and reported as the fit.
+
+        CHEIRALITY. A start that converges with any tag BEHIND the camera is
+        the planar mirror pose (module docstring): it reprojects exactly as
+        well as the truth, so it is neither kept as best nor allowed to pass,
+        and the remaining starts run. A frame where EVERY start lands there
+        returns None with ``_pnp_fail`` saying so. Measured: the 42 mirror
+        frames of data/20260914/0914_163103/nav_163112 all recover the true
+        pose (2.2 px) from the IPPE seed once the warm and cold mirrors are
+        refused.
+        """
         import cv2
 
         obj, img = self._obj_img(dets, insts)
-        guess = rvec0 is not None
-        ok, rvec, tvec = cv2.solvePnP(
-            obj, img, K, dist,
-            rvec=(rvec0.copy() if guess else None),
-            tvec=(tvec0.copy() if guess else None),
-            useExtrinsicGuess=guess, flags=cv2.SOLVEPNP_ITERATIVE)
-        if not ok:
-            return None
-        rms = _reproj_rms(obj, img, rvec, tvec, K, dist)
-        if rms > self.max_reproj_px and guess:
-            ok, rvec, tvec = cv2.solvePnP(obj, img, K, dist,
-                                          flags=cv2.SOLVEPNP_ITERATIVE)
+        best = None
+        behind = 0
+        self._pnp_fail = ""
+
+        def attempt(r0, t0) -> bool:
+            """Run one start; keep it if it is the best so far. -> passed gate?"""
+            nonlocal best, behind
+            guess = r0 is not None
+            ok, rvec, tvec = cv2.solvePnP(
+                obj, img, K, dist,
+                rvec=(np.array(r0, float).reshape(3, 1) if guess else None),
+                tvec=(np.array(t0, float).reshape(3, 1) if guess else None),
+                useExtrinsicGuess=guess, flags=cv2.SOLVEPNP_ITERATIVE)
             if not ok:
-                return None
+                return False
+            if not _all_in_front(obj, rvec, tvec):
+                behind += 1
+                return False
             rms = _reproj_rms(obj, img, rvec, tvec, K, dist)
-        return rvec, tvec, rms
+            if best is None or rms < best[2]:
+                best = (rvec, tvec, rms)
+            return rms <= self.max_reproj_px
+
+        if rvec0 is not None and attempt(rvec0, tvec0):
+            return best
+        if attempt(None, None):
+            return best
+        for r0, t0 in self._seed_from_tag(dets, K, dist, insts):
+            if attempt(r0, t0):
+                break
+        if best is None and behind:
+            self._pnp_fail = (f"mirror pose only ({behind} start(s) put the "
+                              f"tags behind the camera)")
+        return best
 
     def _tag_reproj(self, d: Detection, rvec, tvec, K, dist,
                     inst: int = 0) -> float:
@@ -417,6 +575,89 @@ class TagNav:
             return None, errs[best]          # the copies are not separable here
         return best, errs[best]
 
+    def _drop_notes(self, wrong_copy=()) -> list:
+        """What this frame threw away, for the solution's note field. Every
+        discarded tag is named — a fix built on a pruned tag set must say so."""
+        out = []
+        if self.last_outliers:
+            out.append("outlier tag(s) dropped: "
+                       + ",".join(f"{t}@{e:.1f}px"
+                                  for t, e in self.last_outliers))
+        if wrong_copy:
+            out.append("wrong-copy tag(s) dropped: "
+                       + ",".join(str(t) for t, _e in self.last_dropped))
+        if self.last_clipped:
+            out.append("clipped at frame edge: "
+                       + ",".join(str(t) for t in self.last_clipped))
+        return out
+
+    def _drop_outliers(self, anchors, K, dist, rvec, tvec, rms):
+        """Rescue a frame the joint gate rejected, by dropping outlier tags.
+
+        WHY. ``_joint_pnp`` pools its RMS over every corner with equal weight,
+        so ONE tag whose corners are wrong — a quad clipped by the image edge,
+        a mis-surveyed map entry — drags the pooled number past the gate while
+        the pose itself is fine and every other tag sits near 1 px. Measured on
+        the recordings of 2026-09-06: dropping the single worst tag and
+        refitting rescues 55/55 gate rejections in
+        data/20260906/0906_194856/nav_194856
+        (median 4.63 -> 1.16 px) and 18/18 in .../0906_192348/nav_192348
+        (3.30 -> 0.15 px). Example, frame 1198 of the first: per-tag residuals
+        {27: 7.12, 28: 3.06, 44: 2.40, 29: 1.95, 58: 1.51, 30: 1.21, 31: 1.13}
+        px for a joint 3.27 px against a 3.0 px gate — tag 27's quad runs to
+        y=362.5 in a 360-row image.
+
+        SAFETY. Peeling is how a bad fit turns into a confident wrong one, so
+        three bounds apply and all three must hold for every drop:
+          * at most ``outlier_max_frac`` of the anchors may go (always >= 1),
+          * at least ``max(1, min_tags)`` anchors must remain,
+          * the tag must STAND OUT — its residual must be at least
+            ``outlier_min_ratio`` x the median of the others. A frame that is
+            uniformly bad (wrong map, changed extrinsic, wrong camera model)
+            has no standout tag and is REJECTED rather than peeled, which is
+            the case this bound exists for.
+
+        Returns ``(kept, rvec, tvec, rms)``, where a single survivor comes back
+        with ``rvec=None`` for the caller to re-solve on the single-tag path,
+        or ``None`` to reject (``last_reject`` explains which tag and why).
+        """
+        kept = list(anchors)
+        dropped: list[tuple[int, float]] = []
+        n_max = max(1, int(self.outlier_max_frac * len(anchors)))
+        floor = max(1, self.min_tags)
+        while rms > self.max_reproj_px:
+            errs = [self._tag_reproj(d, rvec, tvec, K, dist) for d in kept]
+            j = int(np.argmax(errs))
+            others = [e for i, e in enumerate(errs) if i != j]
+            med = float(np.median(others)) if others else 0.0
+            stands_out = errs[j] >= self.outlier_min_ratio * med
+            if len(dropped) >= n_max or len(kept) - 1 < floor or not stands_out:
+                why = ("no single tag stands out — the whole frame disagrees "
+                       "with the map" if not stands_out
+                       else f"{len(dropped)}/{n_max} dropped, floor {floor}")
+                self.last_reject = (
+                    f"reproj {rms:.1f}px > {self.max_reproj_px:g}px "
+                    f"({len(kept)} unique tags, worst {kept[j].tag_id} "
+                    f"@{errs[j]:.1f}px: {why})")
+                return None
+            dropped.append((int(kept[j].tag_id), float(errs[j])))
+            kept.pop(j)
+            if len(kept) < 2:
+                # One survivor: the planar 4-point fit is exactly the flip
+                # ambiguity the single-tag IPPE branch exists to resolve, so
+                # hand it there instead of guessing here.
+                self.last_outliers = tuple(dropped)
+                return kept, None, None, float("inf")
+            got = self._joint_pnp(kept, K, dist, rvec, tvec)
+            if got is None:
+                self.last_reject = ((self._pnp_fail or "multi-tag PnP failed")
+                                    + " after dropping "
+                                    + ",".join(str(t) for t, _e in dropped))
+                return None
+            rvec, tvec, rms = got
+        self.last_outliers = tuple(dropped)
+        return kept, rvec, tvec, rms
+
     # ------------------------------------------------------------------- solve
     def solve(self, detections: list[Detection], K: np.ndarray, dist,
               rp_hint: tuple[float, float] | None = None) -> NavSolution | None:
@@ -436,6 +677,18 @@ class TagNav:
             dist = dist[:8]                    # OpenCV accepts 4/5/8/12/14
         mapped = [d for d in detections if d.tag_id in self.map]
         self.last_dropped = ()
+        self.last_outliers = ()
+        self.last_clipped = ()
+        # A quad that crosses the image edge has EXTRAPOLATED corners, not
+        # measured ones (Detection.edge_px), and they are wrong by pixels —
+        # the measured carrier of 16 of the 18 reprojection-gate rejections on
+        # 2026-09-06. Drop them before anything counts tags, so a clipped copy
+        # can neither anchor nor trip the seen-twice rule below.
+        if self.min_border_px is not None:
+            clipped = [d for d in mapped if d.edge_px < self.min_border_px]
+            if clipped:
+                self.last_clipped = tuple(int(d.tag_id) for d in clipped)
+                mapped = [d for d in mapped if d.edge_px >= self.min_border_px]
         # An id detected TWICE in one frame means both physical copies are in
         # view (or one is a misread). Neither corner set can be trusted, so
         # both go — including for ids nobody declared duplicated, which is how
@@ -453,11 +706,14 @@ class TagNav:
         if len(anchors) < self.min_tags:
             # hw_nav.yaml min_tags: a floor-map run can demand >=2 tags so a
             # single grazing detection never carries the whole state estimate.
-            extra = ""
-            if ambig or twice:
-                extra = (f" ({len(ambig)} dup held back"
-                         + (f", {len(twice)} id(s) seen twice" if twice else "")
-                         + ")")
+            bits = []
+            if ambig:
+                bits.append(f"{len(ambig)} dup held back")
+            if twice:
+                bits.append(f"{len(twice)} id(s) seen twice")
+            if self.last_clipped:
+                bits.append(f"{len(self.last_clipped)} clipped at frame edge")
+            extra = f" ({', '.join(bits)})" if bits else ""
             self.last_reject = (f"{len(anchors)}/{self.min_tags} unique tags"
                                 + extra if detections else "no tags")
             return None
@@ -465,14 +721,18 @@ class TagNav:
         if len(anchors) >= 2:
             got = self._joint_pnp(anchors, K, dist, self._rvec, self._tvec)
             if got is None:
-                self.last_reject = "multi-tag PnP failed"
+                self.last_reject = self._pnp_fail or "multi-tag PnP failed"
                 return None
             rvec, tvec, rms = got
             if rms > self.max_reproj_px:
-                self.last_reject = (f"reproj {rms:.1f}px > "
-                                    f"{self.max_reproj_px:g}px "
-                                    f"({len(anchors)} unique tags)")
-                return None
+                # One bad tag must not cost the whole frame: drop it and
+                # refit, under the bounds documented on _drop_outliers.
+                res = self._drop_outliers(anchors, K, dist, rvec, tvec, rms)
+                if res is None:
+                    return None              # last_reject names the culprit
+                anchors, rvec, tvec, rms = res
+
+        if len(anchors) >= 2:
             # WHICH COPY is this? Score every instance the map holds against
             # the pose the unique tags just built. When the map knows both
             # copies (build_tag_map found them) the right one is recovered
@@ -495,9 +755,7 @@ class TagNav:
                     rvec, tvec, rms = got2
                 else:
                     used, insts = list(anchors), [0] * len(anchors)
-            note = ("" if not dropped else
-                    "wrong-copy tag(s) dropped: "
-                    + ",".join(str(t) for t, _e in self.last_dropped))
+            note = "; ".join(self._drop_notes(dropped))
             self._rvec, self._tvec = rvec.copy(), tvec.copy()
             R_cm, _ = cv2.Rodrigues(rvec)
             self.last_reject = ""
@@ -522,6 +780,8 @@ class TagNav:
         R_mt, t_mt = self.map.poses[d.tag_id]
         cands = []
         for i in range(n_sol):
+            if not _all_in_front(self.obj_tag, rvecs[i], tvecs[i]):
+                continue                       # mirror branch (module docstring)
             R_ct, _ = cv2.Rodrigues(rvecs[i])
             t_ct = tvecs[i].ravel()
             # camera_T_map = camera_T_tag o tag_T_map
@@ -529,6 +789,9 @@ class TagNav:
             t_cm = t_ct - R_cm @ t_mt
             rms = _reproj_rms(self.obj_tag, img, rvecs[i], tvecs[i], K, dist)
             cands.append((rms, R_cm, t_cm, rvecs[i], tvecs[i]))
+        if not cands:
+            self.last_reject = "IPPE: every pose puts the tag behind the camera"
+            return None
         cands.sort(key=lambda c: c[0])
         best = cands[0]
         ambiguous = (len(cands) > 1
@@ -572,11 +835,50 @@ class TagNav:
                     f"{math.degrees(self.tilt_gate_rad):.0f}° — tag vertical? "
                     f"camera tilt LEVEL? (hw_nav tilt_gate_deg)")
                 return None                    # pose disagrees with gravity
-        self._rvec, self._tvec = None, None    # tag-frame vecs; don't warm-start map PnP
+        # The lone anchor has fixed the pose, so the duplicated tags held back
+        # above can now be CONFIRMED against it exactly as on the multi-tag
+        # path. This is what turns "1 unique tag, the rest held back" — the
+        # largest single cause of fix dropout measured on 2026-09-06, 372 of
+        # 390 rejections in data/20260906/
+        # 0906_192348/nav_192348 including one 10.9 s outage, the camera
+        # seeing only ids {60, 65, 141} — into a three-tag fix. Confirming a
+        # copy within dup_confirm_px of a ONE-tag pose is also independent
+        # evidence that the IPPE branch chosen above is the right one: the
+        # flipped pose puts every other tag centimetres from where it lands.
+        rvec_map, _ = cv2.Rodrigues(np.asarray(best[1], float))
+        tvec_map = np.asarray(best[2], float).reshape(3, 1)
+        used, insts, wrong = [d], [0], []
+        for a in ambig:
+            i, e = self._pick_instance(a, rvec_map, tvec_map, K, dist)
+            if i is None:
+                wrong.append(a)
+                self.last_dropped += ((a.tag_id, float(e)),)
+            else:
+                used.append(a)
+                insts.append(i)
+        R_cm, t_cm, rms = best[1], best[2], best[0]
+        rvec_out = tvec_out = None
+        if len(used) > 1:
+            got = self._joint_pnp(used, K, dist, rvec_map, tvec_map, insts)
+            if got is not None and got[2] <= self.max_reproj_px:
+                rvec_out, tvec_out, rms = got
+                R_cm, _ = cv2.Rodrigues(rvec_out)
+                t_cm = tvec_out.ravel()
+                note = "; ".join([n for n in
+                                  [note, f"{len(used) - 1} duplicated tag(s) "
+                                         f"confirmed"] if n])
+            else:
+                used, insts = [d], [0]         # keep the one-tag answer
+        note = "; ".join([n for n in [note] + self._drop_notes(wrong) if n])
+        # A map-frame refit CAN warm-start the next frame; a bare tag-frame
+        # IPPE pose cannot (its vectors are in the tag's frame, not the map's).
+        self._rvec = None if rvec_out is None else rvec_out.copy()
+        self._tvec = None if tvec_out is None else tvec_out.copy()
         self.last_reject = ""
-        return self._solution(best[1], best[2], 1, (d.tag_id,), best[0],
-                              ambiguous, note, None, None,
-                              1e3 * (time.perf_counter() - t0))
+        return self._solution(R_cm, t_cm, len(used),
+                              [a.tag_id for a in used], rms,
+                              ambiguous, note, rvec_out, tvec_out,
+                              1e3 * (time.perf_counter() - t0), insts)
 
 
 def _wrap(a: float) -> float:

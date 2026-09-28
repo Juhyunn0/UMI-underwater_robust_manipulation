@@ -15,6 +15,11 @@
 # 손잡이(축 박스, segment, error, object 필터, time_color, theme, ...)는 전부
 # 코드의 기본값이고 필요하면 여기에 키를 더하거나 CLI로 덮으면 된다 —
 # `./c3 plots --help`.
+#
+# 런은 data/<날짜>/<런>/ 에서 찾는다(rov_gui/runstore.py, 2026-09-14 단일 루트).
+# 물속 런만 그린다 — 같은 날짜 폴더의 `_observe`(LOW None, 명령 없음) /
+# `_landdry`(육상 벤치) / `_dryrun`(합성 플랜트) 런은 건너뛴다. 그쪽을 그리려면
+# `kind: observe` 처럼 종류를 적는다.
 
 dates:
   - 20260824

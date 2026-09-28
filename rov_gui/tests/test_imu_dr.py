@@ -196,7 +196,7 @@ def test_static_correction_follows_the_attitude_the_window_actually_held():
 
     The ramp here is the one that was actually flown: pitch -0.34 -> +2.15 deg
     across an 8 s settle
-    [측정: sessions/low_level_controller_data/20260818/0818_160139/mpc_161904
+    [측정: data/20260818/0818_160139/mpc_161904
      _rov.jsonl, ATTITUDE over the settle window].
     """
     T, n = 8.0, int(8.0 * HZ) + 1

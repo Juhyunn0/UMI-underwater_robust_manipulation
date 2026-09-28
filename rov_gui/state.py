@@ -25,6 +25,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 
 
 class Conn(Enum):
@@ -70,9 +71,45 @@ class VideoStat:
     # read as a measurement. See CLAUDE.md on measurement provenance.
     mbps_estimated: bool = False
     conflated: int = 0              # frames the UI skipped to stay current
+    #: WHICH INSTRUMENT produced this frame, when a panel can carry more than
+    #: one ("c3_stereo" | "foundationstereo"). It travels here, in the same
+    #: mailbox slot as the picture and the raw millimetres, for the reason the
+    #: aux map does: a label on a separate signal can arrive before or after
+    #: the frame it describes, and then a measurement gets credited to the
+    #: wrong instrument. Cross-thread ordering cannot desynchronise a field
+    #: that is inside the thing being labelled.
+    instrument: str = ""
     encoding: str = ""
     conn: Conn = Conn.OFFLINE
     note: str = ""
+    #: The millimetre range THIS frame was colourised over, when the producer
+    #: auto-ranges it (FStereoWorker). None = the fixed imaging.DEPTH_*_MM
+    #: scale. It rides in the stat, beside the picture and the raw map, for
+    #: the same reason `instrument` does: a colour bar drawn from a range that
+    #: arrived on another signal can be a frame out of step, and then the
+    #: legend states a distance the picture does not mean.
+    depth_lo_mm: float | None = None
+    depth_hi_mm: float | None = None
+    #: WHICH COLOUR RULE painted this frame, as "umi:<domain>:<cmap>" when the
+    #: picture went through the SHARED rule (rov_gui/depth_colour.py: fixed
+    #: 0.2-3.0 m, warm = NEAR, no per-frame adaptation — the same function that
+    #: paints the land episode videos, so a screenshot is comparable with one).
+    #: "" = the legacy adaptive palette, whose scale rides in depth_lo/hi_mm and
+    #: depth_knots_mm instead. The legend needs it because the two rules put
+    #: NEAR at opposite ends of the bar and place ticks by different formulas.
+    depth_rule: str = ""
+    #: Ascending millimetre quantiles when the picture was HISTOGRAM-EQUALISED
+    #: (imaging.depth_palette_knots). The colour bar needs them to place a tick
+    #: where that depth actually landed — under equalisation the bar is no
+    #: longer linear in millimetres, and a linear one would mislabel it.
+    depth_knots_mm: tuple | None = None
+    #: WHICH GRID the raw map beside this picture is on: "color" (projected
+    #: onto the colour camera, pixel-aligned with the RGB panel) or
+    #: "rect_left" (the stereo network's own rectified-left frame). Anything
+    #: that back-projects the map through the COLOUR intrinsics — the
+    #: depth-vs-MAP calibration check — must read this first; it used to be
+    #: safe to assume, and stopped being so with --fstereo-view.
+    depth_grid: str = "color"
     stamp: float = field(default_factory=now)
 
     @property
@@ -83,6 +120,60 @@ class VideoStat:
 # =============================================================================
 # vehicle telemetry
 # =============================================================================
+@dataclass
+class FStereoState:
+    """What the learned-depth worker is doing, for the panel and the readout.
+
+    Published on its own signal rather than inferred from the depth panel's
+    VideoStat, because two different consumers need it for two reasons that
+    must not drift apart: the window has to attribute the depth-vs-MAP ratio to
+    the right INSTRUMENT, and the FS button has to show whether the feature is
+    actually running. Reading either off the picture would make them guesses.
+
+    ``live`` is the authority on who owns the depth panel. It is TIME-BASED at
+    the source (StereoMailbox.live), so a worker that dies without cleaning up
+    still hands the panel back to the camera's own depth.
+    """
+
+    live: bool = False              # learned depth is the panel's picture NOW
+    enabled: bool = False           # the operator's switch position
+    loading: bool = False
+    load_s: float = 0.0
+    error: str = ""
+    note: str = ""
+    hz: float = 0.0                 # ARRIVAL rate, not 1/solve_ms
+    solve_ms: float = 0.0
+    valid_native: float = 0.0       # % of the matcher's own grid
+    valid_out: float = 0.0          # % MEASURED after projection onto the grid
+    #: % the scatter-gap fill closed on top of ``valid_out``. Deliberately a
+    #: separate number: those pixels carry a neighbour's millimetres, not their
+    #: own, and a chip that added them to "valid" would be reporting a repair
+    #: as a measurement.
+    filled_out: float = 0.0
+    frames: int = 0
+    #: A CUDA graph was asked for but the run is on the eager path (capture
+    #: or replay failed, or the upstream code could not be patched). Same
+    #: numbers, slower, and the pilot should be able to see it on the chip.
+    eager: bool = False
+    stamp: float = field(default_factory=now)
+
+    @property
+    def chip(self) -> str:
+        """One line for the panel overlay. Says WHY when it is not running."""
+        if self.error:
+            return f"FS FAULT — {self.error[:52]}"
+        if self.loading:
+            return f"FS LOADING — {self.load_s:.0f}s"
+        if not self.enabled:
+            return "FS STOPPED — no depth this run"
+        if not self.live:
+            return f"FS STARVED — {self.note or 'no mono pair'}"
+        return (f"FOUNDATIONSTEREO  {self.hz:.1f} Hz  {self.solve_ms:.0f} ms  "
+                f"valid {self.valid_native:.0f}%→{self.valid_out:.0f}%"
+                + (f"+{self.filled_out:.0f}" if self.filled_out >= 0.5 else "")
+                + ("  eager" if self.eager else ""))
+
+
 @dataclass
 class SensorStat:
     """One auxiliary sensor's liveness. ``hz`` is measured, not requested."""
@@ -124,6 +215,13 @@ class Telemetry:
     armed: bool | None = None
     mode: str = ""
     leak: bool | None = None
+    # The 6-DoF variant's actuation gates (2026-09-26), filled by the hardware
+    # backend from AUTOPILOT_VERSION / the command sink; "" / False until known.
+    firmware_version: str = ""             # "4.5.1" style from AUTOPILOT_VERSION
+    mavlink_wire_version: str = ""         # "1.0" | "2.0" of the command link
+    attitude_axes_enabled: bool = False    # sink configured to send s/t (engage.attitude_axes)
+    attitude_axes_degraded: bool = False   # sink fell back to the 4-axis frame mid-run
+    rc_chan_raw: tuple | None = None       # RC_CHANNELS chan1..chan8 raw PWM (probe / trim)
     # auxiliary sensors, keyed by name
     sensors: dict[str, SensorStat] = field(default_factory=dict)
     conn: Conn = Conn.OFFLINE
@@ -196,6 +294,17 @@ class PayloadState:
     tilt_drive: float = 0.0              # -1 down / 0 idle / +1 up, as commanded
     tilt_conn: Conn = Conn.OFFLINE
     tilt_note: str = ""
+    # The TRACKED mount angle (control/tilt_tracker.py): the vehicle's report
+    # when there is one, else the tag localizer's measurement, else the
+    # operator's typed value, else held UP/DOWN dead-reckoned at a [예측]
+    # rate. ``tilt_est_src`` says which, ``tilt_est_unc_deg`` how much doubt,
+    # and ``tilt_epoch`` counts COMMANDED motion — the localizer resets its
+    # RGB-vs-C3 alignment when it changes (control/nav_fusion.py).
+    tilt_est_deg: float | None = None
+    tilt_est_src: str = "unknown"
+    tilt_est_unc_deg: float | None = None
+    tilt_epoch: int = 0
+    tilt_moving: bool = False
     # Free text from the backend about HOW the device is controlled on this
     # vehicle ("hold", "stepped, no feedback", "no button bit mapped"). The
     # panel prints it instead of implying a position that does not exist.
@@ -438,6 +547,10 @@ class TagOverlay:
     src_h: int = 0
     detect_ms: float = 0.0
     localizes: bool = False          # True = these detections drive the MPC
+    # "primary" = the localizing feed; "fallback" = a second calibrated feed
+    # whose fix stands in when the primary has none (control/nav_fusion.py);
+    # "overlay" = detections drawn, never solved.
+    role: str = "overlay"
     enabled: bool = True             # False = one last CLEAR after toggle-off
     # The camera model and capture time these corners belong to. Present so a
     # recording can carry RAW OBSERVATIONS, not just solved poses: rebuilding
@@ -522,9 +635,39 @@ class MpcStatus:
     diagnostic invites sign bugs in the thing meant to catch them.
     """
 
+    # ENGAGED = the mission MACHINERY is live: a datum was captured, the CSV is
+    # open, the state assembler is running, a mission may be armed and the
+    # reference (`ref_flu`, the plan stream, PolicyState) is real.
     engaged: bool = False
+    # COMMANDING = the station's controller is driving the vehicle. Until
+    # 2026-09-03 this was the SAME bit as `engaged`, and four consumers read
+    # `engaged` to mean this one: window.py's teleop pump/gate and command
+    # bars, and the trajectory chip's tracking-error line. POLICY OBSERVE
+    # (--policy-observe) is the first mode where they differ — the diffusion
+    # policy runs, its plans are composed and drawn, and NOTHING leaves the
+    # station because the pilot is flying by hand. Anything that means "the
+    # station is driving" MUST read this field, never `engaged`: a consumer
+    # that gets it wrong either steals the pilot's stick or prints a tracking
+    # error for a loop that was never closed.
+    commanding: bool = False
+    # This run's controller output is MUTED — LOW level None (teleop) in the
+    # trajectory panel; `--policy-observe` is the launch alias that preselects
+    # it. True iff `mode == "none"`. A RECORD
+    # BOUNDARY: nothing measured in an observe run is comparable with a
+    # closed-loop run — no wrench was ever computed, and the vehicle went
+    # where the pilot flew it, not where the reference asked.
+    observe: bool = False
     traj_on: bool = False
-    mode: str = ""                   # "mpc" | "dobmpc"
+    # The LOW level the worker is on: "none" | "pid" | "mpc" | "dobmpc" |
+    # "mpc_tuned" | "dobmpc_tuned" | "mpcc" | "dobmpcc". "none" is TELEOP —
+    # the station commands nothing (observe is True iff mode is "none"); the
+    # panel's LOW combo is re-synced from this field (honesty rule).
+    mode: str = ""
+    # A controller CSV is open OUTSIDE an engagement (REC on the depth feed
+    # -> set_sensor_log). The panel disables the LOW combo on it: the CSV
+    # pinned the run folder under the tree of the mode it was opened in, and
+    # set_mode refuses while it is open (2026-09-11 review).
+    csv_open: bool = False
     # The armed mission, PER SHAPE — a circle carries `radius` and no
     # `size`/`size_y`, a line carries `length`/`dir_deg`. Switch on
     # `scenario["kind"]` before touching a dimension key (meta schema 4).
@@ -536,6 +679,7 @@ class MpcStatus:
     w_hat: tuple = ()                # (6,) NED body wrench, N / N·m
     u_cmd: tuple = ()                # (6,) NED body wrench command
     axes: tuple = ()                 # (surge, sway, heave, yaw) sent, -1..+1
+    axes_rp: tuple = ()              # (roll, pitch) sent, -1..+1; () unless engage.attitude_axes
     p_flu: tuple | None = None       # measured position, world FLU
     ref_flu: tuple | None = None     # reference position, world FLU
     yaw_flu_deg: float | None = None
@@ -645,13 +789,261 @@ class PilotInput:
     active: frozenset[str] = frozenset()   # which inputs are held right now
     source: str = ""                       # "keyboard" | "buttons" | "gamepad"
     stamp: float = field(default_factory=now)
+    # The two attitude axes of the 6-DoF variant (2026-09-26). Trailing fields
+    # so every positional constructor above them keeps its meaning; 0.0 unless
+    # engage.attitude_axes is on (no pilot input drives them -- only the
+    # controller's K/M through allocation.wrench_to_axes). Signs are NED/FRD:
+    roll: float = 0.0      # +starboard-down (K, about x_FRD)
+    pitch: float = 0.0     # +nose-up (M, about y_FRD)
 
     @property
     def any_axis(self) -> bool:
-        return any(abs(v) > 1e-6 for v in (self.surge, self.sway, self.heave, self.yaw))
+        return any(abs(v) > 1e-6 for v in (self.surge, self.sway, self.heave,
+                                           self.yaw, self.roll, self.pitch))
 
     def clamped(self) -> "PilotInput":
         def c(v: float) -> float:
             return max(-1.0, min(1.0, float(v)))
-        return PilotInput(c(self.surge), c(self.sway), c(self.heave), c(self.yaw),
-                          self.active, self.source, self.stamp)
+        return PilotInput(surge=c(self.surge), sway=c(self.sway),
+                          heave=c(self.heave), yaw=c(self.yaw),
+                          active=self.active, source=self.source,
+                          stamp=self.stamp, roll=c(self.roll),
+                          pitch=c(self.pitch))
+
+
+# =============================================================================
+# diffusion policy (live plan source) — see rov_gui/backends/policy.py and
+# MpcWorker's `policy` mission shape. Three plain-data messages, one per hop:
+#   MpcWorker  -> PolicyWorker : PolicyState  (every 20 Hz tick when a policy
+#                                              worker exists; the proprio feed)
+#   PolicyWorker -> MpcWorker  : PolicyPlan   (one per inference; the RAW
+#                                              action chunk, TCP-relative)
+#   PolicyWorker -> window/MpcWorker : PolicyStatus (>= 1 Hz, stamped)
+# All stamps are on `now()` (monotonic). The ONLY place a stamp crosses into
+# the mission clock (t_traj) is MpcWorker._tick_policy_intake.
+# =============================================================================
+@dataclass
+class PolicyState:
+    """The vehicle as the policy must see it, one tick.
+
+    ``t_fix`` is the CAPTURE stamp of the tag fix behind ``eta`` (None when
+    there is no fix). The policy's proprio history is keyed on it, not on the
+    tick time: the assembler holds the same fix across ticks (a 20 Hz
+    staircase), so rows appended per tick would quantise the 66.7 ms motion cue
+    to {0, 1, 2} fixes. ``fix_fresh`` is False whenever ``eta`` is not a fresh
+    tag solution (station bridge active, dead-reckoning control, no fix).
+    ``epoch`` increments at every ENGAGE and every policy ARM; a plan built in
+    an older epoch is dropped by the consumer.
+    """
+
+    t: float
+    t_fix: float | None
+    eta: tuple                       # (6,) datum NED [x, y, z, roll, pitch, yaw]
+    fix_fresh: bool
+    epoch: int
+    active: bool                     # a policy mission is armed AND running
+    halted: bool                     # ...but latched off (escalation/divergence)
+    t0_traj: float | None            # mission clock origin (monotonic), for logs only
+    eta_start: tuple | None          # (6,) datum NED pose at policy START
+    grip_width_m: float              # open-loop jaw width estimate, metres
+    engaged: bool
+    stamp: float = field(default_factory=now)
+
+
+# ---------------------------------------------------------------------------
+# The policy ACTION contract vocabulary (2026-09-07, DP action 10-dim -> 5-dim).
+# stdlib-only module, so perception (dp_policy), control (policy_frames,
+# geometry, workers) and the tools all spell the representation the same way.
+# ---------------------------------------------------------------------------
+#: Legacy (16, 10) [pos(3), rot6d(6), gripper_width_m] -- the 2026-09-01 checkpoint;
+#: kept DECODABLE so old plans.jsonl still render, never flown again.
+ACTION_REPR_POSE10D = "pose10d"
+#: (16, 5) [dx, dy, dz, dyaw, gripper_width_m]: dp in the current TCP/camera frame
+#: (bit-identical to the legacy columns 0:3), dyaw = the C3-mount-referenced ZYX
+#: yaw of the relative TCP rotation (NED sign), width unchanged. Encoder:
+#: universal_manipulation_interface/umi/common/yaw_action.py (transcribed in
+#: control/policy_frames.py).
+ACTION_REPR_POS_YAW_WIDTH = "pos_yaw_width"
+#: (16, 7) [dx, dy, dz, dyaw, droll, dpitch, gripper_width_m] (2026-09-26, the
+#: 6-DoF variant): cols 0:4 and 6 are bit-identical to pos_yaw_width's cols 0:4
+#: and 4; (droll, dpitch, dyaw) = ZYX Euler of R_bt @ R_rel @ R_bt^T, the
+#: relative TCP rotation carried into the body(FRD) frame of a vehicle wearing
+#: the camera on the C3 mount (yaw_action.encode_pos_rpy; transcribed in
+#: control/policy_frames.py). Signs FRD: +dyaw = CW from above, +dpitch =
+#: nose-up, +droll = starboard-down. Whether the roll/pitch columns are FLOWN
+#: or dropped-and-logged is config policy.attitude_track (default false).
+ACTION_REPR_POS_RPY_WIDTH = "pos_rpy_width"
+ACTION_REPR_BY_DIM = {10: ACTION_REPR_POSE10D, 5: ACTION_REPR_POS_YAW_WIDTH,
+                      7: ACTION_REPR_POS_RPY_WIDTH}
+ACTION_DIM_BY_REPR = {v: k for k, v in ACTION_REPR_BY_DIM.items()}
+#: The DEFAULT of config ``policy.action_repr`` [스펙: ckpt cfg
+#: shape_meta.action], pinned PER MISSION at ARM: the worker's checkpoint
+#: contract must equal the pinned value to arm, and every plan is checked
+#: against it at intake (the obs_dt pattern) -- so a stale policy.ckpt pointing
+#: at the 10-dim network is refused instead of silently decoded.
+POLICY_ACTION_REPR = ACTION_REPR_POS_YAW_WIDTH
+#: The representations a mission may be armed on (config policy.action_repr
+#: must be one of these; the legacy pose10d is decodable for old records only).
+POLICY_ACTION_REPRS_FLYABLE = (ACTION_REPR_POS_YAW_WIDTH, ACTION_REPR_POS_RPY_WIDTH)
+#: The ONE default checkpoint path (dp_policy.DEFAULT_CKPT, geometry's policy
+#: block, the backend fallback block and the parity reference tool all derive
+#: from here). Updated when a retrain is selected; the YAML policy.ckpt lines
+#: (config/hw_mpc.yaml, config/land_dp.yaml) must carry the same string
+#: (rov_gui/tests/test_policy_ckpt_paths.py).
+#: The UMI training/inference checkout, VENDORED into this repo on 2026-09-09
+#: (external/UMI_aquatic, a nested git repo with its own history and the
+#: hao-l1/UMI_aquatic remote -- the same shape as external/iPhUMI). It carries
+#: commit 7948a08 "umi_depth_5d", this project's own 5-dim action work, so the
+#: training code and the station that flies its checkpoints now live together.
+#: Training runs from here; dp_policy imports its encoder/denoiser from here.
+#: The old ~/Desktop/universal_manipulation_interface copy is DORMANT -- edits
+#: there reach nothing.
+POLICY_UMI_REPO = str(Path(__file__).resolve().parents[1] / "external" / "UMI_aquatic")
+#: Where the BEST checkpoint of every training run lives -- THIS repo's own
+#: ``data/checkpoints`` (gitignored, .gitignore "data/"), one flat folder
+#: (operator request 2026-09-14): ``<YYYYMMDD_HHMMSS>_<task>_<exp_name>.ckpt``
+#: is a symlink into that run's own ``checkpoints/`` and the ``.json`` beside
+#: it says how it was picked (``selected`` = a held-out replay, ``auto`` = the
+#: top-1 by train_loss the workspace publishes as it trains). The runs
+#: themselves are ``data/YYYYMMDD/MMDD_HHMMSS_train_<task>_<exp>/`` with
+#: every topk checkpoint kept as before. Not the UMI checkout's: the two were
+#: split on 2026-09-09 -- ``POLICY_UMI_REPO`` above stays a CODE dependency
+#: (train.py, and the two modules dp_policy imports at inference), while the
+#: checkpoints live next to the project that flies them. The UMI workspace
+#: yamls' hydra.run.dir write new runs under data/<date>/ and publish their
+#: best into this folder (diffusion_policy/common/best_ckpt.py).
+POLICY_OUTPUTS_ROOT = str(Path(__file__).resolve().parents[1] / "data" / "checkpoints")
+POLICY_CKPT_DEFAULT = (f"{POLICY_OUTPUTS_ROOT}/"
+                       "20260907_113747_umi_depth_5d_can_grasp_depth_5d_v0.ckpt")
+#: ^ epoch 195 of the 2026-09-07 5-dim retrain (task umi_depth_5d), selected on
+#: the 219-window held-out set with the DEPLOYED weights (policy.weights: model,
+#: not the EMA copy): pos RMSE 17.3 mm / yaw RMS 2.20 deg (zero-predictor 2.56,
+#: corr +0.56) / width 7.3 mm vs the 2026-09-01 10-dim checkpoint's 21.0 / 2.24 /
+#: 7.6 on the same tool and windows [측정: <run>/checkpoints/selected.json].
+#: The run's 32-window val curve is computed on the EMA weights and ranks this
+#: family BACKWARDS (it picked epoch 10, the worst measured epoch) -- never rank
+#: on it. The 2026-09-01 run stays readable for old records; flying it again
+#: would need pose10d in POLICY_ACTION_REPRS_FLYABLE as well (arm + intake).
+
+
+@dataclass
+class PolicyPlan:
+    """One inference: the policy's RAW output plus everything needed to
+    attribute it afterwards. ``action`` is (16, D) float32 in the checkpoint's
+    ``action_repr``: D = 5 [dx, dy, dz, dyaw, gripper_width_m] (pos_yaw_width,
+    the 2026-09-07 retrain), D = 7 [dx, dy, dz, dyaw, droll, dpitch, width]
+    (pos_rpy_width, the 6-DoF variant) or the legacy D = 10 [pos(3), rot6d(6),
+    width] (pose10d); every knot is relative to the TCP pose at ``obs_t`` (knot 0 =
+    the observation time itself); composition into NED happens in MpcWorker,
+    never here."""
+
+    plan_id: int
+    epoch: int
+    obs_t: float                     # monotonic stamp of the newest depth frame
+    t_emit: float
+    infer_ms: float
+    action: object                   # np.ndarray (16, D) float32, D per action_repr
+    lowdim: dict                     # the lowdim obs rows fed to the network
+    obs_rows_t: tuple                # (t_prev, t_now) the two proprio row stamps
+    obs_fix_t: tuple                 # the fix stamps bracketing those rows
+    obs_pair_dt_s: float             # actual spacing of the two depth frames
+    pair_dup: bool                   # True when the newest frame was duplicated
+    depth_src: str                   # rect_left | color_aligned | identity
+    depth_coverage: float            # of the 224 obs, from the grid map
+    depth_valid: float               # measured-valid fraction of THIS obs
+    ckpt_sha1: str
+    # The time base the 16 raw knots live on, from the CHECKPOINT's contract
+    # (down_sample_steps / dataset fps), so the consumer can refuse a plan
+    # whose clock disagrees with the config-derived one instead of silently
+    # rescaling every speed (verify 2026-09-02).
+    obs_dt_s: float = 0.0
+    # The checkpoint contract's action representation (ACTION_REPR_*); "" =
+    # unknown, in which case compose_plan infers it from the array width. The
+    # consumer refuses a plan whose value is not POLICY_ACTION_REPR.
+    action_repr: str = ""
+    stamp: float = field(default_factory=now)
+
+
+@dataclass
+class PolicyPlanViz:
+    """One composed policy plan, for DRAWING. Emitted once per plan (~2 Hz).
+
+    Separate from :class:`PolicyPlan` because that one is the network's raw
+    (16, D) TCP-relative output, which is not a thing that can be plotted:
+    only ``MpcWorker`` knows the anchor and the extrinsic that turn it into a
+    datum-NED polyline. This carries the RESULT of that composition — the same
+    array ``plans.jsonl`` records as ``raw.p_ned`` — plus the filter's verdict,
+    because a plan the filter REJECTED is exactly the one the operator needs to
+    see: on the runs so far that is nearly all of them, and nothing on screen
+    showed what the network had actually asked for.
+
+    ``p_ned``/``yaw`` are in the ENGAGE-DATUM frame (the panel's ``_to_map``
+    turns them into map coordinates), and are plain nested lists rather than a
+    numpy view, per this module's rule about buffers someone else may overwrite.
+    """
+
+    plan_id: int
+    status: str                      # accept | clip | reject | late | skipped
+    p_ned: tuple                     # ((x...), (y...), (z...)) datum NED [m]
+    yaw: tuple                       # (K,) rad
+    t0: float                        # first knot, mission clock [s]
+    dt: float                        # knot spacing [s]
+    reason: str = ""                 # the FIRST reason, for the on-plot label
+    stamp: float = field(default_factory=now)
+    rp: tuple | None = None          # ((roll...), (pitch...)) rad; None on a 4-DoF plan
+
+    @property
+    def n_knots(self) -> int:
+        return len(self.p_ned[0]) if self.p_ned else 0
+
+
+#: ``DepthObsBuilder.why`` before any grid was offered (perception/policy_obs.py
+#: sets it in __init__/reset). Shared here so the controller's refusal reads it
+#: as "no grid yet", NOT as a refused grid (integration 2026-09-02).
+POLICY_GRID_WHY_IDLE = "no grid set"
+
+
+@dataclass
+class PolicyStatus:
+    """What the policy worker is doing. Stamped: a consumer must refuse a
+    stale one (a dead worker must not stay 'ready' forever)."""
+
+    ready: bool = False
+    loading: bool = False
+    error: str = ""
+    hz: float = 0.0
+    infer_ms: float = 0.0
+    depth_src: str = ""
+    note: str = ""
+    n_plans: int = 0
+    n_skip: int = 0
+    # The depth GRID's state, separately from the session's: a grid the
+    # builder REFUSED (coverage below policy.min_obs_coverage, live camera
+    # model != training model) leaves depth_src set and ready True, so the
+    # controller must read THESE to refuse arming (verify 2026-09-02).
+    grid_ok: bool = False
+    grid_why: str = ""               # the builder's reason when not ok (POLICY_GRID_WHY_IDLE = no grid yet)
+    obs_dt_s: float = 0.0            # the checkpoint's obs stride, for the arm check
+    action_repr: str = ""           # the checkpoint's action representation, for the arm check
+    # The C3 MOUNT check (2026-09-07): a pos_yaw_width checkpoint carries the
+    # rotation its yaw label was defined on (shape_meta.action.yaw_axis_R_frd_cam)
+    # and the worker compares it with hw_nav's R_frd_cam('main'); a mismatch
+    # means every dyaw would be decoded about a different axis than it was
+    # labelled on, so the controller refuses to arm. True with no yaw-axis keys
+    # (legacy checkpoint, stub) -- the arm check then rests on action_repr.
+    mount_ok: bool = True
+    mount_why: str = ""
+    # WHICH checkpoint the worker HOLDS right now (loading, ready or failed)
+    # — the truth the trajectory panel's picker shows and the controller pins
+    # at ARM (scen["ckpt"] / scen["ckpt_sha1"]); the config's policy.ckpt is
+    # only the launch seed since the panel picker (2026-09-11). `ckpt_sha1`
+    # is the session's sha1 head once READY, "" otherwise (the stub has none).
+    ckpt: str = ""
+    ckpt_sha1: str = ""
+    # Why the last panel pick was REFUSED (mission armed, still loading, not
+    # a file, FS-parity mismatch, worker not running) or "" — the panel shows
+    # it in red for a few seconds; a refusal that only reached the log was
+    # invisible next to a name that silently snapped back (review 2026-09-11).
+    ckpt_note: str = ""
+    conn: Conn = Conn.OFFLINE
+    stamp: float = field(default_factory=now)

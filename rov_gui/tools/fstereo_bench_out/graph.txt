@@ -1,0 +1,17 @@
+# fstereo_bench.py graph — 2026-09-02 10:57:15
+# gpu: NVIDIA GeForce RTX 5090, torch 2.11.0+cu128, other compute processes at start: none, at end: none, --force: False
+# frames: /home/bdml/Desktop/data collection/videos episodes ('61', '66', '12') frames (10, 90, 170)
+# capture ms includes three eager warm-up passes
+
+9 real pairs; the shipped FStereoSession, graph on vs off, per input size; ms = one _disp_at call (cv2 resize + H2D + forward + D2H + resize-back), median over the pairs
+    input it | capture ms replay ms eager ms | max|replay-eager| px equal | note
+ 640x400   8 |       1583     105.2    114.9 |               0.0000  True | scale 1.0
+ 480x300   8 |       1124      67.2     74.9 |               0.0000  True | scale 0.75
+ 320x200  16 |       1084      48.3     60.5 |               0.0000  True | scale 0.5, iters 16
+ 320x200   8 |        207      36.8     45.4 |               0.0000  True | scale 0.5 (shipped)
+ 320x200   4 |        172      31.0     37.9 |               0.0000  True | scale 0.5
+ 256x160   8 |        973      30.4     38.7 |               0.0000  True | scale 0.4
+ 224x140   8 |       1010      25.5     34.3 |               0.0000  True | 224 wide, isotropic
+ 224x140   4 |        141      22.7     29.3 |               0.0000  True | 224 wide, isotropic
+ 224x224   8 |       1033      30.5     38.7 |               0.0000  True | 224x224 anisotropic
+ 160x100   8 |        995      23.5     31.3 |               0.0000  True | scale 0.25

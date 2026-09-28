@@ -1,0 +1,24 @@
+{
+  "hull_bbox_bl": {
+    "lo": [
+      -0.2313,
+      -0.282,
+      -0.1637
+    ],
+    "hi": [
+      0.2259,
+      0.2929,
+      0.0902
+    ]
+  },
+  "dome_region_max_x": 0.2084,
+  "lens_height_above_lowest_hull_m": {
+    "pitch_0": 0.2969,
+    "pitch_5.33_nose_up": 0.3251
+  },
+  "cam_t_flu_minus_cad_lens": [
+    0.1115,
+    -0.0055,
+    -0.0283
+  ]
+}

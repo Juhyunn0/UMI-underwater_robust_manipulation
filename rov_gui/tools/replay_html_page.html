@@ -1,0 +1,625 @@
+<meta charset="utf-8">
+<!-- FIRST LINE, and it must stay there. Opened as a local file this page
+     has no server to send a Content-Type, so with no charset declared a
+     browser falls back to windows-1252 and every glyph in the transport
+     bar (PLAY/PAUSE, the arrows, the middots) renders as mojibake. The
+     artifact host injects its own charset, so this only ever showed up in
+     the copy meant for sharing — which is the copy that matters.
+     A charset meta is only honoured inside the first 1024 bytes. -->
+<title>Pool Replay 0903</title>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* The station's own palette (rov_gui/theme.py), shipped with the data.
+   Deliberately single-theme: theme.py's reason is that a control station is
+   flown in a darkened cabin and a light UI next to a dark video feed destroys
+   the operator's dark adaptation. A replay of that run is read the same way. */
+:root{
+  --bg:#0b0f14; --panel:#121820; --panel-hi:#18202b; --border:#22303f;
+  --border-hi:#2e4356; --text:#c7d5e2; --dim:#7b8ea1; --faint:#4d5f70;
+  --accent:#38bdf8; --ok:#22c55e; --warn:#f59e0b; --fail:#ef4444;
+  --plan:#ff1f1f;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,Segoe UI,sans-serif;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);
+     font-size:13px;overflow:hidden}
+#app{display:flex;flex-direction:column;height:100%;height:100dvh;
+     min-height:100vh}
+
+/* ---- header ---------------------------------------------------------- */
+header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+  padding:9px 14px;background:var(--panel);border-bottom:1px solid var(--border)}
+.run{font-family:var(--mono);font-weight:600;font-size:14px;letter-spacing:.02em}
+.run small{color:var(--faint);font-weight:400;margin-left:8px}
+.chips{display:flex;gap:6px;flex-wrap:wrap}
+.chip{font-family:var(--mono);font-size:10.5px;letter-spacing:.06em;
+  text-transform:uppercase;padding:3px 8px;border-radius:3px;
+  border:1px solid var(--border-hi);color:var(--dim);white-space:nowrap}
+.chip.on{color:var(--accent);border-color:#1d4a63;background:#0e2230}
+.chip.ok{color:var(--ok);border-color:#1c4429;background:#0d1f14}
+.chip.bad{color:var(--fail);border-color:#5a2323;background:#210f0f}
+.spacer{flex:1 1 auto}
+.legend{display:flex;gap:14px;align-items:center;font-family:var(--mono);
+  font-size:11px;color:var(--dim)}
+.legend i{display:inline-block;width:22px;height:0;vertical-align:middle;
+  margin-right:6px;border-top-width:3px;border-top-style:solid}
+.ramp{display:inline-block;width:52px;height:7px;vertical-align:middle;
+  margin:0 6px;border-radius:2px;
+  background:linear-gradient(90deg,#440154,#3b528b,#21918c,#5ec962,#fde725)}
+
+/* ---- stage ----------------------------------------------------------- */
+#stage{position:relative;flex:1 1 auto;min-height:0;background:var(--bg)}
+#cv{position:absolute;inset:0;width:100%;height:100%;display:block;
+    cursor:grab;touch-action:none}
+#cv.drag{cursor:grabbing}
+.hud{position:absolute;font-family:var(--mono);font-size:11.5px;
+  line-height:1.55;pointer-events:none;
+  background:rgba(11,15,20,.74);border:1px solid rgba(34,48,63,.85);
+  border-radius:4px;padding:6px 9px;backdrop-filter:blur(2px)}
+.hud .why{color:var(--faint);display:block;max-width:40ch}
+#hud-l{left:12px;top:10px;color:var(--dim)}
+#hud-l b{color:var(--text);font-weight:500}
+#hud-r{right:12px;top:10px;text-align:right;color:var(--dim);
+  max-width:min(42ch,38vw);white-space:normal;word-break:break-word}
+#eye{position:absolute;right:12px;bottom:12px;display:flex;gap:6px;
+  background:rgba(18,24,32,.92);border:1px solid var(--border);
+  border-radius:5px;padding:6px}
+#eye button{font-family:var(--mono);font-size:11px}
+
+/* ---- transport ------------------------------------------------------- */
+footer{display:flex;align-items:center;gap:12px;padding:9px 14px;
+  background:var(--panel);border-top:1px solid var(--border);flex-wrap:wrap}
+button,select{font-family:var(--mono);font-size:12px;color:var(--text);
+  background:var(--panel-hi);border:1px solid var(--border-hi);
+  border-radius:4px;padding:5px 11px;cursor:pointer}
+button:hover,select:hover{border-color:var(--accent);color:#fff}
+button:focus-visible,select:focus-visible,input:focus-visible{
+  outline:2px solid var(--accent);outline-offset:2px}
+button.on{color:var(--accent);border-color:#1d4a63;background:#0e2230}
+#play{min-width:78px}
+#clock{font-family:var(--mono);font-size:12.5px;color:var(--text);
+  min-width:132px;font-variant-numeric:tabular-nums}
+#clock span{color:var(--faint)}
+input[type=range]{flex:1 1 240px;min-width:160px;accent-color:var(--accent);
+  height:22px;background:transparent;cursor:pointer}
+.note{font-family:var(--sans);font-size:11.5px;color:var(--faint);
+  padding:0 14px 9px;background:var(--panel);margin:0}
+.note code{font-family:var(--mono);color:var(--dim)}
+@media (max-width:720px){
+  .legend{display:none} #hud-r{display:none}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+
+<div id="app">
+  <header>
+    <div class="run" id="run-id">—</div>
+    <div class="chips" id="chips"></div>
+    <div class="spacer"></div>
+    <div class="legend">
+      <span><i style="border-color:#ff1f1f;border-top-style:dashed"></i>DP reference</span>
+      <span>trail<span class="ramp"></span>now</span>
+      <span><i style="border-color:#22c55e"></i>ROV</span>
+    </div>
+  </header>
+
+  <div id="stage">
+    <canvas id="cv"></canvas>
+    <div class="hud" id="hud-l"></div>
+    <div class="hud" id="hud-r"></div>
+    <div id="eye">
+      <button id="b3d" class="on" title="orthographic tilt / straight down">3D</button>
+      <button id="bfollow" class="on" title="keep the hull centred">FOLLOW</button>
+      <button id="bfit" title="frame the whole tag floor">FIT</button>
+    </div>
+  </div>
+
+  <footer>
+    <button id="play">▶ PLAY</button>
+    <button id="prev" title="previous plan">◀</button>
+    <button id="next" title="next plan">▶</button>
+    <input type="range" id="scrub" min="0" max="1" step="1" value="0" aria-label="scrub">
+    <div id="clock">—</div>
+    <select id="speed" aria-label="speed">
+      <option value="0.25">0.25x</option><option value="0.5">0.5x</option>
+      <option value="1" selected>1x</option><option value="2">2x</option>
+      <option value="4">4x</option><option value="8">8x</option>
+    </select>
+  </footer>
+  <p class="note" id="note"></p>
+</div>
+
+<script>
+const D = /*__RUN_DATA__*/null;
+const S = D.style;
+
+/* ====================================================================== *
+ * PORTED FROM rov_gui/widgets/trajectory.py — the camera only.
+ * Everything metric (datum -> map, FLU -> NED, the z offset) was already
+ * applied by the real widget before this file was written; see the tool's
+ * docstring. These four are the cosmetic half, and `probe()` below checks
+ * them against Qt's own output on load.
+ * ====================================================================== */
+const V = {three_d:true, az:25, el:35, zoom:2, panx:0, pany:0, z_centre:0,
+           W:900, H:680};
+
+function basis3(azDeg, elDeg){
+  const az = azDeg*Math.PI/180, el = elDeg*Math.PI/180;
+  const ca=Math.cos(az), sa=Math.sin(az), ce=Math.cos(el), se=Math.sin(el);
+  const f=[ce*ca, ce*sa, se];                 // eye -> centre (also _view_f)
+  const r=[-sa, ca, 0];
+  const u=[r[1]*f[2]-r[2]*f[1], r[2]*f[0]-r[0]*f[2], r[0]*f[1]-r[1]*f[0]];
+  return {r:r, u:u, f:f};
+}
+function fit(v){                               // _fit
+  let x0=-2, x1=2, y0=-2, y1=2;
+  if (v.pool && v.pool.length){
+    const xs=v.pool.map(c=>c[0]), ys=v.pool.map(c=>c[1]);
+    x0=Math.min(...xs); x1=Math.max(...xs);
+    y0=Math.min(...ys); y1=Math.max(...ys);
+  }
+  const w=Math.max(0.5,y1-y0), h=Math.max(0.5,x1-x0);
+  return {s:0.85*Math.min(v.W/w, v.H/h)*v.zoom, cx:(x0+x1)/2, cy:(y0+y1)/2};
+}
+function px(x, y, z, v){                       // _px
+  v = v || V;
+  const F = fit(v);
+  if (!v.three_d)
+    return [v.W/2 + (y-F.cy)*F.s + v.panx, v.H/2 - (x-F.cx)*F.s + v.pany];
+  const B = basis3(v.az, v.el);
+  const dx=x-F.cx, dy=y-F.cy, dz=z-(v.z_centre||0);
+  return [v.W/2 + (dx*B.r[0]+dy*B.r[1]+dz*B.r[2])*F.s + v.panx,
+          v.H/2 - (dx*B.u[0]+dy*B.u[1]+dz*B.u[2])*F.s + v.pany];
+}
+function bodyToMap(p, o, yaw){                 // rov_shape.body_to_map
+  const ca=Math.cos(yaw), sa=Math.sin(yaw), dr=-p[1];
+  return [o[0]+ca*p[0]-sa*dr, o[1]+sa*p[0]+ca*dr, o[2]-p[2]];
+}
+
+/* The self-check. A page that draws the run in a frame of its own would look
+ * perfectly plausible — that is exactly the bug replay_run.py was built to
+ * make impossible, so the port is not trusted, it is measured. */
+function probe(){
+  const p = D.probe, v = {three_d:true, az:p.az, el:p.el, zoom:p.zoom,
+                          panx:0, pany:0, z_centre:p.z_centre,
+                          W:p.w, H:p.h, pool:p.pool};
+  let worst = 0;
+  p.pts.forEach((q,i)=>{
+    const got = px(q[0],q[1],q[2],v), want = p.px[i];
+    worst = Math.max(worst, Math.hypot(got[0]-want[0], got[1]-want[1]));
+  });
+  return worst;
+}
+
+/* ====================================================================== *
+ * data
+ * ====================================================================== */
+const TICKS = D.ticks, PLANS = D.plans;
+const T0 = TICKS.length ? TICKS[0][0] : 0;
+const T1 = TICKS.length ? TICKS[TICKS.length-1][0] : 1;
+V.pool = D.pool;
+
+const RAMP = S.viridis;
+function ageColor(u, alpha){
+  u = Math.max(0, Math.min(1, u));
+  const seg = u*(RAMP.length-1);
+  const i = Math.min(Math.floor(seg), RAMP.length-2), f = seg-i;
+  const a=RAMP[i], b=RAMP[i+1];
+  return `rgba(${Math.round(a[0]+f*(b[0]-a[0]))},${Math.round(a[1]+f*(b[1]-a[1]))},`
+       + `${Math.round(a[2]+f*(b[2]-a[2]))},${((alpha==null?1:alpha)*(0.25+0.75*u)).toFixed(3)})`;
+}
+
+let idx = 0;                 // current tick
+let playing = false, speed = 1, follow = true;
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+
+function tAt(i){ return TICKS[Math.max(0,Math.min(TICKS.length-1,i))][0]; }
+
+/* plans visible at time t: the newest POLICY_PLAN_KEEP whose stamp has passed.
+ * Live, the panel also expires them after POLICY_PLAN_AGE_S; here the two
+ * newest ARE always fresh at 1.7 Hz, and holding them is what lets a paused
+ * frame still show what the network had just drawn. */
+function plansAt(t){
+  let hi = -1;
+  for (let i=0;i<PLANS.length;i++){ if (PLANS[i].t <= t) hi = i; else break; }
+  if (hi < 0) return [];
+  return PLANS.slice(Math.max(0, hi-(S.plan_keep-1)), hi+1);
+}
+
+/* ====================================================================== *
+ * draw
+ * ====================================================================== */
+function resize(){
+  const r = cv.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(r.width*dpr); cv.height = Math.round(r.height*dpr);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  V.W = r.width; V.H = r.height;
+  draw();
+}
+
+function centreOnVehicle(){
+  if (!TICKS.length) return;
+  const r = TICKS[idx];
+  V.panx = 0; V.pany = 0;
+  const q = px(r[1], r[2], r[3]);
+  V.panx = V.W/2 - q[0]; V.pany = V.H/2 - q[1];
+}
+
+function poly(pts, close){
+  ctx.beginPath();
+  pts.forEach((p,i)=>{ const q = px(p[0],p[1],p[2]||0);
+    i ? ctx.lineTo(q[0],q[1]) : ctx.moveTo(q[0],q[1]); });
+  if (close) ctx.closePath();
+}
+
+function drawTags(){
+  const F = fit(V), half = D.tag_size_m/2;
+  const ids = F.s*D.tag_size_m > 12;
+  ctx.lineWidth = 1;
+  ctx.font = '10px "IBM Plex Mono", monospace';
+  for (const [tx,ty,tyaw,tid] of D.tags){
+    const c=Math.cos(tyaw), s=Math.sin(tyaw);
+    const corners = [[-half,-half],[-half,half],[half,half],[half,-half]]
+      .map(([dx,dy])=>[tx+c*dx-s*dy, ty+s*dx+c*dy, 0]);
+    poly(corners, true);
+    ctx.fillStyle = 'rgba(123,142,161,.18)';
+    ctx.strokeStyle = 'rgba(77,95,112,.47)';
+    ctx.fill(); ctx.stroke();
+    if (ids){
+      const q = px(tx,ty,0);
+      ctx.fillStyle = 'rgba(123,142,161,.75)';
+      ctx.textAlign='center'; ctx.textBaseline='middle';
+      ctx.fillText(String(tid), q[0], q[1]);
+    }
+  }
+}
+
+function drawPool(){
+  if (!D.pool) return;
+  poly(D.pool.map(c=>[c[0],c[1],0]), true);
+  ctx.strokeStyle = 'rgba(123,142,161,.86)'; ctx.lineWidth = 2; ctx.stroke();
+}
+
+function drawTrail(){
+  const t = tAt(idx), t0 = t - S.trail_age_s;
+  let i0 = idx;
+  while (i0 > 0 && TICKS[i0-1][0] >= t0) i0--;
+  ctx.lineWidth = 2; ctx.lineCap = 'round';
+  for (let i=i0; i<idx; i++){
+    const a = TICKS[i], b = TICKS[i+1];
+    const u = (a[0]-t0)/Math.max(1e-6, S.trail_age_s);
+    ctx.strokeStyle = ageColor(u, 1);
+    const p = px(a[1],a[2],a[3]), q = px(b[1],b[2],b[3]);
+    ctx.beginPath(); ctx.moveTo(p[0],p[1]); ctx.lineTo(q[0],q[1]); ctx.stroke();
+  }
+}
+
+/* The vehicle. Faces are back-face culled per part (each part is convex, so
+ * that is exact within a part) then sorted far-to-near — the painter's
+ * algorithm, same as _draw_rov. Shading is |dot(normal, view)|: no light
+ * position, no specular. This is an instrument. */
+function drawRov(){
+  const r = TICKS[idx];
+  const o = [r[1], r[2], r[3]], yaw = r[4]*Math.PI/180;
+  const F = fit(V);
+  const hullPx = Math.abs(px(0,0,0)[0] - px(0,D.body.hull_w,0)[0]);
+  const base = S.ok;
+
+  if (!V.three_d || hullPx < 14){
+    // Flat footprint: the historical outline, plus the tool, plus the TCP.
+    const hull = D.body.parts.find(p=>p.kind==='hull');
+    const xs = hull.verts.map(v=>v[0]), ys = hull.verts.map(v=>v[1]);
+    const hl=Math.max(...xs), hw=Math.max(...ys);
+    const box = [[hl,-hw],[hl,hw],[-hl,hw],[-hl,-hw]]
+      .map(([a,b])=>bodyToMap([a,b,0],[o[0],o[1],0],yaw));
+    poly(box, true);
+    ctx.fillStyle='rgba(34,197,94,.16)'; ctx.strokeStyle=base;
+    ctx.lineWidth=2; ctx.fill(); ctx.stroke();
+    const tube = D.body.parts.find(p=>p.kind==='tube');
+    const tx = tube.verts.map(v=>v[0]);
+    const arm = [bodyToMap([Math.min(...tx),0,0],[o[0],o[1],0],yaw),
+                 bodyToMap([Math.max(...tx),0,0],[o[0],o[1],0],yaw)];
+    poly(arm,false); ctx.lineWidth=3; ctx.stroke();
+  } else {
+    const B = basis3(V.az, V.el), f = B.f;
+    const hullFaces = [], gripFaces = [];
+    for (const part of D.body.parts){
+      if (part.kind === 'thruster' && hullPx < 48) continue;   // detail floor
+      const vm = part.verts.map(v=>bodyToMap(v, o, yaw));
+      for (const face of part.faces){
+        const nm = bodyToMap(face.n, [0,0,0], yaw);
+        const facing = nm[0]*f[0] + nm[1]*f[1] + nm[2]*f[2];
+        if (facing >= 0) continue;                             // away from eye
+        const pts = face.i.map(i=>vm[i]);
+        let d = 0; for (const q of pts) d += q[0]*f[0]+q[1]*f[1]+q[2]*f[2];
+        (part.kind==='tube'||part.kind==='jaw' ? gripFaces : hullFaces)
+          .push([d/pts.length, Math.abs(facing), pts]);
+      }
+    }
+    hullFaces.sort((a,b)=>b[0]-a[0]); gripFaces.sort((a,b)=>b[0]-a[0]);
+    const paint = (g,a0,a1)=>{
+      ctx.lineWidth = 1;
+      for (const [,shade,pts] of g){
+        poly(pts, true);
+        const al = (a0 + (a1-a0)*Math.min(1,shade))/255;
+        ctx.fillStyle = `rgba(34,197,94,${al.toFixed(3)})`;
+        ctx.strokeStyle = 'rgba(34,197,94,.82)';
+        ctx.fill(); ctx.stroke();
+      }
+    };
+    // The gripper is painted AFTER the hull, never sorted with it: it hangs
+    // under the hull's front and from the default eye the hull would hide it.
+    // The jaw is the policy's TCP, so the picture is a cutaway on purpose.
+    paint(hullFaces, 40, 150);
+    paint(gripFaces, 150, 235);
+  }
+
+  // The heading line: the vehicle's axis THROUGH the COM, aft and ahead
+  // (widget `_draw_rov_heading`, operator request 2026-09-07). Dotted, in the
+  // hull's own colour, so it reads as part of the vehicle and not a series.
+  // Same policy as the widget: on every path and at every zoom, after the
+  // outline so nothing covers it.
+  if (D.body.heading){
+    const h0 = bodyToMap(D.body.heading[0], o, yaw),
+          h1 = bodyToMap(D.body.heading[1], o, yaw);
+    poly([h0,h1], false);
+    ctx.setLineDash([2,3]); ctx.lineWidth=1;
+    ctx.strokeStyle='rgba(34,197,94,.75)'; ctx.stroke(); ctx.setLineDash([]);
+  }
+
+  // The optical axis. A RAY, not a frustum — a cone would be a claim about
+  // what is visible, and this plot does not know the range. Only with the
+  // 3-D body, as in the widget: from above it is collinear with the heading
+  // line, and drawn over it the shared segment read as a marker of its own.
+  if (V.three_d && hullPx >= 14){
+    const a = bodyToMap(D.body.cam, o, yaw), b = bodyToMap(D.body.cam_tip, o, yaw);
+    poly([a,b], false);
+    ctx.setLineDash([5,4]); ctx.lineWidth=1.5;
+    ctx.strokeStyle='rgba(56,189,248,.85)'; ctx.stroke(); ctx.setLineDash([]);
+  }
+
+  // TCP (the jaw) — where the policy composes its reference.
+  const tcp = bodyToMap(D.body.tcp, o, yaw), q = px(tcp[0],tcp[1],tcp[2]);
+  ctx.beginPath(); ctx.arc(q[0],q[1],3.5,0,7); ctx.fillStyle=base; ctx.fill();
+}
+
+/* LAST, always. Painted before the vehicle they were invisible: the hull is a
+ * filled 0.43x0.53 m body and the plan is composed at the jaw, i.e. exactly
+ * there (2026-09-03). Colour was never the fix; draw order was. */
+function drawPlans(t){
+  const vis = plansAt(t);
+  vis.forEach((pl,i)=>{
+    const newest = i === vis.length-1;
+    ctx.strokeStyle = newest ? S.plan : 'rgba(255,31,31,.51)';
+    ctx.lineWidth = newest ? S.plan_w : S.plan_w_prev;
+    ctx.setLineDash(newest ? [9,6] : [6,5]);
+    ctx.lineJoin = 'round';
+    poly(pl.pts, false); ctx.stroke();
+    ctx.setLineDash([]);
+    const q = px(pl.pts[0][0], pl.pts[0][1], pl.pts[0][2]);
+    ctx.beginPath(); ctx.arc(q[0],q[1], newest?3:2, 0, 7); ctx.stroke();
+  });
+  return vis;
+}
+
+/* The z ruler. Anchored to the LEFT of the vehicle rather than at a fixed
+ * world corner (which is off-screen at replay zooms) or at the centre (which
+ * lands on the hull). Map z is DOWN, so deeper is toward the bottom. */
+function drawZAxis(){
+  if (!V.three_d || !TICKS.length) return;
+  const r = TICKS[idx];
+  const zAt = z => px(r[1], r[2], z)[1];       // the CAMERA places the ticks
+  const perM = Math.abs(zAt(1) - zAt(0));
+  if (perM < 8) return;
+
+  // Anchor off the hull's own projected left edge, not a fixed offset: at
+  // replay zooms the vehicle is 200+ px across and a constant 118 px puts the
+  // ruler through the middle of it.
+  const yaw = r[4]*Math.PI/180, o = [r[1], r[2], r[3]];
+  const hull = D.body.parts.find(p=>p.kind==='hull');
+  let left = Infinity;
+  for (const v of hull.verts){
+    const m = bodyToMap(v, o, yaw);
+    left = Math.min(left, px(m[0], m[1], m[2])[0]);
+  }
+  const x = Math.round(left - 34);
+  if (x < 40 || x > V.W-40) return;
+
+  // Label spacing sets the step, so ticks can never collide.
+  const step = [0.05,0.1,0.25,0.5,1,2].find(v=>v*perM >= 26) || 5;
+  const span = Math.min(V.H*0.44, 2.0*perM);
+  const y0 = zAt(r[3]);
+  ctx.strokeStyle='rgba(77,95,112,.85)'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(x, y0-span/2); ctx.lineTo(x, y0+span/2); ctx.stroke();
+  ctx.font='10px "IBM Plex Mono", monospace';
+  ctx.textAlign='right'; ctx.textBaseline='middle';
+  const n = Math.ceil(span/2/(step*perM)) + 1;
+  const k0 = Math.round(r[3]/step);
+  for (let k=k0-n; k<=k0+n; k++){
+    const zv = k*step, y = zAt(zv);
+    if (y < y0-span/2 || y > y0+span/2) continue;
+    const here = Math.abs(zv - r[3]) < step*0.5;
+    ctx.beginPath(); ctx.moveTo(x-4,y); ctx.lineTo(x+(here?7:4),y);
+    ctx.strokeStyle = here ? 'rgba(56,189,248,.95)' : 'rgba(77,95,112,.85)';
+    ctx.stroke();
+    ctx.fillStyle = here ? 'rgba(56,189,248,.95)' : 'rgba(123,142,161,.9)';
+    ctx.fillText(zv.toFixed(2), x-8, y);
+  }
+  ctx.fillStyle='rgba(77,95,112,.95)'; ctx.textAlign='center';
+  ctx.fillText('z [m]', x, y0-span/2-11);
+  ctx.fillText('\u2193 deeper', x, y0+span/2+12);
+}
+
+function draw(){
+  ctx.fillStyle = S.bg; ctx.fillRect(0,0,V.W,V.H);
+  if (!TICKS.length) return;
+  if (follow) centreOnVehicle();
+  drawPool(); drawTags(); drawZAxis(); drawTrail(); drawRov();
+  const vis = drawPlans(tAt(idx));
+  hud(vis);
+}
+
+/* ====================================================================== *
+ * chrome
+ * ====================================================================== */
+function hud(vis){
+  const r = TICKS[idx];
+  const cur = vis.length ? vis[vis.length-1] : null;
+  document.getElementById('hud-l').innerHTML =
+    `${V.three_d?`3D az ${V.az.toFixed(0)} el ${V.el.toFixed(0)}`:'TOP'}`
+    + `  <span style="color:var(--faint)">(grid = tag plane)</span><br>`
+    + `x <b>${r[1].toFixed(3)}</b>  y <b>${r[2].toFixed(3)}</b>  `
+    + `z <b>${r[3].toFixed(3)}</b> m<br>yaw <b>${r[4].toFixed(1)}</b>&deg;`;
+  document.getElementById('hud-r').innerHTML = cur
+    ? `plan <b style="color:var(--text)">#${cur.id}</b> `
+      + `<span style="color:${cur.status==='ok'?'var(--ok)':'var(--warn)'}">`
+      + `${cur.status||'—'}</span><br>`
+      + `<span class="why" title="${(cur.reason||'').replace(/"/g,'&quot;')}">`
+      + `${cur.reason ? (cur.reason.length > 88
+            ? cur.reason.slice(0,86)+'\u2026' : cur.reason) : '&nbsp;'}</span>`
+      + `${cur.pts.length} knots · ${(tAt(idx)-cur.t).toFixed(2)} s old`
+    : 'no plan yet';
+  const el = document.getElementById('clock');
+  el.innerHTML = `${(tAt(idx)-T0).toFixed(2)}<span> / ${(T1-T0).toFixed(0)} s`
+    + ` · ${idx+1}/${TICKS.length}</span>`;
+}
+
+function setIdx(i){
+  idx = Math.max(0, Math.min(TICKS.length-1, i));
+  document.getElementById('scrub').value = idx;
+  draw();
+}
+
+document.getElementById('scrub').max = Math.max(0, TICKS.length-1);
+document.getElementById('scrub').addEventListener('input', e=>setIdx(+e.target.value));
+
+const playBtn = document.getElementById('play');
+function setPlaying(p){
+  playing = p;
+  playBtn.textContent = p ? '❚❚ PAUSE' : '▶ PLAY';
+  playBtn.classList.toggle('on', p);
+  if (p) { last = performance.now(); requestAnimationFrame(loop); }
+}
+playBtn.addEventListener('click', ()=>setPlaying(!playing));
+document.getElementById('speed').addEventListener('change', e=>speed=+e.target.value);
+
+// The step buttons walk PLANS, not ticks: a policy update is the unit of
+// this diagnosis, and 20 Hz ticks between two of them show nothing new.
+function stepPlan(dir){
+  setPlaying(false);
+  const t = tAt(idx);
+  let j = PLANS.findIndex(p=>p.t > t + 1e-6);
+  if (dir < 0){
+    let k = -1;
+    for (let i=0;i<PLANS.length;i++) if (PLANS[i].t < t - 1e-6) k = i; else break;
+    j = k;
+  }
+  if (j < 0 || j >= PLANS.length) return;
+  const want = PLANS[j].t;
+  let best = 0, bd = Infinity;
+  for (let i=0;i<TICKS.length;i++){
+    const d = Math.abs(TICKS[i][0]-want); if (d < bd){ bd = d; best = i; }
+  }
+  setIdx(best);
+}
+document.getElementById('prev').addEventListener('click', ()=>stepPlan(-1));
+document.getElementById('next').addEventListener('click', ()=>stepPlan(1));
+
+document.getElementById('b3d').addEventListener('click', e=>{
+  V.three_d = !V.three_d; e.target.classList.toggle('on', V.three_d); draw(); });
+document.getElementById('bfollow').addEventListener('click', e=>{
+  follow = !follow; e.target.classList.toggle('on', follow); draw(); });
+document.getElementById('bfit').addEventListener('click', ()=>{
+  follow = false; document.getElementById('bfollow').classList.remove('on');
+  V.zoom = 1; V.panx = 0; V.pany = 0; draw(); });
+
+let last = 0;
+function loop(now){
+  if (!playing) return;
+  const dt = (now-last)/1000; last = now;
+  const t = tAt(idx) + dt*speed;
+  if (t >= T1){ setIdx(TICKS.length-1); setPlaying(false); return; }
+  let i = idx; while (i < TICKS.length-1 && TICKS[i+1][0] <= t) i++;
+  setIdx(i);
+  requestAnimationFrame(loop);
+}
+
+// orbit / pan / zoom
+let drag = null;
+cv.addEventListener('pointerdown', e=>{
+  drag = {x:e.clientX, y:e.clientY, az:V.az, el:V.el, px:V.panx, py:V.pany,
+          shift:e.shiftKey};
+  cv.classList.add('drag'); cv.setPointerCapture(e.pointerId);
+});
+cv.addEventListener('pointermove', e=>{
+  if (!drag) return;
+  const dx = e.clientX-drag.x, dy = e.clientY-drag.y;
+  if (drag.shift || !V.three_d){
+    follow = false; document.getElementById('bfollow').classList.remove('on');
+    V.panx = drag.px + dx; V.pany = drag.py + dy;
+  } else {
+    V.az = drag.az + dx*0.35;
+    V.el = Math.max(5, Math.min(90, drag.el - dy*0.35));
+  }
+  draw();
+});
+const endDrag = ()=>{ drag = null; cv.classList.remove('drag'); };
+cv.addEventListener('pointerup', endDrag);
+cv.addEventListener('pointercancel', endDrag);
+cv.addEventListener('wheel', e=>{
+  e.preventDefault();
+  V.zoom = Math.max(0.3, Math.min(60, V.zoom * (e.deltaY < 0 ? 1.12 : 1/1.12)));
+  draw();
+}, {passive:false});
+
+addEventListener('keydown', e=>{
+  if (e.key === ' '){ e.preventDefault(); setPlaying(!playing); }
+  else if (e.key === 'ArrowRight'){ e.preventDefault(); stepPlan(1); }
+  else if (e.key === 'ArrowLeft'){ e.preventDefault(); stepPlan(-1); }
+});
+addEventListener('resize', resize);
+
+/* ---- header ---------------------------------------------------------- */
+document.getElementById('run-id').innerHTML =
+  `${D.run}<small>${D.csv}</small>`;
+const worst = probe();
+const chips = [
+  ['kind ' + D.kind, D.observe ? 'on' : ''],
+  [D.observe ? 'POLICY OBSERVE' : 'commanding', D.observe ? 'on' : ''],
+  [`${TICKS.length} ticks @ ${D.hz} Hz`, ''],
+  [`${PLANS.length} plans`, ''],
+  [`${D.tags.length} tags`, ''],
+  [D.datum ? 'datum ok' : 'NO DATUM — datum frame', D.datum ? '' : 'bad'],
+  [`projection ${worst < 0.05 ? 'verified' : 'MISMATCH ' + worst.toFixed(2) + ' px'}`,
+   worst < 0.05 ? 'ok' : 'bad'],
+];
+document.getElementById('chips').innerHTML = chips
+  .map(([t,c])=>`<span class="chip ${c}">${t}</span>`).join('');
+
+document.getElementById('note').innerHTML =
+  `Drag to orbit · shift-drag or drag in TOP to pan · wheel to zoom · space to `
+  + `play · ←/→ step one policy update. Every metric quantity here was computed `
+  + `by the station's own <code>TrajectoryView</code> before this page was `
+  + `written; the page owns only the camera, and the `
+  + `<b>projection</b> chip is that camera checked against Qt's output `
+  + `(worst error ${worst.toFixed(3)} px over ${D.probe.pts.length} probe points). `
+  + `Source of truth: <code>${D.run_path}</code>.`;
+
+resize();
+// Open on the FIRST policy update, not tick 0: the page exists to show the
+// red reference, and the run's first seconds have none.
+(function(){
+  let start = 0;
+  if (PLANS.length){
+    const want = PLANS[0].t;
+    let bd = Infinity;
+    for (let i=0;i<TICKS.length;i++){
+      const d = Math.abs(TICKS[i][0]-want); if (d < bd){ bd = d; start = i; }
+    }
+  }
+  setIdx(start);
+})();
+</script>

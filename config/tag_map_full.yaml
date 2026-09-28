@@ -1414,7 +1414,7 @@ duplicate_ids:
 - 70
 - 71
 metadata:
-  source: config/tag_map.yaml (frozen) grown over sessions/nav_runs/20260813_215640
+  source: config/tag_map.yaml (frozen) grown over data/20260813/0813_215640/nav_215640
   tool_version: rov_gui.tools.build_tag_map 1.0
   n_anchor_tags: 47
   n_new_tags: 81

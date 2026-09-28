@@ -76,6 +76,7 @@ class _Scene:
 
     def __init__(self, w: int = 640, h: int = 360, seed: int = 7):
         rng = np.random.default_rng(seed)
+        self.seed = int(seed)
         self.w, self.h = w, h
         # Blue-green vertical gradient with a vignette, i.e. what a wide-angle
         # camera in green water actually looks like.
@@ -112,8 +113,15 @@ class _Scene:
             img = cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)
         return img
 
-    def depth(self, t: float, w: int, h: int) -> np.ndarray:
-        """A uint16 millimetre map with a near object and invalid patches."""
+    def depth(self, t: float, w: int, h: int, frame_index: int = 0) -> np.ndarray:
+        """A uint16 millimetre map with a near object and invalid patches.
+
+        The holes are SEEDED per frame index (``default_rng(seed +
+        frame_index)``, spec v2 A14), so two runs of the demo produce the
+        same depth sequence and a policy dry-run's plans are reproducible —
+        a global ``np.random`` draw here changed every frame between runs
+        and made the offline e2e non-repeatable for no reason.
+        """
         yy = np.linspace(0, 1, h, dtype=np.float32)[:, None]
         d = (1200 + 4200 * (1.0 - yy)) * np.ones((1, w), np.float32)
         cx = int((0.5 + 0.35 * math.sin(t * 0.25)) * w)
@@ -123,7 +131,8 @@ class _Scene:
         d[y0:y1, x0:x1] = 900 + 60 * math.sin(t)
         depth = d.astype(np.uint16)
         # Stereo always has holes: low texture, occlusion, and the near limit.
-        depth[(np.random.random((h, w)) < 0.04)] = 0
+        rng = np.random.default_rng(self.seed + int(frame_index))
+        depth[(rng.random((h, w)) < 0.04)] = 0
         depth[:, : w // 32] = 0
         return depth
 
@@ -140,6 +149,13 @@ class DemoVideoWorker(TimerWorker):
         self._seq = 0
         self._last_pub = 0.0
         self.bus = None            # set by the backend, for VideoStat
+        # Set by DemoBackend under --policy: the policy worker's depth
+        # mailbox. The synthetic 640x400 map is ALREADY on the training target
+        # grid, so it is declared as `identity` (spec v2 A14/A16) — the demo
+        # exercises the pairing, the recipe and the clock plumbing, never the
+        # warp.
+        self.policy_mb = None
+        self._policy_grid_done = False
 
     def setup(self) -> None:
         self._t0 = time.monotonic()
@@ -156,11 +172,12 @@ class DemoVideoWorker(TimerWorker):
             # so the cost profile of the demo matches it.
             aux = None
             if name == "depth":
-                src = self.scene.depth(t, 640, 400)
+                src = self.scene.depth(t, 640, 400, frame_index=self._seq)
                 bgr = imaging.depth_to_bgr(src)
                 res = (640, 400)
                 enc = "16UC1"
                 aux = src            # the probe works in the demo too
+                self._tap_policy(src)
             elif name == "second":
                 bgr = self.scene.render(t, 640, 400, mono=True)
                 res = (640, 400)
@@ -180,6 +197,23 @@ class DemoVideoWorker(TimerWorker):
                 self.bus.video_stat.emit(stat)
         if (t - self._last_pub) > 0.5:
             self._last_pub = t
+
+    def _tap_policy(self, depth_mm: np.ndarray) -> None:
+        """The synthetic depth -> the policy mailbox, grid `identity`.
+
+        Gated on ``wanted()`` before the copy, the same off-costs-nothing
+        rule the hardware taps follow. Stamped ``now()`` — the demo has no
+        sensor latency to subtract.
+        """
+        mb = self.policy_mb
+        if mb is None or not mb.wanted():
+            return
+        from ..perception.policy_obs import GRID_IDENTITY, IdentityGrid
+        if not self._policy_grid_done:
+            self._policy_grid_done = True
+            mb.set_grid(IdentityGrid(size=(depth_mm.shape[1], depth_mm.shape[0])),
+                        GRID_IDENTITY)
+        mb.put(depth_mm.copy(), now(), GRID_IDENTITY)
 
 
 # =============================================================================
@@ -236,7 +270,7 @@ class DemoVehicleWorker(TimerWorker):
         # Depth of the tag MAT below the surface. The tag world has z=0 at the
         # mat with +z DOWN, so a swimming vehicle sits at NEGATIVE tag z —
         # which is what the real recordings show (-0.54 .. -1.30 m,
-        # sessions/nav_runs/*/fixes.csv). Modelling it keeps the demo in the
+        # data/*/*/nav_*/fixes.csv). Modelling it keeps the demo in the
         # same world as the pool instead of one where the vehicle is under
         # the floor.
         self.mat_depth = 1.4
@@ -251,6 +285,25 @@ class DemoVehicleWorker(TimerWorker):
         self.pitch = 0.0
         self.rate_p = 0.0
         self.rate_q = 0.0
+        # ---- the 6-DoF variant's toy attitude plant (2026-09-26). A
+        # second-order pendulum per axis, I*a'' + d*a' + k*a = K|M, ADDED to
+        # the scripted wobble above so a run with K = M = 0 (every 4-DoF
+        # run: the pendulum state stays exactly 0.0) publishes byte-identical
+        # attitude. I = rov_model heavy inertia + 0.12 rotational added mass
+        # [유도: bluerov2_mujoco_marinegym/rov_model.py + the sim placeholder];
+        # k = 1.35 N·m/rad [유도: ZG*W of the dobmpc plant]; d for zeta ~ 0.5
+        # [예측]. K = roll_axis*roll_nm, M = pitch_axis*pitch_nm with the
+        # config's axis_gain — SYNTHETIC like everything else in this module.
+        self.attitude_axes = False
+        self.sign_roll = 1.0
+        self.sign_pitch = 1.0
+        self.roll_nm = 13.2
+        self.pitch_nm = 7.2
+        self._pend_I = (0.3291 + 0.12, 0.6347 + 0.12)
+        self._pend_k = 1.35
+        self._pend_d = (0.78, 1.0)
+        self._pend = np.zeros(2)         # pendulum roll, pitch (rad)
+        self._pend_rate = np.zeros(2)    # ...and their rates
         self._imu_seq = 0
         self.mah = 0.0
         self.grip_cmd = 0.0
@@ -261,6 +314,12 @@ class DemoVehicleWorker(TimerWorker):
         self.armed = False
         self.tilt_deg = 0.0
         self.tilt_drive = 0.0
+        # The same tracker the real sink runs (control/tilt_tracker.py), fed
+        # the same commands, so the PAYLOAD panel's readout is exercised
+        # offline. The simulated mount "reports" its angle every tick — the
+        # MOUNT_STATUS path — so the demo shows measured, not dead-reckoned.
+        from ..control.tilt_tracker import tracker_from_opts
+        self.tilt_track = tracker_from_opts(opts)
         # Deliberately NOT manual at start: the real vehicle keeps whatever it
         # was left in, and the demo has to be able to reproduce arming into a
         # mode that drives the thrusters by itself.
@@ -270,6 +329,55 @@ class DemoVehicleWorker(TimerWorker):
         self.pose_locked = False
         self._log: SensorLog | None = None
         self._imu_log: SensorLog | None = None
+
+    def setup(self) -> None:
+        # The same switch the real sink reads (engage.attitude_axes), so a
+        # demo_e2e variant row exercises the flag the way the pool would.
+        try:
+            from ..control.geometry import MpcConfig
+
+            cfg = MpcConfig.load(getattr(self.opts, "mpc_config",
+                                         "config/hw_mpc.yaml"))
+            aa = cfg.engage.get("attitude_axes") or {}
+            sg = aa.get("sign") or {}
+            self.set_attitude_axes(bool(aa.get("enabled", False)),
+                                   (float(sg.get("roll", 1.0)),
+                                    float(sg.get("pitch", 1.0))))
+            self.roll_nm = float(cfg.axis_gain.get("roll_nm", 13.2))
+            self.pitch_nm = float(cfg.axis_gain.get("pitch_nm", 7.2))
+        except Exception:                                        # noqa: BLE001
+            self.set_attitude_axes(False)
+
+    def set_attitude_axes(self, enabled: bool, sign=(1.0, 1.0)) -> None:
+        """The command sink's slot, mirrored (hardware.MavlinkCommandSink)."""
+        self.attitude_axes = bool(enabled)
+        self.sign_roll = float(sign[0])
+        self.sign_pitch = float(sign[1])
+
+    def attitude_axes_state(self) -> dict:
+        # firmware_version says "(sim)" so a record of a demo run is
+        # recognisable as synthetic; the gate's parser (control/workers.py
+        # MpcWorker._parse_fw, re.search) still reads (4, 5, 1). The wire
+        # version string stays exactly "2.0" — the gate compares it.
+        return {"enabled": self.attitude_axes, "degraded": False,
+                "firmware_version": "4.5.1 (sim)", "mavlink_wire_version": "2.0",
+                "sign": (self.sign_roll, self.sign_pitch), "dropped": 0,
+                "ext_sent": False, "degraded_at": None, "rc_chan_raw": None}
+
+    def _step_pendulum(self, cmd: PilotInput, dt: float) -> None:
+        """One tick of the toy roll/pitch plant. K/M reach it only under
+        attitude_axes (the wire gate), through the same sign the sink
+        applies; otherwise the torque is 0 and a zero state stays zero."""
+        if self.attitude_axes:
+            tau = (self.sign_roll * float(cmd.roll) * self.roll_nm,
+                   self.sign_pitch * float(cmd.pitch) * self.pitch_nm)
+        else:
+            tau = (0.0, 0.0)
+        for i in range(2):
+            acc = ((tau[i] - self._pend_d[i] * self._pend_rate[i]
+                    - self._pend_k * self._pend[i]) / self._pend_I[i])
+            self._pend_rate[i] += acc * dt
+            self._pend[i] += self._pend_rate[i] * dt
 
     # -------------------------------------------------------------- commands
     @Slot(object)
@@ -296,10 +404,20 @@ class DemoVehicleWorker(TimerWorker):
     def set_tilt(self, direction: float) -> None:
         """Held, like the real mount: integrate while the button is down."""
         self.tilt_drive = float(direction)
+        self.tilt_track.drive(self.tilt_drive, time.monotonic())
 
     @Slot()
     def tilt_center(self) -> None:
         self.tilt_deg = 0.0
+        self.tilt_track.center(time.monotonic())
+
+    @Slot(float)
+    def set_tilt_manual(self, deg: float) -> None:
+        self.tilt_track.set_manual(float(deg), time.monotonic())
+
+    @Slot(float, int)
+    def note_tilt_measured(self, deg: float, n_pairs: int) -> None:
+        self.tilt_track.set_measured(float(deg), "tags", time.monotonic())
 
     @Slot(int)
     def set_js_buttons(self, mask: int) -> None:
@@ -528,8 +646,9 @@ class DemoVehicleWorker(TimerWorker):
         self.y += (self.vel[0] * math.sin(self.yaw)
                    + self.vel[1] * math.cos(self.yaw)) * dt
         roll0, pitch0 = self.roll, self.pitch
-        self.roll = 0.03 * math.sin(t * 0.9) + 0.05 * self.vel[1]
-        self.pitch = 0.02 * math.sin(t * 0.6) - 0.04 * self.vel[0]
+        self._step_pendulum(cmd, dt)
+        self.roll = 0.03 * math.sin(t * 0.9) + 0.05 * self.vel[1] + float(self._pend[0])
+        self.pitch = 0.02 * math.sin(t * 0.6) - 0.04 * self.vel[0] + float(self._pend[1])
         # Body rates that MATCH that attitude. Until 2026-08-17 this plant
         # reported p = q = 0 while roll and pitch swung through a few degrees
         # — kinematically impossible, and invisible for years because every
@@ -565,6 +684,9 @@ class DemoVehicleWorker(TimerWorker):
         # mount tilt: a rate, not a position — held buttons drive it and it
         # stops against its stops, like the real one.
         self.tilt_deg = max(-45.0, min(45.0, self.tilt_deg + self.tilt_drive * 30.0 * dt))
+        # ...and the mount reports it, as MOUNT_STATUS would.
+        self.tilt_track.set_measured(self.tilt_deg, "sim", time.monotonic(),
+                                     unc_deg=0.5)
 
         if self._log is not None:
             self._log.write("SIM_STATE", {
@@ -686,6 +808,15 @@ class DemoVehicleWorker(TimerWorker):
             water_temp_c=14.2, internal_temp_c=31.0,
             armed=self.armed,
             mode=f"{self.mode} (sim)",
+            # The attitude-axes facts the engage gate reads (2026-09-26);
+            # SYNTHETIC — the firmware string is what a 4.1.2+ vehicle would
+            # answer, not a reading, and says so ("(sim)", like mode and the
+            # NavFix geometry "demo") so records cannot pass as a vehicle's;
+            # the gate's parser still resolves (4, 5, 1). Wire version "2.0"
+            # stays exact.
+            firmware_version="4.5.1 (sim)", mavlink_wire_version="2.0",
+            attitude_axes_enabled=self.attitude_axes,
+            attitude_axes_degraded=False,
             leak=self._leak_now(),
             sensors={
                 # Two IMUs, named for their owners: the autopilot's and the
@@ -731,6 +862,10 @@ class DemoVehicleWorker(TimerWorker):
             lights_conn=Conn.ONLINE,
             tilt_deg=self.tilt_deg, tilt_drive=self.tilt_drive,
             tilt_conn=Conn.ONLINE, tilt_note="simulated mount",
+            tilt_est_deg=self.tilt_track.deg, tilt_est_src=self.tilt_track.src,
+            tilt_est_unc_deg=(None if not math.isfinite(self.tilt_track.unc_deg)
+                              else self.tilt_track.unc_deg),
+            tilt_epoch=self.tilt_track.epoch, tilt_moving=self.tilt_track.moving,
             stamp=now()))
 
         # Real host counters, at 1 Hz. The only honest numbers in this module.
@@ -766,6 +901,7 @@ class DemoBackend(Backend):
             bus.vehicle_imu.connect(self.mpc.on_vehicle_imu)
             bus.camera_imu.connect(self.mpc.on_camera_imu)
             bus.telemetry.connect(self.mpc.on_telemetry)
+            bus.cmd_mode.connect(self.mpc.on_mode_request)
             bus.thrusters.connect(self.mpc.on_thrusters)
             bus.cmd_mpc_engage.connect(self.mpc.set_engaged)
             bus.cmd_mpc_traj.connect(self.mpc.set_traj)
@@ -776,6 +912,31 @@ class DemoBackend(Backend):
             bus.cmd_enable.connect(self.mpc.on_enable)
             bus.cmd_estop.connect(self.mpc.estop)
             bus.cmd_log_sensors.connect(self.mpc.set_sensor_log)
+
+        # LIVE DIFFUSION POLICY (--policy): the REAL PolicyWorker against the
+        # synthetic depth (grid identity) and the real MpcWorker's PolicyState
+        # feed — with `policy.ckpt: stub` (or a test/tool setting
+        # `Opts.policy_ckpt = "stub"` directly; the `--policy-ckpt` flag was
+        # removed on 2026-09-11 in favour of the panel's picker) no torch is
+        # loaded and the whole seam (clock conversion, epoch, pairing, filter,
+        # stitcher, estimator) runs offline (spec v2 A14). Same wiring helper
+        # as the hardware backend, so the two cannot drift apart — including
+        # the picker hop (bus.cmd_policy_ckpt -> PolicyWorker.set_ckpt).
+        self.policy = None
+        if bool(getattr(opts, "policy", False)):
+            from ..bus import PolicyMailbox
+            from .hardware import wire_policy
+            from .policy import PolicyWorker
+
+            pmb = PolicyMailbox()
+            self.video.policy_mb = pmb
+            self.policy = PolicyWorker(bus, pmb, opts)
+            # See HardwareBackend: --record-depth files its frames in the
+            # CONTROLLER's run folder, which owns both the tree and the pin.
+            if self.mpc is not None:
+                self.policy.run_dir_fn = self.mpc._run_dir
+            self.workers.append(self.policy)
+            wire_policy(bus, self.policy, self.mpc)
 
         # Commands go straight to the simulated vehicle. Connections are made
         # before moveToThread on purpose: Qt resolves AutoConnection at emit
@@ -790,6 +951,8 @@ class DemoBackend(Backend):
         bus.cmd_arm.connect(self.vehicle.set_arm)
         bus.cmd_tilt.connect(self.vehicle.set_tilt)
         bus.cmd_tilt_center.connect(self.vehicle.tilt_center)
+        bus.cmd_tilt_set.connect(self.vehicle.set_tilt_manual)
+        bus.tilt_measured.connect(self.vehicle.note_tilt_measured)
         bus.cmd_buttons.connect(self.vehicle.set_js_buttons)
         bus.cmd_log_sensors.connect(self.vehicle.set_sensor_log)
         bus.cmd_log_raw_sensors.connect(

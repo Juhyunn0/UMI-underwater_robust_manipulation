@@ -33,6 +33,7 @@ training-time affine the identity.
 
 from __future__ import annotations
 
+import time
 import argparse
 import csv
 import json
@@ -85,7 +86,7 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
-    sessions = a.session or [REPO / "sessions/session_0001"]
+    sessions = a.session or [REPO / "data" / time.strftime("%Y%m%d") / "session_0001"]
     cfg = load_pipeline_config(a.config)
     zc = cfg["zarr"]
     RH, RW = (int(v) for v in zc["resize"])

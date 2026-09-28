@@ -1,0 +1,7 @@
+{
+    // Onshape 어셈블리 탭을 연 상태의 브라우저 주소를 그대로 붙여넣기
+    "url": "https://cad.onshape.com/documents/d28bcb717526c067ab7fecf0/w/df32e328d7a365038adad0ac/e/f14f660b0db034ddc56b903b",
+    "output_format": "mujoco",
+    // CAD 유래 질량/관성은 쓰지 않음 (심의 검증된 합성 관성 유지) — pose와 메쉬만 추출
+    "no_dynamics": true
+}

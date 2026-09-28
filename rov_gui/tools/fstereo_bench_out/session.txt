@@ -1,0 +1,19 @@
+# fstereo_bench.py session — 2026-09-02 11:09:23
+# gpu: NVIDIA GeForce RTX 5090, torch 2.11.0+cu128, other compute processes at start: none, at end: none, --force: False
+# frames: /home/bdml/Desktop/data collection/videos episodes ('61', '66', '12') frames (10, 90, 170)
+# rig: c3_camera.host_depth.bench_rig (synthetic C3-like geometry)
+
+9 real pairs through infer(): host rectify -> network -> mm -> 400x250 colour grid -> NEAREST to 640x360 (the station's path)
+                   setting | load s 1st ms infer ms    Hz | native % fill % loss % | provenance
+ graph, scale 0.5, iters 8 |    5.1   1332     44.9  22.3 |   100.00  99.64   0.36 | cuda_graph=True input=[1, 3, 224, 320] err=None
+                             [info] fstereo: vitl @ 23-51-11 ready in 5.1 s (iters=8 scale=0.5, cuda graph on)
+                             [info] fstereo: forward captured as one CUDA graph in 1276 ms (input 320x224, iters 8)
+ eager, scale 0.5, iters 8 |    2.3     53     52.0  19.2 |   100.00  99.64   0.36 | cuda_graph=False input=None err=None
+                             [info] fstereo: vitl @ 23-51-11 ready in 2.3 s (iters=8 scale=0.5, cuda graph off)
+   graph, 224x224, iters 8 |    2.4    993     38.6  25.9 |   100.00  99.63   0.37 | cuda_graph=True input=[1, 3, 224, 224] err=None
+                             [info] fstereo: vitl @ 23-51-11 ready in 2.4 s (iters=8 size=224x224, cuda graph on)
+                             [info] fstereo: forward captured as one CUDA graph in 950 ms (input 224x224, iters 8)
+   graph, 224x140, iters 4 |    2.1    929     30.9  32.3 |   100.00  99.65   0.34 | cuda_graph=True input=[1, 3, 160, 224] err=None
+                             [info] fstereo: vitl @ 23-51-11 ready in 2.1 s (iters=4 size=224x140, cuda graph on)
+                             [info] fstereo: forward captured as one CUDA graph in 895 ms (input 224x160, iters 4)
+graph vs eager depth maps (scale 0.5, iters 8), 9 frames: max |d| = 0 mm

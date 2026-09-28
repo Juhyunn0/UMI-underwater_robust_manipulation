@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """plot_imu_dr.py — how far the IMU carried the vehicle before it was lost.
 
-    python -m rov_gui.tools.plot_imu_dr sessions/low_level_controller_data/20260817/0817_143002
+    python -m rov_gui.tools.plot_imu_dr data/20260817/0817_143002
     python -m rov_gui.tools.plot_imu_dr <run>/mpc_143002.csv --show
 
 A sibling of ``plot_runs.py`` rather than a mode of it, deliberately. That tool

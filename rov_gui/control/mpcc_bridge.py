@@ -73,6 +73,14 @@ class HwMpcc:
         self.eaob = None
         self._tau_ned_cmd = np.zeros(6)
         self.w_clip = np.asarray(cfg.w_hat_clip, float)
+        # hw_mpc.yaml vehicle_net_buoyancy_n (the HwDobMpc heave trim,
+        # 2026-09-07) is NOT wired into this solver: under `mpcc` it flies the
+        # plant's own -5.71 N sinking assumption as an up-force feedforward,
+        # exactly the defect the trim fixes for mpc / mpc_tuned. Say so, and
+        # record it, rather than let a session trim look applied.
+        self.vehicle_net_buoyancy_n = float(getattr(cfg, "vehicle_net_buoyancy_n", 0.0))
+        log(f"mpcc: vehicle_net_buoyancy_n {self.vehicle_net_buoyancy_n:+.2f} N is "
+            f"IGNORED by this controller (heave trim wired for mpc/mpc_tuned only)")
 
         t0 = time.perf_counter()
         self.mpcc = AcadosMPCC()
@@ -337,5 +345,10 @@ class HwMpcc:
             "long_accel_m_s2": float(getattr(self.cfg,
                                              "path_long_accel_m_s2", 0.05)),
             "w_hat_clip": list(map(float, self.w_clip)),
+            "heave_trim": {"applied": False,
+                           "vehicle_net_buoyancy_n": float(self.vehicle_net_buoyancy_n),
+                           "reason": "mpcc ignores vehicle_net_buoyancy_n (not wired "
+                                     "2026-09-07); the solver flies the plant's own "
+                                     "net buoyancy"},
             "ref_preview": True,
         }

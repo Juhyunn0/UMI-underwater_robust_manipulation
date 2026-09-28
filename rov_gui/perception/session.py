@@ -116,7 +116,7 @@ CAPTURE_RANGE_M = (0.25, 1.00)
 #
 # 2.0 is not a guess. Every reference capture this station has ever stored was
 # re-scored with `_frame_depth_quality` and grouped by what its mesh turned out
-# to be [측정: sessions/pose_meshes/*/{depth_enhanced,mask,K.txt}, 14 captures,
+# to be [측정: data/*/*_obj/{depth_enhanced,mask,K.txt}, 14 captures,
 # up to 40 frames each; verdicts from `_check_mesh_size`'s table and the
 # 2026-08-24 post-mortem]:
 #
@@ -157,7 +157,7 @@ SMEAR_MAX_RATIO_CAPTURE = 2.0
 # bound is the one that is always armed and the tape is optional confirmation.
 #
 # 2.0 splits the archive's gap [측정: scratchpad extrude audit 2026-08-24 over
-# sessions/pose_meshes/* — mesh longest / max observed silhouette]:
+# data/*/*_obj — mesh longest / max observed silhouette]:
 #
 #     usable meshes:   1.08  1.38  1.39  1.52  1.59   (a 3D bound box exceeds
 #                                                      any single projection)
@@ -335,7 +335,8 @@ class PoseSession:
         self.mesh = mesh
         self.lost_grace = float(lost_grace)
         self.lost_timeout = float(lost_timeout)
-        self.ref_root = Path(ref_dir) if ref_dir else Path("sessions/pose_meshes")
+        from .. import runstore
+        self.ref_root = Path(ref_dir) if ref_dir else Path(runstore.DEFAULT_BASE)
         self.max_arc = float(max_arc)
         # The operator's tape measure, or None. Used to CHECK the
         # reconstruction, never to rescale it — see _check_mesh_size.
@@ -935,12 +936,16 @@ class PoseSession:
             raise PoseSessionError(
                 f"reference directory {root} contains 'rgb'; the reconstruction "
                 f"derives sibling paths by replacing that substring")
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        out = root / f"obj_{stamp}"
+        # <root>/YYYYMMDD/MMDD_HHMMSS_obj — its own KIND under the dated root
+        # (runstore), so it is never joined by the run's other writers and
+        # they never join it. join=False: a retry seconds after a failed
+        # attempt must NOT reopen that attempt's directory (see above).
+        from .. import runstore
+        out = runstore.run_dir(root, kind="obj", join=False, create=False)
         n = 1
         while out.exists():
             n += 1
-            out = root / f"obj_{stamp}_{n}"
+            out = out.with_name(f"{out.name[:-len('_obj')]}_{n}_obj")
         out.mkdir(parents=True, exist_ok=True)
         return out
 
@@ -994,7 +999,7 @@ class PoseSession:
         reconstruction is the DEPTH inside that mask, and on this camera that
         degrades with RANGE far faster than the picture does. Measured over
         every reference capture stored on 2026-08-23
-        (`sessions/pose_meshes/*/`, p5-p95 of the depth inside the mask):
+        (`data/*/*_obj/`, p5-p95 of the depth inside the mask):
 
             capture range   spread inside the mask   mesh length
               510 mm            102 mm                  182 mm
@@ -1032,7 +1037,7 @@ class PoseSession:
         METRIC RGB-D, so the mesh already has a size and there is nothing to
         anchor — scaling it uniformly would shrink the dimensions that are
         RIGHT in order to fix the one that is wrong. What eight reconstructions
-        of one object on 2026-08-23 actually show (`sessions/pose_meshes/`):
+        of one object on 2026-08-23 actually show (`data/*/*_obj/`):
 
             verts    oriented bbox (mm)
             18548    101 x 114 x 171
@@ -1146,7 +1151,31 @@ class PoseSession:
             if self._pose is not None or self._np_K is None:
                 return
             K = self._np_K
-        from sam2_live.pose import PoseWorker as FpWorker
+        from sam2_live.pose import FP_ROOT, PoseWorker as FpWorker, _ensure_on_path
+        from .upstream import UPSTREAM_IMPORT_LOCK
+
+        # Import FoundationPose HERE, serialised against FoundationStereo's
+        # import: both checkouts have a top-level `Utils` and import it bare
+        # (see perception/upstream.py and fstereo._import_upstream). The
+        # worker's own `from estimater import ...` then finds it cached and
+        # bound to FoundationPose's Utils. A bare `Utils` that is not
+        # FoundationPose's is dropped first — the stereo side never leaves one
+        # behind, but anything that did would otherwise be star-imported in
+        # its place. If this import fails the worker fails the same way and
+        # reports it, exactly as before.
+        with UPSTREAM_IMPORT_LOCK:
+            try:
+                _ensure_on_path(FP_ROOT)
+                stale = sys.modules.get("Utils")
+                if stale is not None and not str(
+                        getattr(stale, "__file__", "")).startswith(str(FP_ROOT)):
+                    sys.modules.pop("Utils")
+                import estimater                                  # noqa: F401
+            except Exception as e:                               # noqa: BLE001
+                if on_log:
+                    on_log("warn", f"pose: FoundationPose pre-import failed "
+                                   f"({type(e).__name__}: {e}); the worker "
+                                   f"will report the load result")
 
         w = FpWorker(mesh, K)
         w.start()

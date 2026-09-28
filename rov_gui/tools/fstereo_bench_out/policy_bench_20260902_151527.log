@@ -1,0 +1,23 @@
+[   0.0 s] info  backend hw started
+[   0.0 s] info  fstereo: learned depth is THIS RUN'S depth source — iters=16 scale=1, cuda graph on, projected onto 400x250. The camera's own depth stream is not requested.
+[   0.0 s] info  mpc: writing runs under sessions/dryruns (hw_mpc.yaml log_dir sessions/low_level_controller_data overridden — one root per run)
+[   0.0 s] info  c3: target 192.168.2.191 streams=['color', 'left', 'right'] — 71 Mbit/s (color=10, left=31, right=31) = 79% of the ~90 Mbit/s PoE budget [tight] [C3 link only]
+[   0.1 s] info  pid: sim GAINS_HEAVY_GRIPPER x omega_derate 0.6 -> kp [51.7, 51.7, 55.4] yaw_kp 3.57 [예측]
+[   0.1 s] info  mavlink: telemetry DISABLED (--mavlink-transport none) — nothing is sent to or read from the vehicle
+[   0.1 s] info  fstereo: loading FoundationStereo from /home/bdml/Desktop/FoundationStereo/FoundationStereo (this takes a few seconds)
+[   0.2 s] info  tagnav: pupil_apriltags, geometry=floor, map=128 tag(s), size 0.170 m, decimate={'main': 1.0}, localizing=main, datum=map
+[   0.2 s] info  policy: loading /home/bdml/Desktop/universal_manipulation_interface/data/outputs/2026.09.01/21.15.26_train_diffusion_transformer_timm_umi_depth/checkpoints/selected.ckpt (eval_transforms=center, steps=16, period 0.50 s); TCP = ROV jaw at body FRD [0.416, 0.0, 0.17] (|t| 0.450 m; handheld comparison [0.0355, 0.1293, 0.3186] in ITS camera frame). Inference runs only while a policy mission is ACTIVE.
+[   1.9 s] info  mpc: acados IPOPT fallback DISABLED — a failed solve holds the previous wrench; 3 in a row disengage
+[   1.9 s] info  mpc solver: acados, probe 2.0 ms, build 1.4s, realtime_ok=True
+[   2.4 s] info  policy: DP policy: loading selected.ckpt (center transforms, 16 DDIM steps)
+[   3.3 s] info  policy: READY after 3.3 s (obs_dt 66.7 ms, fps source: dataset zip .zattrs (/home/bdml/Desktop/data collection/dataset_depth.zarr.zip); sha1 fa7aeb3d92b6228fefa98640504ee833640e7992)
+[   3.5 s] info  policy: DP policy ready in 3.3 s (warm-up 128 ms, 106 tokens, sha1 fa7aeb3d92b6, obs_dt 66.7 ms from dataset zip .zattrs)
+[   4.7 s] info  mpcc: acados-mpcc, 60 stages / 7.2 s horizon, probe 7.1 ms, build 2.8s, realtime_ok=True
+[   4.7 s] info  mpc: dobmpc ready, solver=acados, probe=2.0 ms
+[   5.6 s] info  fstereo: vitl @ 23-51-11 ready in 5.6 s (iters=16 scale=1, cuda graph on)
+[   5.6 s] warn  fstereo: no mono pair yet — this run has no other depth source, so the depth panel is dark until pairs resume
+[  10.6 s] warn  fstereo: no mono pair yet — this run has no other depth source, so the depth panel is dark until pairs resume
+[  11.8 s] info  fstereo: rig ready — fx_rect 343.15 px (raw EEPROM fx differs by -9.35%), baseline 75.0 mm, K 25732 mm*px; depth projected onto 400x250
+[  11.8 s] info  c3: connected
+[  13.3 s] info  fstereo: forward captured as one CUDA graph in 1480 ms (input 640x416, iters 16)
+[  13.5 s] info  policy: depth grid rect_left:791aaed12cc3aad9 — obs coverage 100.00% (min 98.5%)

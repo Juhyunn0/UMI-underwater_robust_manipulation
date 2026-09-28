@@ -1,0 +1,115 @@
+{
+ "summary": "DINOv3 (Siméoni et al., arXiv 2508.10104, v1 2025-08-13; github facebookresearch/dinov3) is a 12-backbone family: one from-scratch teacher ViT-7B/16 (6,716M params, 4096-d, 40 blocks, 32 heads, SwiGLU) and everything else distilled from it — ViT-S/16 21M/384-d, S+/16 29M/384-d, B/16 86M/768-d, L/16 300M/1024-d, H+/16 840M/1280-d, ConvNeXt T/S/B/L 29/50/89/198M — plus SAT-493M versions of only L/16 and 7B/16. So \"largest/official\" = ViT-7B/16 (the actual teacher); \"largest distilled\" = ViT-H+/16, which the paper says is on par with the 8x larger teacher (Fig. 16b) although the model-card table shows 7B still clearly ahead on ObjectNet (91.1 vs 78.6), Oxford-H (72.8 vs 64.5) and NYU depth (0.309 vs 0.352). All ViTs: patch 16, 4 register (\"storage\") tokens, axial RoPE (theta 100, coords normalised to [-1,1], RoPE-box jitter s in [0.5,2] at train time), no absolute pos-embed, so any HxW multiple of 16 works without interpolation; 224 input -> 1 CLS + 4 reg + 196 patches = 201 tokens (HF model card states this explicitly). Pretraining ran at 256 global / 112 local crops, high-res adaptation at global {512,768} / local {112,168,224,336}; the paper's family benchmark runs at 512 (patch-16) and timm's pretrained_cfg says input_size 256 / min 128 / fixed_input_size false — 224 is supported but below both the pretrain (256) and eval (512) resolutions. Data: LVD-1689M = 1,689M images curated (hierarchical k-means on DINOv2 embeddings) from ~17B public Instagram posts; SAT-493M = 493M 512x512 Maxar 0.6 m tiles. License: every backbone is under the custom \"DINOv3 License\" (not Apache-2.0 like DINOv2, not CC-BY-NC) — royalty-free use/modify/distribute incl. commercial, with obligations: redistribute only under the same agreement with a copy attached, cite DINO Materials in publications, no reverse engineering, trade-control compliance incl. no ITAR/military/warfare/nuclear/espionage/weapons use; the ai.meta.com text (Last Updated 2025-08-14, the version HF cards link) additionally requires displaying \"Built with DINOv3\" on redistribution, while GitHub LICENSE.md (2025-08-19) omits that sentence. No DINOv3 backbone is under a FAIR non-commercial license; the only differently-licensed piece is the dino.txt CLIP vocabulary (OpenAI MIT). Gating: facebook/dinov3-* HF repos are gated=manual (contact-info consent + Meta approval; anonymous download -> HTTP 401 GatedRepo), whereas the timm/* mirrors are gated=false and download anonymously (verified 302->200 on H+ and 7B safetensors), under the same license. Exact ids/sizes (fp32, ~4 B/param): facebook/dinov3-vitl16-pretrain-lvd1689m 1.213 GB = timm/vit_large_patch16_dinov3.lvd1689m 1.212 GB; facebook/dinov3-vith16plus-pretrain-lvd1689m 3.362 GB = timm/vit_huge_plus_patch16_dinov3.lvd1689m 3.362 GB; facebook/dinov3-vit7b16-pretrain-lvd1689m 6 shards ~26.87 GB = timm/vit_7b_patch16_dinov3.lvd1689m single 26.864 GB safetensors. Library minimums: transformers >= 4.56.0 (2025-08-29; DINOv3ViTModel/DINOv3ConvNextModel, processor default 224), timm >= 1.0.20 (2025-09-21; Eva-based defs with RotaryEmbeddingDinoV3, dynamic_img_size=True, num_reg_tokens=4, qkv_bias=False plus `_qkvb` twins; final weight tags lvd1689m/sat493m only from 1.0.20), torch >= 2.7.1 for the official repo. Project hook: transformer_obs_encoder.py:56 sets the timm name, :91-96 create_model(global_pool='', num_classes=0), :139-146 the `startswith('vit')` branch, :192-199 infers feature size by an example forward and adds a Linear to n_emb (so 1024/1280/4096-d slot in without code changes to dims), :238-244 CLS = token 0 (timm token order is [cls, reg x4, patches]); with the config's feature_aggregation: null the 4 register tokens will be forwarded as observation tokens (201 vs 197). Compute at 256 (paper Fig 16a GFLOPs / timm GMACs): L 163/82.4, H+ 450/224.9, 7B 3550/1775 vs current-class B 47/23.6. [유도] 7B fp32 weights alone (26.9 GB) fill ~84% of the 32 GB RTX 5090 before any optimiser/EMA/activation memory, so a trainable-encoder (lr 3e-5, EMA on) 7B run is infeasible on this GPU; H+ is the largest realistic candidate and even that needs bf16/8-bit-Adam/grad-checkpoint budgeting.",
+ "claims": [
+  {
+   "claim": "The DINOv3 ladder is: ViT-S/16 21M (384-d, 6 heads, MLP), ViT-S+/16 29M (384-d, SwiGLU), ViT-B/16 86M (768-d, 12 heads), ViT-L/16 300M (1024-d, 24 blocks, 16 heads), ViT-H+/16 840M (1280-d, 32 blocks, 20 heads, SwiGLU), ViT-7B/16 6,716M (4096-d, 40 blocks, 32 heads x 128, SwiGLU hidden 8192) and ConvNeXt Tiny/Small/Base/Large 29/50/89/198M. Only ViT-7B/16 is trained from scratch (the teacher, 61,440 H100-hours); the five smaller ViTs and four ConvNeXts are distilled from it by multi-student distillation (paper Sec. 5.2). The paper says ViT-H+ is 'on par with the 8 times larger ViT-7B' (Fig. 16b), but the model-card benchmark table still shows 7B ahead: ObjectNet 91.1 vs 78.6 (L 74.8), Oxford-H 72.8 vs 64.5 (L 63.1), NYU depth 0.309 vs 0.352 (L 0.352), ADE20k 55.9 vs 54.8 (L 54.9), IN-ReaL 90.4 vs 90.3 (L 90.2).",
+   "sources": [
+    "https://github.com/facebookresearch/dinov3#pretrained-models",
+    "https://github.com/facebookresearch/dinov3/blob/main/dinov3/hub/backbones.py",
+    "https://huggingface.co/facebook/dinov3-vit7b16-pretrain-lvd1689m",
+    "https://arxiv.org/html/2508.10104 (Sec. 3.2 Table 2, Sec. 5.2, Sec. 7.1 Fig. 16)"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "Defines what 'largest / official' means: the true teacher is ViT-7B/16 (4096-d); the largest distilled student is ViT-H+/16 (1280-d). Picking H+ instead of 7B costs measurable global-task accuracy per the card table, not zero as the paper's 'on par' phrasing suggests."
+  },
+  {
+   "claim": "All DINOv3 ViTs use patch size 16, 4 register/storage tokens (n_storage_tokens=4, num_reg_tokens=4) and axial RoPE (theta/base 100, patch coords normalised to a [-1,1] box, 'separate' normalisation, train-time RoPE-box jitter scaling the box to [-s,s], s in [0.5,2]); there is no absolute position embedding (timm: use_abs_pos_emb=False, dynamic_img_size=True). Any input whose H and W are multiples of 16 works without interpolation; the HF card states 'For a 224x224 image, this results in 1 class token + 4 register tokens + 196 patch tokens = 201 tokens' and that non-multiples are cropped down. Resolutions actually used: pretraining at 256 (global) / 112 (local) crops — chosen to match DINOv2's 224@patch-14 sequence length; high-res adaptation at global {512,768} / local {112,168,224,336} for 10k iters; the family benchmark in the paper is run at 512x512 for patch-16 models; timm pretrained_cfg: input_size (3,256,256), min_input_size (3,128,128), fixed_input_size False, crop_pct 1.0, ImageNet mean/std; the HF transformers processor default resize/crop is 224. So 224 is natively supported but below the 256 pretrain and 512 eval resolutions.",
+   "sources": [
+    "https://huggingface.co/facebook/dinov3-vit7b16-pretrain-lvd1689m",
+    "https://arxiv.org/html/2508.10104 (Sec. 3.2 'RoPE-box jittering', Sec. 5.1 Resolution Scaling, Sec. 7.1)",
+    "https://github.com/facebookresearch/dinov3/blob/main/dinov3/hub/backbones.py",
+    "https://huggingface.co/timm/vit_huge_plus_patch16_dinov3.lvd1689m/blob/main/config.json",
+    "https://github.com/huggingface/pytorch-image-models/blob/v1.0.20/timm/models/eva.py",
+    "https://huggingface.co/docs/transformers/model_doc/dinov3"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "The policy feeds 224x224 depth-encoded images: DINOv3 accepts 224 with no pos-embed interpolation (RoPE), yielding 201 tokens vs CLIP ViT-B's 197. In transformer_obs_encoder.py the config uses feature_aggregation: null (all tokens), so the 4 register tokens would be forwarded to the policy transformer unless sliced; and the 224 choice sits below DINOv3's 256 pretrain / 512 eval sweet spot."
+  },
+  {
+   "claim": "Training data: LVD-1689M is 1,689 million images curated from an ~17 billion-image pool of public Instagram posts via hierarchical k-means on DINOv2 embeddings (plus retrieval-based curation), used for all 10 web backbones (6 ViT + 4 ConvNeXt). SAT-493M is 493 million 512x512 tiles randomly sampled from Maxar 0.6 m ortho-rectified RGB imagery; SAT-493M checkpoints exist only for ViT-L/16 (distilled) and ViT-7B/16 (from scratch), trained 100k iters at 256, 10k Gram, 8k high-res at 512. The SAT models are the backbone of the CHMv2 canopy-height release (2026-03-10). No SAT variant of H+, S, S+, B or ConvNeXt exists.",
+   "sources": [
+    "https://arxiv.org/html/2508.10104 (Sec. 3.1, Sec. 8 satellite)",
+    "https://github.com/facebookresearch/dinov3#pretrained-models",
+    "https://huggingface.co/facebook/dinov3-vit7b16-pretrain-lvd1689m"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "For an underwater depth-image policy the lvd1689m (natural-image) weights are the only sensible choice; sat493m is aerial-only and does not exist for H+. Neither dataset contains depth encodings, so the 3-channel depth input is out of distribution for any DINOv3 variant."
+  },
+  {
+   "claim": "License: code and all 12 backbones (and adapters) are released under Meta's custom 'DINOv3 License', not Apache-2.0 (DINOv2's license) and not the FAIR CC-BY-NC license — no DINOv3 backbone is non-commercial. Grant: 'non-exclusive, worldwide, non-transferable and royalty-free limited license ... to use, reproduce, distribute, copy, create derivative works of, and make modifications'. Obligations: redistribute DINO Materials/derivatives only under the same Agreement with a copy attached; 'you must acknowledge the use of DINO Materials in your publication'; no reverse engineering; comply with Trade Controls and 'not ... for any activities subject to ITAR or end uses prohibited by Trade Controls, including those related to military or warfare purposes, nuclear industries or applications, espionage, or the development or use of guns or illegal weapons'; California law; Meta may amend. Discrepancy: the ai.meta.com text (Last Updated 2025-08-14, the version linked by every HF model card and timm cfg) adds '(B) prominently display \"Built with DINOv3\" on a related website, user interface, blogpost, about page, or product documentation' on redistribution; the GitHub LICENSE.md (Last Updated 2025-08-19, commit ffb4bb8) has no such sentence. Meta marketed it as 'a commercial license'; GitHub issue #31 asking for Apache-2.0 was closed 2025-08-15. The only differently-licensed artefact is the dino.txt text vocabulary (OpenAI CLIP BPE, MIT).",
+   "sources": [
+    "https://github.com/facebookresearch/dinov3/blob/main/LICENSE.md",
+    "https://ai.meta.com/resources/models-and-libraries/dinov3-license/",
+    "https://github.com/facebookresearch/dinov3/issues/31",
+    "https://x.com/AIatMeta/status/1956027798524715169",
+    "https://dl.fbaipublicfiles.com/dinov2/thirdparty/LICENSE",
+    "https://huggingface.co/timm/vit_7b_patch16_dinov3.lvd1689m/blob/main/README.md"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "Academic use, fine-tuning and publishing are permitted for every size; the hard requirements are citing DINO Materials in papers and, if the trained policy checkpoint (a derivative) is ever redistributed, shipping the license and (per the ai.meta.com text) a 'Built with DINOv3' notice. The military/ITAR clause is worth noting for an underwater-ROV project."
+  },
+  {
+   "claim": "Hugging Face gating differs by namespace. facebook/dinov3-* repos (vits16, vits16plus, vitb16, vitl16, vith16plus, vit7b16, convnext-*, and the sat493m pair) are gated with gated='manual': the page says 'You need to agree to share your contact information to access this model ... in accordance with the Meta Privacy Policy', and an anonymous GET of model.safetensors/config.json returns HTTP 401 x-error-code: GatedRepo — an HF login, approved request and token are required. The timm/* DINOv3 repos (vit_{small,small_plus,base,large,huge_plus,7b}_patch16_dinov3.{lvd1689m,sat493m}, *_qkvb twins, convnext_{tiny,small,base,large}.dinov3_lvd1689m) report gated=False and download anonymously (verified: resolve/main/model.safetensors -> 302 -> 200, x-linked-size 3,362,084,520 for H+ and 26,864,183,416 for 7B), while still declaring license 'other' / license_name 'dinov3-license'. Meta's own download page requires a form and emails wget URLs.",
+   "sources": [
+    "https://huggingface.co/api/models/facebook/dinov3-vit7b16-pretrain-lvd1689m",
+    "https://huggingface.co/facebook/dinov3-vit7b16-pretrain-lvd1689m",
+    "https://huggingface.co/api/models?author=timm&search=dinov3",
+    "https://huggingface.co/timm/vit_7b_patch16_dinov3.lvd1689m",
+    "https://github.com/facebookresearch/dinov3#pretrained-models"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "timm.create_model('vit_huge_plus_patch16_dinov3.lvd1689m', pretrained=True) in the rovgui-pose env pulls weights with no token or approval wait; going through facebook/ or transformers requires the manual-approval gate. Accepting the DINOv3 License terms is still legally implied by use."
+  },
+  {
+   "claim": "Exact ids and checkpoint sizes (all stored fp32, ~4 bytes/param): ViT-L/16 — facebook/dinov3-vitl16-pretrain-lvd1689m model.safetensors 1.213 GB; timm/vit_large_patch16_dinov3.lvd1689m 1.212 GB (+ pytorch_model.bin 1.212 GB). ViT-H+/16 — facebook/dinov3-vith16plus-pretrain-lvd1689m 3.362 GB; timm/vit_huge_plus_patch16_dinov3.lvd1689m 3.362 GB (+ .bin). ViT-7B/16 — facebook/dinov3-vit7b16-pretrain-lvd1689m sharded model-0000{1..6}-of-00006.safetensors = 4.98 + 4x4.968 + 2.014 ≈ 26.87 GB; timm/vit_7b_patch16_dinov3.lvd1689m single model.safetensors 26.864 GB (26,864,183,416 bytes, no .bin). Satellite: facebook/dinov3-vitl16-pretrain-sat493m (1.213 GB), facebook/dinov3-vit7b16-pretrain-sat493m (6 shards ≈ 26.87 GB), timm/vit_large_patch16_dinov3.sat493m, timm/vit_7b_patch16_dinov3.sat493m. For reference ViT-B: facebook/dinov3-vitb16-pretrain-lvd1689m = timm/vit_base_patch16_dinov3.lvd1689m 0.343 GB; ConvNeXt-L 0.785 GB. torch.hub names: dinov3_vitl16, dinov3_vith16plus, dinov3_vit7b16 (hash for L lvd1689m '8aa4cbdd', sat493m 'eadcf0ff').",
+   "sources": [
+    "https://huggingface.co/api/models/facebook/dinov3-vit7b16-pretrain-lvd1689m?blobs=true",
+    "https://huggingface.co/api/models/timm/vit_7b_patch16_dinov3.lvd1689m?blobs=true",
+    "https://huggingface.co/api/models/timm/vit_huge_plus_patch16_dinov3.lvd1689m?blobs=true",
+    "https://huggingface.co/api/models/facebook/dinov3-vith16plus-pretrain-lvd1689m?blobs=true",
+    "https://github.com/facebookresearch/dinov3/blob/main/dinov3/hub/backbones.py",
+    "https://github.com/facebookresearch/dinov3#pretrained-backbones-via-hugging-face-transformers"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "[유도] The 7B fp32 checkpoint (26.9 GB) alone occupies ~84% of the RTX 5090's 32 GB before gradients, AdamW moments, the EMA copy and activations for batch 64 x 2 frames — a trainable-encoder 7B run (encoder lr 3e-5, EMA on) does not fit; even frozen 7B in bf16 (13.4 GB) leaves little headroom. H+ (3.36 GB fp32) is the largest size that can plausibly be fine-tuned on this GPU with bf16/8-bit-Adam/activation checkpointing; L (1.2 GB) is comfortable."
+  },
+  {
+   "claim": "Minimum library versions: transformers >= 4.56.0 (released 2025-08-29; dev-branch support from 2025-08-14) provides DINOv3ViTModel / DINOv3ViTBackbone / DINOv3ConvNextModel with DINOv3ViTConfig defaults patch_size 16, rope_theta 100.0, image_size 224, num_register_tokens (4 in the released configs), pos_embed_rescale 2.0 (train-mode only) and DINOv3ViTImageProcessor default size 224x224 with ImageNet mean/std. timm >= 1.0.20 (released 2025-09-21; models added 2025-09-17 via the Eva class with a new RotaryEmbeddingDinoV3; on 09-21 the weight tags were renamed lvd_1689m->lvd1689m / sat_493m->sat493m, so 1.0.20 is the first release with the final names). timm model defs: dynamic_img_size=True, use_abs_pos_emb=False, rope_type='dinov3', rope_temperature=100, rope_rotate_half=True, num_reg_tokens=4, init_values 1e-5 (layer-scale), qkv_bias=False for the default names because the released weights have all-zero QKV biases, with *_qkvb twins (S, S+, B, L, H+ — not 7B) that keep qkv_bias=True to mirror transformers; timm generates RoPE periods in fp32 whereas the originals keep a persistent bf16 buffer (small numeric difference; card gives a one-line cast to match). The train-time RoPE rescale augmentation is still not passed in timm's dinov3 model defs on main ('#rope_rescale_coords=2, # haven't added to interface'). timm 1.0.27 (2026-05-08) added DINOv3 weights in NaFlexVit; 1.0.28 (2026-07-11) added EUPE 'DINOv3-style' ViTs. Official repo needs torch >= 2.7.1. The project's umi2 env (timm 0.9.7) predates all of this; rovgui-pose (timm 1.0.29) is covered.",
+   "sources": [
+    "https://github.com/huggingface/transformers/releases/tag/v4.56.0",
+    "https://huggingface.co/docs/transformers/model_doc/dinov3",
+    "https://github.com/huggingface/pytorch-image-models/releases/tag/v1.0.20",
+    "https://github.com/huggingface/pytorch-image-models/blob/v1.0.20/timm/models/eva.py",
+    "https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/eva.py",
+    "https://huggingface.co/timm/vit_7b_patch16_dinov3.lvd1689m/blob/main/README.md",
+    "https://github.com/facebookresearch/dinov3#readme"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "The training env must move timm from 0.9.7 to >= 1.0.20 (torch 2.9.1 is fine) or the policy must be trained in an env like rovgui-pose. Because the encoder is trainable (lr 3e-5), timm's missing RoPE-rescale augmentation and fp32-vs-bf16 periods are the two known fidelity gaps vs the official code; neither affects frozen inference materially."
+  },
+  {
+   "claim": "Compute cost per image scales steeply up the ladder: paper Fig. 16(a) GFLOPs at 256x256 / 512x512 — ViT-S 12/63, S+ 16/79, B 47/216, L 163/721, H+ 450/1903, 7B 3550/14515; ConvNeXt T/S/B/L 5/20, 11/46, 20/81, 38/152. timm model-card GMACs at 256: B 23.6 (34.1M activations), L 82.4 (90.6M), H+ 224.9 (193.6M), 7B 1775.1 (515.9M); ConvNeXt-L 34.4 at 224. So at fixed resolution L ≈ 3.5x, H+ ≈ 9.6x and 7B ≈ 75x the FLOPs of the current ViT-B-class encoder. The project's encoder path (transformer_obs_encoder.py:91-96 timm.create_model(..., global_pool='', num_classes=0); :139-146 vit branch; :192-199 feature size inferred by an example forward then nn.Linear to n_emb; :238-244 CLS = feature[:, [0], :]) works unchanged for any timm 'vit_*_dinov3' name because timm's Eva token order is [cls, reg x4, patches] and the projection is inferred, but nothing in that file applies timm's data_config normalisation (DINOv3 = ImageNet mean/std vs CLIP's OpenAI mean/std).",
+   "sources": [
+    "https://arxiv.org/html/2508.10104 (Sec. 7.1 Fig. 16a)",
+    "https://huggingface.co/timm/vit_huge_plus_patch16_dinov3.lvd1689m/blob/main/README.md",
+    "https://huggingface.co/timm/vit_large_patch16_dinov3.lvd1689m/blob/main/README.md",
+    "https://huggingface.co/timm/vit_7b_patch16_dinov3.lvd1689m/blob/main/README.md",
+    "https://github.com/huggingface/pytorch-image-models/blob/v1.0.20/timm/models/eva.py",
+    "/home/bdml/Desktop/umi_underwater_robust_control/external/UMI_aquatic/diffusion_policy/model/vision/transformer_obs_encoder.py:56,91-96,139-146,192-199,238-244",
+    "/home/bdml/Desktop/umi_underwater_robust_control/external/UMI_aquatic/diffusion_policy/config/train_diffusion_transformer_umi_depth_vit_workspace.yaml:53,63"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "With horizon 2 x batch 64 = 128 images/step, 200 epochs over ~75 episodes, encoder FLOPs dominate step time; H+ is ~10x and 7B ~75x the current cost, and 7B also cannot be held trainable on 32 GB. Deploy-side (rovgui-pose, single 5090 shared with FoundationStereo/SAM2) the per-frame latency multiplier is the same. Name swap is code-free at the timm layer, but register-token handling and input normalisation are integration decisions the orchestrator must make."
+  }
+ ],
+ "gaps": [
+  "No published source evaluates DINOv3 ViT-L/H+/7B at exactly 224x224; the paper's family numbers are at 512 (patch-16) and pretraining was at 256, so any 224-vs-256 accuracy delta for this policy is unmeasured.",
+  "No source covers DINOv3 on 3-channel depth encodings (all pretraining is RGB natural or satellite imagery); the transfer of RGB-learned features to the project's depth colour-mapping is untested and not searched in the literature here.",
+  "Whether the umi2 env (torch 2.9.1) can be upgraded in place to timm >= 1.0.20 without breaking other pins was not tested — only the version requirement was established.",
+  "The GPU-memory feasibility statements (7B infeasible trainable, H+ borderline) are derived from checkpoint byte sizes and parameter counts [유도], not measured on the RTX 5090.",
+  "The 'Built with DINOv3' redistribution clause exists in the ai.meta.com license text but not in GitHub LICENSE.md; which text governs a given download (Meta form vs HF vs timm mirror) is a legal question not resolved here.",
+  "Manual-approval turnaround for the facebook/dinov3-* HF gate was not measured; the timm/* mirrors bypass the gate in practice but the license acceptance remains implied.",
+  "No robot-learning / diffusion-policy benchmark comparing DINOv3 sizes as a visuomotor encoder was searched; the sizing recommendation rests on general-vision benchmarks and compute/memory only.",
+  "transformer_obs_encoder.py does not apply timm's per-model mean/std normalisation; whether the dataset pipeline already normalises to CLIP or ImageNet statistics was not traced beyond that file."
+ ]
+}

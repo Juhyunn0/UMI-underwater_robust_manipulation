@@ -1,0 +1,632 @@
+{
+ "results_csv": "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/bench/dinov3_bench.csv",
+ "script_path": "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/bench/dinov3_bench.py (driver: run_all.sh; download check: download_check.py -> download_check.log, gate_check.log; driver log: run_all.log)",
+ "host_baseline": "2026-09-13 22:43:56 nvidia-smi: NVIDIA GeForce RTX 5090, driver 570.211.01, CUDA 12.8, 15 MiB / 32607 MiB used (only /usr/lib/xorg/Xorg 4 MiB, no compute processes), 32105 MiB free, 0 % util, P8 13 W. torch sees 31.37 GiB capacity. free -g: 60 GB total, 3 used, 53 free, 56 available; swap 1 GB (host RAM would have held a 27 GB fp32 7B, but the 7B was instantiated directly on device in bf16 via timm create_model(device='cuda', dtype=bf16) = 13.43 GB resident). Env: ~/miniforge3/envs/rovgui-pose/bin/python, torch 2.11.0+cu128, timm 1.0.29, bf16 supported. CONTAMINATION EVENT: during the first full run a foreign GPU process appeared (PID 9708, 'timeout 590 python dinov3_bench2.py', 11-17 GB VRAM, not mine - probably a sibling agent's benchmark); it made the ViT-B fp32/128 config OOM and doubled timings, so that run was discarded, the script was patched to stamp 'CONTAMINATED: other GPU procs ...' on any row during which nvidia-smi showed a foreign compute process (sampled at config start, after warm-up, after timed loop, at end), the driver waits for an idle GPU before each model, and the whole thing was rerun 22:48:45-22:51:08 on an otherwise idle GPU. Final CSV: 62 rows, 0 flagged CONTAMINATED.",
+ "rows": [
+  {
+   "model": "vit_base_patch16_clip_224",
+   "mode": "model_info",
+   "images_per_step": 0,
+   "precision": "fp32",
+   "ok": true,
+   "peak_mem_gb": 0.343,
+   "note": "params=85.8M; weights resident 0.34 GB; current project baseline"
+  },
+  {
+   "model": "vit_base_patch16_clip_224",
+   "mode": "train_full_ft",
+   "images_per_step": 128,
+   "precision": "fp32",
+   "ok": true,
+   "peak_mem_gb": 16.741,
+   "ms_per_step": 195.35,
+   "note": "res=224 ckpt=0; out=1x197x768; n_timed=10"
+  },
+  {
+   "model": "vit_base_patch16_clip_224",
+   "mode": "train_full_ft",
+   "images_per_step": 128,
+   "precision": "bf16_autocast",
+   "ok": true,
+   "peak_mem_gb": 10.313,
+   "ms_per_step": 105.14,
+   "note": "res=224 ckpt=0; out=1x197x768; n_timed=10"
+  },
+  {
+   "model": "vit_base_patch16_clip_224",
+   "mode": "train_full_ft",
+   "images_per_step": 32,
+   "precision": "fp32",
+   "ok": true,
+   "peak_mem_gb": 4.988,
+   "ms_per_step": 54.01,
+   "note": "res=224 ckpt=0; out=1x197x768; n_timed=10"
+  },
+  {
+   "model": "vit_base_patch16_clip_224",
+   "mode": "train_full_ft",
+   "images_per_step": 32,
+   "precision": "bf16_autocast",
+   "ok": true,
+   "peak_mem_gb": 3.531,
+   "ms_per_step": 29.87,
+   "note": "res=224 ckpt=0; out=1x197x768; n_timed=10"
+  },
+  {
+   "model": "vit_base_patch16_clip_224",
+   "mode": "train_frozen_fwd",
+   "images_per_step": 128,
+   "precision": "bf16_autocast",
+   "ok": true,
+   "peak_mem_gb": 1.242,
+   "ms_per_step": 30.72,
+   "note": "res=224; no_grad forward; out=1x197x768; n_timed=10"
+  },
+  {
+   "model": "vit_base_patch16_clip_224",
+   "mode": "train_frozen_fwd",
+   "images_per_step": 128,
+   "precision": "fp32",
+   "ok": true,
+   "peak_mem_gb": 1.371,
+   "ms_per_step": 56,
+   "note": "extra; res=224; no_grad forward; out=1x197x768; n_timed=10"
+  },
+  {
+   "model": "vit_base_patch16_clip_224",
+   "mode": "inference",
+   "images_per_step": 2,
+   "precision": "bf16_autocast",
+   "ok": true,
+   "peak_mem_gb": 0.556,
+   "ms_per_step": 1.62,
+   "note": "res=224; out=1x197x768; n_timed=10"
+  },
+  {
+   "model": "vit_base_patch16_clip_224",
+   "mode": "inference",
+   "images_per_step": 2,
+   "precision": "fp32",
+   "ok": true,
+   "peak_mem_gb": 0.382,
+   "ms_per_step": 1.91,
+   "note": "res=224; out=1x197x768; n_timed=10"
+  },
+  {
+   "model": "vit_base_patch16_clip_224",
+   "mode": "inference",
+   "images_per_step": 1,
+   "precision": "bf16_autocast",
+   "ok": true,
+   "peak_mem_gb": 0.554,
+   "ms_per_step": 1.42,
+   "note": "res=224; out=1x197x768; n_timed=10"
+  },
+  {
+   "model": "vit_base_patch16_clip_224",
+   "mode": "inference",
+   "images_per_step": 1,
+   "precision": "fp32",
+   "ok": true,
+   "peak_mem_gb": 0.37,
+   "ms_per_step": 1.45,
+   "note": "res=224; out=1x197x768; n_timed=10"
+  },
+  {
+   "model": "vit_base_patch16_clip_224",
+   "mode": "inference",
+   "images_per_step": 2,
+   "precision": "bf16_params",
+   "ok": true,
+   "peak_mem_gb": 0.211,
+   "ms_per_step": 1.16,
+   "note": "extra; res=224; model.to(bf16), no autocast; out=1x197x768; n_timed=10"
+  },
+  {
+   "model": "vit_base_patch16_clip_224",
+   "mode": "inference",
+   "images_per_step": 1,
+   "precision": "bf16_params",
+   "ok": true,
+   "peak_mem_gb": 0.206,
+   "ms_per_step": 1.05,
+   "note": "extra; res=224; model.to(bf16); out=1x197x768; n_timed=10"
+  },
+  {
+   "model": "vit_large_patch16_dinov3",
+   "mode": "model_info",
+   "images_per_step": 0,
+   "precision": "fp32",
+   "ok": true,
+   "peak_mem_gb": 1.213,
+   "note": "params=303.1M; weights resident 1.21 GB; 24 layers, 1024-d, 16 heads, RoPE, 4 registers"
+  },
+  {
+   "model": "vit_large_patch16_dinov3",
+   "mode": "train_full_ft",
+   "images_per_step": 128,
+   "precision": "fp32",
+   "ok": false,
+   "peak_mem_gb": 32.431,
+   "note": "res=224 ckpt=0; OOM: CUDA out of memory. Tried to allocate 402.00 MiB. GPU 0 has a total capacity of 31.37 GiB of which 316.56 MiB is free (peak_mem = reached before OOM)"
+  },
+  {
+   "model": "vit_large_patch16_dinov3",
+   "mode": "train_full_ft",
+   "images_per_step": 128,
+   "precision": "bf16_autocast",
+   "ok": false,
+   "peak_mem_gb": 29.391,
+   "note": "res=224 ckpt=0; OOM: CUDA out of memory. Tried to allocate 98.00 MiB. GPU 0 has a total capacity of 31.37 GiB of which 52.56 MiB is free (peak_mem = reached before OOM)"
+  },
+  {
+   "model": "vit_large_patch16_dinov3",
+   "mode": "train_full_ft",
+   "images_per_step": 32,
+   "precision": "fp32",
+   "ok": true,
+   "peak_mem_gb": 16.707,
+   "ms_per_step": 193.75,
+   "note": "res=224 ckpt=0; out=1x201x1024; n_timed=10"
+  },
+  {
+   "model": "vit_large_patch16_dinov3",
+   "mode": "train_full_ft",
+   "images_per_step": 32,
+   "precision": "bf16_autocast",
+   "ok": true,
+   "peak_mem_gb": 11.803,
+   "ms_per_step": 115.11,
+   "note": "res=224 ckpt=0; out=1x201x1024; n_timed=10"
+  },
+  {
+   "model": "vit_large_patch16_dinov3",
+   "mode": "train_full_ft",
+   "images_per_step": 128,
+   "precision": "fp32",
+   "ok": true,
+   "peak_mem_gb": 8.922,
+   "ms_per_step": 959.38,
+   "note": "res=224 ckpt=1 (model.set_grad_checkpointing(True)); out=1x201x1024; n_timed=10"
+  },
+  {
+   "model": "vit_large_patch16_dinov3",
+   "mode": "train_full_ft",
+   "images_per_step": 128,
+   "precision": "bf16_autocast",
+   "ok": true,
+   "peak_mem_gb": 7.962,
+   "ms_per_step": 578.93,
+   "note": "res=224 ckpt=1; out=1x201x1024; n_timed=10"
+  },
+  {
+   "model": "vit_large_patch16_dinov3",
+   "mode": "train_frozen_fwd",
+   "images_per_step": 128,
+   "precision": "bf16_autocast",
+   "ok": true,
+   "peak_mem_gb": 2.648,
+   "ms_per_step": 140.96,
+   "note": "res=224; no_grad forward; out=1x201x1024; n_timed=10"
+  },
+  {
+   "model": "vit_large_patch16_dinov3",
+   "mode": "train_frozen_fwd",
+   "images_per_step": 128,
+   "precision": "fp32",
+   "ok": true,
+   "peak_mem_gb": 2.469,
+   "ms_per_step": 230.09,
+   "note": "extra; res=224; no_grad forward; out=1x201x1024; n_timed=10"
+  },
+  {
+   "model": "vit_large_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 2,
+   "precision": "bf16_autocast",
+   "ok": true,
+   "peak_mem_gb": 1.846,
+   "ms_per_step": 6.39,
+   "note": "res=224; out=1x201x1024; n_timed=10"
+  },
+  {
+   "model": "vit_large_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 2,
+   "precision": "fp32",
+   "ok": true,
+   "peak_mem_gb": 1.253,
+   "ms_per_step": 5.9,
+   "note": "res=224; out=1x201x1024; n_timed=10"
+  },
+  {
+   "model": "vit_large_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 1,
+   "precision": "bf16_autocast",
+   "ok": true,
+   "peak_mem_gb": 1.844,
+   "ms_per_step": 5.14,
+   "note": "res=224; out=1x201x1024; n_timed=10"
+  },
+  {
+   "model": "vit_large_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 1,
+   "precision": "fp32",
+   "ok": true,
+   "peak_mem_gb": 1.242,
+   "ms_per_step": 4.75,
+   "note": "res=224; out=1x201x1024; n_timed=10"
+  },
+  {
+   "model": "vit_large_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 2,
+   "precision": "bf16_autocast",
+   "ok": true,
+   "peak_mem_gb": 1.848,
+   "ms_per_step": 7.16,
+   "note": "res=256; out=1x261x1024; n_timed=10"
+  },
+  {
+   "model": "vit_large_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 2,
+   "precision": "fp32",
+   "ok": true,
+   "peak_mem_gb": 1.259,
+   "ms_per_step": 7.01,
+   "note": "res=256; out=1x261x1024; n_timed=10"
+  },
+  {
+   "model": "vit_large_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 1,
+   "precision": "bf16_autocast",
+   "ok": true,
+   "peak_mem_gb": 1.847,
+   "ms_per_step": 5.53,
+   "note": "res=256; out=1x261x1024; n_timed=10"
+  },
+  {
+   "model": "vit_large_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 1,
+   "precision": "fp32",
+   "ok": true,
+   "peak_mem_gb": 1.246,
+   "ms_per_step": 5.96,
+   "note": "res=256; out=1x261x1024; n_timed=10"
+  },
+  {
+   "model": "vit_large_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 2,
+   "precision": "bf16_params",
+   "ok": true,
+   "peak_mem_gb": 0.638,
+   "ms_per_step": 4.9,
+   "note": "extra; res=224; model.to(bf16); out=1x201x1024; n_timed=10"
+  },
+  {
+   "model": "vit_large_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 1,
+   "precision": "bf16_params",
+   "ok": true,
+   "peak_mem_gb": 0.632,
+   "ms_per_step": 3.83,
+   "note": "extra; res=224; model.to(bf16); out=1x201x1024; n_timed=10"
+  },
+  {
+   "model": "vit_large_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 2,
+   "precision": "bf16_params",
+   "ok": true,
+   "peak_mem_gb": 0.642,
+   "ms_per_step": 5.68,
+   "note": "extra; res=256; model.to(bf16); out=1x261x1024; n_timed=10"
+  },
+  {
+   "model": "vit_large_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 1,
+   "precision": "bf16_params",
+   "ok": true,
+   "peak_mem_gb": 0.634,
+   "ms_per_step": 4.05,
+   "note": "extra; res=256; model.to(bf16); out=1x261x1024; n_timed=10"
+  },
+  {
+   "model": "vit_huge_plus_patch16_dinov3",
+   "mode": "model_info",
+   "images_per_step": 0,
+   "precision": "fp32",
+   "ok": true,
+   "peak_mem_gb": 3.463,
+   "note": "params=840.5M; weights resident 3.46 GB; 32 layers, 1280-d, 20 heads, SwiGLU, RoPE, 4 registers"
+  },
+  {
+   "model": "vit_huge_plus_patch16_dinov3",
+   "mode": "train_full_ft",
+   "images_per_step": 128,
+   "precision": "fp32",
+   "ok": false,
+   "peak_mem_gb": 32.449,
+   "note": "res=224 ckpt=0; OOM: CUDA out of memory. Tried to allocate 504.00 MiB. GPU 0 has a total capacity of 31.37 GiB of which 410.56 MiB is free (peak_mem = reached before OOM)"
+  },
+  {
+   "model": "vit_huge_plus_patch16_dinov3",
+   "mode": "train_full_ft",
+   "images_per_step": 128,
+   "precision": "bf16_autocast",
+   "ok": false,
+   "peak_mem_gb": 30.457,
+   "note": "res=224 ckpt=0; OOM: CUDA out of memory. Tried to allocate 124.00 MiB. GPU 0 has a total capacity of 31.37 GiB of which 110.56 MiB is free (peak_mem = reached before OOM)"
+  },
+  {
+   "model": "vit_huge_plus_patch16_dinov3",
+   "mode": "train_full_ft",
+   "images_per_step": 32,
+   "precision": "fp32",
+   "ok": false,
+   "peak_mem_gb": 32.82,
+   "note": "res=224 ckpt=0; OOM: CUDA out of memory. Tried to allocate 126.00 MiB. GPU 0 has a total capacity of 31.37 GiB of which 54.56 MiB is free (peak_mem = reached before OOM)"
+  },
+  {
+   "model": "vit_huge_plus_patch16_dinov3",
+   "mode": "train_full_ft",
+   "images_per_step": 32,
+   "precision": "bf16_autocast",
+   "ok": true,
+   "peak_mem_gb": 29.177,
+   "ms_per_step": 291.63,
+   "note": "res=224 ckpt=0; out=1x201x1280; n_timed=10; only ~2 GB headroom left on the 31.37 GiB card"
+  },
+  {
+   "model": "vit_huge_plus_patch16_dinov3",
+   "mode": "train_full_ft",
+   "images_per_step": 128,
+   "precision": "fp32",
+   "ok": true,
+   "peak_mem_gb": 19.293,
+   "ms_per_step": 2314.75,
+   "note": "res=224 ckpt=1 (model.set_grad_checkpointing(True)); out=1x201x1280; n_timed=10"
+  },
+  {
+   "model": "vit_huge_plus_patch16_dinov3",
+   "mode": "train_full_ft",
+   "images_per_step": 128,
+   "precision": "bf16_autocast",
+   "ok": true,
+   "peak_mem_gb": 17.615,
+   "ms_per_step": 1358.68,
+   "note": "res=224 ckpt=1; out=1x201x1280; n_timed=10"
+  },
+  {
+   "model": "vit_huge_plus_patch16_dinov3",
+   "mode": "train_frozen_fwd",
+   "images_per_step": 128,
+   "precision": "bf16_autocast",
+   "ok": true,
+   "peak_mem_gb": 6.68,
+   "ms_per_step": 328.37,
+   "note": "res=224; no_grad forward; out=1x201x1280; n_timed=10"
+  },
+  {
+   "model": "vit_huge_plus_patch16_dinov3",
+   "mode": "train_frozen_fwd",
+   "images_per_step": 128,
+   "precision": "fp32",
+   "ok": true,
+   "peak_mem_gb": 6.064,
+   "ms_per_step": 558.04,
+   "note": "extra; res=224; no_grad forward; out=1x201x1280; n_timed=10"
+  },
+  {
+   "model": "vit_huge_plus_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 2,
+   "precision": "bf16_autocast",
+   "ok": true,
+   "peak_mem_gb": 5.172,
+   "ms_per_step": 11.9,
+   "note": "res=224; out=1x201x1280; n_timed=10"
+  },
+  {
+   "model": "vit_huge_plus_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 2,
+   "precision": "fp32",
+   "ok": true,
+   "peak_mem_gb": 3.522,
+   "ms_per_step": 12.81,
+   "note": "res=224; out=1x201x1280; n_timed=10"
+  },
+  {
+   "model": "vit_huge_plus_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 1,
+   "precision": "bf16_autocast",
+   "ok": true,
+   "peak_mem_gb": 5.171,
+   "ms_per_step": 10.97,
+   "note": "res=224; out=1x201x1280; n_timed=10"
+  },
+  {
+   "model": "vit_huge_plus_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 1,
+   "precision": "fp32",
+   "ok": true,
+   "peak_mem_gb": 3.502,
+   "ms_per_step": 9.66,
+   "note": "res=224; out=1x201x1280; n_timed=10"
+  },
+  {
+   "model": "vit_huge_plus_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 2,
+   "precision": "bf16_autocast",
+   "ok": true,
+   "peak_mem_gb": 5.175,
+   "ms_per_step": 13.86,
+   "note": "res=256; out=1x261x1280; n_timed=10"
+  },
+  {
+   "model": "vit_huge_plus_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 2,
+   "precision": "fp32",
+   "ok": true,
+   "peak_mem_gb": 3.535,
+   "ms_per_step": 18.11,
+   "note": "res=256; out=1x261x1280; n_timed=10"
+  },
+  {
+   "model": "vit_huge_plus_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 1,
+   "precision": "bf16_autocast",
+   "ok": true,
+   "peak_mem_gb": 5.175,
+   "ms_per_step": 11.37,
+   "note": "res=256; out=1x261x1280; n_timed=10"
+  },
+  {
+   "model": "vit_huge_plus_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 1,
+   "precision": "fp32",
+   "ok": true,
+   "peak_mem_gb": 3.508,
+   "ms_per_step": 11.23,
+   "note": "res=256; out=1x261x1280; n_timed=10"
+  },
+  {
+   "model": "vit_huge_plus_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 2,
+   "precision": "bf16_params",
+   "ok": true,
+   "peak_mem_gb": 1.765,
+   "ms_per_step": 8.43,
+   "note": "extra; res=224; model.to(bf16); out=1x201x1280; n_timed=10"
+  },
+  {
+   "model": "vit_huge_plus_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 1,
+   "precision": "bf16_params",
+   "ok": true,
+   "peak_mem_gb": 1.755,
+   "ms_per_step": 6.42,
+   "note": "extra; res=224; model.to(bf16); out=1x201x1280; n_timed=10"
+  },
+  {
+   "model": "vit_huge_plus_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 2,
+   "precision": "bf16_params",
+   "ok": true,
+   "peak_mem_gb": 1.771,
+   "ms_per_step": 10.29,
+   "note": "extra; res=256; model.to(bf16); out=1x261x1280; n_timed=10"
+  },
+  {
+   "model": "vit_huge_plus_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 1,
+   "precision": "bf16_params",
+   "ok": true,
+   "peak_mem_gb": 1.757,
+   "ms_per_step": 8.02,
+   "note": "extra; res=256; model.to(bf16); out=1x261x1280; n_timed=10"
+  },
+  {
+   "model": "vit_7b_patch16_dinov3",
+   "mode": "model_info",
+   "images_per_step": 0,
+   "precision": "bf16_params",
+   "ok": true,
+   "peak_mem_gb": 13.432,
+   "note": "params=6716.0M; weights resident 13.43 GB in bf16 (fp32 never instantiated: would be ~27 GB); 40 layers, 4096-d, 32 heads, SwiGLU mlp_ratio 2, RoPE, 4 registers"
+  },
+  {
+   "model": "vit_7b_patch16_dinov3",
+   "mode": "train_full_ft",
+   "images_per_step": 32,
+   "precision": "bf16_params",
+   "ok": false,
+   "peak_mem_gb": 31.523,
+   "note": "res=224 ckpt=1; pure bf16 params+grads+AdamW states (no fp32 master); fp32 skipped (27 GB weights alone); OOM: CUDA out of memory. Tried to allocate 64.00 MiB. GPU 0 has a total capacity of 31.37 GiB of which 12.56 MiB is free (peak_mem = reached before OOM)"
+  },
+  {
+   "model": "vit_7b_patch16_dinov3",
+   "mode": "train_frozen_fwd",
+   "images_per_step": 128,
+   "precision": "bf16_params",
+   "ok": true,
+   "peak_mem_gb": 15.811,
+   "ms_per_step": 1747.11,
+   "note": "res=224; no_grad forward; out=1x201x4096; n_timed=10"
+  },
+  {
+   "model": "vit_7b_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 2,
+   "precision": "bf16_params",
+   "ok": true,
+   "peak_mem_gb": 13.489,
+   "ms_per_step": 43.36,
+   "note": "res=224; out=1x201x4096; n_timed=10; fp32 inference not run (27 GB weights would not leave room)"
+  },
+  {
+   "model": "vit_7b_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 1,
+   "precision": "bf16_params",
+   "ok": true,
+   "peak_mem_gb": 13.472,
+   "ms_per_step": 25.18,
+   "note": "res=224; out=1x201x4096; n_timed=10"
+  },
+  {
+   "model": "vit_7b_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 2,
+   "precision": "bf16_params",
+   "ok": true,
+   "peak_mem_gb": 13.5,
+   "ms_per_step": 54.84,
+   "note": "res=256; out=1x261x4096; n_timed=10"
+  },
+  {
+   "model": "vit_7b_patch16_dinov3",
+   "mode": "inference",
+   "images_per_step": 1,
+   "precision": "bf16_params",
+   "ok": true,
+   "peak_mem_gb": 13.478,
+   "ms_per_step": 31.02,
+   "note": "res=256; out=1x261x4096; n_timed=10"
+  }
+ ],
+ "pretrained_download_check": "timm.create_model('vit_large_patch16_dinov3.lvd1689m', pretrained=True, num_classes=0, global_pool='') in env rovgui-pose (CPU only, 120 s SIGALRM): RESULT: DOWNLOAD OK in 26.1 s; 303.1M params; weights landed at HF cache repo timm/vit_large_patch16_dinov3.lvd1689m (1212 MB); blocks[0].attn.qkv.weight std=0.03640 (non-random init confirmed). Pretrained cfg: hf_hub_id timm/vit_large_patch16_dinov3.lvd1689m, input_size (3,256,256), license 'dinov3-license'. Token status: HF_TOKEN and HUGGING_FACE_HUB_TOKEN env vars are UNSET, but a stored login exists at ~/.cache/huggingface/token (dated 2026-01-09; whoami -> user 'sjtuhl'). Gating (gate_check.log, huggingface_hub model_info + anonymous hf_hub_download of config.json with token=False): timm/vit_large_patch16_dinov3.lvd1689m gated=False and timm/vit_7b_patch16_dinov3.lvd1689m gated=False -> anonymous download of config.json OK for both, i.e. the timm mirrors that timm 1.0.29 pulls from need NO token and NO gate acceptance (7B weights themselves were NOT downloaded, metadata only). The Meta originals are gated: facebook/dinov3-vitl16-pretrain-lvd1689m gated='manual', anonymous request -> '401 Client Error. (Request ID: Root=1-6aa78b82-33d857c6761fb98a3c432692;...)'; with the stored token model_info succeeds, and facebook/dinov3-vitb16-pretrain-lvd1689m (343 MB incl. model.safetensors) was already in this machine's HF cache before this task, so this account has already been granted the facebook gate. No 401/403 was hit anywhere with the stored token.",
+ "caveats": [
+  "Random-init architecture cost only, encoder alone: no U-Net/policy head, no data loader, no EMA update, no loss beyond output.float().mean(); real per-step cost is this plus the rest of the diffusion policy step.",
+  "'fp32' rows use TF32 matmuls (torch.set_float32_matmul_precision('medium') + allow_tf32=True) to mirror the project's own training setting (external/UMI_aquatic/diffusion_policy/config/train_diffusion_unet_timm_umi_aquatic_workspace.yaml:164, applied in workspace/train_diffusion_unet_image_workspace.py:55-60); strict fp32 would be slower.",
+  "Precision labels: 'bf16_autocast' = fp32 master weights + torch.autocast(bf16) (what AMP training would do); 'bf16_params' = model.to(bf16), no autocast (marked 'extra' for B/L/H+). ALL 7B rows are bf16_params because the fp32 7B (~27 GB) was never instantiated; the 7B train attempt used pure-bf16 params+grads+AdamW states (no fp32 master, i.e. an optimistic lower bound) and still OOMed at 31.523 GB peak with grad-checkpointing at 32 images -> any real 7B fine-tune (even LoRA with fp32 master) is out of reach on one 32 GB card.",
+  "peak_mem_gb = torch.cuda.max_memory_allocated()/1e9 (allocator view; excludes the CUDA context ~0.5 GB and reserved-but-unallocated slack); on OOM rows it is the peak reached before failure; torch reports the card as 31.37 GiB.",
+  "Full fine-tune at the project's 128 images/step (batch 64 x horizon 2) WITHOUT gradient checkpointing OOMs for ViT-L (fp32 32.431 GB, bf16_autocast 29.391 GB) and ViT-H+ (fp32 32.449, bf16_autocast 30.457, and even fp32 at 32 images 32.82); with model.set_grad_checkpointing(True) at 128 images it fits: ViT-L 8.922 GB/959.38 ms (fp32), 7.962 GB/578.93 ms (bf16); ViT-H+ 19.293 GB/2314.75 ms (fp32), 17.615 GB/1358.68 ms (bf16). Baseline ViT-B at 128 images: 16.741 GB/195.35 ms (fp32), 10.313 GB/105.14 ms (bf16).",
+  "[유도 from CSV rows] gradient accumulation of 4 x 32 images is cheaper than checkpointing at 128 for ViT-L: 4 x 193.75 = 775 ms (fp32, 16.707 GB) vs 959.38 ms ckpt, and 4 x 115.11 = 460 ms (bf16, 11.803 GB) vs 578.93 ms ckpt. For ViT-H+ only bf16_autocast at 32 images fits without ckpt (29.177 GB, 291.63 ms -> 4x = 1167 ms vs 1358.68 ms ckpt) but it leaves ~2 GB, nothing for the policy head, so ckpt (17.615 GB) is the realistic H+ path.",
+  "[유도 from CSV rows] per-128-image-step ratios vs the current ViT-B bf16 full-FT step (105.14 ms): ViT-L ckpt bf16 5.5x, ViT-H+ ckpt bf16 12.9x; frozen no-grad forward at 128 images bf16: ViT-B 30.72 ms, ViT-L 140.96 ms, ViT-H+ 328.37 ms, 7B 1747.11 ms (16.6x the current full-FT step, 15.811 GB).",
+  "Deploy-case inference (horizon 2 = batch 2, 224): ViT-B 1.62 ms (bf16_autocast) / 1.91 (fp32) / 1.16 (bf16_params); ViT-L 6.39 / 5.90 / 4.90; ViT-H+ 11.90 / 12.81 / 8.43; 7B 43.36 ms bf16_params (13.489 GB resident). At batch 1-2 the small models are launch-latency bound, so bf16 autocast is not faster than fp32 there (cast overhead); 256-res (261 tokens) adds ~10-40 %: ViT-L 7.16, ViT-H+ 13.86, 7B 54.84 ms (bf16, batch 2).",
+  "Timing protocol: 3 warm-up + 10 timed iterations with torch.cuda.synchronize for every ok row (n_timed=10 everywhere; no config approached the 120 s budget; whole sweep took 2 min 23 s); AdamW(lr=3e-5, wd=1e-6) default (foreach) implementation, fresh optimizer per config so its lazily created state is inside the peak; timm 1.0.29 Eva blocks use fused SDPA attention.",
+  "GPU-contention incident: the first full run was contaminated by a foreign process (PID 9708 'timeout 590 python dinov3_bench2.py', 11-17 GB, likely a parallel agent) and was discarded; the final run had an idle-GPU guard and per-row contamination stamps and 0 of 62 rows are flagged. If sibling agents benchmark concurrently again, rerun ./run_all.sh (it waits for an idle GPU).",
+  "Inputs were torch.randn images (not the project's 3-channel depth encoding) - irrelevant for cost, relevant only if someone reads outputs; 224 input gives 197 tokens (ViT-B CLIP) vs 201 tokens (DINOv3: 196 patches + CLS + 4 registers); 256 input gives 261 tokens (DINOv3 dynamic_img_size=True; not tried on the CLIP model whose pos-embed is fixed at 224).",
+  "Not measured: epochs-to-wall-clock (needs steps/epoch from the ~75-episode dataset), LoRA/partial fine-tune, feature-caching of a frozen backbone, torch.compile, and the transformers-format facebook/dinov3-* checkpoints (only the timm mirrors were exercised)."
+ ]
+}

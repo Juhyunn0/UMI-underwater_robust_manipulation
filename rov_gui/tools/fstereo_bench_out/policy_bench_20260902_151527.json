@@ -1,0 +1,719 @@
+{
+ "when": "20260902_151527",
+ "seconds": 45.0,
+ "fstereo": {
+  "iters": 16,
+  "scale": 1.0,
+  "alpha": 0.5,
+  "measured_hz": 7.33,
+  "frames": 231,
+  "cuda_graph": true,
+  "rig": {
+   "mono_size": [
+    640,
+    400
+   ],
+   "fx_rect": 343.1480949402376,
+   "fy_rect": 343.1480949402376,
+   "cx_rect": 328.5894660949707,
+   "cy_rect": 191.34119606018066,
+   "baseline_mm": 74.98864849622065,
+   "k_mm_px": 25732.21187362123,
+   "fx_rect_source": "cv2.stereoRectify:P1[0,0]",
+   "baseline_source": "cv2.stereoRectify:-P2[0,3]/P2[0,0]",
+   "alpha": 0.5,
+   "rectifies_on_host": true,
+   "fx_left_raw": 378.560546875,
+   "fx_right_raw": 380.13775634765625,
+   "fx_rect_vs_left_raw_pct": -9.354501473302104,
+   "fx_rect_vs_right_raw_pct": -9.730593920165513,
+   "T_left_to_right_mm": [
+    -74.97936248779297,
+    -0.7605181634426117,
+    -0.902339369058609
+   ],
+   "R1": [
+    [
+     0.9998098024530279,
+     -0.005122731052282593,
+     -0.01881798462650839
+    ],
+    [
+     0.005152374016327598,
+     0.999985560397836,
+     0.0015271011170835261
+    ],
+    [
+     0.018809889973984393,
+     -0.0016237679612263588,
+     0.9998217598236071
+    ]
+   ],
+   "P1": [
+    [
+     343.1480949402376,
+     0.0,
+     328.5894660949707,
+     0.0
+    ],
+    [
+     0.0,
+     343.1480949402376,
+     191.34119606018066,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     1.0,
+     0.0
+    ]
+   ],
+   "P2": [
+    [
+     343.1480949402376,
+     0.0,
+     328.5894660949707,
+     -25732.211873621232
+    ],
+    [
+     0.0,
+     343.1480949402376,
+     191.34119606018066,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     1.0,
+     0.0
+    ]
+   ],
+   "note": "dai.CalibrationHandler",
+   "baseline_spec_mm": 75.0,
+   "extrinsics_use_spec_translation": false,
+   "distortion_model": {
+    "left": "Perspective",
+    "right": "Perspective"
+   },
+   "left_K_live": [
+    [
+     378.560546875,
+     0.0,
+     324.4337463378906
+    ],
+    [
+     0.0,
+     378.75311279296875,
+     190.63800048828125
+    ],
+    [
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "left_D_live": [
+    -1.4053195714950562,
+    -0.6265497207641602,
+    -8.85795998328831e-06,
+    -0.0015156019944697618,
+    2.0006020069122314,
+    -1.1745309829711914,
+    -1.1848130226135254,
+    2.43859601020813,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "color": {
+    "size": [
+     400,
+     250
+    ],
+    "fx": 356.5217590332031,
+    "fy": 356.5604553222656,
+    "cx": 198.28187561035156,
+    "cy": 124.83948516845703,
+    "distortion": [
+     2.628258228302002,
+     81.2908706665039,
+     0.0023482972756028175,
+     -0.000615767203271389,
+     188.5574951171875,
+     2.404470920562744,
+     83.12574005126953,
+     186.52230834960938,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "R_rectleft_to_color": [
+     [
+      0.9999973259054603,
+      -0.0011604640233325472,
+      0.0019809837086714435
+     ],
+     [
+      0.0011724570478225485,
+      0.9999809176168483,
+      -0.006062922189052411
+     ],
+     [
+      -0.0019739101122441477,
+      0.006065229209968194,
+      0.9999797182794604
+     ]
+    ],
+    "t_rectleft_to_color_mm": [
+     -37.547621726989746,
+     -0.317394882440567,
+     0.039247339591383934
+    ]
+   }
+  },
+  "panel_stat": "valid 97% native -> 88% grid (+12% gaps filled)   135 ms",
+  "panel_fps": 7.3357455855214715,
+  "panel_latency_ms": 257.87050100188935
+ },
+ "policy_worker": {
+  "enabled": true,
+  "synthetic": false,
+  "source": "hw",
+  "policy_block_source": "MpcConfig.policy",
+  "session": {
+   "stub": false,
+   "ckpt": "/home/bdml/Desktop/universal_manipulation_interface/data/outputs/2026.09.01/21.15.26_train_diffusion_transformer_timm_umi_depth/checkpoints/selected.ckpt",
+   "ckpt_resolved": "/home/bdml/Desktop/universal_manipulation_interface/data/outputs/2026.09.01/21.15.26_train_diffusion_transformer_timm_umi_depth/checkpoints/epoch=0050-train_loss=0.029.ckpt",
+   "ckpt_sha1_head": "fa7aeb3d92b6228fefa98640504ee833640e7992",
+   "cfg_fingerprint": "309028fe9a77c2d1b4c2d546c63729dcc608c0d1",
+   "policy_target": "diffusion_policy.policy.diffusion_transformer_timm_policy.DiffusionTransformerTimmPolicy",
+   "model_name": "resnet34.a1_in1k",
+   "encoder_batchnorm_kept": true,
+   "num_inference_steps": 16,
+   "num_train_timesteps": 50,
+   "timesteps": [
+    45,
+    42,
+    39,
+    36,
+    33,
+    30,
+    27,
+    24,
+    21,
+    18,
+    15,
+    12,
+    9,
+    6,
+    3,
+    0
+   ],
+   "scheduler": {
+    "num_train_timesteps": 50,
+    "beta_start": 0.0001,
+    "beta_end": 0.02,
+    "beta_schedule": "squaredcos_cap_v2",
+    "clip_sample": true,
+    "set_alpha_to_one": true,
+    "steps_offset": 0,
+    "prediction_type": "epsilon"
+   },
+   "eval_transforms": "center",
+   "transforms": [
+    "CenterCrop(size=(212, 212))",
+    "Resize(size=224, interpolation=bilinear, max_size=None, antialias=True)"
+   ],
+   "crop_px": 212,
+   "n_obs_tokens": 106,
+   "device": "cuda",
+   "torch": "2.11.0+cu128",
+   "diffusers": "0.40.0",
+   "timm": "1.0.29",
+   "normalizer_input_stats": {
+    "robot0_eef_pos": {
+     "min": [
+      -0.013910421170294285,
+      -0.01416352391242981,
+      -0.03364962339401245
+     ],
+     "max": [
+      0.025048894807696342,
+      0.033461421728134155,
+      0.024650096893310547
+     ]
+    },
+    "robot0_gripper_width": {
+     "min": [
+      0.024562379345297813
+     ],
+     "max": [
+      0.08799999952316284
+     ]
+    }
+   },
+   "normalizer_image_identity": true,
+   "dataset_path": "/home/bdml/Desktop/data collection/dataset_depth.zarr.zip",
+   "ready": true,
+   "loading": false,
+   "error": "",
+   "load_s": 3.3022567750012968,
+   "warmup_ms": 127.97631100329454,
+   "n_predict": 0,
+   "infer_ms_p50": NaN,
+   "infer_ms_max": NaN,
+   "contract": {
+    "obs_keys": [
+     "camera0_depth",
+     "robot0_eef_pos",
+     "robot0_eef_rot_axis_angle",
+     "robot0_gripper_width",
+     "robot0_eef_rot_axis_angle_wrt_start"
+    ],
+    "image_key": "camera0_depth",
+    "obs_horizon": 2,
+    "action_horizon": 16,
+    "action_dim": 10,
+    "down_sample_steps": 2,
+    "obs_dt_s": 0.06666666666666667,
+    "fps": 30.0,
+    "fps_source": "dataset zip .zattrs (/home/bdml/Desktop/data collection/dataset_depth.zarr.zip)",
+    "image_shape": [
+     3,
+     224,
+     224
+    ],
+    "lowdim_shapes": {
+     "robot0_eef_pos": [
+      3
+     ],
+     "robot0_eef_rot_axis_angle": [
+      6
+     ],
+     "robot0_gripper_width": [
+      1
+     ],
+     "robot0_eef_rot_axis_angle_wrt_start": [
+      6
+     ]
+    }
+   }
+  },
+  "obs": {
+   "recipe": [
+    "depth (uint16 mm) on the producer's grid",
+    "grid adapter -> raw CAM_B 640x400 target grid (nearest, no averaging)",
+    "centre crop to square (y0=0, x0=120 for 640x400)",
+    "cv2.resize to out_res x out_res, INTER_NEAREST",
+    "normalise_depth(z_near, z_far) -> [0,1], near = 1",
+    "u8 = clip(v*255 + 0.5); channel 1 = 255 where mm > 0; channels (u8, valid, u8)"
+   ],
+   "target_model": {
+    "config": "configs/target_camera_underwater.yaml",
+    "name": "marinesitu_c3_cam_b",
+    "role": "target",
+    "medium": "water",
+    "verified": true,
+    "rectified": false,
+    "image_size": [
+     1280,
+     800
+    ],
+    "fx": 757.12,
+    "fy": 757.51,
+    "cx": 648.87,
+    "cy": 381.28,
+    "distortion": [
+     -1.40532,
+     -0.62655,
+     -1e-05,
+     -0.00152,
+     2.0006,
+     -1.17453,
+     -1.18481,
+     2.4386
+    ],
+    "baseline_m": 0.075
+   },
+   "target_rays": "umi_handheld.camera_model.CameraModel.unproject(px, W, H) (verbatim umi_handheld/warp.py WarpStage._build)",
+   "warp_size": [
+    640,
+    400
+   ],
+   "crop": {
+    "y0": 0,
+    "x0": 120,
+    "size": 400
+   },
+   "out_res": 224,
+   "z_near_m": 0.2,
+   "z_far_m": 3.0,
+   "rays_behind_camera": 0,
+   "grid_kind": "rect_left",
+   "grid_fingerprint": "791aaed12cc3aad9",
+   "coverage": 1.0,
+   "min_coverage": 0.985,
+   "usable": true,
+   "why": "",
+   "fill_iters": 0,
+   "n_builds": 0,
+   "n_set_grid": 1,
+   "grid": {
+    "mono_size": [
+     640,
+     400
+    ],
+    "alpha": 0.5,
+    "R1": [
+     [
+      0.999809802,
+      -0.005122731,
+      -0.018817985
+     ],
+     [
+      0.005152374,
+      0.99998556,
+      0.001527101
+     ],
+     [
+      0.01880989,
+      -0.001623768,
+      0.99982176
+     ]
+    ],
+    "P1": [
+     [
+      343.14809494,
+      0.0,
+      328.589466095,
+      0.0
+     ],
+     [
+      0.0,
+      343.14809494,
+      191.34119606,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      1.0,
+      0.0
+     ]
+    ],
+    "provenance": {
+     "fx_left_raw": 378.560546875,
+     "fx_right_raw": 380.13775634765625,
+     "fx_rect_vs_left_raw_pct": -9.354501473302104,
+     "fx_rect_vs_right_raw_pct": -9.730593920165513,
+     "T_left_to_right_mm": [
+      -74.97936248779297,
+      -0.7605181634426117,
+      -0.902339369058609
+     ],
+     "note": "dai.CalibrationHandler",
+     "baseline_spec_mm": 75.0,
+     "extrinsics_use_spec_translation": false,
+     "distortion_model": {
+      "left": "Perspective",
+      "right": "Perspective"
+     }
+    }
+   },
+   "model_check": {
+    "status": "OK",
+    "K_yaml": [
+     [
+      378.56,
+      0.0,
+      324.435
+     ],
+     [
+      0.0,
+      378.755,
+      190.64
+     ],
+     [
+      0.0,
+      0.0,
+      1.0
+     ]
+    ],
+    "D_yaml": [
+     -1.40532,
+     -0.62655,
+     -1e-05,
+     -0.00152,
+     2.0006,
+     -1.17453,
+     -1.18481,
+     2.4386
+    ],
+    "K_live": [
+     [
+      378.560547,
+      0.0,
+      324.433746
+     ],
+     [
+      0.0,
+      378.753113,
+      190.638
+     ],
+     [
+      0.0,
+      0.0,
+      1.0
+     ]
+    ],
+    "D_live": [
+     -1.405319571,
+     -0.626549721,
+     -8.858e-06,
+     -0.001515602,
+     2.000602007,
+     -1.174530983,
+     -1.184813023,
+     2.43859601,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "K_tol_px": 0.01,
+    "D_tol": 0.0001,
+    "yaml": "configs/target_camera_underwater.yaml",
+    "yaml_fingerprint": "27c17904d4a0d202",
+    "live_fingerprint": "8e5ccb3597451b00",
+    "dK_max_px": 0.0019995117187363576,
+    "dD_max": 4.398005530238235e-06,
+    "D_tail_zero": true
+   },
+   "z_correction_factor": {
+    "min": 0.9819564593969438,
+    "max": 1.0187654975529645
+   },
+   "fill": "none (rect_left is never filled)"
+  },
+  "depth_src": "rect_left",
+  "depth_scale_applied": null,
+  "grid_fault": "",
+  "obs_dt_s": 0.06666666666666667,
+  "period_s": 0.5,
+  "tcp": {
+   "tcp_body_flu_m": [
+    0.4165,
+    0.0,
+    -0.17
+   ],
+   "tcp_offset_cam_m": [
+    0.00547,
+    -0.10997005443031,
+    0.13947460029910336
+   ],
+   "tcp_offset_cam_m_explicit": false,
+   "handheld_tcp_offset_cam_m": [
+    0.0355,
+    0.1293,
+    0.3186
+   ],
+   "t_body_tcp_frd_m": [
+    0.4165,
+    0.0,
+    0.17
+   ],
+   "t_body_tcp_norm_m": 0.4498580331615742,
+   "T_body_tcp": [
+    [
+     0.0,
+     -0.6817320540699252,
+     0.7316019453593604,
+     0.4165
+    ],
+    [
+     1.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.7316019453593604,
+     0.6817320540699253,
+     0.17
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     1.0
+    ]
+   ]
+  },
+  "fstereo": {
+   "requested": {
+    "iters": 16,
+    "scale": 1.0,
+    "size": null,
+    "alpha": 0.5
+   },
+   "worker": {
+    "iters": 16,
+    "scale": 1.0,
+    "infer_size": null,
+    "infer_size_actual": [
+     640,
+     400
+    ],
+    "ckpt": "/home/bdml/Desktop/FoundationStereo/FoundationStereo/pretrained_models/23-51-11/model_best_bp2.pth",
+    "ckpt_sha1_first_8mib": "d277c7ff7de5c627328cde9eaf775e181685276a",
+    "measured_hz": 7.33,
+    "alpha": 0.5
+   },
+   "training": {
+    "status": "ok",
+    "ckpt": "/home/bdml/Desktop/universal_manipulation_interface/data/outputs/2026.09.01/21.15.26_train_diffusion_transformer_timm_umi_depth/checkpoints/selected.ckpt",
+    "hydra_config": "/home/bdml/Desktop/universal_manipulation_interface/data/outputs/2026.09.01/21.15.26_train_diffusion_transformer_timm_umi_depth/.hydra/config.yaml",
+    "dataset_path": "/home/bdml/Desktop/data collection/dataset_depth.zarr.zip",
+    "iters": 16,
+    "scale": 1.0,
+    "checkpoint": "/home/bdml/Desktop/FoundationStereo/FoundationStereo/pretrained_models/23-51-11/model_best_bp2.pth",
+    "depth_scale_applied": 1.0,
+    "tool": "UMI_Underwater/replay_foundation_stereo.py",
+    "fps": 30.0
+   },
+   "allow_mismatch": false
+  },
+  "ready_after_s": 3.346212463999109,
+  "counters": {
+   "plans": 0,
+   "skip_degenerate": 0,
+   "skip_pair": 0,
+   "skip_fresh": 0,
+   "skip_history": 0,
+   "skip_no_depth": 0,
+   "skip_stale_depth": 0,
+   "skip_no_start": 0,
+   "skip_grid": 0,
+   "skip_not_ready": 0,
+   "skip_fix_lag": 0,
+   "pair_dup": 0,
+   "pair_fallback": 0,
+   "pair_near": 0,
+   "infer_errors": 0,
+   "epoch_changes": 0,
+   "depth_frames": 231,
+   "states": 806,
+   "history_rows": 0
+  },
+  "pairing": {
+   "n": 0,
+   "dt_p50_s": null,
+   "dt_max_s": null,
+   "dup": 0,
+   "fallback": 0,
+   "near": 0,
+   "skip": 0,
+   "tol": 0.6,
+   "fallback_max": 3.0,
+   "skip_fix_lag": 0,
+   "fix_lag_tol": 0.5,
+   "trigger": "depth-frame arrival after period_s"
+  },
+  "infer_ms": {
+   "p50": null,
+   "max": null,
+   "n": 0
+  },
+  "depth_hz": 7.310644556299058,
+  "mailbox": {
+   "put": 231,
+   "taken": 231,
+   "dropped_src": 0,
+   "dropped_unwanted": 0,
+   "grid_set": 1,
+   "grid_refused": 0
+  },
+  "plan_hz": 0.0,
+  "state_stale_s": 1.0
+ },
+ "policy_status_last": {
+  "ready": true,
+  "loading": false,
+  "error": "",
+  "hz": 0.0,
+  "infer_ms": NaN,
+  "depth_src": "rect_left",
+  "note": "idle",
+  "n_plans": 0,
+  "n_skip": 0,
+  "grid_ok": true,
+  "grid_why": "",
+  "obs_dt_s": 0.06666666666666667,
+  "conn": "Conn.ONLINE",
+  "stamp": 20378.709404724
+ },
+ "worker_ready_after_s": 4.268063344999973,
+ "worker_errors": [],
+ "sensor_rows": {
+  "DP policy": [
+   null,
+   "Conn.ONLINE",
+   "rect_left 7fps idle"
+  ],
+  "IMU (C3)": [
+   200.0,
+   "Conn.ONLINE",
+   "BNO086 accel+gyro"
+  ],
+  "FStereo": [
+   7.3357455855214715,
+   "Conn.ONLINE",
+   "135 ms  88% valid"
+  ]
+ },
+ "log": [
+  "[   0.0 s] info  backend hw started",
+  "[   0.0 s] info  fstereo: learned depth is THIS RUN'S depth source \u2014 iters=16 scale=1, cuda graph on, projected onto 400x250. The camera's own depth stream is not requested.",
+  "[   0.0 s] info  mpc: writing runs under sessions/dryruns (hw_mpc.yaml log_dir sessions/low_level_controller_data overridden \u2014 one root per run)",
+  "[   0.0 s] info  c3: target 192.168.2.191 streams=['color', 'left', 'right'] \u2014 71 Mbit/s (color=10, left=31, right=31) = 79% of the ~90 Mbit/s PoE budget [tight] [C3 link only]",
+  "[   0.1 s] info  pid: sim GAINS_HEAVY_GRIPPER x omega_derate 0.6 -> kp [51.7, 51.7, 55.4] yaw_kp 3.57 [\uc608\uce21]",
+  "[   0.1 s] info  mavlink: telemetry DISABLED (--mavlink-transport none) \u2014 nothing is sent to or read from the vehicle",
+  "[   0.1 s] info  fstereo: loading FoundationStereo from /home/bdml/Desktop/FoundationStereo/FoundationStereo (this takes a few seconds)",
+  "[   0.2 s] info  tagnav: pupil_apriltags, geometry=floor, map=128 tag(s), size 0.170 m, decimate={'main': 1.0}, localizing=main, datum=map",
+  "[   0.2 s] info  policy: loading /home/bdml/Desktop/universal_manipulation_interface/data/outputs/2026.09.01/21.15.26_train_diffusion_transformer_timm_umi_depth/checkpoints/selected.ckpt (eval_transforms=center, steps=16, period 0.50 s); TCP = ROV jaw at body FRD [0.416, 0.0, 0.17] (|t| 0.450 m; handheld comparison [0.0355, 0.1293, 0.3186] in ITS camera frame). Inference runs only while a policy mission is ACTIVE.",
+  "[   1.9 s] info  mpc: acados IPOPT fallback DISABLED \u2014 a failed solve holds the previous wrench; 3 in a row disengage",
+  "[   1.9 s] info  mpc solver: acados, probe 2.0 ms, build 1.4s, realtime_ok=True",
+  "[   2.4 s] info  policy: DP policy: loading selected.ckpt (center transforms, 16 DDIM steps)",
+  "[   3.3 s] info  policy: READY after 3.3 s (obs_dt 66.7 ms, fps source: dataset zip .zattrs (/home/bdml/Desktop/data collection/dataset_depth.zarr.zip); sha1 fa7aeb3d92b6228fefa98640504ee833640e7992)",
+  "[   3.5 s] info  policy: DP policy ready in 3.3 s (warm-up 128 ms, 106 tokens, sha1 fa7aeb3d92b6, obs_dt 66.7 ms from dataset zip .zattrs)",
+  "[   4.7 s] info  mpcc: acados-mpcc, 60 stages / 7.2 s horizon, probe 7.1 ms, build 2.8s, realtime_ok=True",
+  "[   4.7 s] info  mpc: dobmpc ready, solver=acados, probe=2.0 ms",
+  "[   5.6 s] info  fstereo: vitl @ 23-51-11 ready in 5.6 s (iters=16 scale=1, cuda graph on)",
+  "[   5.6 s] warn  fstereo: no mono pair yet \u2014 this run has no other depth source, so the depth panel is dark until pairs resume",
+  "[  10.6 s] warn  fstereo: no mono pair yet \u2014 this run has no other depth source, so the depth panel is dark until pairs resume",
+  "[  11.8 s] info  fstereo: rig ready \u2014 fx_rect 343.15 px (raw EEPROM fx differs by -9.35%), baseline 75.0 mm, K 25732 mm*px; depth projected onto 400x250",
+  "[  11.8 s] info  c3: connected",
+  "[  13.3 s] info  fstereo: forward captured as one CUDA graph in 1480 ms (input 640x416, iters 16)",
+  "[  13.5 s] info  policy: depth grid rect_left:791aaed12cc3aad9 \u2014 obs coverage 100.00% (min 98.5%)"
+ ],
+ "pair_expectation": {
+  "measured_hz": 7.33,
+  "obs_dt_s": 0.06666666666666667,
+  "frame_spacing_s": 0.1364256480218281,
+  "mode": "fallback",
+  "pair_dt_s": 0.1364256480218281,
+  "ratio_to_training_stride": 2.0463847203274215,
+  "tol": 0.6,
+  "fallback": 3.0
+ }
+}

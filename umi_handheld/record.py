@@ -24,7 +24,7 @@ the usual cause is standing closer than MinZ, where stereo simply cannot triangu
 
     SPACE   start / stop a take          K   switch demonstration <-> grippercalibration
     E       near <-> far mode            Q, ESC  quit
-                                         takes auto-number: sessions/<kind>_0001, _0002 …
+                                         takes auto-number: data/<YYYYMMDD>/<kind>_0001, _0002 …
 
 E switches to --config-extended, which defaults to <config>_extended.yaml if that file
 exists. It halves MinZ by turning extended disparity on, and that is a pipeline
@@ -369,15 +369,25 @@ def SUBDIRS(has_colour: bool, has_right: bool = True):
 
 
 def next_session_dir(base: Path, kind: str) -> Path:
-    """<base>/<kind>_0001, then _0002 … so takes never overwrite each other."""
+    """<base>/<YYYYMMDD>/<kind>_0001, then _0002 … so takes never overwrite
+    each other.
+
+    The date directory is the one every record in this repo lands in since
+    2026-09-14 (``data/YYYYMMDD/``, rov_gui/runstore.py); the take keeps its
+    ``<kind>_NNNN`` name because extract_pose / build_zarr / the replay
+    mission take that folder by name. The counter runs over EVERY day under
+    ``base`` (``data/*/<kind>_*``) so a number is never reused, and a bare
+    ``<base>/<kind>_NNNN`` from before the dated layout still counts.
+    """
     base.mkdir(parents=True, exist_ok=True)
     n = 0
-    for p in base.glob(f"{kind}_*"):
+    for p in list(base.glob(f"{kind}_*")) + list(base.glob(f"*/{kind}_*")):
         try:
             n = max(n, int(p.name.rsplit("_", 1)[1]))
         except (IndexError, ValueError):
             pass
-    return base / f"{kind}_{n + 1:04d}"
+    day = base / time.strftime("%Y%m%d")
+    return day / f"{kind}_{n + 1:04d}"
 
 
 class FrameWriter:
@@ -961,10 +971,11 @@ def main() -> int:
     ap.add_argument("--source", choices=["synthetic", "device"], default="synthetic")
     ap.add_argument("--input", type=Path, default=REPO / "captures/synthetic_0001",
                     help="synthetic capture directory (--source synthetic)")
-    ap.add_argument("--out", type=Path, default=REPO / "sessions/session_0001",
+    ap.add_argument("--out", type=Path, default=REPO / "data" / time.strftime("%Y%m%d") / "session_0001",
                     help="session directory (--source synthetic)")
-    ap.add_argument("--sessions-dir", type=Path, default=REPO / "sessions",
-                    help="where auto-numbered device takes go")
+    ap.add_argument("--sessions-dir", type=Path, default=REPO / "data",
+                    help="ROOT of the dated tree auto-numbered device takes go in "
+                         "(<root>/YYYYMMDD/<kind>_NNNN; default: %(default)s)")
     ap.add_argument("--kind", choices=list(KINDS), default="demonstration")
     ap.add_argument("--seconds", type=float, default=10.0,
                     help="length of the headless device take (--no-preview)")

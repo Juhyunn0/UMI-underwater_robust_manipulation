@@ -5,7 +5,9 @@ THE PROBLEM. A disturbance kick blurs the camera or swings the tags out of
 frame, the localizer stops producing a fix, and about 1.1 s later
 (``tag_stale_s`` 0.7 + ``tag_stale_hold_s`` 0.4) the whole loop DISENGAGES.
 That is worse than it sounds: disengaging drops DEPTH hold as well, and the
-vehicle is negatively buoyant (net -5.7 N), so it starts sinking — which
+vehicle drifts with its trim of the day (the model says -5.7 N sinking;
+2026-09-07 it floated — hw_mpc.yaml vehicle_net_buoyancy_n), so it starts moving
+away from the tags — which
 changes the attitude and the view and makes re-acquisition less likely, not
 more. The operator then has to re-ARM.
 
@@ -143,6 +145,10 @@ class StationBridge:
 
     def __init__(self, cfg: dict | None = None):
         self.cfg = resolve(cfg)
+        # Does K/M actually leave the station this engagement
+        # (engage.attitude_axes, 2026-09-26)? The worker sets it at engage;
+        # False = the 4-DoF station, where the allocation drops them anyway.
+        self.attitude_axes = False
         self.reset()
 
     # ---------------------------------------------------------------- state
@@ -200,20 +206,28 @@ class StationBridge:
         return self.tier
 
     # ------------------------------------------------------------ actuation
-    def release_horizontal(self, u):
-        """Zero X, Y and N of a body wrench; leave Z (and K/M) alone.
+    def release_horizontal(self, u, attitude: bool | None = None):
+        """Zero X, Y and N of a body wrench; leave Z alone. K and M too when
+        ``attitude`` (default: :attr:`attitude_axes`).
 
         Belt and braces with the re-targeting the worker does in the coast
         tier: the reference is moved onto the vehicle so the controller has
         nothing to ask for, AND the surge/sway/yaw components are zeroed here
         so a wound-up integrator or a disturbance feedforward cannot put
-        thrust out through the gap. K and M are already dropped by the
-        allocation (MANUAL_CONTROL carries no roll/pitch axis), so on this
-        vehicle the coast tier commands the HEAVE axis and nothing else."""
+        thrust out through the gap. On the 4-DoF station K and M are dropped
+        by the allocation anyway (MANUAL_CONTROL's four axes carry no
+        roll/pitch), so the coast tier commands the HEAVE axis and nothing
+        else. Under ``engage.attitude_axes`` (2026-09-26) they WOULD reach
+        the wire, and a coast is not the place for an attitude command on an
+        estimate that stopped — so they are zeroed here as well and the meta
+        says so (``released_in_coast``)."""
         v = np.asarray(u, float).copy()
         v[0] = v[1] = 0.0
         if v.size > 5:
             v[5] = 0.0
+        att = self.attitude_axes if attitude is None else bool(attitude)
+        if att and v.size > 4:
+            v[3] = v[4] = 0.0
         return v
 
     def detail(self) -> str:
@@ -235,4 +249,7 @@ class StationBridge:
                 "last_recovery": self.last_recover,
                 "scope": "station hold only (an object follow is demoted "
                          "to a station hold first, then carried here)",
-                "released_in_coast": "X, Y, N (heave and attitude kept)"}
+                "released_in_coast": ("X, Y, N, and K, M under attitude_axes "
+                                      "(heave kept; attitude levels passively)"
+                                      if self.attitude_axes else
+                                      "X, Y, N (heave and attitude kept)")}

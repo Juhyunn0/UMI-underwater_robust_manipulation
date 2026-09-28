@@ -40,13 +40,13 @@ datum: map
 
 # floor geometry — the WHOLE mat: 128 ids / 140 physical tags, exactly the
 # 20x7 layout the operator surveyed by eye (2026-08-14). Built by
-#   python -m rov_gui.tools.build_tag_map sessions/nav_runs/20260813_215640 \
+#   python -m rov_gui.tools.build_tag_map data/20260813/0813_215640/nav_215640 \
 #       --anchor config/tag_map.yaml -o config/tag_map_full.yaml --exclude 112,113
 # from the 2026-05-29 gantry survey's 47 tags, which stay FROZEN inside it
 # (that survey: median residual 0.227 px, anchor drift 0.0 mm). Duplicated ids
 # carry both physical copies as "<id>#0"/"<id>#1" entries.
 #
-# Measured on the run it was built from (sessions/nav_runs/20260813_215640,
+# Measured on the run it was built from (data/20260813/0813_215640/nav_215640,
 # 2984 frames): fix acceptance 74.3% -> 82.3%, tags per fix p50 9 -> 23,
 # accepted reproj p50 1.20 -> 1.27 px. The newly added tags are less accurate
 # than the surveyed core (out-of-plane spread 39 mm vs 8 mm) and the mat edges
@@ -70,13 +70,50 @@ wall_tag_size_m: 0.170
 # rest by the tag-vs-ATTITUDE roll/pitch residual the state assembler reports.
 wall_preset: x_into_wall
 
-# floor map: demand >=2 tags so one grazing detection never carries the whole
-# state (joint PnP over all visible tags is the accuracy win of having a map).
-# Counts UNIQUE anchor ids only (duplicate_ids below never count toward it).
-# Set back to 1 for the wall geometry.
-min_tags: 2
+# How many UNIQUE anchor ids a fix needs (duplicate_ids below never count).
+#
+# 1 SINCE 2026-09-07 (operator's call): one non-duplicated tag is enough to
+# know where the vehicle is. The 2 it replaces was there so "one grazing
+# detection never carries the whole state", and that trade is real — a lone
+# tag fixes range and bearing from a single 0.17 m square, and its pose is the
+# planar IPPE flip case rather than a rigid multi-tag fit. What holds it up:
+#   * the flip is arbitrated by the autopilot's gravity vector (tilt_gate_deg
+#     below) — the same gate the wall geometry has always run on, and the
+#     worker feeds it rp_hint from ATTITUDE on every frame;
+#   * the duplicated tags held back from anchoring are CONFIRMED against the
+#     one-tag pose and refit into it (tagnav.py), so the common case is not
+#     really one tag — {60, 65, 141} solves as a three-tag fix.
+# The cost of the old 2 was measured: 372 of 390 rejections in
+# data/20260906/0906_192348/nav_192348 were
+# "1/2 unique tags (2 dup held back)", including a 10.9 s outage.
+min_tags: 1
 max_reproj_px: 3.0
 stale_s: 0.5
+
+# OUTLIER RESCUE (tagnav.py _drop_outliers). The joint fit pools its RMS over
+# every corner, so ONE tag with bad corners rejects a frame whose other tags
+# agree to ~1 px. A frame over max_reproj_px now drops its worst tag and
+# refits instead of dying. Measured: this rescues 55/55 gate rejections in
+# data/20260906/0906_194856/nav_194856
+# (median 4.63 -> 1.16 px) and 18/18 in .../0906_192348/nav_192348.
+#
+# The bounds are what keep a rescue from becoming a confident wrong answer —
+# a frame that is uniformly bad (wrong map, changed extrinsic) has no standout
+# tag, fails outlier_min_ratio and is REJECTED rather than peeled down to a
+# lucky subset. Raise outlier_min_ratio to be stricter about what counts as an
+# outlier; lower outlier_max_frac to allow fewer drops.
+outlier_max_frac: 0.30    # at most this share of the anchors may go (>= 1)
+outlier_min_ratio: 1.8    # worst tag / median of the others, to count as one
+
+# A quad that crosses the image edge has EXTRAPOLATED corners, not measured
+# ones, and they are wrong by pixels: 16 of the 18 reprojection-gate
+# rejections on 2026-09-06 were carried by one, e.g. frame 1198 of
+# data/20260906/0906_194856/nav_194856, where
+# tag 27's corner sits at y=362.5 in a 360-row image and reprojects at
+# 7.12 px against 1.1-3.1 px for the other six. Such a detection no longer
+# anchors. 0.0 = only quads that actually cross the edge; a positive value
+# also demotes tags merely NEAR it; null = keep them (the old behaviour).
+min_border_px: 0.0
 
 # Ids that exist TWICE on the physical mat. [측정: operator's cell-by-cell
 # survey of the 20x7 mat, 2026-08-14; cross-checked against config/tag_map.yaml
@@ -104,7 +141,7 @@ stale_s: 0.5
 duplicate_ids: [54]
 # Accept a duplicated tag as the surveyed copy within this reprojection error.
 # Sized off measured accepted-frame reproj (p50 1.22-1.34 px, p99 2.36 px,
-# sessions/nav_runs/20260813_17*/fixes.csv) vs the smallest possible wrong-copy
+# data/20260813/0813_17*/nav_*/fixes.csv) vs the smallest possible wrong-copy
 # offset (0.1995 m grid pitch, ~128 px at 0.8 m) — a wide margin either way.
 dup_confirm_px: 6.0
 
@@ -127,7 +164,33 @@ quad_decimate:
 
 # z for the MPC state: 'pressure' = ArduSub depth + a session offset anchored
 # to the tag world at engage; 'tag' = trust the PnP z.
-z_source: pressure
+#
+# TAG since 2026-09-02, and the reason it was not before is now fixed. The PnP
+# z was wrong by 0.26 m — `cam_t_flu` had the lens 0.155 m BELOW the COM when
+# it is 0.105 m above (see hw_nav.yaml's cam_t_flu block) — so the barometer
+# was the only usable vertical. With the extrinsic corrected the tag z
+# cross-checks to 21 mm against the operator's CAD, and the barometer's own
+# behaviour has become the problem:
+#
+#   two policy runs, 2026-09-02: z ran 0.31-0.34 m in 5-9 s while the
+#   tag-derived x/y moved 2-9 cm, i.e. the vehicle was essentially stationary
+#   and only the pressure channel moved. Both runs died on div_max_m 0.25
+#   with z carrying 94-96 % of the squared error
+#   [측정: data/20260902/0902_215928/
+#    mpc_220057.csv and 0902_224231/mpc_224231.csv].
+#
+# `pressure` also self-anchors its offset on the FIRST fix
+# (control/state_assembler.py: `_z_off = z - depth_m`), so the whole vertical
+# axis inherits whatever the barometer happened to read at that instant.
+#
+# NO NEW DROPOUT RISK: `p_tag` comes from the fix, so a tag dropout leaves the
+# assembler with no state at all whichever source is set — pressure never
+# bridged that gap (the imu_dr block has its own separate z_source for that).
+# It REMOVES a failure mode instead: under `pressure`, a stale barometer
+# returns None and kills the state estimate even with a perfect tag fix.
+#
+# A RECORD BOUNDARY: z is not comparable across runs whose meta differs here.
+z_source: tag
 
 # Which C3 stream feeds the MAIN panel's detection (when used).
 nav_stream: color
@@ -159,7 +222,88 @@ cam_extrinsic_json: bluerov2_mujoco_marinegym/meshes/c3_payload_frames.json
 # unmoved by the re-mount. A hinge moves the lens too; if that matters at the
 # centimetre level, measure it and set cam_t_flu below.
 cam_tilt_deg: 43.3
-# cam_t_flu: [0.23949, 0.00547, -0.15537]
+# LENS POSITION — OVERRIDES the JSON above (2026-09-02). The Onshape value it
+# replaces, [0.23949, 0.00547, -0.15537], is from the 2026-07-19 registration
+# and describes a mount that no longer exists; the camera was re-mounted.
+#
+# Derived from the operator's CAD of the CURRENT mount, through the gripper:
+#   jaw-pair centre  [0.4165, 0.0, -0.17] body FLU
+#                    [유도: bluerov2_mujoco_marinegym/compute_payload_inertia.py:95
+#                     JAW_POS, closed position]
+#   lens vs that centre  275.01439 mm UP, 110.66435 mm BACK, collinear (y = 0)
+#                    [측정: operator CAD of the re-mounted C3, 2026-09-02]
+#   => [0.4165 - 0.11066, 0.0, -0.17 + 0.27501] = [0.30584, 0.0, +0.10501]
+#
+# THE SIGN FLIPS: the lens is 0.105 m ABOVE the COM, not 0.155 m below. That
+# 0.26 m is what put the vehicle 0.46 m above a mat it was resting on in the
+# 3-D view (2026-09-02 pool run, nav_220912: fix z_ned -0.4563 with the tag
+# plane flat at z = 0).
+#
+# Cross-checked two ways, both to 21 mm:
+#   * the operator's own chain says the lens sits 47.075 + 275.014 = 322.1 mm
+#     above the ROV's underside, so a vehicle resting on the mat puts it at
+#     0.322 m; the recorded PnP fix puts it at 0.301 m. The MAP and the PnP
+#     were right all along — only the camera->body hop was wrong.
+#   * the old value implies the COM is 0.477 m above the underside, which is
+#     taller than the whole vehicle (0.254 m) and therefore impossible.
+# Predicted effect: the reported COM height drops 0.456 m -> 0.196 m, against
+# 0.217 m for a vehicle sitting on its underside [유도, same 21 mm].
+#
+# NOT re-derived from Onshape. If the mount is re-exported, prefer that and
+# delete this override — process_c3_mesh.py rewrites the JSON.
+#
+# 2026-09-08 — THE CAD OFFSET ABOVE IS CONTRADICTED, AND THIS VALUE IS NOW
+# SUSPECT. Kept on purpose; read this before touching it.
+#   * The C3 image refutes "lens 110.66 mm back of the jaw-pair centre": with
+#     the recorded PnP pose that jaw projects to image row ~420 of the 360-row
+#     colour frame, while the jaws are plainly visible at rows 265-360; a jar
+#     held in the jaws and set on the centre of floor tag 58 puts the grip
+#     point 0.196 m ahead of the lens (range 0.187-0.204) and 0.275 m below it
+#     (~1 cm from the CAD vertical) [측정: data/20260908/
+#     0908_180453_observe/policy_obs/rgb/000160.jpg, tag PnP with the run's own
+#     intrinsics; jar height 0.084 m from data/20260908/
+#     0908_170428_observe/policy_obs/rgb/000000.jpg; open-jaw rays in
+#     data/20260908/0908_175151_observe/policy_obs/rgb/000000.jpg].
+#     So EITHER the CAD's lens->jaw offset is wrong and this lens position is
+#     right (the jaw is then 0.502 m ahead of the COM), OR this lens position
+#     is ~0.09 m too far forward and ~0.05 m too low (lens really at x ~0.21-
+#     0.23, z ~0.155) and the sim's jaw 0.4165 was about right (0.22 + 0.196).
+#     The recordings cannot separate the two — both put the jaws at lens +
+#     [0.196, 0, -0.275] — which is why policy.tcp_body_flu_m and
+#     rov_shape.JAW_CENTRE_M are anchored to the LENS (0.502 = 0.30584 +
+#     0.196) and no longer to this CAD chain.
+#   * Evidence FOR the second reading (all indirect; none is a measurement of
+#     this key): (1) second_cam.t_flu below was measured RELATIVE TO THIS
+#     CHAIN and puts the RGB dome lens at x 0.2663, but the hull mesh has the
+#     dome apex at x 0.230-0.231 and the enclosure tube ending ~0.176 [유도:
+#     bluerov2_mujoco_marinegym/meshes/rov_body_white.obj / rov_body_black.obj
+#     vertex extents, base_link frame] — a lens 3.5-4.5 cm beyond the dome is
+#     impossible, and the operator's own tape put it at 0.18 (the "8.6 cm
+#     short" note below). (2) A pilot-command-gated pure-yaw pivot (per-
+#     thruster PWM, surge/sway ~0) puts the REPORTED body origin 0.117-0.130 m
+#     BEHIND the vehicle's yaw pivot [측정: data/20260908/
+#     0908_170428/mpc_170428.csv n=192, 0908_175151/mpc_175151.csv n=43;
+#     script + output: data/20260908/0908_180453_observe/diag/
+#     skeptic_lever_pwm2.py, yaw_pivot_out.txt]; with the pivot at the composite COM (+0.035)
+#     the second reading predicts ~-0.13, this value ~-0.035. (3) Vertical:
+#     BodyAlign puts the dome camera at z -0.019 against the mesh's
+#     electronics-tube axis ~+0.03, and this chain's underside -0.217 against
+#     the mesh's -0.165..-0.167 (white/black mesh) — ~5 cm low, consistent
+#     with the chain's anchor (jaw z -0.17) being the sim's guess. (4) Under
+#     the second reading the CAD's 110.66 mm lands ~9 cm behind the grip
+#     point, i.e. plausibly the jaw BASE/pivot rather than a wrong number.
+#   * NOT CHANGED because every recorded position is expressed through this
+#     value (a RECORD BOUNDARY: ~0.09 m along heading — 0.085 if the sim jaw
+#     0.4165 is exact, 0.076-0.096 for lens x 0.21-0.23 [유도] — and ~0.05 m
+#     in z on every fix if it moves) and the evidence is indirect. What
+#     decides it is ONE tape measurement on the vehicle: frame front (dome
+#     apex) -> C3 lens (this value: lens ~7.5 cm AHEAD of the apex; second
+#     reading: within ~2 cm of it), and C3 lens -> gripper palm. If it
+#     moves, re-derive policy.tcp_body_flu_m (= cam_t_flu + [0.196, 0,
+#     -0.275]) in the same change; meta hardware.cam_t_flu records the
+#     boundary. Details:
+#     KNOWN_ISSUES.md "C3 외부파라미터 cam_t_flu의 x/z가 의심된다".
+cam_t_flu: [0.30584, 0.0, 0.10501]   # [유도] see above; x/z SUSPECT since 2026-09-08
 # cam_xyaxes_flu: [0.0, -1.0, 0.0, -0.0056, 0.0, 0.99998]
 
 # The ROV DEFAULT RGB camera model, used when nav_source: second.
@@ -172,20 +316,95 @@ cam_tilt_deg: 43.3
 #                so the square stays square but its size inherits the error
 # Calibrate (checkerboard through the dome, in water) before quoting numbers.
 second_cam:
-  t_flu: [0.18, 0.0, 0.0]
+  # LENS POSITION, body FLU — MEASURED 2026-09-08 as the body-frame offset
+  # between the RGB and C3 solvers (control/nav_fusion.py BodyAlign), i.e.
+  # relative to the C3's own extrinsic chain: 207 time-paired fixes, spread
+  # 1.6 mm [측정: data/20260908/0908_105822/
+  # nav_111010 replayed with the calibrated model below]. The old tape
+  # estimate [0.18, 0, 0] was 8.6 cm short and 1.9 cm high.
+  t_flu: [0.2663, -0.0051, -0.0189]
+  # The mount's residual roll/yaw beyond the pure tilt is 1.39 deg (same
+  # measurement); left level here — the runtime alignment absorbs it.
   xyaxes_flu: [0.0, -1.0, 0.0, 0.0, 0.0, 1.0]
-  # Tilt-mount angle the extrinsic assumes, degrees DOWN from level. The
-  # mount is OPEN-LOOP: press LEVEL and keep 0.0, or drive to a stop and
-  # enter that angle. Tilting down helps the floor-map view; a value that
-  # does not match the real mount rotates the whole world estimate.
-  tilt_deg: 0.0
-  fx: 1144.0
-  fy: 1144.0
-  cx: 960.0
-  cy: 540.0
-  width: 1920
-  height: 1080
-  dist: []
+  # Tilt-mount angle the extrinsic assumes, degrees DOWN from level, AT
+  # STARTUP. The mount is OPEN-LOOP, so from here on the PAYLOAD panel TRACKS
+  # it (control/tilt_tracker.py: the vehicle's report if any, else the tag
+  # localizer's measurement, else the typed value, else UP/DOWN held at
+  # tilt_rate_deg_s) and the RGB extrinsic FOLLOWS the tracked angle. Press
+  # LEVEL and keep 0.0, or drive to a stop and enter that angle.
+  # 15.9 = MEASURED 2026-09-08 by the same alignment as t_flu above (the
+  # 2026-09-07 run read +12.8 with the uncalibrated model; +15.7 with it
+  # replayed on this run's old model, +15.9 with the calibrated one).
+  tilt_deg: 15.9
+  # Mount slew while UP/DOWN is held, deg/s. [예측] — never timed on this
+  # vehicle. The dead-reckoned readout grows its ± with every degree it
+  # integrates on this number; time one sweep against the tag-measured tilt
+  # (PAYLOAD panel, "measured:tags") and replace it. --tilt-rate-deg-s wins.
+  tilt_rate_deg_s: 30.0
+  # INTRINSICS — MEASURED 2026-09-08 with rov_gui/tools/calibrate_second_cam.py
+  # from the same run (250 of 3463 frames, 4400 corners, the tag mat as the
+  # target; incidence/azimuth diverse). Principal point fixed at the frame
+  # centre and square pixels (the defaults — a planar target cannot pin
+  # them: free cx/cy moved 50 px for no gain, free fy came out 36% off fx,
+  # i.e. unphysical). Fit RMS 2.00 px, per-frame p50 1.82 / p90 3.05 px.
+  # The old vendor-FOV guess (fx 1144 @1920 = 762.7 @1280, no distortion)
+  # sat at p50 4.71 px and passed 43.5% of this run's RGB frames at the
+  # 3 px gate; this model passes 3462/3463 (replay).
+  fx: 713.81
+  fy: 713.81
+  cx: 640.0
+  cy: 360.0
+  width: 1280
+  height: 720
+  dist: [0.014144, 0.033999, 0.004114, 0.005717, -0.040619]
+
+# SECOND-CAMERA FALLBACK (2026-09-07, operator request: "fill the gaps when
+# the C3 loses the tags with the default camera"). control/nav_fusion.py.
+#
+# The C3 stays the localizer. The ROV RGB (second_cam above, every number
+# [예측]) ALSO solves every frame it sees tags in, but its fix is FORWARDED
+# only when the C3 has produced nothing for `after_s` — and only once the
+# constant body-frame offset between the two solvers has been LEARNED from
+# `min_pairs` time-paired fixes. That offset IS the RGB's extrinsic error
+# (position, focal-length scale at the working range, and the mount tilt),
+# and it divides out exactly for any vehicle pose as long as the mount does
+# not move; so the handover is seamless instead of a 5-20 cm step that the
+# MPC would fly. Before it is learned the RGB fix is HELD (a gap the mission
+# already bridges), unless allow_unaligned: true says a raw RGB pose is
+# wanted regardless (bench use — a step into the controller is the cost).
+#
+# The learned offset also MEASURES the mount tilt (PAYLOAD panel
+# "measured:tags"), and a commanded tilt change resets it: the alignment
+# describes the extrinsic it was learned at, not the one after the move.
+#
+# A RECORD BOUNDARY: NavFix.source says which camera made each fix
+# ("second" = RGB fallback), and its note carries the alignment state.
+fallback:
+  enabled: true
+  after_s: 0.2          # C3 silent this long -> the RGB fix stands in
+  pair_tol_s: 0.08      # |dt| to pair a C3 fix with an RGB fix for learning
+  min_pairs: 10         # pairs before the RGB is trusted (aligned)
+  window: 60            # samples averaged (the newest N pairs)
+  allow_unaligned: false
+  tilt_reset_deg: 2.0   # tracked tilt moved this much -> relearn
+  # The RGB solver's OWN reprojection gate. The second_cam model above has NO
+  # distortion terms and a guessed fx, and the ROV camera is wide-angle, so
+  # several tags across its frame do not fit a pinhole to 3 px: in the
+  # 2026-09-07 14:52 run every multi-tag RGB frame died on the 3 px gate and
+  # the only RGB fixes that got through were single tags at 2.1-2.4 px
+  # self-residual (data/20260907/0907_145206/
+  # nav_145240/fixes.csv — the C3's single-tag residual is 0.17 px). 8 px
+  # [예측] admits those frames at the cost of a few cm of pose error that the
+  # learned alignment cannot remove (it is not constant per frame). REC NAV
+  # with both cameras on the mat, then rov_gui/tools/calibrate_second_cam.py,
+  # replaces the guess with a measured model — and this can come back down.
+  #
+  # 4.0 SINCE 2026-09-08, with the calibrated model: the RGB's residual floor
+  # is the SAME tag-map error the C3 sees, scaled by its 2x pixel pitch
+  # (1280 wide vs 640), so 4 px here is the margin 2 px would be on the C3
+  # [유도]. Replay of the calibration run: 3462/3463 frames pass even at 3.0
+  # (p50 2.32, p90 2.87 px) — 4.0 is headroom, not a loosening.
+  max_reproj_px: 4.0
 
 # GEOFENCE — REMOVED 2026-08-14 (operator request).
 #
@@ -205,7 +424,7 @@ second_cam:
 #   x [-0.57, 1.15]  y [-1.97, 2.17]  z [-1.8, 0.15]  margin 0.3
 # with z the TAG-FRAME z (floor tags are z=0, +z DOWN, so a swimming vehicle is
 # NEGATIVE) sized to the measured operating band -1.30 .. -0.54 m across four
-# runs (sessions/nav_runs/*/fixes.csv, z_ned of accepted fixes).
+# runs (data/*/*/nav_*/fixes.csv, z_ned of accepted fixes).
 
 pool_draw_flu: [4.877, 1.8]   # display only
 

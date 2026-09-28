@@ -32,24 +32,57 @@ for, and says so.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
 
 _MARINEGYM = Path(__file__).resolve().parents[2] / "bluerov2_mujoco_marinegym"
 
+#: ModuleNotFoundError names the cv2 sys.path race can surface as: the
+#: ``dobmpc`` package itself, or the shared ``rov_model`` module that
+#: dobmpc/params.py imports (mirrors mpc_bridge._RETRY_IMPORT_NAMES).
+_RETRY_IMPORT_NAMES = ("dobmpc", "rov_model")
+
 
 def _load(rov_model: str):
-    """(params, fossen), importing the sim's model stack at most once."""
+    """(params, fossen), importing the sim's model stack at most once.
+
+    When ``dobmpc.params`` is already in memory under a different
+    ``ROV_MODEL`` than the one asked for, the loaded one is returned with a
+    WARNING (log + ``warnings.warn``), never an error — the record
+    (:func:`plant_meta` ``rov_model_loaded`` / ``warning``) carries the
+    mismatch; a raise here would only lose the plant block of a run that
+    is flying anyway."""
+    rov_model = str(rov_model)
     if "dobmpc.params" not in sys.modules:
         if not _MARINEGYM.is_dir():
             raise FileNotFoundError(f"marinegym tree not found at {_MARINEGYM}")
-        if str(_MARINEGYM) not in sys.path:
+        os.environ["ROV_MODEL"] = rov_model
+    for attempt in (0, 1):
+        if "dobmpc.params" not in sys.modules and str(_MARINEGYM) not in sys.path:
             sys.path.insert(0, str(_MARINEGYM))
-        os.environ["ROV_MODEL"] = str(rov_model)
-    from dobmpc import fossen, params
+        try:
+            from dobmpc import fossen, params
+            break
+        except ModuleNotFoundError as e:
+            # A concurrent ``import cv2`` (rov_gui.qt.import_cv2) replaces
+            # sys.path with a pre-import snapshot and drops the insert above
+            # — see mpc_bridge.import_dobmpc (2026-09-26). It surfaces as
+            # name "rov_model" OR "dobmpc" depending on where the race
+            # lands. One retry on either.
+            if e.name not in _RETRY_IMPORT_NAMES or attempt:
+                raise
+    loaded = str(getattr(params, "MODEL", rov_model))
+    if loaded != rov_model:
+        msg = (f"plant._load: dobmpc already imported as ROV_MODEL={loaded!r}; "
+               f"{rov_model!r} was requested — the plant record describes the "
+               f"LOADED model (rov_model_loaded), not the requested one")
+        logging.getLogger(__name__).warning(msg)
+        warnings.warn(msg, RuntimeWarning, stacklevel=3)
     return params, fossen
 
 

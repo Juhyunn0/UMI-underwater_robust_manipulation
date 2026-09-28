@@ -1,0 +1,1102 @@
+# land_dp.yaml — the HANDHELD LAND diffusion-policy validation run.
+#
+# A human CARRIES the vehicle; a can sits in the C3's view; ORB-SLAM3 supplies the
+# pose that AprilTag navigation normally would; the policy infers at ~2 Hz and its
+# knots are drawn in the ORB-SLAM3 map window. NOTHING IS TRANSMITTED: the run is
+# launched without --allow-command, so the sink is a NullCommandSink and the
+# controller's output goes nowhere.
+#
+# THIS IS A FULL COPY of hw_mpc.yaml, not an overlay: MpcConfig.load has no
+# `extends:` and unknown keys RAISE (geometry.py:951-962), so an overlay file is
+# not expressible. Everything below is hw_mpc.yaml verbatim EXCEPT the six values
+# listed here, each a deliberate land-run relaxation:
+#
+#   mode                     dobmpc  -> pid
+#   vel_propagation          true    -> false
+#   policy.workspace_box_ned 2x2x1 m -> unreachable (see the note at the key)
+#   policy.reject_escalate   3       -> 12
+#   policy.obs_max_age_s     0.6     -> 1.0
+#   nav.stale.imu_stale_s    0.3     -> 0.5
+#
+# A RECORD BOUNDARY. Accept/clip/reject rates from a run flown on this file are
+# NOT comparable with a pool run on hw_mpc.yaml — obs_max_age_s and
+# reject_escalate both move the verdict distribution directly. The run meta
+# carries the config path; cite it beside any number taken from such a run.
+#
+# hw_mpc.yaml — the hardware MPC/DOB-MPC configuration (rov_gui/control/).
+#
+# The controller itself (horizon, weights, U_MAX, DT_CTRL) lives in
+# bluerov2_mujoco_marinegym/dobmpc/params.py and is reused verbatim — this
+# file only holds what is DIFFERENT on the real vehicle.
+
+rov_model: heavy_gripper    # ROV_MODEL for dobmpc (heavy | heavy_c3 | heavy_gripper)
+mode: pid                   # none | mpc | dobmpc | mpc_tuned | dobmpc_tuned | pid
+                            # LAND: the controller output is discarded by the
+                            # NullCommandSink, so the only thing acados would
+                            # add here is failure modes — a lazy solver build
+                            # that blocks the worker, max_solver_fails
+                            # disengages, and the realtime_ok engage gate.
+                            # pid removes all three. (hw_mpc.yaml: dobmpc)
+                            # ONE solver serves the four MPC names: 'dob' adds
+                            # w_hat, '_tuned' splits the position cost into
+                            # along/cross in the path frame (mpc_tuned: below).
+                            # none = LOW level None, TELEOP (2026-09-11): the
+                            # station commands nothing (what --policy-observe
+                            # preselects); the panel also offers mpcc/dobmpcc.
+ctrl_hz: 20.0               # MUST equal 1/DT_CTRL — baked into the solver
+
+# PID baseline (mode: pid, or the mode combo in the MPC panel). Gains are the
+# sim's pole-placed GAINS_HEAVY_GRIPPER (controller.py) scaled by
+# omega_derate (kp·d², kd·d, ki·d³ — the ωn scalings): the sim design point
+# assumed clean state and ideal thrust, and its own docs say derate for
+# hardware. [예측] until a pool session tunes it.
+pid:
+  omega_derate: 0.6
+  # kp/kd/ki/yaw_* overrides accepted here; see rov_gui/control/pid.py
+
+# Bridge tag fixes with the velocity/gyro estimate between camera frames —
+# the state (and the plot) moves at 20 Hz instead of holding each fix.
+vel_propagation: false
+# LAND: OFF. StateAssembler bridges eta FORWARD to the tick time
+# (state_assembler.py:141-155) and MpcWorker then stores that tick-time pose
+# under the FIX stamp (workers.py:3742-3747), so every proprio row the policy
+# reads is a forward extrapolation of up to camera_latency + one tick, not the
+# pose at t_fix. The policy's motion cue is a difference of two such rows, so
+# the extrapolation lands directly in the observation. Off makes eta the honest
+# ZOH fix pose; the cost is a staircased reference for a follower whose output
+# is discarded anyway. (hw_mpc.yaml: true)
+
+# MANUAL-mode axis gains: the body wrench at FULL MANUAL_CONTROL deflection.
+# [예측] from the T200 curve + Heavy mixer geometry at nominal voltage, at the
+# vehicle's CURRENT pilot gain — never measured on this vehicle. Replace with
+# the P4 step-calibration values. Wrong gains = tracking offset (mpc) or a DC
+# w_hat (dobmpc), bounded either way by axis_cap.
+# The gains are [예측] — derived from the T200 curve and the Heavy mixer
+# geometry, never measured on this vehicle — until a P4 step calibration
+# replaces them. What HAS been measured (2026-08-17, pooling every engaged
+# trajectory tick of 29 hardware runs, r = 0.95) is a whole-loop relation:
+#
+#     speed = 0.692 * (|axis| - 0.096)          [측정]
+#
+# READ THAT CAREFULLY: it is not the thruster gain. It is thrust MINUS whatever
+# opposes motion, and on a tethered vehicle that is dominated by drag the
+# prediction model does not carry — the same relation implies the horizontal
+# drag the controller assumes is 8-12x too low. Feeding its slope in here as
+# axis_gain (6.4 N) was a misattribution and it is on the record what that
+# cost: expressible authority collapsed from axis_cap*gain = 30 N to 3.2 N, so
+# the normalized axis railed on 64-77 % of ticks in
+# .../20260817/{0817_144318, 0817_150426} against under 0.5 % in every other
+# run on file, and cross-track p95 roughly doubled. 60 N is the value every
+# good run used, including the best full mission on record
+# (0817_110145: 5/5 laps, cross-track p95 6.6 cm, zero saturation).
+#
+# The real consequence of that measurement belongs in the PREDICTION MODEL's
+# drag, not here; until that is done the vehicle simply tracks well and slowly
+# (110145 held 0.058 m/s against a 0.20 m/s command).
+axis_gain:
+  surge_n: 60.0
+  sway_n: 60.0
+  heave_n: 60.0
+  yaw_nm: 20.0
+axis_cap: 0.5               # |axis| ceiling on everything the MPC sends
+
+# Slew limit on the axis command [1/s]. The yaw axis has been reversing at
+# 1.9-2.7 sign flips/s in EVERY hardware run (2026-08-14 onward), deadband or
+# not, and thrust that reverses faster than the hull can respond is heat and
+# noise rather than control. This bounds how fast a command may move: 1.5/s
+# lets a full-cap swing happen in a third of a second, which is far quicker
+# than the vehicle's own horizontal time constant, while clipping the 20 Hz
+# reversals. 0 disables it (every run before 2026-08-17 had no limit).
+axis_slew_per_s: 1.5
+
+# THRUSTER DEADBAND: known, real, and deliberately NOT compensated here.
+# A T200/Basic ESC produces no thrust until its command clears +/-25 us
+# [스펙, vendor, unmeasured on this vehicle], and small commands do fall into
+# it. An axis-domain inverse was tried on 2026-08-17 and removed the same day
+# — it is the right idea applied at the wrong interface, and it made the
+# vehicle shake (.../20260817/0817_124624: ax_yaw |a| p50 0.012-0.043 ->
+# 0.358, surge on/off toggling 0.00 -> 3.10 /s, pwm_dev 24-31 -> 62 us).
+# Three reasons it cannot work over MANUAL_CONTROL:
+#   * the deadband is per-THRUSTER, downstream of ArduSub's mixer. surge, sway
+#     and yaw all sum into the same four vectored thrusters, so pre-distorting
+#     each axis stacks the offset 2-3x on one thruster: measured on the run
+#     that motivated it, |surge|+|sway|+|yaw| went 0.246 -> 0.685 (x2.78), with
+#     65 % of ticks having all three axes live. It distorts DIRECTION too — a
+#     (0.40, 0.031) request comes out with 4.8x the sway/surge ratio.
+#   * the null zone is a discontinuity, and the real request crosses it about
+#     once a second (0.56-1.37 /s measured), so it pulses rather than pushes.
+#   * the motivation was wrong anyway: axis_gain is roughly right. Depth hold
+#     is a steady-state balance against net buoyancy, and across 29 runs the
+#     median |ax_heave| of 0.100 implies heave_n ~ 57 N against the 60 N
+#     assumed [유도; net buoyancy -5.7 N is itself a model number].
+# If it is ever revisited it belongs per-thruster, which means leaving
+# MANUAL_CONTROL for a direct thruster interface.
+
+# GEOMETRIC PATH FOLLOWING. The PID gets a spatial reference: the measured
+# hull is projected onto the active segment and its setpoint sits at most
+# path_lead_m ahead of that projection. False restores the legacy wall-clock
+# trajectory tracker.
+#
+# The CORNER GATE that lived here until 2026-08-16 (path_corner_tol_m /
+# _speed_m_s / _dwell_s / path_brake_accel_m_s2) is GONE at the operator's
+# request. It stopped the reference dead 10 cm before every vertex and refused
+# to reveal the next leg until the hull had parked inside 5 cm below 0.03 m/s
+# for 0.30 s — a stop-and-go square, and the reason no MPC horizon could ever
+# look round a corner. Runs recorded before 2026-08-16 flew that gate; their
+# corner behaviour is not comparable with anything after it.
+path_following: true
+path_lead_m: 0.10
+traj_timeout_factor: 3.0    # wall-clock backstop
+
+# MPCC PATH SHAPING (mode: mpcc). The mission stops being a polygon and becomes
+# a C1 curve: rectangle corners are replaced by circular fillets of
+# path_fillet_m, so the heading is continuous through them and the NMPC horizon
+# can plan across the corner instead of into it.
+# The two accelerations define the FEASIBLE speed profile baked into the path:
+#   v <= sqrt(path_lat_accel_m_s2 * R)   through a fillet
+#   |dv/dt| <= path_long_accel_m_s2      so the reference brakes BEFORE a corner
+# path_turn_radius_m rounds an out-and-back LINE's turnarounds into a stadium;
+# 0 keeps the mission's exact geometry and reverses in place (the vehicle has
+# to stop to reverse anyway).
+# path_creep_m_s is a deadlock guard, not a tuning knob: v_ref is the target
+# for theta_dot, so a v_ref of exactly zero is a fixed point the optimizer
+# never leaves — the mission would never start, with a healthy solver status.
+# fillet 0.10 = a corner you have to look for on the plot (10 % of a 1 m
+# side), so an MPCC square and a PID square are visually the same rectangle
+# and the comparison is about the CONTROLLER.
+#
+# It is a FLOOR, not a preference. Projection onto a curve is degenerate once
+# the vehicle is inside the arc's centre of curvature, i.e. once |e_cross| > R
+# on the concave side — the nearest point then sweeps across the arc and the
+# reference darts forward. That is not hypothetical: at R = 0.06 with the
+# uncorrected axis_gain, 17 % of arc ticks had |e_cross| > R and the reference
+# outran the hull by more than 3x on 12 % of them, which is exactly the
+# "cross speeds up in the corner" the operator reported
+# (.../20260817/0817_135600/mpc_140502.csv). KEEP R WELL ABOVE THE CROSS-TRACK
+# ERROR YOU ACTUALLY GET: with the gain fixed the error falls to ~1 cm, so
+# 0.10 leaves a 10x margin and 0.06 would also be defensible.
+# WAYPOINT MODE: set path_fillet_m to 0.0 and the mission becomes the exact
+# rectangle the operator typed, with the reference braking to a crawl at each
+# vertex and accelerating out (path_geometry.speed_profile detects the heading
+# discontinuity and pins the speed there). Because the reference arrives
+# stopped, every horizon stage collapses onto the vertex while it sits there —
+# setpoint regulation at the corner, reached continuously instead of by
+# switching modes. Runs flown that way are labelled
+# reference_clock.strategy = "waypoint_vertex_stop" and must not be pooled with
+# filleted ones. 0.15 is the value the best recorded mission used
+# (0817_110145) and what MPCC wants, since its contouring frame needs a
+# tangent; keep it there unless you are deliberately flying waypoints.
+path_fillet_m: 0.0
+path_turn_radius_m: 0.0
+# a_lat / a_long shape the feasible speed profile. Both are back at 0.05
+# (2026-08-17): they were raised to 0.30/0.15 to chase speed, and the hardware
+# audit says the best full mission on record flew 0.05/0.05
+# (0817_110145, cross-track p95 6.6 cm over 5/5 laps). For scale the vehicle's
+# own lateral limit is axis_cap*axis_gain/m_eff_sway = 0.5*60/26.42 = 1.14
+# m/s^2 [예측 — axis_gain is unmeasured], so 0.05 is very conservative; raise
+# it only with a run to compare against.
+path_lat_accel_m_s2: 0.05
+path_long_accel_m_s2: 0.05
+path_creep_m_s: 0.02
+
+# ALONG/CROSS COST SPLIT — read ONLY by mode `mpc_tuned` / `dobmpc_tuned`.
+#
+# The tracking NMPC penalises position error with a diagonal Q in the WORLD
+# frame (Q[0]=Q[1]=300 on the heavy), so a centimetre OFF the path costs
+# exactly what a centimetre BEHIND on it costs. At a corner the optimiser
+# spends the cheap one to buy the expensive one — it cuts the corner — and
+# that is optimal for that cost, not a bug. These modes rotate the same 2x2
+# block into the PATH frame at every stage:
+#
+#     cost = q_along * (t_hat . e)^2  +  q_cross * (n_hat . e)^2
+#     i.e.  W = Rz(psi_path) diag(q_along, q_cross) Rz(psi_path)^T
+#
+# A rotation is orthogonal, so along_scale == cross_scale reproduces the
+# isotropic diagonal to machine precision — which is the parity test that
+# pins the machinery (rov_gui/tests/test_path_cost.py). acados takes the
+# per-stage W with cost_set on the ALREADY generated OCP, so `mpc` and
+# `mpc_tuned` are one compiled solver and one build.
+#
+# The angle is NedPlan.psi_path, the path's own tangent — never the vehicle
+# heading. Under heading_follow: false the vehicle crabs, so the two are
+# unrelated, and the reference VELOCITY cannot stand in for the tangent
+# either because speed_profile brakes it to a crawl at exactly the corners
+# this exists for.
+#
+# READ WITH path_lead_m. PathCursor already caps along-track error at the
+# leash (0.10 m), so lowering along_scale cannot let the reference run away —
+# it changes how much authority the NMPC spends closing a gap that is bounded
+# anyway. On 2026-08-18 that leash was saturated on 83.6 % of engaged ticks
+# (data/20260818/0818_143802/mpc_143938.csv),
+# i.e. the vehicle already could not keep up; in that regime a lower
+# along_scale buys cross-track accuracy by going slower still.
+#
+# 0.25 / 4.0 (a 16x anisotropy) is a FIRST GUESS [예측], not a measured
+# optimum, and no tuned run has been flown in water. Sweep it offline first:
+#   python -m rov_gui.tools.sweep_path_cost --grid
+mpc_tuned:
+  along_scale: 0.25      # q_along = along_scale * 300
+  cross_scale: 4.0       # q_cross = cross_scale * 300
+  # q_along: 75.0        # absolute overrides; null = use the scales above
+  # q_cross: 1200.0
+  apply_terminal: true   # rotate QN too (off re-admits cutting at the horizon end)
+  split_velocity: false  # also split the linear-velocity weight (see path_cost.py)
+  v_along_scale: 1.0
+  v_cross_scale: 1.0
+
+# Per-axis w_hat clip [X,Y,Z,K,M,N] (N / N·m) applied BEFORE the solver — the
+# KNOWN_ISSUES replacement for the scalar ±50 backstop in mpc_acados.py.
+w_hat_clip: [15, 45, 45, 5, 5, 8]
+
+# NET BUOYANCY OF THE VEHICLE ACTUALLY FLOWN, B - W [N] (+ floats, - sinks).
+# The NMPC's plant assumes heavy_gripper SINKS at 5.71 N (dobmpc/params.py
+# NET_BUOYANCY, composed from vendor masses + CAD volume, never measured on
+# this vehicle) and that number is baked into the generated solver. A nominal
+# NMPC cancels its own model's gravity, so at zero depth error mpc/mpc_tuned
+# pushed UP 5.7 N — a wrong-signed feedforward whenever the real trim differs.
+# 2026-09-07 18:00 the vehicle floated: every mpc_tuned policy mission rose
+# 0.27-0.54 m under a plan that pointed DOWN (policy dz +0.055 m/s p50), with
+# the heave law fitting uZ = -5.6 N - 60 N/m * ez (R^2 0.54-0.94) and the
+# command inside the T200 deadband on 88-100 % of ticks
+# [측정: data/20260907/0907_180038/mpc_18*.csv,
+#  plans.jsonl]. The same day's flat-depth PID holds sat at |uZ| < 3 N and the
+# 16:53 mpc holds at -6.5 N, so the real B - W moved between about -2 N and
+# > +3 N — never -5.7. The bridge feeds (model - this value) to the mpc and
+# mpc_tuned solver as a CONSTANT heave wrench through the disturbance
+# parameter (no rebuild, not an observer; dobmpc ignores it — the EAOB
+# estimates the same residual). 0.0 = neutral. Set it per session if a PID
+# depth hold shows a steady uZ beyond the deadband; |value| <= 15 (half the
+# heave authority — a wrong entry is a constant feedforward). IGNORED by the
+# mpcc family (its meta says so); dobmpc estimates it instead.
+# MEASURED 2026-09-08 from a free rise with the heave command inside the
+# deadband (0908_105822/mpc_110419.csv, 0-11 s, pwm_dev <= 22 us): B - W =
+# +0.12 N with the plant's heave drag, +0.04 N with none, +0.28 N with 3x
+# drag [측정+유도: data/20260908/0908_105822/
+# buoyancy_fit_20260908.txt]. The vehicle is neutral to within a few tenths
+# of a newton; the trim below is that value, and the residual drift you see
+# in MANUAL is the ESC deadband (thrust is nil until the position term
+# reaches ~6 N, i.e. ~0.1 m of error), not the buoyancy — the same day's
+# STABILIZE runs (mpc_105945 / mpc_110306) held depth within +/-7 cm with
+# ~zero heave command because the attitude loop keeps the vertical
+# thrusters out of the deadband (pwm_dev p50 35 us vs 10 us in MANUAL).
+vehicle_net_buoyancy_n: 0.1
+
+# STATION BRIDGE — a tag dropout is not a reason to stop controlling.
+# STATION MODE ONLY (rov_gui/control/station_bridge.py).
+#
+# THE PROBLEM. A disturbance kick blurs the camera or swings the tags out of
+# frame; the localizer stops producing a fix; ~1.1 s later (tag_stale_s 0.7 +
+# tag_stale_hold_s 0.4) the loop DISENGAGES. That drops DEPTH hold too, and
+# this vehicle drifts wherever its trim of the day takes it (the MODEL says
+# -5.7 N sinking; on 2026-09-07 it floated — see vehicle_net_buoyancy_n), so it
+# starts moving away from where the tags were —
+# which changes the view and makes re-acquisition LESS likely. Turning on
+# imu_dr does not help: MpcWorker._runtime_fault reads `meas` (the tag
+# solution, deliberately kept as ground truth), not the state the controller
+# eats, so the interlock fires whatever the estimator is doing.
+#
+# THE LADDER. Which axes may be carried, and for how long, is four questions,
+# because the sensors behind them differ:
+#
+#     z            barometer          ABSOLUTE, no drift
+#     roll/pitch   ArduSub AHRS       ABSOLUTE, no drift
+#     yaw          gyro integration   slow drift (0.02 rad/s = 70 deg/min)
+#     x, y         accel double-int   t^2, fast
+#
+#   fix fresh          everything, as always
+#   0 .. imu_hold_s    all axes on the bridge estimate, full authority
+#   after imu_hold_s   x/y/yaw RELEASED; depth + attitude held INDEFINITELY
+#
+# The last tier is deliberately NOT a disengage. Pushing on a drifting
+# horizontal estimate actively drives the vehicle somewhere wrong and nothing
+# here stops it by position any more (the geofence was removed 2026-08-14);
+# releasing lets it drift with the water, which at pool speeds is slow, while
+# the two axes that never drift keep it at depth and level — the state most
+# likely to get the tags back. Safe to sit in forever, so it does.
+#
+# The bridge estimator is its OWN ImuDeadReckoner, RE-ANCHORED on every fresh
+# fix (imu_dr's is not, on purpose — its whole point is to measure drift) and
+# using attitude="vehicle" (autopilot roll/pitch, absolute).
+#
+# EVERY OTHER INTERLOCK STILL FIRES: disarm, flight-mode change, telemetry
+# loss, solver failure, tick overrun, E-STOP — and the two staleness faults
+# the bridge would otherwise fly blind on ("imu stale", "pressure depth
+# stale"), because those are the sensors it would be flying ON.
+#
+# Each recovery logs how far the estimate had drifted when truth came back.
+# That is the free measurement this feature produces, and it is the number
+# that turns the IMU budget from [예측] into [측정].
+#
+# **실기 미검증** (2026-08-18) — KNOWN_ISSUES.md.
+station_bridge:
+  enabled: true
+  imu_hold_s: 3.0        # all axes on the estimate this long, then release x/y/yaw
+  # auto = integrate the accelerometer ONLY when imu_dr.calibration loaded,
+  # else freeze x/y at the last fix. A RAW C3 accelerometer carries a measured
+  # 1.8 m/s^2 bias — 8 m of drift in 3 s — so `auto` is not a convenience.
+  xy_source: auto        # auto | imu | hold
+  axis_cap: null         # null = the normal axis_cap (operator decision 2026-08-18)
+
+# OBJECT FOLLOW — put the --pose tracked object into the pool's frame, and
+# (shape: follow) hold the relative pose START was pressed at.
+# rov_gui/control/object_nav.py. Needs --pose AND --mpc.
+#
+# WHAT IT DOES. The object tracker reports T_cam_obj (object -> CAMERA); the
+# tag localizer reports the VEHICLE in the map frame. Composed from ONE camera
+# frame, the camera extrinsic cancels exactly:
+#
+#     R_map_cam = R_ned_body . R_frd_cam       <- extrinsic-free
+#     p_map_cam = p_ned + R_ned_body . t_frd_cam
+#
+# and that is load-bearing, because the C3 re-mount is only half measured: the
+# 43.3 deg tilt is applied as a PURE rotation and the translation a real hinge
+# also moves (cam_t_flu, a 0.2855 m lever arm [측정: c3_payload_frames.json,
+# Onshape 2026-07-19]) is still unmeasured (KNOWN_ISSUES 2026-08-17). Pair the
+# two estimates ACROSS frames and that unknown comes straight back:
+# |t_frd_cam| * 2*sin(theta/2), i.e. 2.5 cm at 5 deg of yaw between them.
+# `pair_exact` on the panel and in the CSV is the ONLY warning that the
+# cancellation has stopped — watch it on the bench before the pool.
+#
+# WHAT `follow` HOLDS. The offset is captured at START, in the OBJECT's yaw
+# frame: the object translates and the vehicle translates with it; the object
+# yaws and the vehicle ORBITS to keep the same face; the object rolls or
+# pitches and nothing happens (MANUAL_CONTROL has no K/M axis, so a roll it
+# tried to answer would be dropped by the allocation anyway). Because the
+# offset is taken from the vehicle's CURRENT pose, arming a follow never moves
+# the vehicle — that is a property, not an omission.
+#
+# EVERY NUMBER HERE IS [예측] until the first pool run (a hold-only pass with
+# the object in view produces all of them at once). The two that are not:
+# the 0.3-0.8 m working range and the 2.4 m registration failure are
+# [측정: KNOWN_ISSUES 2026-08-09, stored data], and in AIR the C3's factory
+# UNDERWATER calibration reads distances ~1.33x long
+# [측정: calib/FOV_AUDIT.md] — do NOT "fix" that on the bench.
+#
+# **실기 미검증** (2026-08-21), and it inherits the whole of --pose's own
+# "never run on hardware" risk (KNOWN_ISSUES 2026-08-09).
+object_nav:
+  pair_tol_s: 0.08          # [유도] 0.2855 m lever arm x 0.5 rad/s ~ 1.1 cm
+  nav_source_required: main # the object leg is ALWAYS the C3
+  yaw_axis: none            # auto | x | y | z | none
+  # `none` ignores the object's heading entirely and keeps the offset in the
+  # MAP frame. One whole failure class disappears with it, so fly the first
+  # bench and pool passes that way and only then turn the orbit on.
+  yaw_min_horiz: 0.25       # axis within 14.5 deg of vertical -> yaw undefined
+  max_jump_m: 0.35          # [예측]
+  max_yaw_jump_deg: 45.0    # [예측]
+  reseed_after_n: 5         # this many rejections in a row = it really moved
+  min_distance_m: 0.15      # [측정: KNOWN_ISSUES 2026-08-09 — 0.3-0.8 m works,
+  max_distance_m: 10      #  2.4 m fails to register]
+  pos_lp_alpha: 0.5         # [예측]
+  vel_lp_alpha: 0.3         # [예측]
+  max_extrap_s: 0.30        # [예측] past this the point STOPS, honestly
+  stale_s: 0.50             # past this the panel marker goes hollow
+  hold_s: 2.00              # not live this long -> demote to a station hold
+  max_excursion_m: 1.50     # reference CLAMP from the arm point (operator)
+
+# LIVE DIFFUSION POLICY — shape `policy` (2026-09-02, HARDWARE-UNVERIFIED).
+#
+# The trained UMI DiffusionTransformerTimmPolicy (rov_gui/perception/dp_policy.py,
+# worker rov_gui/backends/policy.py) turns the depth stream + the tag pose into
+# 1 s action chunks that the NMPC tracks through the SAME PlanFilter/PlanStitcher
+# seam the replay mission uses. Needs `--policy` (the worker) AND `--mpc` (the
+# consumer) AND `--fstereo` (the training-parity depth): on --source hw a
+# missing --fstereo is REFUSED at launch (unless --policy-allow-device-depth,
+# a bench experiment recorded as such); a missing --mpc only WARNS (the worker
+# then infers for nobody). Under the --policy FS defaults FoundationStereo
+# measured 7.26 Hz, solve 137 ms, panel latency 243 ms [측정: rov_gui/tools/
+# fstereo_bench_out/policy_bench_20260902_141224.json, C3 실기, alpha 0.5,
+# scale 1.0, iters 16, 330 frames, GPU shared with a concurrent test run], so
+# the two depth frames of an observation are 138 ms apart = 2.07x the 66.7 ms
+# training stride (recorded per plan as obs_pair_dt_s; the proprio rows are
+# taken at the same spacing).
+#
+# Every number here carries its provenance (CLAUDE.md rule); the same tags live
+# in rov_gui/control/geometry.py POLICY_PROVENANCE and are written into the run
+# meta beside the values. Defaults = spec DP_LIVE_POLICY_SPEC_V2 §B, one
+# definition in geometry.default_policy_block; this block only OVERRIDES.
+# UNKNOWN KEYS RAISE at startup (the replay/imu_dr rule).
+#
+# READ BEFORE A POOL RUN: the TCP below is the ROV's OWN jaw, anchored to the C3
+# lens since 2026-09-08 (tcp_body_flu_m = cam_t_flu + [0.196, 0, -0.275]; the x
+# is [측정 2026-09-08], see the key). It sits 0.338 m from the lens, ~11 deg below
+# the optical axis under the 43.3 deg tilt [유도] — the open jaws are visible at
+# rows 265-360 of the 360-row colour frame — where the handheld's TCP sat
+# 0.346 m in front of / 22 deg below ITS camera axis. (The 2026-09-02 "0.178 m,
+# outside the FOV" that stood here was computed with a dead fallback extrinsic
+# and the sim jaw; both are gone.) A pool run is still a PIPELINE SMOKE until
+# the jaw's y/z and cam_t_flu's x/z are measured (KNOWN_ISSUES 2026-09-08).
+policy:
+  ckpt: /home/bdml/Desktop/umi_underwater_robust_control/data/checkpoints/20260907_113747_umi_depth_5d_can_grasp_depth_5d_v0.ckpt
+                              # data/checkpoints/ holds the BEST checkpoint of every
+                              # training run (a symlink into the run's own
+                              # checkpoints/ + a .json saying how it was picked);
+                              # this one = the run's selected.ckpt (epoch 195).
+                              # 2026-09-07 5-dim retrain (task umi_depth_5d; action
+                              # [dx,dy,dz,dyaw,width] = action_repr pos_yaw_width),
+                              # epoch 195, selected on the 219-window held-out set
+                              # with the DEPLOYED weights (policy.weights below):
+                              # pos RMSE 17.3 mm / yaw 2.20 deg (zero-predictor 2.56,
+                              # corr +0.56) / width 7.3 mm, vs the old 10-dim ckpt's
+                              # 21.0 / 2.24 / 7.6 on the same tool and windows
+                              # [측정: <run>/checkpoints/selected.json]. The run's
+                              # 32-window val curve is EMA-based and ranks this
+                              # family backwards — do not select on it.
+                              # MUST equal rov_gui/state.py POLICY_CKPT_DEFAULT
+                              # (rov_gui/tests/test_policy_ckpt_paths.py); the
+                              # 2026.09.01 10-dim ckpt is refused at arm
+                              # (action_repr mismatch). "stub" = canned
+                              # straight-ahead chunk, no torch (demo_e2e /
+                              # policy_dryrun)
+  repo: /home/bdml/Desktop/umi_underwater_robust_control/external/UMI_aquatic
+  weights: model              # which state dict inside the ckpt: model (raw trained)
+                              # or ema_model. The EMA copy carries the BatchNorm
+                              # defect (KNOWN_ISSUES.md) and is much worse on BOTH
+                              # families [측정 2026-09-07, 219-win held-out: 5-dim
+                              # ep195 17.3 mm (model) vs 31.3 mm (ema at the epoch
+                              # the EMA-based val picked); 10-dim 21.0 vs 29.8 mm].
+                              # --policy-weights overrides; runs on different
+                              # weights must NOT be pooled (meta records it).
+  target_model: configs/target_camera_underwater.yaml   # the training warp target
+  dataset_fps: 30.0           # [측정: dataset zip .zattrs fps 30] obs_dt = 2/30 s
+  num_inference_steps: 8      # [측정 2026-09-02: 16 steps ran 319 ms p50 (min 249,
+                              #  max 395) on the first pool run —
+                              #  data/20260902/0902_215928/
+                              #  plans.jsonl infer_ms — against the ~33 ms the
+                              #  obs_max_age_s budget was derived from, so 12 of
+                              #  29 plans arrived LATE and none installed. DDIM,
+                              #  so halving the steps halves the forward.
+                              #  CHANGES THE OUTPUT, not just the speed: 8-step
+                              #  DDIM is a different sample from 16. Training cfg
+                              #  was 16 [스펙] — dp_policy_parity.py --steps is
+                              #  the tool to score what that costs, UNRUN.]
+  eval_transforms: center     # center (deterministic CenterCrop 212 -> 224) |
+                              # train (upstream's RandomCrop/RandomRotation) — A19
+  period_s: 0.5               # [유도: n_action_steps 8 x obs_dt 66.7 ms = 0.533 s]
+  knot_dt_s: 0.2              # [예측] raw 16 knots @ 66.7 ms -> 6 knots @ 0.2 s
+                              # (FD-accel gain 61·σ vs 551·σ, A5)
+  # LAND: raised from 0.6. On the only end-to-end hardware policy run on record
+  # the age at intake was p50 0.588 s against this limit and 12 of 29 plans were
+  # dropped as late, with none accepted [측정:
+  # data/20260902/0902_215928/plans.jsonl]; adding a SLAM
+  # pose to the same chain only lengthens it. Nothing is flown here, so a stale
+  # plan is still an honest answer to "what did the network predict". ON THE
+  # WATER THIS MUST GO BACK.
+  obs_max_age_s: 1.0          # [예측] — NOT the hw_mpc.yaml derivation. That one
+                              # ([유도] from the measured depth chain, 0.6) sized a
+                              # limit for a plan that would be FLOWN; this run flies
+                              # nothing, so the limit is sized to keep the map
+                              # populated instead. Do not carry this number back to
+                              # a water config.
+  stale_s: 1.5                # [예측] no accepted plan this long -> "policy stale"
+  max_run_s: 500.0            # [결정: operator 2026-09-11 — 120 -> 500 s] wall-clock completion of the mission
+  # ANCHOR (A4): leash = measured pose + the reference offset clipped to a leash;
+  # reference = the active stitched reference; measured = the fix. `leash` is
+  # what plan doc §5-B1 asked for — measured anchoring resets tracking error
+  # every replan, pure reference anchoring drifts away from the vehicle.
+  #
+  # 2026-09-07 [결정: operator] leash -> MEASURED, as a TRIAL. Every plan now
+  # starts exactly where the vehicle was at its obs_t (fix history), so the
+  # red knot-0 dot sits on the hull and the tracking error is forgiven at
+  # every replan (~0.5 s). The operator judged that acceptable for now and
+  # will say so if the pool run shows the known costs: the reference jumps
+  # back by the lag each replan, the low-level loop never accumulates the
+  # error it needs to beat the T200 deadband, and a steady push (current)
+  # walks the reference along with the hull instead of being resisted.
+  # Revert = `leash`. A RECORD BOUNDARY: meta policy.anchor_mode says which;
+  # do not pool err/accept rates across it. anchor_leash_* below are kept
+  # for the revert and are ignored while measured.
+  # 2026-09-14 [결정: operator] back to LEASH, mirroring hw_mpc.yaml (see the
+  # note there: measured reset the error every replan and the hull never
+  # cleared the ESC deadband, data/20260914/0914_172420).
+  anchor: leash               # leash | reference | measured
+  anchor_leash_m: 0.05        # [예측: below the 62 mm jaw opening
+                              #  (bluerov2_mujoco_marinegym/tools/gen_gripper_variant.py:47
+                              #  vendor spec), above the ~0.04 m one-period lag at 0.08 m/s]
+  # 2026-09-14 [결정: operator] 10 -> 0, mirroring hw_mpc.yaml (yaw anchored
+  # to the measured yaw; the position keeps its leash).
+  anchor_leash_yaw_deg: 0.0   # [결정 2026-09-14] was 10.0 [예측]
+  # YAW REFERENCE FILTER (2026-09-14). Why the anchor could never fix the yaw
+  # wobble: the station yaw-step test (data/20260914/0914_190226/mpc_190335
+  # -13.3 deg, mpc_190532 +26.3 deg, no policy) showed the NMPC yaw loop is
+  # stable but underdamped — overshoot 45 / 18 %, ring period ~1.4-2 s,
+  # settled after 1-2 half-cycles, tails quiet (eyaw band-pass std 0.02-0.22
+  # deg, uN 0-0.9 sign flips/s vs ~2/s in policy runs) [측정]. The policy runs
+  # kept it ringing because every 0.5 s plan put something near that period
+  # into the yaw reference: with leash 0 the yaw measured at obs_t (0.5 s
+  # stale — a 0.8 s-delayed copy of the hull's own swing, anti-phase in
+  # 0914_181425 run 2: eyaw_bp 4.8 deg > yaw_bp 3.5), with leash 10 the
+  # policy's alternating dyaw (0914_174815: ryaw +-4 deg per plan). So the
+  # yaw reference is now (policy_frames.filter_plan_yaw): start at the FLOWN
+  # reference yaw at the plan's t0 (never the measurement), turn at a
+  # low-passed (tau_s) version of the chunk's requested turn rate capped at
+  # rate_deg_s, and stay within guard_deg of the measured yaw (the only place
+  # the measurement enters). The body knots are re-derived from the TCP
+  # knots with that yaw, so the TCP still goes where the policy asked and
+  # only the heading is filtered. A policy that keeps asking for the same
+  # turn gets it in ~tau_s; one that alternates every plan averages to ~0.
+  # tau 2 s > ring period [측정 above]; rate 3 deg/s and guard 15 deg [예측].
+  # null = off (yaw knots = anchor yaw + dyaw_k, as before). RECORD BOUNDARY:
+  # meta policy.config.yaw_ref_filter + run.yaw_ref_filter, each plan
+  # record's `yaw_ref_filter`; runs before 2026-09-14 19:40 flew without it.
+  # Every arm logs "YAW REF FILTER ...". With it on, anchor_leash_yaw_deg no
+  # longer reaches the flown yaw (the anchor yaw is still what the plan is
+  # composed against, i.e. the direction its dx/dy are laid out in).
+  yaw_ref_filter:
+    rate_deg_s: 3.0     # [예측]
+    tau_s: 2.0          # [측정-based: > 1.4-2 s ring period, 0914_190226]
+    guard_deg: 15.0     # [예측]
+  # THE DIVISION OF LABOUR (2026-09-02, operator decision). The plan doc's
+  # §0 architecture, taken literally: "policy는 embodiment-무관한 기하만 내고,
+  # 기체 dynamics/제약은 MPC follower가 담당". The NMPC already carries the
+  # actuator limits and optimises over a 3 s horizon, so it decides what is
+  # trackable — not a finite-difference gate on six knots.
+  #
+  # true = the DYNAMICS and CONTINUITY gates below still run, still compute
+  # every margin and still write their sentence into plans.jsonl, but they no
+  # longer REJECT: anchor_max_m, jump_max_m, yaw_jump_max_deg, the post-stitch
+  # blend gate, and the clip_ratio_max ceiling. Time dilation still happens —
+  # it preserves geometry and only re-times it for this vehicle, which IS the
+  # adaptation this division asks for — and is now unbounded, because more
+  # dilation is a SLOWER reference, never a more demanding one.
+  #
+  # STILL HARD, because none of these are dynamics:
+  #   * schema / finiteness / monotone knot times
+  #   * obs_max_age_s (a stale plan describes a world that has moved)
+  #   * workspace_box_ned (the only position protection since the geofence
+  #     was removed 2026-08-14)
+  #   * div_max_m (below) — the vehicle-vs-reference divergence guard. Handing
+  #     dynamics to the follower makes this MORE important, not less: it is
+  #     now the thing that says "the follower cannot keep up", so it is
+  #     deliberately unchanged.
+  #
+  # A RECORD BOUNDARY: accept/clip/reject rates are not comparable across it.
+  # The run meta carries the flag [결정: operator, 2026-09-02].
+  follower_owns_dynamics: true
+  # FILTER LIMITS (A5/A21) — ALL explicit; the test asserts FilterLimits == this.
+  v_max_m_s: 0.15             # [측정 2026-09-02: raised from 0.08, which sat BELOW
+                              #  the distribution it was gating. The policy's own
+                              #  chunks peaked at 0.090–0.152 m/s on the first pool
+                              #  run and every one was time-dilated (alpha 1.23–1.91)
+                              #  [data/20260902/
+                              #  0902_215928/plans.jsonl]; the HUMAN demonstrations
+                              #  need p50 alpha 1.50 at 0.08 with peak speed p50
+                              #  0.118 m/s [측정: rov_gui/tools/dp_policy_out/
+                              #  gate_20260902_clip3.log]. 0.15 covers the demo p50
+                              #  and most of the policy's range.
+                              #  THIS IS A SAFETY LIMIT, raised on operator request:
+                              #  the vehicle may now be commanded ~2x faster, and
+                              #  0.058 m/s is still the best speed it has actually
+                              #  achieved [유도: axis_gain comment above], so the
+                              #  reference can outrun the hull further before
+                              #  div_max_m catches it.]
+  a_max_m_s2: 0.20            # [예측]
+  r_max_rad_s: 0.50           # [예측]
+  # LAND: raised from the default 3. Nothing can move, so a latch buys no
+  # safety and costs the whole point of the run: PolicyState.active goes False,
+  # the worker stops inferring, and the map stops updating in a way
+  # indistinguishable from "the network died". 12 = one full plan ring.
+  reject_escalate: 12
+  clip_ratio_max: 3.0         # [예측: 3.0 chosen from the gate — GT chunks need p50 1.50 / p90 3.44 at these caps on the 0.2 s grid [측정: rov_gui/tools/dp_policy_out/gate_20260902_clip3.log]]
+                              # (replay keeps 1.5). The caps above still bound the
+                              #  vehicle: dilation stretches the clock, never the
+                              #  geometry.
+  anchor_max_m: 0.15          # [예측]
+  jump_max_m: 0.06            # [예측]
+  yaw_jump_max_deg: 8.0       # [유도: r_max·blend_s·2/π ≈ 0.13 rad, A11]
+  div_max_m: 0.25             # [예측] the policy's OWN divergence guard (A21)
+  blend_s: 0.4                # [예측]
+  blend_v_max_m_s: 0.16       # [예측: 2·v_max, A11 post-stitch blend gate]
+  blend_a_max_m_s2: 1.0       # [예측]
+  # HOLD TAIL (A10): mask = stages past the plan's end carry ZERO position /
+  # linear-velocity weight (heading + level still held); track = today's
+  # behaviour (they track the hold point, braking ~0.3-0.4 s early [유도]).
+  hold_tail: extrapolate      # mask | track | extrapolate. 2026-09-08: track -> EXTRAPOLATE.
+                              # A/B #2 (0908_165517, track + anchor measured + drag override):
+                              # mpc_tuned uX sat at 2.5-3.5 N on 100 % of ticks (axis 0.053, 0 %
+                              # above the 0.096 knee) and moved 0.01 m in 45 s while PID (p90
+                              # 8.9 N, 30 % above the knee) moved 0.73 m [측정: mpc_165753.csv vs
+                              # mpc_165700.csv]. Cause: the 1 s plan arrives ~0.5 s old, so under
+                              # `track` 87 % of the 3 s horizon is "reach the endpoint and stop"
+                              # (hold_frac p50 0.87) and the velocity feedforward is zero there.
+                              # `extrapolate` continues the horizon past the plan's last knot at
+                              # that plan's last-segment velocity (clipped to v_max_m_s, capped by
+                              # hold_tail_extrap_max_m, inside workspace_box_ned; live-only like
+                              # the mask). Offline closed loop, real acados solver + the measured
+                              # deadband law, the run's own 88 plans: track never moves at any
+                              # q_scale (q8 0.017 m/s); extrapolate + along_scale 1.0 -> 0.055 m/s
+                              # (64 % of the 0.085 m/s plan), error 1.3 cm, 0.16 sign flips/s
+                              # [측정: data/20260908/0908_165517/
+                              # diag/fwd_C_out.txt]. 실기 미검증. `track` = the 2026-09-07 behaviour.
+  hold_tail_taper_s: 0.0      # [예측] 0 = hard mask (only used when hold_tail: mask)
+  hold_tail_extrap_max_m: 0.3  # [예측] extrapolate: continue at most this far past the plan's
+                              # end (0.3 = v_max 0.15 x 2 s); the offline A/B ran uncapped.
+  # THE ONLY POSITION-BASED PROTECTION (geofence removed 2026-08-14): a plan
+  # with any knot outside this datum-NED box is REJECTED. REQUIRED for the
+  # policy shape — null REFUSES the mission (unlike replay). [예측]
+  # LAND: DELIBERATELY UNREACHABLE, not "sized to the room".
+  #
+  # On the water this box is the only position protection left after the
+  # geofence was removed, so it is a HARD reject that follower_owns_dynamics
+  # does not soften. Here it protects nothing: the run is launched without
+  # --allow-command, the sink is a NullCommandSink, and no wrench reaches a
+  # thruster no matter what the box says. What it CAN still do is break the
+  # run — the box is checked in the DATUM frame, which is pinned at the engage
+  # pose, so it measures how far the CARRIER has walked, not how far the plan
+  # reaches. hw_mpc.yaml's 2x2x1 m is a pool station box; a walking human
+  # leaves it in seconds, every plan then rejects, and reject_escalate
+  # consecutive rejects latch the mission (plan_stream.py:216-221 ->
+  # _policy_halt) — GPU stopped, map frozen, indistinguishable from "the
+  # network died".
+  #
+  # So it is set past any indoor distance rather than to a measured one. A
+  # number nobody has to measure is a number nobody can get wrong, and
+  # _arm_policy REFUSES a null box (workers.py: "policy.workspace_box_ned is
+  # unset"), so it cannot simply be turned off.
+  # (hw_mpc.yaml: [[-1,-1,-0.5],[1,1,0.5]])
+  workspace_box_ned: [[-50.0, -50.0, -10.0], [50.0, 50.0, 10.0]]
+  # TCP (A3): the ROV's OWN jaw (jaw-pair centre, closed) in body FLU.
+  # = cam_t_flu [0.30584, 0, 0.10501] (hw_nav.yaml) + lens->grip [0.196, 0, -0.275]
+  # = [0.50184, 0, -0.16999], rounded. x [측정 2026-09-08: a jar held in the jaws
+  # and set on the centre of floor tag 58 sits 0.196 m ahead of the C3 lens —
+  # data/20260908/0908_180453_observe/policy_obs/rgb/000160.jpg (tag
+  # PnP with the run's own intrinsics) + jar height 0.084 (±0.006) m from
+  # data/20260908/0908_170428_observe/policy_obs/rgb/000000.jpg +
+  # open-jaw rays in data/20260908/0908_175151_observe/policy_obs/rgb/
+  # 000000.jpg; range 0.187-0.204]; z = the CAD 275.014 mm vertical, image-
+  # consistent to ~1 cm [유도]; y = 0 [예측]. The old 0.4165 (sim JAW_POS, = lens
+  # + the CAD's 110.66 mm) is contradicted by the same image: that jaw projects
+  # below the 360-row frame while the jaws are visible at rows 265-360.
+  # ANCHORED TO THE LENS: if cam_t_flu is ever corrected (its x/z are suspect,
+  # KNOWN_ISSUES 2026-09-08), RE-DERIVE this = cam_t_flu + [0.196, 0, -0.275] —
+  # or set tcp_offset_cam_m, which names the TCP in the C3 optical frame and
+  # makes the lens position cancel. Same point as rov_shape.JAW_CENTRE_M
+  # (test_rov_shape pins the two equal).
+  # RECORD BOUNDARY: runs before 2026-09-08 carry [0.4165, 0, -0.17] in meta
+  # policy.tcp_body_flu_m / rov_drawn_geometry.jaw_centre_m — do not pool plan
+  # geometry across it.
+  # ROV-vs-HANDHELD TCP MISMATCH (NOT compensated; spec A3 substitutes the ROV's
+  # own jaw for the handheld fingertips). In the C3 optical frame (x right,
+  # y down, z forward) this jaw is [0, 0.0675, 0.331] (0.338 m, 11.5 deg below
+  # the axis) against the training TCP [0.0355, 0.1293, 0.3186] (0.346 m,
+  # 22.1 deg): jaw - handheld = [-0.0355, -0.0618, +0.0124] (0.072 m; the old
+  # 0.4165 gave [-0.0355, -0.0035, -0.050], 0.062 m) = in body FLU
+  # [+0.051 fwd, +0.036 left, +0.037 up] [유도: NavConfig.R_t_frd_cam +
+  # policy_frames.tcp_offset_from_body on these numbers]. dp is camera-
+  # relative, so the plan moves the CAMERA the same way whatever this key says
+  # (t_bt cancels exactly at constant yaw): the vector above is where the jaws
+  # would sit RELATIVE TO THE OBJECT if the policy placed the camera as it was
+  # trained to — the expected first-grasp miss is "~5 cm past, ~4 cm high,
+  # ~3.6 cm left" (2.4 cm left if the jaw really is 0.011 m right of the
+  # axis, see y above), no longer "stop short" (the old 0.4165 was 3.4 cm
+  # short, same left/up). Do NOT paper over it with tcp_offset_cam_m — the
+  # jaw is where it is; compensation, if wanted, is a separate explicit
+  # decision (e.g. a plan-level offset) recorded as its own boundary.
+  # tcp_offset_cam_m: null = derived from tcp_body_flu_m through the C3
+  # extrinsic (hw_nav.yaml); a 3-vector in the C3 optical frame overrides.
+  tcp_body_flu_m: [0.502, 0.0, -0.17]
+  tcp_offset_cam_m: null
+  # DEPTH OBS (A16): the builder refuses a grid whose 224 obs coverage is below
+  # this [유도: 0.985 sits at the 0.06 % tail of the training obs validity (per-frame min 0.9777, p1 1.000, 99.94 % of frames ≥ 0.985) [측정: rov_gui/tools/dp_policy_out/training_validity_20260902.txt]];
+  # z_near/z_far/obs_res are the training recipe [스펙: dataset .zattrs obs].
+  min_obs_coverage: 0.985
+  z_near_m: 0.20
+  z_far_m: 3.00
+  obs_res: 224
+  # GRIPPER (A12): OFF for the first runs, ON since 2026-09-07 (see the key). Levels are the DATASET's
+  # [측정: /home/bdml/Desktop/data collection/slam/actions_summary.json reports[*].gripper_command — open_level_m p10–p90 0.055–0.070 (median 0.061), closed_level_m p10–p90 0.034–0.043 (median 0.040); 0.069/0.042 chosen near the upper tail [예측]];
+  # thresholds = width 0.050 / 0.060 m [유도]; init = OPEN at
+  # process start [가정, logged]; travel [예측]; hold_max = UMI-U's 4 s [예측].
+  gripper: true               # 2026-09-07: ON. Policy runs before this date computed
+                              # the jaw channel and DISCARDED it (A12 default OFF until
+                              # the trajectory was proven). Proven on the 0907_145206 pool
+                              # run: approach reached the object and the policy asked
+                              # to close (53/161 plans with g < 0.30, last-knot width
+                              # 0.045 m vs closed 0.042) while no jaw command left the
+                              # station [측정: data/
+                              # 20260907/0907_145206/plans.jsonl, mpc_145239.csv grip_cmd].
+                              # Behaviour: g < close_below -> CLOSE drive, g > open_above
+                              # -> OPEN, hysteresis between, auto-neutral after hold_max_s
+                              # (jaw keeps position, no feedback), pilot G/H edges still
+                              # win. RECORD BOUNDARY: runs before this are gripper-off.
+  gripper_close_below: 0.30
+  gripper_open_above: 0.67
+  gripper_hold_max_s: 4.0
+  gripper_width_open_m: 0.069
+  gripper_width_closed_m: 0.042
+  gripper_width_init_m: 0.069
+  gripper_travel_s: 2.0
+  gripper_lookahead_s: 0.0    # WHEN on the streamed plan the jaw hysteresis samples the width
+                              # channel: now + this [s]. 0.0 = sample the jaw channel at now
+                              # (pre-2026-09-07 behaviour; on the 0907_145206 run this crosses
+                              # close_below only during plan gaps — the policy puts its close at
+                              # the far end of every ~0.45 s-lived chunk while the width it
+                              # observes never changes, so knot 0 stays open). 0.6-0.8 s follows
+                              # the policy's stated intent and fired steadily from ~32 s on that
+                              # run [유도: replayed offline from data/
+                              # 20260907/0907_145206/plans.jsonl, mission mpc_145239] — set by
+                              # the operator after the first jaw-on pool run. Clamped to the
+                              # plan's covered span (endpoint hold); max 3.0 = the NMPC horizon.
+                              # What the hysteresis saw is CSV `grip_g` (schema 13); a jaw-timing
+                              # statistic must not be pooled across different values of this.
+
+  q_scale: 1.0               # POSITION-weight multiplier for the MPC-family follower
+                              # while a policy plan is installed (PID ignores it). Diagnosis
+                              # 2026-09-07: mpc/mpc_tuned commanded |uX| p50 0.5-1.8 N for the
+                              # 8-10 cm leashed error -> axis 0.01-0.03, below the T200
+                              # deadband (~0.096 axis, ~5.8 N) on 92-100 % of ticks, so the
+                              # vehicle sat still; PID commanded 6-7 N and moved [측정:
+                              # data/20260907/0907_164659/
+                              # mpc_16{4716,4835,5209}.csv vs 0907_145206/mpc_145239.csv].
+                              # Stiffness ~ sqrt(q): 16 ~ 4x (~1 N -> ~4-6 N) [유도]. Kept at
+                              # 1.0 (no effect) because the primary cause turned out to be
+                              # hold_tail (above): the same runs already show 3.3-6.9 N
+                              # whenever the mask lifts. SECOND lever, untested — raise it
+                              # only if hold_tail: track alone leaves the MPC follower
+                              # below the deadband (CSV ax_surge < ~0.096 most ticks).
+  along_scale: 1.0            # ALONG-track weight scale for a PATH-FRAME follower (mpc_tuned)
+                              # while a policy plan is installed; null = the controller's own
+                              # split (mpc_tuned.along_scale 0.25 above, chosen for geometric
+                              # path missions where lagging the virtual target is free). For a
+                              # policy approach the along-track lag IS the task: at 0.25 the
+                              # surge stiffness is 35 N/m (solver-measured) and uX never leaves
+                              # the deadband. Surge-only, unlike q_scale (x, y AND z: q_scale 4
+                              # would also put heave at 110 N/m against the STAB attitude loop's
+                              # +-7 cm ripple). Restored at STOP / mode change / disengage; meta
+                              # controller.plan_along_scale_flown is the record boundary. `mpc`
+                              # (isotropic) ignores it. [측정: .../0908_165517/diag/fwd_C_out.txt,
+                              # fwd_B_out.txt] 실기 미검증.
+# IMU DEAD RECKONING — "how far can the IMU carry us on its own".
+#
+# At the end of the mission settle the C3's BNO086 is anchored to the tag
+# solution and integrates alone from there; the AprilTag pose keeps running as
+# GROUND TRUTH and as the second marker on the trajectory plot. The gap between
+# the two markers is the measurement.
+#
+# OFF by default. With enabled: false the control tick is byte-identical to a
+# build without any of this (pinned by test_control's shadow-parity test).
+#
+# UNKNOWN KEYS IN THIS BLOCK RAISE at startup, unlike everywhere else in this
+# file. `imu-dr:` for `imu_dr:` is otherwise ignored in silence, and the
+# operator flies a pool session believing an estimator is running.
+imu_dr:
+  enabled: false
+  # shadow  = the controller stays on the tag state; the estimate is only
+  #           drawn and recorded. Safe to leave on; measures drift honestly.
+  # control = the controller flies on the ESTIMATE. This is the experiment the
+  #           operator asked for (2026-08-16), and it needs --imu-dr-control on
+  #           the command line as well — see the safety note below.
+  mode: shadow
+  source: c3                  # the C3 BNO086; the ROV IMU is not wired up
+  # gyro    pure integration. The strictest reading of "IMU only", and the
+  #         one whose error grows as t^3.
+  # ahrs    gyro + gravity levelling of roll/pitch, yaw gyro-only. RECOMMENDED
+  #         and the operator's choice: still 100% IMU, and at 0.05 m/s the
+  #         linear acceleration is under 0.02 m/s^2 so levelling is nearly
+  #         exact. Turns the t^3 attitude term into a bounded t^2 one.
+  # vehicle roll/pitch from ArduSub, yaw still ours — isolates position error.
+  attitude: ahrs
+  # Levelling time constant. The trade, both directions [유도]: a gyro bias
+  # beta settles at a standing tilt of beta*tau, so smaller is better for
+  # bias; but frequencies below 1/tau of REAL horizontal acceleration are
+  # rejected as tilt, and this vehicle's whole signal is 1 s ramps at
+  # 0.05 m/s^2. Also note levelling only beats pure gyro for t >> 3*tau.
+  # 3.0, not the 10.0 first shipped. MEASURED on this vehicle's own settle
+  # windows (2026-08-18, bias uncertainty 0.0253 deg/s after differencing
+  # against the autopilot): predicted drift at 19 s is 7.8 m at tau=10,
+  # 2.3 m at tau=3, and 4.95 m with no levelling at all. That ordering is
+  # exactly the "levelling only wins for t >> 3*tau" rule this file already
+  # states — 10 s violated it for the 20-60 s windows these runs actually use.
+  ahrs_tau_s: 3.0
+  # Skip levelling when |accel| is this far off gravity — a thruster kick is
+  # not gravity moving. Should almost never fire at mission speeds; if the run
+  # meta reports a large `ungated`, look at the mounting before the drift.
+  accel_trust_m_s2: 0.15
+  # DEPTH IS NOT DEAD RECKONED (operator decision 2026-08-16). z and heave
+  # rate come from the barometer — a different sensor, so it survives a tag
+  # dropout — and only the horizontal plane plus yaw come from the IMU. An
+  # integrated vertical channel would drive heave commands into the mat or the
+  # surface, and the question being asked is about horizontal drift. The IMU's
+  # own integrated depth is still logged as dr_pz_imu for the comparison.
+  z_source: pressure
+  # The last N seconds of the 10 s settle become the static window: gyro bias
+  # and the accel offset are measured there. gyro_static_std_max rejects a
+  # window the vehicle was not actually still for — a DP hold has live
+  # thrusters, so this fires more often than it sounds like it should.
+  static_window_s: 8.0
+  # Gyro bias is gated on the PRECISION OF ITS MEAN, not on how much the gyro
+  # wobbled: a vehicle holding station at 0.1 cm/s shows ~1.4 deg/s of gyro
+  # std (thruster vibration) while its mean is determined to 0.026 deg/s. The
+  # old std gate rejected every real settle window, no bias was subtracted,
+  # and the 0.128 deg/s that survived became 37.6 m of drift in 19 s.
+  gyro_bias_sem_max: 0.005      # rad/s; measured windows land near 0.00044
+  accel_static_sd_max: 0.15     # m/s^2 steadiness; measured 0.032 on a settle
+  gyro_static_std_max: 0.02     # only used when no autopilot rates are given
+  # Bench calibration (accel scale/bias by tumble, IMU->body rotation by
+  # Kabsch against the autopilot's rates). Its sha1 goes in the run meta;
+  # a run with calibration_sha1 null was flown on the RAW sensor, which reads
+  # ~+20% of gravity and has an unknown mounting rotation.
+  #   python -m rov_gui.tools.calib_c3_imu <run>/..._c3_imu.jsonl --fit accel
+  calibration: config/c3_imu_calib.json
+  max_dt_s: 0.1               # bigger sample gaps are dropped, not integrated
+  # NO AUTOMATIC ABORT (operator decision 2026-08-16: "I'll stop it by hand").
+  # Worth knowing what that means: the geofence was removed on 2026-08-14, so
+  # NOTHING stops this vehicle for being in the wrong place. Under `control`
+  # the loop actively drives toward wherever the IMU thinks it is, and the
+  # plot's `DR xx cm` readout is the instrument the pilot watches. Set either
+  # of these to a number to turn the corresponding guard on.
+  abort_err_m: null           # disengage when |p_dr - p_tag| exceeds this
+  abort_max_s: null           # ...or after this long under DR control
+  axis_cap_dr: null           # null = use axis_cap above
+
+# nudot for the EAOB: 'imu' = SCALED_IMU2 specific force (+gravity, -omega x v);
+# 'fd' = finite-difference of nu (the sim's definition — much noisier here
+# because nu itself comes from differentiated tag positions).
+nudot_source: imu
+
+# Low-pass on the tag-derived world velocity (state_assembler.py). The ROV has
+# no velocity sensor, so nu comes from differencing consecutive tag fixes, and
+# this smooths that difference:
+#
+#     v <- (1 - alpha) * v  +  alpha * (p_now - p_prev) / (t_now - t_prev)
+#
+# alpha is a NOISE-vs-LAG trade, and it is recursive: 1 - alpha of the old
+# value survives every step, so the output is a decaying average of the past
+# whose centre of mass sits (1 - alpha)/alpha frames back.
+#
+# RAISED 0.35 -> 0.6 on 2026-08-14, because the noise it was sized against
+# turned out to be 25x smaller than assumed. MEASURED on the last pool session
+# (data/20260814/2120/nav_212035/fixes.csv,
+# 10815 accepted fixes over 612 s, high-frequency residual against a local
+# quadratic fit): sigma_pos = 0.8 / 0.7 / 0.6 mm in x/y/z and 0.04 deg in yaw,
+# solved from 20-58 tags at once, reproj_rms p50 1.58 px, 0 ambiguous.
+# CAVEAT: that is the WHITE component only — a slowly varying bias (tag map,
+# camera calibration) is invisible to that test.
+#
+# What the change costs and buys, at the measured 0.0666 s fix interval [유도]:
+#     alpha   sigma_v     lag
+#      0.35   0.78 cm/s   124 ms      <- was
+#      0.60   1.11 cm/s    44 ms      <- is
+# Mission speed is 0.05 m/s, so both noise figures are well under the signal;
+# the 80 ms comes straight off the PID's D-term path (kd_x = 59.7 N.s/m) and
+# off the MPC's velocity state. The remaining lag is transport: tag_age p50
+# 0.191 s (data/20260814/2131/mpc_213128.csv),
+# which is a camera-pipeline problem, not a filter one.
+vel_lp_alpha: 0.6
+
+# Honest hardware sigmas for the EAOB 'perf' profile (overrides params.EAOB_SIG_*).
+# [예측] until the P3 residual fit: pose from single-tag PnP at 1.5-3 m is
+# centimetres, not the sim's 5 mm; velocity is differentiated position.
+#
+# NOTE (2026-08-14): `pos` is now known to be ~25x LOOSER than the measured
+# white noise above (0.8 mm vs 20 mm), i.e. the EAOB is told the tag is far
+# worse than it is and leans on its model instead. Deliberately NOT changed
+# here: R must cover the CORRELATED error too (tag map, calibration,
+# refraction), which the residual test cannot see. That is exactly what the P3
+# residual fit this comment already asks for is supposed to produce — until
+# then a tighter R would be a guess in the other direction.
+eaob_sigmas:
+  pos: [0.02, 0.02, 0.01]
+  ang_deg: [0.5, 0.5, 1.5]
+  lvel: [0.05, 0.05, 0.05]
+  avel: [0.005, 0.005, 0.005]
+  acc: 0.5
+  # aacc / alloc: keep the params.py defaults unless P3 says otherwise
+
+# The square (world = NED datum frame — first fix is (0,0) with
+# datum: first_fix in hw_nav.yaml). origin/yaw 'current' = wherever the
+# vehicle is holding when the trajectory starts, so START right after the
+# datum zeroes = a 0.2 m square from (0,0) at the initial heading.
+square:
+  # THE MISSION. shape: "line" = out-and-back along dir_deg (one lap = there
+  # AND back); "square" = a rectangle, size = x side, size_y = y side;
+  # "circle" = a closed loop of `radius` (one lap = one revolution).
+  # origin_tag anchors the path to a physical tag id — the vehicle must be
+  # within engage.start_err_max_m of it when START is pressed, so it never
+  # lunges across the pool. The trajectory panel writes these fields (shape /
+  # origin_tag / distances / speed) live; everything else comes from here.
+  # STATION FIRST. If the vehicle cannot hold a point it cannot track a line,
+  # and every number a line run produced would be measuring that instead.
+  shape: station
+  # LINE: 2 m along +y (dir_deg 90 in the tag-map frame) from tag 79,
+  # 5 round trips. ramp_s is the cosine speed ramp at each turnaround —
+  # without it the reference reverses in one sample and floors the tracking
+  # error the way the square's corners do (memory: square-corner-error-floor).
+  length: 2.0
+  dir_deg: 90.0
+  ramp_s: 1.0
+  origin_tag: 79
+  # SQUARE/rectangle sides (size_y: null = square of side `size`). The
+  # rectangle is placed in the MAP frame: origin_tag is its min-x / min-y
+  # corner (bottom LEFT of the top-down plot) and the sides run along the tag
+  # map's x and y axes, so `size` is the +x side and `size_y` the +y side.
+  # rot_deg below tilts it AWAY from that; it is a MAP rotation, not a
+  # datum one, so the same number means the same physical rectangle every run.
+  size_y: null
+  size: 0.2                 # 20 cm x 20 cm (2026-08-12 mission)
+  # CIRCLE: the entered tag is a point on the RIM — its minimum-x point, which
+  # is the BOTTOM of the top-down plot — and the centre sits one radius along
+  # the map's +x from it (rot_deg swings the centre around the tag). Same
+  # promise the rectangle makes about its own tag: what you point at on the
+  # floor is where the vehicle starts, not a place it only orbits.
+  #
+  # A circle is the only mission here with nothing unrealizable in it: no
+  # 90-deg vertex (memory: square-corner-error-floor) and no 180-deg reversal.
+  # The price is that its curvature limit applies to the WHOLE lap, not just
+  # to corners: v <= sqrt(path_lat_accel_m_s2 * R), so at the 0.05 shipped
+  # above a 0.5 m circle caps at 0.158 m/s and a 0.3 m one at 0.122 m/s
+  # whatever the speed box says.
+  # [유도: v = sqrt(path_lat_accel_m_s2 * R); pinned by
+  #  rov_gui/tests/test_mpcc.py ::
+  #  test_circle_speed_is_curvature_limited_over_the_whole_lap. NOT measured
+  #  in water — no circle has been flown yet.]
+  # The worker logs a warning when that cap binds, so the number in the speed
+  # box is never quietly overridden by the geometry.
+  radius: 0.5
+  speed: 0.05               # panel seed (m/s box); 16 s per lap here — slow
+                            # enough for the RTP-feed lag
+  laps: 5                   # LINE: 5 round trips; SQUARE/CIRCLE: 5 circuits
+  depth_ned: null           # null = hold the engage depth
+  heading_follow: false     # yaw stays at the START heading (crab square)
+  yaw_rate_deg_s: 60
+  origin: current           # current | [x_ned, y_ned]
+  rot_deg: 0.0              # MAP-frame tilt of the rectangle (0 = axis-aligned);
+                            # for a CIRCLE it is the bearing from the tag to
+                            # the centre (0 = centre at +x, tag at the bottom)
+  yaw_fixed_deg: current    # current | degrees (NED), used when not heading_follow
+  # ABSOLUTE heading in the tag-map frame, degrees (90 = facing +y). This is
+  # what "sit on the tag facing +y" means; yaw_fixed_deg is datum-relative and
+  # therefore means something different every time you engage. null = use
+  # yaw_fixed_deg.
+  yaw_map_deg: 90.0
+
+engage:
+  # The ArduSub flight mode(s) the vehicle must be in to ENGAGE, and must
+  # stay in (leaving the set disengages). One name or a list, e.g.
+  #   require_mode: [MANUAL, STABILIZE]
+  # Names are checked against the ArduSub vocabulary (geometry.py
+  # ARDUSUB_MODE_NAMES); an empty value removes the gate. The mode decides
+  # how ArduSub interprets every axis this station sends: in MANUAL the four
+  # axes pass straight to the mixer; in STABILIZE the autopilot levels
+  # roll/pitch itself and reads the yaw axis as a RATE demand (heading hold
+  # when it is near zero). A run engaged outside MANUAL is a record boundary
+  # (meta run.flight_mode_at_engage / flight_modes_seen) and is PINNED to the
+  # mode it engaged in: any change afterwards disengages. dobmpc/dobmpc_tuned
+  # are refused outside MANUAL whatever this list says (the observer would
+  # absorb the autopilot's torques as disturbance). The 2026-09-08 design
+  # review proposed shipping MANUAL alone until STABILIZE runs exist; the
+  # OPERATOR chose both (2026-09-08): press MANUAL or STAB on the teleop
+  # panel, then START, and the follower runs under whichever the vehicle
+  # reports. Still UNVERIFIED IN WATER under STABILIZE.
+  require_mode: [MANUAL, STABILIZE]
+  # Refuse START this long after an observed change INTO a self-driving mode
+  # (a change into MANUAL starts no clock — nothing settles there): ArduSub does
+  # not relax its attitude target / rate-PID integrators on an armed
+  # MANUAL->STABILIZE entry [예측: control_stabilize.cpp stabilize_init(),
+  # unmeasured on this vehicle; settle with ATTITUDE/Des* logs].
+  mode_settle_s: 2.0
+  # The station's YAW axis when it engaged in STABILIZE. ArduSub reads that
+  # axis as a yaw-RATE demand there: |axis| <= 0.10 (= N <= 2 N*m at yaw_nm
+  # 20) is a deadzone and 250 ms later the autopilot holds the current
+  # heading; above it the axis is a rate, ~68 deg/s at cap 0.5 with PilotGain
+  # 1 (~32 at the boot default 0.5) [ArduSub source, Sub-4.1/4.5; unmeasured].
+  #   hold   : send 0 — the autopilot's heading hold owns heading. DEFAULT.
+  #            heading_follow / circle / policy dyaw will NOT turn (warned).
+  #   torque : send the follower's N unchanged (experiment; predicted to
+  #            hunt at the deadzone edge).
+  #   rate   : reserved — the deadzone-inverting remap needs PilotGain,
+  #            which the station does not read (KNOWN_ISSUES) -> refused.
+  stabilize:
+    yaw_axis: hold
+  # The solver probe (MEDIAN wall time of 5 warm solves after one warm-up
+  # solve, HwDobMpc._probe) must beat this to engage. It is measured at
+  # controller build AND again at every engage attempt that would otherwise
+  # be refused, so a cold first solve (2026-09-08: 79.7 ms right after a
+  # pid -> mpc_tuned swap while FoundationStereo captured its CUDA graph)
+  # cannot lock the session out. The 20 Hz loop budget is 50 ms; 25 keeps
+  # half for everything else in the tick.
+  probe_ms_max: 25.0
+  # tag_age is DOMINATED BY CAMERA LATENCY, not by the fix rate: measured
+  # 2026-08-14 it sits at 0.14 s (p95 0.19, max 0.22) under mpc/pid and
+  # 0.26 s (p95 0.40) under dobmpc — whose solve spikes to 17-32 ms and slows
+  # the shared process. At 0.5 s dobmpc had ZERO headroom and both runs died
+  # on one late frame. 0.7 s costs 3.5 cm of position knowledge at the 0.05
+  # m/s mission speed, which vel_propagation already bridges.
+  tag_stale_s: 0.7
+  # ...and the gate must HOLD this long before it disengages. Every other
+  # interl  ock debounces (max_solver_fails: 3); this one did not.
+  tag_stale_hold_s: 0.4
+  # LAND: 0.5. Attitude arrives with the 15 Hz SLAM pose rather than at the
+  # MAVLink rate, so 0.3 s is only 4.5 frames of headroom. (hw_mpc.yaml: 0.3)
+  imu_stale_s: 0.5
+  warmup_s: 1.5             # DP-hold EAOB warm-up before START TRAJ unlocks
+  # How close counts as "over the path origin". START no longer REFUSES when
+  # the vehicle is further than this — it flies there under DP first (the tag
+  # the path is anchored to is usually not where you engaged) — this is the
+  # arrival tolerance for that approach.
+  start_err_max_m: 0.3
+  settle_s: 10.0            # hold over the origin this long before the PATH runs
+  # STATION does not use settle_s. The settle holds the vehicle in the SLOWER
+  # regime (the setpoint is still leashed to approach_lead_m) for another ten
+  # seconds, and there is nothing to start afterwards — the armed station
+  # target is the same point the approach was already walking to. Arming
+  # EARLIER is what makes it arrive, because that is what drops the leash.
+  # The one thing the settle buys is imu_dr's static window, so when that
+  # experiment is enabled the full settle_s comes back automatically.
+  settle_station_s: 0.0
+  approach_max_s: 180.0     # give up approaching after this and hold position
+  # The approach moves the SETPOINT toward the tag at this speed instead of
+  # stepping it there: a position controller chases whatever error it is
+  # handed, so a setpoint that teleports 2 m is a full-authority lunge — which
+  # is what made the vehicle overshoot and wallow on 2026-08-14. approach_lead_m
+  # additionally leashes the setpoint to that distance ahead of the hull, so a
+  # slow tick or a stall cannot let it run away.
+  # RAISED 0.10 -> 0.20 and 0.35 -> 0.50 on 2026-08-18, and the two go
+  # TOGETHER or neither does anything. Measured over 4 approaches that day:
+  # |axis| p50 0.18 against the 0.50 cap, ZERO ticks at the cap — the vehicle
+  # was using a third of its authority. What actually set the speed was the
+  # LEASH, not this number:
+  #
+  #     kp*lead = 51.7 * 0.35 = 18.1 N,  and the whole-loop fit above says
+  #     F = 86.7*v + 5.76      ->  v = 0.084 m/s   [유도]
+  #
+  # against a measured 0.079-0.102 m/s. Raising approach_speed_m_s alone
+  # would have been another number outside the loop (the 2026-08-17 lesson).
+  # With lead 0.50 the same algebra gives 0.232 m/s, so 0.20 is what the
+  # geometry can now deliver; the peak command is kp*0.50 = 25.9 N = axis
+  # 0.43, still inside the cap, with brief excursions to it while
+  # accelerating. _tick_approach also now passes the setpoint's OWN velocity
+  # as a feedforward, which it never did (the path follower always has).
+  approach_speed_m_s: 0.20
+  approach_lead_m: 0.50
+  # FOLLOW's feedforward ceiling. The follow hands the controller the goal's
+  # own velocity (object velocity + orbit term) and `_xref_ned` extrapolates
+  # the ENTIRE horizon along it, so an unbounded value moves the far end of the
+  # reference, not the near end — invisible in the CSV's stage-0 rx/ry/rz.
+  # 2026-08-23 a mis-registered object drove it to 3.15 m/s (dragging the
+  # vehicle 0.54 m) and then to 2.97 m/s against a static position target,
+  # which is the reference acados failed with status 4.
+  # The cap is the vehicle's own ceiling — above it the request is not
+  # information: [유도] the whole-loop fit above, F = 86.7*v + 5.76 N, at
+  # U_MAX 30 N gives v = 0.28 m/s. Clipping is logged, because the only thing
+  # that asks for more is a broken pose.
+  follow_ff_max_m_s: 0.30
+  max_solver_fails: 3       # consecutive acados failures before disengage
+  tick_overrun_ms: 100.0
+
+# ROOT of the dated run tree (rov_gui/runstore.py), NOT the folder written to.
+# NOTE: `--rec-dir` OVERRIDES this, so one run always lands in one tree — the
+# worker says so in the log when it happens. Set `mpc_log_dir` on the opts if
+# you genuinely want the CSV somewhere else.
+#
+# the CSV lands in <log_dir>/YYYYMMDD/MMDD_HHMMSS/mpc_<hhmmss>.csv, beside the UI
+# recording and the nav recording of the same run. events.log goes in the same
+# folder. Auto-opened at engage when no recording stem is active.
+# (The leaf folder gained its MMDD_ prefix on 2026-08-14 — operator request;
+# older runs keep the bare HHMM name.)
+# (2026-09-14: ONE dated root. Was sessions/low_level_controller_data (2026-09-14)
+# with sessions/policy_observe and sessions/land_dryruns as siblings (2026-09-14);
+# those kinds are now the leaf suffix `_observe` / `_landdry` under the same
+# date folder — rov_gui/runstore.py. Every old folder was moved by
+# tools/migrate_data_layout_20260914.py; data/MIGRATION_20260914.json maps them.)
+log_dir: data

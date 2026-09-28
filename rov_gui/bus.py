@@ -129,6 +129,12 @@ class DataBus(QObject):
     # mount moves for as long as the bit stays set.
     cmd_tilt = Signal(float)            # -1 down / 0 hold / +1 up
     cmd_tilt_center = Signal()          # one press of mount_center
+    # The operator TYPED the mount angle (PAYLOAD panel SET): an anchor for
+    # the tilt tracker, degrees DOWN-negative like tilt_deg.
+    cmd_tilt_set = Signal(float)
+    # The tag localizer MEASURED the RGB mount's tilt from the C3-vs-RGB
+    # alignment (control/nav_fusion.py): (deg, n_pairs). Feeds the tracker.
+    tilt_measured = Signal(float, int)
     # The gamepad's OWN button bitmask, forwarded verbatim so the vehicle's
     # BTNn_FUNCTION parameters decide what each button does — the same contract
     # QGC has. Without this the station had a second, private button map and a
@@ -171,7 +177,11 @@ class DataBus(QObject):
     # "fly the square and log it". Kept SEPARATE from cmd_mpc_engage so the
     # DP-only hold (calibration, station-keeping tests) still exists.
     cmd_mpc_start = Signal()
-    cmd_mpc_mode = Signal(str)        # "mpc" | "dobmpc"
+    # The LOW level: "none" (teleop — the station commands nothing; a policy
+    # mission still infers and draws) | "pid" | "mpc" | "dobmpc" | "mpc_tuned"
+    # | "dobmpc_tuned" | "mpcc" | "dobmpcc". Refused by the worker while
+    # engaged or while a controller CSV is open.
+    cmd_mpc_mode = Signal(str)
     # Payload keys are PER SHAPE: station {} | line {length} |
     # square {size, size_y} | circle {radius}, all beside {shape, origin_tag,
     # speed}. Merged over hw_mpc.yaml's `square:` block by the worker.
@@ -187,6 +197,30 @@ class DataBus(QObject):
     # C3 feed off mid-engagement starves the localizer and the MPC disengages
     # on the stale-fix gate — that is the intended, safe consequence.
     cmd_tag_enable = Signal(str, bool)
+    # What the learned-depth worker is doing (state.FStereoState). Its own
+    # signal because two consumers need it for reasons that must not drift:
+    # the window attributes the depth-vs-MAP ratio to the right INSTRUMENT with
+    # it, and the FS button shows the feature's real state with it.
+    fstereo_state = Signal(object)
+    # DIFFUSION POLICY (rov_gui/backends/policy.py <-> MpcWorker shape
+    # `policy`). Three hops, three signals, all queued worker->worker
+    # snapshots (state.PolicyState / PolicyPlan / PolicyStatus). Wired only
+    # when --policy builds the worker; nothing emits them otherwise.
+    policy_state = Signal(object)     # MpcWorker -> PolicyWorker (proprio, 20 Hz)
+    policy_plan = Signal(object)      # PolicyWorker -> MpcWorker (raw action chunk)
+    policy_status = Signal(object)    # PolicyWorker -> MpcWorker + window
+    #: Trajectory panel -> PolicyWorker.set_ckpt: the checkpoint PATH chosen in
+    #: the panel's picker (HIGH = Diffusion Policy). The worker closes the
+    #: held session and loads this one, or REFUSES (mission armed / still
+    #: loading / not a file / FS-parity mismatch) and says why in
+    #: PolicyStatus.ckpt_note. Replaces the --policy-ckpt flag (2026-09-11).
+    cmd_policy_ckpt = Signal(str)
+    #: MpcWorker -> trajectory panel, ONE per composed plan (~2 Hz, not 20):
+    #: the policy's own output as a datum-NED polyline, WITH its verdict, so
+    #: the operator can see what the network asked for even when the filter
+    #: threw it away — which is the only state most plans have reached so far
+    #: (2026-09-02: 13 plans, 0 installed). state.PolicyPlanViz.
+    policy_plan_viz = Signal(object)
 
 
 class FrameMailbox:
@@ -281,6 +315,83 @@ class FrameMailbox:
             self._mutex.unlock()
 
 
+class LatestFrame:
+    """A short history of one stream, for a recorder to pair against by TIME.
+
+    ``--record-depth`` files the COLOUR frame beside each depth observation.
+    "The newest colour" is the wrong frame to file: the depth an observation is
+    built from was captured before FoundationStereo ran on it, so the newest
+    colour at record time is systematically LATER — measured +195 ms median
+    (p5 +86, p95 +365) on data/20260907/0907_133358_observe, which
+    is 2 cm of vehicle travel at 0.1 m/s. So this keeps ~0.5 s of frames and
+    :meth:`nearest` picks the one closest to the depth frame's own stamp,
+    which brings the pairing inside one colour frame interval (~33 ms at
+    30 Hz). The residual still travels with the row (`rgb_dt_ms`): near
+    simultaneous, never simultaneous.
+
+    Same array rule as :class:`RgbdMailbox`: the producer hands over copies.
+    """
+
+    #: ~0.5 s at 30 Hz. Long enough to cover the depth chain's lag, short
+    #: enough that the history is ~10 MB of 640x360 BGR and never grows.
+    DEPTH = 16
+
+    def __init__(self, depth: int | None = None):
+        self._mutex = QMutex()
+        self._item = None                # (image, t_capture) — the newest
+        self._hist = deque(maxlen=int(depth or self.DEPTH))
+        self._wanted = False
+
+    def set_wanted(self, on: bool) -> None:
+        self._mutex.lock()
+        try:
+            self._wanted = bool(on)
+            if not on:
+                self._item = None
+                self._hist.clear()
+        finally:
+            self._mutex.unlock()
+
+    def wanted(self) -> bool:
+        self._mutex.lock()
+        try:
+            return self._wanted
+        finally:
+            self._mutex.unlock()
+
+    def put(self, image, t_capture: float) -> None:
+        self._mutex.lock()
+        try:
+            if self._wanted:
+                self._item = (image, float(t_capture))
+                self._hist.append(self._item)
+        finally:
+            self._mutex.unlock()
+
+    def get(self):
+        """(image, t_capture) or (None, 0.0). NOT consuming: one colour frame
+        legitimately pairs with several observations."""
+        self._mutex.lock()
+        try:
+            return self._item if self._item is not None else (None, 0.0)
+        finally:
+            self._mutex.unlock()
+
+    def nearest(self, t: float):
+        """The held frame closest in time to ``t`` — (image, t_capture).
+
+        Nearest, not newest: see the class docstring. Falls back to the newest
+        when the history is empty, so a caller never has to branch.
+        """
+        self._mutex.lock()
+        try:
+            if not self._hist:
+                return self._item if self._item is not None else (None, 0.0)
+            return min(self._hist, key=lambda it: abs(it[1] - float(t)))
+        finally:
+            self._mutex.unlock()
+
+
 class RgbdMailbox:
     """Latest RGB-D frame for the perception worker. One slot, newest wins.
 
@@ -359,6 +470,225 @@ class RgbdMailbox:
                     "conflated": self._conflated}
         finally:
             self._mutex.unlock()
+
+
+class StereoMailbox:
+    """Latest raw mono PAIR for the learned-stereo worker. One slot, newest wins.
+
+    :class:`RgbdMailbox`'s sibling and it obeys the same two rules — the
+    producer hands over copies (DepthAI recycles its pool), and ``set_wanted``
+    lets the producer skip the copy entirely while the feature is off.
+
+    The one thing it adds is the rig. ``StereoRig`` is frozen, built once when
+    the camera opens, and read-only thereafter, so it rides with the frames
+    rather than crossing the thread boundary on its own signal — which means a
+    pair can never be matched against a rig that describes a different camera.
+    """
+
+    def __init__(self):
+        self._mutex = QMutex()
+        self._item: dict | None = None
+        self._put = 0
+        self._taken = 0
+        self._conflated = 0
+        self._wanted = False
+        self._result = None            # newest learned depth, for the RGB-D tap
+
+    def set_wanted(self, on: bool) -> None:
+        self._mutex.lock()
+        try:
+            self._wanted = bool(on)
+            if not on:
+                self._item = None       # drop what nobody will ever read
+                self._result = None
+        finally:
+            self._mutex.unlock()
+
+    def wanted(self) -> bool:
+        self._mutex.lock()
+        try:
+            return self._wanted
+        finally:
+            self._mutex.unlock()
+
+    # ------------------------------------------------------- the return leg
+    def set_result(self, depth_mm, t_capture: float) -> None:
+        """Publish the learned depth map back, for the RGB-D tap to pair.
+
+        The learned map is computed on the consumer's thread ~45 ms after its
+        mono pair [측정: rov_gui/tools/fstereo_bench_out/session.txt], but
+        FoundationPose is fed from the PRODUCER's thread, where
+        the colour frame is. Rather than a second signal, the answer comes back
+        through the same object the question went out on — so a reader cannot
+        end up holding a depth map and a rig that describe different sessions.
+
+        ``depth_mm`` must be an array the caller will not touch again.
+        """
+        self._mutex.lock()
+        try:
+            self._result = (depth_mm, float(t_capture))
+        finally:
+            self._mutex.unlock()
+
+    def result(self):
+        """The newest learned depth as (array, t_capture), or (None, 0.0).
+
+        Deliberately NOT consuming: the colour feed runs at 30 fps against the
+        learned map's ~13, so the same map legitimately pairs with several
+        colour frames. Staleness is the caller's judgement, made against
+        t_capture, because only the caller knows what it is pairing with.
+        """
+        self._mutex.lock()
+        try:
+            return self._result if self._result is not None else (None, 0.0)
+        finally:
+            self._mutex.unlock()
+
+    def put(self, left, right, rig, t_capture: float, frame_seq: int = 0,
+            out_size=None) -> None:
+        """Publish a rectifiable pair. Any thread. Overwrites what is pending.
+
+        ``frame_seq`` is the DEVICE sequence number the two images share. The
+        producer only calls this when left and right report the same one; it is
+        carried through so a consumer (or a log) can say which exposure a depth
+        map came from.
+        """
+        self._mutex.lock()
+        try:
+            if self._item is not None:
+                self._conflated += 1
+            self._put += 1
+            self._item = {"left": left, "right": right, "rig": rig,
+                          "t_capture": t_capture, "frame_seq": int(frame_seq),
+                          "out_size": out_size, "seq": self._put}
+        finally:
+            self._mutex.unlock()
+
+    def take(self) -> dict | None:
+        """Take the pending pair, or None. Never hands back a repeat."""
+        self._mutex.lock()
+        try:
+            item, self._item = self._item, None
+            if item is not None:
+                self._taken += 1
+            return item
+        finally:
+            self._mutex.unlock()
+
+    def counters(self) -> dict[str, int]:
+        self._mutex.lock()
+        try:
+            return {"put": self._put, "taken": self._taken,
+                    "conflated": self._conflated}
+        finally:
+            self._mutex.unlock()
+
+
+class PolicyMailbox:
+    """Latest depth frame for the policy worker, plus the GRID it lives on.
+
+    One producer per run (device depth OR FoundationStereo's rectified-left
+    map OR the demo's synthetic map — never two), one consumer
+    (:class:`rov_gui.backends.policy.PolicyWorker`). Same contract as the other
+    mailboxes: ``put`` from any thread, latest-wins, ``wanted()`` gates the
+    producer's copy so an idle policy costs nothing.
+
+    The grid is the producer's statement of which projection the millimetres
+    are on (``kind`` = ``rect_left`` | ``color_aligned`` | ``identity``); it
+    is set once, is idempotent for an identical fingerprint, and a frame whose
+    ``src`` does not match the grid kind is DROPPED and counted — a depth map
+    warped through the wrong geometry is exactly the kind of error that gets
+    believed.
+    """
+
+    def __init__(self):
+        self._lock = QMutex()
+        self._item = None
+        self._wanted = False
+        self._grid = None
+        self._kind = ""
+        self._counters = {"put": 0, "taken": 0, "dropped_src": 0,
+                          "dropped_unwanted": 0, "grid_set": 0,
+                          "grid_refused": 0}
+
+    def set_wanted(self, on: bool) -> None:
+        self._lock.lock()
+        try:
+            self._wanted = bool(on)
+            if not on:
+                self._item = None
+        finally:
+            self._lock.unlock()
+
+    def wanted(self) -> bool:
+        self._lock.lock()
+        try:
+            return self._wanted
+        finally:
+            self._lock.unlock()
+
+    def set_grid(self, grid, kind: str) -> bool:
+        """Declare the grid. Returns True when accepted (first set, or an
+        identical fingerprint); False — and counts — when a DIFFERENT grid is
+        offered, which the caller must log (a camera that reconnected with
+        another calibration)."""
+        fp = getattr(grid, "fingerprint", None)
+        self._lock.lock()
+        try:
+            if self._grid is None:
+                self._grid, self._kind = grid, str(kind)
+                self._counters["grid_set"] += 1
+                return True
+            if (str(kind) == self._kind
+                    and fp == getattr(self._grid, "fingerprint", None)):
+                return True
+            self._counters["grid_refused"] += 1
+            return False
+        finally:
+            self._lock.unlock()
+
+    def grid(self):
+        """(grid, kind) or (None, "")."""
+        self._lock.lock()
+        try:
+            return self._grid, self._kind
+        finally:
+            self._lock.unlock()
+
+    def put(self, depth_mm, t_capture: float, src: str) -> bool:
+        """``depth_mm`` must be a private array (uint16 millimetres, 0 = no
+        measurement) the caller will not touch again."""
+        self._lock.lock()
+        try:
+            if not self._wanted:
+                self._counters["dropped_unwanted"] += 1
+                return False
+            if self._grid is None or str(src) != self._kind:
+                self._counters["dropped_src"] += 1
+                return False
+            self._item = {"depth": depth_mm, "t_capture": float(t_capture),
+                          "src": str(src)}
+            self._counters["put"] += 1
+            return True
+        finally:
+            self._lock.unlock()
+
+    def take(self) -> dict | None:
+        self._lock.lock()
+        try:
+            item, self._item = self._item, None
+            if item is not None:
+                self._counters["taken"] += 1
+            return item
+        finally:
+            self._lock.unlock()
+
+    def counters(self) -> dict[str, int]:
+        self._lock.lock()
+        try:
+            return dict(self._counters)
+        finally:
+            self._lock.unlock()
 
 
 class Freshness:

@@ -1,0 +1,81 @@
+2026-09-02 14:05:19 ready: dobmpc, geometric-path/corner-gate, no geofence, mission=station @tag79
+2026-09-02 14:05:19 station_bridge ON: hold every axis 3.0s (xy=imu, demo: ideal sensor), then release x/y/yaw and keep depth+attitude
+2026-09-02 14:05:19 ENGAGED (dobmpc) — holding (+0.00, +0.00, +0.00) NED
+2026-09-02 14:05:19 ENGAGED (dobmpc) datum p0=[-0.007, -0.001, -1.001] yaw0 0.9 deg
+2026-09-02 14:05:21 POLICY requested
+2026-09-02 14:05:21 POLICY started
+2026-09-02 14:05:21 POLICY started - POLICY selected.ckpt: max 120 s, anchor leash (leash 0.05 m), v_max 0.08 m/s, knots 0.2 s, hold tail mask, box [[-1.0, -1.0, -0.5], [1.0, 1.0, 0.5]], gripper off; jaw width assumed 69 mm at START (open-loop estimate, init 69 mm = OPEN)
+2026-09-02 14:05:23 POLICY plans rejected 3x — halted
+2026-09-02 14:05:24 POLICY requested
+2026-09-02 14:05:24 POLICY started
+2026-09-02 14:05:24 POLICY started - POLICY selected.ckpt: max 120 s, anchor leash (leash 0.05 m), v_max 0.08 m/s, knots 0.2 s, hold tail mask, box [[-1.0, -1.0, -0.5], [1.0, 1.0, 0.5]], gripper off; jaw width assumed 69 mm at START (open-loop estimate, init 69 mm = OPEN)
+2026-09-02 14:05:26 POLICY plans rejected 3x — halted
+2026-09-02 14:05:27 POLICY requested
+2026-09-02 14:05:27 POLICY started
+2026-09-02 14:05:27 POLICY started - POLICY selected.ckpt: max 120 s, anchor leash (leash 0.05 m), v_max 0.08 m/s, knots 0.2 s, hold tail mask, box [[-1.0, -1.0, -0.5], [1.0, 1.0, 0.5]], gripper off; jaw width assumed 69 mm at START (open-loop estimate, init 69 mm = OPEN)
+2026-09-02 14:05:29 POLICY plans rejected 3x — halted
+2026-09-02 14:05:30 POLICY requested
+2026-09-02 14:05:30 POLICY started
+2026-09-02 14:05:30 POLICY started - POLICY selected.ckpt: max 120 s, anchor leash (leash 0.05 m), v_max 0.08 m/s, knots 0.2 s, hold tail mask, box [[-1.0, -1.0, -0.5], [1.0, 1.0, 0.5]], gripper off; jaw width assumed 69 mm at START (open-loop estimate, init 69 mm = OPEN)
+2026-09-02 14:05:31 POLICY plans rejected 3x — halted
+2026-09-02 14:05:32 POLICY requested
+2026-09-02 14:05:32 POLICY started
+2026-09-02 14:05:32 POLICY started - POLICY selected.ckpt: max 120 s, anchor leash (leash 0.05 m), v_max 0.08 m/s, knots 0.2 s, hold tail mask, box [[-1.0, -1.0, -0.5], [1.0, 1.0, 0.5]], gripper off; jaw width assumed 69 mm at START (open-loop estimate, init 69 mm = OPEN)
+2026-09-02 14:05:34 POLICY plans rejected 3x — halted
+2026-09-02 14:05:34 POLICY requested
+2026-09-02 14:05:34 POLICY started
+2026-09-02 14:05:34 POLICY started - POLICY selected.ckpt: max 120 s, anchor leash (leash 0.05 m), v_max 0.08 m/s, knots 0.2 s, hold tail mask, box [[-1.0, -1.0, -0.5], [1.0, 1.0, 0.5]], gripper off; jaw width assumed 69 mm at START (open-loop estimate, init 69 mm = OPEN)
+2026-09-02 14:05:36 POLICY plans rejected 3x — halted
+2026-09-02 14:05:36 POLICY requested
+2026-09-02 14:05:36 POLICY started
+2026-09-02 14:05:36 POLICY started - POLICY selected.ckpt: max 120 s, anchor leash (leash 0.05 m), v_max 0.08 m/s, knots 0.2 s, hold tail mask, box [[-1.0, -1.0, -0.5], [1.0, 1.0, 0.5]], gripper off; jaw width assumed 69 mm at START (open-loop estimate, init 69 mm = OPEN)
+2026-09-02 14:05:38 POLICY plans rejected 3x — halted
+2026-09-02 14:05:38 POLICY requested
+2026-09-02 14:05:38 POLICY started
+2026-09-02 14:05:38 POLICY started - POLICY selected.ckpt: max 120 s, anchor leash (leash 0.05 m), v_max 0.08 m/s, knots 0.2 s, hold tail mask, box [[-1.0, -1.0, -0.5], [1.0, 1.0, 0.5]], gripper off; jaw width assumed 69 mm at START (open-loop estimate, init 69 mm = OPEN)
+2026-09-02 14:05:40 POLICY plans rejected 3x — halted
+2026-09-02 14:05:40 POLICY requested
+2026-09-02 14:05:40 POLICY started
+2026-09-02 14:05:40 POLICY started - POLICY selected.ckpt: max 120 s, anchor leash (leash 0.05 m), v_max 0.08 m/s, knots 0.2 s, hold tail mask, box [[-1.0, -1.0, -0.5], [1.0, 1.0, 0.5]], gripper off; jaw width assumed 69 mm at START (open-loop estimate, init 69 mm = OPEN)
+2026-09-02 14:05:42 POLICY plans rejected 3x — halted
+2026-09-02 14:05:43 POLICY requested
+2026-09-02 14:05:43 POLICY started
+2026-09-02 14:05:43 POLICY started - POLICY selected.ckpt: max 120 s, anchor leash (leash 0.05 m), v_max 0.08 m/s, knots 0.2 s, hold tail mask, box [[-1.0, -1.0, -0.5], [1.0, 1.0, 0.5]], gripper off; jaw width assumed 69 mm at START (open-loop estimate, init 69 mm = OPEN)
+2026-09-02 14:05:44 POLICY plans rejected 3x — halted
+2026-09-02 14:05:45 POLICY requested
+2026-09-02 14:05:45 POLICY started
+2026-09-02 14:05:45 POLICY started - POLICY selected.ckpt: max 120 s, anchor leash (leash 0.05 m), v_max 0.08 m/s, knots 0.2 s, hold tail mask, box [[-1.0, -1.0, -0.5], [1.0, 1.0, 0.5]], gripper off; jaw width assumed 69 mm at START (open-loop estimate, init 69 mm = OPEN)
+2026-09-02 14:05:46 POLICY plans rejected 3x — halted
+2026-09-02 14:05:47 POLICY requested
+2026-09-02 14:05:47 POLICY started
+2026-09-02 14:05:47 POLICY started - POLICY selected.ckpt: max 120 s, anchor leash (leash 0.05 m), v_max 0.08 m/s, knots 0.2 s, hold tail mask, box [[-1.0, -1.0, -0.5], [1.0, 1.0, 0.5]], gripper off; jaw width assumed 69 mm at START (open-loop estimate, init 69 mm = OPEN)
+2026-09-02 14:05:48 POLICY plans rejected 3x — halted
+2026-09-02 14:05:49 POLICY requested
+2026-09-02 14:05:49 POLICY started
+2026-09-02 14:05:49 POLICY started - POLICY selected.ckpt: max 120 s, anchor leash (leash 0.05 m), v_max 0.08 m/s, knots 0.2 s, hold tail mask, box [[-1.0, -1.0, -0.5], [1.0, 1.0, 0.5]], gripper off; jaw width assumed 69 mm at START (open-loop estimate, init 69 mm = OPEN)
+2026-09-02 14:05:50 POLICY plans rejected 3x — halted
+2026-09-02 14:05:51 POLICY requested
+2026-09-02 14:05:51 POLICY started
+2026-09-02 14:05:51 POLICY started - POLICY selected.ckpt: max 120 s, anchor leash (leash 0.05 m), v_max 0.08 m/s, knots 0.2 s, hold tail mask, box [[-1.0, -1.0, -0.5], [1.0, 1.0, 0.5]], gripper off; jaw width assumed 69 mm at START (open-loop estimate, init 69 mm = OPEN)
+2026-09-02 14:05:53 POLICY plans rejected 3x — halted
+2026-09-02 14:05:54 POLICY requested
+2026-09-02 14:05:54 POLICY started
+2026-09-02 14:05:54 POLICY started - POLICY selected.ckpt: max 120 s, anchor leash (leash 0.05 m), v_max 0.08 m/s, knots 0.2 s, hold tail mask, box [[-1.0, -1.0, -0.5], [1.0, 1.0, 0.5]], gripper off; jaw width assumed 69 mm at START (open-loop estimate, init 69 mm = OPEN)
+2026-09-02 14:05:55 POLICY plans rejected 3x — halted
+2026-09-02 14:05:56 POLICY requested
+2026-09-02 14:05:56 POLICY started
+2026-09-02 14:05:56 POLICY started - POLICY selected.ckpt: max 120 s, anchor leash (leash 0.05 m), v_max 0.08 m/s, knots 0.2 s, hold tail mask, box [[-1.0, -1.0, -0.5], [1.0, 1.0, 0.5]], gripper off; jaw width assumed 69 mm at START (open-loop estimate, init 69 mm = OPEN)
+2026-09-02 14:05:57 POLICY plans rejected 3x — halted
+2026-09-02 14:05:58 POLICY requested
+2026-09-02 14:05:58 POLICY started
+2026-09-02 14:05:58 POLICY started - POLICY selected.ckpt: max 120 s, anchor leash (leash 0.05 m), v_max 0.08 m/s, knots 0.2 s, hold tail mask, box [[-1.0, -1.0, -0.5], [1.0, 1.0, 0.5]], gripper off; jaw width assumed 69 mm at START (open-loop estimate, init 69 mm = OPEN)
+2026-09-02 14:05:59 POLICY plans rejected 3x — halted
+2026-09-02 14:05:59 POLICY requested
+2026-09-02 14:05:59 POLICY started
+2026-09-02 14:05:59 POLICY started - POLICY selected.ckpt: max 120 s, anchor leash (leash 0.05 m), v_max 0.08 m/s, knots 0.2 s, hold tail mask, box [[-1.0, -1.0, -0.5], [1.0, 1.0, 0.5]], gripper off; jaw width assumed 69 mm at START (open-loop estimate, init 69 mm = OPEN)
+2026-09-02 14:06:01 POLICY plans rejected 3x — halted
+2026-09-02 14:06:01 POLICY requested
+2026-09-02 14:06:01 POLICY started
+2026-09-02 14:06:01 POLICY started - POLICY selected.ckpt: max 120 s, anchor leash (leash 0.05 m), v_max 0.08 m/s, knots 0.2 s, hold tail mask, box [[-1.0, -1.0, -0.5], [1.0, 1.0, 0.5]], gripper off; jaw width assumed 69 mm at START (open-loop estimate, init 69 mm = OPEN)
+2026-09-02 14:06:02 DISENGAGED: released
+2026-09-02 14:06:02 DISENGAGED - released

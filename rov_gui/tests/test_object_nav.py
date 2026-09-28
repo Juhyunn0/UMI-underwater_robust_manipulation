@@ -431,6 +431,27 @@ def _harness():
     return TC
 
 
+try:                                   # pytest is optional: main() below is
+    import pytest                      # the plain runner and restores W.now
+except ImportError:                    # itself (its finally: clause)
+    pytest = None
+
+if pytest is not None:
+    @pytest.fixture(autouse=True)
+    def _restore_worker_clock():
+        """``_follow_worker`` installs a fake ``workers.now``; under pytest
+        ``main()`` never runs, so without this the fake clock leaked into
+        every later worker-driven test file (test_policy / test_replay /
+        test_station_bridge: 55 plans dropped as late, 2026-09-26 full-suite
+        run). Mirrors main()'s ``finally: W.now = real_now``."""
+        import rov_gui.control.workers as W
+        real_now = W.now
+        try:
+            yield
+        finally:
+            W.now = real_now
+
+
 class _Clock:
     """A controllable ``now()`` for the worker tests.
 
@@ -1171,11 +1192,21 @@ def test_the_csv_has_the_object_columns_and_the_meta_says_schema_7():
                  "follow_state", "follow_err_m"):
         assert name in cols, name
     # appended at the END, so every by-name reader of an older run still
-    # works (the 2026-08-30 replay columns landed after tick_ms, same rule)
-    assert cols[-14:] == ["obj_px", "obj_py", "obj_pz", "obj_yaw_deg",
-                          "obj_age_s", "obj_pair_dt_ms", "obj_pair_exact",
-                          "obj_state", "follow_state", "follow_err_m",
-                          "tick_ms", "plan_id", "ref_src", "grip_cmd"]
+    # works (the 2026-08-30 replay columns landed after tick_ms, and the
+    # 2026-09-02 policy columns after those, same rule; the 2026-09-07
+    # `grip_g` is the one deliberate exception — beside the estimate it is
+    # judged against, schema 13 — and by-name readers still do not care)
+    # BY NAME, not by tail offset: the 2026-09-08 per-thruster block was
+    # appended after `observe`, so `cols[-18:]` stopped being this list — which
+    # is the append rule working, not a regression. What still matters is that
+    # the eighteen stay contiguous and in order.
+    want = ["obj_px", "obj_py", "obj_pz", "obj_yaw_deg",
+            "obj_age_s", "obj_pair_dt_ms", "obj_pair_exact",
+            "obj_state", "follow_state", "follow_err_m",
+            "tick_ms", "plan_id", "ref_src", "grip_cmd",
+            "grip_w_est", "grip_g", "hold_frac", "observe"]
+    i = cols.index("obj_px")
+    assert cols[i:i + len(want)] == want, cols[i:i + len(want)]
 
     tmp = tempfile.mkdtemp(prefix="objcsv_")
     TC, w, _bus, _pilots, _logs, clk = _follow_worker(tmp, yaw_axis="none")
@@ -1189,7 +1220,7 @@ def test_the_csv_has_the_object_columns_and_the_meta_says_schema_7():
     path = w._csv_path
     m = w._run_meta("test")
     w.disengage("done")
-    assert m["schema_version"] == 8, m["schema_version"]   # 8: + plan_stream
+    assert m["schema_version"] == 16, m["schema_version"]     # 16: + 6-DoF attitude axes (2026-09-26); 15: + top-level mode / LOW None holder (2026-09-11)
     on = m["object_nav"]
     assert on["enabled"] and on["source_ok"]
     assert on["pair_exact_ratio"] == 1.0, on

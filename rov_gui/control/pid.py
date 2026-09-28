@@ -7,8 +7,13 @@ translation / 3.0 yaw, ζ=0.9, α=0.2, re-evaluated at the heavy+gripper+C3
 payload masses — provenance in that file). Structure ported likewise:
 world-frame position error rotated into the body, per-axis PID with gated
 (+clamped) integrals, wrench saturation and a slew limit; yaw its own PID on
-the wrapped angle. Roll/pitch terms are NOT ported: MANUAL_CONTROL carries no
-roll/pitch axis, so they would be dropped downstream anyway.
+the wrapped angle. Roll/pitch terms are NOT ported: the 4-DoF MANUAL_CONTROL
+frame carries no roll/pitch axis, so they would be dropped downstream anyway
+— and this stays true under the 6-DoF variant (2026-09-26,
+``engage.attitude_axes``): this controller emits K = M = 0, so there is
+nothing to put on the extension axes, and ``policy.attitude_track`` /
+``engage.attitude_axes`` are REFUSED on LOW = pid (the refusal lives in
+MpcWorker; the same holds for rl_policy.py and mpcc_bridge.py).
 
 Two hardware deltas, both deliberate:
   * ``omega_derate`` scales the design frequency down (kp·d², kd·d, ki·d³ —
@@ -287,7 +292,8 @@ class HwPid:
                 "yaw_gate_rad": float(self.yaw_gate),
                 "f_max": self.f_max.tolist(), "mz_max": self.mz_max,
                 "slew_n_per_s": float(self.slew),
-                "axes_note": "u = [X, Y, Z, 0, 0, N] — MANUAL_CONTROL carries "
-                             "no roll/pitch axis, so K and M are not commanded",
+                "axes_note": "u = [X, Y, Z, 0, 0, N] — this controller has no "
+                             "roll/pitch loop, so K and M are never commanded "
+                             "(attitude_axes / attitude_track refused on pid)",
                 "ref_preview": False,
                 "path_reference": "shared spatial plan, stage 0"}

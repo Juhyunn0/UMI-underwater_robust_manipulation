@@ -1,0 +1,68 @@
+{
+ "summary": "Full DiffusionTransformerTimmPolicy graph (hydra compose of train_diffusion_transformer_umi_depth_vit_workspace + task=umi_depth_5d, hydra.utils.instantiate(cfg.policy), random init) was built in rovgui-pose (torch 2.11.0+cu128, timm 1.0.29, RTX 5090 31.37 GiB) with obs_encoder.model_name = vit_large_patch16_dinov3 (backbone 303.1M, policy 370.4M, 1024->768 Linear proj) and vit_huge_plus_patch16_dinov3 (840.5M / 908.0M, 1280->768 proj), 410 obs tokens (2x201 + 4 lowdim x 2) -> cond_pos_emb 411. Training step = compute_loss + backward + AdamW (foreach or fused) + EMAModel.step with a deepcopied EMA policy on GPU, fp32, no autocast, no checkpointing. RESULTS (script /tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/dinov3_full_policy_bench.py, JSONs train_*.json / predict_*.json / attn_L.json, table full_policy_bench_summary.txt in the same dir): DINOv3-L at the real batch 32 (64 images) OOMs (29.05 GB allocated at the failing 202 MiB request; with expandable_segments 30.5 GB, still OOM); b24 = 24.39 GB peak / 418 ms; b16 = 18.19 GB peak / 286 ms (foreach fp32), 275 ms fused, 213 ms with TF32. DINOv3-H+ OOMs at b32 AND b16 (30.4-30.5 GB); b8 = 28.02 GB allocated / 30.68 GB reserved (0.7 GB headroom) / 403 ms foreach, 373 ms fused, 293 ms TF32; b4 = 21.27 GB / 236 ms. Baseline CLIP ViT-B b32 in the same harness: 10.61 GB / 176.5 ms. predict() at DDIM 8, B=1, 2-frame obs, fp32 (as dp_policy.py deploys): L 25.8 ms (encoder 10.4 + denoiser x8 15.3), peak 1.42 GB; H+ 38.7 ms (23.5 + 15.3), peak 3.53 GB; ViT-B 19.7 ms, 0.60 GB. Attention: blocks[0].attn is timm EvaAttention with fused_attn=True for both; in fp32 (the dtype actually used in training and deploy) can_use_flash_attention=False, can_use_efficient_attention=True, cudnn=False, and the profiler shows the mem-efficient fmha_cutlassF/B_f32 kernels plus SIMT sgemm (no tensor cores) for the matmuls; bf16/fp16 flash=True and pytorch_flash::flash_fwd_kernel runs under bf16 autocast.",
+ "claims": [
+  {
+   "claim": "Training-step peak memory, fp32 / no autocast / no grad-checkpointing / EMA deepcopy resident / AdamW foreach, full policy graph: DINOv3-L does NOT fit the real batch 32 (64 images) on the 32 GB RTX 5090 -- OOM with 29.05 GB allocated at the failing 202 MiB request (train_L_b32_foreach_fp32.json), and still OOM at 30.5 GB with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (train_L_b32_foreach_fp32_expseg.json); b24 peaks at 24.39 GB allocated / 25.89 GB reserved, b16 at 18.19 GB / 20.26 GB (static model+EMA 2.76 GB, steady with Adam states 5.59 GB, activation slope ~0.78 GB per batch item = 2 images, so b32 extrapolates to ~30.6 GB). DINOv3-H+ OOMs at b32 (30.39 GB) AND at b16 (30.47 GB); b8 fits with 28.02 GB allocated / 30.68 GB reserved of 31.37 GiB (static model+EMA 6.95 GB, steady 13.77 GB, slope ~1.69 GB per item -> b16 would need ~41.5 GB); b4 peaks at 21.27 GB. Memory is identical for fused AdamW and for TF32. Baseline CLIP ViT-B in the same harness at b32: 10.61 GB allocated / 11.13 GB reserved.",
+   "sources": [
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/dinov3_full_policy_bench.py",
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/full_policy_bench_summary.txt",
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/train_L_b32_foreach_fp32.json",
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/train_Hp_b16_foreach_fp32.json",
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/train_Hp_b8_foreach_fp32.json",
+    "/home/bdml/Desktop/umi_underwater_robust_control/data/20260910/0910_095252_train_umi_depth_5d_depth5d_9926_A_vitclip/.hydra/config.yaml:55 (batch_size: 32 is the real ViT-A run)",
+    "/home/bdml/Desktop/umi_underwater_robust_control/external/UMI_aquatic/diffusion_policy/workspace/train_diffusion_transformer_timm_workspace.py:78-85,247-259 (instantiate, EMA deepcopy, get_optimizer, step order reproduced)"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "The current recipe (batch 32, fp32, EMA on, no checkpointing) cannot be reused as-is with L or H+: L needs batch <= 24 (or checkpointing/bf16), H+ needs batch <= 8 with 0.7 GB headroom -- any change of recipe confounds a DINOv3-vs-CLIP comparison."
+  },
+  {
+   "claim": "Training-step time (ms/step median over 10 timed steps after 3 warmup, cuda-synchronized, fp32 'highest' = the real setting because accelerate 0.24.1 only enables TF32 when a dynamo backend is set and the workspace sets no matmul precision): DINOv3-L b16 = 286 ms foreach / 275 ms fused AdamW (-4 %) / 213 ms with torch.set_float32_matmul_precision('high') (1.34x); b24 = 418 ms. DINOv3-H+ b8 = 403 ms foreach / 373 ms fused (-7.5 %) / 293 ms TF32 (1.38x); b4 = 236 ms. Baseline CLIP ViT-B b32 = 176.5 ms, which projects to 91 s/epoch at the real 518 steps/epoch (logs.json.txt of the 09.52.52 run) vs 97.3 s/epoch measured from that run's checkpoint mtimes (5 epochs per 486-487 s) -- harness is ~6 % optimistic. Projections at equal images/epoch: L at b16 (1036 steps) ~296 s/epoch -> ~16.5 h for 200 epochs fp32 (~12.3 h TF32); H+ at b8 (2072 steps) ~835 s/epoch -> ~46 h fp32 (~34 h TF32) [유도 from measured ms/step].",
+   "sources": [
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/full_policy_bench_summary.txt",
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/train_L_b16_foreach_fp32.json",
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/train_L_b16_fused_fp32.json",
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/train_L_b16_foreach_tf32.json",
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/train_Hp_b8_fused_fp32.json",
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/train_Hp_b8_foreach_tf32.json",
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/train_B_b32_foreach_fp32.json",
+    "/home/bdml/miniforge3/envs/umi2/lib/python3.10/site-packages/accelerate/state.py:794-799 (TF32 only with dynamo backend)",
+    "/home/bdml/Desktop/umi_underwater_robust_control/data/20260910/0910_095252_train_umi_depth_5d_depth5d_9926_A_vitclip/logs.json.txt (518 steps/epoch, 103600 lines) and checkpoints/ mtimes (epoch 150->155 17:43:10->17:51:16)"
+   ],
+   "confidence": "medium",
+   "why_it_matters_here": "Sets the wall-clock budget: L roughly triples and H+ roughly 9x the current 5.4 h/200-epoch run; the free 1.3x from TF32 and the 4-8 % from fused AdamW do not change the order of magnitude. Epoch projections assume the smaller batches keep 200 epochs and ignore dataloader/val overhead."
+  },
+  {
+   "claim": "predict() at DDIM 8, B=1, 2-frame obs (411 cond tokens incl. time token, confirmed: obs_tokens 410 = 2x201 image + 4 lowdim x 2, cond_pos_emb.shape[1] = 411), fp32 no autocast under torch.no_grad with CenterCrop(0.95)+Resize as dp_policy.py deploys, policy resident alone (no EMA/optimizer): DINOv3-L 25.8 ms median (encoder 10.4 ms + 8 denoiser steps 15.3 ms), resident 1.38 GB, peak 1.42 GB; DINOv3-H+ 38.7 ms (23.5 + 15.3), resident 3.48 GB, peak 3.53 GB; baseline CLIP ViT-B 19.7 ms (4.15 + 15.4), peak 0.60 GB. The 7-layer denoiser (66.5M params) at 411 cond tokens is the fixed ~15.3 ms floor; the encoder is 2.5x (L) / 5.7x (H+) the ViT-B encoder time.",
+   "sources": [
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/predict_vit_large_patch16_dinov3.json",
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/predict_vit_huge_plus_patch16_dinov3.json",
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/predict_B.json",
+    "/home/bdml/Desktop/umi_underwater_robust_control/rov_gui/perception/dp_policy.py:655-656,962-975 (center transforms, torch.no_grad fp32 sampling loop)",
+    "/home/bdml/Desktop/umi_underwater_robust_control/external/UMI_aquatic/diffusion_policy/policy/diffusion_transformer_timm_policy.py:38-51,105-138 (max_cond_tokens = obs_tokens+1, predict_action)"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "Both DINOv3 sizes stay far under the ~66.7 ms obs stride (obs_down_sample_steps 2 at 30 fps) and under 4 GB VRAM at inference, so deploy-side latency/VRAM is not the blocker -- training memory is."
+  },
+  {
+   "claim": "Attention backend on the RTX 5090 (sm_120, torch 2.11.0+cu128): key_model_map['camera0_depth'].blocks[0].attn is timm EvaAttention with fused_attn=True for both vit_large_patch16_dinov3 and vit_huge_plus_patch16_dinov3 (SDPA path, timm eva.py:168/256). For fp32 -- the dtype actually used (training: no autocast, matmul TF32 off; deploy: dp_policy.py no autocast) -- with q/k/v (64, heads, 201, 64): torch.backends.cuda.can_use_flash_attention = False, can_use_efficient_attention = True, can_use_cudnn_attention = False; the profiler over an fp32 fwd+bwd shows fmha_cutlassF_f32_aligned_64x64_rf_sm80 (fwd) / fmha_cutlassB_f32_aligned_64x64_k64_sm80 (bwd) i.e. the memory-efficient kernel, and every Linear runs on cutlass_80_simt_sgemm_* (SIMT, no tensor cores). For bf16 and fp16 all three (flash, efficient, cudnn) return True, and under bf16 autocast pytorch_flash::flash_fwd_kernel<..., bfloat16_t, ...> actually runs with tensorop bf16 GEMMs. Enabling TF32 ('high') keeps the SDPA kernel but switches GEMMs to tensor cores (the 1.34-1.38x above).",
+   "sources": [
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/attn_L.json",
+    "/tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/e6a19018-30c0-41fb-922d-b51c7549768a/scratchpad/train_Hp_b8_foreach_fp32.json (fused_attn: true for H+)",
+    "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/timm/models/eva.py:116-120,168,256-257,3002-3025,3058-3086 (EvaAttention fused_attn, dinov3 L/H+ model_args: dynamic_img_size, rope dinov3, 4 reg tokens, H+ swiglu)",
+    "/home/bdml/Desktop/umi_underwater_robust_control/rov_gui/perception/dp_policy.py:962 (torch.no_grad, no autocast)"
+   ],
+   "confidence": "high",
+   "why_it_matters_here": "Flash attention is unreachable in the current fp32 recipe on any GPU; it only becomes available (and the matmuls only hit tensor cores) if the training moves to bf16 autocast or at least TF32 -- a recipe change that would have to be applied to the CLIP baseline too for a fair comparison."
+  }
+ ],
+ "gaps": [
+  "Measured in rovgui-pose (torch 2.11.0+cu128), not the training env umi2 (torch 2.9.1, timm 0.9.7 has no dinov3 models); kernel selection and allocator behaviour can differ slightly between torch versions (harness ViT-B baseline is ~6 % faster than the real 09.52.52 run's 97.3 s/epoch, which also includes val and data loading).",
+  "Random init only (policy.obs_encoder.pretrained=false via hydra override); pretrained DINOv3 weights (HF gated, 'dinov3-license') were never downloaded -- memory/time do not depend on weights, but the instantiate path with pretrained=True is unverified in this env.",
+  "A stub `zarr` module (with an Array attribute) had to be injected because rovgui-pose has no zarr and the project root's `zarr/` data dir shadows it (dp_policy.py forbids importing the normalizer for this reason); the full-graph path therefore ran with LinearNormalizer from a random-stat normalizer, not a dataset-fit one -- no effect on memory/time.",
+  "No dataloader, no validation pass, no lr scheduler, no wandb in the harness; steady-state numbers are compute-only. Real training with num_workers 8 + pin_memory adds host RAM but no GPU memory; the 0.7 GB reserved headroom of H+ at b8 is fragile against any other process on the GPU (e.g. a display or a concurrent run).",
+  "Grad checkpointing, bf16 autocast, and freezing/LoRA of the backbone were NOT measured (out of scope per the question); each would change the memory picture materially (activations dominate: ~0.78 GB/item for L, ~1.69 GB/item for H+).",
+  "vit_7b_patch16_dinov3 was not instantiated: fp32 weights alone are ~26.9 GB and the recipe keeps an EMA copy plus Adam states (~4x weights), so it cannot fit the 32 GB card under this recipe [유도, not measured].",
+  "TF32 was measured only at one batch per model (L b16, H+ b8) and only with foreach AdamW; fused AdamW only in fp32.",
+  "Epoch/200-epoch projections are derivations from measured ms/step and the real run's 518 steps/epoch at batch 32 [유도]; they assume the same number of images per epoch at the smaller batch and no change in num_epochs."
+ ]
+}

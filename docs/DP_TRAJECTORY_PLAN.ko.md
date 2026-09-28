@@ -8,16 +8,37 @@
 > 테스트 일부(test_replay 9/9 + test_plan_stream 19/19), demo_e2e 실솔버 완주.
 > safety-code-reviewer 감사 FAIL→전항 수정(딜맨 held-drive 해제, 발산 가드 등 —
 > .claude/journal/reviews.md 2026-08-30). **남은 M0 전제 = 태그 배열 앞 시연 1개 촬영**
-> (§7 첫 항목). PolicyWorker(라이브 추론)와 Track A1 이후는 미착수.
+> (§7 첫 항목). PolicyWorker(라이브 추론)와 Track A1 이후는 미착수 (2026-08-30 시점;
+> PolicyWorker는 2026-09-02에 랜딩 — 다음 단락).
 > 조사 근거: 2026-08-30 워크플로(코드 리더 3 + UMI_underwater 레포 검증 + advisor 2)
 > + 탐색 2건(handheld pose-라벨 경로 / gripper 명령 경로).
+> **구현 현황 (2026-09-02)**: **PolicyWorker(라이브 추론) 랜딩** — shape `policy`,
+> `rov_gui/backends/policy.py`(워커) + `perception/dp_policy.py`(2026-09-01 체크포인트
+> 세션, DDIM 전사) + `perception/policy_obs.py`(depth 관측, 훈련 레시피 bit-parity) +
+> `control/policy_frames.py`(TCP 대수) + MpcWorker policy 미션(meta schema 10; 2026-09-07
+> 5-dim action 전환 이후 schema 12).
+> 5-렌즈 설계 리뷰의 결정 A1–A23을 그대로 반영: obs_t monotonic 시계 + intake 단일
+> 변환(A1), TCP 공간 합성(A2), TCP = ROV 자체 턱(A3, **미실측**), leash 앵커(A4),
+> 0.2 s 격자(A5), fix 기준 proprio(A6), 에스컬레이션 latch + late 분리(A7), epoch(A8),
+> bridge 중 거부(A9), hold-tail cost mask(A10), blend·yaw-jump 게이트(A11), 데이터셋
+> gripper 레벨(A12), status 신선도(A13), stub 세션으로 demo/e2e parity(A14), 기록
+> provenance(A15), depth 격자 규칙 + 디바이스 depth 거부(A16), FS 계기 parity(A17),
+> 페어링(A18), eval `center`(A19), upstream import 규율(A20), 안전 기본값(A21),
+> end_reason 문구(A22), 가드 안 intake(A23). 오프라인 검증: 테스트 5파일 +
+> `policy_dryrun.py`(stub·실제 체크포인트, 합성 장면). **실기 미검증**; 첫 실기는
+> §5 Phase 6-1(overlay만, 추종 없음)이고 README가 말하는 "첫 풀 런 = 파이프라인
+> 스모크"는 Phase 6-2(저속·좁은 박스 추종)다; 파지 전제는 턱 중심 실측(KNOWN_ISSUES
+> 2026-09-02). 검증 2026-09-02 후속: FS 실측 7.26 Hz(depth 페어 138 ms = 훈련 stride
+> 2.07×), 페어 상한 3.0·obs_dt, proprio 행을 페어 간격에 맞춤, 프레임 도착 트리거,
+> obs_max_age_s 0.6 — README policy 절.
 > 수치 표기 규칙은 repo CLAUDE.md의 측정 인용 규칙 — 경로 없는 수치는 `[예측]`/`[스펙]`/`[유도]`.
 
 ## 0. 한 줄 요약
 
 **UMI handheld 시연으로 학습한 diffusion policy**를 GUI trajectory 패널의 새 미션으로
-추가한다: obs = (depth 영상, proprioception) → 1 Hz로 미래 4 s 궤적 + gripper
-(action 80-dim) 생성 → PlanFilter/Stitcher를 거쳐 기존 NMPC(`HwDobMpc`)가 20 Hz 추종,
+추가한다: obs = (depth 영상, proprioception) → ~2 Hz로 미래 1.07 s 궤적 + gripper
+(action 16 knot × [Δx, Δy, Δz, Δψ, g] = 80-dim, 2026-09-07 재학습; 2026-09-01 ckpt는
+16×10 rot6d) 생성 → PlanFilter/Stitcher를 거쳐 기존 NMPC(`HwDobMpc`)가 20 Hz 추종,
 gripper는 기존 MANUAL_CONTROL 버튼 경로로 전송. 1차 태스크: **바위 접근 + 파지**.
 
 진행 순서(확정): **① 데모 1개 → 라벨 추출 → 실기 replay 게이트(M0) → ② 대량 수집(100–150)
@@ -75,7 +96,7 @@ C3VideoWorker (기존)                               MpcWorker (기존, 50 ms ti
                       obs 조립: depth + proprio           │
                       DDIM 8–16 steps (rovgui-pose env,  │
                       RTX 5090, 예상 15–40 ms [예측])     │
-                              │ raw plan (16×0.25 s + g) │
+                              │ raw plan (16×66.7 ms + g)│
                               ▼                          │
                     PlanFilter → PlanStitcher (신규, 순수 numpy)
                       게이트/클립/기각 + blend — 1 Hz 이음새를
@@ -115,13 +136,33 @@ Obs (horizon 2 frames, 0.25–0.5 s 간격):
             **양쪽 의미 일치가 규약** — 절대 yaw·절대 xy는 제외(프레임 불변성).
             per-dim dataset stats로 [-1,1].
 
-Action = 미래 궤적 + gripper, body-frame-at-t0 상대 표현:
-  16 knots × 0.25 s = 4.0 s  →  (Δx, Δy, Δz, Δψ, g) × 16 = 80-dim
-  4 s인 이유: replan 1 s + MPC preview 3 s (MPC_N=60 × DT_CTRL=0.05 s,
-  dobmpc/params.py:103,111)를 항상 커버 — 짧으면 stale plan 꼬리를 추종.
-  Δψ = t0 기준 unwrapped 스칼라 (4 s 내 |Δψ|<π 전제).
-  g ∈ [0,1] — 라벨은 기존 gripper-width 추출값(extract_gripper_width.py, [0,1] 0=closed),
-  실행은 문턱 처리(§5-B5). 61-stage plan은 cubic spline 리샘플, v/r은 spline 미분.
+Action = 미래 궤적 + gripper, 최신 obs TCP 기준 상대 표현 (2026-09-07 확정, `action_repr: pos_yaw_width`):
+  16 knots × 66.7 ms (stride 2 @ 30 fps) = 1.07 s  →  (Δx, Δy, Δz, Δψ, g) × 16 = 80-dim
+  Δp  = inv(T_tcp_now) @ T_tcp_k 의 병진 — TCP(=카메라 광학 프레임 x right/y down/z forward,
+        기울어진 채) 기준. 2026-09-01 ckpt의 10-dim [pos, rot6d, width] 열 0:3과 비트 동일.
+  Δψ  = yaw_of(R_bt · R_rel_k · R_btᵀ) — 상대 TCP 회전을 C3 마운트(R_bt, 43.3° 하향)에 얹힌
+        수평 기체가 재현하려면 돌려야 할 body yaw. NED 부호(위에서 봐 시계방향 +), knot마다
+        wrap(-π, π] (누적 unwrap 아님, knot 0 = 0). 중력·world 프레임을 쓰지 않는다.
+        (광축 방위각 변화 정의는 손 roll이 tan|기울기| 배율로 새어 기각 — 상관 0.688 vs 0.986)
+  g   = 턱 폭 [m] 라벨 그대로; 배포에서 w_open/w_closed로 [0,1] clip 후 문턱 처리(§5-B5).
+  정규화: 5열 모두 range → [-1,1] (DDIM clip_sample). 인코더 umi/common/yaw_action.py.
+  배포 디코드(policy_frames.compose_plan): p_tcp_k = p_a + R_ned_tcp_a Δp_k, yaw_k = anchor yaw + Δψ_k,
+  roll/pitch = 앵커 측정값; 0.2 s 격자 리샘플(A5) 후 PlanFilter/Stitcher.
+  (구 설계의 4 s/0.25 s는 폐기: 1 s replan + MPC preview는 stitcher가 hold-tail로 덮는다, A10.)
+
+6-DoF 변형 (2026-09-26, `action_repr: pos_rpy_width`, config + ckpt 로 선택, 기본 OFF — docs/DP_6DOF_PLAN.ko.md):
+  16 knots × (Δx, Δy, Δz, Δψ, Δφ, Δθ, g) = 112-dim. 열 0:4 와 6 은 위 5-dim 과 비트 동일(5-dim 플랜 = 7-dim 의
+  열 [0:4, 6]); (Δφ, Δθ, Δψ) = 같은 M = R_bt·R_rel_k·R_btᵀ 의 ZYX 오일러 — ψ = atan2(M10, M00) (5-dim 과 동일 식),
+  θ = asin(−M20), φ = atan2(M21, M22). FRD 부호: +Δθ nose-up, +Δφ starboard-down. 최신 obs 행 기준 상대(누적 아님),
+  7열 모두 range → [-1,1]; 인코더 umi/common/yaw_action.py encode_pos_rpy / decode_pos_rpy, task yaml 이
+  shape_meta.action.rpy_convention {order: zyx, frame: body_frd_via_R_bt, columns: [...]} 를 선언한다.
+  배포 디코드는 **앵커 자세에서 body-z 합성**: R_body_k = R_body_a · rot_zyx(Δφ_k, Δθ_k, Δψ_k), (φ_k, θ_k, ψ_k) = rpy_of(R_body_k)
+  — 수평 앵커에선 5-dim 디코드와 비트 동일, 기운 앵커에선 O(rp·Δψ) 만큼 다르므로 별도 분기.
+  두 하위 모드(policy.attitude_track): false = dropped-and-logged(열 0:4 로 5-dim 산술 + 앵커 레벨링, Δφ/Δθ 는
+  rp_raw / dropped_rp_deg 로 기록만(raw.rp 는 tracked 때만); 7-dim 망의 **의무 첫 비행**), true = 클립 rp_max_deg 뒤 p_body = p_tcp − R_body_k·t_bt
+  (p_tcp 는 정책 요청 그대로, 선체만 기울임) + PlanMsg.rp 로 NMPC 가 roll/pitch 추종, K/M 은 MANUAL_CONTROL
+  확장축(s = pitch, t = roll) 으로 송신. 라벨은 손목이고 실기는 선체 — 기울기는 추력을 쓰고 C3 의 태그 바닥 시야를
+  움직이므로(20° nose-up 에서 태그 소실 [예측]) 라벨 분포 산출물(rp_label_stats / dp_policy_offline gate) 없이는 학습 선택 금지.
 
 모델:
   encoder  : ResNet-18 + GroupNorm + spatial softmax (~11 M) 1순위 — depth 입력에
@@ -189,8 +230,9 @@ Track A(데이터/학습)와 Track B(제어/통합)는 병렬 진행, **M0에서
 - 제외 규칙: 태그 검출 불량 구간, 정지 구간 (안 자르면 hover를 배움).
 
 **A2. 데이터셋 빌드**
-- Slicing: obs 시각 t를 0.25–0.5 s stride로 sliding window,
-  `label = pose over (t, t+4 s], 0.25 s 리샘플, body-frame-at-t 변환 + g`.
+- Slicing(실제 구현 = upstream `UmiDataset` 재사용): obs 시각 t마다
+  `label = pose over [t, t+1.07 s], 66.7 ms stride, inv(T_tcp_t) 상대 변환 → (Δp, Δψ) + width`
+  (zarr에 action 배열 없음 — 로더가 pos/rotvec/width에서 매번 합성; `action_repr` 플래그로 인코딩 선택).
 - 라벨은 **복원된 EXECUTED 궤적** — 리샘플 전 smoothing spline/SavGol 평활
   (안 하면 MPC가 PnP jitter를 성실히 추종).
 - depth 규약 단일화: 학습(in-air→warp) / 배포(C3 ×0.64) 각각의 파이프라인과 경계 필드를
@@ -234,7 +276,11 @@ v_ref    = (1-w)·v_old + w·v_new + w_dot·(p_new − p_old)   ← 교차항 �
   추적오차 리셋 → EAOB/적분기 무효화 + leash·데드밴드와 결합한 래칫 드리프트.
   예외: |r−x_meas|가 leash(0.10 m) 초과 포화 중이면 leash 가장자리에 앵커
   (0818 런에서 leash 포화 = engaged tick의 83.6 % — path_cost.py 헤더,
-  sessions/low_level_controller_data/20260818/0818_143802/mpc_143938.csv).
+  data/20260818/0818_143802/mpc_143938.csv).
+  - **2026-09-07 시험 전환 [결정: operator]**: `policy.anchor: measured`(hw_mpc/land_dp
+    둘 다). 0907 실기 4,048 플랜에서 leash가 94 % 포화(항상 5 cm 앞)였고, 운영자가 위
+    리셋 비용을 감수하고 "실제 위치 앵커"를 먼저 관찰하기로 함. 관찰 후 안 되면 leash 복귀.
+    기록 경계 = meta `policy.anchor_mode`.
 - ACT식 temporal ensembling 기각 — diffusion 멀티모달 출력에서 모드 간 평균
   (좌회피/우회피 평균 = 정면 돌진). 옵션: mode-consistency(직전 plan과 최근접 후보).
 - yaw는 unwrap 후 블렌드.
@@ -293,9 +339,9 @@ v_ref    = (1-w)·v_old + w·v_new + w_dot·(p_new − p_old)   ← 교차항 �
      시 policy gripper 명령 동결**을 필터 규칙에 명시.
 
 ### Phase 6 — 실기 (M0 이후 단계별)
-1. 태그 위 정지 상태에서 plan 시각화만 (추종 없이 — policy 출력 overlay).
+1. 태그 위 정지 상태에서 plan 시각화만 (추종 없이 — policy 출력 overlay). 첫 실기.
 2. 저속·작업공간 박스 좁게 + 오퍼레이터 즉시 개입 대기 (기존 이중 게이트/DISARM 규약,
-   gripper는 초기 런에서 비활성 옵션).
+   gripper는 초기 런에서 비활성 옵션). = README의 "첫 풀 런(파이프라인 스모크)".
 3. 단계적으로 박스/속도 확대 → 파지 활성. 매 런 plans.jsonl 기반 planner-vs-tracker 귀속.
 
 ## 6. 리스크 (순위)

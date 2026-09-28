@@ -1,0 +1,847 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>run scene</title>
+<!--
+  Written by rov_gui/tools/export_run_html.py. The data below is inlined
+  because a page opened from a folder (file://) may not fetch a sibling JSON.
+  No CDN and no framework on purpose: this has to still open in five years,
+  from a USB stick, with no network.
+-->
+<style>
+  :root { --bg:#111; --panel:#181818; --line:#333; --dim:#8a8a8a; --fg:#e6e6e6;
+          --accept:#78ff78; --clip:#ffbe64; --late:#969696; --rov:#8cc88c; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:13px/1.45 ui-monospace,Menlo,Consolas,monospace; }
+  header { padding:8px 12px; border-bottom:1px solid var(--line); display:flex;
+           gap:18px; flex-wrap:wrap; align-items:baseline; }
+  header b { font-weight:600; }
+  header span { color:var(--dim); }
+  main { display:flex; gap:8px; padding:8px; align-items:stretch;
+         height:calc(100vh - 190px); min-height:420px; }
+  .col { background:var(--panel); border:1px solid var(--line); border-radius:4px;
+         display:flex; flex-direction:column; min-width:0;
+         /* flex-basis 0, so a picture loading later cannot resize the column
+            (and leave the canvas measured against the old width) */
+         flex:1 1 0; }
+  .col h2 { margin:0; padding:6px 10px; font-size:12px; font-weight:600;
+            color:var(--dim); border-bottom:1px solid var(--line);
+            display:flex; justify-content:space-between; gap:10px; }
+  .col .body { flex:1; position:relative; min-height:0; display:flex;
+               align-items:center; justify-content:center; overflow:hidden; }
+  .col img { max-width:100%; max-height:100%; object-fit:contain;
+             image-rendering:auto; }
+  .rgbnote { padding:14px; color:var(--dim); text-align:center; max-width:36em; }
+  /* the hover readout, following the cursor over the depth picture */
+  .chip { position:absolute; display:none; pointer-events:none; z-index:3;
+          background:rgba(12,12,12,0.92); border:1px solid #555; border-radius:3px;
+          padding:3px 7px; font-size:12px; white-space:nowrap; color:var(--fg); }
+  .chip.on { display:block; }
+  .chip b { color:#fff; font-weight:600; }
+  .chip span { color:var(--dim); }
+  .chip .none { color:var(--clip); }
+  #depth.probe { cursor:crosshair; }
+  #cam { flex:1.7 1 0; }
+  #cam .body { display:block; }
+  canvas#scene { width:100%; height:100%; display:block; cursor:grab; }
+  canvas#scene.drag { cursor:grabbing; }
+  canvas#inset { position:absolute; background:#0d0d0d; cursor:pointer;
+                 border:1px solid var(--line); border-radius:3px;
+                 opacity:0.94; }
+  canvas#inset:hover { opacity:1; border-color:#666; }
+  footer { padding:8px 12px; border-top:1px solid var(--line);
+           display:flex; flex-direction:column; gap:6px; }
+  .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  button, select { background:#222; color:var(--fg); border:1px solid var(--line);
+                   border-radius:3px; padding:3px 10px; font:inherit;
+                   cursor:pointer; }
+  button:hover, select:hover { background:#2b2b2b; }
+  input[type=range] { flex:1; min-width:200px; }
+  label { color:var(--dim); display:inline-flex; gap:5px; align-items:center; }
+  .read { display:flex; gap:20px; flex-wrap:wrap; color:var(--dim); }
+  .read b { color:var(--fg); font-weight:600; }
+  .warn { color:#ffbe64; }
+</style>
+
+<header>
+  <b id="hRun"></b>
+  <span id="hMap"></span>
+  <span id="hFs"></span>
+  <span id="hClock"></span>
+</header>
+
+<main>
+  <section class="col" id="colRgb">
+    <h2><span>C3 RGB</span><span id="rgbT"></span></h2>
+    <div class="body"><img id="rgb" alt=""><div class="rgbnote" id="rgbNote"></div></div>
+  </section>
+  <section class="col">
+    <h2><span>FoundationStereo</span><span id="depthT"></span></h2>
+    <div class="body"><img id="depth" alt="">
+      <div class="chip" id="dchip"></div>
+      <div class="rgbnote" id="depthNote" style="display:none"></div></div>
+  </section>
+  <section class="col" id="cam">
+    <h2><span>trajectory — drag to orbit, right-drag to pan, wheel to zoom, R to reset</span>
+        <span id="camT"></span></h2>
+    <div class="body">
+      <canvas id="scene"></canvas>
+      <canvas id="inset" width="300" height="300"></canvas>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="row">
+    <button id="play">▶ play</button>
+    <input type="range" id="seek" min="0" value="0" step="1">
+    <span id="frameLbl"></span>
+    <label>speed <select id="speed">
+      <option>0.5</option><option selected>1</option><option>2</option>
+      <option>4</option><option>8</option></select></label>
+  </div>
+  <div class="row">
+    <label><input type="checkbox" id="cbIds" checked> tag ids</label>
+    <label><input type="checkbox" id="cbGrid" checked> grid</label>
+    <label><input type="checkbox" id="cbInset" checked> top-down</label>
+    <label><input type="checkbox" id="cbRaw" checked> raw 16-step</label>
+    <label>mark tag <select id="tagPick"><option value="">none</option></select></label>
+    <button id="clearMarks">clear marks</button>
+    <label>size <select id="insetSize">
+      <option value="s">small</option><option value="m" selected>medium</option>
+      <option value="l">large</option></select></label>
+    <label>zoom <select id="insetZoom">
+      <option value="1">ROV 1 m</option>
+      <option value="2" selected>ROV 2 m</option>
+      <option value="3">ROV 3 m</option>
+      <option value="0">whole map</option></select></label>
+    <button id="reset">reset view</button>
+    <button id="top">look straight down</button>
+  </div>
+  <div class="read" id="read"></div>
+</footer>
+
+<script>
+const D = /*__DATA__*/null;
+
+// ---------------------------------------------------------------- geometry
+// Body FLU -> map NED. The SAME two sign flips as rov_gui/widgets/rov_shape.py
+// body_to_map (+y is LEFT, +z is UP, map z is DOWN); keeping them here in one
+// function is what stops the page and the station drawing different vehicles.
+function b2m(v, o, yaw) {
+  const ca = Math.cos(yaw), sa = Math.sin(yaw), dr = -v[1];
+  return [o[0] + ca * v[0] - sa * dr, o[1] + sa * v[0] + ca * dr, o[2] - v[2]];
+}
+const sub = (a, b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+const add = (a, b) => [a[0]+b[0], a[1]+b[1], a[2]+b[2]];
+const mul = (a, s) => [a[0]*s, a[1]*s, a[2]*s];
+const dot = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+const cross = (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+function norm(a) { const n = Math.hypot(a[0], a[1], a[2]) || 1e-9; return mul(a, 1/n); }
+
+// WORLD UP IS -Z: the map frame is the anchor tag's and it is NED, so the mat
+// is z = 0 and everything above it is NEGATIVE. Getting this backwards still
+// draws a scene, just upside down.
+const UP = [0, 0, -1];
+
+const bx = D.bounds[0], by = D.bounds[1];
+const CENTRE = [(bx[0]+bx[1])/2, (by[0]+by[1])/2, 0];
+const RADIUS = Math.max(Math.hypot(bx[1]-bx[0], by[1]-by[0]) / 2, 0.5);
+const HOME = { az: -1.05, el: 0.56, dist: RADIUS * 2.6, target: CENTRE.slice() };
+let cam = JSON.parse(JSON.stringify(HOME));
+
+function basis() {
+  const dir = norm([Math.cos(cam.el)*Math.cos(cam.az),
+                    Math.cos(cam.el)*Math.sin(cam.az), -Math.sin(cam.el)]);
+  const eye = add(cam.target, mul(dir, cam.dist));
+  const f = norm(sub(cam.target, eye));
+  let right = cross(f, UP);
+  if (Math.hypot(right[0], right[1], right[2]) < 1e-6) right = cross(f, [1,0,0]);
+  right = norm(right);
+  const down = norm(cross(f, right));
+  return { eye, R: [right, down, f] };
+}
+
+// Tags the reader has marked as holding something. A marker is drawn as a
+// small cylinder standing on the tag's own plane, along its outward normal —
+// so it sits ON the mat the way an object would, at any viewing angle.
+const marked = new Set();
+//: which corner the top-down sits in (0 TL, 1 TR, 2 BL, 3 BR) and how big.
+let insetCorner = 1, insetScale = 'm';
+const MARK_R = 0.04, MARK_H = 0.15;          // metres: a 80 mm can, 150 mm tall
+
+const scene = document.getElementById('scene');
+const sctx = scene.getContext('2d');
+let W = 800, H = 600, focal = 600;
+
+function project(p, B) {
+  const d = sub(p, B.eye);
+  const x = dot(B.R[0], d), y = dot(B.R[1], d), z = dot(B.R[2], d);
+  if (z <= 0.02) return null;
+  return [W/2 + focal * x / z, H/2 + focal * y / z, z];
+}
+
+// ------------------------------------------------------------------ drawing
+const C_TAG = '#3e3a37', C_TAG_EDGE = '#6f6c66', C_ANCHOR = '#ffc85a';
+const C_ROV = { hull:'#8cc88c', tube:'#c0bedc', jaw:'#ffc85a',
+                thruster:'#6e6e6e', camera:'#5ab4dc' };
+const C_PLAN = { accept:'#78ff78', clip:'#ffbe64', late:'#969696',
+                 reject:'#eb5a5a' };
+
+function shade(hex, k) {
+  const n = parseInt(hex.slice(1), 16);
+  const r = Math.min(255, ((n>>16)&255) * k) | 0;
+  const g = Math.min(255, ((n>>8)&255) * k) | 0;
+  const b = Math.min(255, (n&255) * k) | 0;
+  return `rgb(${r},${g},${b})`;
+}
+
+function cylinder(centre, n, r, h, sides = 14) {
+  // An orthonormal pair across the tag's normal, so the disc lies IN the tag's
+  // plane whatever that plane is.
+  let a = Math.abs(n[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
+  const u = norm(cross(n, a)), v = norm(cross(n, u));
+  const ring = t => {
+    const out = [];
+    for (let k = 0; k < sides; k++) {
+      const th = 2 * Math.PI * k / sides;
+      out.push(add(add(centre, mul(n, h * t)),
+                   add(mul(u, r * Math.cos(th)), mul(v, r * Math.sin(th)))));
+    }
+    return out;
+  };
+  return { bottom: ring(0), top: ring(1) };
+}
+
+function drawScene(f) {
+  const B = basis();
+  sctx.fillStyle = '#141414';
+  sctx.fillRect(0, 0, W, H);
+
+  if (document.getElementById('cbGrid').checked) {
+    sctx.strokeStyle = '#2a2a2a'; sctx.lineWidth = 1;
+    for (let s = 0; s < 2; s++) {
+      const lo = s ? by[0] : bx[0], hi = s ? by[1] : bx[1];
+      const alo = s ? bx[0] : by[0], ahi = s ? bx[1] : by[1];
+      for (let v = Math.floor(lo*2)/2; v <= hi; v += 0.5) {
+        const a = project(s ? [alo, v, 0] : [v, alo, 0], B);
+        const b = project(s ? [ahi, v, 0] : [v, ahi, 0], B);
+        if (!a || !b) continue;
+        sctx.beginPath(); sctx.moveTo(a[0], a[1]); sctx.lineTo(b[0], b[1]); sctx.stroke();
+      }
+    }
+  }
+
+  // Painter's algorithm over the tags and the vehicle together: they are the
+  // only filled surfaces, and the vehicle flies above the mat, so a single
+  // far-to-near sort cannot be wrong here.
+  const polys = [];
+  for (const t of D.tags) {
+    const pts = t.q.map(p => project(p, B));
+    if (pts.some(p => !p)) continue;
+    polys.push({ pts, z: pts.reduce((s, p) => s + p[2], 0) / 4,
+                 fill: C_TAG, stroke: t.id === D.tagmap.anchor ? C_ANCHOR : C_TAG_EDGE,
+                 id: t.id, c: project(t.c, B) });
+  }
+  for (const t of D.tags) {
+    if (!marked.has(t.id)) continue;
+    const cyl = cylinder(t.c, t.n, MARK_R, MARK_H);
+    for (let k = 0; k < cyl.bottom.length; k++) {
+      const j = (k + 1) % cyl.bottom.length;
+      const quad = [cyl.bottom[k], cyl.bottom[j], cyl.top[j], cyl.top[k]];
+      const pts = quad.map(q => project(q, B));
+      if (pts.some(p => !p)) continue;
+      const nk = norm(sub(quad[0], t.c));    // side normal, for the shading
+      const k2 = 0.45 + 0.55 * Math.abs(dot(nk, B.R[2]));
+      polys.push({ pts, z: pts.reduce((s, p) => s + p[2], 0) / 4,
+                   fill: shade('#e05a5a', k2), stroke: null });
+    }
+    const cap = cyl.top.map(q => project(q, B));
+    if (!cap.some(p => !p))
+      polys.push({ pts: cap, z: cap.reduce((s, p) => s + p[2], 0) / cap.length,
+                   fill: shade('#ff8a6a', 1.0), stroke: '#ffd0c0' });
+  }
+
+  const o = f.p, yaw = f.yaw;
+  for (const part of D.rov.parts) {
+    const world = part.verts.map(v => b2m(v, o, yaw));
+    const base = C_ROV[part.kind] || '#b4b4b4';
+    for (const face of part.faces) {
+      const pts = face.i.map(k => project(world[k], B));
+      if (pts.some(p => !p)) continue;
+      const n = norm(b2m(face.n, [0,0,0], yaw));
+      const k = 0.45 + 0.55 * Math.abs(dot(n, B.R[2]));
+      polys.push({ pts, z: pts.reduce((s, p) => s + p[2], 0) / pts.length,
+                   fill: shade(base, k), stroke: null });
+    }
+  }
+  polys.sort((a, b) => b.z - a.z);
+  for (const p of polys) {
+    sctx.beginPath();
+    sctx.moveTo(p.pts[0][0], p.pts[0][1]);
+    for (let i = 1; i < p.pts.length; i++) sctx.lineTo(p.pts[i][0], p.pts[i][1]);
+    sctx.closePath();
+    sctx.fillStyle = p.fill; sctx.fill();
+    if (p.stroke) { sctx.strokeStyle = p.stroke; sctx.lineWidth = 1; sctx.stroke(); }
+  }
+
+  if (document.getElementById('cbIds').checked) {
+    sctx.font = '11px ui-monospace,monospace';
+    sctx.textAlign = 'center'; sctx.textBaseline = 'middle';
+    for (const p of polys) {
+      if (p.id === undefined || !p.c) continue;
+      const w = Math.hypot(p.pts[1][0]-p.pts[0][0], p.pts[1][1]-p.pts[0][1]);
+      if (w < 12) continue;                 // no room; a smear is not a label
+      sctx.fillStyle = 'rgba(0,0,0,0.55)';
+      sctx.fillRect(p.c[0]-11, p.c[1]-7, 22, 14);
+      sctx.fillStyle = p.id === D.tagmap.anchor ? C_ANCHOR : '#c8c8c8';
+      sctx.fillText(String(p.id), p.c[0], p.c[1]);
+    }
+  }
+
+  // The reference, last and on top: it is the one thing this page exists for.
+  const plan = D.plans[f.plan];
+  if (plan) {
+    const col = C_PLAN[plan.status] || '#c8c8c8';
+    // The policy emits 16 steps at its training stride (66.7 ms); the plan the
+    // controller is given is those resampled onto the 0.2 s grid, which is 6
+    // knots for a 1.07 s horizon. Both are drawn: thin is what the network
+    // said, thick is what flew.
+    if (plan.r && document.getElementById('cbRaw').checked) {
+      const pr = plan.r.map(p => project(p, B)).filter(Boolean);
+      if (pr.length > 1) {
+        sctx.strokeStyle = col; sctx.lineWidth = 1; sctx.globalAlpha = 0.85;
+        sctx.beginPath(); sctx.moveTo(pr[0][0], pr[0][1]);
+        for (let i = 1; i < pr.length; i++) sctx.lineTo(pr[i][0], pr[i][1]);
+        sctx.stroke();
+        for (const q of pr) {
+          sctx.beginPath(); sctx.arc(q[0], q[1], 1.6, 0, 6.283);
+          sctx.fillStyle = col; sctx.fill();
+        }
+        sctx.globalAlpha = 1;
+      }
+    }
+    const pts = plan.k.map(p => project(p, B)).filter(Boolean);
+    if (pts.length > 1) {
+      sctx.strokeStyle = col; sctx.lineWidth = 3; sctx.lineJoin = 'round';
+      sctx.beginPath(); sctx.moveTo(pts[0][0], pts[0][1]);
+      for (let i = 1; i < pts.length; i++) sctx.lineTo(pts[i][0], pts[i][1]);
+      sctx.stroke();
+    }
+    pts.forEach((p, i) => {
+      sctx.beginPath(); sctx.arc(p[0], p[1], i ? 3.5 : 5, 0, 6.283);
+      sctx.fillStyle = col; sctx.globalAlpha = i ? 0.9 : 1; sctx.fill();
+      sctx.globalAlpha = 1;
+    });
+    // dropped to the mat plane, so a knot's HEIGHT reads as height
+    const end = plan.k[plan.k.length - 1];
+    const a = project(end, B), b = project([end[0], end[1], 0], B);
+    if (a && b) {
+      sctx.strokeStyle = col; sctx.lineWidth = 1; sctx.setLineDash([4, 3]);
+      sctx.beginPath(); sctx.moveTo(a[0], a[1]); sctx.lineTo(b[0], b[1]);
+      sctx.stroke(); sctx.setLineDash([]);
+    }
+  }
+}
+
+// ------------------------------------------------------------- top-down map
+const inset = document.getElementById('inset');
+const ictx = inset.getContext('2d');
+
+function drawInset(f) {
+  const on = document.getElementById('cbInset').checked;
+  inset.style.display = on ? 'block' : 'none';
+  if (!on) return;
+  const box = parseFloat(document.getElementById('insetZoom').value);
+  const spanX = bx[1] - bx[0], spanY = by[1] - by[0];
+  // Sized against the PANEL, not fixed: a 300 px square took ~40 % of the
+  // width of a 770 px view and sat on top of the very trajectory it is there
+  // to locate. A quarter of the shorter side reads at a glance and leaves the
+  // scene alone; `inset size` overrides, and clicking it parks it in another
+  // corner (occlusion depends on where the vehicle is, which moves).
+  const SIDE_FRAC = {s: 0.18, m: 0.25, l: 0.34}[insetScale] || 0.25;
+  const side = Math.max(110, Math.min(300, Math.round(Math.min(W, H) * SIDE_FRAC)));
+  let IW, IH, cx, cy, scale;
+  if (box > 0) {                       // zoomed on the vehicle: square
+    IW = IH = side;
+    cx = f.p[0]; cy = f.p[1]; scale = (IW - 20) / box;
+  } else {                             // the whole mat, at the MAT's shape —
+    // a square panel for a 1.7 x 4.1 m mat is mostly empty, and the tags then
+    // squeeze into a band where their ids cannot be read.
+    // Fit BOTH ways: map x (north) runs up the panel and map y (east) across,
+    // so a 1.7 x 4.1 m mat wants a wide, short inset — but it must still fit
+    // the corner it lives in.
+    const maxW = Math.min(Math.round(side * 1.6), Math.max(140, W - 24));
+    const maxH = Math.min(side, Math.max(100, H - 24));
+    scale = Math.min((maxW - 16) / Math.max(spanY, 0.5),
+                     (maxH - 16) / Math.max(spanX, 0.5));
+    IW = Math.round(spanY * scale) + 16;
+    IH = Math.round(spanX * scale) + 16;
+    cx = CENTRE[0]; cy = CENTRE[1];
+  }
+  if (inset.width !== IW || inset.height !== IH) {
+    inset.width = IW; inset.height = IH;
+    inset.style.width = IW + 'px'; inset.style.height = IH + 'px';
+  }
+  // park it in the chosen corner (top-right by default)
+  const V = insetCorner < 2 ? 'top' : 'bottom', Hh = (insetCorner % 3) ? 'right' : 'left';
+  inset.style.top = inset.style.bottom = inset.style.left = inset.style.right = '';
+  inset.style[V] = '8px'; inset.style[Hh] = '8px';
+  ictx.setTransform(1, 0, 0, 1, 0, 0);
+  ictx.fillStyle = '#0d0d0d'; ictx.fillRect(0, 0, IW, IH);
+  // map x is NORTH and points UP here; map y is EAST -> right.
+  const px = q => [IW/2 + (q[1]-cy)*scale, IH/2 - (q[0]-cx)*scale];
+
+  ictx.strokeStyle = '#242424'; ictx.lineWidth = 1;
+  for (let v = -10; v <= 10; v += 0.5) {
+    let a = px([v, cy-99]), b = px([v, cy+99]);
+    ictx.beginPath(); ictx.moveTo(a[0], a[1]); ictx.lineTo(b[0], b[1]); ictx.stroke();
+    a = px([cx-99, v]); b = px([cx+99, v]);
+    ictx.beginPath(); ictx.moveTo(a[0], a[1]); ictx.lineTo(b[0], b[1]); ictx.stroke();
+  }
+  ictx.font = '9px ui-monospace,monospace';
+  ictx.textAlign = 'center'; ictx.textBaseline = 'middle';
+  const ids = document.getElementById('cbIds').checked;
+  for (const t of D.tags) {
+    const pts = t.q.map(px);
+    ictx.beginPath(); ictx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < 4; i++) ictx.lineTo(pts[i][0], pts[i][1]);
+    ictx.closePath();
+    ictx.fillStyle = C_TAG; ictx.fill();
+    ictx.strokeStyle = t.id === D.tagmap.anchor ? C_ANCHOR : C_TAG_EDGE;
+    ictx.stroke();
+    if (ids) {
+      // 15 px, not 9: at 9 the digits are wider than the tag and the inset
+      // becomes a mush of overlapping numbers. Below that the outline still
+      // shows where the tag is; `size: large` or the 1 m zoom brings the ids
+      // back.
+      const w = Math.hypot(pts[1][0]-pts[0][0], pts[1][1]-pts[0][1]);
+      if (w >= 15) {
+        ictx.fillStyle = t.id === D.tagmap.anchor ? C_ANCHOR : '#b4b4b4';
+        const c = px(t.c);
+        ictx.fillText(String(t.id), c[0], c[1]);
+      }
+    }
+  }
+  // the hull footprint, from the SAME body model as the 3-D view
+  const hl = D.rov.hull[0] / 2, hw = D.rov.hull[1] / 2;
+  const corners = [[hl, hw, 0], [hl, -hw, 0], [-hl, -hw, 0], [-hl, hw, 0]]
+      .map(v => px(b2m(v, f.p, f.yaw)));
+  ictx.beginPath(); ictx.moveTo(corners[0][0], corners[0][1]);
+  for (let i = 1; i < 4; i++) ictx.lineTo(corners[i][0], corners[i][1]);
+  ictx.closePath();
+  ictx.strokeStyle = C_ROV.hull; ictx.lineWidth = 2; ictx.stroke();
+  ictx.beginPath(); ictx.moveTo(corners[0][0], corners[0][1]);
+  ictx.lineTo(corners[1][0], corners[1][1]);
+  ictx.strokeStyle = '#fff'; ictx.stroke();          // the nose
+  const tcp = px(b2m(D.rov.tcp, f.p, f.yaw));
+  ictx.beginPath(); ictx.arc(tcp[0], tcp[1], 3.5, 0, 6.283);
+  ictx.fillStyle = C_ROV.jaw; ictx.fill();
+
+  for (const t of D.tags) {
+    if (!marked.has(t.id)) continue;
+    const c = px(t.c);
+    ictx.beginPath(); ictx.arc(c[0], c[1], Math.max(3, MARK_R * scale), 0, 6.283);
+    ictx.fillStyle = '#e05a5a'; ictx.fill();
+    ictx.strokeStyle = '#ffd0c0'; ictx.lineWidth = 1; ictx.stroke();
+  }
+  const plan = D.plans[f.plan];
+  if (plan) {
+    const col = C_PLAN[plan.status] || '#c8c8c8';
+    const pts = plan.k.map(px);
+    ictx.strokeStyle = col; ictx.lineWidth = 2;
+    ictx.beginPath(); ictx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) ictx.lineTo(pts[i][0], pts[i][1]);
+    ictx.stroke();
+    pts.forEach((p, i) => {
+      ictx.beginPath(); ictx.arc(p[0], p[1], i ? 2.5 : 4, 0, 6.283);
+      ictx.fillStyle = col; ictx.fill();
+    });
+  }
+  ictx.fillStyle = '#8a8a8a'; ictx.textAlign = 'left';
+  // Short, because the panel is now ~165 px wide: the hint lives in the
+  // tooltip rather than being clipped mid-word.
+  ictx.fillText(box > 0 ? `ROV ${box.toFixed(1)} m` : 'whole map', 6, 10);
+  inset.title = 'top-down — click to move it to another corner';
+}
+
+// ------------------------------------------------------------------ the page
+const imgD = document.getElementById('depth');
+const imgC = document.getElementById('rgb');
+const depthNote = document.getElementById('depthNote');
+// A frame is either a file beside the page (frames/dNNNNN.jpg) or, with
+// --embed, the picture itself as a data: URI. One file that shows everything
+// costs about 18 kB per frame; the folder form keeps the page under a MB.
+const srcOf = s => (s.startsWith('data:') ? s : 'frames/' + s);
+// index.html holds the WHOLE 3-D scene inline (tag map, vehicle, references,
+// every readout) and NONE of the pictures — those are JPEGs in the sibling
+// frames/ folder. Opened on its own the page still works; the image columns go
+// blank, and a blank column looks like a bug unless it says this.
+imgD.addEventListener('error', () => {
+  imgD.style.display = 'none';
+  depthNote.style.display = '';
+  depthNote.textContent = D.embedded
+      ? 'the embedded frame did not decode — the page may have been truncated ' +
+        'in transit; check its size against what the exporter reported.'
+      : `frames/${D.frames[i] ? D.frames[i].img : '...'} did not load. This ` +
+        `page carries the 3-D scene but not the pictures — copy the whole ` +
+        `scene_html/ folder (index.html + frames/), not index.html alone, or ` +
+        `re-export with --embed for a single file.`;
+});
+imgD.addEventListener('load', () => {
+  imgD.style.display = ''; depthNote.style.display = 'none';
+});
+imgC.addEventListener('error', () => { imgC.style.display = 'none'; });
+
+// -------------------------------------------- hover: the millimetre under the cursor
+// The number does NOT come from the colour. The panel is an 8-bit palette
+// position and, in the obs domain, one level is 0.16 m wide at 3 m; lossy WebP
+// then moves it again. So the page carries a SECOND, lossless picture per
+// frame whose R/G channels are the high/low byte of the recorded millimetre
+// (export_run_html.encode_values), and the readout is that value, unaltered.
+const dchip = document.getElementById('dchip');
+const dval = new Image();                 // the exact-mm layer of frame `i`
+const vcan = document.createElement('canvas');
+const vctx = vcan.getContext('2d', { willReadFrequently: true });
+let dvalOk = false, vFrame = -1, dvalIdx = -1, probeWhy = '';
+dval.addEventListener('load',  () => { dvalOk = true;  vFrame = -1; });
+dval.addEventListener('error', () => { dvalOk = false; vFrame = -1; });
+
+function valueAt(sx, sy) {
+  // Decode once per frame, then one pixel per mouse move. Returns mm, or -1
+  // when the browser will not let us look (a file:// page may not read the
+  // pixels of a sibling image — that is why --embed, whose frames are data:
+  // URIs and therefore same-origin, is the form the readout works in).
+  if (vFrame !== i) {
+    vcan.width = dval.naturalWidth; vcan.height = dval.naturalHeight;
+    vctx.drawImage(dval, 0, 0);
+    vFrame = i;
+  }
+  try {
+    const d = vctx.getImageData(sx, sy, 1, 1).data;
+    return (d[0] << 8) | d[1];            // R = high byte, G = low byte
+  } catch (err) {
+    probeWhy = D.embedded
+        ? 'the value layer did not decode'
+        : 'the readout needs --embed: a browser will not let a file:// page ' +
+          'read a sibling image\u2019s pixels';
+    dvalOk = false;
+    return -1;
+  }
+}
+
+// Mouse -> source pixel. Two undos, both from numbers the exporter measured
+// rather than from an assumed 1:1: the panel is drawn 'contain' inside the
+// <img> box, and the depth image is centred inside the panel's image band by
+// depth_panel.fit_into (INTER_NEAREST, so floor is its exact inverse).
+function sourcePixel(ev) {
+  const G = D.depth_geom;
+  if (!G) return null;
+  const r = imgD.getBoundingClientRect();
+  const pw = imgD.naturalWidth || G.pw, ph = imgD.naturalHeight || G.ph;
+  if (!r.width || !r.height) return null;
+  const s = Math.min(r.width / pw, r.height / ph);
+  const px = (ev.clientX - (r.left + (r.width  - pw * s) / 2)) / s;
+  const py = (ev.clientY - (r.top  + (r.height - ph * s) / 2)) / s;
+  // Per AXIS: fit_into rounds nw and nh independently, so a 320x240 grid lands
+  // at 533/320 across and 400/240 down — one shared scale names the wrong
+  // column on every non-1:1 grid (it did, until this was checked against
+  // cv2.resize itself in test_the_hover_geometry_inverts_the_panel_layout).
+  if (px < G.x0 || py < G.y0 || px >= G.x0 + G.nw || py >= G.y0 + G.nh)
+    return null;
+  const sx = Math.min(G.iw - 1, Math.floor((px - G.x0) * G.iw / G.nw));
+  const sy = Math.min(G.ih - 1, Math.floor((py - G.y0) * G.ih / G.nh));
+  return [sx, sy];
+}
+
+function hideChip() { dchip.className = 'chip'; }
+
+imgD.addEventListener('mousemove', ev => {
+  const f = D.frames[i];
+  if (!D.depth_geom || !f || !f.v) { hideChip(); return; }
+  const at = sourcePixel(ev);
+  if (!at) { hideChip(); return; }        // header, legend or letterbox
+  let body;
+  if (!dvalOk) {
+    body = `<span class="none">${probeWhy || 'value layer not loaded'}</span>`;
+  } else {
+    const mm = valueAt(at[0], at[1]);
+    if (mm < 0) {
+      body = `<span class="none">${probeWhy}</span>`;
+    } else if (mm === 0) {
+      // 0 is "no measurement", not "far" — the same thing the legend says.
+      body = '<span class="none">no measurement</span>';
+    } else {
+      body = `<b>${(mm / 1000).toFixed(3)} m</b> <span>${mm} mm</span>`;
+    }
+  }
+  dchip.innerHTML = body +
+      ` <span>· px ${at[0]},${at[1]}` +
+      (f.dpng ? ` · ${f.dpng}` : '') + '</span>';
+  // Place it in the panel's own box, and flip it before it runs off an edge.
+  const b = imgD.parentElement.getBoundingClientRect();
+  dchip.className = 'chip on';
+  const x = ev.clientX - b.left, y = ev.clientY - b.top;
+  const w = dchip.offsetWidth, h = dchip.offsetHeight;
+  dchip.style.left = Math.max(2, Math.min(b.width  - w - 2, x + 14)) + 'px';
+  dchip.style.top  = Math.max(2, Math.min(b.height - h - 2,
+                                          y - h - 10 < 2 ? y + 18 : y - h - 10)) + 'px';
+});
+imgD.addEventListener('mouseleave', hideChip);
+const seek = document.getElementById('seek');
+let i = 0, playing = false, last = 0;
+
+function fitView() {
+  // Fit the MAT'S OWN CORNERS, not its bounding sphere: the mat is 1.7 x 4.1 m,
+  // so a sphere fit leaves most of the panel empty at every viewing angle.
+  // Distance is monotone in the projected extent, so twenty bisections are
+  // exact enough and cost nothing.
+  const corners = [];
+  for (const x of bx) for (const y of by) for (const z of [0, -0.9])
+    corners.push([x, y, z]);
+  const extent = d => {
+    const save = cam.dist; cam.dist = d;
+    const B = basis(); cam.dist = save;
+    let m = 0;
+    for (const c of corners) {
+      const v = sub(c, B.eye);
+      const z = dot(B.R[2], v);
+      if (z <= 0.02) return 1e9;
+      m = Math.max(m, Math.abs(focal * dot(B.R[0], v) / z) / (W / 2),
+                      Math.abs(focal * dot(B.R[1], v) / z) / (H / 2));
+    }
+    return m;
+  };
+  let lo = 0.5, hi = RADIUS * 12;
+  for (let k = 0; k < 24; k++) {
+    const mid = (lo + hi) / 2;
+    if (extent(mid) > 0.94) lo = mid; else hi = mid;
+  }
+  HOME.dist = hi;
+}
+
+let fitted = false;
+function resize() {
+  // The CANVAS's own box, not the parent's: the parent is a flex item and its
+  // width settles only after the images have loaded. Never trust a size
+  // measured before layout has stopped moving — that is what left the scene
+  // drawn off the edge of a canvas that was still 800x600.
+  scene.style.width = '100%'; scene.style.height = '100%';
+  const b = scene.getBoundingClientRect();
+  const r = window.devicePixelRatio || 1;
+  W = Math.max(320, Math.round(b.width)); H = Math.max(240, Math.round(b.height));
+  scene.width = Math.round(W * r); scene.height = Math.round(H * r);
+  sctx.setTransform(r, 0, 0, r, 0, 0);
+  focal = (H / 2) / Math.tan(0.42);          // ~48 deg vertical field
+  fitView();
+  if (!fitted) { cam.dist = HOME.dist; fitted = true; }
+  draw();
+}
+
+function fmt(v, n = 3) { return (v >= 0 ? '+' : '') + v.toFixed(n); }
+
+function draw() {
+  const f = D.frames[i];
+  if (!f) return;
+  if (f.img) imgD.src = srcOf(f.img);
+  // by frame index, not by comparing src: with --embed that string is the
+  // whole 64 kB data: URI.
+  if (f.v && dvalIdx !== i) { dvalOk = false; dvalIdx = i; dval.src = srcOf(f.v); }
+  imgD.classList.toggle('probe', !!(f.v && D.depth_geom));
+  if (f.rgb) { imgC.src = srcOf(f.rgb); imgC.style.display = ''; }
+  const plan = D.plans[f.plan];
+  drawScene(f);
+  drawInset(f);
+  seek.value = i;
+  document.getElementById('frameLbl').textContent =
+      `frame ${i + 1}/${D.frames.length}   t ${f.t.toFixed(2)} s`;
+  document.getElementById('depthT').textContent =
+      `valid ${f.valid}%  nearest ${f.near} m  median ${f.med} m`;
+  document.getElementById('camT').textContent =
+      `az ${(cam.az * 57.3).toFixed(0)}°  el ${(cam.el * 57.3).toFixed(0)}°  ` +
+      `${cam.dist.toFixed(1)} m`;
+  const bits = [
+    `<b>ROV</b> x ${fmt(f.p[0])} y ${fmt(f.p[1])} z ${fmt(f.p[2])} m ` +
+    `yaw ${fmt(f.yaw * 57.3, 1)}° <span>(pitch ${fmt(f.pitch,1)} roll ` +
+    `${fmt(f.roll,1)}, drawn yaw-only)</span>`,
+    `<b>tags</b> ${f.tags} <span>age ${f.age.toFixed(2)} s  rms ${f.rms} px  ` +
+    `z_src ${f.zsrc}</span>`,
+    plan ? `<b>plan ${f.plan}</b> <span style="color:${C_PLAN[plan.status]}">` +
+           `${plan.status}</span> ` +
+           (plan.r ? `${plan.nraw} raw steps @ ${plan.obsdt} ms &rarr; ` : '') +
+           `${plan.k.length} knots @ 0.2 s, issued ${f.page} s ago`
+         : '<b>plan</b> none in force',
+  ];
+  if (Math.abs(f.dtp) > 0.1) bits.push(
+      `<span class="warn">pose is ${(Math.abs(f.dtp)*1e3).toFixed(0)} ms from ` +
+      `this frame</span>`);
+  document.getElementById('read').innerHTML = bits.map(b => `<div>${b}</div>`).join('');
+}
+
+function tick(ts) {
+  if (playing) {
+    const dt = (ts - last) / 1000; last = ts;
+    const sp = parseFloat(document.getElementById('speed').value);
+    acc += dt * D.fps * sp;
+    while (acc >= 1) { acc -= 1; i = (i + 1) % D.frames.length; }
+    draw();
+  } else { last = ts; }
+  requestAnimationFrame(tick);
+}
+let acc = 0;
+
+// ------------------------------------------------------------------ controls
+let drag = null;
+scene.addEventListener('pointerdown', e => {
+  drag = { x: e.clientX, y: e.clientY, pan: e.button === 2 || e.shiftKey };
+  scene.setPointerCapture(e.pointerId); scene.classList.add('drag');
+});
+scene.addEventListener('pointermove', e => {
+  if (!drag) return;
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+  drag.x = e.clientX; drag.y = e.clientY;
+  if (drag.pan) {
+    const B = basis(), k = cam.dist / focal;
+    cam.target = add(cam.target, add(mul(B.R[0], -dx * k), mul(B.R[1], -dy * k)));
+  } else {
+    cam.az -= dx * 0.008;
+    cam.el = Math.max(0.05, Math.min(1.52, cam.el + dy * 0.006));
+  }
+  draw();
+});
+// A click that did not drag toggles the tag under the cursor: picking an id
+// out of a 140-entry list to find out which one you are looking at is the
+// wrong way round.
+scene.addEventListener('click', e => {
+  const r = scene.getBoundingClientRect();
+  const hit = tagAt(e.clientX - r.left, e.clientY - r.top);
+  if (hit === null) return;
+  marked.has(hit) ? marked.delete(hit) : marked.add(hit);
+  draw();
+});
+
+function tagAt(x, y) {
+  const B = basis();
+  let best = null, bestZ = Infinity;
+  for (const t of D.tags) {
+    const pts = t.q.map(p => project(p, B));
+    if (pts.some(p => !p)) continue;
+    let inside = false;
+    for (let i = 0, j = 3; i < 4; j = i++) {
+      const a = pts[i], b = pts[j];
+      if ((a[1] > y) !== (b[1] > y) &&
+          x < (b[0] - a[0]) * (y - a[1]) / (b[1] - a[1]) + a[0]) inside = !inside;
+    }
+    if (!inside) continue;
+    const z = pts.reduce((s, p) => s + p[2], 0) / 4;
+    if (z < bestZ) { bestZ = z; best = t.id; }
+  }
+  return best;
+}
+
+const stop = e => { drag = null; scene.classList.remove('drag'); };
+scene.addEventListener('pointerup', stop);
+scene.addEventListener('pointercancel', stop);
+scene.addEventListener('contextmenu', e => e.preventDefault());
+scene.addEventListener('wheel', e => {
+  e.preventDefault();
+  cam.dist = Math.max(0.3, Math.min(RADIUS * 12, cam.dist * Math.exp(e.deltaY * 0.001)));
+  draw();
+}, { passive: false });
+
+document.getElementById('play').onclick = () => {
+  playing = !playing;
+  document.getElementById('play').textContent = playing ? '❚❚ pause' : '▶ play';
+};
+seek.oninput = () => { i = +seek.value; draw(); };
+document.getElementById('reset').onclick = () => {
+  fitView();
+  cam = JSON.parse(JSON.stringify(HOME)); draw();
+};
+document.getElementById('top').onclick = () => {
+  cam.el = 1.5; cam.az = -Math.PI / 2; draw();
+};
+for (const id of ['cbIds', 'cbGrid', 'cbInset', 'insetZoom', 'cbRaw'])
+  document.getElementById(id).onchange = draw;
+document.getElementById('insetSize').onchange = e => {
+  insetScale = e.target.value; draw();
+};
+// A click moves it: which corner is in the way depends on where the vehicle
+// is, and that changes through the run.
+inset.addEventListener('click', () => { insetCorner = (insetCorner + 1) % 4; draw(); });
+
+const tagPick = document.getElementById('tagPick');
+for (const id of [...new Set(D.tags.map(t => t.id))].sort((a, b) => a - b)) {
+  const o = document.createElement('option');
+  o.value = String(id); o.textContent = String(id);
+  tagPick.appendChild(o);
+}
+tagPick.onchange = () => {
+  if (tagPick.value !== '') marked.add(parseInt(tagPick.value, 10));
+  tagPick.value = '';
+  draw();
+};
+document.getElementById('clearMarks').onclick = () => { marked.clear(); draw(); };
+addEventListener('keydown', e => {
+  if (e.key === 'r' || e.key === 'R') {
+    fitView(); cam = JSON.parse(JSON.stringify(HOME)); draw();
+  }
+  else if (e.key === ' ') { e.preventDefault(); document.getElementById('play').click(); }
+  else if (e.key === 'ArrowRight') { i = Math.min(D.frames.length-1, i+1); draw(); }
+  else if (e.key === 'ArrowLeft') { i = Math.max(0, i-1); draw(); }
+});
+addEventListener('resize', resize);
+// The images arrive after first paint and change the layout; a ResizeObserver
+// is the only thing that catches that without polling.
+if (window.ResizeObserver) new ResizeObserver(() => resize()).observe(scene.parentElement);
+addEventListener('load', resize);
+imgD.addEventListener('load', () => { if (!fitted) resize(); });
+
+// ------------------------------------------------------------------- header
+document.getElementById('hRun').textContent = D.run;
+document.getElementById('hMap').textContent =
+    `tag map ${D.tagmap.file} sha1 ${D.tagmap.sha1}` +
+    (D.tagmap.matches ? ' (matches the run)' : ' != THE RUN') +
+    `  ${D.tagmap.n} instances @ ${(D.tagmap.size_m*1000).toFixed(0)} mm  ` +
+    `anchor ${D.tagmap.anchor}`;
+document.getElementById('hFs').textContent =
+    `FS iters ${D.fstereo.iters} scale ${D.fstereo.scale} ${D.fstereo.ckpt} ` +
+    `grid ${D.fstereo.grid} fx_rect ${D.fstereo.fx_rect} px`;
+document.getElementById('hClock').textContent =
+    `clock offset ${D.clock.offset} s` +
+    (D.clock.spread_ms === null ? ' (not measured)'
+                                : ` (spread ${D.clock.spread_ms} ms)`);
+seek.max = D.frames.length - 1;
+// ?f=N opens on a frame, so a finding can be linked to rather than described.
+const Q = new URLSearchParams(location.search);
+const q = Q.get('f');
+if (q !== null) i = Math.max(0, Math.min(D.frames.length - 1, parseInt(q, 10) || 0));
+// ?mark=25,60 marks tags on open, so a link can point at "the object on 25".
+for (const v of (Q.get('mark') || '').split(',')) {
+  const id = parseInt(v, 10);
+  if (Number.isFinite(id)) marked.add(id);
+}
+if (D.has_depth === false) {
+  imgD.style.display = 'none';
+  depthNote.style.display = '';
+  depthNote.textContent =
+      'no depth in this run — ' + (D.depth_why || '') +
+      '. The scene, the vehicle and the policy\u2019s reference are unaffected: ' +
+      'they come from the pose log and the plans, and the timeline here is the ' +
+      'pose log at ~5 Hz.';
+}
+if (!D.frames.some(f => f.rgb)) {
+  imgC.style.display = 'none';
+  // The column stays — it says what is missing and it is where colour lands as
+  // soon as a run records it — but it gives most of its width back.
+  document.getElementById('colRgb').style.flex = '0.55 1 0';
+  document.getElementById('rgbNote').textContent =
+      'no colour frames in this run — ' + D.rgb_why +
+      '. Re-export with --rgb-dir once a run records them; the column joins on ' +
+      'the same clock as everything else.';
+} else {
+  document.getElementById('rgbNote').style.display = 'none';
+}
+resize();
+requestAnimationFrame(tick);
+</script>

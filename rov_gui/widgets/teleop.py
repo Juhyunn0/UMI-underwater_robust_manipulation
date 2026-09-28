@@ -290,9 +290,15 @@ class TeleopPanel(Panel):
             btn.setMinimumWidth(fm.horizontalAdvance(label) + 18)
             btn.setToolTip({
                 "MANUAL": "no self-levelling: an armed vehicle with no stick "
-                          "input sits still",
+                          "input sits still.\nFollower (START) runs here with "
+                          "all four axes as torque/force commands",
                 "STABILIZE": "the autopilot holds attitude — it WILL run the "
-                             "thrusters with no stick input",
+                             "thrusters with no stick input.\nFollower (START) "
+                             "runs here too: roll/pitch levelled by the "
+                             "autopilot, surge/sway/heave pass through, and "
+                             "the station's YAW axis is HELD at 0 (the "
+                             "autopilot owns heading) — press START 2 s after "
+                             "switching",
                 "ALT_HOLD": "the autopilot holds depth — it WILL run the "
                             "thrusters with no stick input",
             }[mode])

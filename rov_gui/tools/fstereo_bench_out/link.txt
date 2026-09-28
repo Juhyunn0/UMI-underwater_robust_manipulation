@@ -1,0 +1,11 @@
+# fstereo_bench.py link — 2026-09-02 10:40:32
+# frames: /home/bdml/Desktop/data collection/videos episodes ('61', '66', '12') frames (10, 90, 170) (left)
+# encoder: OpenCV libjpeg-turbo on the host — a PROXY for the C3's Myriad X JPEG encoder; ratios are [예측], decode ms are real
+
+9 real 640x400 mono frames; raw = 256 kB/frame
+  q |     kB  ratio | pair Mbit/s @15    @20 | decode ms | PSNR dB
+ 70 |   29.3   8.7x |             7.0    9.4 |      0.27 |    37.7
+ 80 |   36.8   7.0x |             8.8   11.8 |      0.31 |    39.3
+ 90 |   54.9   4.7x |            13.2   17.6 |      0.36 |    42.3
+ 95 |   79.6   3.2x |            19.1   25.5 |      0.46 |    45.7
+raw pair: 61.4 Mbit/s @15, 81.9 @20; one raw frame on a 90 Mbit/s link = 22.8 ms wire time

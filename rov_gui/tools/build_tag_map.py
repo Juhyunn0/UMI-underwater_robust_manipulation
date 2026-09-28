@@ -205,7 +205,7 @@ def find_instances(ts, min_obs, max_spread, dup_sep, max_inst=2):
     """Where do this id's observations actually pile up? -> [(idx, centre)].
 
     Mode-seeking, NOT "is the whole set tight": measured on the real pool run
-    (sessions/nav_runs/20260813_215640) a tag's observations sit within about
+    (data/20260813/0813_215640/nav_215640) a tag's observations sit within about
     13 mm of their median while a few land METRES away, so any gate on the
     full extent rejects every tag (it rejected 89/89). Instead take the
     densest neighbourhood, keep what is within ``max_spread`` of its median,
@@ -360,7 +360,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("run_dir", type=Path,
                     help="a nav_<hhmmss>/ folder inside a run folder "
-                         "(or sessions/nav_runs/<stamp>/ for pre-2026-08-14 runs)")
+                         "(or data/YYYYMMDD/MMDD_HHMMSS/nav_<hhmmss>/ for pre-2026-08-14 runs)")
     ap.add_argument("--anchor", type=Path, default=Path("config/tag_map.yaml"),
                     help="the surveyed map to grow from (stays frozen)")
     ap.add_argument("-o", "--out", type=Path,

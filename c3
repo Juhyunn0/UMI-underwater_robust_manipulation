@@ -5,6 +5,8 @@
 #     ./c3 collect --profile research_near
 #     ./c3 collect --profile research_near --dry-run
 #     ./c3 discover --probe
+#     ./c3 scene-html --run <RUN_DIR> --embed   # a run as ONE interactive page
+#     ./c3 scene      --run <RUN_DIR>           # the same scene as an mp4
 #     ./c3 gantry                   # FMC4030 gantry panel (jog, move, tag-map position)
 #     ./c3 gantry --connect-test    # is the controller reachable? (no motion)
 #     ./c3 test                     # the no-camera regression suite
@@ -134,6 +136,14 @@ tools:
   madrona          start/stop the RPi video service
   gui              topside control-station dashboard    (python -m rov_gui)
   plots            trajectory figures from a run date   (rov_gui/tools/plot_runs.py)
+  depth-live       LIVE two-pane depth viewer, ONE colour rule, scale knob
+  twocam           OAK-D-W vs C3 depth, same scene, ONE colour rule
+  umicap           live depth from the OAK-D-W through the land training chain
+  depth-compare    land training obs vs a recorded run, ONE colour rule
+  run-replay       watch a recorded RUN back (tags + vehicle + DP references)
+  replay-html      bake that same replay into one scrubbable HTML page
+  scene-html       a run as an interactive 3-D page + the depth it saw
+  scene            the same scene as an mp4
   gantry           FMC4030 gantry: panel (no args) or CLI (src/gantry_runner.py)
   test             run every no-camera test file
   env              print the interpreter and versions this wrapper resolved
@@ -174,6 +184,85 @@ case "$tool" in
     fi
     cd "$REPO"
     exec "$GUI_PY" -m rov_gui "$@"
+    ;;
+  run-replay)
+    # Watch a recorded run back: the tag floor, the vehicle, and the policy's
+    # reference at every update. Needs Qt and the SAME env as `gui`, because
+    # it drives the REAL TrajectoryView widget rather than re-drawing the run
+    # — that reuse is the whole point of the tool (see its docstring), and it
+    # is what makes the replay the same picture the operator flew with.
+    GUI_PY="${ROVGUI_PY:-${CONDA_PREFIX_ROOT:-$HOME/miniforge3}/envs/rovgui-pose/bin/python}"
+    [[ -x "$GUI_PY" ]] || GUI_PY="$PY"
+    cd "$REPO"
+    exec "$GUI_PY" -m rov_gui.tools.replay_run "$@"
+    ;;
+  replay-html)
+    # The same replay as `run-replay`, baked into ONE self-contained HTML
+    # page: no display, no Qt on the far end. Needs the SAME env here,
+    # because the export runs the real TrajectoryView offscreen to do every
+    # frame conversion — the page never converts a coordinate of its own.
+    GUI_PY="${ROVGUI_PY:-${CONDA_PREFIX_ROOT:-$HOME/miniforge3}/envs/rovgui-pose/bin/python}"
+    [[ -x "$GUI_PY" ]] || GUI_PY="$PY"
+    cd "$REPO"
+    QT_QPA_PLATFORM=offscreen exec "$GUI_PY" -m rov_gui.tools.replay_html "$@"
+    ;;
+  scene-html)
+    # A recorded run as an interactive page: the tag map in 3-D, the vehicle,
+    # the policy's reference, and the depth it saw. SAME env as `gui` on
+    # purpose — the interpreter a run is flown in is the one the operator has,
+    # and the export needs nothing the station does not already have (no PyAV,
+    # no zarr).
+    GUI_PY="${ROVGUI_PY:-${CONDA_PREFIX_ROOT:-$HOME/miniforge3}/envs/rovgui-pose/bin/python}"
+    [[ -x "$GUI_PY" ]] || GUI_PY="$PY"
+    cd "$REPO"
+    exec "$GUI_PY" -m rov_gui.tools.export_run_html "$@"
+    ;;
+  scene)
+    # The same scene as an mp4. Also the `gui` env; without PyAV there it
+    # writes mp4v instead of h264 and says so — run it in the fstereo env
+    # (C3_SCENE_PY) when the file is going somewhere that needs h264.
+    SCENE_PY="${C3_SCENE_PY:-${ROVGUI_PY:-${CONDA_PREFIX_ROOT:-$HOME/miniforge3}/envs/rovgui-pose/bin/python}}"
+    [[ -x "$SCENE_PY" ]] || SCENE_PY="$PY"
+    cd "$REPO"
+    exec "$SCENE_PY" -m rov_gui.tools.render_run_scene "$@"
+    ;;
+  depth-live)
+    # LIVE two-pane viewer. Same env as `twocam` (depthai 2.x + torch) and it
+    # additionally needs a display: it draws with PyQt5 because cv2.imshow
+    # aborts here (cv2 ships Qt platform plugins that lose to PyQt5's — the
+    # xcb crash rov_gui/qt.py documents).
+    GUI_PY="${ROVGUI_PY:-${CONDA_PREFIX_ROOT:-$HOME/miniforge3}/envs/rovgui-pose/bin/python}"
+    [[ -x "$GUI_PY" ]] || GUI_PY="$PY"
+    cd "$REPO"
+    exec "$GUI_PY" -m rov_gui.tools.depth_live_view "$@"
+    ;;
+  twocam)
+    # OAK-D-W and C3 on ONE colour rule, same scene, same FoundationStereo
+    # session. Needs BOTH depthai 2.x (c3_camera refuses 3.x by construction —
+    # 3.x opens a device just by constructing a Pipeline and can claim the
+    # camera out from under you) AND torch for FoundationStereo, which is
+    # exactly the `gui` env and NOT the conda base most shells land in.
+    GUI_PY="${ROVGUI_PY:-${CONDA_PREFIX_ROOT:-$HOME/miniforge3}/envs/rovgui-pose/bin/python}"
+    [[ -x "$GUI_PY" ]] || GUI_PY="$PY"
+    cd "$REPO"
+    exec "$GUI_PY" -m rov_gui.tools.depth_two_cameras "$@"
+    ;;
+  umicap)
+    # Live depth from the OAK-D-W through the LAND TRAINING chain, verbatim.
+    # Same env requirement as `twocam`.
+    GUI_PY="${ROVGUI_PY:-${CONDA_PREFIX_ROOT:-$HOME/miniforge3}/envs/rovgui-pose/bin/python}"
+    [[ -x "$GUI_PY" ]] || GUI_PY="$PY"
+    cd "$REPO"
+    exec "$GUI_PY" -m rov_gui.tools.depth_capture_umi "$@"
+    ;;
+  depth-compare)
+    # Offline renderer: land training obs vs a recorded run, one colour rule.
+    # No camera, but it reads the training zarr through dp_policy_offline's
+    # blosc bridge, which wants the repo root as cwd.
+    GUI_PY="${ROVGUI_PY:-${CONDA_PREFIX_ROOT:-$HOME/miniforge3}/envs/rovgui-pose/bin/python}"
+    [[ -x "$GUI_PY" ]] || GUI_PY="$PY"
+    cd "$REPO"
+    exec "$GUI_PY" -m rov_gui.tools.depth_compare "$@"
     ;;
   plots)
     # Offline replotting of the run folders. Unlike `gui` this needs NO Qt and

@@ -153,7 +153,7 @@ def test_shipped_settings_match_the_best_recorded_mission():
 
     This exists because I drifted away from it three times in one day on the
     strength of simulator sweeps, and each step made the vehicle worse. The
-    reference is an ARTIFACT, not an opinion: sessions/.../0817_110145 is the
+    reference is an ARTIFACT, not an opinion: data/20260817/0817_110145 is the
     only run on file that completed 5/5 laps with cross-track p95 6.6 cm and
     zero actuator saturation. Anything that changes these numbers should be
     changing them against a NEW run, not against a simulation — the simulator's
@@ -166,10 +166,10 @@ def test_shipped_settings_match_the_best_recorded_mission():
     import json
 
     from rov_gui.control.geometry import MpcConfig
+    _pin_model()
     from rov_gui.control import mpcc_acados as M
 
-    ref = (ROOT / "sessions/low_level_controller_data/20260817/0817_110145"
-           / "mpc_110145.meta.json")
+    ref = (ROOT / "data/20260817/0817_110145" / "mpc_110145.meta.json")
     if not ref.exists():
         print("  SKIP (best-run artifact not on disk)")
         return
@@ -193,9 +193,24 @@ def test_shipped_settings_match_the_best_recorded_mission():
         w["contour"], w["lag"], w["progress"])
 
 
+
+def _pin_model():
+    """Pin the shared ``rov_model`` module to the CONFIG's model before
+    ``mpcc_acados`` is imported: that module does a bare ``from dobmpc import
+    params`` whose ``import rov_model`` reads $ROV_MODEL once, so an isolated
+    run flew the env default ("heavy") while the station (HwDobMpc built
+    first) and the full suite fly hw_mpc.yaml's heavy_gripper — and a later
+    heavy_gripper import in the same process kept heavy physics under the
+    wrong label (test_path_cost heave trim, 2026-09-26)."""
+    from rov_gui.control.geometry import MpcConfig
+    from rov_gui.control.mpc_bridge import import_dobmpc
+    import_dobmpc(MpcConfig.load(str(ROOT / "config" / "hw_mpc.yaml")).rov_model)
+
+
 # --------------------------------------------------------------- closed loop
 def _acados_or_skip():
     try:
+        _pin_model()
         from rov_gui.control.mpcc_acados import AcadosMPCC
         return AcadosMPCC
     except Exception as e:                                    # noqa: BLE001
@@ -205,6 +220,7 @@ def _acados_or_skip():
 
 def _plant():
     import casadi as ca
+    _pin_model()
     from dobmpc.mpc import _f_casadi
 
     xs, us, ws = ca.SX.sym("x", 12), ca.SX.sym("u", 6), ca.SX.sym("w", 6)
@@ -337,7 +353,7 @@ def test_the_commanded_speed_actually_reaches_the_reference():
 
     Measured on hardware 2026-08-17 before this was fixed: 0.2 m/s commanded,
     1.09 m of path covered in 42 s = 0.026 m/s
-    (sessions/low_level_controller_data/20260817/0817_103431/mpc_103624.csv).
+    (data/20260817/0817_103431/mpc_103624.csv).
     The cursor advanced its setpoint by PROJECTION only, so the reference was a
     carrot pinned lead_m ahead of the hull and the speed number never entered
     the loop at all."""
@@ -624,6 +640,7 @@ def test_the_window_spline_reproduces_a_circle_at_every_offered_radius():
     the error against the true arc, over the panel's whole radius range.
     """
     try:
+        _pin_model()
         from rov_gui.control import mpcc_acados as M
         mp = M.AcadosMPCC(build=False)
     except Exception as e:                                   # noqa: BLE001

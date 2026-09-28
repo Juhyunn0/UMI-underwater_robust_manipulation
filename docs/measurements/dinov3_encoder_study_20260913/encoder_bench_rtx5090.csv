@@ -1,0 +1,63 @@
+model,mode,images_per_step,precision,ok,peak_mem_gb,ms_per_step,note
+vit_base_patch16_clip_224,model_info,0,fp32,True,0.343,,params=85.8M; weights resident 0.34 GB; current project baseline
+vit_base_patch16_clip_224,train_full_ft,128,fp32,True,16.741,195.35,res=224 ckpt=0; out=1x197x768; n_timed=10
+vit_base_patch16_clip_224,train_full_ft,128,bf16_autocast,True,10.313,105.14,res=224 ckpt=0; out=1x197x768; n_timed=10
+vit_base_patch16_clip_224,train_full_ft,32,fp32,True,4.988,54.01,res=224 ckpt=0; out=1x197x768; n_timed=10
+vit_base_patch16_clip_224,train_full_ft,32,bf16_autocast,True,3.531,29.87,res=224 ckpt=0; out=1x197x768; n_timed=10
+vit_base_patch16_clip_224,train_frozen_fwd,128,bf16_autocast,True,1.242,30.72,res=224; no_grad forward; out=1x197x768; n_timed=10
+vit_base_patch16_clip_224,train_frozen_fwd,128,fp32,True,1.371,56,extra; res=224; no_grad forward; out=1x197x768; n_timed=10
+vit_base_patch16_clip_224,inference,2,bf16_autocast,True,0.556,1.62,res=224; out=1x197x768; n_timed=10
+vit_base_patch16_clip_224,inference,2,fp32,True,0.382,1.91,res=224; out=1x197x768; n_timed=10
+vit_base_patch16_clip_224,inference,1,bf16_autocast,True,0.554,1.42,res=224; out=1x197x768; n_timed=10
+vit_base_patch16_clip_224,inference,1,fp32,True,0.37,1.45,res=224; out=1x197x768; n_timed=10
+vit_base_patch16_clip_224,inference,2,bf16_params,True,0.211,1.16,"extra; res=224; model.to(bf16), no autocast; out=1x197x768; n_timed=10"
+vit_base_patch16_clip_224,inference,1,bf16_params,True,0.206,1.05,extra; res=224; model.to(bf16); out=1x197x768; n_timed=10
+vit_large_patch16_dinov3,model_info,0,fp32,True,1.213,,"params=303.1M; weights resident 1.21 GB; 24 layers, 1024-d, 16 heads, RoPE, 4 registers"
+vit_large_patch16_dinov3,train_full_ft,128,fp32,False,32.431,,res=224 ckpt=0; OOM: CUDA out of memory. Tried to allocate 402.00 MiB. GPU 0 has a total capacity of 31.37 GiB of which 316.56 MiB is free (peak_mem = reached before OOM)
+vit_large_patch16_dinov3,train_full_ft,128,bf16_autocast,False,29.391,,res=224 ckpt=0; OOM: CUDA out of memory. Tried to allocate 98.00 MiB. GPU 0 has a total capacity of 31.37 GiB of which 52.56 MiB is free (peak_mem = reached before OOM)
+vit_large_patch16_dinov3,train_full_ft,32,fp32,True,16.707,193.75,res=224 ckpt=0; out=1x201x1024; n_timed=10
+vit_large_patch16_dinov3,train_full_ft,32,bf16_autocast,True,11.803,115.11,res=224 ckpt=0; out=1x201x1024; n_timed=10
+vit_large_patch16_dinov3,train_full_ft,128,fp32,True,8.922,959.38,res=224 ckpt=1 (model.set_grad_checkpointing(True)); out=1x201x1024; n_timed=10
+vit_large_patch16_dinov3,train_full_ft,128,bf16_autocast,True,7.962,578.93,res=224 ckpt=1; out=1x201x1024; n_timed=10
+vit_large_patch16_dinov3,train_frozen_fwd,128,bf16_autocast,True,2.648,140.96,res=224; no_grad forward; out=1x201x1024; n_timed=10
+vit_large_patch16_dinov3,train_frozen_fwd,128,fp32,True,2.469,230.09,extra; res=224; no_grad forward; out=1x201x1024; n_timed=10
+vit_large_patch16_dinov3,inference,2,bf16_autocast,True,1.846,6.39,res=224; out=1x201x1024; n_timed=10
+vit_large_patch16_dinov3,inference,2,fp32,True,1.253,5.9,res=224; out=1x201x1024; n_timed=10
+vit_large_patch16_dinov3,inference,1,bf16_autocast,True,1.844,5.14,res=224; out=1x201x1024; n_timed=10
+vit_large_patch16_dinov3,inference,1,fp32,True,1.242,4.75,res=224; out=1x201x1024; n_timed=10
+vit_large_patch16_dinov3,inference,2,bf16_autocast,True,1.848,7.16,res=256; out=1x261x1024; n_timed=10
+vit_large_patch16_dinov3,inference,2,fp32,True,1.259,7.01,res=256; out=1x261x1024; n_timed=10
+vit_large_patch16_dinov3,inference,1,bf16_autocast,True,1.847,5.53,res=256; out=1x261x1024; n_timed=10
+vit_large_patch16_dinov3,inference,1,fp32,True,1.246,5.96,res=256; out=1x261x1024; n_timed=10
+vit_large_patch16_dinov3,inference,2,bf16_params,True,0.638,4.9,extra; res=224; model.to(bf16); out=1x201x1024; n_timed=10
+vit_large_patch16_dinov3,inference,1,bf16_params,True,0.632,3.83,extra; res=224; model.to(bf16); out=1x201x1024; n_timed=10
+vit_large_patch16_dinov3,inference,2,bf16_params,True,0.642,5.68,extra; res=256; model.to(bf16); out=1x261x1024; n_timed=10
+vit_large_patch16_dinov3,inference,1,bf16_params,True,0.634,4.05,extra; res=256; model.to(bf16); out=1x261x1024; n_timed=10
+vit_huge_plus_patch16_dinov3,model_info,0,fp32,True,3.463,,"params=840.5M; weights resident 3.46 GB; 32 layers, 1280-d, 20 heads, SwiGLU, RoPE, 4 registers"
+vit_huge_plus_patch16_dinov3,train_full_ft,128,fp32,False,32.449,,res=224 ckpt=0; OOM: CUDA out of memory. Tried to allocate 504.00 MiB. GPU 0 has a total capacity of 31.37 GiB of which 410.56 MiB is free (peak_mem = reached before OOM)
+vit_huge_plus_patch16_dinov3,train_full_ft,128,bf16_autocast,False,30.457,,res=224 ckpt=0; OOM: CUDA out of memory. Tried to allocate 124.00 MiB. GPU 0 has a total capacity of 31.37 GiB of which 110.56 MiB is free (peak_mem = reached before OOM)
+vit_huge_plus_patch16_dinov3,train_full_ft,32,fp32,False,32.82,,res=224 ckpt=0; OOM: CUDA out of memory. Tried to allocate 126.00 MiB. GPU 0 has a total capacity of 31.37 GiB of which 54.56 MiB is free (peak_mem = reached before OOM)
+vit_huge_plus_patch16_dinov3,train_full_ft,32,bf16_autocast,True,29.177,291.63,res=224 ckpt=0; out=1x201x1280; n_timed=10; only ~2 GB headroom left on the 31.37 GiB card
+vit_huge_plus_patch16_dinov3,train_full_ft,128,fp32,True,19.293,2314.75,res=224 ckpt=1 (model.set_grad_checkpointing(True)); out=1x201x1280; n_timed=10
+vit_huge_plus_patch16_dinov3,train_full_ft,128,bf16_autocast,True,17.615,1358.68,res=224 ckpt=1; out=1x201x1280; n_timed=10
+vit_huge_plus_patch16_dinov3,train_frozen_fwd,128,bf16_autocast,True,6.68,328.37,res=224; no_grad forward; out=1x201x1280; n_timed=10
+vit_huge_plus_patch16_dinov3,train_frozen_fwd,128,fp32,True,6.064,558.04,extra; res=224; no_grad forward; out=1x201x1280; n_timed=10
+vit_huge_plus_patch16_dinov3,inference,2,bf16_autocast,True,5.172,11.9,res=224; out=1x201x1280; n_timed=10
+vit_huge_plus_patch16_dinov3,inference,2,fp32,True,3.522,12.81,res=224; out=1x201x1280; n_timed=10
+vit_huge_plus_patch16_dinov3,inference,1,bf16_autocast,True,5.171,10.97,res=224; out=1x201x1280; n_timed=10
+vit_huge_plus_patch16_dinov3,inference,1,fp32,True,3.502,9.66,res=224; out=1x201x1280; n_timed=10
+vit_huge_plus_patch16_dinov3,inference,2,bf16_autocast,True,5.175,13.86,res=256; out=1x261x1280; n_timed=10
+vit_huge_plus_patch16_dinov3,inference,2,fp32,True,3.535,18.11,res=256; out=1x261x1280; n_timed=10
+vit_huge_plus_patch16_dinov3,inference,1,bf16_autocast,True,5.175,11.37,res=256; out=1x261x1280; n_timed=10
+vit_huge_plus_patch16_dinov3,inference,1,fp32,True,3.508,11.23,res=256; out=1x261x1280; n_timed=10
+vit_huge_plus_patch16_dinov3,inference,2,bf16_params,True,1.765,8.43,extra; res=224; model.to(bf16); out=1x201x1280; n_timed=10
+vit_huge_plus_patch16_dinov3,inference,1,bf16_params,True,1.755,6.42,extra; res=224; model.to(bf16); out=1x201x1280; n_timed=10
+vit_huge_plus_patch16_dinov3,inference,2,bf16_params,True,1.771,10.29,extra; res=256; model.to(bf16); out=1x261x1280; n_timed=10
+vit_huge_plus_patch16_dinov3,inference,1,bf16_params,True,1.757,8.02,extra; res=256; model.to(bf16); out=1x261x1280; n_timed=10
+vit_7b_patch16_dinov3,model_info,0,bf16_params,True,13.432,,"params=6716.0M; weights resident 13.43 GB in bf16 (fp32 never instantiated: would be ~27 GB); 40 layers, 4096-d, 32 heads, SwiGLU mlp_ratio 2, RoPE, 4 registers"
+vit_7b_patch16_dinov3,train_full_ft,32,bf16_params,False,31.523,,res=224 ckpt=1; pure bf16 params+grads+AdamW states (no fp32 master); fp32 skipped (27 GB weights alone); OOM: CUDA out of memory. Tried to allocate 64.00 MiB. GPU 0 has a total capacity of 31.37 GiB of which 12.56 MiB is free (peak_mem = reached before OOM)
+vit_7b_patch16_dinov3,train_frozen_fwd,128,bf16_params,True,15.811,1747.11,res=224; no_grad forward; out=1x201x4096; n_timed=10
+vit_7b_patch16_dinov3,inference,2,bf16_params,True,13.489,43.36,res=224; out=1x201x4096; n_timed=10; fp32 inference not run (27 GB weights would not leave room)
+vit_7b_patch16_dinov3,inference,1,bf16_params,True,13.472,25.18,res=224; out=1x201x4096; n_timed=10
+vit_7b_patch16_dinov3,inference,2,bf16_params,True,13.5,54.84,res=256; out=1x261x4096; n_timed=10
+vit_7b_patch16_dinov3,inference,1,bf16_params,True,13.478,31.02,res=256; out=1x261x4096; n_timed=10

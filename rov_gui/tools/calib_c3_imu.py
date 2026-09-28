@@ -179,7 +179,7 @@ def static_mask(a: np.ndarray, w: np.ndarray, t: np.ndarray | None = None,
     threshold can see: measured on the first real tumble, |a| reached
     27.8 m/s^2 (2.8 g) while |gyro| stayed under the old 0.5 rad/s gate, and
     the fit dutifully absorbed the handling as a 1.8 m/s^2 accelerometer bias
-    [측정: sessions/low_level_controller_data/20260817/0817_094728/
+    [측정: data/20260817/0817_094728/
     c3_depth_20260817_094733_c3_imu.jsonl].
 
     So the real test is STEADINESS: over a short window the accelerometer

@@ -38,6 +38,7 @@ fact travels with the output as `dimensions_are_placeholders`.
 
 from __future__ import annotations
 
+import time
 import argparse
 import csv
 import json
@@ -165,7 +166,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default="configs/pipeline.yaml")
-    ap.add_argument("--session", type=Path, default=REPO / "sessions/session_0001")
+    ap.add_argument("--session", type=Path, default=REPO / "data" / time.strftime("%Y%m%d") / "session_0001")
     ap.add_argument("--out", type=Path, default=None, help="default: <session>/gripper_width.json")
     ap.add_argument("--ground-truth", type=Path, default=None,
                     help="synthetic ground_truth.json, for a reported comparison only")

@@ -29,6 +29,10 @@ how long ago it arrived. The pilot has to be unable to mistake it for live.
 
 from __future__ import annotations
 
+import math
+
+import numpy as np
+
 from .. import theme
 from ..bus import FrameMailbox, Freshness
 from ..qt import (QColor, QFont, QImage, QPainter, QRectF, Qt, QtCore, QtGui,
@@ -64,6 +68,11 @@ class VideoCanvas(QtWidgets.QLabel):
         # AprilTag detections on THIS feed (state.TagOverlay), same optional-
         # overlay contract as `pose`: None costs nothing in paintEvent.
         self._tags = None
+        # The learned-depth worker's own account of itself (state.FStereoState).
+        # None until --fstereo publishes one, and then it is drawn on EVERY
+        # frame — not only in the NO-SIGNAL branch, which is where every other
+        # note on this canvas goes to die once a picture has been shown.
+        self._fs = None
         self._image: QImage | None = None
         self._stat: VideoStat | None = None
         # The raw data behind the picture, when the producer sends it (the
@@ -168,6 +177,8 @@ class VideoCanvas(QtWidgets.QLabel):
             self._paint_probe(p, rect)
         if self.pose:
             self._paint_pose(p, rect)
+        if self._fs is not None:
+            self._paint_fs(p, rect)
         if self._tags is not None:
             self._paint_tags(p, rect)
         # Border last, in the state colour, so the panel edge is readable from
@@ -288,7 +299,13 @@ class VideoCanvas(QtWidgets.QLabel):
         fm = p.fontMetrics()
         for i, quad in enumerate(t.quads):
             mapped = bool(t.mapped[i]) if i < len(t.mapped) else False
-            col = _c(theme.OK if (mapped and t.localizes) else theme.ACCENT,
+            # Green = these detections ARE the state; amber = a calibrated
+            # fallback feed (its fix stands in when the primary has none);
+            # blue = drawn only. Unmapped ids fade whichever colour.
+            role = getattr(t, "role", "primary" if t.localizes else "overlay")
+            col = _c(theme.OK if (mapped and t.localizes)
+                     else theme.WARN if (mapped and role == "fallback")
+                     else theme.ACCENT,
                      255 if mapped else 120)
             path = QtGui.QPainterPath()
             path.moveTo(r.x() + quad[0][0] * sx, r.y() + quad[0][1] * sy)
@@ -544,22 +561,76 @@ class VideoCanvas(QtWidgets.QLabel):
     def _paint_legend(self, p: QPainter, rect) -> None:
         """Colourbar for the depth view.
 
-        Depth is colourised over a FIXED millimetre range upstream
-        (``c3_camera.viz.colorize_depth``), not auto-scaled per frame, so a
-        colour means the same distance in every frame — which is the only way
-        this legend can be honest.
-        """
-        from ..imaging import DEPTH_MAX_MM, DEPTH_MIN_MM
+        Depth is normally colourised over a FIXED millimetre range upstream
+        (``c3_camera.viz.colorize_depth``), so a colour means the same distance
+        in every frame. A producer that AUTO-ranges instead (FStereoWorker
+        under ``--fstereo-palette adaptive``: a grasp scene occupies the bottom
+        fifth of 0.3-6 m and goes uniformly dark) sends the range it actually
+        used on the stat, and this reads it — bar labels, ticks and the cursor
+        marker all move with it. Both halves have to come from one place: a
+        fixed legend over an auto-ranged picture states distances the picture
+        does not mean, which is worse than either scale on its own.
 
-        lo, hi = self.legend
+        Since 2026-09-06 the FoundationStereo panel's default is neither: it is
+        the SHARED rule (``rov_gui/depth_colour.py`` — warm = NEAR, fixed
+        0.20-3.00 m, inverse spacing), the same one that paints the land
+        episode videos. It arrives as ``stat.depth_rule`` so this bar can be
+        drawn by the very formula the picture was.
+        """
+        from ..imaging import (DEPTH_MAX_MM, DEPTH_MIN_MM, UMI_Z_FAR_MM,
+                               UMI_Z_NEAR_MM, legend_labels)
+
+        st = self._stat
+        lo_mm = getattr(st, "depth_lo_mm", None) if st else None
+        hi_mm = getattr(st, "depth_hi_mm", None) if st else None
+        auto = (lo_mm is not None and hi_mm is not None and hi_mm > lo_mm)
+        if not auto:
+            lo_mm, hi_mm = DEPTH_MIN_MM, DEPTH_MAX_MM
+        lo, hi = legend_labels(lo_mm, hi_mm) if auto else self.legend
+        knots = getattr(st, "depth_knots_mm", None) if st else None
+        # The SHARED rule (rov_gui/depth_colour.py) announces itself on the
+        # stat as "umi:<domain>:<cmap>", and the bar has to follow it in three
+        # places at once or it lies: the ramp is warm = NEAR (so it is TURBO
+        # read BACKWARDS from the device panel's), the ticks are placed by the
+        # rule's own formula rather than linearly in millimetres, and the
+        # endpoints are fixed rather than this frame's percentiles.
+        rule = (getattr(st, "depth_rule", "") or "") if st else ""
+        umi = rule.startswith("umi")
+        domain = (rule.split(":") + ["obs"])[1] if umi else None
+        cmap = (rule.split(":") + ["obs", "turbo"])[2] if umi else ""
+        if umi and not auto:
+            # A producer that named the rule but sent no endpoints. Take the
+            # RULE's, never the device panel's 0.3-6 m default: a bar labelled
+            # 0.3-6 m over a 0.2-3 m picture is precisely the lie this legend
+            # exists to prevent, and it would be a quiet one.
+            lo_mm, hi_mm = UMI_Z_NEAR_MM, UMI_Z_FAR_MM
+            lo, hi = legend_labels(lo_mm, hi_mm)
         w = 16
         h = min(220, max(90, int(rect.height() * 0.5)))
         x = rect.width() - w - 12
         y = int(rect.height() / 2 - h / 2)
         grad = QtGui.QLinearGradient(0, y + h, 0, y)
-        for pos, col in ((0.0, "#30123b"), (0.25, "#4686fb"), (0.5, "#1ae4b6"),
-                         (0.75, "#fabc39"), (1.0, "#7a0403")):
-            grad.setColorAt(pos, QColor(col))          # matches cv2 TURBO
+        if umi:
+            # TURBO with NEAR at the BOTTOM: the same ramp as the picture, which
+            # is cv2 TURBO indexed by a palette position that is 1 at z_near. So
+            # these are the device panel's stops in reverse — not a typo; the
+            # opposite polarity is the point of the rule.
+            stops = ((0.0, "#7a0403"), (0.25, "#fabc39"), (0.5, "#1ae4b6"),
+                     (0.75, "#4686fb"), (1.0, "#30123b"))
+            if cmap == "jet":
+                stops = ((0.0, "#7f0000"), (0.125, "#ff0000"), (0.375, "#ffff00"),
+                         (0.625, "#00ffff"), (0.875, "#0000ff"), (1.0, "#00007f"))
+        elif knots:
+            # WARM = NEAR (imaging.depth_to_bgr_warm_near, cv2 JET), so the
+            # bar runs dark red at the bottom (near) to dark blue at the top.
+            # Stops are JET read backwards for that reason, not a typo.
+            stops = ((0.0, "#7f0000"), (0.125, "#ff0000"), (0.375, "#ffff00"),
+                     (0.625, "#00ffff"), (0.875, "#0000ff"), (1.0, "#00007f"))
+        else:
+            stops = ((0.0, "#30123b"), (0.25, "#4686fb"), (0.5, "#1ae4b6"),
+                     (0.75, "#fabc39"), (1.0, "#7a0403"))   # cv2 TURBO
+        for pos, col in stops:
+            grad.setColorAt(pos, QColor(col))
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QtGui.QColor(0, 0, 0, 120))         # keep it readable on any scene
         p.drawRoundedRect(QRectF(x - 4, y - 18, w + 8, h + 36), 3, 3)
@@ -572,28 +643,65 @@ class VideoCanvas(QtWidgets.QLabel):
         p.drawText(QRectF(x - 60, y + h + 3, w + 60, 12),
                    int(Qt.AlignmentFlag.AlignRight), lo)
 
-        # Intermediate ticks at whole metres, placed by the SAME linear
-        # mapping colorize uses (imaging.depth_to_bgr) — the legend and the
-        # picture must share one formula or the legend lies.
-        span = DEPTH_MAX_MM - DEPTH_MIN_MM
+        # Ticks placed by the SAME formula the picture was colourised with
+        # (imaging.depth_fraction) — the legend and the picture must share one
+        # or the legend lies. Under equalisation that formula is the quantile
+        # interpolation, not a linear ramp, so ticks BUNCH where the scene has
+        # few pixels and spread where it has many. That is the honest drawing
+        # of what the palette did.
+        from ..imaging import depth_fraction
+
+        span = max(1.0, float(hi_mm - lo_mm))
+        near_at_bottom = bool(knots) or umi   # warm = near, drawn low on the bar
 
         def bar_y(mm: float) -> float:
-            f = (mm - DEPTH_MIN_MM) / span
-            return y + h - f * h
+            t = float(depth_fraction(np.float32(mm), knots, lo_mm, hi_mm,
+                                     domain=domain))
+            f = (1.0 - t) if near_at_bottom else ((mm - lo_mm) / span)
+            return y + h - min(1.0, max(0.0, f)) * h
 
+        # Whole metres while the span is metres-wide; every 10 cm once it is
+        # not (an auto-ranged grasp scene spans ~0.4-1.5 m, and "1" alone on
+        # the bar leaves the reader interpolating the part they care about).
         p.setPen(_c(theme.TEXT_DIM))
-        for metres in (1.0, 2.0, 4.0):
-            ty = bar_y(metres * 1000.0)
+        if umi:
+            # The SAME rungs depth_compare's colour bar draws, minus the two
+            # endpoints (already labelled above and below the bar). Fixed rather
+            # than derived, so the station's bar and a land video's bar carry
+            # the same ticks and the eye can match them without arithmetic.
+            fmt = "{:.2f}"
+            ticks = [t for t in (300.0, 500.0, 750.0, 1000.0, 1500.0, 2000.0)
+                     if lo_mm < t < hi_mm]
+        else:
+            step = 1000.0 if span >= 2500.0 else (500.0 if span >= 1200.0 else 100.0)
+            fmt = "{:.0f}" if step >= 1000.0 else "{:.1f}"
+            first = math.ceil((lo_mm + 0.15 * span) / step) * step
+            last = lo_mm + 0.85 * span
+            ticks, mm = [], first
+            while mm <= last and len(ticks) < 8:
+                ticks.append(mm)
+                mm += step
+        # Under the inverse (obs) spacing the far ticks bunch — 1.5 m and 2.0 m
+        # land ~5 px apart on a 220 px bar — so a label is drawn only where it
+        # has room. The RULE line is always drawn: a tick with no room to be
+        # labelled is still true, an overprinted pair of numbers is not.
+        last_label_y = None
+        for tick_mm in ticks:
+            ty = bar_y(tick_mm)
             p.drawLine(int(x - 3), int(ty), int(x + w), int(ty))
+            if last_label_y is not None and abs(ty - last_label_y) < 11:
+                continue
+            last_label_y = ty
             p.drawText(QRectF(x - 40, ty - 6, 34, 12),
-                       int(Qt.AlignmentFlag.AlignRight), f"{metres:.0f}")
+                       int(Qt.AlignmentFlag.AlignRight),
+                       fmt.format(tick_mm / 1000.0))
 
         # And the cursor's own depth as a marker on the bar, when it has one:
         # the reading and where that reading sits in the colour scale, at once.
         if self._hover is not None:
             mm = self.depth_at(self._hover)
             if mm is not None:
-                ty = bar_y(min(max(mm, DEPTH_MIN_MM), DEPTH_MAX_MM))
+                ty = bar_y(min(max(mm, lo_mm), hi_mm))
                 p.setPen(QtGui.QPen(_c(theme.TEXT), 2))
                 p.drawLine(int(x - 4), int(ty), int(x + w + 4), int(ty))
 
@@ -616,6 +724,66 @@ class VideoCanvas(QtWidgets.QLabel):
         it — so `window._check_depth_scale` has to reach in and compare the two
         (see the "depth-vs-TAG" line on the trajectory readout)."""
         return self._aux
+
+    def depth_grid(self) -> str:
+        """Which camera's grid :meth:`depth_map` is on ("color"/"rect_left").
+
+        Beside ``depth_map`` because the two must be read together: the map
+        alone does not say which intrinsics back-project it, and a consumer
+        that guesses gets a plausible wrong answer rather than an error.
+        Defaults to "color", which is what every producer sent before
+        --fstereo-view existed.
+        """
+        return getattr(self._stat, "depth_grid", "color") or "color"
+
+    def set_fs_state(self, st) -> None:
+        self._fs = st
+
+    def _paint_fs(self, p: QPainter, rect) -> None:
+        """One line saying which depth this is, and why if it is not learned.
+
+        It sits ON the image on purpose. ``_note`` is only rendered in the
+        NO-SIGNAL branch, so once a single frame has been drawn every
+        explanation the learned-depth worker produces becomes invisible — a
+        feature that ran once and then stopped would show as a frozen panel
+        with a STALE hatch and no reason anywhere on screen. That is
+        indistinguishable from "never started", which is the exact confusion
+        this whole feature already caused once.
+        """
+        st = self._fs
+        text = st.chip
+        # State colour, same vocabulary as everything else on this station:
+        # green = learned depth is what you are looking at, amber = asked for
+        # but not delivering, red = faulted, grey = deliberately off.
+        if st.error:
+            col = theme.FAIL
+        elif st.live:
+            col = theme.OK
+        elif st.enabled:
+            col = theme.WARN
+        else:
+            col = theme.TEXT_DIM
+        p.setFont(self._hud_font)
+        fm = QtGui.QFontMetrics(self._hud_font)
+        w = fm.horizontalAdvance(text) + 12
+        h = fm.height() + 4
+        # Under the title bar, left — clear of the REC/FS buttons on the right
+        # and of the pose chip, which only ever appears on the colour feed.
+        y = fm.height() + 8
+        p.fillRect(QRectF(6, y, w, h), _c("#000000", 150))
+        p.setPen(_c(col))
+        p.drawText(QRectF(6 + 6, y, w, h),
+                   int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                   text)
+
+    def clear_depth_map(self) -> None:
+        """Forget the millimetres behind the picture.
+
+        For a feed that STOPPED: the frame can stay up (the watchdog will mark
+        it stale) but the raw map must not, or the cursor keeps reporting
+        distances from a frame that no longer describes the world.
+        """
+        self._aux = None
 
     def depth_at(self, pos) -> float | None:
         """Millimetres under a canvas point, or None.

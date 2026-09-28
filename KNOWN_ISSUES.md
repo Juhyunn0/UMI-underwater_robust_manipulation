@@ -6,13 +6,595 @@
 
 ## ⚠️ 운용 안전
 
+### 학습 런이 GPU를 쓰는 동안 비행하면 정책 플랜이 **전부 late**로 버려진다 (2026-09-14)
+- **증상**: `data/20260914/0914_151901/` 세 engagement에서 `plans.jsonl` 329건 **전부 `late`**(intake 시 obs age 0.84 s >
+  `policy.obs_max_age_s` 0.60 s), `mpc_152047.meta.json policy.run`: received 75 / installed 0. 추론 `infer_ms` p50 **629 ms**
+  (p95 707, max 952) — 09-13 실기 262 ms의 2.4배. reference는 hold 지점에서 한 번도 안 움직였고(`rz` 0, `plan_id` NaN)
+  DP는 기체를 몰지 않았다.
+- **원인**: `tools/run_ablations.sh D_dinov3b` 학습(12:00:50 시작)이 같은 RTX 5090을 99 % / 14.7 GB 점유한 상태에서
+  스테이션 추론(rovgui-pose)이 돌았다 [측정: `nvidia-smi` 15:30, `ps` etimes]. 스테이션은 이를 감지·경고하지 않는다.
+- **대책(미구현)**: 풀 세션 전에 학습을 멈추거나, 스테이션 기동 시 다른 CUDA 프로세스가 있으면 WARN(`policy: READY` 줄에
+  infer_ms 첫 측정치가 이미 있으니 late 3연속이면 원인 후보로 GPU 공유를 말하게 하는 것이 최소 수정).
+
+### [임시 — 2026-09-13에 삭제] 정책 플랜의 z가 `policy.z_hold_above_floor_m: 0.20`으로 고정돼 있다 (2026-09-12)
+- **무엇**: `config/hw_mpc.yaml policy.z_hold_above_floor_m: 0.20`이 켜져 있는 동안 정책 플랜의 **모든 knot z가 태그 바닥 위 0.20 m로 고정**되고 정책 자체의 dz는 버려진다. 조종자 요청("오늘만 잠시, 내일 삭제") — yaw 응답 테스트에서 핸드헬드 시연의 하강(dz)이 참조를 바닥으로 끌지 않게.
+- **어디**: `rov_gui/control/workers.py` 정책 intake(`compose_plan` 직후, `msg.p_ned[2, :] = z_ned`), `rov_gui/control/geometry.py` 기본값·검증(0 < h ≤ 1.5 m 또는 null), `hw_mpc.yaml`.
+- **경계**: arm마다 로그 `ctrl: Z HOLD …`, 플랜 레코드마다 `z_hold_applied`, meta `policy.config.z_hold_above_floor_m`. **이 키가 켜진 런과 꺼진 런의 z 지표를 합산하지 말 것.**
+- **되돌리기**: `hw_mpc.yaml`에서 `z_hold_above_floor_m: null`(또는 줄 삭제) → 이 항목 삭제. 코드는 두어도 무해(null이면 아무것도 안 함)하나 테스트 `test_policy_z_hold_pins_every_knot_and_says_so`와 함께 지워도 된다.
+- **닫힌 루프 주의**: 관측 모드에선 그림만 바뀌지만, `--policy-observe` 없이 날리면 NMPC가 이 z를 실제로 추종한다. 높이의 프레임은 "태그 바닥 위, 양수 = 위"이고 datum 변환은 p0[2]만큼의 오프셋(테스트로 고정: p0 z −0.205 → datum +0.005).
+
+
+### 단일태그 fix가 폴백 fix 직후(Δt 0.8 ms)에 소비되면 속도 추정이 47.9 m/s로 튀어 상태가 2 m 점프하고 렌치가 ±30 N 포화한다 (2026-09-14)
+- **증상**: `data/20260914/0914_202238/mpc_202610.csv` rows 891–929 (t 44.6–46.5 s, 20:26:55): nav 소스가 second(RGB 폴백)→main(C3)으로
+  바뀌는 순간 상태 px 0.214→1.369 m 점프, 2.36 m/s coast → uX/uY/uN ±30/±30/±10 포화 29틱, solver status 4 1회, pwm 1351–1695 µs,
+  batt_a 4.5–5.0 A, 선체가 물리적으로 걷어차임(yaw +8/−16°, sway 0.27 m) 뒤 ~8 s 링잉 [측정]. 소형 사례: `mpc_202951.csv` t 53.69 s
+  (1-tag fix Δt 2.4 ms → 5.3 m/s, 0.24 m 점프), `0914_181425/mpc_181425.csv` t 18.28–18.43 s (4틱 ±30 N).
+  기록된 fix 자체(`nav_202611/fixes.csv` rows 1286–1288, x_ned)는 정상이고 점프는 소비된 STATE에만 있다.
+- **원인(추정, [유도] — 코드 경로는 맞고 수치 재현은 안 함)**: `rov_gui/control/state_assembler.py:193-197`
+  `v_new = (p_tag − prev_p) / dtc`에서 dtc = 두 fix의 t_capture 차. 폴백 fix의 t_capture는 host 도착시각이라 main fix와 거의 같은
+  시각에 다른 위치(1-tag PnP 수 cm 오프셋)로 들어오면 dtc≈1 ms로 나눠 v가 수십 m/s가 되고, alpha 0.6 EMA를 거쳐
+  `p += v·age`(속도 브리징, :200-204)가 한 tick에 상태를 미터 단위로 옮긴다. 소스 전환/1-tag에서만 발생.
+- **임시 대응**: 없음 — 정책 런 중 C3가 태그를 못 보는 구간(202610/202718에서 틱의 56/64 %가 폴백)이 길수록 노출. 폴백 구간의
+  `tag_age_s` 0.03 s는 host 도착시각 기준이라 신선도 지표로 믿지 말 것.
+- **제대로 고치는 법**: (1) 소스가 바뀐 첫 fix에서 `_v_ned` 리셋(또는 prev_p를 새 소스 기준으로 재시딩), (2) dtc 하한(예: 0.5·공칭
+  프레임 간격) 아래면 속도 갱신 생략, (3) |v_new| 물리 상한(예: 0.5 m/s) 클램프 + 이벤트 로그, (4) 1-tag fix는 속도 갱신에 안 쓰기.
+  회귀 테스트: second→main 전환 Δt 1 ms + 4 cm 오프셋을 넣어 상태 점프 < 5 cm 확인.
+
+### 스러스터 출력이 **1.4 s 동안 얼어** 기체가 최대 역토크에도 55° 돌았다 — 명령 경로 hiccup (2026-09-14)
+- **증상**: `data/20260914/0914_190226/mpc_190230.csv` t 3.62–5.03 s: 보고 PWM 8개가 `1554/1500/1400/1654/…`로 **1.4 s 동일**(평소 0.149 s마다 갱신,
+  `pwm_age_s` 0.11–0.22 s로 텔레메트리는 신선), 그 사이 명령 축은 `ax_yaw` +0.40→−0.50, `ax_sway` −0.38→+0.06으로 움직였고 `uN`은 −10 N·m
+  포화. 기체 yaw는 +14°→−42° (55°, 최대 45°/s)로 돌았다가 5.1 s에 PWM이 갱신되며 복귀 [측정]. 접근 walk 중(sway −22 N)이라 위치도 0.5 m 밀림.
+- **빈도**: 같은 날 세션 전체에서 "PWM 동일 ≥0.35 s + 축 명령 변화 >0.05" 구간 6개(0.35–0.75 s: `mpc_171212` 52.0 s, `mpc_172142` 1.9 s,
+  `mpc_175628` 24.5 s, `mpc_175912` 18.6 s, `mpc_175227` 1.8 s; 1.4 s는 이 한 번). 18:14 정책 런 세 개에는 없음.
+- **원인(추정, [유도])**: 텔레메트리는 오는데 서보 출력만 안 바뀌었으므로 ArduSub가 새 MANUAL_CONTROL을 못 받고 마지막 입력을 유지한 것
+  (테더/UDP 드롭 또는 송신 스레드 정지). 제어 tick(`tick_ms` 2–6 ms)은 정상이라 워커 쪽은 아님. 500 ms deadman이 발동했다면 1500(중립)이
+  됐어야 하는데 값이 유지됐다.
+- **임시 대응**: 없음. 접근 walk처럼 큰 수평 추력 중에 걸리면 크게 돈다. 큰 스텝 실험은 사람 손이 E-STOP 위에 있을 때.
+- **제대로 고치는 법**: 송신 측에 "보낸 축 vs 보고 PWM" 불일치 감시(예: 0.3 s 이상 PWM 정지 + 축 변화 시 WARN·이벤트 기록), MANUAL_CONTROL
+  송신 타임스탬프/간격을 CSV에 남겨 드롭이 송신인지 수신인지 가르기.
+
+### `--record-stereo` 레코더가 **첫 engagement의 트리에 고정**된다 — LOW 런타임 전환 뒤 다른 트리에 섞인다 (2026-09-11)
+- **증상**: `HardwareBackend`의 fstereo 워커가 `stereo_rec`를 한 번만 arm하고(`_rec_started`, `rov_gui/backends/hardware.py`
+  ~3402) 폴더는 `run_dir_fn = mpc._run_dir`로 첫 프레임에 한 번 해석된다. 2026-09-11부터 LOW를 패널에서 바꿀 수 있어
+  `_run_tree()`가 engagement 사이에 물속 잎 ↔ `_observe` 잎을 오가는데(2026-09-14부터 접미사; 전엔 별도 트리), 원본 스테레오 쌍은 첫 폴더에
+  계속 쌓인다 — 종류 분리가 풀링 가드인 기록 경계를 넘는다. 같은 결함의 depth 레코더(`--record-depth`)는 같은 날
+  `PolicyWorker._rotate_recorder_if_moved`(폴더가 바뀌면 닫고 새로 연다, `meta policy.depth_record.previous`)로 고쳤다.
+- **임시 대응**: `--record-stereo` 세션에서는 LOW를 바꾸지 말고(바꿔야 하면 스테이션 재기동), 바꿨다면 `stereo/`의 t_capture를
+  각 engagement의 `mpc_*.csv` 시각과 대조해 분리.
+- **제대로 고치는 법**: fstereo 워커에 "새 engagement" 트리거(PolicyState epoch이 없으니 `MpcStatus.engaged` 상승 에지나 버스
+  신호)를 주고, depth 레코더와 같은 폴더-비교 회전을 넣는다. 같은 폴더 재-arm은 index.csv를 `w`로 덮으니 폴더가 **다를 때만**.
+
+### 실기 DP가 물체 오른쪽 오프셋에 **무반응**이고, 분포 밖 장면이면 yaw 헤드가 **좌 −1.4~−2.6°/plan 기본값**으로 흘러간다 (2026-09-08)
+- **증상**: 0908_112101(물체가 헤딩 오른쪽 +2.5~3.3°, 0.9 m 앞)에서 정책이 처음 18 s는 우로 조금 돌다 27 s부터 좌 −2°/plan을
+  요청해 끝에는 물체 방위보다 11° 왼쪽; 오늘 15런 전부 런 평균 yaw 의도가 좌(−2.0 ± 0.4°/plan)
+  [측정: data/20260908/0908_112101/plans.jsonl, 같은 폴더 diag/out_regress.txt].
+- **원인(오프라인 재현 r 0.92 위의 ablation)**: (1) 캔 blob을 왼쪽으로 −20/−40/−60 px 옮기면 −2.6/−5.1/−6.3°, 오른쪽으로 +20/+40 px면
+  +0.2/−0.1° — **한쪽 반응**, 기준선은 화면 중앙이 아니라 턱 기둥(u≈150/224) [측정: diag/ablate_out2.txt]. (2) proprio 전부 항등·폭·페어링·
+  pitch·depth 배율·좌우반전 모두 |Δ|≤0.3°이고, 분포 밖 영상이면 무엇이든(좌우반전한 **학습** 영상도 −2.2°) −1.4~−2.6°로 흘러간다 =
+  yaw 헤드의 OOD 기본값; 라이브 영상은 방향 감도를 학습 대비 ~3.5× 약화 [측정: diag/taskD_out_ablation_analysis.txt]. (3) 112101에선
+  기체가 0.3 m 떠올라 바닥이 멀어진 것(inverse-depth 기울기 0.52→0.26)이 트리거 — 캔·그리퍼 없는 합성 평면만으로 같은 시계열이 재현
+  [측정: diag/ablate_timeseries.png]. Newton 턱이 화면에 있는 것이 ~0.5~0.7° 기여. (4) 학습셋은 조향을 담고 있으나(방위→dyaw r 0.55)
+  **손끝(+4.1° = 핸드헬드 TCP 횡오프셋 0.0355 m)** 을 겨눈 것이고 캔 방위 p99가 +8.5°라 ROV가 보인 +9~13°는 예 0건
+  [측정: diag/taskB_out.txt]. 배포 ep195/model은 held-out에서 yaw corr +0.64·자기일관성 +0.94(학습은 됨; ep10 EMA의 "≈0"은 인용 금지).
+- **임시 대응**: 기체를 낮고 수평하게 유지(STAB 또는 아래 데드밴드 항목 해결)해 바닥 외형을 학습 범위에 두고, 물체를 손끝 set-point(+4°)
+  근처나 약간 왼쪽에 두고 시작; 실기 yaw 통계는 STAB 런(정책 yaw 미실행)과 합산 금지.
+- **제대로 고치는 법**: 횡 오프셋이 큰(±15°) 시연과 ROV 턱이 보이는 관측을 수집하거나 턱 영역을 일관되게 마스킹; TCP 횡오프셋을 ROV 기하(y=0)에
+  맞춰 라벨을 재생성; 분포 밖 감지(바닥 기울기·근거리 덩어리 위치)로 정책 출력을 게이트.
+- **2026-09-08 검증 정정(반박 2렌즈 통과분)**: (1) "오른쪽 무반응"은 맞으나 **실기 영상 탓이 아니다** —
+  학습 영상에서도 같은 한쪽 응답이 나온다(아래 "정책 yaw 응답이 한쪽뿐" 항목). (2) "분포 밖 기본값"은 절반만
+  맞다: 방위 0°의 좌편향은 **시연 라벨 자체에 −1.85~−2.17°/plan** 있고(손끝이 렌즈보다 3.55 cm 오른쪽),
+  실기 영상이 거기에 −2.2~−2.7을 **더** 얹는다. (3) **기수 정렬은 분포 밖이 아니다** — 방위 0°는 학습 접근
+  분포의 16.5 퍼센타일(±2° 안에 19.1 %)이고, 오히려 조준점으로 권했던 +12°가 99.4 퍼센타일·+13.6° 위는
+  학습 창 0개다 [측정: `.../diag/taskB_windows.npz` 재계산, `q1_refuteX_recompute_out.txt`].
+
+### 정책 미션에서 추종자 명령이 **세 축 모두 ESC 정지대역 안**이라 기체가 표류한다 — `anchor: measured`가 오차를 못 키운다 (2026-09-08)
+- **증상**: 0908_112101 지면속도 0.008 m/s(요청 0.047), +0.30 m 상승(정책은 매 플랜 하강 요청); surge |ax|<0.096 100 %(uX p50 1.4 N),
+  heave 92 %(uZ ≤5.9 N), yaw 96 %; 기체 보고 pwm_dev p50 10 µs·max 20 µs < ±25 µs [스펙] [측정: 0908_112101/mpc_112101.csv, diag/taskE_out.txt].
+  상승은 "추력에 맞선" 것이 아니라 추력 0 + B−W ≈ +0.1 N 표류이고, 같은 날 MANUAL 런은 같은 sub-데드밴드 명령으로 −0.006~+0.029 m/s로
+  제각각 떴다(부력·트림·정책에 귀속 불가).
+- **원인**: anchor measured + 1 s 플랜(도착 시 0.5 s 낡음)이라 참조가 0.5 s마다 실측 pose에 재앵커 → 추종 오차가 플랜 변위(xy p50 3 cm, z ≤10 cm)에
+  묶이고, 추종자 강성 uX ≈ 35.6 N/m·e·uZ ≈ 64.9 N/m·e로는 5.8~7.5 N 문턱에 xy 0.15~0.2 m 오차가 필요해 절대 못 넘는다. hold_tail track은
+  plan 구간 |uX|를 0.05→1.21 N으로 올렸을 뿐(데드밴드의 1/4). STAB은 자세루프가 수직 추진기만 34~37 µs로 깨워 상승이 적다(수평은 여전히 표류).
+- **2026-09-08 조치(절반)**: 예측모델의 수평 항력을 실기 값으로 올렸다 — `hw_mpc.yaml`
+  `plant.linear_damping [86.7, 133.8, ...]`(= `axis_gain/0.692`, 모델의 21.5배). 오차 0인
+  0.05 m/s 참조에서 uX 2.74 → 4.80 N(axis 0.046 → 0.080) [측정: 오프라인 솔버].
+  **단, 그 이득은 참조가 움직이는 동안에만 있다** — LQ 위치 강성은 sqrt(q/r)이라 항력이
+  안 들어간다. 실기 기하로 다시 재면(오차 4.7 cm, v_ref 0.047, **hold_frac 0.885**)
+  4.62 → **4.79 N(+3.7 %)**뿐이다 [측정: .../0908_112101/diag/drag_sweep.py]: 플랜이 3 s
+  호라이즌의 12 %만 덮고 나머지는 참조가 서 있어서 피드포워드가 가려진다. 즉 항력 값은
+  이제 맞지만 **기체를 움직이게 하는 열쇠는 hold tail / 플랜 나이**이고, 데드밴드
+  (axis 0.096 = 5.8 N)는 항력이 아니라 이 블록이 못 채운다. 실기 미검증.
+- **A/B #2 (0908_165517, 같은 장면 PID↔mpc_tuned)**: PID 0.73 m/40 s(uX p90 8.9 N, 무릎 초과 30 %) vs mpc_tuned 0.01 m/45 s
+  (uX 2.5–3.5 N 고정, 0 %). 정체는 피드포워드가 아니라 **비례 스프링**: uX ≈ 40 N/m × (플랜 하나의 변위 0.086 m) = 3.1 N이
+  LQ 최적이고, 속도 피드포워드는 호라이즌 87 %가 v=0 hold라 0.56 N. PID는 kd·v_ref(6–8 N)+4 N 적분기의 73회/분 펄스로 움직였고
+  0.029 m/s 플랜을 받던 처음 10 s엔 똑같이 멈춰 있었다 [측정: `.../0908_165517/diag/fwd_A_out.txt`].
+- **랜딩(2026-09-08, 실기 미검증)**: `policy.hold_tail: extrapolate`(플랜 끝 너머를 마지막 구간 속도로 외삽, v_max·0.3 m·박스 클립,
+  live-only) + `policy.along_scale: 1.0`(정책 미션 동안만 along 가중 75→300, surge만). 오프라인 폐루프(실제 acados + 측정 데드밴드
+  법칙, 그 런의 88플랜): track은 q_scale 8에서도 0.017 m/s, 배포 세팅 0.055 m/s(플랜의 64 %)·오차 1.3 cm·반전 0.16/s
+  [측정: `.../0908_165517/diag/fwd_C_out.txt`]. 남는 것: 0.04 m/s 플랜에선 0.008–0.02 m/s뿐(FF 2.5 N), STAB 헤딩홀드의 T2/T4
+  역부호 preload(surge axis ~0.16 전엔 대각선 한 쌍만 밈)는 하네스에 없음 — 풀 A/B는 per-thruster pwm·yaw를 같이 볼 것.
+- **임시 대응(대안, 운영자 결정 필요)**: `anchor: leash` + `anchor_leash_m 0.10`(오차를 10 cm까지 키움; 반박자 하네스 0.050 m/s@0.085,
+  0.029@0.040, 무릎 0.13에도 견딤 — 단 knot0 점이 선체를 떠나고 정책이 본 pose보다 10 cm 앞에서 플랜을 합성, 2026-09-07의 measured
+  결정을 되돌리는 것), `policy.q_scale 4`(같은 surge, sway 1200→4800·heave 150→600 동반), STAB engage(수직만).
+- **제대로 고치는 법**: 할당 단에서 데드밴드 보상(최소 PWM 피드포워드 또는 실측 추력 맵), 혹은 per-thruster 인터페이스.
+- **미해명 관측**: 같은 날 MANUAL 110419는 yaw 명령 ~0(|ax_yaw| p50 0.032)인데 1.6°/s 좌회전, STAB 105945도 0.15°/s 좌 — 명령되지 않은 좌회전
+  토크(테더·추진기 비대칭?)가 있어 112101 순 13° 중 최대 3.6~6°까지 기여 가능 [측정: 0908_105822/mpc_110419.csv, diag/taskE_yaw_out.txt].
+
+### 카메라 광축과 턱이 **가로로 3.4~5 cm 어긋나** 있다 — CAD 체인엔 없다 (2026-09-08)
+- **증상**: obs에서 근거리 그리퍼 덩어리의 열 중심이 세 기록 모두 **obs u 150.7 / 150.8 / 151.3**
+  (sd 0.2~1.3)인데, CAD 체인(`cam_t_flu [0.30584,0,0.10501]`, jaw `[0.4165,0,-0.17]`(2026-09-08부터 x 0.502이지만 이 열 예측엔 y=0만 든다), 둘 다 y=0)은
+  **광축 열 116.8**을 예측한다. 차이 +34.5 px = +10.3°. 바닥 평면에서 잰 카메라 롤(+3.0~5.9°)은 그중
+  4~8 px(12~23 %)만 설명하고, 남는 +26~30 px는 **가로 오프셋 34~50 mm**를 뜻한다
+  [측정: `data/20260908/0908_112101/diag/q1_jaw_out.txt`, `q1_roll_out.txt`].
+- **왜 중요한가**: `policy.tcp_offset_cam_m`이 x=0(턱이 광축 위)이라는 전제로 계획→NMPC 변환이 돌고,
+  정책 관측의 좌우 해석도 이 전제 위에 있다. 3.4~5 cm면 62 mm 턱 개구의 절반을 넘는다.
+- **아직 확정 아님**: 덩어리 중심이 턱 자체인지(팔·마운트가 섞였는지), FS depth의 왜곡인지 미분리.
+- **다음에 할 일**: 자를 물고 실측하거나, 광축 위 아는 위치에 표적을 놓고 obs 열을 확인.
+- **2026-09-06 항목 정정**: "그리퍼가 육상과 반대쪽(위)에 있다"는 **반증됐다** — 그 캡처는 벤치에서
+  기체가 기울어져 있었고(그 항목 자신이 경고), 첫 실수중 프레임에서는 근거리 행 중심이
+  **live 0.900 ± 0.020 vs train 0.898 ± 0.081, 100 %가 학습 범위 안**이다(같은
+  `depth_compare.py:408-425` near_row) [측정: `.../diag/q1_ood_report_out.txt`]. 남은 차이는 위아래가
+  아니라 **1.8배 크고 14 px 오른쪽**이라는 것뿐이고, 그게 위 항목이다.
+- **교차 참조 (2026-09-08, 턱 실측에서 나온 후보 설명)**: obs 격자는 rect_LEFT 모노 그리드이고 그 카메라는
+  컬러 카메라에서 37.5 mm 떨어져 있다(data/20260908/0908_180453_observe/mpc_180453.meta.json
+  `fstereo.rig.color.t_rectleft_to_color_mm` = [−37.5, …]; 같은 런의 policy_obs/meta.json에는 이 키가 없다); 컬러 카메라 PnP로 잰
+  턱에 문 병의 축은 기체 축 **오른쪽 0.011 m**다 [측정: data/20260908/0908_180453_observe/policy_obs/rgb/000160.jpg,
+  같은 런 프레임 0/80도 동일]. 37.5 + 11 ≈ 49 mm가 위 34~50 mm에 맞는다 — 후보일 뿐 미확정(기준선
+  방향 부호와 "덩어리 = 턱" 여부 미확인).
+
+### C3 외부파라미터 cam_t_flu의 x/z가 의심된다 — 렌즈가 ~9 cm 뒤·5 cm 위일 수 있다 (2026-09-08)
+- **발견 경위**: 0908_180453(POLICY OBSERVE, 기체 44 s 정지, 매트 위, 기수 5.3° 상향)에서 조종사가 턱에 문
+  병을 바닥 태그 58 중심에 놓았는데, 화면의 턱 링이 태그 58보다 heading 방향 0.138 m 뒤에 그려졌다
+  (yaw-only 마커; 기수 상향까지 넣은 3-D로는 0.123 m) [측정: data/20260908/0908_180453_observe/
+  mpc_180453.meta.json datum + policy_obs/rgb/000160.jpg 재해석, config/tag_map_full.yaml 태그 58; 재해석 스크립트·투영 그림·출력은 같은 런의 diag/ (solve_frame.py, jar_geom.py, pixskeptic_refined.py, proj160_zoom.png, *_out.txt)].
+- **측정은 선다, 귀속이 열려 있다**: 태그맵·PnP(rms 2.0 px, 태그 부분집합 {48,59}/{59}로도 heading 방향
+  1 cm 안정)·틸트(rp_residual 2.4°)·수직(렌즈가 매트 위 0.343 m vs CAD 체인+기수각 0.350 m, 7 mm)·마커
+  변환(body_to_map)까지 전부 재현된다 [측정: data/20260908/0908_180453_observe/mpc_180453.csv
+  `pnp_rms_px`·`rp_residual_deg`·`n_tags`; 부분집합 재해석과 렌즈 높이 0.343 m는 같은 런 policy_obs/rgb/000160.jpg
+  재해석, 0.350 m = CAD 0.322 + 0.306·sin 5.33° [유도]]. 반증된 것은 **"렌즈가 턱 중심 110.66 mm 뒤"라는 CAD 오프셋 하나**
+  — 그 턱은 360행 프레임의 행 ~420으로 투영되는데 턱은 행 265~360에 보이고, 문 병의 축은 렌즈 앞 0.196 m
+  (프레임 0/80/160: 0.196/0.194/0.196, 범위 0.187~0.204)다 [측정: 위 프레임 + 0908_170428/policy_obs/rgb/000000.jpg
+  (병 높이 0.084 ± 0.006 m) + 0908_175151/policy_obs/rgb/000000.jpg (열린 턱 광선: 손끝 0.215~0.234, 팜 0.165~0.180)].
+  높이 무관 검증도 있다: 문 병 뚜껑의 겉보기 폭 비(60 px vs 원거리 35~36 px = 1.67~1.71)가 실측 가설(1.66)에
+  맞고 CAD 턱(2.38)을 기각한다. 그런데 이것은 두 가지로 읽힌다 — **(a)** `cam_t_flu`가 맞고 턱이 COM 앞 0.502에
+  있다; **(a')** `cam_t_flu.x`가 ~0.09 m 크고(렌즈 실제 x ~0.21~0.23) z가 ~0.05 m 낮으며(실제 ~0.155) 시뮬 턱
+  0.4165가 대략 맞다(0.22 + 0.196 = 0.42). 두 해석 모두 턱을 **렌즈 + [0.196, 0, −0.275]**에 두므로 턱/TCP는
+  렌즈에 앵커해 고쳤고(`rov_shape.LENS_TO_GRIP_FLU_M`, `policy.tcp_body_flu_m` 0.502), 이 항목은 **남은 절반**이다.
+- **(a')를 가리키는 정황** (전부 간접, 이 키를 잰 것은 없다): (1) `second_cam.t_flu [0.2663, …]`는 BodyAlign이
+  **C3 체인에 상대적으로** 잰 값인데, 시뮬 선체 메시(base_link 프레임)의 돔 정점은 x 0.230~0.231, 전자장비
+  튜브 끝은 ~0.176이다 [유도: bluerov2_mujoco_marinegym/meshes/rov_body_white.obj / rov_body_black.obj 정점 범위]
+  — 돔 카메라 렌즈가 돔 정점보다 3.5~4.5 cm 앞일 수는 없고, 조종사의 테이프는 0.18이었다(hw_nav.yaml의
+  "8.6 cm short" 주석). (2) 조종 명령으로 게이트한 순수 yaw 피벗(스러스터별 PWM, surge/sway ≈ 0)에서 **보고되는
+  body 원점이 yaw 피벗보다 0.117~0.130 m 뒤**다 [측정: data/20260908/0908_170428_observe/mpc_170428.csv
+  n=192, 0908_175151/mpc_175151.csv n=43; 스크립트·출력 data/20260908/0908_180453_observe/diag/skeptic_lever_pwm2.py, yaw_pivot_out.txt]; 피벗이 합성 COM(+0.035)이라면 (a')는 −0.13,
+  현행 값은 −0.035를 예측한다. (3) 수직: BodyAlign의 돔 카메라 z −0.019 vs 메시 전자장비 튜브 축 ~+0.03,
+  체인의 밑면 −0.217 vs 메시 −0.165~−0.167(white/black) [유도: 같은 메시] — 체인이 ~5 cm 낮은데 그 앵커(턱 z −0.17)가 시뮬
+  추정값이다. (4) (a')면 CAD의 110.66 mm는 그립점 ~9 cm 뒤, 즉 턱 **베이스/피벗**까지의 거리로 읽혀 "틀린
+  숫자"가 아니라 "다른 점"이 된다.
+- **(a')가 맞다면 결과**: 보고되는 body 원점이 실제보다 heading 방향 ~0.09 m 뒤(시뮬 턱 0.4165가
+  정확하다면 0.085; 렌즈 x 0.21~0.23이면 0.076~0.096 [유도])·~0.05 m 아래 → **모든 기록
+  위치**가 그만큼 밀려 있고, NMPC가 규제하는 점과 플랜트 COM의 격차는 알려진 0.043 m가 아니라 ~0.13 m
+  [유도], 마커의 선체는 실제보다 ~9 cm 뒤에 그려진다(턱은 맞음). 시뮬 GRIP_POS/JAW_POS는 (a')면 대략 맞고
+  (a)면 렌즈-앵커 턱보다 8.5 cm 뒤다 — 플랜트 합성은 손대지 않았다.
+- **왜 안 바꿨나 / 임시 대응**: 이 값은 모든 기록 위치의 기록 경계이고(hw_nav.yaml 주석), 위 정황은 전부
+  간접이다. 턱/TCP만 렌즈에 앵커했다(끝). 위치 절대값을 cm 단위로 인용할 때 이 항목을 병기할 것.
+- **제대로 고치는 법**: 기체에서 줄자 두 번 — (1) 프레임 앞끝(돔 정점) → C3 렌즈: 현행 값이면 렌즈가 돔
+  정점보다 ~7.5 cm **앞**, (a')면 돔 정점 ±2 cm; (2) C3 렌즈 → 그리퍼 팜. 바꾸면 같은 커밋에서
+  `policy.tcp_body_flu_m = cam_t_flu + [0.196, 0, −0.275]`를 재유도(또는 `tcp_offset_cam_m`을 설정해 렌즈 위치
+  소거), meta `hardware.cam_t_flu`가 경계를 기록한다.
+- **2026-09-09 CAD 재export 정황 ((a') 쪽)**: 사용자의 Onshape 문서 "BlueROV2" 탭 "mujoco"(카메라·upper mount·Newton
+  그리퍼 포함)를 onshape-to-robot으로 재export하고, 7월 등록(R0·C_ASM, 선체 파트 포즈가 7월과 바이트 동일)으로
+  base_link에 놓았다 [유도: assets/CAD files/onshape_export_20260909/payload_frames_20260909.json; 스크립트는
+  같은 등록 상수(tools/process_c3_mesh.py)]. CAD가 말하는 값: **렌즈면 중심 [0.194, 0.006, +0.133]**, 광축 40.0° 하향,
+  베이스라인 수평; **턱 쌍 중심 [0.364, 0.006, −0.127]**(턱 x 0.329~0.404); 렌즈→턱 중심 [+0.170, 0, −0.260].
+  현행 `cam_t_flu` [0.306, 0, 0.105]보다 렌즈가 **x 0.11 m 뒤, z 0.03 m 위**, `tcp_body_flu_m` 0.502보다 턱이
+  0.10~0.14 m 뒤 — (a')의 예측(렌즈 x ~0.21~0.23, 턱 ~0.42)과 같은 방향이고, 렌즈-턱 상대값(0.17~0.21 m 앞)은
+  이미지 실측 0.196과 정합한다. 한계: 원점은 7월 시뮬 스킨 등록의 COM이고 CAD의 그리퍼/마운트 배치는 사용자
+  모델링(export 20분 전까지 mujoco 탭에서 인스턴스 Unfix/Drag 편집 이력)이라 **줄자 실측을 대체하지 않는다**.
+  - **0908 근거를 CAD로 재검산** [유도: assets/CAD files/onshape_export_20260909/reanalysis_20260909.json]: (1) yaw 피벗 —
+    CAD는 보고 원점이 COM보다 **0.111 m 뒤**라고 예측, 실측 0.117~0.130 (0.6~1.9 cm 안). (2) 돔 카메라 — BodyAlign 0.266 −
+    0.111 = 0.155, CAD 선체 돔 영역 최전방 x 0.208(전체 최전방 0.226)·테이프 0.18과 2~3 cm 안. (3) 턱 — 렌즈+0.196 = 0.39,
+    CAD 턱 중심 0.364·팁 0.404, 시뮬 0.4165 → 현행 0.502가 0.11 m 앞. (4) **수직은 반대 방향**: CAD 선체 최저점 z −0.164
+    (시뮬 메시 −0.165~−0.167과 일치)에서 렌즈는 정지 시 바닥 위 0.297, 기수 5.33° 상향 시 0.325 m인데 0908 실측은 0.343
+    (바닥 z −0.016이면 0.359) — CAD가 2~3.5 cm **낮다**(옛 체인 0.350은 0.7 cm). 즉 렌즈 z는 CAD +0.133보다 높은 +0.15~0.16
+    [유도]일 가능성이 있고, upper mount의 CAD 배치가 그만큼 낮게 그려졌거나 매트/피치 가정 문제. 결론: 수평은 (a')로
+    수렴(x −0.11), 수직은 +0.03~+0.05 사이에서 미정 — **줄자로 결정**: 돔 정점→렌즈는 CAD면 렌즈가 정점보다 1~3 cm
+    **뒤**, 현행 체인이면 8~10 cm **앞**.
+
+### 정책 yaw 응답이 **한쪽뿐**이다 — 오른쪽 오차는 영원히 못 고친다 (2026-09-08)
+- **증상**: 캔을 좌우로 옮기며 잰 knot-15 dyaw가 조준점 **왼쪽에서는 +0.15~0.25°/°** 로 반응하지만
+  **오른쪽에서는 +0.02~0.05°/°** 로 죽는다. |dyaw| ≤ 1°인 평탄역이 +8°부터 최소 +20°까지 이어진다.
+  같은 스윕을 **학습 영상**에 돌려도 같은 모양이라(왼쪽 +0.146, 오른쪽 +0.020) 실기 영상 탓이 아니라
+  **정책 성질**이다 [측정: `.../diag/q1_sweep1_out.txt`, `q1_sweep_train_out.txt`].
+- **덧붙는 상수**: 방위 0°(기수 정렬)에서 시연 라벨 자체가 −1.85~−2.17°/plan 좌(시연자 손끝이 렌즈보다
+  3.55 cm 오른쪽 = +4.1°가 라벨의 영점이라서), 학습 영상 위 정책은 −2.32°, **실기 영상 위에서는 −3.7~−4.97°**
+  — 즉 실기 영상이 −2.2~−2.7°/plan을 더 얹는다 [측정: `taskB_windows.npz` 재계산, `q1_sweep_train_out.txt`,
+  `q1_sweep1_out.txt`].
+- **함정**: 실기 폐루프의 평형점(명령 0)은 **방위 +12~18°**인데 그 구간은 학습 창이 **0개**(방위 > +13.6°)다.
+  거기서 정책이 조용한 건 맞아서가 아니라 **반응을 멈춰서**다. 반대로 기수 정렬(방위 0°)은 학습 분포의
+  **16.5 퍼센타일로 분포 안쪽**이다 — 캔을 오른쪽에 두는 건 수리가 아니라 바이어스의 **수치 상쇄**다.
+- **임시 대응**: 첫 시험은 캔을 시연 분포의 중심인 **방위 +4°**(0.7~1.0 m에서 오른쪽 5~7 cm)에 두고,
+  고도를 유지해 캔을 관측 대역(0.2~3.0 m) 안에 붙잡아 둔다. 그래도 −3.7°/plan쯤은 남는다.
+- **제대로 고치는 법**: (a) ROV의 TCP(턱이 광축 위, 위 항목의 실측 오프셋 포함)로 라벨을 재생성해 재학습,
+  (b) 좌우 오차가 큰(±15°) 시연 수집, (c) 임시로는 intake 크롭을 +34.5 px 이동(방위 0에서 −4.66 → −0.98°/plan,
+  단 절대 열에만 반응하므로 이동한 만큼만 벌 뿐이다 [측정: `.../diag/q1_sweep_shift2_out.txt`]).
+
+### 배포된 EMA 가중치가 held-out에서 **1.9배 나쁘다** — 원인은 BatchNorm running stats (2026-09-06)
+- **증상**: 2026-09-03 실기에서 DP 참조가 우유부단했다. 그 체크포인트가 로드하는
+  `state_dicts.ema_model`이 **검증 세트에서 비-EMA `state_dicts.model`보다 크게 나쁘다**
+  [측정: 검증 4개 에피소드(6/32/48/56, `get_val_mask(75, 0.05, 42)`) 219 윈도, DDIM 16스텝]:
+
+  | 가중치 | action MSE | pos MSE | pos RMSE |
+  |---|---|---|---|
+  | `ema_model` (**배포 중**) | 0.001582 | 0.000956 | 30.9 mm |
+  | `model` (비-EMA) | 0.000828 | 0.000435 | 20.8 mm |
+
+  실기 설정(DDIM 8스텝)에서도 같다: 0.001535 vs 0.000842. 즉 **1.82–1.91배**.
+- **분해 실험이 원인을 확정했다**: EMA 사본의 **파라미터는 그대로 두고 BatchNorm buffer
+  108개만** 학습된 것으로 갈아끼우면 0.001535 → **0.000896**(pos RMSE 20.9 mm)로,
+  격차의 **92%가 회수된다** [측정 2026-09-06, 같은 219 윈도]. 즉 **EMA 평균 자체는
+  멀쩡하고, 통계가 전부였다**. "EMA가 나쁘게 학습됐다"는 해석은 틀렸다.
+- **원인 (확정)**: `EMAModel.step`은 `named_parameters()`만 순회하므로 **buffer를 평균하지
+  않는다**. 그리고 `transformer_obs_encoder.py:120`의 `if use_group_norm and not pretrained:`
+  때문에 `use_group_norm: true`인데도 `pretrained: true`라서 **GroupNorm 치환이 조용히
+  건너뛰어졌고 BatchNorm이 살아남았다**. 결과적으로 EMA 사본의 `running_mean/var`는
+  **timm ImageNet 값 그대로**다 [측정: `num_batches_tracked` — timm `resnet34.a1_in1k`
+  pretrained **374,981**, ckpt `ema_model` **374,983**(+2), ckpt `model` **395,128**
+  (= +20,145 = global_step+1)]. BN buffer의 model↔ema 최대 상대차 **9847배**.
+  eval()에서 BN은 running stats를 쓰므로, **비전 인코더가 depth 관측을 ImageNet RGB
+  통계로 정규화하고 있다**.
+- **임시 대응 (2026-09-06 구현)**: `--policy-weights model`. 기본값은 `ema_model` 그대로라
+  이전 기록은 재현되고, 고른 값은 `describe()`와 런 meta에 남는다 — **다른 가중치로 돈
+  런끼리는 합산 금지**.
+- **제대로 고치는 법**: (1) ~~가중치 소스를 config/CLI로 노출~~ 완료; (2) 재학습 시 인코더의
+  BatchNorm을 GroupNorm으로 실제 치환하거나(=`pretrained` 게이트 제거) EMA가 buffer도
+  복사하게 한다; (3) 재선정은 **전체 검증 세트**로 — 현재 `selected.json`의 근거 숫자는
+  `next(iter(val_dataloader))` 한 배치(32 윈도)뿐이라 전체 세트보다 1.4배 낙관적이었다.
+- **2026-09-07 5-dim action 재학습(`umi_depth_5d`)은 사용자 결정으로 (2)를 손대지 않아 결함을 상속했고,
+  그 덕에 같은-에폭 증거가 더 선명해졌다**: epoch 195에서 219-윈도 held-out pos RMSE
+  **ema_model 33.0 mm vs model 17.3 mm**(MSE 3.6배), yaw RMS 2.87° vs 2.20°
+  [측정: `<run>/heldout_pos_yaw_width_ep0195{,_model}_stride4.log`]. 옛 10-dim ckpt도 29.8 vs 21.0 mm.
+  → **2026-09-07부터 배포 기본 가중치를 `model`로 바꿨다**(`geometry.default_policy_block()['weights']`,
+  `config/hw_mpc.yaml`·`land_dp.yaml`의 `policy.weights: model`; `--policy-weights`로 덮어쓰기 가능).
+  파리티 fixture도 배포 가중치로 다시 만든다(`dp_policy_reference.py --weights`, 기본값이 배포 선택).
+  `ema_model`로 돈 이전 런과 **합산 금지**는 그대로.
+
+### NMPC 플랜트는 기체가 **5.7 N으로 가라앉는다**고 믿는데 실기는 떠오른다 — mpc/mpc_tuned가 정책 하강 플랜 아래서 계속 상승 (2026-09-07)
+- **증상**: `mpc_tuned` + policy 미션 5개가 전부 위로 흘렀다(pz 0.27–0.54 m 상승, vz p50 +0.015…+0.035 m/s) — 정책은
+  1 s당 +0.055 m(p50) **아래**를 요청했고(NED +down, 154 플랜), 앵커 z 오프셋(참조−실측) p50 +0.108 m로 참조는 항상 기체 아래였다
+  [측정: data/20260907/0907_180038/mpc_18*.csv, plans.jsonl].
+- **원인**: 히브 지령을 회귀하면 다섯 미션 모두 `uZ ≈ −5.6 N − 60 N/m·ez`(R² 0.54–0.94; ez = rz − pz, FLU). **절편 −5.6 N(위로)**은
+  `dobmpc/params.py NET_BUOYANCY = −5.71 N`(heavy_gripper가 침강한다는 CAD·벤더 합성값, 실측 0건)과 일치 — 명목 NMPC는 자기 모델의
+  중력을 상쇄하므로 오차 0에서 5.7 N을 **위로** 민다. 여기에 T200 데드밴드(~5.8 N)까지 더하면 아래로 추력이 나오려면 ez ≈ −0.19 m가
+  필요한데 leash 0.05 m + 플랜 하강폭이 오차를 −0.10…−0.15 m에 묶어 둔다 → 추력 0(|ax_heave| < 0.096이 88–100 % 틱), 실기 부력만큼
+  상승. 미션 시작 1.4 s(station hold)도 uZ −5.1…−6.1 N(위). 실기 B−W는 같은 날 −2 N(16:53 mpc hold −6.5 N 지령, 수심 평탄)에서
+  > +3 N(16:07 PID +8 N 지령에도 0.25–0.49 m 상승)까지 움직였고 −5.7 N이었던 적이 없다 [측정: 0907_16*/mpc_*.csv, 0907_15*/].
+  같은 메커니즘이 16:11–16:13 mpc_tuned 미션 4개(0907_160750/mpc_1611{15,49}, 1612{38}, 1613{15}: +0.22…+0.53 m)에도 있다.
+- **대응(2026-09-07, 실기 미검증)**: `hw_mpc.yaml`/`land_dp.yaml` **`vehicle_net_buoyancy_n: 0.0`**(실기 B−W, + 부양) → `HwDobMpc`가
+  (모델 − 실기) = −5.71 N을 **상수 히브 렌치**로 acados 파라미터 p(= w)에 넣는다(런타임 입력, 재빌드 없음, 관측기 아님; mpc/mpc_tuned만 —
+  dobmpc는 EAOB가 같은 잔차를 추정하므로 미적용). meta `controller.heave_trim` 블록이 기록 경계(없는 런 = −5.7 N 상향 FF를 날린 런);
+  CSV `w2`는 EAOB 열로 유지. 모델 플랜트 예측: 중립 기체 station hold에서 무보정 +12.2 cm 위에 정지, 보정 0.00 cm
+  [예측: rov_gui/tests/test_path_cost.py::test_a_neutral_vehicle_holds_depth_only_with_the_trim, 데드밴드 없는 플랜트]. 검증은 CSV
+  `uZ`의 절편(정지 틱 평균)이 0 근처인지와 policy 미션의 pz 드리프트로.
+- **실측(2026-09-08)**: 히브 지령이 데드밴드 안인 자유 상승 창(0908_105822/mpc_110419.csv 0–11 s, pwm_dev ≤ 22 µs)을 플랜트 히브 모델로
+  적합하면 B−W = **+0.12 N**(모델 항력), +0.04 N(항력 0), +0.28 N(항력 3배) [측정+유도: 0908_105822/buoyancy_fit_20260908.txt] → 기체는
+  사실상 중립이고 `vehicle_net_buoyancy_n: 0.1`로 설정. 같은 날 MANUAL 런은 그래도 0.25 m/15 s 떠올랐는데, 이는 부력 상수가 아니라
+  **데드밴드**다(위치항이 ~6 N이 되는 오차 ~0.1 m까지 추력 0). 반면 STABILIZE 런 2개(mpc_105945/110306)는 히브 지령 ~0으로 깊이를
+  ±7 cm 안에 잡았다 — 자세 루프가 수직 추진기를 데드밴드 밖에 세워 둔다(pwm_dev p50 35 vs MANUAL 10 µs).
+- **남은 것**: 트림은 **상수**라 하루 안에 ±8 N 움직이는 실기 부력(테더·트림)을 못 따라간다 — mpc 계열엔 적분·관측기가 없으므로(사용자 결정)
+  세션마다 값을 재는 수밖에 없고(PID depth hold의 정상 uZ가 데드밴드 밖이면 그 값), 데드밴드 5.8 N 안의 부력 오차는 여전히 ~0.1 m 오프셋으로
+  남는다(`policy.q_scale`로 강성을 올리면 줄어듦 [유도]). `--policy-observe`(비송신)에선 무관.
+
+### STABILIZE에서 engage — 배선됐지만 **실기 0런**, yaw는 `hold`라 스테이션이 헤딩을 못 돌린다 (2026-09-08)
+- `engage.require_mode`가 목록을 받아 `[MANUAL, STABILIZE]`로 열 수 있다(핀 고정·`mode_settle_s`·dobmpc 거부·
+  `stabilize.yaw_axis: hold`; README "STABILIZE에서 engage하기"). 세 자문(제어이론·수중운용·정책관측) 판정은 모두
+  **conditional**: roll/pitch는 이득, yaw는 의미가 토크→rate로 바뀌어 손실. 검토는 MANUAL 단독 기본을 권했으나
+  **운용자 결정으로 기본값이 `[MANUAL, STABILIZE]`**(2026-09-08): STAB 버튼 → START가 그대로 STAB 아래서 돈다.
+- 미해결: (1) `hold`에선 heading_follow·circle·정책 dyaw가 동작하지 않고, `torque`는 데드존(axis ≤ 0.10) 경계 hunting이
+  [예측]; 제대로 하려면 N→yaw-rate 재해석 + 데드존 역보상인데 PilotGain(위 항목)을 못 읽어 미구현(`rate` 거부).
+  (2) `mode_settle_s 2.0`은 [예측]이고, 게임패드의 모드 버튼은 기체로 직행해 스테이션이 못 보므로 그 경로의 전환은 HEARTBEAT(1 Hz)
+  지연만큼 늦게 인지된다(패널 경로는 요청 시점에 시계를 찍음). (3) E-STOP/데드맨의 중립 송신은 STABILIZE에서 정지가 아니다(수평·헤딩
+  홀드, 추진기 활성) — E-STOP 시 error 로그로만 알리고 DISARM/MANUAL 자동 전환은 별도 안전 검토 대상.
+  (4) 펌웨어 버전 미확인 — 4.1.0이면 STABILIZE 자세 목표가 '마지막 yaw 입력 시 자세'로 잠겨 전제가 깨진다. (5) 수직 추진기를
+  roll/pitch PID와 나눠 써 접촉 국면 heave 권한 감소 [유도]. (6) 스테이션 UI에 STAB 상태 칩/툴팁 없음(거부 문구만).
+- 첫 세션 절차와 측정 항목은 README 해당 절. 그 산출물이 생기기 전엔 STABILIZE 런의 수치를 MANUAL 런과 합산·인용 금지.
+
+### 6-DoF 변형(roll/pitch 추종, `pos_rpy_width` + `engage.attitude_axes`)이 **실기 0런** — 펌웨어 s/t 소비·부호·플랜트가 전부 미확인 (2026-09-26)
+- **무엇**: 정책이 `[dx,dy,dz,dyaw,droll,dpitch,width]` 7-dim을 내고 NMPC가 roll/pitch 참조를 추종해 K/M 토크를
+  MANUAL_CONTROL 확장축(s = pitch, t = roll, `enabled_extensions=0b11`)으로 보내는 변형. 기본값은 전부 OFF
+  (`policy.action_repr: pos_yaw_width`, `policy.attitude_track: false`, `engage.attitude_axes.enabled: false`)이고
+  OFF면 4-DoF 경로는 바이트 동일(테스트 고정). 설계·첫 비행 순서는 `docs/DP_6DOF_PLAN.ko.md`. 아래는 켜기 전에 남은 것.
+- **펌웨어가 s/t를 읽는지·어느 부호로 읽는지 미확인**: 이 ROV의 ArduSub 버전 자체가 미확인(위 STABILIZE 항목 (4))이고 s/t는
+  Sub 4.1.2(2024-02-22)부터만 소비된다 — 4.1.0/4.1.1이면 **조용히 무시**. `joystick.cpp`의 s/t 줄(채널 인덱스·rpyScale·부호·
+  pitchTrim/rollTrim 래치)은 원문을 읽지 않았다 [스펙 미확인]. engage 게이트(mavlink20 + AUTOPILOT_VERSION ≥ 4.1.2 + 벤치 프로브
+  `python -m rov_gui.tools.attitude_axes_probe` 산출물 JSON 파싱: `tool`·`pass: true`·`mavlink_wire_version "2.0"`·`firmware_version`이
+  기체와 일치)와 disarmed 프로브의 전제 "disarmed 상태의 RC_CHANNELS chan1/2가 MANUAL_CONTROL
+  override를 반영한다"도 [스펙 미확인] — 안 되면 armed 상태로 물속에서 프로브를 돌려야 한다.
+- **중립 프레임의 확장축 0 명시**: 확장 프레임(`enabled_extensions=0b11`)을 한 번이라도 보낸 뒤의 중립 프레임은 `enabled_extensions=0b11`
+  + `s = t = 0`을 **명시**해 보낸다(비트를 뺀 프레임에서 펌웨어가 마지막 s/t를 유지하는지 0으로 보는지가 [스펙 미확인]이라 0을 명시하는
+  쪽을 택함). 비트가 없을 때의 펌웨어 동작은 여전히 [스펙 미확인].
+- **K/M 부호 [가정]**: `engage.attitude_axes.sign {roll: 1, pitch: 1}`는 가정. 뒤집히면 U_MAX 8 N·m까지 양의 피드백
+  (복원 ~2.1 N·m/rad [유도] → 전복 가능). 방어선은 첫 물 캡 `first_water_caps [0.1, 0.15]`(≤ 1.35 N·m/rad 복원 대비 전복 불가
+  [유도]) + sat-ineffective 인터록(축이 캡에 1 s 붙어 있고 오차가 안 줄면 disengage, 상수 [예측]) + **armed 수중 부호 프로브**.
+  부호 프로브 미션 종류(`attitude_sign_probe`)는 **이번 컷에 없다**: arm 게이트는 `engage.attitude_axes.sign_probe` JSON의
+  `sign_proven: true`를 요구하므로(`require_sign_probe: true` 기본), 그 파일은 지금은 수동으로(ATTITUDE + SERVO_OUTPUT_RAW 기록,
+  roll +0.10 1 s → pitch +0.10 1 s, |rp| > 10° 또는 2 s abort) 만들고 `sign_proven: true`를 적어야 한다. `require_sign_probe: false`로
+  우회하면 arm은 되지만 `first_water_caps [0.1, 0.15]`가 강제되고 meta `run.attitude_axes`에 `sign_proven: false`·`caps_in_force`가
+  남는다 — 부호가 증명되지 않은 런의 유효 캡은 항상 첫 물 캡.
+- **회전 플랜트가 전부 placeholder**: `hw_mpc.yaml plant.linear_damping` roll/pitch 0.07, 회전 부가질량 0.12
+  (메모리 heavy-added-mass-provenance), ZG 0.01 고정(params.py) vs heavy_gripper coBM 0.01625, 페이로드 정적 pitch 모멘트 ~1.4 N·m
+  [스펙 BlueROVHeavyGripper.yaml] 미모델. 하드웨어에서 자세 루프를 닫아 본 적이 없다 → 첫 물 시험은 정책 없는 **plain mpc 자세
+  스텝**(0914 yaw 스텝 시험의 자세판)이어야 하고, 그 전엔 `attitude_q_scale`·`rp_ref_filter`는 손대지 말 것.
+- **축 이득 [유도] + 솔버 U_MAX vs 선 캡 불일치**: `axis_gain.roll_nm 13.2 / pitch_nm 7.2`는 heave_n 60 N [예측] × 레버암
+  (y ±0.22 / x ±0.12 m, bluerov_heavy.xml)에서 유도한 값. 솔버 U_MAX[3:5] = 8 N·m인데 선이 나르는 최대는 cap×gain =
+  2.6 / 2.2 N·m(첫 물 1.3 / 1.08 N·m) → 최적화기는 선이 못 나르는 토크를 계획할 수 있다. EAOB엔 `note_applied`로 캡된 값을
+  알리므로 관측기는 진실을 보지만 plain mpc는 큰 자세 과도에서 추종 지연을 보인다. 첫 물 pitch 캡 1.08 N·m는 정적 페이로드
+  모멘트 ~1.4 N·m **아래**라 능동 레벨링 런이 M 포화 상태로 상수 오차를 안고 앉을 수 있다(sat-ineffective가 잡아야 함).
+  나중 수정: acados를 U_MAX[3:5] = cap×gain으로 재빌드(시뮬 플랜트 바이너리도 같이 바뀜). meta `controller.attitude_ref.u_max_wire_nm`에 기록.
+- **pitch 축 데드밴드 리밋사이클 위험**: 무릎 ≈ 0.096 × 7.2 ≈ 0.7 N·m [유도] ≈ 20° 홀드 모멘트(0.47–0.73 N·m [유도]) —
+  yaw 디더(2026-09-14)의 자세판. 깊이 유지 중 수직 추진기가 이미 무릎 위에 있는지는 부력 가정에 달렸는데 두 메모리가
+  충돌한다(선체 음성 부력 vs 적합 +0.1 N 중립) → 시뮬 S5 데드밴드 플러그인이 첫 증거.
+- **`transport: rc_override`(FALLBACK-A) 미구현**: `validate_engage_attitude_axes`가 "not implemented"로 거부. 4.1.2 미만
+  펌웨어에서 s/t가 무시될 때의 대안 경로인데 데드맨 의미(RC_OVERRIDE_TIME [스펙 미확인] vs 500 ms)와 4-DoF 경로 자체를 바꾸므로
+  자체 벤치 패리티 산출물 없이는 켜지 말 것. STABILIZE lean-angle 캐스케이드도 미구현(attitude_axes.enabled면 STABILIZE 거부).
+- **자세 수치는 전부 [예측]**: rp_max 20°, rp_reject 30°, pq_max 0.35 rad/s, rp_jump 5°, leash 3°, div_rp 15°, abort 35°,
+  caps 0.2/0.3. 라벨 분포의 첫 산출물은 `data/20260926/0926_175145_offline/gate_pos_rpy_width.log`(0901 육상 데모, 1721 윈도:
+  |dpitch| p50/p90/p99/p99.9 1.17/5.53/13.07/18.31°, |droll| 0.70/2.56/5.39/8.17°; 피크 |p|,|q| p90 0.453 rad/s > 0.35 캡이라 200 ms
+  격자에서 2/1721 청크가 accept→clip) — 7-dim 학습 런의 held-out 게이트(`dp_policy_offline.py replay --val-only`)와
+  `policy_session_replay.py --ckpt D7=…`(수중 런 OOD 프로브)는 아직 안 돌았다.
+- **기록 경계는 의도적으로 깨진다**: schema 16부터 미션 CSV 끝 5열(`rroll_deg,rpitch_deg,ax_roll,ax_pitch,rp_track`),
+  `policy_plan.csv` 끝 `roll_deg,pitch_deg`, plans.jsonl `rp_tracked`가 항상 붙는다. 이름으로 읽는 이 리포의 도구는 무관하지만
+  열 수를 세거나 바이트 비교하는 외부 판독기는 깨진다. `attitude_track`·`attitude_axes.enabled`·`action_repr`·비행 모드·
+  `controller.allocation.attitude`(dobmpc w_hat[3:5] 의미가 바뀜)가 다른 런은 **합산 금지**.
+- **시뮬 근거의 빈칸**: (i) [해소] "K/M이 조용히 버려질 때 dobmpc가 `div_rp 15°`를 안 넘는다"는 174607 `dropped_*` 행은
+  임계 = 참조 크기(15°)라 퇴화 — 인용 금지. 비퇴화 재실행(참조 20° = `rp_max_deg`, 임계 15° = `div_max_rp_deg`)에선 mpc·dobmpc
+  모두 0.45 s에 트립(임계 초과 연속 10 샘플 = 스테이션 0.5 s 디바운스; 선체는 20°에 접근하지 않음), dobmpc는 크레딧되었으나
+  미전달된 K/M으로 pitch 6.83°까지 흘러 rad_max 14.5 cm(`bluerov2_mujoco_marinegym/recordings/20260926/attitude_hold_211917/
+  results.csv`, `dropped_*` 행) — `dobmpc_allowed: false`를 유지하는 이유는 임계가 아니라 이 드리프트다. (ii) S2 hold 그리드는 NONE만 돌았고 C/CDW 셀은 미실행(`verify_attitude_hold.py --modes C,CDW`);
+  (iii) S5 데드밴드 플러그인은 heavy(+1.1 N 근중립)만, heavy_gripper(−5.7 N 침강)의 리밋사이클은 미실행;
+  (iv) `pos_rpy_width` 체크포인트가 아직 없다(`tools/run_ablations.sh depth_7d_*` 미실행) → held-out 수용·OOD 리플레이·
+  `dp_policy_reference.py` 패리티 픽스처 전부 미실행; (v) `tests/test_dobmpc.py main()`은 기존 NU=4 vs 6 실패로 여전히
+  red, 새 자세 테스트 6개는 이름을 줘서 개별 실행.
+
+### ArduSub **조이스틱 gain**이 스테이션이 보내는 모든 축을 곱하는데, 읽지도 기록하지도 않는다 (2026-09-07)
+- ArduSub은 MANUAL_CONTROL의 x/y/r을 `PWM = 1500 + 0.4·gain·값`, z를 `0.8·gain·JS_THR_GAIN` 배율로 RC override에
+  넣는다(`ArduSub/joystick.cpp transform_manual_control_to_rc_override`, Sub-4.1 :55-150, Sub-4.5 동일). `gain`은 부팅 시
+  `JS_GAIN_DEFAULT`(기본 **0.5**, 범위 0.25–1.0)이고 패드의 `gain_inc/dec` 버튼(이 스테이션 패드 표 기준 십자키 11–14)이
+  즉석에서 바꾼다. 즉 `axis_gain.surge_n/heave_n 60 N`·데드밴드 문턱 axis ≈0.096·슬루 1.5/s 같은 스테이션 캘리브레이션은
+  전부 **gain 0.5를 전제로 한 값**이고, 십자키 한 번에 조용히 2배가 된다. 기체는 이 값을 `NAMED_VALUE_FLOAT name="PilotGain"`으로
+  주기 송신한다(`GCS_Mavlink.cpp` Sub-4.1 :145) [출처: ArduSub 소스 읽기 2026-09-07, 워크플로 stabilize-mode-llc; 실기 파라미터는 미확인].
+- 영향: 런마다 유효 추력 배율이 달라도 meta에 흔적이 없어 데드밴드·축게인 관련 모든 수치 비교가 조건부다.
+- 고치는 법: `hardware.py`가 `PilotGain`을 Telemetry에 싣고 `MpcWorker`가 engage 시 meta `run.pilot_gain`으로 적는다;
+  gain ≠ 0.5면 engage 거부 또는 경고. 그 전엔 세션 시작 때 QGC/BlueOS의 gain 표시(STATUSTEXT `#Gain: NN%`)를 확인해 둘 것.
+
+### 수동 REC 경로에선 meta `controller`가 **날린 제어기가 아닐 수 있다** (2026-09-07, safety 감사에서 발견)
+- REC를 engage 전에 누르면 `_csv_auto=False` → disengage가 CSV를 안 닫고 → `set_mode`가 허용되며 → REC stop 시
+  `_write_meta()`가 **새** 컨트롤러의 `meta()`를 적는다(`rov_gui/control/workers.py` `_write_meta`/`set_mode`). `type`·Q·
+  `heave_trim.applied`가 전부 실제 비행과 어긋난 채 저장될 수 있다. 자동 REC(engage가 여닫는 경로)는 무관.
+- 고치는 법: engage 시점에 `ctrl.meta()` 스냅샷을 잡아 close 때 그것을 쓴다. 그 전엔 수동 REC 런의 meta `controller`는
+  `events.log`의 `ENGAGED (<mode>)` 줄과 대조해서 읽을 것.
+
+### MPC 계열 추종자는 정책 플랜 아래서 **hold-tail 마스크 때문에 추력을 못 낸다** — `track` 1차 A/B는 부족, `q_scale` 미검증 (2026-09-07)
+- **증상**: `mpc`/`mpc_tuned`를 하위 제어기로 policy를 날리면 기체가 거의 전진하지 않는다(순변위
+  0.05–0.4 m/50–90 s; PID 0.2–0.9 m). 참조는 body 전방 7.5–10 cm에 일관, yaw 오차 ~1°, uX 부호 반전
+  0–0.4/s → 흔들림이 아니라 **추력 부족**: |uX| p50 0.5–1.8 N, axis_surge 0.01–0.03으로 데드밴드 아래
+  틱 92–100 %(PID 6–7 N, 37–52 %) [측정: data/20260907/0907_164659/
+  mpc_16{4716,4835,5209}.csv, 0907_152730/mpc_153134.csv vs 0907_145206/mpc_145239.csv].
+- **원인(증거 순)**: (1) `hold_tail: mask` — 플랜이 도착할 때 이미 ~0.5 s 낡아(obs age p50 0.5 s)
+  3 s 호라이즌 중 위치 가중 구간이 0.25–0.4 s뿐(`hold_frac` p50 0.87–0.92); 그 비용의 최적 surge는
+  신선한 플랜 0.05–0.2 N, blend 0.6–1.9 N. **같은 런에서 마스크가 풀린 `ref_src hold` 틱은 3.3–6.9 N**
+  (mpc 164716 6.5 / 165209 6.9 / mpc_tuned 164835 4.5 / 153134 3.3 N; PID는 ref_src 무관 ~6.5 N).
+  (2) leash 0.05 m가 replan 95–99 %에서 포화 → 오차가 못 자람(정책은 epoch당 3–9 m를 요청, anchor는
+  0.05–0.48 m만 이동). (3) mpc/mpc_tuned엔 적분·외란 항 없음(EAOB 미사용, 의도) → DC 손실 학습 불가;
+  `mpc_tuned`는 `along_scale 0.25`로 더 무름. 데드밴드는 물리 문턱(이 기록의 무릎 axis 0.05–0.07 ≈ 3–4 N).
+- **A/B 1차 결과(2026-09-07 18:00, `hold_tail: track`)**: mpc_tuned 미션 4개에서 uX p50이 0.4–0.6 N(mask, 16:11–16:40) →
+  **2.5–3.6 N**으로 5배쯤 올랐지만 여전히 데드밴드 아래(|ax_surge| > 0.096 틱 0–2 %), 순변위 0.07–0.24 m/16–28 s
+  [측정: 0907_180038/mpc_18{0058,0132,0202,0253}.csv vs 0907_161726/, 0907_163702/]. 같은 런은 위의 부력 FF 문제로 위로 흘렀으므로
+  전진 판정은 `vehicle_net_buoyancy_n` 적용 뒤 다시. 다음 레버는 `policy.q_scale`(2–3).
+- **임시 대응(2026-09-07, 미검증)**: hw_mpc/land_dp `policy.hold_tail: mask → track`(단일 변수 A/B 1순위;
+  A10이 우려한 "청크 끝마다 감속"을 관찰) + 보조 레버 `policy.q_scale`(정책 플랜 중 위치 가중치 ×s,
+  런타임 cost_set, STOP/모드 전환 복원; 기본 1.0, 강성 ~√q [유도]) + `anchor_leash_m` 상향. 판정은
+  CSV `ax_surge > 0.096` 틱 비율·순변위를 PID 런과 대조. dobmpc는 요청대로 손대지 않음.
+- **A/B 2차(2026-09-08, `track` + `anchor: measured`)**: plan 구간 |uX| 0.05–0.22 → 1.21 N(blend 1.46, hold 0.80)으로 올랐지만 여전히
+  데드밴드의 1/4이고 세 축 전부 pwm_dev ≤20 µs; 지면속도 0.008 m/s. 이제 병목은 마스크가 아니라 위 "세 축 모두 ESC 정지대역" 항목
+  [측정: 0908_112101/mpc_112101.csv, diag/taskE_out.txt]. 오늘은 measured 앵커가 같이 바뀌어 track 단독 효과로 인용 금지.
+- **제대로 고치는 법**: (a) 관측 나이(추론 232 ms, FS와 GPU 공유)를 줄여 플랜 수명을 되찾거나 마스크를
+  플랜 시작 시각이 아니라 도착 시각 기준으로, (b) 플랜트에 실측 추력 맵(데드밴드)을 넣거나 per-thruster
+  보상(직접 스러스터 인터페이스 필요), (c) 실기용 Q/R·leash·v_max를 접근 단계에 맞게 재유도.
+
+### 정책 턱 채널: "지금" 샘플은 교착이고, 의도 샘플은 **도착 전에** 닫을 수 있다 (2026-09-07)
+- **증상**: 첫 실기 접근(0907_145206, mission mpc_145239, 120 플랜)에서 기체는 물체에 도달했지만 턱은
+  안 닫혔다. 1차 원인은 `policy.gripper: false`(A12 기본 OFF) → 2026-09-07 `true`로 전환. 그런데
+  기록을 되돌려 보면 스위치를 켰어도 즉시 닫히지 않았을 것이다: 정책은 매 청크에서 knot 0 g≈0.95(열림),
+  knot 4–5에서 g<0.30(닫힘)을 내는데(마지막 15 플랜 전부), 스테이션은 스티처의 "지금" 값(`ts[0]`)만 보고
+  플랜은 0.45 s마다 교체되므로 문턱 아래 틱은 32 s 이후 7–59 %뿐이고, 새 플랜의 knot 0(0.95 >
+  open_above 0.67)이 OPEN 에지를 다시 낼 수 있다 [유도: plans.jsonl 오프라인 재생, 이 세션].
+  knot 0이 열림에 머무는 이유는 정책이 관측하는 폭이 open-loop 추정치라 명령 없이는 안 바뀌기 때문
+  (정책은 턱이 움직이길, 스테이션은 g가 내려가길 기다림).
+- **더 깊은 문제**: 정책의 닫기 의도는 t≈32 s, 최종 위치에서 **0.35 m 밖**부터 나타난다(플랜 g[-1] 평균
+  0.26). 데모에서는 손이 최종 자세 ~1 s 전(≈0.3 m)에 닫기 시작하니 정책은 그 **공간적** 타이밍을 재현하는
+  것인데, 기체는 데모보다 5–10배 느려(0.03–0.2 m/s) 그 0.35 m에 30 s가 걸린다. 의도대로 닫으면 턱(travel
+  2 s)이 도착 28 s 전에 완전히 닫힌다. 게다가 배포 관측은 분포 밖(위 "그리퍼가 화면 반대쪽" 항목)이라
+  폭 예측 자체의 신뢰도도 미확인.
+- **임시 대응(2026-09-07)**: `gripper_lookahead_s` 노브(기본 0.0 = 옛 동작; 0.6 s면 같은 런의 32 s 이후
+  틱 70–100 %가 문턱 아래) + CSV `grip_g` 열(schema 13)로 다음 런에서 hysteresis가 본 값을 남긴다.
+  첫 CLOSE 에지 뒤에는 추정 폭이 내려가 정책이 따라오므로 교착은 스스로 풀릴 것으로 본다 [예측].
+  파일럿 G/H 에지는 여전히 우선(last-writer-wins, 위 replay 항목).
+- **제대로 고치는 법**: (a) 턱 결정을 시간이 아니라 **경로 진행**에 묶는다 — 플랜의 g가 떨어지는 knot의
+  위치에 기체가 도달했을 때 닫기(스티처의 시간 팽창을 g에도 적용하면 자연히 그렇게 된다; 지금은 g가
+  knot 격자에 그대로 실리는지 확인 필요); (b) 도착 판정(참조 정지 + 의도 g<문턱)의 AND; (c) 근본적으로는
+  데모 속도에 맞는 추종(v_max ↑, 시간 팽창 ↓) 또는 폭 채널을 속도에 독립인 "거리 기반"으로 재라벨링.
+  어느 쪽이든 **턱을 켠 실기 런 1회의 `grip_g`/`grip_cmd`/events 기록이 먼저**다.
+
+### `demo_e2e.py policy`가 배포 설정으로 **red** — 임시 z-hold + demo 플랜트, 오늘 변경과 무관 (2026-09-11)
+- **증상**: `QT_QPA_PLATFORM=offscreen python rov_gui/tests/demo_e2e.py policy`가 exit 1. 배포
+  `hw_mpc.yaml policy.z_hold_above_floor_m: 0.20`(위 임시 항목)이 demo datum 기준으로 모든 knot z를 박스 밖
+  (~0.3 m)에 두어 3연속 reject → escalated, installed 0. z-hold를 null로 해도 `hold_tail: extrapolate` +
+  `anchor: measured`(둘 다 기존 미커밋 diff) 아래서 참조가 합성 플랜트를 앞질러 `diverged`로 끝난다
+  [측정: 검토 에이전트 3회 실행, 로그 스크래치패드 e2e_policy_shipped.log — 세션 종료 후 사라짐; 재현은 위 명령].
+  HIGH/LOW·ckpt 피커·max_run_s 500 변경(2026-09-11)은 실패 경로에 없지만, 그 변경에 대한 **녹색 e2e 베이스라인이 없다**.
+- **임시 대응**: 오프라인 단위 테스트(offline 119·policy 84·control 112·policy_worker 30)와
+  `rov_gui/tools/policy_observe_smoke.py` 15/15로 대신 확인. e2e는 `demo_e2e.py pid follow …` 같은 다른 셰이프만 green.
+- **제대로 고치는 법**: z-hold 항목을 예정대로 삭제한 뒤, demo 플랜트 또는 e2e 기대치를 `hold_tail: extrapolate`/`anchor: measured`에
+  맞게 재조정(`div_max_m` 0.25 대비 합성 플랜트의 응답)해 `demo_e2e.py policy`를 다시 green으로 만들고, 그때 LOW None 변형
+  (`Opts.mpc_mode = "none"`)도 드라이버 인자로 돌릴 수 있게 한다(지금은 main()이 mpc/dobmpc/…/pid만 받는다).
+
+### `demo_e2e.py mpc policy`가 한 번 "a plan was installed after STOP"으로 FAIL — 재현 안 됨 (2026-09-07)
+- **증상**: 추종자 모드 확인 중 `demo_e2e.py mpc policy` 6회 중 1회(첫 실행, dobmpc_tuned 직후 연속 실행)가
+  STOP 뒤 플랜 1개가 설치됐다며 FAIL. 같은 인자로 2회 재실행·pid/mpc_tuned/dobmpc_tuned/dobmpc 모두 OK
+  ("after STOP: 0 plans emitted, 0 installed"). 하네스는 wall-clock으로 돌고 acados 빌드 직후라 타이밍
+  플레이크일 가능성이 크지만, 실제 워커에서 STOP 뒤 in-flight 청크가 epoch/inactive 규칙을 뚫는 경로가
+  있다면 안전 문제라 기록해 둔다.
+- **임시 대응**: 없음(재현 시 그 런의 plans.jsonl `epoch`/`t_rel`과 STOP 이벤트 시각을 대조).
+- **제대로 고치는 법**: demo_e2e의 STOP 검사에 플랜의 epoch·obs_t·intake 시각을 출력하게 해 다음 재현 때
+  "STOP 이전 epoch의 지연 도착"인지 "STOP 이후 epoch"인지 즉시 갈리게 한다.
+
+### 학습 리포의 val 곡선이 **EMA 가중치 기준**이라 체크포인트 선택을 거꾸로 시킨다 (2026-09-07)
+- **증상**: 2026-09-07 5-dim 재학습에서 `logs.json.txt`의 32-윈도 `val_action_mse_error_pos`(= workspace의
+  `sample_every` 배치)로 랭킹하니 **epoch 10**이 1위였는데, 배포 가중치(`model`)로 219-윈도 held-out을 재보면
+  epoch 10이 **측정한 에폭 중 최악**(26.7 mm)이고 후반 에폭이 최고(ep150 17.2 / ep195 17.3 mm)다
+  [측정: `<run>/heldout_pos_yaw_width_ep*_model_stride4.log`, run =
+  umi_underwater_robust_control/data/20260907/0907_113747_train_umi_depth_5d_can_grasp_depth_5d_v0].
+  워크스페이스의 val은 `policy`(= EMA 사본)로 샘플링하므로, BatchNorm 결함(아래 항목)에 오염된 가중치의
+  곡선으로 **정상 가중치의 순위를 매기는 셈**이다. 같은 에폭 195에서 ema 33.0 mm vs model 17.3 mm
+  (MSE 3.6배)이고, 두 곡선의 에폭 순위는 서로 뒤집혀 있다.
+- **임시 대응**: 선택은 `dp_policy_offline.py replay --val-only --weights model`(219 윈도)로 하고, val 곡선은
+  "수렴 확인용"으로만 본다. 2026-09-07 런의 `selected.json`에 이 프로토콜과 두 곡선을 모두 적어 두었다.
+- **제대로 고치는 법**: (a) BatchNorm/EMA 결함을 고쳐(아래 항목의 (2)) 두 가중치가 같은 것을 가리키게 하거나,
+  (b) 워크스페이스의 val 샘플링을 `model`로도 돌려 두 계열을 함께 로깅하거나, (c) 주석 처리된 held-out val
+  루프(`train_diffusion_transformer_timm_workspace.py:273-288`)를 되살려 전체 검증 세트로 기록한다.
+
+### 2026-09-06 이전 모든 런에 **수중 depth가 한 프레임도 없다** (2026-09-06)
+- **증상**: 실기 런은 depth를 디스크에 안 남긴다 — 224 관측도, uint16 mm 맵도, **원본
+  스테레오 쌍도**. 그래서 사후 확인도 오프라인 재생성도 불가능하다
+  [측정: data/20260903/0903_183555/ = controller.json,
+  mission_log.txt, ui_20260903_183555.{mp4,json} — depth 없음].
+  유일한 시각 흔적인 `ui_*.mp4`는 **프레임별 auto-range + 64-knot 히스토그램 평활화로
+  이미 색칠되고 위젯 크기로 축소된 화면**의 녹화라, 같은 색이 같은 거리가 아니다.
+- **임시 대응 (지금부터)**: `--record-depth`가 `<run>/policy_obs/`에 무손실 PNG로 남긴다.
+  `python -m rov_gui.tools.depth_compare pair --run <run>`로 육상 학습 관측과 **같은 색 규칙**에
+  올려 비교한다.
+- **~~제대로 고치는 법: 원본 스테레오 쌍도 남겨야 한다~~ → 2026-09-06 구현**:
+  `--record-stereo`가 `<run>/stereo/`에 **RAW(미정류) mono 쌍 + rig + 그 런의 FS 설정**을
+  무손실로 남긴다(`rov_gui/perception/stereo_record.py`). 이제 iters/scale/체크포인트를
+  바꿔서, 또는 새 캘리브로 다시 정류해서 **재잠수 없이 depth를 다시 만들 수 있다**.
+  남은 미비: **오프라인 재생성 도구는 아직 없다** — 저장 포맷은 자기서술적이지만
+  `<run>/stereo/`를 읽어 FoundationStereo를 다시 돌리는 스크립트를 아직 안 썼다.
+
+### depth 렌더러 통일 — **절반만** 끝났다 (2026-09-06 갱신)
+- **고쳐진 쪽**: 수중 FoundationStereo 패널과 육상 FS 영상이 이제 **같은 함수**를 쓴다
+  (`rov_gui/depth_colour.py`: TURBO / warm=NEAR / 고정 0.20–3.00 m / obs 역수 간격 /
+  invalid 검정). 스테이션은 `--fstereo-palette umi`가 기본이고, 옛 장면적응형 그림
+  (JET + 프레임별 백분위 + 64-knot 평활화)은 `--fstereo-palette adaptive`로만 나온다.
+  육상은 `data_collection/make_depth_trajectory_video.py`와 `depth_compare`가 같은 모듈을
+  임포트한다. 규칙은 HUD·컬러바·런 meta(`fstereo.panel`)에 적힌다.
+- **남은 두 개(안 고침)**: 육상 recorder 프리뷰 TURBO/선형 mm/**warm=FAR**
+  (`umi_handheld/record.py:529-536`)와 수중 device-stereo 패널 TURBO/선형 mm/**warm=FAR**
+  (`rov_gui/imaging.py:105-125`, `depth_to_bgr`). 둘 다 극성이 반대라, FS 패널 스크린샷과
+  나란히 놓으면 **가까운 쪽이 반대 색**이다.
+- **덤(그대로 유효)**: repo 루트의 옛 `umi_ep0_foundationstereo.mp4`는 obs와 끝점은
+  같지만(0.2–3.0 m) 매핑이 **선형**이다 — 1.00 m가 그 영상에선 팔레트 0.29, obs에선 0.14.
+  새 3-패널 영상은 obs 간격이므로 그 옛 mp4와 섞어 보지 말 것.
+- **제대로 고치는 법**: 남은 두 렌더러도 `depth_colour.depth_mm_to_bgr`로 옮기거나
+  (device 패널은 0.3–6 m 범위를 유지하되 극성만 맞추는 선택지도 있다), 최소한 각 패널이
+  자기 규칙을 화면에 적게 한다.
+
+### 런 폴더 하나에 engagement가 여러 개이고, **플랜 로그가 공유된다** (2026-09-06)
+- **증상**: `data/20260906/0906_191935_observe/`에 engagement가 **둘** 들어 있다 —
+  `mpc_191935`(19:19:35, 14,918행, epoch 2, plan 1..1426)과 41분 뒤 `mpc_200050`
+  (20:00:50, 2,391행, epoch 4, plan 1991..2203). CSV와 meta는 파일이 분리되지만
+  **`plans.jsonl`(1,639 rec)과 `policy_plan.csv`(1,639 plan)는 두 런이 공유**하고,
+  두 번째 런의 `t_rel`은 **0부터 다시 시작**한다.
+- **왜 조용히 틀리는가**: 시간으로 플랜을 찾으면 t < 230 s 구간에서 **두 번째 engagement의
+  참조가 첫 번째의 시각에 뽑힌다**. 실제로 첫 렌더가 그랬고, 두 epoch를 섞어 잰 clock offset
+  스프레드가 **0 ms가 아니라 2,475 s**로 나왔다.
+- **임시 대응 (구현됨)**: `render_run_scene.py` / `export_run_html.py`가 engagement를
+  **데이터로 고른다**(기록된 depth 창 안에 플랜이 들어오는 쪽) + `meta.policy.epoch`와
+  CSV의 `plan_id` 열로 플랜을 필터한다. `--engagement <이름조각>`으로 명시 선택.
+  회귀 테스트 `test_run_scene.py::test_two_engagements_in_one_folder_are_not_mixed`.
+- **제대로 고치는 법**: 스테이션이 engagement마다 폴더를 새로 열거나(`_run_dir` 핀이
+  풀린 뒤 join 창이 다시 열린 것으로 보인다), 최소한 `policy_plan.csv`에 `epoch` 열을 넣어
+  파일 스스로 소유권을 말하게 할 것. 지금은 **파일 이름만 보고는 어느 런인지 알 수 없다.**
+
+### FoundationStereo 패널의 위쪽 아치·오른쪽 띠가 **빨갛다(≤0.2 m)** — alpha 0.5 정류 여백을 네트워크가 근거리로 환각하고 아무것도 안 걸러낸다 (2026-09-14)
+- **증상**: `--fstereo`(native 뷰) depth 패널 상단에 가운데가 두꺼운 짙은 빨강 아치(rect rows 0~10),
+  오른쪽 끝 ~6 px 세로 띠(cols 634~639), 왼쪽은 없음. 값은 상단 205→315 mm 램프, 오른쪽 **72 mm**
+  (disparity 357 px @640). HUD는 `valid 100%`라고 말한다 — 그 100 %가 증상(정크가 유효로 집계).
+- **원인(확정, 반박 3렌즈 0)**: `--policy`가 `--fstereo-alpha`를 0→**0.5**로 올린다
+  (`rov_gui/__main__.py:1127`, 224 obs crop coverage 게이트 때문). alpha 0.5의 좌측 정류 맵
+  (`initUndistortRectifyMap(K_left_live, D_left_live, R1, P1)`)은 격자의 **2.89 %**가 원본 센서 밖을 샘플
+  (row 0은 raw y −10.4~+5.9 → 가운데만 밖 = 아치; col 639는 raw x 638.6~643.9; col 0은 x 7.4~13.3 = 안쪽이라
+  왼쪽 띠 없음). `cv2.remap` 기본 BORDER_CONSTANT 0이 그 픽셀을 **검게** 채우고(`rov_gui/perception/fstereo.py:840-841`),
+  FoundationStereo는 softmax 회귀라 "무효"를 낼 수 없어 양수 disparity를 뱉으며(`core/submodule.py:427-431`,
+  clip은 `run_hierachical`에만), `depth_from_disparity`는 d≤0만 0 처리(`c3_camera/host_depth.py:168-226`,
+  `Z_RANGE_MM=(0,65535)`), `stereoRectify`의 `validPixROI`는 버려진다(`host_depth.py:503`). 마스크가 어디에도 없다.
+  [측정: near(<300 mm) 비율 out-of-sensor 마스크 안 0.811 vs 밖 0.015, 168/168 프레임, 번짐 1 px —
+  scratchpad `margin_check.py`/`ring_bleed.txt` 결과를 data/20260914/0914_152913/policy_obs/depth/*.png +
+  mpc_152951.meta.json `fstereo.rig`로 재현 가능; 52/52 native PNG 보유 런 전부 동일]
+- **영향**: (1) 패널·커서 프로브(아치 0.17~0.31 m, 띠 0.07~0.09 m를 "측정"으로 표시); (2) 컬러 그리드 맵은 상하단
+  여백은 FOV 밖으로 떨어지지만 오른쪽 72 mm 띠가 cols 298~399에 **물결 곡선으로 착지해 z-buffer에서 실제 표면을 덮음**
+  (프레임당 0.6~1.0 %) → `--pose` FoundationPose 마스크가 오른쪽 1/4에 걸리면 `_frame_depth_quality` p5 흔들림 가능;
+  (3) `--record-depth` native PNG에 정크가 그대로 기록(52 런); (4) **정책 obs**: 오른쪽 띠는 crop(x0=120) 밖, 상단 아치는
+  obs **row 0 한 줄에 점선(~36 %/프레임, 픽셀의 0.16~0.20 %)**으로만 들어가되 valid=255로 위장 — 53/53 런 동일,
+  육상 학습 obs(alpha 0, 소스 rows 81~369만 사용)엔 없는 형태. 플랜에 미치는 효과는 **미측정**
+  (`policy_session_replay.py`로 row 0을 row 1로 덮은 obs와 비교하면 답 나옴, GPU 필요).
+- **임시 대응**: 패널의 그 두 자리는 무시. 오프라인 통계는 out-of-sensor 마스크로 걸러서 계산(rig가 meta에 있음).
+- **제대로 고치는 법(1순위 A)**: `StereoRig.from_stereo_pair`(`host_depth.py:517-519`)에서
+  `valid_left = cv2.remap(np.full((h,w),255,np.uint8), maps_l[0], maps_l[1], cv2.INTER_LINEAR) == 255`를 만들고
+  invalid를 1~2 px **dilate**(valid를 erode하지 말 것 — col 0 쪽은 여백이 없음), `StereoRig.valid_left` 필드 +
+  provenance `valid_left_pct`/`margin_dilate_px`(meta 경계) → `fstereo.py:844` 직후 `depth_native[~valid_left] = 0`.
+  HUD `valid_native`가 ~97 %로 정직해진다. 우측 영상 마스크는 **적용 금지**(격자 8.8 %가 매칭점이 우측 여백에 떨어지지만
+  near 정크 없음, 0.016 vs 0.015). 보조로 alpha 0.2~0.3 [유도: coverage 99.1~99.6 %, 여백 0.31~0.74 %] 검토하되
+  alpha 0 시절 네트워크 d≤0 3.06 %(`fstereo_bench_out/hardware_20260902_fill.txt`)가 되돌아올 수 있음(미모델).
+  전제: run meta `fstereo.rig`에 **K_right/D_right/R2를 기록**(`hardware.py:708-715`는 좌측만 적음) — 없으면 오프라인 검증 전부 [유도].
+  범위 제한 컷(E)은 답이 아님(15 cm 그리퍼를 지운 전례, `fstereo.py:107-119`). `--record-stereo` 없이는 BORDER_REPLICATE/네트워크 전 crop A/B 불가.
+
+
+### 배포 FoundationStereo 설정이 학습 데이터와 다르다 — 의도적이지만 미해결 (2026-09-06)
+- **상태**: 학습 depth는 iters **16** / scale **1.0**
+  [측정: `~/Desktop/data collection/dataset_depth.zarr.zip` `.zattrs['depth_source']`],
+  0903 실기는 iters **8** / scale **0.75**
+  [측정: data/20260903/0903_183555/controller.json
+  `fstereo.iters` / `fstereo.scale`]. 시간축 패리티(관측 쌍 간격을 학습 stride 66.7 ms에
+  붙이기)를 사기 위한 **의도된 거래**이고 `__main__.py`의 `FS_RATE_NOTE`가 그렇게 적고 있다.
+- **미해결**: 어느 불일치가 더 비싼지 **A/B를 아무도 안 돌렸다**. `--fstereo-scale 1.0
+  --fstereo-iters 16`이 계기 패리티를 복원하지만 ~7 Hz로 떨어진다.
+- **제대로 고치는 법**: `--record-depth`로 두 설정을 각각 한 런씩 남기고 육상 관측과
+  `depth_compare`로 대조 — 이제 그 비교가 가능하다.
+
+
+### 기체 마커의 그리퍼 기하: **턱 x만 실측**, 나머지는 여전히 추정 (2026-09-03, 2026-09-08 갱신)
+- **상태**: `--policy-observe`와 새 기체 마커(선체+그리퍼+추진기+C3, 3-D, 앞뒤 헤딩 점선)는 풀에서
+  돌았다(data/20260903/0903_183405_observe, 20260908/0908_180453 등). 마커의 첫 실물 대조가
+  2026-09-08의 "턱에 문 병을 태그 58 중심에" 시험이고, 그것이 턱 위치 오류를 드러냈다(아래). 태그
+  dropout·박스 이탈·긴 런에서 안 끊기는지, 조이스틱이 끝까지 살아 있는지는 **따로 확인한 적 없다**.
+- **마커 기하의 근거 등급 (2026-09-08 갱신)**: 턱 x는 이제 **렌즈 기준 실측**이다 — 턱에 문 병을 바닥
+  태그 58 중심에 놓은 프레임에서 그립점이 렌즈 앞 0.196 m(범위 0.187~0.204) [측정: data/*/*_observe/
+  20260908/0908_180453/policy_obs/rgb/000160.jpg (런 자체 intrinsics로 태그 PnP) + 0908_170428/policy_obs/rgb/
+  000000.jpg (병 높이 0.084 (±0.006) m) + 0908_175151/policy_obs/rgb/000000.jpg (열린 턱 광선)]. CAD 체인의 110.664 mm
+  (→ 턱 0.4165)는 반증됐다(그 턱은 360행 프레임의 행 ~420으로 투영되는데 턱은 행 265~360에 보인다).
+  `rov_shape.LENS_TO_GRIP_FLU_M = (0.196, 0, −0.275)`, `JAW_CENTRE_M = policy.tcp_body_flu_m = (0.502, 0, −0.17)`,
+  메타 `rov_drawn_geometry.lens_to_grip_flu_m`. 2026-09-08 이전 런의 메타는 0.4165를 들고 있다(기록 경계).
+  **아직 미실측**: 턱 z(CAD 275.014 mm 수직에 앵커; 이미지와 ~1 cm 안에서 일치하나 독립 실측 아님 [유도]),
+  턱 y(0 가정 [예측]; 컬러 카메라는 문 병의 축을 기체 축 오른쪽 0.011 m에 본다), 손가락 길이·개구(턱 상자
+  [예측]/벤더 [스펙]), 튜브 위치(sim `GRIP_POS`를 턱과 같은 +0.0855만큼 민 [유도]), footprint/shroud(아래).
+  그리고 **렌즈 자체의 x/z가 의심된다**(항목 "C3 외부파라미터 cam_t_flu의 x/z가 의심된다") — 턱은 렌즈에
+  앵커돼 있어 어느 쪽이든 턱은 맞지만, 선체 그림은 실제보다 ~9 cm 뒤에 그려질 수 있다.
+- **추진기 shroud 반경 0.0467 m는 순환 유도**다: "수직 추진기가 기체 폭을 만든다"고 가정하고
+  footprint 0.5334에서 뺀 값이라 **독립 검증이 없다**. 게다가 CAD 폭 0.5749가 따로
+  돌아다니는데(그 값이면 0.0675) 어느 쪽이 맞는지 미결.
+- **제대로 고치는 법**: (1) 풀의 `--policy-observe` 런에서 태그 dropout·박스 이탈·긴 런·조이스틱
+  생존을 명시적으로 확인; (2) 턱 y·z와 그리퍼 튜브를 기체에서 실측(스테레오 삼각측량 또는 자)해
+  `rov_shape` + `policy.tcp_body_flu_m`(또는 `tcp_offset_cam_m`)을 같이 갱신; (3) footprint를 CAD/테이프 중
+  하나로 확정하고 shroud 반경을 재유도.
+
 ### C3 수중 depth 오차는 **거리에 비례해 커진다** — 배율 상수로는 원리적으로 못 고친다 (2026-08-24)
 - **증상**: `--depth-scale` 하나로는 한 거리에서만 맞는다. 실측 depth-vs-MAP 원시값이
   낮은 높이 **1.28**, ~0.9 m **1.56**으로 움직인다(조종사 확인).
 - **샘플링 아티팩트가 아니라는 결정적 증거**(진단 함수가 관여하지 않는 증인):
   한 메시의 세 축이 **143 x 166 x 187 mm**인데 캘리퍼 실측은 119.73 mm — 축별 1.19 /
   1.39 / 1.56, **비등방 1.31**
-  [측정: sessions/low_level_controller_data/20260823/0823_210304/mission_log.txt 21:02:29].
+  [측정: data/20260823/0823_210304/mission_log.txt 21:02:29].
   상수 배율 오차는 **모든 축을 똑같이** 늘린다. 정육면체가 벽돌로 나왔다는 건 오차가
   거리에 따라 변한다는 뜻이다.
 - **모델**: 오차는 **disparity 도메인**에 있다(disparity가 과소 보고 → depth가 길게,
@@ -45,7 +627,7 @@
 ### 물체가 태그맵에서 **매트 밑/두 칸 옆**으로 찍히면 아무것도 안 막는다 — map-frame 타당성 검사 부재 (2026-08-24)
 - **증상**: 2026-08-24 오전 두 런 모두 물체(태그 58 위)가 **매트 아래 51~53 cm**,
   가장 가까운 태그 11/10/52로 보고됐고, follow가 그대로 arm됐다(231 cm / 256 cm).
-  [측정: sessions/low_level_controller_data/20260824/{0824_101807,0824_101251},
+  [측정: data/20260824/{0824_101807,0824_101251},
   nav_*/map.json로 재투영 — 과대 배율 1.55x / 1.57x]
 - **그날의 원인은 따로 고쳤다**(`--depth-scale` 미지정 → 기본값 0.64로 승격). 남는 결함은
   **원인과 무관한 방어가 없다는 것** — 바닥 밑 물체는 물리적으로 불가능한데
@@ -204,7 +786,7 @@
   태그 21장·reproj 1.85 px·ambig 0·tag_age 0.15 s·축 포화 0 % — 계기는 전부 정상.
   2026-08-18 풀 세션에서 **두 런 연속 같은 꼭짓점**에서 발생, 조종사가 손으로 해제할 때까지
   각각 40 s / 45 s 정지
-  (`sessions/low_level_controller_data/20260818/0818_143802/mpc_143802.csv` s=1.93 정지,
+  (`data/20260818/0818_143802/mpc_143802.csv` s=1.93 정지,
   `.../mpc_143938.csv` s=5.92 정지 — 둘 다 tag 37 앵커 경로의 s≡2.0 m 꼭짓점, 즉
   origin tag 대각 반대편 모서리. 정지 중 hull wander p95 1.9 cm).
 - **기구 (세 개가 겹쳐야 성립)**:
@@ -235,7 +817,68 @@
       해야 한다. 지금은 MPCC 데드락 2건(memory: mpcc-contouring-control)과 똑같이
       solver status 0으로 조용히 실패한다.
 
+### 미스 사유가 1 Hz로만 기록돼 CSV가 dropout을 15.6배 과소보고 (2026-09-06)
+- **증상**: [`workers.py:290`](rov_gui/control/workers.py#L290)의
+  `if t - self._last_miss_note > 1.0:` 때문에 거부된 프레임은 **초당 한 줄**만
+  `fixes.csv`에 남는다. 실측: `data/20260906/
+  0906_192348/nav_192348`에서 거부 **390건이 25행**으로 기록됐다(15.6배).
+- **왜 위험한가**: `fixes.csv`의 **행 비율로 채택률을 계산하면 틀린다**
+  (채택 행은 전수, 거부 행은 1 Hz로 솎였다). 2026-09-06 진단에서 실제로
+  이 함정에 걸렸고, 진짜 숫자는 `frames.csv` + `detections.csv`를 다시 푸는
+  재현으로만 나온다.
+- **임시 대응**: 채택률은 재현으로 계산한다
+  (`rov_gui/control/tagnav.py`에 녹화 코너를 그대로 물리면 accept/reject가
+  100% 재현된다 — 채택 프레임의 `reproj_rms_px`가 |Δ| 최대 0.0051 px로 일치).
+- **제대로 고치는 법**: 문구는 1 Hz로 유지하되, 사유별 **집계 카운터**를
+  매 프레임 갱신해 런 종료 시 한 줄로 남긴다(또는 `frames.csv`에 사유 열 추가).
+
+
 ## 🐛 테스트 / 스크립트 함정
+
+### depthai를 cv2/torch보다 **먼저** 초기화해야 USB 카메라가 열거된다 (2026-09-06)
+- **증상**: 한 프로세스에서 `cv2`와 FoundationStereo(=torch+CUDA)를 먼저 import하면
+  그 프로세스에서만 USB OAK-D-W가 `getAllAvailableDevices()`에 **30초 넘게 안 뜬다**.
+  같은 시각에 띄운 다른 파이썬은 즉시 본다. PoE인 C3는 멀쩡해서 "USB 카메라가 고장났다"로
+  읽힌다 [측정 2026-09-06: 도구 안에서 20회 × 1.5 s 재시도 내내 C3만, 별도 인터프리터는
+  둘 다].
+- **대응**: `import depthai` → 열거 → **두 장치를 먼저 연다** → 그 다음 무거운 import.
+  `rov_gui/tools/depth_two_cameras.py`와 `depth_live_view.py`가 그 순서로 되어 있다.
+- **제대로 고치는 법**: 원인을 XLink 초기화 순서로 좁히고(추정), 필요하면 진입점에서
+  한 번 열거해 두는 헬퍼로 강제.
+
+### 카메라 도구를 `kill -9` 하면 장치가 booted로 남고 워치독이 안 살린다 (2026-09-06)
+- **증상**: SIGKILL 후 USB PID가 `03e7:2485`(unbooted) → `03e7:f63b`(booted)로 바뀌고
+  `getAllAvailableDevices()`가 빈 배열, 직접 연결은 `X_LINK_DEVICE_ALREADY_IN_USE`.
+  2분 넘게 자동 회복되지 않았다.
+- **함정**: heredoc으로 띄운 프로세스는 커맨드라인이 `python -`이라 **`pkill -f <스크립트명>`이
+  안 잡는다**. 그래서 "아무도 안 잡고 있는데 안 된다"처럼 보인다.
+- **대응**: 인터프리터 경로로 찾아서 **SIGTERM**한다. 정상 종료가 장치를 돌려준다.
+  ```
+  ps aux | grep 'rovgui-pose/bin/python'
+  kill -TERM <pid>
+  ```
+  실측: SIGTERM 6초 뒤 USB PID가 `03e7:2485`로 복귀, 뽑았다 꽂을 필요 없었다.
+- **제대로 고치는 법**: 카메라를 여는 도구에 SIGTERM 핸들러를 달아 `device.close()`를
+  보장하고, 도구는 `kill -9` 하지 말 것.
+
+
+### `test_object_nav.py`가 먼저 돌면 `test_policy.py`가 23개 깨진다 — 순서 의존 (2026-09-06)
+- **증상**: 파일 단독으로는 `test_policy.py` **42/42 통과**. 전체 스위트에서는 26개 실패.
+  최소 재현: `pytest rov_gui/tests/test_object_nav.py rov_gui/tests/test_policy.py`
+  → **23 failed, 55 passed**. `pytest rov_gui/tests/test_replay.py
+  rov_gui/tests/test_policy.py` → 51 passed. 즉 오염원은 `test_object_nav.py`다.
+- **두 갈래로 나타난다**: (1) 플랜 인테이크가 죽는다 —
+  `w.replay["installed"] == 0`, `rp["late"] == 0` 등 `MpcWorker`가 플랜을 아예 안 받는다;
+  (2) 벽시계 의존 — `engage refused: imu stale (0.44s)`. 후자는 앞 파일이 소비한
+  wall-clock에 좌우돼서, 무관한 코드가 수 ms만 움직여도 실패/통과가 뒤집힌다.
+- **내 변경 탓이 아님을 확인**: 2026-09-06 `--record-depth` 관련 파일 4개를 전부 되돌리고
+  같은 명령을 돌려도 **23개가 그대로 실패**한다(되돌린 상태 23, 되돌리기 전 24 — 늘어난
+  1개는 위 (2)의 imu-stale 타이밍 케이스).
+- **임시 대응**: 정책 테스트는 파일 단독으로 판단한다. 전체 스위트의 실패 수를 회귀
+  신호로 쓰지 말 것.
+- **제대로 고치는 법**: `test_object_nav.py`가 남기는 전역 상태를 찾아 fixture로 격리하고,
+  시계 의존 검사는 monotonic 주입으로 바꾼다.
+
 
 ### 1280×800에서 **컬러 스트림이 디바이스 프레임의 3.3%를 떨어뜨린다** (2026-08-04)
 - **발견**: 2026-08-04, maxres를 8.4 → 29 fps로 고친 뒤 실기 take 검증 중.
@@ -364,7 +1007,7 @@
   커밋 이후 한 번도 안 바뀌었는데(`git log -- config/config.yaml`), ROV 실기록이 둘 다
   넘긴다.
   1. **압력센서가 개입하지 않는 하한**: 채택된 fix의 `z_ned` 최저 **−1.296 m**
-     (p50 −1.138, n=22094 — `sessions/nav_runs/*/fixes.csv`, 2026-08-13/14 집계).
+     (p50 −1.138, n=22094 — `data/*/*/nav_*/fixes.csv`, 2026-08-13/14 집계).
      바닥 태그 매트가 z=0이고 +z가 아래니까, 기체가 매트 위 1.296 m에서 **잠긴 채**
      바닥 태그를 보고 있었다는 뜻 → 매트 위 물기둥이 최소 1.3 m.
   2. **압력에서**: engage마다 `StateAssembler.calibrate_z_offset`이
@@ -715,7 +1358,7 @@
   한 프레임에 들어오기는 했으나 **물체가 1.2~1.56 m**에 있어 `object_nav.max_distance_m:
   1.20`이 관측을 거의 전부 거부했다. 근거: `pose: collecting reference views — object is
   1556 mm away`와 메시 캡처 시 `distance 1195-1256 mm`
-  (`sessions/low_level_controller_data/20260823/0823_162548/mission_log.txt`),
+  (`data/20260823/0823_162548/mission_log.txt`),
   16:34~16:36 세 런의 `obj_state`가 **전 행 `cold`**(한 번도 lock 안 됨), 16:38 런은
   단 한 번 lock한 뒤 **전 행 `lost`**로 `obj_age_s`가 9.6 s→202 s까지 자람
   (`0823_163414/mpc_163512.csv`, `0823_163707/mpc_163809.csv`). 그래서 플롯에
@@ -730,7 +1373,7 @@
 ### 물체 자세의 **거리가 1.42~1.50배 길다** — 원인 미확정(메시 스케일 vs depth 캘리브) (2026-08-23)
 - **증상**: 매트 위에 놓인 물체가 태그면 **아래 0.42~0.50 m**에 찍히고, 선체→물체 광선이
   태그면까지 거리 대비 **1.42~1.50배**(p10~p90 1.37~1.60). 방향은 맞고 길이만 늘어난다.
-  [측정: `sessions/low_level_controller_data/20260823/0823_174602/mpc_174638.csv`,
+  [측정: `data/20260823/0823_174602/mpc_174638.csv`,
   `mpc_174657.csv`, `obj_state=live` 행; 태그면 위치는 각 런 meta의
   `hardware.datum_tag_frame.p0`]
 - **굴절은 아니다(부호가 반대)**: 평면 포트에서 물은 상을 1.33배 크게 만들어 거리를
@@ -783,7 +1426,7 @@
   치수·참조뷰 distance 전부 인용 금지.
 - **(이하 과거 분석 기록)** 2026-08-23 20:00 당시 원인 후보였던 것: 재구성이 물체가 아닌
   것을 삼킨다(스케일 오류가 아니다).**
-  같은 물체 여덟 번 재구성 [측정: `sessions/pose_meshes/*/model/model.obj`, oriented bbox]:
+  같은 물체 여덟 번 재구성 [측정: `data/*/*_obj/model/model.obj`, oriented bbox]:
 
   | verts | bbox (mm) |
   |---|---|
@@ -797,7 +1440,7 @@
 
   **범인은 마스크가 아니라 마스크 안의 depth이고, 그 결정 변수는 거리다.**
   저장된 모든 참조 캡처에서 마스크 안 depth의 p5~p95를 재봤다
-  [측정: `sessions/pose_meshes/*/{depth_enhanced,mask}`]:
+  [측정: `data/*/*_obj/{depth_enhanced,mask}`]:
 
   | 캡처 거리 | 마스크 안 depth 산포 | 결과 메시 길이 |
   |---|---|---|
@@ -963,24 +1606,257 @@ SAM2 추적(1단계), 메시 기반 6-DoF(2단계), 현장 재구성(3단계)을
 - **제대로 고치는 법**: `demo_e2e`의 60 s 상한을 경로 길이에서 유도하거나, demo
   `SHAPES["line"]`를 더 짧게. 고치면 이 항목 삭제.
 
+### DP 데이터셋: `extract_pose`가 tilt 0 extrinsic을 합성하는데 실기 C3는 43.3° 숙여 있다 (2026-09-01)
+- **증상**: `umi_handheld/extract_pose.py:149`가 `--extrinsic c3` 기본 경로에서
+  **cam_tilt_deg = 0(forward-level)** 등록을 합성한다. 실기 값은
+  `config/hw_nav.yaml:161` `cam_tilt_deg: 43.3` [측정 2026-08-17].
+  라벨은 "이 카메라가 C3 마운트에 달렸다면 BODY(FRD) 원점이 있었을 자리"인데,
+  그 마운트 자세가 틀리면 **모든 위치 라벨이 자세 결합 오차만큼** 틀린다.
+  같은 불일치를 리포는 이미 "최대 0.21 m 오프셋 + yaw 오염"으로 가격했다
+  (KNOWN_ISSUES 'C3 틸트 보정' 항목). reprojection error에는 안 보인다.
+- **임시 대응**: 없음. 아직 라벨을 만든 세션이 하나(0026)뿐이고 그건 fix 0이라
+  오염된 산출물은 없다.
+- **제대로 고치는 법**: `extract_pose`에 `--cam-tilt-deg`를 노출하거나
+  `rov_gui/control/geometry.py`의 `NavConfig.R_t_frd_cam`(이미 tilt를 옳게 합성한다)를
+  재사용하고, 쓴 값을 `poses.json`·`session.json`에 **경계 필드로** 찍는다.
+  rig도 지그로 같은 각도에 물리적으로 고정한다. 틸트 병진 성분은 여전히 미실측이므로
+  같은 기회에 `cam_t_flu`를 잰다. **대량 촬영 전에 고칠 것 — 사후엔 전량 재라벨이다.**
+
+### DP 데이터셋: 촬영 stereo 설정과 비행 stereo 설정이 전부 다르고, warp 도착 격자도 배포 격자가 아니다 (2026-09-01)
+- **증상**: 두 경로가 공유하는 knob이 사실상 없다.
+  촬영(`configs/pipeline.yaml` stereo_depth): extended **true**, subpixel **true**(3 bit),
+  median **off**, confidence 245, `depth_align: rectified_left`,
+  decimation 2 + speckle + temporal + spatial(hole_filling 3) + threshold 100~3000 mm.
+  비행(`rov_gui/backends/hardware.py:425-447`이 `StreamConfig`를 만들 때 아무것도 안 덮음
+  → `c3_camera/config.py:179-192` 기본값): extended **False**, subpixel **False**,
+  median **5x5**, preset robotics, `depth_align: "color"`, 후처리 스테이지 **없음**.
+- **파생 결과**: (a) MinZ 300 mm(비행) vs ~112 mm(촬영) — 파지 직전 구간이 배포 센서엔
+  물리적으로 없다; (b) 훈련 depth는 hole-fill·시간평활·3 m 절단, 배포 depth는 생것;
+  (c) warp 도착 격자는 `configs/target_camera_underwater.yaml`의 **raw CAM_B**인데
+  배포가 서빙하는 건 **CAM_A(colour) 정렬** depth다.
+- **임시 대응**: 없음. 지금 촬영하면 데이터셋 전체가 이 불일치를 안고 굳는다.
+- **제대로 고치는 법**: 설정 **하나**를 정해 양쪽에 강제하고 그 해시를 세션마다 찍는다.
+  격자는 둘 중 하나 — 비행을 `depth_align=rectified_left`로 바꾸거나(단 rectified 모델은
+  EEPROM에 extrinsics가 없어 수중 재캘리브 필요), 같은 EEPROM 덤프로 **CAM_A 타깃 모델**을
+  만들어 warp를 그쪽으로 돌린다. `zarr.z_near_m: 0.20`도 배포 MinZ 위로 올려야 한다.
+
+### DP 데이터셋: 기존 handheld 데모 25개의 pose 라벨 수율이 **0%로 측정**됐다 (2026-09-01)
+- **증상**: `data/20260831/demonstration_0026/poses.json` = n_frames 576, **n_fix 0**,
+  reject_counts `{"no tags": 576}`. 25개 세션 전부를 독립 재검출(세션당 10프레임,
+  pupil_apriltags tag36h11)해도 id 0/1(그리퍼 손가락) 말고는 **0검출**이다.
+  원인은 계획서가 적은 "태그 패밀리"가 아니라 **환경 태그가 아예 없는 실내 사무실 장면**.
+  계획서 `docs/DP_TRAJECTORY_PLAN.ko.md:180-183`의 "미기록/추정" 두 헤지는 이 측정으로
+  대체돼야 한다. 덤으로 그 25개는 워킹트리에 없다(2026-08-31 filter-branch 사고,
+  `refs/original` 백업 ref에만 존재 — 복구 전까지 `git gc` 금지).
+- **임시 대응**: 없음. 라벨용 데이터는 **0개**다.
+- **제대로 고치는 법**: 새 촬영. `record.py`의 `TagProbe`가 지금은 그리퍼 손가락 태그만
+  보므로(`record.py:714-715`가 `cfg['gripper']['aruco']`로 만든다), **매핑된 환경 태그 수**를
+  라이브로 띄우고 `frames.csv`에 적게 확장한 뒤에 찍을 것. 안 그러면 이 사고가 반복된다
+  (0026은 24일 뒤에야 발각됐다).
+
+### DP 데이터셋: `build_zarr`에 pose/action 배열이 없고 gripper 채널이 전 스토어 상수 0.0 (2026-09-01)
+- **증상**: `umi_handheld/build_zarr.py`가 쓰는 배열은 camera / camera_1 /
+  camera0_main_depth / tracked_gripper_pct 넷뿐 — **pose도 action도 없다**(선행연구
+  affordance 파이프라인용 스키마다). `zarr/` 7개 스토어 전부 `tracked_gripper_pct`가
+  단일값 0.0이고 `gripper_dimensions_are_placeholders=true`이며,
+  `meta/episode_ends`가 shape (1,) = **에피소드 1개짜리**라 다중 에피소드 슬라이싱이
+  한 번도 돌아본 적이 없다.
+- **부수 결함**: `.gitignore:34`의 `data/` 규칙이 앵커되지 않아 `zarr/*.zarr/data`가
+  통째로 무시된다 → `git ls-files zarr` 28개(.zgroup/.zarray/episode_ends)뿐인데
+  `git status`는 아무 말도 안 한다. 새로 clone하면 **픽셀 없는 zarr**를 받는다.
+- **제대로 고치는 법**: 슬라이서(A2)를 만들 때 `poses.npy`+`gripper_width.npy`를
+  물리고 배열을 추가한다. `.gitignore`는 `/data/`로 앵커한다.
+
+### cv2 5.0의 "두꺼운 검정 + 얇은 흰" 외곽선이 긴 라벨의 꼬리를 유령으로 남긴다 (2026-09-06)
+- **증상**: OpenCV 5.0.0의 `putText`는 thickness에 따라 글리프 전진폭이 달라진다
+  [측정 2026-09-06, `cv2.getTextSize`, 같은 79자 문자열 @scale 0.40: **thickness 1 → 408 px,
+  thickness 2/3/4 → 435 px**]. 그래서 같은 org에 검정 3 → 흰 1을 겹쳐 그리는 관용구는
+  외곽선이 채움보다 점점 오른쪽으로 밀려, 문자열 끝에서 27 px만큼 **꼬리 글자가 그림자로
+  남는다**. 라벨이 길수록 뚜렷하고, 짧은 라벨에서는 안 보인다.
+- **해당 코드(안 고침)**: `rov_gui/tools/depth_compare.py:272-277` `_put`,
+  `c3_camera/viz.py:133-143`. 둘 다 cv2 5.0.0인 env(`fstereo`/`oakd`/`rovgui-pose`)에서 돈다.
+  cv2 4.x(`robust` 4.10, `umi` 4.7)에서는 재현되지 않는다.
+- **임시 대응**: `data_collection/make_depth_trajectory_video.py`의 `text()`는 두께를 1로 고정하고
+  ±1 px 오프셋 4장으로 외곽선을 그린다 — 전진폭이 같아지므로 유령이 없다.
+- **제대로 고치는 법**: 위 두 곳도 같은 방식으로. 순수 미관 문제이고 측정값엔 영향 없다.
+
+
 ## 📌 알려진 한계 (당장 고칠 계획 없음, 잊지 말 것)
 
-### replay 미션(plan_stream): **실기 미검증** + jaw 중재·라이브 소스 함정 2건 (2026-08-30)
+### 2026-09-14 이전에 앱이 쓴 기록 안의 경로는 여전히 `sessions/…`를 가리킨다 (2026-09-14)
+- **증상**: 데이터 루트를 `data/YYYYMMDD/<run>[_kind]/` 하나로 접으면서(`tools/migrate_data_layout_20260914.py`,
+  485건 이동) config 주석·docs·journal·memory의 인용은 새 경로로 고쳐 썼지만(292줄), **앱이 런타임에 쓴 기록**은
+  손대지 않았다 — `_pose.jsonl`의 MESH 행 `path`/`ref_views_dir`(구 `sessions/pose_meshes/obj_*`), 옛 dryrun
+  `meta.json`의 `log_dir`(`rov_gui/tools/dp_policy_out/*/`), `rov_gui/tools/fstereo_bench_out/*.json`, 각 런의
+  `events.log`/`mission_log.txt` 본문. 그 경로는 이제 존재하지 않는다.
+- **해결 경로**: `data/MIGRATION_20260914.json`의 `moves[]`(from→to)로 풀어 읽는다. 기록을 고쳐 쓰지 않는 이유는
+  측정치 인용 규칙과 같다 — 기록은 당시 그대로여야 한다.
+- 같은 이유로 `sessions/demonstration_0015/0019`, `sessions/grippercalibration_0004`, `sessions/session_syn`처럼
+  이행 시점에 이미 없던 폴더의 인용(`configs/pipeline*.yaml`, `umi_handheld/extract_gripper_width.py`, journal)은
+  그대로 두었다 — 원래부터 죽은 참조였고, 어디로 갔는지 확인된 바 없다.
+
+### `replay-html`의 z 눈금자가 라이브 패널과 갈라졌다 (2026-09-07)
+- **증상**: 라이브 `3D` 패널의 깊이 눈금은 2026-09-07에 **오른쪽 여백 고정 게이지**가
+  됐지만(`_z_gauge`/`_paint_z_axis`), `./c3 replay-html`이 굽는 HTML은 **독립 JS 포트**
+  `rov_gui/tools/replay_html_page.html:411 drawZAxis()`를 쓰고 그건 여전히 **선체의
+  투영된 왼쪽 모서리 − 34 px**에 앵커한다. 즉 같은 런을 두 도구로 보면 눈금자가 한쪽은
+  가만히 있고 한쪽은 기체를 따라다닌다.
+- **왜 남겼나**: 다른 언어의 별도 구현이고 테스트가 없다. 사용자가 물은 것은 라이브
+  GUI였다.
+- **임시 대응**: 리플레이 HTML의 눈금자는 "기체 옆에 붙은 옛 눈금자"로 읽을 것. 두
+  도구의 눈금 위치를 같은 것으로 인용하지 말 것.
+- **제대로 고치는 법**: `_z_gauge()`의 규칙(고정 창 → 고정 픽셀 띠, 자세·pan 무관,
+  확장 전용 래치)을 `drawZAxis()`에 그대로 포팅. 창 상수는 파이썬 쪽
+  `Z_GAUGE_WINDOW_M`을 HTML 생성 시 주입해서 두 곳에 숫자를 두 번 쓰지 않는 것이 좋다.
+
+### `policy_observe_smoke`의 폴백 자세가 매트 아래다 (2026-09-07)
+- **증상**: `rov_gui/tools/policy_observe_smoke.py:86, :204`가 fix가 없을 때
+  `_set_p_act((0.0, 0.0, 0.35))`로 떨어진다. map z는 **아래가 +**라 +0.35는 태그 평면
+  **아래** — 실기록 44,548개 accepted fix는 전부 −0.856 .. −0.165 m 구간이고
+  [측정: `data/2026090*/*/nav_*/fixes.csv`, 32파일] 매트
+  아래로 간 적이 없다. 새 깊이 게이지가 바늘로 그 값을 찍기 시작해서 이제 스모크 샷에
+  "실제로 존재한 적 없는 깊이"가 보인다.
+- **임시 대응**: 스모크 샷의 깊이 숫자는 인용하지 말 것.
+- **제대로 고치는 법**: 두 곳을 실측 p50인 `-0.22`로 바꾼다. 한 줄짜리지만 이번 변경의
+  범위 밖이라 손대지 않았다.
+
+### 두 카메라 폴백 + 틸트 추적은 **실기 미검증**, 틸트 속도는 [예측] (2026-09-07)
+- **무엇**: `hw_nav.yaml: fallback` — C3가 `after_s`(0.2 s) 조용하면 기본 RGB의
+  fix가 대신 들어간다(`control/nav_fusion.py`). RGB의 [예측] extrinsic 오차는 body
+  프레임 상수 E로 학습해 나눠 주고, 학습 전엔 보류한다. PAYLOAD의 CAMERA TILT 줄이
+  마운트 각을 추적한다(`control/tilt_tracker.py`).
+- **검증된 것**: 합성뿐. 40° 틸트 + 5 cm 오차를 심은 RGB가 8쌍 뒤 5 mm 안으로
+  복원되고, 실측 틸트가 40.0°로 나온다(`rov_gui/tests/test_control.py`
+  `test_second_camera_fallback_*`, `test_nav_fusion.py`).
+- **첫 실기(2026-09-07 14:52, `0907_145206/nav_145240`)에서 배운 것**: 정렬은 됐다
+  (`offset 67 mm spread 11 mm`, RGB fix 63) — 막힌 건 **RGB 카메라 모델**. 왜곡항이
+  없어 다태그 RGB 프레임이 3 px 게이트에서 전부 죽고, 통과한 63 중 58이 단일 태그
+  (self-residual 2.1~2.4 px vs C3 0.17). 임시로 `fallback.max_reproj_px: 8.0`
+  [예측]; 제대로는 REC NAV(양 카메라가 매트를 보게, 여러 위치·헤딩) →
+  `rov_gui/tools/calibrate_second_cam.py --yaml` → `second_cam`에 붙여넣기 →
+  게이트 복귀. **2026-09-08 완료**: `nav_111010`(RGB 3,463 프레임)로 fx 713.8 + 왜곡
+  5항, 렌즈 위치·틸트 15.9° 실측 → `second_cam` 기입; 재현서 RGB 채택 43.5% → 100%,
+  두 솔버 offset 2 mm. 게이트는 4.0(RGB 픽셀 피치 2배 [유도]). 남은 것: 아래 1, 3.
+- **실기에서 확인해야 할 것**:
+  1. `second_cam.tilt_rate_deg_s: 30` **[예측]** — 한 번도 재지 않았다. 마운트를
+     LEVEL에서 DOWN으로 2 s 눌러 두고 PAYLOAD의 `measured:tags` 값을 읽으면 그
+     자체가 실측이다(태그가 양쪽 카메라에 보여야 함). 그 전까지 dead-reckoned
+     값의 ±는 적분한 각의 절반씩 커진다.
+  2. RGB 피드의 `t_capture`는 **도착 시각**이다(RTP h264 지연 100~300 ms 미보정,
+     `hardware.py _publish`). 정렬 쌍은 `pair_tol_s` 0.08 안에서 C3 fix와 맺히므로
+     쌍 사이 실제 시간차가 지연만큼 난다. **실측 2026-09-08**: 그 런의 재현에서
+     spread 1.7 mm(207쌍) — 그 속도에선 무시할 크기. 빠르게 움직이는 런에선
+     `spread_mm`을 다시 볼 것.
+  3. 핸드오버 순간의 실제 계단 크기(controller.json `nav_fallback.offset_mm`
+     대비 `spread_mm`), 그리고 MPC engaged 중 핸드오버가 기체를 움직이는지.
+  4. `fallback.min_pairs: 10`이 실제 프레임률에서 충분히 빨리 차는지(C3 15 Hz +
+     RGB 32 fps면 ~1 s [예측]).
+- **알려진 한계(설계상)**: 두 카메라를 **한 PnP에 합치지 않는다**(RGB 캘리브가
+  전부 [예측]이라 좋은 C3 해를 오염시킬 뿐). 마운트가 움직이면 E를 버리고 다시
+  배우므로, 움직인 직후 C3가 끊기면 그 구간은 공백이다(`allow_unaligned: true`로
+  바꿀 수 있으나 계단을 감수하는 것).
+
+### replay 미션(plan_stream): **실기 미검증** + jaw 중재 부재 (2026-08-30, 2026-09-02 갱신)
 - **실기 미검증**: shape `replay`(기록 시연 재비행, `control/plan_stream.py` →
   `set_path_plan_ned`) 전체가 오프라인(9/9 + 19/19)과 demo_e2e(실제 acados,
   honest-완주 판정)까지만 검증됐다. safety-code-reviewer 감사(2026-08-30)의
   CRITICAL(딜맨이 래치된 버튼 비트 미해제)·HIGH(발산 가드 부재)는 **수정 완료**.
-- **jaw 중재 부재(잔존)**: 파일럿 G/H와 replay가 같은 `cmd_gripper_drive`를
-  last-writer-wins로 쓴다. 완화 3중(replay는 상태 변화 에지에서만 방출 + 기본
-  `replay.gripper: false` + 딜맨이 이제 held drive를 놓음)으로 M0엔 충분하다는
-  감사 판단이지만, 파일럿이 **누르고 있는** 중에 replay 에지가 덮으면 릴리스까지
+- **jaw 중재 부재(잔존)**: 파일럿 G/H와 replay/policy가 같은 `cmd_gripper_drive`를
+  last-writer-wins로 쓴다. 완화 3중(스트림 미션은 상태 변화 에지에서만 방출 + 기본
+  `gripper: false` + 딜맨이 이제 held drive를 놓음)으로 M0엔 충분하다는
+  감사 판단이지만, 파일럿이 **누르고 있는** 중에 워커 에지가 덮으면 릴리스까지
   파일럿 의도가 밀린다. 제대로: sink에 jaw 전용 중재(파일럿 우선 + 워커 방출 무시
-  창) — `replay.gripper: true`를 상시 쓰기 전에.
-- **라이브 policy 소스 함정**: PlanFilter의 신선도 게이트는 `obs_t=None`이면
-  조용히 skip한다(replay엔 옳다 — 기록 시연에 관측 시각이 없다). 나중에 라이브
-  diffusion-policy 소스를 붙일 때 obs_t를 안 실으면 **0.7 s stale 게이트가 통째로
-  꺼진 채** 돈다. 제대로: 라이브 소스에선 obs_t 부재 = reject로 뒤집을 것
-  (plan_stream.py:201-209 부근).
+  창) — `replay.gripper: true` / `policy.gripper: true`를 상시 쓰기 전에.
+  (2026-09-02부터 모든 드라이브가 `MpcWorker.on_gripper_drive`의 open-loop 폭
+  추정기에도 적분되므로, 중재가 생기면 추정기도 같은 곳에서 먹여야 한다.)
+
+### 라이브 diffusion policy(shape `policy`): TCP/턱 기하 — **x만 실측**, y·z 미실측 (2026-09-02, 2026-09-08 갱신)
+- **상태**: `--policy` 스택은 2026-09-07부터 풀에서 돈다(data/20260907/0907_145206
+  이후); 실기에서 드러난 문제는 이 파일의 2026-09-07/08 항목들(턱 채널, 추종자 정지대역, yaw 좌편향)에 따로
+  있다. 파지 결과를 정책의 것으로 귀속하기엔 아직 이르다(아래).
+- **TCP = 턱 기하**: `policy.tcp_body_flu_m: [0.502, 0, -0.17]` = `cam_t_flu` + 렌즈→그립 [0.196, 0, −0.275]
+  (2026-09-08; x [측정: data/20260908/0908_180453_observe/policy_obs/rgb/000160.jpg — 턱에 문 병을
+  태그 58 중심에 놓음, + 0908_170428/policy_obs/rgb/000000.jpg 병 높이 0.084 (±0.006) m + 0908_175151/policy_obs/rgb/000000.jpg
+  열린 턱; 범위 0.187~0.204], z CAD 수직 [유도], y=0 [예측]). 2026-09-02~07 런의 0.4165(시뮬 JAW_POS)는 이미지가
+  반증했고 **기록 경계**다(meta `policy.tcp_body_flu_m`). 렌즈에서 0.338 m / 광축 아래 약 11° [유도]라 턱은
+  프레임 아래쪽(행 265~360)에 **보인다** — 핸드헬드(카메라 축 앞 0.346 m / 아래 22° [유도: 데이터셋 config
+  offset_m [0.0355, 0.1293, 0.3186]])보다 광축에 가깝다. **핸드헬드와의 불일치 벡터(보정 안 함)**: 턱 − 손끝,
+  C3 광학 프레임(x 우, y 하, z 전) = [−0.036, −0.062, +0.012] m(|0.072|; 옛 0.4165는 [−0.036, −0.004, −0.050],
+  |0.062|) = body FLU 앞 +0.051·좌 +0.036·위 +0.037 [유도: `NavConfig.R_t_frd_cam` + `tcp_offset_from_body`].
+  dp는 카메라 상대라 카메라 궤적은 이 키와 무관하고(t_bt는 yaw 일정 시 정확히 소거), 이 벡터가 "정책이
+  학습대로 카메라를 놓았을 때 턱이 물체에서 어긋나는 양"이다 → 예상되는 첫 파지 실패는 **~5 cm 지나침·~4 cm
+  높음·~3.6 cm 왼쪽**이지 "못 미침"이 아니다(옛 값은 3.4 cm 못 미침에 같은 좌/위; 턱이 정말 축 오른쪽
+  0.011 m면 좌 2.4 cm). `tcp_offset_cam_m`으로 덮지 말 것 — 턱은 거기 있다; 보정은 별도 결정·별도 기록
+  경계(예: 플랜 레벨 오프셋). 남은 것: 턱 y·z 미실측, `cam_t_flu` 자체의 x/z 의심(별도 항목; 턱은 렌즈에
+  앵커돼 있어 TCP는 어느 쪽이든 맞다).
+- **제대로**: C3 프레임에서 턱 중심을 스테레오 삼각측량으로 실측(`measure_rig.py --pick-tcp`류)해
+  `tcp_offset_cam_m`에 넣으면 렌즈 위치가 소거된다. 그 전엔 파지 결과를 정책의 것으로 귀속하지 말 것.
+
+### policy: 디바이스 depth는 **거부**, FoundationStereo만 parity 경로 (2026-09-02)
+- `--source hw --policy`에 `--fstereo`가 없으면 기동을 **거부**한다(`--mpc`가 없는 건
+  경고뿐이고, 거부가 경고보다 먼저 판정된다). C3 자체 depth는 CAM_A 정렬(63.7°
+  화각)이라 정책 FOV(CAM_B 85.6°) 안에 든 부분만 덮고 [유도: 화각 비교, 면적 비율은
+  미계산], ×0.64 stopgap이 걸린 온디바이스 매처다. `--policy-allow-device-depth`는
+  벤치 실험용이며 경고와 함께 meta에 `depth_scale_applied: 0.64`와 coverage가 남는다.
+- `--fstereo`도 훈련 스토어 설정(iters 16 / scale 1.0 [측정: `~/Desktop/data
+  collection/depth/0/depth.zarr/.zattrs`])과 다르면 `--policy-allow-fs-mismatch`
+  없이 거부한다(체크포인트는 타이핑 값이 아니라 실제 로드될 기본값까지 비교). 이
+  설정의 실측: 7.26 Hz, solve 137 ms, panel latency 243 ms [측정: rov_gui/tools/fstereo_bench_out/policy_bench_20260902_141224.json, C3 실기, alpha 0.5, scale 1.0, iters 16, 330 frames, GPU shared with a concurrent test run].
+
+### policy: FS 7.26 Hz라 depth 페어가 훈련 stride의 **2.07배** — 계기 parity와 시간 parity가 충돌 (2026-09-02)
+- 훈련 관측은 66.7 ms 간격 두 장인데, `--policy` 기본(iters 16 / scale 1.0 / alpha 0.5)의
+  FoundationStereo는 7.26 Hz, solve 137 ms, panel latency 243 ms [측정: rov_gui/tools/fstereo_bench_out/policy_bench_20260902_141224.json, C3 실기, alpha 0.5, scale 1.0, iters 16, 330 frames, GPU shared with a concurrent test run]라 한 관측의 depth 두 장이 프레임 간격 138 ms = 2.07×
+  떨어진다(플랜마다 `obs_pair_dt_s` 기록; 페어 상한 3.0·obs_dt = 200 ms라 skip은 안
+  된다). proprio 두 행은 이제 **같은 138 ms**로 잡아 이미지-proprio 기준선은 일치하지만
+  (검증 2026-09-02 수정), 네트워크가 훈련에서 본 적 없는 2배 기준선을 본다는 사실은
+  남는다. `--fstereo-scale 0.5` + `--policy-allow-fs-mismatch`면 ~15 Hz 페어(≈ near
+  창 안)를 얻는 대신 계기 불일치(훈련 scale 1.0)를 산다 — 어느 쪽 불일치가 싼지는
+  실기 A/B 전엔 모른다 [예측]. 고치려면 20 Hz FS(모노 MJPEG, fstereo 메모리)나
+  scale 0.5 재학습 depth 스토어.
+
+### policy: proprio SNR — 66.7 ms 운동 단서가 태그 fix 잡음과 같은 자릿수 (2026-09-02)
+- 정책의 상대 자세 관측은 두 행의 차이다(훈련 66.7 ms; 실기에선 depth 페어 간격과
+  같은 138 ms — 위 항목). 0.08 m/s에서 그 변위는 66.7 ms에 ~5 mm, 138 ms에 ~11 mm
+  [유도]인데 단일 태그 PnP의 위치 잡음은 ~1 cm 수준 [예측: demo 잡음 모델과 같은
+  자릿수; 실기 잔차 fit은 아래 "`rov_gui --mpc`: 폐루프 MPC 스택 전체가 실기·수중
+  미검증" 항목의 3번(EAOB 시그마) 참조]. fix 기준 히스토리(A6)와 degenerate /
+  fix-lag skip으로 **양자화**와 몰래 줄어드는 단서는 막았지만 SNR 자체는 못 올린다.
+  `dp_policy_offline.py noise`가 민감도를 재는 도구이고, 실기 값은 첫 런의
+  plans.jsonl `lowdim`에서 읽을 것.
+
+### policy: hold-tail cost mask(A10)가 **실기 미검증** (2026-09-02)
+- `policy.hold_tail: mask`는 플랜 끝 너머 stage의 위치/선속도 가중치를 0으로
+  둔다(`HwDobMpc._apply_stage_weights`) — 단 **플랜이 살아 있고 래치되지 않은 동안만**
+  (`_tick_replay`의 `live` 게이트, 2026-09-02 검증 수정: 그 전엔 플랜 만료·halt 뒤에도
+  호라이즌 전체가 마스크돼 x/y/z·heave 가중치가 0이었다; 만료 뒤엔 `w_stage=None`,
+  종점 hold 전체 가중치). 오프라인에선 StubCtrl이 w_stage를 받는
+  것과 acados가 완주하는 것까지만 확인했다. 실기에서 "브레이크 조기 밟기"가 정말
+  사라지는지, 마스크가 solver 조건수를 흔들지 않는지는 미확인. 의심되면
+  `hold_tail: track`(종전 거동)으로 A/B.
+
+### policy: 검증 오차가 ~36 mm RMS — 정밀 파지엔 부족 (2026-09-02)
+- selected.json의 val action pos MSE에서 [유도]한 위치 RMS ~36 mm. 62 mm 턱 [스펙]
+  대비 여유가 얇다. 첫 풀 런의 기대치는 "정책이 대체로 맞는 방향으로 기체를 민다"
+  까지이고, 파지 성공률은 더 많은 시연과 재학습 뒤의 일이다.
+
+### policy/fstereo: 모델 로드 셋이 겹칠 때 **네이티브 크래시 2회** — 원인 미귀속, 직렬화로 완화 (2026-09-02)
+- **증상 (둘 다 같은 날, 같은 프로세스 구성)**: (a) `rov_gui/tools/policy_dryrun.py` 실제
+  체크포인트 4회 중 1회가 `DP policy: loading selected.ckpt` 직후 core dump(직전에 acados 빌드
+  종료, FoundationStereo 미개입); (b) `rov_gui/tools/policy_bench_check.py` 1회차가 t≈2.4 s에
+  `malloc(): invalid size (unsorted)` — DP ckpt 로드 + acados mpcc 빌드 + FoundationStereo
+  로드가 겹친 순간. (b)는 JSON을 쓰고도(FS 7.27 Hz, 220 frames, grid coverage 1.0) 세션
+  ready=False로 종료에서 멈춰 400 s 타임아웃으로 kill됐다
+  [측정: rov_gui/tools/fstereo_bench_out/policy_bench_20260902_150726.json]. 재시도(151527)와
+  참조 런(141224)은 정상(3.5~4.3 s 로드).
+- **원인 미귀속**: 스택이 없다(faulthandler 미설정이었다). torch.load 둘 + 방금 빌드한 솔버
+  `.so`의 dlopen이 세 스레드에서 겹치는 조합이라는 것만 안다.
+- **임시 대응 (적용됨)**: `rov_gui/perception/upstream.MODEL_LOAD_LOCK`이 FoundationStereo
+  로드(`FStereoSession._load`)와 정책 로드(`DpPolicySession.load`)를 **직렬화**하고,
+  `rov_gui/__main__.main`이 `faulthandler.enable()`로 다음 크래시에 스레드를 남긴다. acados
+  빌드는 여전히 병렬(`MpcWorker.setup`).
+- **제대로 고치는 법**: 재발하면 faulthandler 스택으로 범인을 특정하고, 필요하면 acados 빌드도
+  같은 잠금 뒤로 보낸다(시작 ~+3 s). 재현 시도는 `policy_bench_check.py`를 `timeout -s KILL 150`
+  아래에서 돌릴 것 — 멈춘 프로세스가 카메라를 물고 있으면 다음 런이 DeviceBusy로 죽는다.
 
 ### 실기 Newton gripper: servo 채널·PWM 레인지·지속 close 거동이 **미기록** (2026-08-30)
 - 리포에 있는 실측은 버튼 기능 번호 둘뿐(BTN0/15 = 77/76, 2026-08-06,
@@ -1091,7 +1967,7 @@ AprilTag PnP → EAOB+acados NMPC → MANUAL_CONTROL 폐루프(`rov_gui/control/
   | 적합된 bias | **[1.803, 0.007, −0.064]** m/s² = **0.184 g, 거의 전부 IMU x** |
   | 보정 후 \|a\| | **9.806 ± 0.050** (중력 9.807) |
 
-  `[측정: sessions/low_level_controller_data/20260817/0817_101511/ +
+  `[측정: data/20260817/0817_101511/ +
   0817_100139/ 의 *_c3_imu.jsonl 2테이크, 21985 정지샘플 6자세;
   config/c3_imu_calib.json sha1 7081ff43]`
 
@@ -1185,12 +2061,22 @@ AprilTag PnP → EAOB+acados NMPC → MANUAL_CONTROL 폐루프(`rov_gui/control/
   미상이라 `compute_payload_inertia.py` 합성에서 빠져 있음(카메라 1.7 kg 대비 수백 g 추정).
 - 사용자에게 실물 브래킷 질량(또는 재질)을 받으면 C3처럼 합성에 추가할 것.
 
-### Newton 그리퍼는 아직 Onshape에 없어 heavy_c3에서 제외 (2026-07-20)
+### Newton 그리퍼가 Onshape에 추가됐지만(2026-09-09 export) 시뮬 GRIP_POS/JAW_POS는 아직 추정값 (2026-07-20)
 - 사용자 요청: Onshape 어셈블리에 있는 것(차체 + C3)만 반영. 그리퍼는 CAD 추가 전까지
   `heavy_c3`에서 제외. `heavy_gripper` 변종은 그리퍼가 추가될 때를 위한 config로 유지되나,
   현재 그 GRIP_POS=[0.25,0,−0.17]는 여전히 **추정값**(Onshape 미검증)이다.
 - 그리퍼가 Onshape에 추가되면: export 재실행 → 브래킷처럼 실측 위치로 GRIP_POS 갱신 →
   heavy_gripper 재생성.
+- **2026-09-09**: 그리퍼·upper mount·C3(40° 하향)가 들어간 mujoco 탭을 재export했다
+  (`assets/CAD files/onshape_export_20260909/`, 파트 포즈→base_link는 payload_frames_20260909.json [유도]).
+  CAD 턱 쌍 중심 x 0.364(팁 0.404), 하우징 x 0.127~0.316, z −0.127 → 시뮬 GRIP_POS 0.25/z −0.17보다 실린더가
+  ~2.5 cm 앞·4 cm 위. **시뮬 변종·hw 설정은 아직 갱신하지 않았다**(사용자 결정 대기).
+- **2026-09-08**: 실기 턱은 C3 렌즈 앞 0.196 m로 실측돼(항목 "기체 마커의 그리퍼 기하") 스테이션의
+  렌즈-앵커 턱이 COM 앞 0.502가 됐다(`rov_shape.JAW_CENTRE_M`, `policy.tcp_body_flu_m`; 튜브도 같은
+  +0.0855). 시뮬의 GRIP_POS 0.25 / JAW_POS 0.4165는 `cam_t_flu`가 맞다면 그보다 **8.5 cm 뒤**이고,
+  `cam_t_flu`가 ~9 cm 앞으로 틀린 것이라면(항목 "C3 외부파라미터 cam_t_flu의 x/z가 의심된다") **대략
+  맞다**. 플랜트 합성(합성 COM/관성)은 손대지 않았다 — 8.5 cm 이동이면 합성 COM은 수 mm 수준 [예측,
+  미계산]. 줄자 측정으로 귀속이 정해지면 그때 GRIP_POS/JAW_POS를 갱신할 것.
 
 ### 방향 sweep이 seed-0 파랑 실현 하나를 공유 — worst-vertex 통계는 단일-실현 아티팩트
 - 발견 2026-07-21 (`compare_20260720_230025` 코너 기하 분석): 모든 (current, wave) 헤딩쌍
@@ -1211,5 +2097,88 @@ AprilTag PnP → EAOB+acados NMPC → MANUAL_CONTROL 폐루프(`rov_gui/control/
 - C3/페이로드 배치는 **실측 metric**(COM 앵커) 기준이라 동역학·카메라는 정확하지만,
   렌더에서 페이로드가 스킨 대비 ~3–5 mm 어긋나 보일 수 있음(코스메틱).
 
+### DP 프레임 감사에서 나온 스테일/오류 인용 4건((2)(5)(6)(7)) + COM 43.4 mm 격차 (2026-09-03; (1)은 2026-09-08 해소)
+- 발견: 6-리더 프레임 감사(`.claude/journal/research.md` 2026-09-03 항목). 프레임 체인 자체는
+  건전하다(정책=TCP, `policy_frames.py:578`이 레버암을 빼서 NMPC엔 body 원점 궤적). 문제는
+  **주변 문서·주석이 폐기된 값을 계속 들고 있다**는 것.
+- **(2) "body 원점 = heavy_c3 COM"(`geometry.py:331` 주석)은 틀렸다.** 실제는 **맨몸 heavy 차체
+  COM**(`bluerov2_mujoco_marinegym/compute_payload_inertia.py:45-46` `COM_VEH = np.zeros(3)`).
+  heavy_c3는 자기 합성 COM으로 재원점하므로 32.5 mm 다르다.
+- **(3) NMPC가 규제하는 점과 플랜트 모델의 COM이 43.4 mm 어긋나 있다.** 스테이션 eta는
+  맨몸 차체 COM(base_link) 포즈인데, NMPC가 적분하는 플랜트는 `heavy_gripper`
+  (`config/hw_mpc.yaml:7`)이고 그 MJCF는 **합성 COM에 원점을 재설정**한다
+  (`compute_payload_inertia.py:118-122`). 격차 (0.03489, 0.00099, −0.02579) m [유도].
+  `compute_payload_inertia.py:118-122`가 스스로 "원점을 COM에서 떼면 모델되지 않은 회전-병진
+  커플링이 NMPC를 불안정하게 만든다"고 경고한 바로 그 종류의 오차인데, **어떤 config 키도
+  meta 필드도 이 경계를 기록하지 않는다**. 임시 대응: 없음(실기 영향 미측정). 제대로 고치는
+  법: 의도적인지 먼저 판정 → 의도라면 meta에 기록, 아니라면 eta에 시프트를 적용하거나
+  플랜트를 base_link 원점으로 재생성.
+- **(5) obs 두 행 간격 "66.7 ms"는 런타임에서 거짓.** 실제 간격은 depth 페어 간격
+  (`rov_gui/backends/policy.py:684` `spacing = pair_dt if how != "dup" else obs_dt`,
+  ~138 ms 실측). 66.7 ms는 **학습 스트라이드**(down_sample_steps 2 / fps 30). 학습-배포
+  모션큐 시간척도 불일치이므로, 문구 정정과 별개로 실제 영향 평가가 필요하다.
+- **(6) 배포 TCP: x의 순환은 2026-09-08에 끊겼고, z의 순환은 남아 있다.** `tcp_body_flu_m`은 이제
+  `cam_t_flu` + [0.196, 0, −0.275]이고 그 x는 CAD 체인과 독립적으로 실측됐다(턱에 문 병을 태그 58 중심에
+  놓은 프레임에서 렌즈 앞 0.196 m [측정: data/20260908/0908_180453_observe/policy_obs/rgb/000160.jpg
+  + 0908_170428/policy_obs/rgb/000000.jpg + 0908_175151/policy_obs/rgb/000000.jpg]) — CAD의 110.664 mm는
+  반증됐다. **남은 순환은 z**: "렌즈가 턱 위 0.275 m"는 여전히 `cam_t_flu`를 유도한 그 CAD 수치이고
+  (이미지가 ~1 cm 안에서 확인하지만 독립 실측은 아님), 스테레오 삼각측량은 여전히 0건이다. 게다가
+  `cam_t_flu` 자체의 x/z가 의심된다(별도 항목) — 턱은 렌즈에 앵커돼 TCP는 어느 쪽이든 맞지만 body 원점은
+  아니다. 제대로 고치는 법: 턱을 C3 프레임에서 스테레오 삼각측량해 `tcp_offset_cam_m`에 직접 넣을 것
+  (렌즈 위치 소거).
+- **(7) C3 마운트의 roll/yaw가 리마운트 이후 미재측정.** `hw_nav.yaml`의 `cam_xyaxes_flu`는
+  주석 처리되어 `c3_payload_frames.json` 값이 그대로 산다(피치만 43.3°로 갱신). `R_bt = R_bc`
+  이므로 roll/yaw 오차는 **정책 액션 프레임 전체를 회전**시킨다. 게다가 렌즈 위치는 2026-09-02
+  CAD, 틸트는 2026-08-17 측정 — 두 반쪽이 서로 다른 마운트 시점에 고정되어 있다.
+
+### `test_object_nav.test_the_shipped_config_resolves`가 배포 config에서 실패 (2026-09-07 발견)
+- 테스트는 `object_nav.max_distance_m ≤ 3.0`을 단언하는데 `config/hw_mpc.yaml`은 **10.0**이라
+  35/36으로 떨어진다(`min_distance_m 0.15 < max 10.0 ≤ 3.0` 단언). 헤딩 점선 작업 중
+  `_run_meta` 호출 스위트를 돌리다 발견했고 그 변경과 무관(config diff에 distance 키 없음 =
+  이미 커밋된 값). 테스트 상한을 풀 것인지 config를 3 m로 되돌릴 것인지는 사용자 결정 —
+  10 m는 풀 대각선보다 길어 사실상 상한 없음이다.
+
+### RGB+depth 정책 체크포인트(`umi_rgbd_5d`)는 스테이션에서 **아직 못 돈다** — RGB obs 빌더가 없다 (2026-09-23)
+- **무엇**: 2026-09-23 ablation의 two-stream 모델(obs `camera0_rgb` + `camera0_depth`, task
+  `external/UMI_aquatic/diffusion_policy/config/task/umi_rgbd_5d.yaml`)은 학습만 된다.
+  `rov_gui/perception/policy_obs.py`는 depth obs만 만들고 `dp_policy.py`는 shape_meta의 이미지 키를 그대로
+  기대하므로, 이 ckpt를 패널에서 고르면 `camera0_rgb`가 없어 로드/추론이 실패한다(어느 단계에서 어떻게 죽는지는
+  **미확인**). 오프라인 리플레이(`policy_session_replay.py`)도 같은 이유로 안 된다 — 기록된 `policy_obs/rgb/*.jpg`는
+  C3 컬러 원본(q85)이지 224 obs가 아니다.
+- **학습 RGB의 정체**: OAK-D-W 컬러 CAM_A `rgb.mp4`(1280x720) 센터 크롭 224, 정류·warp 없음
+  (`data collection/UMI_Underwater/demonstration_processing/build_dataset.py:83-92,146-150`). 소스 store는 **BGR**이고
+  병합 store(`slam/9_9_26/dataset_rgbd.zarr.zip`)는 RGB로 뒤집어 저장했다 [측정: `umi_handheld/build_dp_rgbd_zarr.py`
+  channel-order proof, stored-vs-BGR 0.0000 / stored-vs-RGB 10.2925]. depth와 **픽셀 정렬이 아니다**(컬러 카메라 vs
+  rectified-left 격자를 C3 광학으로 warp) — two-stream이라 학습엔 무관하지만 4채널 early fusion에는 이 데이터를 쓰면 안 된다.
+- **제대로 고치는 법**: (1) `policy_obs.py`에 C3 CAM_A 컬러 → 센터 크롭 224 RGB 빌더 추가(학습 레시피와 같은 크롭,
+  BGR→RGB), (2) `dp_policy.py`의 `eval_transforms`를 키별로 적용(이미 `key_transforms`는 무시하도록 해둠), (3) 육상
+  OAK 컬러 광학과 C3 컬러 광학의 차이는 보정하지 않는다는 것을 run meta에 남길 것. 그 전까지 RGB+D ckpt는
+  held-out(학습 zarr) 평가 전용.
+
 ---
-*마지막 갱신: 2026-08-19*
+*마지막 갱신: 2026-09-23*
+
+### `demo_e2e.py dobmpc policy`가 `skip_fix_lag`로 플랜 0건 — 데모 프로세스에서 dobmpc tick이 fix보다 70–140 ms 늦다 (2026-09-26)
+- **증상**: `rov_gui/tests/demo_e2e.py dobmpc policy`(docstring 기본 추종자)는 PolicyWorker가 12/12 쌍을
+  `skip_fix_lag`로 버려 "no PolicyPlan ever reached the bus"로 끝난다. 같은 드라이버의 `mpc policy`·`mpc station`·`pid policy`는 통과.
+- **측정**: 임시 로그(복구 완료)로 본 `fix_lag_s` = depth 스탬프 − 최신 proprio 행: dobmpc 0.068–0.141 s (전부 > FIX_LAG_TOL·obs_dt = 33 ms),
+  mpc 0.000–0.067 s (`scratchpad/demo_dobmpc_diag.txt`, `demo_mpc_diag.txt`, 2026-09-26; 세션 스크래치패드라 재현은 같은 임시 로그로).
+  즉 게이트는 설계대로 동작하고, 데모 단일 프로세스(오프스크린 Qt + acados dobmpc + EAOB + 합성 플랜트)에서 MpcWorker tick이
+  fix 스탬프를 놓치는 것이 원인 [유도]. 6-DoF 변형과 무관(변형 OFF, 4-DoF 경로).
+- **경계**: 2026-09-11 저널에 이미 "`demo_e2e.py policy` 녹색 베이스라인 없음"으로 기록된 행. 실기 dobmpc 정책 런에는 다른 프로세스 배치라
+  그대로 옮겨 읽지 말 것.
+- **후속**: dobmpc tick 소요를 데모에서 재고(EAOB 첫 tick 비용 / 플랜트 RK4), 또는 demo_e2e의 policy 행 기본 추종자를 mpc로 고정.
+
+### `demo_e2e.py dobmpc square`가 이 작업트리에서 red — 설정의 `plant.linear_damping` 덮어쓰기 vs 데모 플랜트, 그리고 드라이버 예산 (2026-09-26)
+- **증상**: `rov_gui/tests/demo_e2e.py dobmpc square` → `[error] ctrl[dobmpc]: w_hat has been PINNED to its clip for 3 s (X=15, Y=45)`
+  → `FAIL: START did not reach the square. last: approaching the start point (0.37 m)`; FAIL 뒤 드라이버가 disengage 없이
+  `app.quit()`하면서 "Qt has caught an exception thrown from an event handler … terminate called without an active exception"으로
+  abort(exit 134). 같은 드라이버의 `mpc station`·`mpc policy`·`pid policy`·`mpc replay`·`mpc policy rp`는 통과.
+- **원인 [유도]**: `config/hw_mpc.yaml plant.linear_damping [86.7, 133.8, …]`(2026-09-08 실기값, 모델의 21.5×)는 **제어기 모델**에만
+  들어가고 데모 플랜트(`rov_gui/control/plant.py`)는 marinegym 원본 항력(4.03)으로 돈다 → EAOB가 그 차이를 외란으로 추정해
+  접근 중 클립에 붙는다. 덮어쓰기를 뺀 임시 설정으로 다시 돌리면 접근은 되지만 10 s 정착이 드라이버의 20 s 예산을 넘겨
+  `settling over the start point (5 s)`에서 FAIL(`demo_e2e.py line`의 예산 결함과 같은 부류). 6-DoF 변형과 무관(변형 OFF, dobmpc 제어 출력은
+  `test_attitude_axes`/`test_control`의 바이트 동일 검사 대상).
+- **경계**: 2026-08-14 이후 dobmpc square 데모 행이 통과한 기록은 저널에 없다(마지막 녹색은 damping 덮어쓰기 이전). 실기 dobmpc 런에 옮겨 읽지 말 것.
+- **후속**: 데모 플랜트가 `plant.linear_damping` 덮어쓰기를 같이 받게 하거나(데모의 목적이 "제어기 모델 = 플랜트"라면) 드라이버 예산을
+  SETTLE_S만큼 늘리고, FAIL 분기에서 `cmd_mpc_engage(False)`를 보낸 뒤 quit하도록 고칠 것.

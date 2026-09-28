@@ -1,0 +1,6 @@
+source: /home/bdml/Desktop/data collection/dataset_depth.zarr.zip
+frames: 15746  obs (224, 224, 3)  channel 1 = validity (255 where depth > 0)
+validity fraction per frame: min 0.9777  p1 1.0000  p10 1.0000  median 1.0000  mean 1.0000  max 1.0000
+frames with validity < 0.985: 9 (0.06%)
+frames with validity < 0.99 : 14 (0.09%)
+corner 16x16 block validity (TL,TR,BL,BR) mean: [0.9999, 0.999, 1.0, 1.0]  min: [0.7461, 0.1172, 1.0, 1.0]

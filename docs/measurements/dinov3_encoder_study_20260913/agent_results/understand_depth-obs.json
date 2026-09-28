@@ -1,0 +1,112 @@
+{
+ "summary": "Encoder input is NOT an RGB image. Each obs frame is a 224x224x3 uint8 image packed as (ch0 = normalised INVERSE depth v=(1/Z-1/Z_far)/(1/Z_near-1/Z_far), Z_near 0.20 m / Z_far 3.00 m, near=1, far/invalid=0; ch1 = validity mask 255 where depth_mm>0; ch2 = exact copy of ch0), built by umi_handheld/build_dp_depth_zarr.py:284-296 and reproduced bit-for-bit at deploy by rov_gui/perception/policy_obs.py:643-662. The dataset divides by 255 (umi_dataset.py:286) and the image normalizer is identity scale 1/offset 0 (normalize_util.py:39-51), so the timm backbone sees float32 in [0,1] with NO mean/std normalisation anywhere (encoder transforms = RandomCrop(212)->Resize(224,bilinear,antialias)->RandomRotation(+-5, fill 0), ColorJitter removed; deploy = CenterCrop(212)->Resize(224)). CLIP-B expects mean/std (0.481,0.458,0.408)/(0.269,0.261,0.276); DINOv3 expects ImageNet (0.485,0.456,0.406)/(0.229,0.224,0.225); neither is applied, and the actual per-channel stats of the training obs (400-frame uniform subsample of /home/bdml/Desktop/data collection/dataset_depth.zarr.zip, this session) are ch0/ch2 mean 0.276 std 0.159, ch1 mean 1.0000 std 0.005 (validity is ~constant 1: 99.94 % of frames >=0.985 valid per rov_gui/tools/dp_policy_out/training_validity_20260902.txt). Effective information content is a single greyscale-like inverse-depth plane in R and B plus a near-constant G plane, median metric range 0.62 m, 4.3 % of valid pixels clipped to 0 at >=3 m. Land demos: OAK-D-W in air, FoundationStereo depth on the alpha=0 rectified-left grid (fx 249.566 px @640x400) is re-projected with a pure ray-to-ray remap (no extrinsics, INTER_NEAREST) onto the C3's RAW CAM_B underwater projection from the EEPROM (fx 757.12 @1280x800 scaled to 640x400, 85.6 deg HFOV), then centre-cropped 400x400 (x0=120) and nearest-resized to 224; the 0.64 depth scale in the plan doc is NOT applied on this path (depth_scale_applied 1.0). 224 was inherited from upstream UMI (task shape [3,224,224], vit_base_patch16_clip_224 is fixed-size) — no independent justification found. Moving to 256 for DINOv3 is config-plus-rebuild: --out-res 256 (dataset rebuild from the existing depth/ stores), task yaml shape, and deploy obs_res in config/hw_mpc.yaml:691 / backends/policy.py:143; the encoder crop/resize, projection (1024->768 Linear), and denoiser cond-token count all follow automatically, and DINOv3 (RoPE, dynamic_img_size) runs at 224 (201 tokens) or 256 (261 tokens) while the current CLIP-B asserts at 256.",
+ "facts": [
+  {
+   "fact": "Training obs key is camera0_depth with shape [3,224,224], type 'rgb', horizon 2, down_sample_steps 2 (66.7 ms stride); dataset path /home/bdml/Desktop/data collection/dataset_depth.zarr.zip",
+   "evidence": "external/UMI_aquatic/diffusion_policy/config/task/umi_depth_5d.yaml:14-29,100; umi_depth.yaml:17-23 identical"
+  },
+  {
+   "fact": "Channel packing of the stored uint8 obs: CHANNELS = ('inverse_depth', 'validity_mask', 'inverse_depth'); ch2 repeats ch0 only because 'the stock timm/ResNet stems want three'",
+   "evidence": "umi_handheld/build_dp_depth_zarr.py:82-84 and per-frame packing at :293-296 (`v = normalise_depth(w, z_near, z_far); valid = (w > 0).astype(np.uint8) * 255; u8 = np.clip(v * 255.0 + 0.5, 0, 255).astype(np.uint8); frames[j] = np.stack([u8, valid, u8], axis=-1)`)"
+  },
+  {
+   "fact": "ch0 value = normalised INVERSE depth v = (1/Z - 1/Z_far)/(1/Z_near - 1/Z_far) clipped to [0,1], near = LARGE (1.0 at 0.20 m, 0.0 at >=3.00 m); invalid (depth_mm==0) pixels also become 0.0 in ch0, indistinguishable from z_far in that channel — ch1 disambiguates",
+   "evidence": "umi_handheld/build_zarr.py:59-69 (normalise_depth, incl. TODO at :67-68); defaults --z-near 0.20 --z-far 3.00 at build_dp_depth_zarr.py:177-180; store attrs 'invalid_convention' at :329-330; confirmed in the actual dataset .zattrs['obs'] (z_near_m 0.2, z_far_m 3.0, channels [inverse_depth, validity_mask, inverse_depth], resolution [224,224]) read from /home/bdml/Desktop/data collection/dataset_depth.zarr.zip"
+  },
+  {
+   "fact": "Stored dtype is uint8 (T,224,224,3) HWC; UmiDataset converts to float32 in [0,1] by moveaxis + /255 -> (T,3,224,224); no other image preprocessing in the dataset",
+   "evidence": "external/UMI_aquatic/diffusion_policy/dataset/umi_dataset.py:283-288; zarr .zarray dtype '|u1' shape (15746,224,224,3) chunks (1,224,224,3) in dataset_depth.zarr.zip; 75 episodes / 15746 frames (.zattrs n_episodes/n_frames)"
+  },
+  {
+   "fact": "Image normalizer is the identity (scale 1, offset 0; stats min 0 max 1 mean 0.5 std sqrt(1/12)), so policy.normalizer.normalize leaves the image unchanged; deploy re-implementation honours the same identity",
+   "evidence": "external/UMI_aquatic/diffusion_policy/dataset/umi_dataset.py:265-268 -> diffusion_policy/common/normalize_util.py:39-51; applied at diffusion_policy/policy/diffusion_transformer_timm_policy.py:112,179; arithmetic x*scale+offset at diffusion_policy/model/common/normalizer.py:264-276; deploy rov_gui/perception/dp_policy.py:343-346 and contract flag 'normalizer_image_identity' at :859-861"
+  },
+  {
+   "fact": "NO mean/std (ImageNet/CLIP) Normalize is applied anywhere in the TransformerObsEncoder path: transforms are exactly [RandomCrop(int(224*0.95)=212), Resize(224, antialias=True), RandomRotation(-5..5 deg, expand=False)]; ColorJitter was deliberately removed for depth; the sibling timm_obs_encoder.py has an imagenet_norm branch but is not the class used",
+   "evidence": "external/UMI_aquatic/diffusion_policy/model/vision/transformer_obs_encoder.py:171-178 (crop/resize construction), config train_diffusion_transformer_umi_depth_vit_workspace.yaml:65-72 (transform list, ColorJitter comment at :73-75); timm_obs_encoder.py:170-176 (unused Normalize); grep of transformer_obs_encoder.py shows no Normalize"
+  },
+  {
+   "fact": "The transform is applied to the batched tensor (B*T,3,H,W) in one call, so torchvision v1 RandomCrop/RandomRotation draw ONE crop offset and ONE angle per minibatch (shared across all 64 samples and both horizon frames)",
+   "evidence": "external/UMI_aquatic/diffusion_policy/model/vision/transformer_obs_encoder.py:273-279 (`img = img.reshape(B*T, ...); img = self.key_transform_map[key](img)`); torchvision RandomCrop/RandomRotation signatures (get_params once per forward)"
+  },
+  {
+   "fact": "Train-time Resize after RandomCrop is BILINEAR with antialias (torchvision default), and RandomRotation is NEAREST with fill=0 — i.e. the last stage does interpolate inverse-depth across edges and produces fractional validity values at mask edges, and rotation corners become 0 in all channels (ch1=0 -> 'invalid', ch0=0 -> 'z_far')",
+   "evidence": "transformer_obs_encoder.py:176 `torchvision.transforms.Resize(size=image_shape[0], antialias=True)` with default interpolation; torchvision signatures checked in rovgui-pose: Resize(interpolation=BILINEAR, antialias=True), RandomRotation(interpolation=NEAREST, expand=False, fill=0); the nearest-only rule upstream of this is at build_dp_depth_zarr.py:215-221, 291-292"
+  },
+  {
+   "fact": "Deploy-time transform (default eval_transforms 'center'): CenterCrop(int(224*0.95)=212) -> Resize(224, antialias=True), no rotation; 'train' mode replays the training RandomCrop+RandomRotation; 'identity' is tests only",
+   "evidence": "rov_gui/perception/dp_policy.py:55-61 (docstring), :650-661 (construction from the checkpoint cfg: `crop = int(image_shape[-1] * ratio)`), config/hw_mpc.yaml:509 `eval_transforms: center`, rov_gui/backends/policy.py:128 default 'center'"
+  },
+  {
+   "fact": "Deploy obs is built bit-identically to training: grid adapter -> raw CAM_B 640x400 -> centre crop 400x400 (y0=0, x0=120) -> cv2.resize 224 INTER_NEAREST -> normalise_depth(0.20, 3.00) -> u8 -> (u8, valid, u8); then two frames are stacked, /255, transposed to (2,3,224,224) float32 and passed to predict()",
+   "evidence": "rov_gui/perception/policy_obs.py:9-15 (recipe), :140-146 (RECIPE), :643-662 (build()), :154-170 (verbatim normalise_depth copy); rov_gui/backends/policy.py:1251-1252 (`np.stack([obs_prev, obs_now]).astype(np.float32) / 255.0` then transpose (0,3,1,2)); rov_gui/perception/dp_policy.py:938 ('image (T, 3, H, W) float [0, 1]') and :921-929 shape/finite checks"
+  },
+  {
+   "fact": "Deploy config values z_near 0.20 / z_far 3.00 / obs_res 224 / min_obs_coverage 0.985 are hard defaults and YAML entries, not read from the checkpoint; DepthObsBuilder gets out_res from pc['obs_res']",
+   "evidence": "rov_gui/backends/policy.py:143 (defaults), :513-517 (DepthObsBuilder(... out_res=int(pc['obs_res']))); config/hw_mpc.yaml:687-691; rov_gui/perception/policy_obs.py:337-340 (ctor defaults 0.20/3.00/224)"
+  },
+  {
+   "fact": "Measured per-channel statistics of the training obs (uniform 400-frame subsample of the 15746-frame dataset, computed this session in conda umi2): ch0==ch2 exactly; ch0 mean 0.2762 std 0.1587 p1 0.000 p50 0.275 p99 0.737; ch1 mean 1.0000 std 0.0050 (values only {0,1}); per-frame validity min 0.99 in the subsample; 4.30 % of VALID pixels have ch0==0 (range >= 3 m clipped), 5e-6 have ch0==1; metric range among valid pixels p1 0.265 m, p10 0.398, p50 0.619, p90 1.809, p99 3.000 m",
+   "evidence": "[측정 this session] source /home/bdml/Desktop/data collection/dataset_depth.zarr.zip data/camera0_depth, script scratchpad obs_stats.py (ephemeral); corroborating recorded artifact rov_gui/tools/dp_policy_out/training_validity_20260902.txt: validity per frame min 0.9777, mean 1.0000, frames <0.985: 9 (0.06 %), corner-block min TR 0.1172"
+  },
+  {
+   "fact": "CLIP ViT-B/16 (current) pretrained cfg expects mean (0.48145466, 0.4578275, 0.40821073) std (0.26862954, 0.26130258, 0.27577711), input 224 fixed (fixed_input_size True, learned pos_embed (1,197,768), dynamic_img_size False) — feeding 256 raises 'Input height (256) doesn't match model (224)'",
+   "evidence": "timm 1.0.29 get_pretrained_cfg('vit_base_patch16_clip_224.openai') and create_model forward test in conda rovgui-pose (this session)"
+  },
+  {
+   "fact": "DINOv3 ViT-L/H+/7B timm cfgs expect ImageNet mean (0.485,0.456,0.406) std (0.229,0.224,0.225), input_size (3,256,256), crop_pct 1.0, license 'dinov3-license'; the ViT has RoPE (rope present, pos_embed None), 4 register tokens + CLS (num_prefix_tokens 5), dynamic_img_size True; forward at 224 -> (1,201,1024), at 256 -> (1,261,1024). convnext_large.dinov3_lvd1689m cfg is 224 with fixed_input_size False",
+   "evidence": "timm 1.0.29 get_pretrained_cfg / create_model(pretrained=False) forward test in conda rovgui-pose (this session)"
+  },
+  {
+   "fact": "The encoder uses ALL ViT tokens (feature_aggregation null -> returns full (B,N,C) feature incl. CLS and, for DINOv3, the 4 register tokens) and auto-inserts Linear(feature_size -> n_emb 768) when dims differ; the denoiser's cond positional embedding is sized from obs_encoder.output_shape() (max_cond_tokens = obs_tokens + 1), so a change in token count (201 vs 261 per frame, x2 frames + 8 low-dim tokens) needs no config edit",
+   "evidence": "transformer_obs_encoder.py:139-146, 191-200, 237-244; diffusion_policy/policy/diffusion_transformer_timm_policy.py:38-49; transformer_for_action_diffusion.py:18,28,196-199"
+  },
+  {
+   "fact": "Land->water optics bridge: source = OAK-D-W (mxid 14442C10716DBCD600) rectified-left alpha=0.0 pinhole rebuilt from the same umi_dataset.Rectifier that produced the FoundationStereo depth (fx=fy=249.5656 px, cx 294.578 cy 218.693 @640x400, zero distortion, baseline 0.0753 m), asserted against the depth store's fx_rect_px; target = C3 (OAK-D-W-POE) RAW CAM_B EEPROM model underwater (fx 757.12 fy 757.51 cx 648.87 cy 381.28 @1280x800, 8-coef rational distortion, HFOV 85.6 deg; calibration determined to be underwater), scaled to a 640x400 warp grid; rectified C3 model unavailable because the EEPROM dump has no stereo extrinsics",
+   "evidence": "umi_handheld/build_dp_depth_zarr.py:23-42 (docstring), :112-145 (rectified_left_model), :204-227 (WarpStage build), :275-282 (fx_rect_px assert); configs/target_camera_underwater.yaml:16-42, 60-70; dataset .zattrs['warp'] source_model/target_model (read this session)"
+  },
+  {
+   "fact": "The warp is a pure ray-to-ray remap treating both cameras as co-located and co-oriented (no extrinsics, no viewpoint change): for each target pixel, tgt.unproject -> ray -> src.project -> source pixel; cv2.remap with INTER_NEAREST for depth (INTER_LINEAR for mono), BORDER_CONSTANT 0; measured coverage 100.00 %, behind-camera rays 0, round-trip 0.00034 px on the actual dataset",
+   "evidence": "umi_handheld/warp.py:9-31, 54-99, 119-123; dataset .zattrs['warp'] coverage_fraction 1.0, rays_behind_camera 0, roundtrip_max_px 0.000339 (read this session)"
+  },
+  {
+   "fact": "Depth values are metric millimetres from FoundationStereo (checkpoint 23-51-11/model_best_bp2.pth, iters 16, scale 1.0) with depth_scale_applied 1.0 — the '×0.64 보정' written in DP_TRAJECTORY_PLAN.ko.md §4 is NOT applied on this path (it belongs to the C3 on-device StereoDepth only); the medium difference is meant to be absorbed by each camera's own calibration before normalisation so the same physical range lands on the same normalised value",
+   "evidence": "docs/DP_TRAJECTORY_PLAN.ko.md:128-133 vs umi_handheld/build_dp_depth_zarr.py:14-31, 335-345 and dataset .zattrs['depth_source'] depth_scale_applied 1.0; build_zarr.py:19-21"
+  },
+  {
+   "fact": "Plan §4 spec: obs = depth (inverse-depth normalised, near=large, + validity channel) + proprio; model note says 'depth 입력에 CLIP ViT 사전학습 이득 거의 없음' and recommended ResNet-18+GroupNorm first; the plan's depth recipe references build_zarr.py:59-69 and warp.py as the domain bridge",
+   "evidence": "docs/DP_TRAJECTORY_PLAN.ko.md:125-133, 155-158"
+  },
+  {
+   "fact": "Resolution 224 has no documented independent justification: umi_depth.yaml copies upstream UMI's [3,224,224] (umi.yaml:18), the upstream encoder vit_base_patch16_clip_224 is fixed at 224, build_dp_depth_zarr.py --out-res defaults to 224 ('square resolution the policy sees'), and the plan only says '리사이즈(예: 224²)'. The 224 figures in rov_gui/README.md:878-915 are FoundationStereo input-size benchmarks, unrelated to the policy obs",
+   "evidence": "external/UMI_aquatic/diffusion_policy/config/task/umi.yaml:18; umi_depth.yaml:18; umi_depth_5d.yaml:25; umi_handheld/build_dp_depth_zarr.py:175-176; docs/DP_TRAJECTORY_PLAN.ko.md:130"
+  },
+  {
+   "fact": "Switching to 256 requires: (a) rebuilding dataset_depth.zarr.zip with --out-res 256 from the existing depth/<ep>/depth.zarr stores (crop 400x400 -> 256 nearest); (b) task yaml shape [3,256,256] (crop becomes int(256*0.95)=243 -> Resize 256 automatically); (c) deploy obs_res 256 in config/hw_mpc.yaml:691 and backends/policy.py:143 default; dp_policy.py derives its transform/contract from the checkpoint shape_meta so a mismatch fails loudly at predict (shape ValueError), not silently; min_obs_coverage 0.985 provenance is 224-specific and would need re-derivation [유도]",
+   "evidence": "umi_handheld/build_dp_depth_zarr.py:175-176, 285-296; transformer_obs_encoder.py:171-177; rov_gui/perception/dp_policy.py:636-655, 921-927; rov_gui/backends/policy.py:143, 513-517; config/hw_mpc.yaml:687-691; rov_gui/perception/policy_obs.py:85-88"
+  },
+  {
+   "fact": "Training hyper-parameters relevant to the encoder: pretrained True, frozen False, obs_encoder_lr 3e-5 (wd 1e-6), main lr 3e-4, batch 64, 200 epochs, cosine with 2000 warmup, EMA on (EMAModel skips buffers — irrelevant for a LayerNorm-only ViT), n_emb 768, denoiser 7 layers/8 heads, DDIM 50 train / 16 infer (deploy 8)",
+   "evidence": "train_diffusion_transformer_umi_depth_vit_workspace.yaml:12-13, 49-57, 92-100, 103-109, 111-113, 125-130, 132-141; rov_gui/backends/policy.py:128 num_inference_steps 8"
+  }
+ ],
+ "risks_for_dinov3": [
+  "Input statistics mismatch: DINOv3 was pretrained on ImageNet-normalised RGB (mean ~0.45, std ~0.23 per channel, after Normalize roughly zero-mean unit-var); the encoder here receives raw [0,1] with ch0/ch2 mean 0.276 std 0.159 and ch1 a near-constant 1.0 plane (std 0.005). Without adding a Normalize, the patch-embed sees inputs ~2 std off the pretraining distribution in G and compressed in R/B. Adding Normalize is a code change in transformer_obs_encoder.py (currently none) and must be mirrored in rov_gui/perception/dp_policy.py:650-661 for parity. [유도 from measured stats + timm cfg]",
+  "Semantic mismatch: the 'image' is a duplicated inverse-depth plane in R and B with a constant G — a magenta-tinted greyscale relief, not a natural photo. DINOv3's RGB patch-embed and low-level features carry no prior for this encoding; the large-model advantage (LVD-1689M self-supervised RGB features) is largely lost on the first layer, and the plan doc itself notes 'depth 입력에 CLIP ViT 사전학습 이득 거의 없음' (DP_TRAJECTORY_PLAN.ko.md:155-156). A greyscale-replicated 3-channel (ch0,ch0,ch0) packing would be closer to what RGB pretraining tolerates, but that changes the data contract and the validity channel would need another home. [유도]",
+  "Validity channel is uninformative in training (99.94 % of frames >= 0.985 valid, per-pixel mean 1.0000) but can differ underwater (rect_left border zeros when coverage < 1, stereo dropouts on turbid/textureless scenes, RandomRotation corners are the only zeros the training set sees). A high-capacity encoder can latch onto ch1 as a spurious constant; any deployment-time ch1 structure is OOD. [유도 from training_validity_20260902.txt + policy_obs.py:80-93]",
+  "Range clipping: 4.3 % of valid pixels are clipped to 0 at >= 3 m and are indistinguishable in ch0 from invalid; median range 0.62 m, so most of the [0,1] code space (v>0.74 => Z<0.26 m) is nearly unused. DINOv3 fine-tuning does not fix this encoding limitation. [측정 this session, dataset_depth.zarr.zip subsample]",
+  "Train-time augmentation is per-minibatch (one crop, one angle for all 128 images, transformer_obs_encoder.py:277-278) and the crop->Resize is bilinear on inverse depth + mask; with a much larger encoder and only ~12.6k training windows from 75 episodes, over-fitting pressure rises and the effective augmentation diversity is lower than it looks.",
+  "Resolution/tokens: DINOv3 timm cfg is 256 (fixed_input_size flag True, but RoPE + dynamic_img_size make 224 legal: 201 tokens). Training at 224 keeps the current dataset; training at 256 needs a dataset rebuild (--out-res 256), task yaml shape, and deploy obs_res edits in config/hw_mpc.yaml:691 + backends/policy.py:143 — and the deploy coverage threshold 0.985 was derived on the 224 grid. Cond tokens per frame rise 197->201 (224) or 261 (256); the denoiser sizes itself automatically. The 4 register tokens are forwarded to the denoiser as conditioning (feature_aggregation null) — harmless but not meaningful. [유도]",
+  "Env split: training env umi2 (timm 0.9.7) has no dinov3 registrations; deploy env rovgui-pose (timm 1.0.29) does. A DINOv3 checkpoint trained after upgrading timm in umi2 must still load strict in rovgui-pose (dp_policy.py builds the encoder with pretrained=False and strict-loads state dict, :666-680); timm version skew between train/deploy is a new parity surface for dp_policy_parity.py. [유도]",
+  "Compute/memory on one RTX 5090 32 GB [예측]: full fine-tuning (frozen False, EMA on) of ViT-L (303 M) ≈ 1.2 GB weights + grads + 2×Adam + EMA ≈ 6 GB plus activations for 128 images × 24 layers × 201 tokens — feasible, probably with bf16/grad-checkpointing; H+ (840 M) ≈ 17 GB before activations — marginal; 7B (6.7 G params) cannot be fine-tuned (27 GB fp32 weights alone) and even frozen fp16 (13.4 GB) competes at deploy with FoundationStereo (~46 ms, memory measured elsewhere) and the 8-step DDIM loop on the same GPU; the station's intake budget already stalls at 7.26 Hz FS (rov_gui/backends/policy.py:46,83). Frozen-encoder use also changes the contract (`frozen: True` asserts pretrained, transformer_obs_encoder.py:99-102) and forfeits adaptation to the depth encoding.",
+  "License: timm tags DINOv3 weights 'dinov3-license' (Meta DINOv3 license), unlike CLIP-B 'apache-2.0'; check terms before shipping a checkpoint. [스펙: timm pretrained cfg]"
+ ],
+ "open_questions": [
+  "Should a mean/std Normalize (ImageNet for DINOv3) be added inside the encoder transform, and if so is it applied per-channel to the validity plane too (which would map constant 1.0 to ~+2.4)? Any change must be mirrored in dp_policy.py:650-661 and re-verified with rov_gui/tools/dp_policy_parity.py.",
+  "Would re-packing channels as (ch0, ch0, ch0) [greyscale replicate] or (ch0, valid, ch0) with an explicit Normalize better suit an RGB-pretrained encoder? This changes the dataset contract (.zattrs['obs'].channels) and the deploy builder (policy_obs.py:660-662) — out of scope for this study, needs a decision.",
+  "Train at 224 (no dataset rebuild, 201 tokens) or at DINOv3's native 256 (dataset rebuild + 3 config edits + re-derived coverage threshold)? The current CLIP-B cannot do 256 at all, so 256 is DINOv3-only.",
+  "Which DINOv3 size is the target: L (fine-tunable), H+ (marginal on 32 GB with EMA), or 7B (frozen-only, and deploy latency alongside FoundationStereo unknown)? Needs a measured VRAM/latency bench in umi2 and rovgui-pose before committing.",
+  "Does the plan's ResNet/CLIP-vs-DINOv3 expectation ('depth 입력에 사전학습 이득 거의 없음') still hold? The only existing ablation (dp-ablation-groupnorm-wins) compares ResNet34 BN/GN vs CLIP ViT-B; there is no depth-specific pretrained-encoder result to extrapolate from.",
+  "The rectified-C3 target model is still unavailable (EEPROM has no stereo extrinsics, target_camera_underwater.yaml:60-70), so training frames are on the RAW CAM_B grid while live depth arrives on rect_left and is inverse-rectified with a per-pixel z correction (policy_obs.py:44-70); this residual grid mismatch is independent of the encoder choice but bounds what any encoder can fix."
+ ]
+}

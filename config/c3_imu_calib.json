@@ -1,6 +1,6 @@
 {
  "source_c3_jsonl": [
-  "sessions/low_level_controller_data/20260817/0817_102759/c3_depth_20260817_102759_c3_imu.jsonl"
+  "data/20260817/0817_102759/c3_depth_20260817_102759_c3_imu.jsonl"
  ],
  "cam_tilt_deg_at_fit": 40.0,
  "accel": {

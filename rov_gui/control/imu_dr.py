@@ -44,7 +44,7 @@ Three error sources, and they are not equally fixable:
 
 The BNO086 on this camera carries a **1.80 m/s^2 (0.184 g) accelerometer
 bias, almost entirely on IMU x**, with the scale within 0.9% of unity
-[측정: 6-attitude tumble, sessions/low_level_controller_data/20260817/
+[측정: 6-attitude tumble, data/20260817/
 0817_101511 + _100139, 21985 still samples; config/c3_imu_calib.json
 sha1 7081ff43]. Uncorrected that is 0.5 * 1.80 * t^2 = **90 m at 10 s** — the
 estimator is not approximately wrong without a calibration, it is useless.
@@ -360,7 +360,7 @@ class ImuDeadReckoner:
         # std gate rejected that, no bias was subtracted, and the resulting
         # 0.128 deg/s bias became a 1.28 deg standing tilt under the AHRS —
         # 0.22 m/s^2 of leaked gravity and 37.6 m of drift in 19 s
-        # [측정: sessions/low_level_controller_data/20260818/0818_151119].
+        # [측정: data/20260818/0818_151119].
         #
         # And when gyro_ref is supplied the rotation question does not arise
         # at all: differencing against the autopilot removes real motion,
@@ -439,7 +439,7 @@ class ImuDeadReckoner:
             # 0.12 m/s^2 of permanent bias, which under the AHRS is a fixed
             # 0.36 m/s velocity error and a LINEAR 4.3 m of drift by 17 s.
             # Per-sample: 0.74 m over the same 17 s, from the same log
-            # [측정: sessions/low_level_controller_data/20260818/0818_160139,
+            # [측정: data/20260818/0818_160139,
             #  mpc_161904 — offline A/B on the flown samples].
             ref = None if att_ref is None else np.asarray(att_ref, float)
             if ref is not None and ref.ndim == 2 and ref.shape[1] >= 3:

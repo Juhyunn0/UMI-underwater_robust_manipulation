@@ -66,6 +66,7 @@ class PayloadPanel(Panel):
     gripper_drive = Signal(float)    # -1 close / 0 idle / +1 open  (momentary)
     tilt_drive = Signal(float)       # -1 down / 0 idle / +1 up     (momentary)
     tilt_center = Signal()           # one press of mount_center
+    tilt_set = Signal(float)         # the operator typed the mount angle (deg)
 
     def __init__(self):
         super().__init__("payload", right=None, spacing=3)
@@ -193,7 +194,39 @@ class PayloadPanel(Panel):
         for w in (self.btn_tilt_down, self.btn_tilt_center, self.btn_tilt_up):
             w.setFixedHeight(BTN_H)
             row.addWidget(w)
+
+        # WHERE THE MOUNT IS (operator request 2026-09-07: an accidental press
+        # left it tilted with nothing on screen to say so). The vehicle
+        # reports no angle, so this is the TRACKED estimate — measured by the
+        # tag localizer when both cameras see the mat, dead-reckoned from the
+        # held buttons otherwise — with its source and doubt printed on the
+        # caption line. The spinbox is also an INPUT: type the angle you drove
+        # to and press SET, and every reading after that counts from there.
+        # The value the RGB localizer currently assumes is shown too, so a
+        # mount that wandered from it is visible before it costs a fix. Both
+        # sit ON the button row: the panel's height budget is spent
+        # (test_layout_fits_one_screen), so no new row.
+        self.tilt_spin = QtWidgets.QDoubleSpinBox()
+        self.tilt_spin.setRange(-90.0, 90.0)
+        self.tilt_spin.setDecimals(1)
+        self.tilt_spin.setSingleStep(1.0)
+        self.tilt_spin.setSuffix("°")
+        self.tilt_spin.setFixedHeight(BTN_H)
+        self.tilt_spin.setFixedWidth(74)
+        self.tilt_spin.setToolTip(
+            "tracked mount angle (down = negative). Type the real angle and "
+            "press SET to re-anchor the tracker; UP/DOWN dead-reckon from "
+            "there and LEVEL resets it to 0.")
+        self.btn_tilt_set = QtWidgets.QPushButton("SET")
+        self.btn_tilt_set.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_tilt_set.setFixedHeight(BTN_H)
+        self.btn_tilt_set.setToolTip("the mount IS at the typed angle")
+        row.addWidget(self.tilt_spin)
+        row.addWidget(self.btn_tilt_set)
         b.addLayout(row)
+        self._tilt_nominal: float | None = None   # what the RGB extrinsic assumes
+        self._tilt_est_last: float | None = None
+        self._tilt_warn = False
 
         # ----------------------------------------------------- mission log
         # Lives in the slack under CAMERA TILT (operator request 2026-08-14).
@@ -283,6 +316,8 @@ class PayloadPanel(Panel):
         self.btn_tilt_up.held.connect(lambda on: self.drive_tilt(+1.0 if on else 0.0))
         self.btn_tilt_down.held.connect(lambda on: self.drive_tilt(-1.0 if on else 0.0))
         self.btn_tilt_center.clicked.connect(self.tilt_center.emit)
+        self.btn_tilt_set.clicked.connect(
+            lambda: self.tilt_set.emit(float(self.tilt_spin.value())))
 
     # ------------------------------------------------------------- commands
     def _set_drive(self, direction: float) -> None:
@@ -384,12 +419,44 @@ class PayloadPanel(Panel):
                 0.0 if s.tilt_deg is None else max(-1.0, min(1.0, s.tilt_deg / 45.0)),
                 "hold" if s.tilt_deg is None else f"{s.tilt_deg:+.0f}°",
                 s.tilt_conn)
-        bits = []
-        if s.tilt_deg is None:
+        bits = [self._show_tilt_estimate(s)]
+        if s.tilt_deg is None and s.tilt_est_deg is None:
             bits.append("no angle reported (open loop)")
         if s.tilt_note:
             bits.append(s.tilt_note)
-        self.tilt_note.setText("   ".join(bits) if bits else "")
+        self.tilt_note.setText("   ".join(b for b in bits if b))
+        self.tilt_note.set_colour(theme.WARN if self._tilt_warn else theme.TEXT_FAINT)
+
+    def set_tilt_nominal(self, deg: float | None) -> None:
+        """The angle the RGB localizer's extrinsic assumes (hw_nav.yaml
+        second_cam.tilt_deg), so drift away from it is visible."""
+        self._tilt_nominal = None if deg is None else float(deg)
+
+    def _show_tilt_estimate(self, s: PayloadState) -> str:
+        """Push the tracked angle into the spinbox; -> the caption text."""
+        self._tilt_warn = False
+        est = s.tilt_est_deg
+        # Follow the tracker unless the operator is typing into the box.
+        if est is not None and not self.tilt_spin.hasFocus():
+            if self._tilt_est_last is None or abs(est - self._tilt_est_last) > 0.05:
+                self.tilt_spin.blockSignals(True)
+                self.tilt_spin.setValue(float(est))
+                self.tilt_spin.blockSignals(False)
+                self._tilt_est_last = float(est)
+        if est is None:
+            return "angle unknown — press LEVEL or SET"
+        unc = ("" if s.tilt_est_unc_deg is None
+               else f" ±{s.tilt_est_unc_deg:.0f}")
+        bits = [f"{est:+.1f}°{unc} {s.tilt_est_src}"]
+        if self._tilt_nominal is not None:
+            off = est - self._tilt_nominal
+            if abs(off) > 3.0:
+                bits.append(f"RGB nav assumes {self._tilt_nominal:+.0f}° "
+                            f"({off:+.0f}° off)")
+                self._tilt_warn = True
+        if s.tilt_moving:
+            bits.append("moving")
+        return "  ".join(bits)
 
     # ------------------------------------------------------------ mission log
     #

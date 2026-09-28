@@ -502,6 +502,13 @@ def circle_run_time(radius, speed, laps):
 # that arms a path calls these; the only per-controller freedom is `dt` (the
 # sampling grid) and `preview_s` (how far past the end the horizon must stay
 # defined — an MPC needs its N*dt, a PID needs nothing).
+#
+# ATTITUDE (2026-09-26, the 6-DoF variant): every sampler here is yaw-only —
+# (p, yaw, v, r) — and the geometric shapes stay LEVEL under the variant
+# too. Roll/pitch references exist ONLY on the policy stream
+# (PlanMsg.rp -> PlanStitcher.sample_att -> NedPlan.rp_ned); a square, line,
+# circle or station is flown with xref[3:5] = 0 exactly as before, whether
+# or not engage.attitude_axes sends K/M (then it is active levelling).
 # --------------------------------------------------------------------------
 def place_square_ned(square: dict, origin_ned_xy, yaw_fixed_ned: float,
                      depth_ned: float, dt: float, preview_s: float = 0.0):

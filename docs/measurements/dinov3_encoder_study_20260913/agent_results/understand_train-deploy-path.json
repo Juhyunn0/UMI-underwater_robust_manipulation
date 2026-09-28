@@ -1,0 +1,145 @@
+{
+ "summary": "model_name is consumed in exactly one place on the training side (TransformerObsEncoder.__init__ -> timm.create_model, transformer_obs_encoder.py:91-96) and rebuilt with pretrained=False on the station (rov_gui/perception/dp_policy.py:672-681); every other consumer (policy max_cond_tokens, denoiser cond_pos_emb, EMA, optimizer groups, checkpoint save, describe()/run meta) derives shape from the encoder's example forward, so swapping to a DINOv3 ViT (timm 'vit_large_patch16_dinov3' / 'vit_huge_plus_patch16_dinov3' / 'vit_7b_patch16_dinov3', class timm.models.eva.Eva, 201 tokens = CLS+4 reg+196 patches at 224, RoPE with coords normalised to [-1,1] so 224 needs no pos-embed resampling, non-persistent rope buffer so strict load is clean) is CONFIG-ONLY for the network graph: the 1024/1280/4096->768 projection is auto-created (line 197-199), cond_pos_emb becomes (1,411,768), n_obs_tokens 410. The hard blockers are environmental, not architectural: (1) the training env umi2 has timm 0.9.7 which has no dinov3 models — needs timm >= 1.0.20 (DINOv3 added in v1.0.20; pin 1.0.29 to match rovgui-pose); upgrading is safe for existing checkpoints because vit_base_patch16_clip_224.openai (151 keys) and resnet34.a1_in1k (216 keys) state-dict keys/shapes are identical between 0.9.7 and 1.0.29 and the real data/20260910/0910_095252_train_umi_depth_5d_depth5d_9926_A_vitclip ViT-CLIP checkpoint's backbone keys equal timm 1.0.29's; (2) resources on the single RTX 5090 + 87 GB free disk: ViT-L (303M) is feasible with care (~3.0 GB per ckpt x21 = 62 GB, fp32 training memory unmeasured/borderline), H+ (840M) needs topk reduction (7.3 GB/ckpt x21 = 153 GB > disk) and almost certainly bf16/grad-checkpointing (code), and 7B (6.7B, 26.9 GB fp32 weights) is infeasible without deep code changes (construction deep-copies the encoder at transformer_obs_encoder.py:187 and the workspace deep-copies the whole policy for EMA at workspace:82 -> 3 x 27 GB CPU, 54 GB GPU; deploy loader is fp32-only, dp_policy.py:755, beside a 7.5 GB station process). Two code-level traps: `frozen: True` in the config makes the deploy loader crash (dp_policy passes `frozen` through with pretrained=False; transformer_obs_encoder.py:99-100 asserts pretrained), and register tokens ride into the decoder as conditioning tokens unless aggregate_feature is edited. Parity fixture regeneration (dp_policy_reference.py in umi2) also requires the timm upgrade.",
+ "facts": [
+  {
+   "fact": "The only training-side consumer of model_name is timm.create_model(model_name, pretrained, global_pool='', num_classes=0); the name is stored and later only tested with startswith('resnet'|'convnext'|'vit').",
+   "evidence": "external/UMI_aquatic/diffusion_policy/model/vision/transformer_obs_encoder.py:91-97, :105, :118, :139, :237"
+  },
+  {
+   "fact": "For any name starting with 'vit' and feature_aggregation=null, aggregate_feature returns ALL backbone tokens unchanged; 'cls' returns feature[:, [0], :]. Any other aggregation is coerced to 'cls' with a warning.",
+   "evidence": "transformer_obs_encoder.py:139-146 and :237-244"
+  },
+  {
+   "fact": "The projection to n_emb is inferred from an example CPU forward of zeros(1,3,224,224): feature_size != n_emb -> nn.Linear(feature_size, n_emb) under key_projection_map.<rgb_key>. For DINOv3 L/H+/7B this auto-creates Linear(1024|1280|4096 -> 768) — no code needed. The current CLIP run has NO image projection (768==768; checkpoint key_projection_map only holds the 3 lowdim Linear pairs).",
+   "evidence": "transformer_obs_encoder.py:191-200; checkpoint data/20260910/0910_095252_train_umi_depth_5d_depth5d_9926_A_vitclip/checkpoints/epoch=0195-train_loss=0.020.ckpt state_dicts.model projection keys (inspected read-only)"
+  },
+  {
+   "fact": "frozen=True asserts pretrained=True inside the encoder constructor.",
+   "evidence": "transformer_obs_encoder.py:99-102"
+  },
+  {
+   "fact": "The deploy loader rebuilds the encoder with pretrained=False and forwards every other obs_encoder cfg key (including `frozen`) as kwargs; therefore a checkpoint trained with frozen: True raises AssertionError at station load. Currently frozen: False so it does not trigger.",
+   "evidence": "rov_gui/perception/dp_policy.py:675-681 (enc_kwargs excludes only _target_, transforms, shape_meta, pretrained, use_group_norm, force_group_norm); config train_diffusion_transformer_umi_depth_vit_workspace.yaml:57"
+  },
+  {
+   "fact": "use_group_norm=True replaces only nn.BatchNorm2d; timm Eva (DINOv3 ViT) has no BatchNorm so the swap is a no-op, and describe()['encoder_batchnorm_kept'] would report True (cosmetic, misleading).",
+   "evidence": "transformer_obs_encoder.py:128-135; dp_policy.py:844"
+  },
+  {
+   "fact": "Policy derives obs_tokens from obs_encoder.output_shape() and passes max_cond_tokens=obs_tokens+1 to the denoiser, whose cond_pos_emb is nn.Parameter (1, max_cond_tokens, n_emb). With DINOv3 at horizon 2 and 4 lowdim keys: 2*201 + 4*2 = 410 obs tokens, cond_pos_emb (1,411,768). The real CLIP ckpt has cond_pos_emb (1,403,768) = 2*197+8+1, confirming the arithmetic.",
+   "evidence": "diffusion_transformer_timm_policy.py:38-51; transformer_for_action_diffusion.py:28, :194-199; ckpt model.cond_pos_emb shape inspected"
+  },
+  {
+   "fact": "Optimizer groups: every param whose name starts with 'key_model_map' gets obs_encoder_lr (3e-5) and obs_encoder_weight_decay (1e-6); the new image projection Linear and lowdim projections go to the other group at base lr 3e-4. DINOv3 LayerScale gamma_1/gamma_2, reg_token, cls_token and LayerNorms all receive the 1e-6 decay (no exclusion).",
+   "evidence": "diffusion_transformer_timm_policy.py:155-170; config yaml:125-130"
+  },
+  {
+   "fact": "The workspace deep-copies the entire policy for EMA (a second full encoder copy) and moves both to the GPU; Accelerator is created without mixed_precision (fp32 training); no allow_tf32/autocast/grad-checkpointing anywhere in the training code.",
+   "evidence": "train_diffusion_transformer_timm_workspace.py:80-82, :97, :202-207; grep for allow_tf32|autocast|mixed_precision|grad_checkpointing in workspace/encoder/train.py returned nothing"
+  },
+  {
+   "fact": "freeze_encoder=True only sets eval() + requires_grad_(False) each epoch; the frozen params stay in the optimizer (AdamW skips None grads) and EMAModel.step copies (not averages) params with requires_grad False. EMA averages named_parameters() only.",
+   "evidence": "workspace:230-232; diffusion_policy/model/diffusion/ema_model.py:100-119"
+  },
+  {
+   "fact": "Checkpoints store both state_dicts.model and state_dicts.ema_model in fp32 (cpu copies, saved on a thread) with topk k=20 plus latest.ckpt = 21 files per run. The ViT-B CLIP run's files are 1.219 GB each (85.8M encoder + 66.5M denoiser); the 11 kept files occupy 13 GB.",
+   "evidence": "base_workspace.py:35-70; config yaml:167-174; ls/du of data/20260910/0910_095252_train_umi_depth_5d_depth5d_9926_A_vitclip_.../checkpoints"
+  },
+  {
+   "fact": "Per-checkpoint size arithmetic (model+ema, fp32): DINOv3-L ~3.0 GB (21 files ~62 GB); H+ ~7.3 GB (~153 GB); 7B ~54 GB (~1.1 TB). The data volume has 87 GB free (96% full).",
+   "evidence": "computed from encoder param counts 303.08M/840.5M/6716M + 66.5M denoiser; df -h /home/bdml/Desktop/umi_underwater_robust_control/data -> 1.8T, 87G avail"
+  },
+  {
+   "fact": "selected.json is hand-written (no code produces it); the deployed ckpt path is one constant POLICY_CKPT_DEFAULT that must equal the config/hw_mpc.yaml and land_dp.yaml policy.ckpt lines (tested), and since 2026-09-11 the panel picker can select any ckpt at runtime.",
+   "evidence": "rov_gui/state.py:878-880 and comment :856-860; config/hw_mpc.yaml:470; rov_gui/tests/test_policy_ckpt_paths.py; MEMORY trajectory-panel-high-low"
+  },
+  {
+   "fact": "state.py POLICY_* constants carry nothing encoder-specific (POLICY_ACTION_REPR, POLICY_UMI_REPO, POLICY_OUTPUTS_ROOT, POLICY_CKPT_DEFAULT, POLICY_GRID_WHY_IDLE); the ARM-time _policy_refusal checks only worker status, depth grid, obs_dt and action_repr.",
+   "evidence": "rov_gui/state.py:842-889, :964; rov_gui/control/workers.py:4344-4400"
+  },
+  {
+   "fact": "Station-side, timm is imported via the upstream encoder module under UPSTREAM_IMPORT_LOCK; rovgui-pose timm 1.0.29 registers the dinov3 ViTs, and the tagged name 'vit_large_patch16_dinov3.lvd1689m' also resolves with pretrained=False (no download). describe() records model_name, n_obs_tokens, timm version; nothing pins n_obs_tokens; test_dp_policy.py:591 pins model_name == 'resnet34.a1_in1k' only for the DEFAULT checkpoint.",
+   "evidence": "dp_policy.py:433-476, :597, :843, :853, :857; rov_gui/tests/test_dp_policy.py:591; verified create_model in rovgui-pose"
+  },
+  {
+   "fact": "timm DINOv3 ViTs are class timm.models.eva.Eva with dynamic_img_size=True, no abs pos_embed (use_abs_pos_emb=False), RoPE 'dinov3' (rope_temperature 100, rotate_half), 4 register tokens, qkv_bias=False, LayerScale init 1e-5, use_fc_norm=False, LayerNorm eps 1e-5; H+ and 7B use SwiGLU MLP (keys mlp.fc1_g/fc1_x/fc2). pretrained_cfg: input_size (3,256,256), fixed_input_size True, ImageNet mean/std, num_classes 0, license 'dinov3-license', hf_hub_id timm/vit_*_patch16_dinov3.lvd1689m. The def comments say global_pool default is avg (we pass '') and '#rope_rescale_coords=2 haven't added to interface'.",
+   "evidence": "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/timm/models/eva.py:1379-1400, :3002-3028 (L), :3058-3087 (H+), :3119-3150 (7B)"
+  },
+  {
+   "fact": "At 224x224 input the Eva DINOv3 ViTs emit (B, 201, D): token order [cls, reg x4, 196 patches] (num_prefix_tokens 5), post-final-LayerNorm, head Identity, pool '' passthrough. Random-init CPU forward at 224 works (L: (1,201,1024); H+: (1,201,1280); batch 2 fine).",
+   "evidence": "keys.py runs in rovgui-pose (scratchpad dinov3_L.json / dinov3_Hp.json); eva.py _pos_embed concatenates cls_token then reg_token then patches"
+  },
+  {
+   "fact": "RoPE at 224 needs no resampling: RotaryEmbeddingDinoV3 builds coords per forward from the actual grid, normalised 'separate' to [-1,1] per axis ((i+0.5)/H), so a 14x14 grid spans the same range as the 16x16 pretraining grid (per-patch angular step 2/14 vs 2/16 [유도]). rope.periods is a NON-persistent buffer -> absent from state_dict -> strict load unaffected; timm notes original weights had bf16 periods, timm regenerates fp32.",
+   "evidence": "timm/layers/pos_embed_sincos.py:1107+ (RotaryEmbeddingDinoV3, register_buffer(..., persistent=False)), make_coords_dinov3; dinov3_L.json shows no rope keys among 318 state-dict keys"
+  },
+  {
+   "fact": "DINOv3-L state dict: 318 keys — cls_token [1,1,1024], reg_token [1,4,1024], patch_embed.proj.{weight,bias}, norm.{weight,bias}, blocks.N.{gamma_1,gamma_2,norm1.*,attn.qkv.weight (no bias),attn.proj.*,norm2.*,mlp.fc1.*,mlp.fc2.*}; H+: 486 keys with mlp.fc1_g/fc1_x/fc2. Params 303,079,424 (L) / 840,509,440 (H+).",
+   "evidence": "scratchpad dinov3_L.json, dinov3_Hp.json"
+  },
+  {
+   "fact": "Training env umi2 (python 3.10, torch 2.9.1+cu128, timm 0.9.7, huggingface-hub 0.16.4, diffusers 0.18.2, accelerate 0.24.1, hydra 1.2.0, omegaconf 2.2.3, safetensors 0.7.0) cannot build a DINOv3 model; timm added DINOv3 (Eva + RotaryEmbeddingDinoV3) in release v1.0.20, with a later v1.0.27 fix only for the NaFlexVit variant. timm 1.0.29 Requires-Python >=3.8 and Requires-Dist torch, torchvision, pyyaml, huggingface_hub, safetensors with NO version pins; its _hub.py imports HfApi, hf_hub_download, model_info and huggingface_hub.utils.{EntryNotFoundError,RepositoryNotFoundError}, all present in hub 0.16.4 [예측: import-compatible, not executed].",
+   "evidence": "pip list in umi2; github releases page (WebFetch); importlib.metadata in rovgui-pose; timm/models/_hub.py:34-36; hasattr checks in umi2"
+  },
+  {
+   "fact": "Upgrading timm would NOT change state-dict keys of existing checkpoints: vit_base_patch16_clip_224.openai random-init keys are identical (151 keys, same shapes, same order: cls_token, pos_embed, patch_embed.proj.weight, norm_pre.*, blocks.*) in 0.9.7 and 1.0.29; resnet34.a1_in1k identical (216 keys); and the real ViT-CLIP checkpoint's 151 backbone keys under key_model_map.camera0_depth.* equal timm 1.0.29's set with equal shapes. The station already strict-loads 0.9.7-trained resnet34 ckpts under 1.0.29 (parity logs 2026-09-02/07).",
+   "evidence": "scratchpad clip_097.json vs clip_1029.json, r34_097.json vs r34_1029.json; ckpt inspection; rov_gui/tools/dp_policy_out/parity_20260907.log:18"
+  },
+  {
+   "fact": "The timm-hosted DINOv3 weights are NOT gated on the Hub (gated: False): L model.safetensors 1.21 GB, H+ 3.36 GB, 7B 26.86 GB. A HF token file exists and the gated facebook/dinov3-vitb16-pretrain-lvd1689m (gated: manual, 327 MB, HF-transformers format, not timm) was already downloaded on 2026-01-09, i.e. the DINOv3 license was accepted. No timm DINOv3 weights are cached yet.",
+   "evidence": "HfApi.model_info queries; ls ~/.cache/huggingface/hub; ~/.cache/huggingface/token"
+  },
+  {
+   "fact": "No Normalize(mean,std) exists anywhere in the pipeline (train transforms RandomCrop 0.95 -> Resize 224 -> RandomRotation +-5; station 'center' = CenterCrop(212) -> Resize(224)); pretrained_cfg mean/std are never applied, for CLIP today and for DINOv3 tomorrow alike. Input is a 3-channel depth encoding in [0,1].",
+   "evidence": "config yaml:65-72 (ColorJitter removed comment :73-75); dp_policy.py:648-663"
+  },
+  {
+   "fact": "ViT-B CLIP training throughput on this GPU: 518 steps/epoch at batch 64 (2 frames -> 128 images/step); 40 epochs (150->190) took 64.8 min = ~97 s/epoch; 200 epochs of logs (103,600 lines).",
+   "evidence": "checkpoint mtimes 17:43:10 -> 18:48:00 in data/20260910/0910_095252_train_umi_depth_5d_depth5d_9926_A_vitclip_.../checkpoints; data/20260910/train_logs/A_vitclip.log"
+  },
+  {
+   "fact": "The GPU currently hosts a rovgui-pose process (pid 10463) using 7.5 GB at 100% util, so no DINOv3 memory benchmark was run; peak training memory for L/H+ is UNMEASURED.",
+   "evidence": "nvidia-smi at 2026-09-13"
+  },
+  {
+   "fact": "The parity chain needs the upgrade too: dp_policy_reference.py runs in umi2 and instantiates cfg.policy through hydra (pretrained: True -> re-downloads weights), then compares encoder tokens against the station with TOL_TOKENS = 5e-3 (a TF32 noise floor measured on a resnet34: 2.4e-3 / 3.1e-3). Parity was never run for the ViT-CLIP run.",
+   "evidence": "rov_gui/tools/dp_policy_reference.py:5, :161; rov_gui/tools/dp_policy_parity.py:95-97, :35-45; parity logs list"
+  },
+  {
+   "fact": "ConvNeXt fallback is also config-only: 'convnext_large.dinov3_lvd1689m' goes through the convnext branch (children [stem, stages, norm_pre, head]; [:-2] -> (1,1536,7,7) -> 49 tokens/frame -> auto Linear(1536->768)); 196.2M params, no BatchNorm; the hard-coded feature_dim=1024 at :124 matters only for soft_attention/spatial_embedding/attention_pool_2d.",
+   "evidence": "transformer_obs_encoder.py:118-126, :148-161; verified in rovgui-pose"
+  },
+  {
+   "fact": "dp_policy.py module docstring 'Architecture facts the loader relies on' (resnet34, BatchNorm kept) and the header line 'timm resnet34' are stale for any ViT checkpoint; the loader logic itself is model-agnostic apart from the frozen pass-through and the use_gn derivation.",
+   "evidence": "dp_policy.py:5-7, :46-54, :666-681"
+  },
+  {
+   "fact": "Training launcher: tools/run_ablations.sh uses $HOME/miniforge3/envs/umi2/bin/python train.py --config-name=<workspace yaml>; A_vitclip maps to train_diffusion_transformer_umi_depth_vit_workspace.",
+   "evidence": "tools/run_ablations.sh:13, :19, :42"
+  }
+ ],
+ "risks_for_dinov3": [
+  "BLOCKER (env, config cannot fix): umi2 timm 0.9.7 -> timm.create_model('vit_*_patch16_dinov3') fails; needs pip upgrade to timm>=1.0.20, recommended ==1.0.29 to match rovgui-pose so Eva key names are identical on both sides. Verified safe for existing CLIP/resnet34 checkpoints (identical keys), but the umi2 install itself (hub 0.16.4 compatibility, other timm 1.0 API drift in umi/ code) is untested.",
+  "BLOCKER for 7B: 26.9 GB fp32 weights; encoder construction deep-copies the backbone once per rgb key (transformer_obs_encoder.py:187, share_rgb_model False) and the workspace deep-copies the whole policy for EMA (workspace:82) -> ~81 GB CPU RAM transient on a 60 GB machine, 54 GB GPU for model+EMA on a 32 GB card, 54 GB per checkpoint; deploy loader is fp32-only (dp_policy.py:755) and would need 27 GB beside the station's 7.5 GB. Not feasible without bf16 weights, no-EMA, no-deepcopy, frozen-backbone code changes.",
+  "H+ (840M): 21 x 7.3 GB = 153 GB of checkpoints vs 87 GB free -> must cut checkpoint.topk.k (config) or the run dies mid-way; static GPU footprint ~17 GB fp32 (weights+EMA+grads+Adam) leaves ~15 GB for 128-image activations through 32 x 1280-d layers -> OOM expected at batch 64 [예측]; fixes are bf16 autocast / model.set_grad_checkpointing(True) (code, or possibly ACCELERATE_MIXED_PRECISION=bf16 env for accelerate 0.24.1 — unverified) or batch reduction (config).",
+  "L (303M): fits on disk only barely (62 GB of 87 GB, with 13 GB of ViT-CLIP ckpts already there); fp32 batch 64x2 training memory unmeasured and borderline [예측]; throughput ~3.5x ViT-B FLOPs -> ~6 min/epoch, ~19 h for 200 epochs [예측]. Measure peak memory with a 1-epoch debug run before committing.",
+  "Deploy assert trap: any DINOv3 config with frozen: True crashes DpPolicySession.load (dp_policy.py:675-681 passes frozen with pretrained=False; encoder asserts at transformer_obs_encoder.py:99-100). Needs one-line code change (drop 'frozen' from enc_kwargs) if freezing is chosen.",
+  "Register tokens leak into conditioning: with feature_aggregation null the 4 register tokens per frame (8 total) become decoder memory tokens; dropping them (feature[:, 5:] or CLS+patches) needs code in aggregate_feature; 'cls' aggregation alone is a 2-token conditioning and discards spatial detail.",
+  "Any NEW obs_encoder config key (e.g. a register-drop flag) is forwarded verbatim to TransformerObsEncoder by the station (dp_policy.py:675-681) -> TypeError at load unless the upstream class signature accepts it; encoder changes must land in external/UMI_aquatic (the vendored repo dp_policy imports from), not only in training.",
+  "Pretraining mismatch: DINOv3 expects ImageNet mean/std RGB at 256; pipeline feeds unnormalised [0,1] depth-encoding at 224 (RoPE handles 224 natively). Adding Normalize is a config change on the training side but must be mirrored in dp_policy's transforms (code) — currently CenterCrop/Resize only.",
+  "Parity/regression tooling: dp_policy_reference.py (umi2) must be rerun after the timm upgrade to regenerate rov_gui/tests/data/dp_policy_ref.npz; TOL_TOKENS 5e-3 was calibrated on a 21M resnet and may fail for a 24/32-layer ViT across torch 2.9 vs 2.11 TF32 paths [예측]; test_dp_policy.py:591 breaks only if POLICY_CKPT_DEFAULT is repointed at a non-resnet run.",
+  "EMA doubles GPU memory for a giant encoder and (with obs_encoder_lr 3e-5, EMA power 0.75) slows the encoder's effective adaptation; use_ema is a config switch but selection protocols (selected.json) currently rank on 'model' weights anyway.",
+  "Weight decay 1e-6 and lr 3e-5 apply uniformly to LayerScale gammas, register/cls tokens and LayerNorms of the backbone (no param-group exclusions) — harmless at 1e-6 but any larger decay would need code.",
+  "License: timm tags the weights 'dinov3-license' (Meta DINOv3 License, not Apache); the HF mirrors are ungated so nothing technical blocks the download, but the checkpoint provenance/meta should record the license tag."
+ ],
+ "open_questions": [
+  "Peak GPU memory of DINOv3-L and H+ at batch 64 (128 images/step) in fp32 on the RTX 5090 — could not be measured (GPU occupied by pid 10463); a 1-epoch training.debug run per size is the cheapest answer.",
+  "Full fine-tune vs frozen backbone: frozen: True currently breaks the deploy loader (assert) and keeps EMA/optimizer overhead; if frozen is intended, decide whether to fix dp_policy.py enc_kwargs or keep frozen out of the yaml and freeze via training.freeze_encoder (which does not trip the assert).",
+  "Does accelerate 0.24.1 honour ACCELERATE_MIXED_PRECISION=bf16 for this workspace (Accelerator(log_with='wandb') without mixed_precision) so bf16 training is env-only? Untested; if not, autocast/grad-checkpointing is a code change.",
+  "Register/CLS handling: keep all 201 tokens (config-only), or add a register-drop option in aggregate_feature (code in external/UMI_aquatic + station pass-through)?",
+  "Should ImageNet mean/std normalisation be added for DINOv3 (never applied for CLIP/resnet) — and if so, mirrored in dp_policy transforms?",
+  "Which timm version to pin in umi2: 1.0.29 (identical Eva code to rovgui-pose) — and does the upgrade break any other umi2 import (wandb 0.15.8, zarr, umi/ scripts)? Only key-name compatibility was verified here.",
+  "Disk: 87 GB free — which existing runs (e.g. the 13 GB ViT-CLIP 09.52.52 run, 43-ckpt 2026.09.07 run) can be pruned, or should checkpoint.topk.k be lowered for the DINOv3 run?",
+  "Is the ImageNet/LVD-1689M DINOv3 prior expected to transfer to a 3-channel depth encoding at all, given the ablation history (E/A/C) where the ViT-CLIP variant's advantage rested on one run? A held-out replay (dp_policy_offline.py in rovgui-pose, which already supports DINOv3 via timm 1.0.29) would be the gate."
+ ]
+}

@@ -59,13 +59,15 @@ from pathlib import Path
 import numpy as np
 
 from .. import imaging
+# bus pulls in nothing heavier than Qt, which this module already needs.
+from ..bus import StereoMailbox
 from ..leak import PRESSURE_REPEAT_S, LeakMonitor
 from ..net import NicMonitor
 from ..qt import Qt, Slot, import_cv2
 from ..sensorlog import SensorLog
-from ..state import (Conn, ImuBatch, PayloadState, PilotInput, PoseTrack,
-                     SensorStat, Telemetry, ThrusterState, VehicleImu,
-                     VideoStat, now)
+from ..state import (Conn, FStereoState, ImuBatch, PayloadState, PilotInput,
+                     PolicyStatus, PoseTrack, SensorStat, Telemetry,
+                     ThrusterState, VehicleImu, VideoStat, now)
 from ..widgets.propulsion import pwm_to_norm
 from .base import Backend, LoopWorker, TimerWorker
 
@@ -109,10 +111,29 @@ def _parse_size(text) -> tuple[int, int] | None:
 # image or the ROV's own RGB camera, chosen with --panel2.
 STREAM_TO_PANEL = {"color": "main", "left": "second", "depth": "depth"}
 
+
+def stream_to_panel(opts) -> dict:
+    """Which C3 stream draws which panel, for THIS configuration.
+
+    ``left`` is the ambiguous one: with ``--panel2 stereo`` it is the middle
+    panel's picture, and with ``--fstereo`` it is ALSO an input to the
+    learned-depth worker. Those are compatible — the tap copies, it does not
+    consume — so the only rule here is the original one: do not publish it to a
+    panel that is showing something else.
+
+    The depth panel is not listed here at all: with --fstereo the learned
+    worker owns it for the whole run and the device stream is not even
+    requested, so there is nothing to arbitrate.
+    """
+    mapping = dict(STREAM_TO_PANEL)
+    if getattr(opts, "panel2", "rov") != "stereo":
+        mapping.pop("left", None)
+    return mapping
+
 #: THE DEPTH CORRECTION, and it is ON unless someone turns it off.
 #: The C3's stereo depth reads LONG in water [측정: 2026-08-23 — mesh longest
 #: axis 187 mm against a caliper-measured 119.73 mm object = 1.56x;
-#: sessions/low_level_controller_data/20260823/0823_210304/mission_log.txt
+#: data/20260823/0823_210304/mission_log.txt
 #: 21:02:29 "메시 73770 verts, 143 x 166 x 187 mm"], while colour PnP stays
 #: mm-accurate. 0.64 = 1/1.56.
 #: WARNING — 0.64 IS A SCALAR AND THE ERROR IS NOT. The same mesh line reads
@@ -127,7 +148,7 @@ STREAM_TO_PANEL = {"color": "main", "left": "second", "depth": "depth"}
 #: It defaulted to 1.0 until 2026-08-24, which made forgetting it SILENT: two
 #: runs that morning placed the object 1.55-1.57x down the camera ray — two tag
 #: rows past it and half a metre under the mat — and nothing in the log said the
-#: correction was absent [측정: sessions/low_level_controller_data/20260824/
+#: correction was absent [측정: data/20260824/
 #: {0824_101807,0824_101251}, object at tag 58 reported nearest tags 11/10/52].
 #: The flag still exists; `--depth-scale 1.0` is what an IN-AIR bench wants.
 #: Kept here rather than only in __main__ so a hand-built opts object (a test,
@@ -318,11 +339,49 @@ class C3VideoWorker(LoopWorker):
         # Set by HardwareBackend when --pose is on. None = perception off, and
         # then _tap_pose does not even copy a frame.
         self.pose_mb = None
+        # Set by HardwareBackend when --fstereo is on. None = feature off, and
+        # then the run loop does not even look at the mono pair.
+        self.fstereo_mb = None
+        self._fstereo_on = bool(getattr(opts, "fstereo", False))
+        # --slam: the ORB-SLAM3 bridge's own pair queue. Set by the backend
+        # when the feature is on; None keeps _tap_slam free (the --pose rule).
+        self.slam_q = None
+        self._slam_on = bool(getattr(opts, "slam", False))
+        self._slam_last_seq = -1
+        self._slam_tap_fault = None
+        # Built once, when the device opens: frozen geometry, shared read-only
+        # with the learned-depth worker by riding along in the mailbox.
+        self._rig = None
+        self._rig_note = ""
+        self._panel_of = stream_to_panel(opts)
+        #: --record-depth's colour tap (bus.LatestFrame), injected by the
+        #: backend. None, or `wanted()` False, means not one byte is copied.
+        self.color_rec_mb = None
+        self._fs_last_seq = None
+        self._fs_tap_fault = ""
+        self._color_rec_fault = ""
+        #: How far apart a colour frame and a learned depth map may be and
+        #: still describe the same scene. The learned map lags its mono pair
+        #: by one inference (~45 ms end-to-end as a CUDA graph [측정:
+        #: rov_gui/tools/fstereo_bench_out/session.txt]) and arrives at the
+        #: pair's 15 fps against colour's 30, so ~3 learned frames is the
+        #: natural bound; beyond it
+        #: the pair is refused rather than handed over as if simultaneous.
+        self.FS_PAIR_MAX_MS = 250.0
         # Set by HardwareBackend when --mpc is on: the AprilTag worker's own
         # mailbox. A SECOND slot, not a shared one, so tag navigation and SAM2
         # tracking cannot starve each other of frames — and colour-only,
         # because tag PnP has no use for depth (no 1.15 MB copy).
         self.nav_mb = None
+        # Set by HardwareBackend ONLY under --policy --policy-allow-device-depth
+        # (and no --fstereo): the policy worker's depth mailbox, fed with the
+        # device's CAM_A-aligned depth on the `color_aligned` grid. Refused by
+        # default because that depth covers ~64% of the policy FOV [유도] and is
+        # the x0.64-scaled on-device matcher (spec v2 A16); --fstereo is the
+        # parity path and then FStereoWorker feeds the mailbox instead.
+        self.policy_mb = None
+        self._policy_grid_done = False
+        self._policy_tap_fault = ""
 
     def setup(self) -> None:
         # Imported here, not at module import: c3_camera's __init__ requires
@@ -331,10 +390,30 @@ class C3VideoWorker(LoopWorker):
         from c3_camera.config import StreamConfig
 
         wanted = ["color"]
-        if getattr(self.opts, "depth", True):
+        # The DEVICE depth stream is not requested with --fstereo. Nothing
+        # would consume it — the learned map replaces it everywhere for the
+        # run — and its bandwidth is what buys the mono pair its frame rate.
+        # It also removes the only way this station could ever mix two depth
+        # instruments in one recording, one log, or one ratio.
+        if getattr(self.opts, "depth", True) and not self._fstereo_on:
             wanted.append("depth")
         if getattr(self.opts, "panel2", "rov") == "stereo":
             wanted.append("left")
+        # --slam wants the SAME raw pair, so the request fires on EITHER flag.
+        # It must not hang off --fstereo alone: --slam without --fstereo would
+        # otherwise open a pipeline with no mono streams in it and the bridge
+        # would starve silently, which is the failure this stack is least able
+        # to diagnose from the outside.
+        if self._fstereo_on or self._slam_on:
+            # RAW mono, not the device's rectifiedLeft/Right: DepthAI 2.32
+            # exposes no rectified focal length, so a device-rectified pair
+            # would have to be paired with the EEPROM fx — a ~0.4% silent
+            # metric scale error that host_depth.py refuses by construction.
+            # Rectifying on the host makes P1[0,0] the focal length of the
+            # very images being matched. mono_source therefore stays "raw".
+            for stream in ("left", "right"):
+                if stream not in wanted:
+                    wanted.append(stream)
         # Colour and the stereo pair get SEPARATE rates, because they cost
         # wildly different amounts of the link and only one of them is what the
         # pilot flies on. Measured on this rig, 960x540 MJPEG + aligned depth
@@ -392,7 +471,8 @@ class C3VideoWorker(LoopWorker):
             fps=float(getattr(self.opts, "fps", 30.0) or 30.0),
             isp_scale=isp,
             mjpeg_quality=int(getattr(self.opts, "mjpeg_quality", 80) or 80),
-            mono_fps=float(getattr(self.opts, "depth_fps", 20.0) or 20.0),
+            mono_fps=float(getattr(self.opts, "depth_fps", None)
+                           or (5.0 if self._fstereo_on else 20.0)),
             depth_size=_parse_size(getattr(self.opts, "depth_size", None)),
             # The C3's on-board BNO086. A DIFFERENT sensor from the autopilot's
             # IMU, on the camera's own clock — which is exactly why it is worth
@@ -408,6 +488,12 @@ class C3VideoWorker(LoopWorker):
             imu_batch_threshold=10,
         )
         rc = self.cfg.resolve()
+        # The colour grid. The learned depth is delivered on it because every
+        # existing consumer already assumes depth and colour share a shape —
+        # perception/session.py:891 refuses a capture outright when they do
+        # not, and the cursor probe and the depth-vs-MAP check both map through
+        # the colour intrinsics.
+        self._color_out_size = tuple(rc.color_out_size)
         # That budget is the C3's OWN link (camera -> switch, measured ~90
         # Mbit/s), not the tether. The fibre runs at 1000 and carries the ROV's
         # camera and MAVLink besides; only C3 streams count against this.
@@ -440,8 +526,16 @@ class C3VideoWorker(LoopWorker):
             self._status_for(panel, conn, note)
 
     def _panels(self) -> list[str]:
+        """The panels whose STATUS this worker may stamp.
+
+        Not the depth panel under --fstereo: it belongs to the learned-depth
+        worker for the whole run. Freshness lets a reported state override
+        fresh frames, so a C3 reconnect's ONLINE would otherwise wipe a
+        learned-depth fault note and a C3 fault would paint a healthy learned
+        feed red. Whoever draws the picture owns the state.
+        """
         owned = ["main"]
-        if getattr(self.opts, "depth", True):
+        if getattr(self.opts, "depth", True) and not self._fstereo_on:
             owned.append("depth")
         if getattr(self.opts, "panel2", "rov") == "stereo":
             owned.append("second")
@@ -467,6 +561,13 @@ class C3VideoWorker(LoopWorker):
             self._stop.wait(delay)
             return False
         self._attempt = 0
+        # Sequence numbers restart at 0 on a new device session, so a remembered
+        # one from the previous connection would reject every pair until the
+        # count climbed back past it.
+        self._fs_last_seq = None
+        self._slam_last_seq = -1
+        if self._fstereo_on or self._slam_on:
+            self._build_rig()
         self.bus.log.emit("info", "c3: connected")
         self._status(Conn.ONLINE, "")
         return True
@@ -519,7 +620,7 @@ class C3VideoWorker(LoopWorker):
                                 f"corrected millimetres; depth-vs-MAP should "
                                 f"now read ~1.0x")
             for stream in bundle.fresh:
-                panel = STREAM_TO_PANEL.get(stream)
+                panel = self._panel_of.get(stream)
                 if panel is None or panel not in self.mailboxes:
                     continue
                 frame = bundle.frames.get(stream)
@@ -527,6 +628,188 @@ class C3VideoWorker(LoopWorker):
                     continue                  # encoded passthrough, not decoded
                 self._publish(panel, stream, frame)
             self._tap_pose(bundle)
+            # Guarded: this is the only per-frame work in the loop that exists
+            # for an optional feature, and an exception here would escape run()
+            # and END THE CAMERA WORKER — taking the pilot's colour feed, the
+            # depth feed and the MPC's nav tap with it. Learned depth failing
+            # must cost learned depth and nothing else.
+            try:
+                self._tap_fstereo(bundle)
+            except Exception as e:                               # noqa: BLE001
+                if self._fs_tap_fault != str(e):
+                    self._fs_tap_fault = str(e)
+                    self.bus.log.emit(
+                        "warn", f"fstereo: mono tap failed ({type(e).__name__}: "
+                                f"{e}) — learned depth only; the camera is "
+                                f"unaffected")
+            # Same guard, same reason: losing the SLAM pose must not also cost
+            # the pilot the picture.
+            try:
+                self._tap_slam(bundle)
+            except Exception as e:                               # noqa: BLE001
+                if self._slam_tap_fault != str(e):
+                    self._slam_tap_fault = str(e)
+                    self.bus.log.emit(
+                        "warn", f"slam: mono tap failed ({type(e).__name__}: "
+                                f"{e}) — the SLAM pose stops; the camera is "
+                                f"unaffected")
+            # Same guard, same reason: --record-depth's colour tap is a
+            # diagnostic and must never cost the pilot the picture.
+            try:
+                self._tap_record_color(bundle)
+            except Exception as e:                               # noqa: BLE001
+                if self._color_rec_fault != str(e):
+                    self._color_rec_fault = str(e)
+                    self.bus.log.emit(
+                        "warn", f"record-depth: colour tap failed "
+                                f"({type(e).__name__}: {e}) — the recording "
+                                f"keeps its depth; the camera is unaffected")
+            # Same guard, same reason: the policy's device-depth tap is an
+            # optional feature and must never cost the pilot the camera.
+            try:
+                self._tap_policy_depth(bundle)
+            except Exception as e:                               # noqa: BLE001
+                if self._policy_tap_fault != str(e):
+                    self._policy_tap_fault = str(e)
+                    self.bus.log.emit(
+                        "warn", f"policy: device-depth tap failed "
+                                f"({type(e).__name__}: {e}) — the policy gets "
+                                f"no depth; the camera is unaffected")
+
+    def _build_rig(self) -> None:
+        """Rectification geometry for the learned-depth path. Once, at open.
+
+        Failure here disables learned depth and says why; it never stops the
+        station. ``CalibrationIncomplete`` is the interesting case — it means
+        the EEPROM is missing the stereo extrinsics, and host_depth refuses to
+        substitute the raw fx rather than returning distances that are wrong by
+        a fixed fraction.
+        """
+        self._rig = None
+        try:
+            from c3_camera.host_depth import StereoRig
+            rc = self.cfg.resolve()
+            align = _parse_size(getattr(self.opts, "fstereo_align_size", None)) \
+                or rc.color_out_size
+            calib = self.src.device.readCalibration()
+            # alpha: 0 = crop to the valid rectified region (the learned-depth
+            # default), 0.5 under --policy (resolve_defaults) so the policy's
+            # 400x400 centre crop is covered [유도: depth-parity review — 99.99%
+            # crop coverage at 0.5 vs a refused <98.5% at 0]. Already part of
+            # rig.describe() and therefore of the run meta.
+            alpha = float(getattr(self.opts, "fstereo_alpha", None) or 0.0)
+            self._rig = StereoRig.from_calibration_handler(
+                calib, mono_size=rc.mono_size, color_size=align, alpha=alpha)
+            # The raw CAM_B intrinsics at mono size ride in the provenance so
+            # the policy's observation builder can ASSERT them against the
+            # training target model (spec v2 A16) instead of skipping the
+            # check. Lists, not arrays: rig.describe() is written to JSON.
+            try:
+                import depthai as dai
+                w, h = int(rc.mono_size[0]), int(rc.mono_size[1])
+                sock = dai.CameraBoardSocket.CAM_B
+                self._rig.provenance["left_K_live"] = [
+                    [float(v) for v in row]
+                    for row in calib.getCameraIntrinsics(sock, w, h)]
+                self._rig.provenance["left_D_live"] = [
+                    float(v) for v in calib.getDistortionCoefficients(sock)]
+            except Exception as e:                               # noqa: BLE001
+                self._rig.provenance["left_KD_live_error"] = f"{type(e).__name__}: {e}"
+        except Exception as e:                                   # noqa: BLE001
+            self._rig_note = f"{type(e).__name__}: {e}"
+            self.bus.log.emit(
+                "error", f"fstereo: no rectification geometry — "
+                         f"{self._rig_note}. Learned depth is OFF for this "
+                         f"session; the camera's own depth is unaffected.")
+            return
+        r = self._rig
+        # fx_rect vs the raw EEPROM fx is the number this whole detour exists
+        # for, so it goes in the log where the operator can see it was not a
+        # rounding argument.
+        gap = r.provenance.get("fx_rect_vs_left_raw_pct")
+        self.bus.log.emit(
+            "info",
+            f"fstereo: rig ready — fx_rect {r.fx_rect:.2f} px "
+            f"(raw EEPROM fx differs by {gap:+.2f}%), baseline "
+            f"{r.baseline_mm:.1f} mm, K {r.k_mm_px:.0f} mm*px; depth projected "
+            f"onto {r.color.size[0]}x{r.color.size[1]}")
+
+    def _tap_fstereo(self, bundle) -> None:
+        """Hand the newest RAW mono pair to the learned-depth worker.
+
+        Two gates before any copy happens, for the same reason ``_tap_pose``
+        has them: with the feature off this must cost nothing at all.
+
+        The sequence check is not defensive tidiness. left and right cross
+        XLink as separate streams and are NOT delivered in lockstep — measured
+        p50 host latency 87.0 ms (left) vs 69.5 ms (right) on this camera
+        [측정: c3_camera/datasets/dataset_20260729_173152/metadata.json,
+        camera_metrics] — so a bundle routinely holds one brand-new frame and
+        one retained one. Nothing else in the stack pairs them: C3Source's
+        pair_mode/pair_tolerance_ms govern colour-vs-depth only. Matching a
+        mismatched pair does not fail; it returns a plausible, WRONG disparity
+        field, which is the kind of error that gets believed.
+
+        So the mismatch branch firing is NORMAL — roughly every other pass at
+        5 fps — and counting it would be counting healthy traffic. The honest
+        liveness signal is "how long since a pair was actually submitted",
+        which is what the consumer reports.
+        """
+        mb = self.fstereo_mb
+        if mb is None or self._rig is None:
+            return
+        left = bundle.frames.get("left")
+        right = bundle.frames.get("right")
+        if left is None or right is None:
+            return
+        if left.image is None or right.image is None:
+            return
+        if left.seq != right.seq:
+            return                      # normal: the halves arrive apart
+        if left.seq == self._fs_last_seq:
+            return                      # already submitted; nothing new arrived
+        self._fs_last_seq = left.seq
+        # .copy(): DepthAI recycles these buffers, and the worker will still be
+        # reading them 150 ms from now.
+        mb.put(left.image.copy(), right.image.copy(), self._rig,
+               now() - (left.age_ms() / 1000.0), left.seq,
+               out_size=self._color_out_size)
+
+    def _tap_slam(self, bundle) -> None:
+        """Hand the newest RAW mono pair to the ORB-SLAM3 bridge.
+
+        A SECOND tap rather than a second consumer of ``fstereo_mb``, for two
+        reasons that both matter here: the mailbox conflates to the newest
+        frame (right for a depth network, wrong for a tracker that needs
+        consecutive frames), and --slam must work with --fstereo OFF.
+
+        Everything else is ``_tap_fstereo`` verbatim, deliberately — including
+        the ``left.seq != right.seq`` gate, whose firing is NORMAL (the two
+        mono streams cross XLink separately and are not delivered in lockstep),
+        and the ``t_capture`` expression. That last one is the whole reason
+        this tap exists inside the station: the depth frame and the SLAM pose
+        for one exposure carry the SAME stamp by construction, so the policy's
+        fix-lag gate cannot fire on a clock mismatch between two instruments
+        that never had to agree about a clock.
+        """
+        q = self.slam_q
+        if q is None or self._rig is None or not q.wanted():
+            return
+        left = bundle.frames.get("left")
+        right = bundle.frames.get("right")
+        if left is None or right is None:
+            return
+        if left.image is None or right.image is None:
+            return
+        if left.seq != right.seq:
+            return                      # normal: the halves arrive apart
+        if left.seq == self._slam_last_seq:
+            return
+        self._slam_last_seq = left.seq
+        # .copy() for the same reason _tap_fstereo copies: DepthAI recycles
+        # these buffers and the writer thread reads them later.
+        q.put(left.image.copy(), right.image.copy(), self._rig,
+              now() - (left.age_ms() / 1000.0), left.seq)
 
     @staticmethod
     def _scale_depth(img, k: float):
@@ -564,9 +847,19 @@ class C3VideoWorker(LoopWorker):
         if (not (want_pose or want_nav)) or "color" not in bundle.fresh:
             return
         color = bundle.frames.get("color")
-        depth = bundle.frames.get("depth")
         if color is None or color.image is None:
             return
+        # WHICH DEPTH FoundationPose EATS. Under --fstereo there is no device
+        # depth stream at all, so this is not a preference — it is the only
+        # depth in the process. It arrives from another thread ~45 ms after
+        # its mono pair, so it is paired here by capture time and REFUSED when
+        # too old: handing the tracker a stale map is worse than handing it
+        # none, which it already knows how to sit out.
+        depth = fs_depth = fs_skew = None
+        if self._fstereo_on:
+            fs_depth, fs_skew = self._fs_depth_for(color)
+        else:
+            depth = bundle.frames.get("depth")
         # The stamp is when the frame was TRUE, not when we got here
         # (state.py:13-15). age_ms() covers sensor->host.
         t_capture = now() - (color.age_ms() / 1000.0)
@@ -578,14 +871,114 @@ class C3VideoWorker(LoopWorker):
         # array is fine, but the pose worker hands its copy to torch, which
         # may write into it.
         if want_pose:
-            self.pose_mb.put(
-                color.image.copy(),
-                depth.image.copy() if (depth is not None
-                                       and depth.image is not None) else None,
-                intr, t_capture, bundle.skew_ms)
+            if self._fstereo_on:
+                # fs_depth is already a private array (the learned worker hands
+                # over one it will not touch again), so it is not copied twice.
+                self.pose_mb.put(color.image.copy(), fs_depth, intr,
+                                 t_capture, fs_skew)
+            else:
+                self.pose_mb.put(
+                    color.image.copy(),
+                    depth.image.copy() if (depth is not None
+                                           and depth.image is not None)
+                    else None,
+                    intr, t_capture, bundle.skew_ms)
         if want_nav:
             self.nav_mb.put(color.image.copy(), None, intr, t_capture,
                             bundle.skew_ms)
+
+    def _fs_depth_for(self, color):
+        """The learned depth to pair with this colour frame, and their skew.
+
+        Returns ``(None, nan)`` when the newest learned map is too old to be
+        about the same scene. That refusal matters: FoundationPose reads depth
+        at the mask, so a map from half a second ago on a moving vehicle puts
+        the object at a distance it no longer occupies — and the tracker has a
+        documented path for "no depth this frame" but none for "confidently
+        wrong depth".
+        """
+        depth, t_depth = self.fstereo_mb.result()
+        if depth is None:
+            return None, float("nan")
+        t_color = now() - (color.age_ms() / 1000.0)
+        skew_ms = abs(t_color - t_depth) * 1000.0
+        if skew_ms > self.FS_PAIR_MAX_MS:
+            return None, skew_ms
+        return depth, skew_ms
+
+    # ------------------------------------------------------ policy depth tap
+    def _tap_record_color(self, bundle) -> None:
+        """The newest COLOUR frame, for --record-depth to file beside the obs.
+
+        Its own tap rather than a second reader of ``_tap_pose``'s: --pose can
+        be off while --record-depth is on, and with nobody recording this must
+        cost nothing at all — hence the ``wanted()`` gate before the copy,
+        which is the same contract every other optional tap here has.
+
+        The stamp is the frame's own capture time, not this moment: the
+        recorder writes it beside the observation's and the difference is what
+        says how near-simultaneous the pair really was.
+        """
+        slot = self.color_rec_mb
+        if slot is None or not slot.wanted() or "color" not in bundle.fresh:
+            return
+        color = bundle.frames.get("color")
+        if color is None or color.image is None:
+            return
+        # .copy(): DepthAI recycles its pool and the writer thread reads this
+        # later — the same hazard every tap above copies against.
+        slot.put(color.image.copy(), now() - (color.age_ms() / 1000.0))
+
+    def _tap_policy_depth(self, bundle) -> None:
+        """Device depth -> the policy mailbox, on the `color_aligned` grid.
+
+        Bench-only (--policy-allow-device-depth, spec v2 A16). The grid is
+        declared ONCE from the calibration handler: K_A/D_A at the DEPTH
+        array's size (``bundle.intrinsics["depth"]`` — the depth stream is
+        aligned to CAM_A, so its intrinsics are CAM_A's at (dw, dh), never the
+        colour stream's), and the CAM_A->CAM_B extrinsic through
+        ``host_depth._split_extrinsics_cm`` (cm -> mm, the one place that x10
+        lives). The frame put here is the already x--depth-scale'd map every
+        other consumer sees; the worker records the factor in the meta.
+        """
+        mb = self.policy_mb
+        if mb is None or not mb.wanted() or "depth" not in bundle.fresh:
+            return
+        depth = bundle.frames.get("depth")
+        if depth is None or depth.image is None:
+            return
+        if not self._policy_grid_done:
+            self._policy_grid_done = True          # one attempt; failure is logged
+            intr = bundle.intrinsics.get("depth") if bundle.intrinsics else None
+            if intr is None:
+                raise RuntimeError("no depth intrinsics in the bundle "
+                                   "(depth not aligned to a calibrated socket)")
+            h, w = depth.image.shape[:2]
+            if (int(intr.width), int(intr.height)) != (w, h):
+                raise RuntimeError(f"depth intrinsics are at {intr.width}x"
+                                   f"{intr.height} but the array is {w}x{h}")
+            import depthai as dai
+            from c3_camera.host_depth import _split_extrinsics_cm
+
+            from ..perception.policy_obs import GRID_COLOR_ALIGNED, ColorAlignedGrid
+
+            calib = self.src.device.readCalibration()
+            ext = np.array(calib.getCameraExtrinsics(
+                dai.CameraBoardSocket.CAM_A, dai.CameraBoardSocket.CAM_B),
+                dtype=np.float64)
+            R_ab, t_ab_mm = _split_extrinsics_cm(ext)
+            grid = ColorAlignedGrid(K_a=intr.K, D_a=np.asarray(intr.distortion, float),
+                                    size_a=(w, h), R_ab=R_ab, t_ab_mm=t_ab_mm)
+            if not mb.set_grid(grid, GRID_COLOR_ALIGNED):
+                raise RuntimeError("policy mailbox refused the color_aligned grid "
+                                   "(another grid is already declared)")
+            self.bus.log.emit(
+                "warn", f"policy: DEVICE depth feeds the policy (color_aligned "
+                        f"{w}x{h}, x{self._depth_scale:g} scaled) — a bench "
+                        f"experiment, not the training-parity path (--fstereo)")
+        from ..perception.policy_obs import GRID_COLOR_ALIGNED
+        mb.put(depth.image.copy(), now() - (depth.age_ms() / 1000.0),
+               GRID_COLOR_ALIGNED)
 
     # -------------------------------------------------------------- C3 IMU
     def request_sensor_log(self, on: bool, stem: str) -> None:
@@ -713,6 +1106,7 @@ class C3VideoWorker(LoopWorker):
             drop_rate=st.drop_rate if st else 0.0,
             mbps=st.mbps if st else None,
             encoding=frame.encoding or ("16UC1" if stream == "depth" else ""),
+            instrument=("c3_stereo" if stream == "depth" else ""),
             conn=Conn.ONLINE, stamp=now())
         mb.put(imaging.bgr_to_qimage(small), stat, aux=aux)
 
@@ -1264,7 +1658,11 @@ class VehicleWorker(TimerWorker):
                           # what the vehicle SAID, incl. "Leak Detected" — a
                           # recording that cannot show the leak warning is a
                           # recording that cannot explain the recovery
-                          "STATUSTEXT")
+                          "STATUSTEXT",
+                          # 2026-09-26 (the 6-DoF variant): which firmware
+                          # consumed the s/t axes, and the RC_CHANNELS
+                          # chan1/chan2 that MANUAL_CONTROL writes on 4.1.2+
+                          "AUTOPILOT_VERSION", "RC_CHANNELS")
         # Water in the enclosure. See rov_gui/leak.py: ArduSub reports it only
         # as STATUSTEXT, so this is fed from tick() rather than from _latest.
         # `leak_cfg_fn` is injected by HardwareBackend from the command sink,
@@ -1275,9 +1673,39 @@ class VehicleWorker(TimerWorker):
         self._leak_reported = 0
         self._press_reported = 0.0
         self.leak_cfg_fn = None
+        # The command sink's attitude-axes state (MavlinkCommandSink
+        # .attitude_axes_state), injected by HardwareBackend the same way as
+        # leak_cfg_fn; None = no sink / NullCommandSink. Read every publish
+        # so Telemetry can carry firmware_version / mavlink_wire_version /
+        # attitude_axes_enabled / attitude_axes_degraded for the engage gate.
+        self.attitude_axes_fn = None
+        # 2026-09-26 audit: BlueOS routes EVERY companion component's traffic
+        # to this endpoint, so the first AUTOPILOT_VERSION on the link can be
+        # a companion's — and firmware_version is sticky. AUTOPILOT_VERSION /
+        # RC_CHANNELS are kept only from the vehicle, the (system, component)
+        # pair the command sink addresses. An ABSENT source id is the REST
+        # transport (scoped to components/1 by its URL, same rule as the
+        # HEARTBEAT filter in tick()) and passes; a present, different pair
+        # is dropped and counted.
+        self._aa_target = (int(getattr(opts, "target_sysid", 1) or 1), 1)
+        self._aa_foreign = 0
 
     def setup(self) -> None:
         from c3_camera.mavlink_log import MavlinkLogger
+
+        # "none" means NONE: no socket, no stream-rate request, nothing sent.
+        # MavlinkLogger itself only special-cases "rest" and treats every other
+        # value as udp, so the two camera tools that offer this choice guard it
+        # at the call site (c3_collect.py:592, c3_option_sweep.py:1296) — and
+        # this one did not, which made --mavlink-transport none open the UDP
+        # listener AND transmit SET_MESSAGE_INTERVAL anyway. Found 2026-09-02
+        # while running the station deliberately vehicle-free.
+        if getattr(self.opts, "mavlink_transport", "udp") == "none":
+            self.logger = None
+            self.bus.log.emit(
+                "info", "mavlink: telemetry DISABLED (--mavlink-transport "
+                        "none) — nothing is sent to or read from the vehicle")
+            return
 
         self.logger = MavlinkLogger(
             connection=getattr(self.opts, "mavlink", "udpin:0.0.0.0:14551"),
@@ -1298,6 +1726,11 @@ class VehicleWorker(TimerWorker):
                           f"({self.logger.transport})")
 
     def tick(self) -> None:
+        if self.logger is None:                 # --mavlink-transport none
+            # Still publish, so the panels say OFFLINE rather than holding the
+            # last frame of a link that was never opened.
+            self._publish()
+            return
         for rec in self.logger.drain():
             # HEARTBEAT arrives from every system on the link — the autopilot,
             # onboard components, and any GCS. Keeping the last one regardless
@@ -1307,6 +1740,19 @@ class VehicleWorker(TimerWorker):
             # _srccomp is the autopilot by construction.
             if (rec["msg_type"] == "HEARTBEAT"
                     and rec.get("_srccomp") not in (None, 1)):
+                continue
+            # AUTOPILOT_VERSION / RC_CHANNELS: the vehicle's only (_aa_target).
+            # A companion's answer must become neither the sticky firmware
+            # fact the engage gate reads nor the RC echo the probe judges.
+            if (rec["msg_type"] in ("AUTOPILOT_VERSION", "RC_CHANNELS")
+                    and not self._rec_from_vehicle(rec)):
+                self._aa_foreign += 1
+                if self._aa_foreign == 1:
+                    self.bus.log.emit(
+                        "info", f"{rec['msg_type']} from "
+                                f"{rec.get('_srcsys')}/{rec.get('_srccomp')} "
+                                f"ignored — not the vehicle "
+                                f"{self._aa_target[0]}/{self._aa_target[1]}")
                 continue
             # STATUSTEXT is an EVENT stream, so it cannot go through _latest
             # like everything else: keeping only the newest one means a "Leak
@@ -1328,6 +1774,17 @@ class VehicleWorker(TimerWorker):
         if t - self._last_link > 1.0:
             self._last_link = t
             self.bus.link.emit(self.nic.sample())
+
+    def _rec_from_vehicle(self, rec: dict) -> bool:
+        """Is this logger record the vehicle's (``_aa_target``)? Absent
+        source ids (the REST transport) count as yes; a present, different
+        pair is some other system or component on the link."""
+        src_sys, src_comp = rec.get("_srcsys"), rec.get("_srccomp")
+        try:
+            return ((src_sys is None or int(src_sys) == self._aa_target[0])
+                    and (src_comp is None or int(src_comp) == self._aa_target[1]))
+        except (TypeError, ValueError):
+            return False
 
     # ----------------------------------------------------------------- leak
     def _note_statustext(self, rec: dict) -> None:
@@ -1520,7 +1977,35 @@ class VehicleWorker(TimerWorker):
 
         connected = bool(self.logger and self.logger.connected)
         armed, mode = self._arm_state()
+        # 2026-09-26: the attitude-axes facts. The command SINK owns the
+        # link that asked for AUTOPILOT_VERSION (the reply comes back on
+        # that socket) and knows its own wire version; this worker's copy
+        # of AUTOPILOT_VERSION / RC_CHANNELS is the fallback and the
+        # recording. Empty string = never read (the gate refuses on it).
+        aa = {}
+        if self.attitude_axes_fn is not None:
+            try:
+                aa = dict(self.attitude_axes_fn() or {})
+            except Exception:                                # noqa: BLE001
+                aa = {}
+        fw = str(aa.get("firmware_version") or "")
+        if not fw:
+            raw_fw = self._get("AUTOPILOT_VERSION", "flight_sw_version")
+            fw = firmware_version_str(raw_fw) if raw_fw is not None else ""
+        rc = self._latest.get("RC_CHANNELS")
+        rc_raw = None
+        if rc is not None:
+            try:
+                rc_raw = tuple(int(rc.get(f"chan{i}_raw", 0) or 0)
+                               for i in range(1, 9))
+            except (TypeError, ValueError):
+                rc_raw = None
         tel = Telemetry(
+            firmware_version=fw,
+            mavlink_wire_version=str(aa.get("mavlink_wire_version") or ""),
+            attitude_axes_enabled=bool(aa.get("enabled", False)),
+            attitude_axes_degraded=bool(aa.get("degraded", False)),
+            rc_chan_raw=rc_raw,
             battery_v=volt, battery_pct=pct, battery_pct_source=source,
             battery_left_mah=left_mah, current_a=amps, consumed_mah=mah,
             roll=self._get("ATTITUDE", "roll"),
@@ -1599,7 +2084,13 @@ class VehicleWorker(TimerWorker):
 
         base = int(rec.get("base_mode", 0) or 0)
         armed = bool(base & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
-        custom = int(rec.get("custom_mode", -1) or -1)
+        # custom_mode 0 is STABILIZE (hardware.py MODE_NUMBERS), so `or -1`
+        # here turned every STABILIZE heartbeat into "mode -1" and the engage
+        # gate refused it as an unknown mode (2026-09-08 pool; the 2026-08-23
+        # "flight mode is mode -1" refusals were the same misread). Only a
+        # MISSING field means unknown.
+        raw = rec.get("custom_mode")
+        custom = int(raw) if raw is not None else -1
         mapping = mavutil.mode_mapping_bynumber(int(rec.get("type", 12) or 12)) or {}
         return armed, mapping.get(custom, f"mode {custom}")
 
@@ -1688,6 +2179,22 @@ class VehicleWorker(TimerWorker):
 # =============================================================================
 # command sinks
 # =============================================================================
+def firmware_version_str(flight_sw_version) -> str:
+    """AUTOPILOT_VERSION.flight_sw_version -> ``"major.minor.patch"``.
+
+    ArduPilot packs it as ``major << 24 | minor << 16 | patch << 8 | type``
+    [스펙: ArduPilot GCS_Common.cpp send_autopilot_version / version.h
+    FIRMWARE_VERSION]; the type byte (dev/alpha/beta/rc/official) is not
+    part of the comparison the engage gate makes. "" when unreadable."""
+    try:
+        v = int(flight_sw_version)
+    except (TypeError, ValueError):
+        return ""
+    if v <= 0:
+        return ""
+    return f"{(v >> 24) & 0xFF}.{(v >> 16) & 0xFF}.{(v >> 8) & 0xFF}"
+
+
 class NullCommandSink(TimerWorker):
     """The default. Accepts every command and transmits nothing.
 
@@ -1711,6 +2218,29 @@ class NullCommandSink(TimerWorker):
         self.lights_fb: float | None = None
         self.enabled = False
         self._warned = False
+        # The 6-DoF variant's attitude-axes slot, mirrored from
+        # MavlinkCommandSink so the backend wiring and the telemetry
+        # producer see one surface. Nothing is transmitted either way.
+        self.attitude_axes = False
+        self.attitude_axes_degraded = False
+        self.sign_roll = 1.0
+        self.sign_pitch = 1.0
+        self.firmware_version = ""
+        self.mavlink_wire_version = ""
+        self.attitude_axes_dropped = 0
+
+    def set_attitude_axes(self, enabled: bool, sign=(1.0, 1.0)) -> None:
+        self.attitude_axes = bool(enabled)
+        self.sign_roll = float(sign[0])
+        self.sign_pitch = float(sign[1])
+
+    def attitude_axes_state(self) -> dict:
+        return {"enabled": self.attitude_axes, "degraded": self.attitude_axes_degraded,
+                "firmware_version": self.firmware_version,
+                "mavlink_wire_version": self.mavlink_wire_version,
+                "sign": (self.sign_roll, self.sign_pitch),
+                "dropped": int(self.attitude_axes_dropped),
+                "ext_sent": False, "degraded_at": None, "rc_chan_raw": None}
 
     @Slot(object)
     def set_pilot(self, cmd: PilotInput) -> None:
@@ -1743,6 +2273,14 @@ class NullCommandSink(TimerWorker):
 
     @Slot()
     def tilt_center(self) -> None:
+        pass
+
+    @Slot(float)
+    def set_tilt_manual(self, deg: float) -> None:
+        pass
+
+    @Slot(float, int)
+    def note_tilt_measured(self, deg: float, n_pairs: int) -> None:
         pass
 
     @Slot(int)
@@ -1809,6 +2347,25 @@ class MavlinkCommandSink(TimerWorker):
     explicit rather than assumed, and the default is the one ArduSub documents
     for Sub: 0 = full down, 500 = neutral, 1000 = full up.
 
+    The s/t trap (2026-09-26, the 6-DoF variant): MAVLink 2 MANUAL_CONTROL
+    carries extension axes ``s`` and ``t`` that Sub 4.1.2+ reads in MANUAL as
+    PITCH and ROLL torque demands (``enabled_extensions`` bit 0 = pitch = s,
+    bit 1 = roll = t, per the v20 ardupilotmega dialect). Their SIGN relative
+    to the NED K / M convention is [가정] until the armed in-water sign probe
+    writes its artefact — ``engage.attitude_axes.sign`` is where the probe's
+    answer goes. They are sent ONLY when :meth:`set_attitude_axes` enabled
+    them (the config's explicit flag, never "gains present"); a 4-DoF command
+    packs to the identical 23-byte frame the pre-variant sink sent (verified
+    by execution: pymavlink 2.4.49 zero-truncates all-zero extensions), and
+    the v1 dialect — a link that never saw a 0xFD byte — has no such fields
+    and raises TypeError, which degrades this sink to the 4-axis frame and
+    flags ``attitude_axes_degraded`` so the worker disengages. Once an
+    extension frame HAS gone out this session, every later 4-DoF frame
+    (neutral, E-STOP, deadman, teardown) carries ``enabled_extensions =
+    0b11, s = t = 0`` — an explicit clear, not a hope about what the
+    firmware does with an absent bit (2026-09-26 audit); a session that
+    never sent one keeps the six positional arguments.
+
     Where the commands actually go
     ------------------------------
     NOT ``udpout:192.168.2.2:14550``. That was this class's first default and it
@@ -1867,6 +2424,13 @@ class MavlinkCommandSink(TimerWorker):
         self.grip_drive = 0.0            # -1 close / 0 idle / +1 open, HELD
         self.tilt_drive = 0.0            # -1 down / 0 idle / +1 up, HELD
         self.tilt_deg: float | None = None
+        # WHERE THE MOUNT IS, tracked from every kind of evidence there is
+        # (control/tilt_tracker.py): this vehicle reports no angle, so held
+        # UP/DOWN is dead-reckoned between anchors — LEVEL, a typed value,
+        # MOUNT_STATUS if it ever arrives, and the tag localizer's own
+        # measurement of the RGB mount (bus.tilt_measured).
+        from ..control.tilt_tracker import tracker_from_opts
+        self.tilt_track = tracker_from_opts(opts)
         _tservo = getattr(opts, "tilt_servo", -1)
         self.tilt_servo = None if _tservo is None or int(_tservo) < 0 else int(_tservo)
         self.tilt_min_deg = float(getattr(opts, "tilt_min_deg", -45.0))
@@ -1896,6 +2460,21 @@ class MavlinkCommandSink(TimerWorker):
         self.target_sys = int(getattr(opts, "target_sysid", 1) or 1)
         self.target_comp = 1                          # MAV_COMP_ID_AUTOPILOT1
         self.listening = False
+        # ---- the 6-DoF variant (2026-09-26): K/M on the extension axes.
+        self.attitude_axes = False           # set_attitude_axes (config engage.attitude_axes)
+        self.attitude_axes_degraded = False  # the extended frame failed once -> 4-axis only
+        self.sign_roll = 1.0
+        self.sign_pitch = 1.0
+        self.firmware_version = ""           # "a.b.c" once AUTOPILOT_VERSION answered
+        self.mavlink_wire_version = ""       # "1.0" | "2.0" of THIS link (mavlink20())
+        self.attitude_axes_dropped = 0       # nonzero roll/pitch seen while disabled
+        self.attitude_axes_ext_sent = False  # did an enabled_extensions frame ever go out
+        self.attitude_axes_degraded_at: float | None = None
+        self._autopilot_version_asked = 0.0
+        self._autopilot_version_tries = 0
+        self._autopilot_version_raw: dict | None = None
+        self.rc_chan_raw: tuple | None = None   # RC_CHANNELS chan1..8 seen on this link
+        self.attitude_axes_foreign = 0       # AUTOPILOT_VERSION / RC_CHANNELS not from the vehicle
 
     def setup(self) -> None:
         from pymavlink import mavutil
@@ -1908,11 +2487,128 @@ class MavlinkCommandSink(TimerWorker):
                           f"command sink OPEN on {target} (sysid "
                           f"{self.opts.cmd_sysid}) — it transmits only while "
                           f"COMMAND ENABLE is on")
+        # engage.attitude_axes -> this sink's switch. The config is the ONLY
+        # source (never "gains present"); a load failure means OFF, said once.
+        try:
+            from ..control.geometry import MpcConfig
+
+            cfg = MpcConfig.load(getattr(self.opts, "mpc_config",
+                                         "config/hw_mpc.yaml"))
+            aa = cfg.engage.get("attitude_axes") or {}
+            sg = aa.get("sign") or {}
+            self.set_attitude_axes(bool(aa.get("enabled", False)),
+                                   (float(sg.get("roll", 1.0)),
+                                    float(sg.get("pitch", 1.0))))
+        except Exception as e:                                   # noqa: BLE001
+            self.set_attitude_axes(False)
+            self.bus.log.emit("warn",
+                              f"attitude axes OFF: could not read "
+                              f"engage.attitude_axes ({type(e).__name__}: {e})")
         if self.listening:
             self.bus.log.emit(
                 "info", "command sink replies to whoever pushes to that port; "
                         "if nothing arrives run: ./c3 blueos_endpoint add "
                         f"--port {target.rsplit(':', 1)[-1]} --yes")
+
+    # ------------------------------------------------ attitude axes (2026-09-26)
+    def set_attitude_axes(self, enabled: bool, sign=(1.0, 1.0)) -> None:
+        """Switch the K/M extension axes on or off and fix their wire sign
+        ``(sign_roll, sign_pitch)``. Called from setup() with the config's
+        answer; a worker may switch it OFF at disengage but never on."""
+        on = bool(enabled)
+        if on != self.attitude_axes:
+            self.bus.log.emit("warn" if on else "info",
+                              f"attitude axes {'ON' if on else 'OFF'} — K/M "
+                              f"{'go out as MANUAL_CONTROL s/t' if on else 'are dropped'}"
+                              + (f" (sign roll {sign[0]:+.0f}, pitch {sign[1]:+.0f})"
+                                 if on else ""))
+        self.attitude_axes = on
+        self.sign_roll = float(sign[0])
+        self.sign_pitch = float(sign[1])
+
+    def attitude_axes_state(self) -> dict:
+        """Plain-attribute snapshot for the telemetry producer / run meta."""
+        return {"enabled": bool(self.attitude_axes),
+                "degraded": bool(self.attitude_axes_degraded),
+                "firmware_version": self.firmware_version,
+                "mavlink_wire_version": self.mavlink_wire_version,
+                "sign": (self.sign_roll, self.sign_pitch),
+                "dropped": int(self.attitude_axes_dropped),
+                "ext_sent": bool(self.attitude_axes_ext_sent),
+                "degraded_at": self.attitude_axes_degraded_at,
+                "rc_chan_raw": self.rc_chan_raw}
+
+    def _link_v2(self) -> bool:
+        """MAVLink 2 on THIS link. pymavlink starts on the v1 dialect and
+        flips once it has parsed a 0xFD byte (mavutil), which a udpin sink
+        does in _drain before it is ever allowed to send."""
+        m = self.master
+        if m is None:
+            return False
+        try:
+            return bool(m.mavlink20())
+        except Exception:                                        # noqa: BLE001
+            return False
+
+    def _degrade_attitude_axes(self, why: str) -> None:
+        if not self.attitude_axes_degraded:
+            # degraded_at FIRST: the telemetry thread snapshots both without
+            # a lock (attitude_axes_state), and degraded=True beside
+            # degraded_at=None was a readable interleaving.
+            self.attitude_axes_degraded_at = time.monotonic()
+            self.attitude_axes_degraded = True
+            self.bus.log.emit("error",
+                              f"attitude axes DEGRADED — {why}; K/M are no "
+                              f"longer on the wire, the follower must disengage")
+
+    def _request_autopilot_version(self) -> None:
+        """MAV_CMD_REQUEST_MESSAGE(AUTOPILOT_VERSION) once a peer exists,
+        retried every 5 s until answered (bounded). The reply carries
+        flight_sw_version, the engage gate's firmware fact."""
+        if self.master is None or self.firmware_version:
+            return
+        if self.listening and self._peer_count() == 0:
+            return
+        t = time.monotonic()
+        if t - self._autopilot_version_asked < 5.0 or self._autopilot_version_tries >= 12:
+            return
+        self._autopilot_version_asked = t
+        self._autopilot_version_tries += 1
+        try:
+            from pymavlink import mavutil
+
+            self.master.mav.command_long_send(
+                self.target_sys, self.target_comp,
+                mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE, 0,
+                mavutil.mavlink.MAVLINK_MSG_ID_AUTOPILOT_VERSION,   # 148
+                0, 0, 0, 0, 0, 0)
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    def _msg_from_vehicle(self, msg) -> bool:
+        """Did the vehicle (``target_sys`` / ``target_comp``) send this?
+        BlueOS routes every companion component's traffic to this endpoint,
+        so the first AUTOPILOT_VERSION can be a companion's — and
+        firmware_version is sticky. Every pymavlink message carries the
+        header accessors; an object without them (a test fake) passes."""
+        try:
+            src_sys, src_comp = msg.get_srcSystem(), msg.get_srcComponent()
+        except AttributeError:
+            return True
+        try:
+            return (int(src_sys) == self.target_sys
+                    and int(src_comp) == self.target_comp)
+        except (TypeError, ValueError):
+            return False
+
+    def _note_autopilot_version(self, msg) -> None:
+        d = msg.to_dict() if hasattr(msg, "to_dict") else {}
+        self._autopilot_version_raw = d
+        fw = firmware_version_str(d.get("flight_sw_version"))
+        if fw and fw != self.firmware_version:
+            self.firmware_version = fw
+            self.bus.log.emit("info", f"AUTOPILOT_VERSION: flight_sw {fw} "
+                                      f"(raw {d.get('flight_sw_version')})")
 
     # -------------------------------------------------------------- commands
     @Slot(object)
@@ -1974,10 +2670,27 @@ class MavlinkCommandSink(TimerWorker):
         shape the lights use.
         """
         self.tilt_drive = float(direction)
+        self.tilt_track.drive(self.tilt_drive, time.monotonic())
 
     @Slot()
     def tilt_center(self) -> None:
         self.queue_presses(self.bit_tilt_center, 1)
+        self.tilt_track.center(time.monotonic())
+
+    @Slot(float)
+    def set_tilt_manual(self, deg: float) -> None:
+        """The operator typed the mount angle (PAYLOAD panel SET)."""
+        self.tilt_track.set_manual(float(deg), time.monotonic())
+        self.bus.log.emit("info", f"mount tilt set to {float(deg):+.1f}° by "
+                                  f"the operator (tracker anchor)")
+
+    @Slot(float, int)
+    def note_tilt_measured(self, deg: float, n_pairs: int) -> None:
+        """The tag localizer measured the RGB mount's tilt from the C3-vs-RGB
+        alignment (control/nav_fusion.py). The best evidence there is on this
+        vehicle, so it anchors the tracker — without counting as motion."""
+        self.tilt_track.set_measured(float(deg), "tags", time.monotonic(),
+                                     unc_deg=1.0)
 
     @Slot(str)
     def set_mode(self, name: str) -> None:
@@ -2064,12 +2777,17 @@ class MavlinkCommandSink(TimerWorker):
         # the mount's configured limits and labelled [유도] in the panel.
         if "mount_deg" in servos:
             self.tilt_deg = float(servos["mount_deg"])
+            self.tilt_track.set_measured(self.tilt_deg, "MOUNT_STATUS",
+                                         time.monotonic(), unc_deg=0.5)
         elif self.tilt_servo is not None:
             pwm = servos.get(int(self.tilt_servo))
             if pwm:
                 span = float(self.tilt_max_deg - self.tilt_min_deg)
                 frac = max(0.0, min(1.0, (float(pwm) - 1100.0) / 800.0))
                 self.tilt_deg = self.tilt_min_deg + frac * span
+                self.tilt_track.set_measured(self.tilt_deg,
+                                             f"servo{self.tilt_servo}",
+                                             time.monotonic(), unc_deg=3.0)
 
         if self.lights_servo is None:
             return
@@ -2128,10 +2846,19 @@ class MavlinkCommandSink(TimerWorker):
         t = time.monotonic()
         self._drain()
         self._check_gcs_sysid()
+        self._request_autopilot_version()
+        if self.master is not None:
+            self.mavlink_wire_version = "2.0" if self._link_v2() else "1.0"
+        self.tilt_track.update(t)
+        tt = self.tilt_track
         # The payload panel shows the COMMAND even when nothing is transmitted,
         # with no feedback bar — see widgets/payload.py on why those must not be
         # the same number.
         self.bus.payload.emit(PayloadState(
+            tilt_est_deg=tt.deg, tilt_est_src=tt.src,
+            tilt_est_unc_deg=(None if not math.isfinite(tt.unc_deg)
+                              else tt.unc_deg),
+            tilt_epoch=tt.epoch, tilt_moving=tt.moving,
             gripper_cmd=self.grip, gripper_fb=None,
             gripper_conn=Conn.ONLINE if (self.enabled and self.bit_grip_open
                                          is not None) else Conn.OFFLINE,
@@ -2357,8 +3084,28 @@ class MavlinkCommandSink(TimerWorker):
                 break
             if msg is None:
                 break
-            if msg.get_type() == "PARAM_VALUE":
+            mt = msg.get_type()
+            if mt == "PARAM_VALUE":
                 self._note_param(msg)
+            elif mt in ("AUTOPILOT_VERSION", "RC_CHANNELS"):
+                if not self._msg_from_vehicle(msg):
+                    self.attitude_axes_foreign += 1
+                    if self.attitude_axes_foreign == 1:
+                        self.bus.log.emit(
+                            "info", f"{mt} from {msg.get_srcSystem()}/"
+                                    f"{msg.get_srcComponent()} ignored — not "
+                                    f"the vehicle {self.target_sys}/"
+                                    f"{self.target_comp}")
+                    continue
+                if mt == "AUTOPILOT_VERSION":
+                    self._note_autopilot_version(msg)
+                else:
+                    try:
+                        self.rc_chan_raw = tuple(
+                            int(getattr(msg, f"chan{i}_raw", 0) or 0)
+                            for i in range(1, 9))
+                    except (TypeError, ValueError):
+                        pass
 
     def _peer_count(self) -> int:
         clients = getattr(self.master, "clients", None)
@@ -2446,6 +3193,22 @@ class MavlinkCommandSink(TimerWorker):
         return int(max(lo, min(hi, round(v))))
 
     def _send(self, cmd: PilotInput, buttons: int) -> None:
+        """ONE manual_control_send call site.
+
+        4-DoF command (roll = pitch = 0, or attitude axes off): the six
+        positional arguments, byte-identical to the pre-variant frame.
+        Attitude axes ON and a nonzero roll/pitch on a MAVLink 2 link: the
+        same six plus ``buttons2 = 0, enabled_extensions = 0b11, s, t``
+        (bit 0 = pitch = s, bit 1 = roll = t). A nonzero roll/pitch while
+        the axes are off is DROPPED and counted, never sent. TypeError from
+        the extended call (the v1 dialect) re-sends the six-argument frame
+        with K/M zero and degrades this sink for the rest of the session.
+        Once an extension frame HAS gone out (``attitude_axes_ext_sent``),
+        every later roll = pitch = 0 frame — neutral, E-STOP, deadman,
+        teardown, and a dropped K/M — goes as the six plus
+        ``0, 0b11, 0, 0``: s/t cleared explicitly rather than left to the
+        firmware's treatment of an absent bit. A session that never sent
+        one keeps the six-positional call (the OFF path stays byte-identical)."""
         if self.master is None:
             return
         if self.listening and self._peer_count() == 0:
@@ -2454,13 +3217,45 @@ class MavlinkCommandSink(TimerWorker):
             z = self._clamp(500 + cmd.heave * 500, 0, 1000)
         else:
             z = self._clamp(cmd.heave * 1000, -1000, 1000)
-        self.master.mav.manual_control_send(
-            self.target_sys,
-            self._clamp(cmd.surge * 1000, -1000, 1000),
-            self._clamp(cmd.sway * 1000, -1000, 1000),
-            z,
-            self._clamp(cmd.yaw * 1000, -1000, 1000),
-            buttons)
+        args = (self.target_sys,
+                self._clamp(cmd.surge * 1000, -1000, 1000),
+                self._clamp(cmd.sway * 1000, -1000, 1000),
+                z,
+                self._clamp(cmd.yaw * 1000, -1000, 1000),
+                buttons)
+        roll = float(getattr(cmd, "roll", 0.0) or 0.0)
+        pitch = float(getattr(cmd, "pitch", 0.0) or 0.0)
+        ext = 0
+        if roll != 0.0 or pitch != 0.0:
+            if not self.attitude_axes or self.attitude_axes_degraded:
+                self.attitude_axes_dropped += 1
+            elif not self._link_v2():
+                self.attitude_axes_dropped += 1
+                self._degrade_attitude_axes(
+                    "the command link is MAVLink 1.x (no extension fields)")
+            else:
+                ext = 0b11
+                args = args + (
+                    0, ext,
+                    self._clamp(self.sign_pitch * pitch * 1000, -1000, 1000),   # s
+                    self._clamp(self.sign_roll * roll * 1000, -1000, 1000))     # t
+        if ext == 0 and self.attitude_axes_ext_sent:
+            # s/t have been on the wire this session: clear them EXPLICITLY.
+            args = args + (0, 0b11, 0, 0)
+        while True:
+            try:
+                self.master.mav.manual_control_send(*args)
+                break
+            except TypeError:
+                if len(args) <= 6:
+                    raise
+                args = args[:6]          # the 4-axis frame, K/M zero
+                ext = 0
+                self._degrade_attitude_axes(
+                    "manual_control_send refused the extension fields "
+                    "(v1 dialect?)")
+        if ext:
+            self.attitude_axes_ext_sent = True
         self._sent += 1
 
     def leak_config(self) -> dict:
@@ -2496,6 +3291,671 @@ class MavlinkCommandSink(TimerWorker):
             except Exception:                             # noqa: BLE001
                 pass
             self.master = None
+
+
+# =============================================================================
+# learned stereo depth
+# =============================================================================
+class FStereoWorker(TimerWorker):
+    """Runs FoundationStereo on the mono pairs C3VideoWorker taps.
+
+    With --fstereo this is THE depth path for the run: the device's own depth
+    stream is not requested, so the map produced here is what the panel draws,
+    what the cursor reads, what the depth-vs-MAP check scores, and what
+    FoundationPose eats. One instrument per session, which is what makes a
+    recording attributable afterwards — and why there is no runtime toggle.
+
+    A ``TimerWorker`` rather than a ``LoopWorker`` because it must receive
+    queued slots at all; a LoopWorker's slot silently never fires (see
+    ``C3VideoWorker.request_sensor_log``). Inference runs inline in the tick:
+    ~37 ms as a CUDA-graph replay plus ~8 ms of rectify/mm/projection
+    [측정: rov_gui/tools/fstereo_bench_out/graph.txt, session.txt], which
+    makes the timer late but blocks nothing else — this thread has no other job, and a
+    third thread inside the session would buy only a shutdown race.
+    """
+
+    def __init__(self, bus, mailbox, opts, mailboxes):
+        # 5 ms, not the usual 20: once inference is shorter than the pair's
+        # period this worker is input-limited, and the tick period is then
+        # pure added latency between a pair landing in the mailbox and being
+        # picked up (half a period on average). 20 -> 5 ms is ~7 ms off every
+        # frame for nothing [유도]; the tick is a mailbox poll when idle.
+        super().__init__("fstereo", interval_ms=5)
+        self.bus = bus
+        self.mailbox = mailbox
+        self.opts = opts
+        self.mailboxes = mailboxes
+        # WHICH COLOUR RULE the panel paints with (2026-09-06).
+        #   "umi"       the SHARED rule (rov_gui/depth_colour.py): TURBO, warm =
+        #               NEAR, FIXED 0.20-3.00 m, no per-frame adaptation. The
+        #               default, because it is the same function that paints the
+        #               land FoundationStereo videos, so red here and red there
+        #               are the same distance and the two can be compared by eye.
+        #   "adaptive"  the reference viewer's picture this panel used to draw:
+        #               JET plus a per-frame percentile range plus a per-frame
+        #               64-knot equalisation. More contrast on a flat scene, but
+        #               the same distance is a different colour in every frame,
+        #               so it is comparable with nothing — including itself.
+        # Neither touches what any CONSUMER of depth receives.
+        self.palette = str(getattr(opts, "fstereo_palette", "umi"))
+        self.domain = str(getattr(opts, "fstereo_domain", "obs"))
+        # Only read under "adaptive": the fixed 0.3-6 m scale is unreadable at
+        # manipulation range, which is the only range this instrument is used at.
+        self.auto_range = bool(getattr(opts, "fstereo_autorange", True))
+        # Which map the PANEL draws, and how it is colourised. Both default to
+        # the reference viewer's choices so the two pictures are comparable
+        # frame by frame; neither touches what any CONSUMER of depth receives.
+        self.view = str(getattr(opts, "fstereo_view", "native"))
+        self.equalize = bool(getattr(opts, "fstereo_equalize", True))
+        self.session = None
+        self.enabled = False
+        #: How long a gap in arrivals before the panel says the feed is
+        #: starved. The pair arrives at --depth-fps (15) and inference takes
+        #: ~45 ms, so a healthy feed never goes quiet for anything like this.
+        self.IDLE_S = 2.0
+        #: Consecutive inference failures before the feature gives up. Enough
+        #: to ride out a genuinely bad frame, few enough that a broken
+        #: configuration stops paying for itself within a couple of seconds.
+        self.INFER_FAIL_LIMIT = 10
+        #: Learned depth REPLACES the camera's own for the run, in the same
+        #: panel — same colour bar, same cursor probe, same recording.
+        self._panel = "depth"
+        self._fault = ""
+        self._said_fault = False
+        self._last_stat = 0.0
+        self._last_arrival = 0.0
+        self._last_idle_said = 0.0
+        self._last_state_pub = 0.0
+        self._note = ""
+        self._was_starved = False
+        self._infer_fails = 0
+        self._hz = 0.0
+        self._frames = 0
+        self._last = None            # the newest result, for the HUD
+        self._rig_desc = None        # the rectification geometry, for meta()
+        # Set by HardwareBackend under --policy: the policy worker's depth
+        # mailbox. Fed with `depth_native` (the rectified-left map BEFORE the
+        # colour-grid warp and the gap fill) plus the rig, on the `rect_left`
+        # grid — the training-parity path (spec v2 A16).
+        self.policy_mb = None
+        self._policy_grid_said = False
+        self._policy_grid_err_said = False
+        self._policy_grid = None
+        self._policy_grid_rig = None
+        # What the policy tap did with each frame: put, or dropped because
+        # the mailbox refused a DIFFERENT grid / the rig has no rect_left
+        # geometry. The log used to say "dropped" while the frame was still
+        # put and warped through the FIRST grid's maps (verify 2026-09-02).
+        self._policy_tap = {"put": 0, "dropped_grid_refused": 0,
+                            "dropped_no_grid": 0}
+        # --record-stereo: the RAW mono pairs, so this run's depth can be made
+        # again offline at other FoundationStereo settings (the output in
+        # policy_obs/ cannot answer that — see perception/stereo_record.py).
+        # Injected by HardwareBackend, exactly like the policy recorder's: the
+        # frames are filed in the CONTROLLER's run folder, never one of ours.
+        self.run_dir_fn = None
+        self.stereo_rec = None
+        #: Why there is no recorder, when the operator asked for one. Empty
+        #: when nothing was asked. meta() prints it rather than letting the
+        #: run record imply the flag was never given.
+        self._rec_why = ""
+        self._rec_started = False
+
+    def setup(self) -> None:
+        # Imported here, not at module scope: this pulls torch and 3 GiB of
+        # weights, which must not be a requirement for starting the station.
+        from ..perception.fstereo import FStereoSession
+        raw_size = getattr(self.opts, "fstereo_size", None)
+        size = _parse_size(raw_size)
+        if raw_size and size is None:
+            # argparse already refuses this; belt and braces for a programmatic
+            # opts object. A malformed size must not quietly become "scale".
+            self._fault = f"--fstereo-size {raw_size!r} is not WxH"
+            self.bus.log.emit("error", f"fstereo: {self._fault}")
+            self._publish_state()
+            return
+        try:
+            self.session = FStereoSession(
+                repo=getattr(self.opts, "fstereo_repo", None),
+                ckpt=getattr(self.opts, "fstereo_ckpt", None),
+                iters=int(getattr(self.opts, "fstereo_iters", 8) or 8),
+                scale=float(getattr(self.opts, "fstereo_scale", 0.5) or 0.5),
+                fill=int(getattr(self.opts, "fstereo_fill", 2)),
+                size=size,
+                graph=bool(getattr(self.opts, "fstereo_graph", True)))
+        except Exception as e:                                   # noqa: BLE001
+            self._fault = f"{type(e).__name__}: {e}"
+            self.bus.log.emit("error", f"fstereo: {self._fault}")
+            self._publish_state()
+            return
+        if getattr(self.opts, "record_stereo", False):
+            # Constructed here, ARMED on the first pair (_start_recorder): the
+            # rig's describe() is what makes the recording regenerable, and it
+            # exists only once a pair has arrived with it. Wrapped, because a
+            # read-only mount must cost a diagnostic and never the depth.
+            try:
+                from ..perception.stereo_record import (DEFAULT_MAX_PAIRS,
+                                                        StereoRecorder)
+                if self.run_dir_fn is None:
+                    raise RuntimeError(
+                        "no run_dir_fn was injected — the recorder must file "
+                        "its pairs in the controller's run folder, and this "
+                        "backend did not provide it")
+                self.stereo_rec = StereoRecorder(
+                    self.run_dir_fn,
+                    every_s=float(getattr(self.opts, "record_stereo_every", 0.0)
+                                  or 0.0),
+                    max_frames=int(getattr(self.opts, "record_stereo_max", None)
+                                   or DEFAULT_MAX_PAIRS),
+                    on_log=lambda lvl, msg: self.bus.log.emit(lvl, msg))
+            except Exception as e:                               # noqa: BLE001
+                self.stereo_rec = None
+                self._rec_why = (f"--record-stereo WAS given but the recorder "
+                                 f"could not be constructed: "
+                                 f"{type(e).__name__}: {e}")
+                self.bus.log.emit("warn", f"fstereo: {self._rec_why}; the run "
+                                          f"continues WITHOUT the mono pairs "
+                                          f"on disk")
+        # LOAD NOW. --fstereo is already the operator saying this run is about
+        # learned depth; making them find a button afterwards is how the first
+        # hardware run produced a blank panel and a log that looked healthy.
+        self.enabled = True
+        self.mailbox.set_wanted(True)
+        self.session.start_async(on_log=self._say)
+        self.bus.log.emit(
+            "info",
+            f"fstereo: learned depth is THIS RUN'S depth source — "
+            f"iters={self.session.iters} "
+            + (f"size={self.session.infer_size[0]}x{self.session.infer_size[1]}"
+               if self.session.infer_size else f"scale={self.session.scale:g}")
+            + f", cuda graph {'on' if self.session.graph else 'off'}, "
+            f"projected onto "
+            f"{getattr(self.opts, 'fstereo_align_size', '400x250')}. The "
+            f"camera's own depth stream is not requested.")
+        self._publish_state()
+
+    def _say(self, level: str, text: str) -> None:
+        """on_log for the session. ``_say``, never ``_log`` — see PoseWorker."""
+        self.bus.log.emit(level, text)
+
+    def _status(self, conn, note: str) -> None:
+        """Stamp the depth panel's state. This worker owns it for the run."""
+        if self._panel not in self.mailboxes:
+            return
+        self.bus.video_stat.emit(
+            VideoStat(name=self._panel, conn=conn, note=note,
+                      instrument="foundationstereo", stamp=now()))
+
+    def _publish_state(self, note: str = "") -> None:
+        """The one channel that says what learned depth is really doing.
+
+        Feeds the panel's overlay chip and the window's health view. It is NOT
+        what attributes a measurement to an instrument — that is fixed for the
+        run by the flag — so a late or dropped publish can no longer put a
+        number under the wrong sensor's name.
+        """
+        s = self.session
+        self._note = note or self._note
+        self.bus.fstereo_state.emit(FStereoState(
+            live=(self._last_arrival > 0.0
+                  and (now() - self._last_arrival) < self.IDLE_S),
+            enabled=bool(self.enabled),
+            loading=bool(s is not None and s.loading),
+            load_s=float(s.load_seconds) if s is not None else 0.0,
+            error=(s.error if s is not None and s.error else self._fault),
+            note=note,
+            hz=float(self._hz),
+            solve_ms=float(self._last["solve_ms"]) if self._last else 0.0,
+            valid_native=float(self._last["valid_native"]) if self._last else 0.0,
+            valid_out=float(self._last["valid_out"]) if self._last else 0.0,
+            filled_out=float(self._last.get("filled_out", 0.0)) if self._last else 0.0,
+            frames=int(self._frames),
+            eager=bool(s is not None and getattr(s, "graph_requested", False)
+                       and not s.graph),
+            stamp=now()))
+
+    def _publish_state_throttled(self, note: str = "") -> None:
+        """State for the paths that run every tick and change slowly.
+
+        The tick is 5 ms (200 Hz); a state publish is a queued signal to the
+        GUI thread. 4 Hz keeps a slowly changing note (a starvation gap, a
+        load timer) current without flooding the event loop.
+        """
+        t = now()
+        if t - self._last_state_pub < 0.25:
+            return
+        self._last_state_pub = t
+        self._publish_state(note)
+
+    def _disarm(self, why: str) -> None:
+        """Stop consuming the mono pair. There is no way back inside a run.
+
+        --fstereo names the run's depth instrument, so a failure does not fall
+        back to the camera's own depth: the device stream was never requested,
+        and quietly substituting a different sensor is the one thing a
+        measurement record must never do. It stops, loudly, and the depth
+        panel goes dark with the reason on it.
+        """
+        if not self.enabled:
+            return
+        self.enabled = False
+        self.mailbox.set_wanted(False)
+        self.bus.log.emit(
+            "error", f"fstereo: STOPPED — {why}. This run has no other depth "
+                     f"source (--fstereo does not stream the camera's own); "
+                     f"restart without --fstereo to fly on the C3's stereo.")
+        self._publish_state()
+
+    # ------------------------------------------------------------------ tick
+    def tick(self) -> None:
+        s = self.session
+        if s is None:
+            if not self._said_fault:
+                self._said_fault = True
+                self._status(Conn.FAULT, self._fault or "unavailable")
+            return
+        if s.error:
+            self._disarm(s.error[:70])
+            self._status(Conn.FAULT, s.error[:60])
+            return
+        if not self.enabled:
+            self._publish_state_throttled()
+            return
+        if s.loading:
+            self._publish_state_throttled()
+            return
+        if not s.ready:
+            self._publish_state_throttled()
+            return
+
+        item = self.mailbox.take()
+        if item is None:
+            # Ready, enabled, and nothing is coming. The usual cause is that
+            # the rectification geometry failed to build, in which case
+            # _tap_fstereo returns before it ever puts anything — and without
+            # this branch the panel keeps showing the last "loading" note for
+            # the rest of the session, which reads as a slow model rather than
+            # a dead feature.
+            if (self._last_arrival and not self._was_starved
+                    and now() - self._last_arrival < self.IDLE_S):
+                return
+            # Latch dropped or the gap opened: tell the window IMMEDIATELY on
+            # the transition. Everything downstream that must not misattribute
+            # a measurement keys on this, so a throttle THERE is a window of
+            # wrong labels. While it STAYS starved the note only changes by
+            # the second, and at a 5 ms tick an unthrottled publish is 400
+            # queued signals a second to the GUI thread for nothing.
+            transition = not self._was_starved
+            self._was_starved = True
+            # Say the MEASUREMENT, not a guess at the cause. The old wording
+            # blamed rectification, which is the one part the startup log has
+            # already proved healthy or already complained about — pointing the
+            # operator at it is worse than saying nothing.
+            t = now()
+            gap = (t - self._last_arrival) if self._last_arrival else 0.0
+            note = (f"no mono pair for {gap:.0f} s" if self._last_arrival
+                    else "no mono pair yet")
+            if transition:
+                self._publish_state(note)
+                self._status(Conn.DEGRADED, note)
+            else:
+                self._publish_state_throttled(note)
+                if t - self._last_stat > 0.5:
+                    self._last_stat = t
+                    self._status(Conn.DEGRADED, note)
+            if t - self._last_idle_said > 5.0:
+                self._last_idle_said = t
+                self.bus.log.emit(
+                    "warn", f"fstereo: {note} — this run has no other depth "
+                            f"source, so the depth panel is dark until pairs "
+                            f"resume")
+            return
+        if self._frames == 0:
+            # The first inference captures the CUDA graph — three eager
+            # warm-ups plus the capture, 1.3 s; ~55 ms with the graph off
+            # [측정: rov_gui/tools/fstereo_bench_out/session.txt] — and it runs
+            # INLINE in this tick, so nothing else in this worker can speak
+            # until it returns. Say so before blocking, or the panel sits on a
+            # "loading" note that is already stale.
+            self._publish_state("capturing the CUDA graph (once, ~1 s)"
+                                if s.graph else "warming up the first inference")
+            rig = item.get("rig")
+            if self._rig_desc is None and hasattr(rig, "describe"):
+                self._rig_desc = rig.describe()
+        # BEFORE inference, deliberately: a pair that then makes the network
+        # throw is exactly the pair someone will want to reproduce offline.
+        # The join with policy_obs/ is by t_capture either way.
+        self._record_pair(item)
+        try:
+            out = s.infer(item["left"], item["right"], item["rig"],
+                          out_size=self._out_size(item))
+        except Exception as e:                                   # noqa: BLE001
+            # One bad frame must not kill the feature — but a hundred must not
+            # look like one either. Say it once per distinct fault text so a
+            # persistent problem does not flood the log.
+            text = f"{type(e).__name__}: {e}"
+            if text != self._fault:
+                self._fault = text
+                self.bus.log.emit("warn", f"fstereo: {text}")
+            self._infer_fails += 1
+            self._status(Conn.DEGRADED, text[:60])
+            self._publish_state(f"{text[:48]} (x{self._infer_fails})")
+            if self._infer_fails >= self.INFER_FAIL_LIMIT:
+                # Not a bad frame — a broken configuration. Stop paying for it.
+                self._disarm(f"{self._infer_fails} consecutive inference "
+                             f"failures ({text[:60]})")
+            return
+
+        # An ARRIVAL rate, not 1/solve_ms. The two answer different questions
+        # and the pose chip already made this mistake once: a rate computed
+        # from compute time cannot show that frames stopped coming.
+        t = now()
+        if self._last_arrival:
+            dt = t - self._last_arrival
+            inst = 1.0 / dt if dt > 1e-6 else 0.0
+            self._hz = inst if self._hz <= 0.0 else 0.8 * self._hz + 0.2 * inst
+        self._last_arrival = t
+        self._was_starved = False
+        # A frame came back. Whatever the last failure was, it is over — and a
+        # fault string that outlives its fault paints "FS FAULT" across a
+        # healthy learned feed until the process ends.
+        self._fault = ""
+        self._infer_fails = 0
+        self._frames += 1
+        self._last = out
+        self._publish(out, item)
+        self._tap_policy(out, item)
+
+    def _tap_policy(self, out, item) -> None:
+        """`depth_native` + the rig -> the policy mailbox (grid rect_left).
+
+        The grid descriptor is built by ``backends.policy.rect_left_grid_from_rig``
+        — ONE owner, so the mailbox's fingerprint and the builder's are the
+        same object — and declared idempotently; the mailbox refuses (and
+        counts) a DIFFERENT rig mid-run, which the worker reports.
+        """
+        mb = self.policy_mb
+        if mb is None or not mb.wanted():
+            return
+        native = out.get("depth_native")
+        rig = item.get("rig")
+        if native is None or rig is None:
+            return
+        from ..perception.policy_obs import GRID_RECT_LEFT, GridError
+        from .policy import rect_left_grid_from_rig
+
+        # One descriptor per rig OBJECT (the fingerprint hashes the arrays;
+        # not something to redo 15 times a second for an unchanged rig).
+        if self._policy_grid_rig is not rig:
+            self._policy_grid_rig = rig
+            self._policy_grid = None
+            try:
+                self._policy_grid = rect_left_grid_from_rig(rig)
+            except GridError as e:
+                # Said once per rig; every frame on it is skipped below.
+                if not self._policy_grid_err_said:
+                    self._policy_grid_err_said = True
+                    self.bus.log.emit(
+                        "error", f"fstereo: no policy depth grid from this rig "
+                                 f"— {e}; the policy gets no frames")
+        grid = self._policy_grid
+        if grid is None:
+            self._policy_tap["dropped_no_grid"] += 1
+            return
+        ok = mb.set_grid(grid, GRID_RECT_LEFT)
+        if not ok:
+            if not self._policy_grid_said:
+                self._policy_grid_said = True
+                self.bus.log.emit(
+                    "error", "fstereo: the rectification geometry CHANGED mid-run "
+                             "— the policy keeps the first grid and drops these "
+                             "frames (a reconnect with another calibration?)")
+            # RETURN: the mailbox gates on `src`, which is still rect_left, so
+            # a put here would be ACCEPTED and warped through the first grid's
+            # maps — the opposite of what the line above says.
+            self._policy_tap["dropped_grid_refused"] += 1
+            return
+        if mb.put(np.ascontiguousarray(native, dtype=np.uint16),
+                  float(item["t_capture"]), GRID_RECT_LEFT):
+            self._policy_tap["put"] += 1
+
+    def _record_pair(self, item) -> None:
+        """Hand the RAW mono pair to --record-stereo. Never raises, never blocks.
+
+        Armed on the FIRST pair rather than in setup(), because what makes the
+        recording regenerable is the rig — and the rig arrives WITH the frames
+        (StereoMailbox carries it so a pair can never be matched against a rig
+        describing a different camera). Arming here is also what keeps the run
+        folder from being created for a launch that never saw a frame.
+        """
+        rec = self.stereo_rec
+        if rec is None:
+            return
+        try:
+            if not self._rec_started:
+                self._rec_started = True
+                rig = item.get("rig")
+                if self._rig_desc is None and hasattr(rig, "describe"):
+                    self._rig_desc = rig.describe()
+                s = self.session
+                try:
+                    fs = s.describe() if s is not None else {}
+                except Exception:                                # noqa: BLE001
+                    fs = {}                 # provenance, never a reason to stop
+                if not rec.start(rig_describe=self._rig_desc or {}, fstereo=fs):
+                    self._rec_why = rec.why
+                    self.stereo_rec = None
+                    return
+            rec.submit(float(item["t_capture"]), item["left"], item["right"],
+                       int(item.get("frame_seq", 0)))
+        except Exception as e:                                   # noqa: BLE001
+            # Rule 3, at the call site as well: a recorder defect must cost the
+            # recording and nothing else. Said once, then it stops trying.
+            self._rec_why = f"disabled after {type(e).__name__}: {e}"
+            self.stereo_rec = None
+            self.bus.log.emit("warn", f"fstereo: stereo recorder {self._rec_why}"
+                                      f" — learned depth is unaffected")
+
+    def _out_size(self, item):
+        """The COLOUR grid, which is the shape every depth consumer assumes.
+
+        The scatter lands on --fstereo-align-size (400x250 by default, chosen
+        so it fills completely); this NEAREST-upscales that to the colour grid.
+        Not cosmetic: ``perception/session.py:891`` refuses a reference-view
+        capture when depth and colour differ in shape, so a learned map left on
+        its own grid would make --fstereo and --pose mutually exclusive.
+        NEAREST replicates rather than interpolates, so the upscale adds no
+        distance that was not measured.
+        """
+        return item.get("out_size")
+
+    def _publish(self, out, item) -> None:
+        mb = self.mailboxes.get(self._panel)
+        if mb is None:
+            return
+        depth_mm = out["depth_mm"]
+        # WHAT THE PANEL DRAWS (2026-09-02). `native` is the network's own
+        # rectified-left output; `depth_mm` is that same map forward-scattered
+        # onto --fstereo-align-size and NEAREST-upscaled to the colour grid.
+        # Three of the four differences the operator saw against
+        # oakd_foundation_stereo.py are in that projection alone: resolution
+        # (400x250 blown back up, hence the stair-steps), the ~10% of grid it
+        # loses to occlusion and resampling, and the holes the fill then
+        # repairs. The map itself was never worse.
+        #
+        # Only the PICTURE and the cursor readout move: the colour-aligned map
+        # still goes to FoundationPose and the depth-vs-MAP check below, and
+        # the policy has always been fed the native map (_tap_policy_depth).
+        shown_mm = depth_mm
+        if self.view == "native":
+            native = out.get("depth_native")
+            if native is not None:
+                shown_mm = native
+        h, w = shown_mm.shape[:2]
+        tw, th = mb.target_size()
+        # PALETTE (2026-09-06: the default changed to the shared rule).
+        #
+        # "umi" paints with rov_gui/depth_colour.py — the SAME function as the
+        # land episode videos (data_collection/make_depth_trajectory_video.py) and
+        # the offline comparison tool: TURBO, warm = NEAR, fixed 0.20-3.00 m,
+        # inverse-depth ("obs") spacing, invalid black. Nothing looks at the
+        # frame's own content, which is the whole point: red is 0.2 m here, in
+        # the land video and in this same panel a minute ago.
+        #
+        # "adaptive" is what this panel drew from 2026-09-02: an auto range
+        # (a grasp scene inside ~1.5 m is the bottom fifth of the fixed 0.3-6 m
+        # ramp and goes uniformly dark) plus a 64-knot histogram equalisation
+        # (a range alone cannot help when one open doorway makes the scene span
+        # 0.4-28 m). It reads better on a single flat scene and is comparable
+        # with nothing, so it is now opt-in.
+        #
+        # The scale is computed on the FULL-resolution map, before the panel
+        # downscale, so it does not shift when the widget is resized.
+        rule = ""
+        if self.palette == "umi":
+            knots = None
+            lo_mm, hi_mm = imaging.UMI_Z_NEAR_MM, imaging.UMI_Z_FAR_MM
+            small_mm = imaging.scale_depth(shown_mm, tw, th)
+            small = imaging.depth_to_bgr_umi(small_mm, self.domain)
+            rule = f"umi:{self.domain}:{imaging.DEFAULT_CMAP}"
+        else:
+            knots = (imaging.depth_palette_knots(shown_mm)
+                     if self.equalize else None)
+            if self.auto_range:
+                lo_mm, hi_mm = imaging.auto_depth_range(shown_mm)
+            else:
+                lo_mm, hi_mm = imaging.DEPTH_MIN_MM, imaging.DEPTH_MAX_MM
+            small_mm = imaging.scale_depth(shown_mm, tw, th)
+            small = imaging.depth_to_bgr_warm_near(small_mm, knots, lo_mm, hi_mm)
+        # An empty map is a BLACK PICTURE, which is pixel-for-pixel what "no
+        # image" looks like. Without this it would arrive under a green ONLINE
+        # chip and a healthy frame rate, and the one number that explains it
+        # (valid 0%) is not drawn anywhere on the panel.
+        empty = out["valid_out"] <= 0.0
+        conn = Conn.DEGRADED if empty else Conn.ONLINE
+        stat = VideoStat(
+            name=self._panel, width=w, height=h, fps=self._hz,
+            latency_ms=max(0.0, (now() - item["t_capture"]) * 1000.0),
+            encoding="16UC1 (FoundationStereo)",
+            instrument="foundationstereo",
+            # Two valid percentages, because they answer different questions
+            # and only one of them is about the network. A forward scatter
+            # cannot fill a grid finer than its 640x400 source, so `out` is
+            # structurally lower than `native` and saying so is what stops it
+            # being read as the matcher failing.
+            note=("matched nothing — 0% valid"
+                  if empty else
+                  (f"valid {out['valid_native']:.0f}% native"
+                   if self.view == "native" else
+                   f"valid {out['valid_native']:.0f}% native -> "
+                   f"{out['valid_out']:.0f}% grid"
+                   + (f" (+{out.get('filled_out', 0.0):.0f}% gaps filled)"
+                      if out.get("filled_out", 0.0) >= 0.5 else ""))
+                  + f"   {out['solve_ms']:.0f} ms"
+                  # The scale, always, and named: an operator comparing this
+                  # panel with a land video has to be able to see from the HUD
+                  # which rule painted it.
+                  + (f"   {lo_mm / 1000:.2f}-{hi_mm / 1000:.2f} m "
+                     f"{imaging.DEFAULT_CMAP}/{self.domain} warm=NEAR"
+                     if self.palette == "umi" else
+                     (f"   {lo_mm / 1000:.2f}-{hi_mm / 1000:.2f} m"
+                      if self.auto_range else "")
+                     + ("  eq" if self.equalize else ""))),
+            # Both rules now state their endpoints, so the colour bar labels
+            # and the cursor marker read from the frame that was drawn.
+            depth_lo_mm=(lo_mm if (self.palette == "umi" or self.auto_range)
+                         else None),
+            depth_hi_mm=(hi_mm if (self.palette == "umi" or self.auto_range)
+                         else None),
+            depth_rule=rule,
+            # The equalisation the picture used, so the colour bar can place a
+            # tick where that depth actually landed. 64 floats a frame.
+            depth_knots_mm=(tuple(float(k) for k in knots)
+                            if knots is not None else None),
+            depth_grid=("rect_left" if shown_mm is not depth_mm else "color"),
+            conn=conn, stamp=now())
+        # The raw millimetres ride WITH the picture so the cursor probe can
+        # never read a distance from a different frame than it is drawing —
+        # and, since 2026-09-02, from a different GRID either: with
+        # --fstereo-view native the picture is the native map, so the probe
+        # must index that one or every readout is off by the projection.
+        raw = shown_mm.copy()
+        mb.put(imaging.bgr_to_qimage(small), stat, aux=raw)
+        # ...and back to the producer's thread, where the colour frame is, so
+        # FoundationPose and the reference-view capture eat the SAME map the
+        # panel is showing. A separate array: the panel's copy is handed to the
+        # GUI thread and torch may write into the tracker's.
+        self.mailbox.set_result(depth_mm.copy(), item["t_capture"])
+        self._publish_state()
+        t = time.monotonic()
+        if t - self._last_stat > 0.5:
+            self._last_stat = t
+            self.bus.video_stat.emit(stat)
+            self.bus.sensor_stat.emit(SensorStat(
+                "FStereo", self._hz, conn,
+                f"{out['solve_ms']:.0f} ms  {out['valid_out']:.0f}% valid"))
+
+    def meta(self) -> dict:
+        """Provenance for the run folder. Written whether it ran or not."""
+        if self.session is None:
+            return {"enabled": False, "why": self._fault or "not built"}
+        d = self.session.describe()
+        d.update(enabled=bool(self.enabled), ready=bool(self.session.ready),
+                 frames=self._frames, measured_hz=round(self._hz, 2),
+                 error=self.session.error or None,
+                 # What turned the disparity into the recorded millimetres and
+                 # which grid it was projected onto. The rig is known only
+                 # once a pair has arrived (it is built from the camera's
+                 # EEPROM after the device opens); None before that.
+                 align_size=getattr(self.opts, "fstereo_align_size", "400x250"),
+                 rig=self._rig_desc,
+                 # WHAT PAINTED THE PANEL. Cosmetic for the vehicle, decisive
+                 # for the only visual artifact a run leaves (ui_*.mp4): without
+                 # it, a colour in that recording cannot be turned back into a
+                 # distance, which is exactly the complaint KNOWN_ISSUES raised
+                 # about every run before 2026-09-06.
+                 panel=({"view": self.view, "palette": "umi",
+                         "domain": self.domain, "cmap": imaging.DEFAULT_CMAP,
+                         "z_near_m": imaging.UMI_Z_NEAR_MM / 1000.0,
+                         "z_far_m": imaging.UMI_Z_FAR_MM / 1000.0,
+                         "warm_end": "near", "per_frame_adaptation": "none"}
+                        if self.palette == "umi" else
+                        {"view": self.view, "palette": "adaptive",
+                         "cmap": "jet", "warm_end": "near",
+                         "autorange": self.auto_range,
+                         "equalize": self.equalize,
+                         "per_frame_adaptation":
+                             "2/98 percentile range + 64-knot equalisation"}),
+                 # --record-stereo: present whether it ran or not, and never
+                 # silently absent when the flag was given (_rec_why carries a
+                 # construction failure that the counters cannot express).
+                 stereo_recording=(self.stereo_rec.describe()
+                                   if self.stereo_rec is not None else
+                                   {"enabled": bool(getattr(
+                                       self.opts, "record_stereo", False)),
+                                    "why": self._rec_why or
+                                    "--record-stereo not given"}),
+                 policy_tap=dict(self._policy_tap))
+        return d
+
+    def teardown(self) -> None:
+        # Release the panel first: closing the session takes seconds (it joins
+        # a torch loader), and the depth panel should already be back on the
+        # camera's own depth by then.
+        self.mailbox.set_wanted(False)
+        # Then the recorder, BEFORE the session: its close is bounded to ~1 s
+        # and writes meta.json, and doing it after a multi-second torch join
+        # spends the station's shutdown budget on a diagnostic.
+        if self.stereo_rec is not None:
+            try:
+                self.stereo_rec.close()
+            except Exception as e:                               # noqa: BLE001
+                self.bus.log.emit("warn", f"fstereo: stereo recorder close: "
+                                          f"{type(e).__name__}: {e}")
+            self.stereo_rec = None
+        if self.session is not None:
+            self.session.close()
+            self.session = None
 
 
 # =============================================================================
@@ -2728,6 +4188,16 @@ class PoseWorker(TimerWorker):
             # measurement rule exists for.
             "medium": "water", "rectified": False,
             "depth_align": "color", "depth_units": "mm",
+            # WHICH SENSOR produced the depth these poses were solved from.
+            # Under --fstereo it is not the C3's stereo block at all — it is
+            # FoundationStereo on the same mono pair, host-rectified, with its
+            # own disparity and NO --depth-scale correction. A pose file that
+            # did not say so would be attributed to the wrong instrument by
+            # anyone reading it later, which is the failure the measurement
+            # rule in CLAUDE.md exists to prevent.
+            "depth_source": ("foundation_stereo"
+                             if getattr(self.opts, "fstereo", False)
+                             else "c3_device_stereo"),
             "note": "UNDERWATER factory calibration (vendor-confirmed; "
                     "measured HFOV 63.7 deg matches the Snell-underwater "
                     "prediction, not the in-air spec — calib/fov_audit.py, "
@@ -2746,10 +4216,14 @@ class PoseWorker(TimerWorker):
             "mesh": str(getattr(self.opts, "pose_mesh", "") or ""),
             # The correction the depth in THIS file's poses was multiplied by
             # before anything consumed it (C3VideoWorker, --depth-scale).
-            # 1.0 = raw sensor millimetres.
-            "depth_scale_applied": float(
-                getattr(self.opts, "depth_scale", DEPTH_SCALE_DEFAULT)
-                or DEPTH_SCALE_DEFAULT),
+            # 1.0 = raw sensor millimetres. The learned path is ALWAYS 1.0:
+            # 0.64 was fitted to the device block matcher's disparity bias, and
+            # applying it to a map computed from its own rectified geometry
+            # would correct a corrected number.
+            "depth_scale_applied": (
+                1.0 if getattr(self.opts, "fstereo", False) else
+                float(getattr(self.opts, "depth_scale", DEPTH_SCALE_DEFAULT)
+                      or DEPTH_SCALE_DEFAULT)),
         }
         fields.update({"fx": i.fx, "fy": i.fy, "cx": i.cx, "cy": i.cy,
                        "width": i.width, "height": i.height,
@@ -3030,6 +4504,97 @@ class PoseWorker(TimerWorker):
 # =============================================================================
 # backend
 # =============================================================================
+def _build_slam_worker(bus, pair_q, opts, log_base=None):
+    """Construct the ORB-SLAM3 bridge worker (--slam).
+
+    Everything that needs the CAMERA is deferred: the child process, its
+    settings file and its image size are all decided by
+    ``SlamNavWorker._start_child`` when the first rectified pair arrives, so
+    this function only has to resolve the things that are knowable at launch —
+    the binary, the vocabulary, where the run's artifacts go, and the ONE
+    extrinsic that turns a camera pose into a body pose.
+
+    ``log_base`` may be a CALLABLE (2026-09-11: ``MpcWorker._run_tree``, so
+    the SLAM outputs follow the LOW level the panel is on at the moment the
+    child starts — None/teleop is a runtime choice now) or a ``runstore.Tree``
+    / string; None means "derive the launch-time tree from opts" (``--slam``
+    without ``--mpc``, where no controller owns a kind).
+    """
+    from ..control.geometry import NavConfig
+    from ..control.slam_frames import SlamNav
+    from .slam import DRIVER_BIN, VOCAB, OrbSlamProc, SlamNavWorker
+
+    nav_cfg = NavConfig.load(getattr(opts, "nav_config", "config/hw_nav.yaml"))
+    R_bc, t_bc = nav_cfg.R_t_frd_cam("main")
+    nav = SlamNav(R_bc, t_bc)
+
+    proc = OrbSlamProc(
+        binary=DRIVER_BIN, vocab=VOCAB,
+        # settings/out_prefix/width/height are ALL resolved by _start_child
+        # when the first pair arrives: the yaml needs the live rig, and the run
+        # folder must be the one runstore joins at that moment rather than one
+        # created at launch by a station that may never fly.
+        settings=None, out_prefix=None, width=0, height=0,
+        viewer=bool(getattr(opts, "slam_viewer", True)),
+        log=lambda level, msg: bus.log.emit(level, msg))
+    if log_base is None:
+        # The SAME kind rule MpcWorker._run_tree uses, and it has to be kept
+        # in step with it: a land dry-run and a POLICY OBSERVE run each get
+        # their own, so a bench or open-loop record can never be pooled with
+        # a water one. If these two lists diverge, only the SLAM outputs land
+        # in a water folder and the split stops being a guarantee. LAUNCH-
+        # TIME ONLY (no controller to ask): observe is the `--policy-observe`
+        # alias OR `--mpc-mode none`; with --mpc the caller passes the
+        # worker's own `_run_tree` instead and this tree is never used.
+        from .. import runstore
+        observe = (bool(getattr(opts, "policy_observe", False))
+                   or str(getattr(opts, "mpc_mode", "") or "").lower() == "none")
+        base = str(getattr(opts, "rec_dir", None) or runstore.DEFAULT_BASE)
+        log_base = runstore.Tree(
+            base, str(getattr(opts, "run_kind", "") or "")
+            or ("landdry" if bool(getattr(opts, "land_dry_run", False))
+                else "observe" if observe else ""))
+    return SlamNavWorker(bus, pair_q, proc, nav, opts,
+                         clahe=bool(getattr(opts, "slam_clahe", True)),
+                         log_base=log_base)
+
+
+def wire_policy(bus, policy, mpc) -> None:
+    """The three policy hops + the failure route, shared by BOTH backends
+    (spec v2 A13/A14). TimerWorker -> TimerWorker everywhere, so every queued
+    slot below IS delivered (backends/base.py rule).
+
+    * ``policy_state``  MpcWorker -> PolicyWorker (proprio, every tick)
+    * ``policy_plan``   PolicyWorker -> MpcWorker (raw action chunks)
+    * ``policy_status`` PolicyWorker -> MpcWorker (refusal/readiness; the
+      window reads the SENSORS row and the log instead)
+    * ``cmd_gripper_drive`` -> MpcWorker.on_gripper_drive: EVERY jaw drive
+      (pilot and policy) feeds the open-loop width estimator (A12)
+    * the worker's ``failed`` signal is routed into ``policy_status`` as an
+      error, so a dead worker cannot leave the controller believing "ready".
+    ``mpc`` may be None (``--policy`` without ``--mpc``): the worker then
+    runs with no consumer, which the CLI has already warned about.
+    """
+    bus.policy_state.connect(policy.on_policy_state)
+
+    def _failed(msg: str, _bus=bus) -> None:
+        _bus.policy_status.emit(PolicyStatus(error=str(msg), conn=Conn.FAULT,
+                                             stamp=now()))
+    policy.failed.connect(_failed)
+    # The panel's checkpoint picker (2026-09-11, operator request: the
+    # `--policy-ckpt` flag is gone, the file is chosen in the GUI). Before
+    # the `mpc is None` return on purpose: a `--policy` station without a
+    # controller can still swap the network it holds.
+    bus.cmd_policy_ckpt.connect(policy.set_ckpt)
+    if mpc is None:
+        return
+    bus.policy_plan.connect(mpc.on_policy_plan)
+    bus.policy_status.connect(mpc.on_policy_status)
+    bus.cmd_gripper_drive.connect(mpc.on_gripper_drive)
+    mpc.policy_present = True
+    mpc.policy_meta_fn = policy.meta
+
+
 class HardwareBackend(Backend):
     name = "hw"
     simulated = False
@@ -3038,7 +4603,14 @@ class HardwareBackend(Backend):
         super().__init__(bus, mailboxes, opts)
         self.video = C3VideoWorker(bus, mailboxes, opts)
         self.vehicle = VehicleWorker(bus, opts)
-        allow = bool(getattr(opts, "allow_command", False))
+        # --land-dry-run is checked SEPARATELY from allow_command even though
+        # resolve_defaults already forces it False. This mode is what permits
+        # the arm and flight-mode engage gates to be skipped, so "no sink" must
+        # not depend on one earlier assignment having run: a caller that builds
+        # opts by hand (a test, a tool, a future entry point) would otherwise
+        # get the relaxed gates AND a live MAVLink sink.
+        land = bool(getattr(opts, "land_dry_run", False))
+        allow = bool(getattr(opts, "allow_command", False)) and not land
         self.sink = (MavlinkCommandSink(bus, opts) if allow
                      else NullCommandSink(bus, opts))
         # The vehicle worker never transmits (source_system 200, a passive
@@ -3047,6 +4619,10 @@ class HardwareBackend(Backend):
         # pattern as mpc.sink_status_fn below.
         if hasattr(self.sink, "leak_config"):
             self.vehicle.leak_cfg_fn = self.sink.leak_config
+        # ...and the attitude-axes facts (firmware / wire version / enabled /
+        # degraded) the engage gate reads off Telemetry (2026-09-26).
+        if hasattr(self.sink, "attitude_axes_state"):
+            self.vehicle.attitude_axes_fn = self.sink.attitude_axes_state
         self.workers = [self.video, self.vehicle, self.sink]
         # Object tracking: opt-in, and when it is off nothing is constructed,
         # nothing is imported, and C3VideoWorker does not even copy a frame.
@@ -3058,6 +4634,16 @@ class HardwareBackend(Backend):
             self.video.pose_mb = mb
             self.pose = PoseWorker(bus, mb, opts)
             self.workers.append(self.pose)
+
+        # Learned stereo depth: the same opt-in contract as --pose. Without the
+        # flag no torch import, no mailbox, and the video worker never looks at
+        # the mono pair (which is not even in the pipeline).
+        self.fstereo = None
+        if bool(getattr(opts, "fstereo", False)):
+            fmb = StereoMailbox()
+            self.video.fstereo_mb = fmb
+            self.fstereo = FStereoWorker(bus, fmb, opts, mailboxes)
+            self.workers.append(self.fstereo)
 
         self.rovcam = None
         if getattr(opts, "panel2", "rov") == "rov":
@@ -3092,6 +4678,111 @@ class HardwareBackend(Backend):
             self.mpc = MpcWorker(bus, opts)
             self.workers.append(self.tagnav)
             self.workers.append(self.mpc)
+            if self.fstereo is not None:
+                # controller.json records WHICH depth instrument the run used.
+                # Injected rather than imported: control/ must stay free of the
+                # perception stack, so it reads the block through a hook.
+                self.mpc.fstereo_meta_fn = self.fstereo.meta
+                # --record-stereo files the RAW mono pairs in the CONTROLLER's
+                # run folder for the same reason --record-depth does: MpcWorker
+                # owns the TREE (a land dry-run gets its own) and the PIN (the
+                # folder is fixed at engagement), so the pairs land beside the
+                # CSVs and the policy_obs they are meant to be read against.
+                # Injected outside the --policy block on purpose: recording
+                # pairs needs a camera and a run folder, not a policy.
+                self.fstereo.run_dir_fn = self.mpc._run_dir
+            if bool(getattr(opts, "record_depth", False)) and \
+                    bool(getattr(opts, "record_depth_rgb", True)):
+                # --record-depth also files the COLOUR frame that was current
+                # when each observation was built, so the run can be watched
+                # (rov_gui/tools/export_run_html.py) and not only measured.
+                # The slot is wanted() only while this is on, so the camera
+                # worker copies nothing otherwise.
+                from ..bus import LatestFrame
+                slot = LatestFrame()
+                slot.set_wanted(True)
+                if self.video is not None:
+                    self.video.color_rec_mb = slot
+                self._color_rec_slot = slot
+
+        # LIVE DIFFUSION POLICY (--policy, spec v2 A14): the worker is built
+        # whether or not --mpc is (the CLI warns when there is no consumer),
+        # lazily imported like every other GPU feature. Its depth comes from
+        # exactly ONE producer per run: FoundationStereo's rectified-left map
+        # under --fstereo, else the device's colour-aligned depth — and the
+        # latter ONLY with --policy-allow-device-depth (the CLI refuses
+        # otherwise; a bench experiment, not the training-parity path).
+        self.policy = None
+        if bool(getattr(opts, "policy", False)):
+            from ..bus import PolicyMailbox
+            from .policy import PolicyWorker
+
+            pmb = PolicyMailbox()
+            self.policy = PolicyWorker(bus, pmb, opts)
+            # --record-depth files its frames in the CONTROLLER's run folder,
+            # never one of its own: MpcWorker owns both the TREE (a land dry-run
+            # and an observe run get their own, which _run_tree calls a safety
+            # property of the record) and the PIN (the folder is fixed at
+            # engagement, so a first inference 90 s later cannot open a second
+            # one). Without --mpc there is no controller and no recorder.
+            if self.mpc is not None:
+                self.policy.run_dir_fn = self.mpc._run_dir
+            # ...and the colour slot the camera worker fills, so the recorder
+            # can file the frame that was current when each obs was built.
+            self.policy.color_mb = getattr(self, "_color_rec_slot", None)
+            if self.fstereo is not None:
+                self.fstereo.policy_mb = pmb
+                self.policy.fstereo_meta_fn = self.fstereo.meta
+            elif bool(getattr(opts, "policy_allow_device_depth", False)):
+                self.video.policy_mb = pmb
+            self.workers.append(self.policy)
+
+        # LIVE ORB-SLAM3 (--slam): the pose instrument for a run with no tags
+        # in the room. Opt-in like every other feature here — off means no
+        # queue, no child process, and _tap_slam returns on its first line.
+        #
+        # THE WORKER IS BUILT LAST ON PURPOSE. It is the fix producer, and
+        # TagNavWorker (built above under --mpc) is the other one; the
+        # suppression below has to happen after that object exists.
+        self.slam = None
+        if bool(getattr(opts, "slam", False)):
+            from .slam import SlamNavWorker, SlamPairQueue
+
+            sq = SlamPairQueue()
+            self.video.slam_q = sq
+            # The controller's OWN tree resolver when there is one (a
+            # callable: LOW level None is a runtime choice since 2026-09-11,
+            # so the tree is decided when the SLAM child starts, not at
+            # launch); the launch-time string only for --slam without --mpc.
+            self.slam = _build_slam_worker(
+                bus, sq, opts,
+                log_base=(self.mpc._run_tree if self.mpc is not None
+                          else None))
+            self.workers.append(self.slam)
+            # THE KNOT RETURN PATH — the whole reason --slam draws anything.
+            # Without these two the bridge still publishes a pose and the
+            # station still plots the plan on its own panel, so everything
+            # LOOKS wired while the Pangolin map shows only map points. Both
+            # ends are TimerWorkers, so these queued slots are delivered
+            # (backends/base.py rule).
+            #   policy_plan_viz — the composed plan, one per inference.
+            #   mpc_status      — the engage datum. A datum-frame knot cannot
+            #                     be placed in the SLAM world without it, and
+            #                     a STALE one would place it confidently in
+            #                     the wrong spot, so the overlay is cleared
+            #                     whenever it changes.
+            bus.policy_plan_viz.connect(self.slam.on_policy_plan_viz)
+            bus.mpc_status.connect(self.slam.on_mpc_status)
+            if self.tagnav is not None:
+                # ONE fix producer. bus.nav_fix is last-writer-wins in
+                # MpcWorker, so the --land-dry-run synthetic stationary fix
+                # racing a real SLAM fix would hand the policy a proprio
+                # history that alternates between moving and stationary — a
+                # 15 Hz sign-flipping motion cue that reads as a broken
+                # network. The synthetic fix exists precisely because a bench
+                # has no tags; with SLAM running the bench HAS a pose, so it
+                # is not needed and must not fire.
+                self.tagnav.suppress_land_fix = True
 
         bus.cmd_pilot.connect(self.sink.set_pilot)
         bus.cmd_gripper.connect(self.sink.set_gripper)
@@ -3103,6 +4794,8 @@ class HardwareBackend(Backend):
         bus.cmd_lights_step.connect(self.sink.set_lights_step)
         bus.cmd_tilt.connect(self.sink.set_tilt)
         bus.cmd_tilt_center.connect(self.sink.tilt_center)
+        bus.cmd_tilt_set.connect(self.sink.set_tilt_manual)
+        bus.tilt_measured.connect(self.sink.note_tilt_measured)
         bus.cmd_buttons.connect(self.sink.set_js_buttons)
         bus.cmd_mode.connect(self.sink.set_mode)
         bus.aux_servos.connect(self.sink.note_aux_servos)
@@ -3149,6 +4842,7 @@ class HardwareBackend(Backend):
             # above, where the LoopWorker was the receiver.
             bus.camera_imu.connect(self.mpc.on_camera_imu)
             bus.telemetry.connect(self.mpc.on_telemetry)
+            bus.cmd_mode.connect(self.mpc.on_mode_request)
             bus.thrusters.connect(self.mpc.on_thrusters)
             bus.vehicle_imu.connect(self.tagnav.set_imu_hint)
             # The sink's own health gates engage: computing a mission that the
@@ -3167,6 +4861,13 @@ class HardwareBackend(Backend):
             bus.cmd_estop.connect(self.mpc.estop)
             bus.cmd_log_sensors.connect(self.mpc.set_sensor_log)
             bus.cmd_tag_enable.connect(self.tagnav.set_source_enabled)
+            # The tracked mount tilt -> the RGB solver's extrinsic (a
+            # commanded change resets the C3-vs-RGB alignment), and the
+            # fallback's state -> controller.json (the fstereo_meta_fn shape).
+            bus.payload.connect(self.tagnav.on_payload)
+            self.mpc.nav_fallback_meta_fn = self.tagnav.fallback_meta
+        if self.policy is not None:
+            wire_policy(bus, self.policy, self.mpc)
 
     def describe(self) -> str:
         kind = "MAVLink command sink" if isinstance(self.sink, MavlinkCommandSink) \

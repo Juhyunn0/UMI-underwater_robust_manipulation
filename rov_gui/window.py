@@ -49,6 +49,9 @@ boundary (see widgets/teleop.py).
     Ctrl+R             start/stop UI recording
     F11                fullscreen
     Esc                ALL STOP + disable commands
+                       (also inside the checkpoint picker, which closes —
+                        widgets/trajectory.py CkptDialog; the keyboard is
+                        NOT flying while that dialog is up, the joystick is)
 
 The command heartbeat
 ---------------------
@@ -72,7 +75,8 @@ from .bus import DataBus, FrameMailbox, Freshness
 from .imaging import legend_labels
 from .joystick import JoystickReader, apply_deadzone, default_axis_spec
 from .qt import (QShortcut, QTimer, Qt, QtCore, QtGui, QtWidgets,
-                 preload_platform_libs, run_app, sanitize_plugin_path)
+                 install_slot_guard, preload_platform_libs, run_app,
+                 sanitize_plugin_path)
 from .recorder import ScreenRecorder, StreamRecorder
 from .state import (Conn, LinkStat, PayloadState, PilotInput, SensorStat,
                     Telemetry, ThrusterState, now)
@@ -92,6 +96,14 @@ SECOND_TITLES = {"rov": "Default RGB", "stereo": "C3 Stereo L",
 # One name per feed, used for the panel title, the record button and the file
 # name — so what you clicked and what landed on disk are obviously the same feed.
 FEED_NAMES = {"main": "C3 RGB", "second": "Default RGB", "depth": "C3 Depth"}
+
+#: The middle panel's name follows what it actually carries.
+FEED_NAMES_BY_PANEL2 = {"stereo": "C3 Stereo L"}
+
+#: ...and so does the depth panel's, because --fstereo swaps its content at
+#: runtime. A recording called "c3_depth" holding FoundationStereo output would
+#: keep telling that lie for as long as the file exists.
+FEED_NAME_DEPTH_FS = "C3 FS Depth"
 
 
 def _parse_remap(text) -> dict[int, int]:
@@ -122,10 +134,13 @@ def _file_stem(name: str) -> str:
 
 def panel_specs(opts) -> tuple:
     """(key, title, legend) for the three video panels."""
-    second = getattr(opts, "panel2", "rov")
+    second = getattr(opts, "panel2", None) or "rov"
     return (
         ("main", "C3 RGB", None),
         ("second", SECOND_TITLES.get(second, second), None),
+        # One depth panel, one colour bar, either instrument. Learned depth
+        # replaces the picture in place — same fixed range, same cursor probe —
+        # so a toggle compares them instead of the eye reconciling two views.
         ("depth", "C3 Depth", legend_labels()),
     )
 
@@ -134,6 +149,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, opts):
         super().__init__()
         self.opts = opts
+        self._panel2 = getattr(opts, "panel2", None) or "rov"
+        # THE depth instrument for this run. --fstereo is not a preference the
+        # operator can flip; it selects which sensor the whole session is
+        # about, which is what makes a recording attributable at all.
+        self._fstereo_on = bool(getattr(opts, "fstereo", False))
         self.setWindowTitle("BlueROV2 — Control Station")
         self.bus = DataBus()
 
@@ -167,7 +187,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.recorder = ScreenRecorder(self, out_dir=rec_dir,
                                        fps=float(getattr(opts, "rec_fps", 12)))
         self.recorder.state_changed.connect(self._rec_state)
-        self.feed_recorders = {k: StreamRecorder(_file_stem(FEED_NAMES.get(k, k)),
+        self.feed_recorders = {k: StreamRecorder(_file_stem(self._feed_name(k)),
                                                  out_dir=rec_dir)
                                for k, _t, _l in self.panels}
 
@@ -241,6 +261,13 @@ class MainWindow(QtWidgets.QMainWindow):
             expect = float(getattr(self.opts, "fps", 30.0) or 30.0)
             if key == "depth":
                 expect = float(getattr(self.opts, "depth_fps", 20.0) or 20.0)
+            if key == "depth" and bool(getattr(self.opts, "fstereo", False)):
+                # Learned depth is input-limited at the pair's 15 fps (the
+                # graph replay is ~43 ms end-to-end, session.txt), but it can
+                # drop to eager (~53 ms) or, with --fstereo-scale 1.0, to ~9 Hz
+                # — and the watchdog must never paint a healthy learned feed
+                # STALE. Sized for the slowest configuration this flag admits.
+                expect = min(expect, 4.0)
             # Only the C3 colour feed can be tracked on: SAM2 needs the picture
             # the pose will eventually be computed against, and only this feed
             # has depth aligned to it on the same grid.
@@ -275,6 +302,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # occupy). Without --mpc nothing moves.
         self._traj_panel = None
         self._nav_source = "main"
+        self._nav_fallback: str | None = None    # the second localizing feed
         # MAP-frame geometry, pushed to the plot ONCE at build time and never
         # re-framed: the plot draws in the map frame (trajectory.py set_datum),
         # so the mat and the pool do not move when a run engages.
@@ -286,6 +314,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_fix = None                    # newest NavFix, for the checks
         self._depth_chk = None                   # (ratio, spread) or None
         self._depth_chk_t = 0.0
+        # The same measurement made against the LEARNED depth map. A separate
+        # accumulator, never merged: they are two different instruments and an
+        # average of the two would describe neither.
+        self._depth_chk_fs = None
+        self._depth_chk_fs_t = 0.0
+        # Whether learned depth is the depth panel's picture RIGHT NOW. Comes
+        # from the worker's own state signal, never inferred from a flag or a
+        # panel key: it is what attributes the ratio to an instrument.
+        self._fstereo_live = False
         self._cam_ext = None                     # (R_frd_cam, t_frd_cam)
         self._nav_rec: dict | None = None        # open REC NAV recording
         if bool(getattr(self.opts, "mpc", False)):
@@ -298,6 +335,14 @@ class MainWindow(QtWidgets.QMainWindow):
                     getattr(self.opts, "nav_config", "config/hw_nav.yaml"),
                     geometry_override=getattr(self.opts, "nav_geometry", None))
                 self._nav_source = cfg.nav_source
+                fb = getattr(cfg, "fallback", {}) or {}
+                if fb.get("enabled"):
+                    self._nav_fallback = ("second" if cfg.nav_source == "main"
+                                          else "main")
+                # The angle the RGB extrinsic assumes, so the PAYLOAD panel's
+                # tracked tilt can say when the mount has wandered from it.
+                self.payload.set_tilt_nominal(
+                    float(cfg.second_cam.get("tilt_deg", 0.0)))
                 # The camera extrinsic, kept for `_check_depth_scale`. THE SAME
                 # ONE the localizer divides out and object_nav multiplies back
                 # in (control/geometry.py R_t_frd_cam) — a second definition
@@ -367,11 +412,24 @@ class MainWindow(QtWidgets.QMainWindow):
                 # the worker runs the file's (see set_mode_default).
                 self._traj_panel.set_mode_default(
                     getattr(self.opts, "mpc_mode", None) or _mcfg.mode)
+                # ...and the CHECKPOINT the PolicyWorker loads at startup
+                # (hw_mpc.yaml policy.ckpt): the picker's SEED only — the
+                # confirmed name comes back through PolicyStatus.ckpt.
+                # --policy-ckpt was removed on 2026-09-11 (operator request:
+                # choose the model in the GUI; see _pick_policy_ckpt).
+                self._traj_panel.set_policy_ckpt_default(
+                    str(_mcfg.policy["ckpt"]))
             except Exception as e:                           # noqa: BLE001
                 print(f"[warn] mpc panel: mission defaults ({e})", flush=True)
             if cfg is not None:
                 self._traj_panel.view.tag_size_m = float(cfg.tag_size_m)
                 self._traj_panel.view.rov_size_m = tuple(cfg.rov_footprint_m)
+                # The SAME mount angle the localizer applies, so the C3's
+                # optical-axis ray on the plot cannot point somewhere the
+                # solver does not think it points (widgets/rov_shape.py).
+                tilt = getattr(cfg, "cam_tilt_deg", None)
+                if tilt is not None:
+                    self._traj_panel.view.cam_tilt_deg = float(tilt)
             if self._map_tags_raw:
                 self._traj_panel.view.set_map_tags(self._map_tags_raw)
             if self._pool_raw:
@@ -441,6 +499,51 @@ class MainWindow(QtWidgets.QMainWindow):
         for panel in self.videos.values():
             panel.show()
         self._main_video = main
+
+    def _depth_instrument(self) -> str:
+        """Which instrument the depth panel carries. Fixed for the run.
+
+        --fstereo replaces the depth path outright — the device stream is not
+        even requested — so there is exactly one depth instrument per session
+        and no moment at which a measurement could be credited to the other
+        one. That is the point of making it a launch flag rather than a
+        button: an experiment whose instrument can change mid-run produces a
+        record that cannot be attributed afterwards.
+        """
+        return "fs" if self._fstereo_on else "dev"
+
+    def _tick_depth_checks(self) -> None:
+        """Advance the ratios' ages so stale ones drop out on the clock."""
+        if self._depth_chk is not None or self._depth_chk_fs is not None:
+            self._push_depth_checks()
+
+    def _feed_name(self, key: str) -> str:
+        """What this feed is called in titles, buttons and file names.
+
+        The middle panel is the only one whose content depends on a flag, and
+        a recording called "default_rgb" holding a depth map would keep telling
+        that lie for as long as the file exists.
+        """
+        if key == "second":
+            override = FEED_NAMES_BY_PANEL2.get(self._panel2)
+            if override:
+                return override
+        if key == "depth" and self._depth_instrument() == "fs":
+            return FEED_NAME_DEPTH_FS
+        return FEED_NAMES.get(key, key)
+
+    def _on_fstereo_state(self, st) -> None:
+        """The learned-depth worker's own account of itself.
+
+        Drives the panel's overlay chip only. Which instrument a measurement
+        belongs to is NOT decided here — it is fixed for the run by the flag —
+        so a late or dropped publish cannot put a number under the wrong
+        sensor's name.
+        """
+        self._fstereo_live = bool(st.live)
+        panel = self.videos.get("depth")
+        if panel is not None:
+            panel.canvas.set_fs_state(st)
 
     def _toggle_focus(self, name: str) -> None:
         """Double-click a feed to promote it to the big slot."""
@@ -553,6 +656,7 @@ class MainWindow(QtWidgets.QMainWindow):
         b.payload.connect(self._on_payload)
         b.link.connect(self._on_link)
         b.video_stat.connect(self._on_video_stat)
+        b.fstereo_state.connect(self._on_fstereo_state)
         b.log.connect(self._on_log)
 
         # UI -> bus. The panels never talk to a backend directly; they emit and
@@ -573,6 +677,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.payload.gripper_drive.connect(b.cmd_gripper_drive)
         self.payload.tilt_drive.connect(b.cmd_tilt)
         self.payload.tilt_center.connect(b.cmd_tilt_center)
+        self.payload.tilt_set.connect(b.cmd_tilt_set)
         b.sensor_stat.connect(self._on_sensor_stat)
         b.pose.connect(self._on_pose)
         b.nav_fix.connect(self._on_nav_fix)
@@ -580,6 +685,8 @@ class MainWindow(QtWidgets.QMainWindow):
         b.mpc_status.connect(self._on_mpc_status)
         b.tag_overlay.connect(self._on_tag_overlay)
         b.mpc_event.connect(self._on_mission_event)
+        b.policy_plan_viz.connect(self._on_policy_plan_viz)
+        b.policy_status.connect(self._on_policy_status)
         for panel in self.videos.values():
             if panel.tag_btn is not None:
                 panel.tag_toggled.connect(b.cmd_tag_enable)
@@ -591,6 +698,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self._traj_panel.estop_requested.connect(self.estop)
             self._traj_panel.record_requested.connect(self._toggle_nav_record)
             self._traj_panel.scenario_requested.connect(b.cmd_mpc_scenario)
+            # The ckpt picker (2026-09-11): the panel asks, the WINDOW opens
+            # the dialog (it owns the keyboard hand-back and Esc = E-STOP),
+            # and the chosen path goes to the PolicyWorker over the bus.
+            self._traj_panel.policy_ckpt_pick_requested.connect(
+                self._pick_policy_ckpt)
+            self._traj_panel.policy_ckpt_requested.connect(b.cmd_policy_ckpt)
 
         # Explicit .connect rather than the `activated=` constructor keyword:
         # that keyword form is a PyQt convenience and is not portable to PySide.
@@ -615,7 +728,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # feed starts off.
         for key, panel in self.videos.items():
             if panel.tag_btn is not None:
-                panel.set_tag_checked(key == self._nav_source)
+                panel.set_tag_checked(key in (self._nav_source,
+                                              self._nav_fallback))
         self.bus.log.emit("info", f"backend {backend.name} started")
 
     # ================================================================== slots
@@ -708,12 +822,27 @@ class MainWindow(QtWidgets.QMainWindow):
         # what makes a REC NAV run re-usable — a solved fix throws the corners
         # away, and rebuilding or extending the tag map needs them
         # (rov_gui/tools/build_tag_map.py).
-        if self._nav_rec is not None and t.localizes and t.K:
-            self._nav_rec_frame(t)
+        if self._nav_rec is not None and t.K:
+            if t.localizes:
+                self._nav_rec_frame(t)
+            elif getattr(t, "role", "") == "fallback":
+                self._nav_rec_frame(t, feed="second")
         if t.localizes:
-            self._check_depth_scale(t)
+            # Once per depth SOURCE. The tag floor is the only ground truth on
+            # this station that shares nothing with the depth path, so it is
+            # also the only fair way to ask whether the learned matcher is more
+            # metric than the camera's own — the question --fstereo exists to
+            # answer. Two independent accumulators; never one blended series.
+            # ONE measurement, attributed to whichever instrument is actually
+            # in the depth panel. There is only ever one depth map on screen,
+            # so running this twice would feed the SAME array to both
+            # accumulators and print a fabricated agreement between two
+            # instruments — on the one cross-check nothing else on this station
+            # can make. The source comes from the worker's own live state,
+            # never from a panel key.
+            self._check_depth_scale(t, self._depth_instrument())
 
-    def _check_depth_scale(self, t) -> None:
+    def _check_depth_scale(self, t, source: str = "dev") -> None:
         """Is the C3's DEPTH MAP metric? Ask the FLOOR, which it never sees.
 
         THIS IS THE ONE CROSS-CHECK NOTHING ELSE ON THE STATION CAN MAKE, and
@@ -750,9 +879,45 @@ class MainWindow(QtWidgets.QMainWindow):
         is already on the GUI thread — the fix, the depth panel's own uint16
         map (the same one the cursor probe reads), and the extrinsic.
         """
+        # ONE panel, either instrument — but ONLY while its map is on the
+        # COLOUR grid. Every ray below is built from the COLOUR intrinsics
+        # (`t.K`), so a map on any other grid would be back-projected through
+        # the wrong camera and produce a plausible, wrong calibration ratio in
+        # silence. Since --fstereo-view native (2026-09-02) the panel may hold
+        # the network's own rectified-left map, so the grid is checked rather
+        # than assumed. `source` selects the ACCUMULATOR, never the input.
         fix, panel = self._last_fix, self.videos.get("depth")
         if (panel is None or fix is None or not fix.ok or self._cam_ext is None
                 or fix.R_ned_body is None or len(t.K) != 4):
+            return
+        # `_cam_ext` is the PRIMARY camera's extrinsic. A fix that came from
+        # the fallback camera (RGB standing in for a silent C3) would be
+        # composed through the wrong lens here and print a fabricated ratio.
+        if fix.source and fix.source != self._nav_source:
+            return
+        if getattr(panel.canvas, "depth_grid", lambda: "color")() != "color":
+            return
+        # A LAND DRY-RUN has no tag floor to score depth against. The synthetic
+        # fix would still satisfy every guard above, and this would then EMA a
+        # fabricated depth-vs-MAP ratio out of whatever plane the tags are
+        # pretended to be on and park it on the panel for two minutes.
+        if bool(getattr(getattr(self, "opts", None),
+                        "land_dry_run", False)):
+            return
+        # A DEAD FEED KEEPS ITS LAST PICTURE, and measuring it would keep the
+        # ratio's timestamp fresh while the vehicle flies on — the readout's
+        # age would then say "now" about a map from minutes ago, which is the
+        # one thing the age exists to prevent.
+        #
+        # `age` is None until the panel's FIRST frame, which is not "fresh"
+        # and not "stale" — there is no map at all. It crashed here instead
+        # (2026-09-02 pool run): --fstereo has no second depth source, so the
+        # panel stays empty for the seconds the mono pairs take to start,
+        # while the COLOUR stream is already feeding tag overlays into this
+        # check — and an exception inside a Qt slot aborts the process, so an
+        # empty panel took the whole station down.
+        age = panel.fresh.age
+        if age is None or age > self.DEPTH_MAP_STALE_S:
             return
         aux = panel.canvas.depth_map()
         if aux is None or not t.src_w or not t.src_h:
@@ -804,11 +969,138 @@ class MainWindow(QtWidgets.QMainWindow):
         spread = float(ratios[int(0.9 * n)] - ratios[int(0.1 * n)])
         # Light EMA: the question is a CALIBRATION constant, so anything that
         # moves frame to frame is noise on it by definition.
-        prev = self._depth_chk[0] if self._depth_chk else r
-        self._depth_chk = (0.9 * prev + 0.1 * r, spread)
-        self._depth_chk_t = now()
+        if source == "dev":
+            prev = self._depth_chk[0] if self._depth_chk else r
+            self._depth_chk = (0.9 * prev + 0.1 * r, spread)
+            self._depth_chk_t = now()
+        else:
+            prev = self._depth_chk_fs[0] if self._depth_chk_fs else r
+            self._depth_chk_fs = (0.9 * prev + 0.1 * r, spread)
+            self._depth_chk_fs_t = now()
+        self._push_depth_checks()
+
+    #: How long a ratio measured by the instrument that is no longer showing
+    #: stays on the readout. It is a real measurement, so it is worth keeping
+    #: across a toggle for comparison — but the vehicle moves, and this depth
+    #: error grows with RANGE (KNOWN_ISSUES 2026-08-24), so an old number from
+    #: another height is not comparable with a live one. Two minutes is long
+    #: enough to flip the switch and read both, short enough that the pair
+    #: still describes roughly the same place.
+    DEPTH_CHK_HOLD_S = 120.0
+
+    #: Under this, a ratio counts as "now" and is drawn bare. The check itself
+    #: EMAs over ~10 samples arriving at the tag rate, so a couple of seconds
+    #: is the natural age of a live reading.
+    DEPTH_CHK_FRESH_S = 3.0
+
+    #: Older than this, the panel's depth map is not a measurement of now. The
+    #: slower instrument runs at ~12 Hz, so this is many missed frames.
+    DEPTH_MAP_STALE_S = 1.5
+
+    def _push_depth_checks(self) -> None:
+        """Send both ratios down, each with the age of its own measurement.
+
+        Called from the UI tick as well as on new samples, and that is not
+        housekeeping: the age is computed HERE and rendered as drawn, so a
+        version that only ran when a fresh sample arrived froze the age exactly
+        when the instrument stopped measuring — the one case the age exists to
+        expose — and the staleness drop could never fire.
+
+        AGE IS SHOWN FOR BOTH ROWS, live included. This error grows with RANGE
+        (KNOWN_ISSUES 2026-08-24), so a ratio measured two minutes ago at
+        another altitude is not the answer to "is the depth path metric NOW",
+        whether or not its instrument is the one currently on the panel.
+        """
+        if self._traj_panel is None:
+            return
+        for source, chk, stamp in (("dev", self._depth_chk, self._depth_chk_t),
+                                   ("fs", self._depth_chk_fs,
+                                    self._depth_chk_fs_t)):
+            if chk is None or stamp <= 0.0:
+                self._traj_panel.view.set_depth_check(None, None, source=source)
+                continue
+            age = now() - stamp
+            if age > self.DEPTH_CHK_HOLD_S:
+                # Too old to stand as a measurement. Dropping it is the honest
+                # move: a stale ratio on screen reads as a current one.
+                self._traj_panel.view.set_depth_check(None, None, source=source)
+                continue
+            # Below the grace window a number is "now" for this purpose; above
+            # it the age is drawn so the two rows can never read as one
+            # simultaneous comparison.
+            self._traj_panel.view.set_depth_check(
+                *chk, source=source,
+                held_s=(0.0 if age < self.DEPTH_CHK_FRESH_S else age))
+
+    def _on_policy_plan_viz(self, v) -> None:
+        """The diffusion policy's own output, onto the trajectory plot.
+
+        Straight through: the worker already composed it into the datum frame
+        and the panel does the datum->map hop, the same path every other
+        series takes. Guarded only because the panel is optional (--mpc off).
+        """
         if self._traj_panel is not None:
-            self._traj_panel.view.set_depth_check(*self._depth_chk)
+            self._traj_panel.add_policy_plan(v)
+
+    def _on_policy_status(self, st) -> None:
+        """PolicyWorker -> the panel's ckpt row: which checkpoint the worker
+        HOLDS, loading…/READY/ERROR, and why a panel pick was refused
+        (PolicyStatus.ckpt_note). Display only — the MpcWorker reads the same
+        signal for its own arm gates."""
+        if self._traj_panel is not None:
+            self._traj_panel.set_policy_status(st)
+
+    def _pick_policy_ckpt(self) -> None:
+        """The ckpt row's `…` button (HIGH = Diffusion Policy). 2026-09-11,
+        operator request: the model is chosen here instead of --policy-ckpt.
+
+        The dialog is OWNED HERE, not by the panel, for the same reason the
+        recording-name field is handled here (eventFilter): while it is up
+        the keyboard belongs to the dialog, so every held key is released
+        first (all_stop) and the log says the keys are not flying; and its
+        Esc must be what Esc is everywhere else — E-STOP — as well as closing
+        it (CkptDialog.estop_requested -> estop) — whichever child of the
+        dialog has the focus: the file list and the completer popup handle
+        Esc themselves, so the dialog catches it with an application-level
+        filter while it is up (review 2026-09-11). The JOYSTICK keeps flying:
+        its reader is a timer and the modal loop keeps timers alive.
+
+        The path goes through the panel's `_apply_ckpt_choice`, which shows it
+        as a REQUEST and emits it to the bus; whether it loads is the
+        PolicyWorker's answer (PolicyStatus), never assumed here."""
+        panel = self._traj_panel
+        if panel is None:
+            return
+        if not bool(getattr(self.opts, "policy", False)):
+            # Nothing would load it: no PolicyWorker without --policy. Say so
+            # instead of opening a dialog whose result could only sit on the
+            # row as a request nobody answers.
+            self.bus.log.emit("warn", "no policy worker (--policy): a "
+                                      "checkpoint picked here could not load "
+                                      "— picker not opened")
+            return
+        from pathlib import Path
+
+        from .state import POLICY_OUTPUTS_ROOT
+        from .widgets.trajectory import CkptDialog
+
+        self.teleop.all_stop()
+        self.bus.log.emit("warn", "choosing a checkpoint — the keyboard is "
+                                  "NOT flying the vehicle; Esc closes the "
+                                  "dialog AND is E-STOP")
+        cur = panel.current_ckpt()
+        start = (str(Path(cur).parent) if cur and Path(cur).is_file()
+                 else POLICY_OUTPUTS_ROOT)
+        dlg = CkptDialog(self, "Diffusion policy checkpoint", start,
+                         "Checkpoints (*.ckpt);;All files (*)")
+        dlg.estop_requested.connect(self.estop)
+        # `fileSelected` fires on accept only, with the one chosen file — no
+        # dialog-code comparison across Qt bindings needed.
+        dlg.fileSelected.connect(lambda p: panel._apply_ckpt_choice(str(p)))
+        try:
+            (dlg.exec_ if hasattr(dlg, "exec_") else dlg.exec)()
+        finally:
+            dlg.deleteLater()
 
     def _on_nav_fix(self, f) -> None:
         self._last_fix = f
@@ -823,6 +1115,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._traj_panel is not None:
             self._traj_panel.add_fix(f)
         src = {"main": "C3", "second": "RGB"}.get(f.source, f.source or "?")
+        if f.source and f.source == self._nav_fallback and f.ok:
+            src += "↩"                    # the backup camera is the state
         detail = (f"[{src}] {f.n_tags} tag(s), {f.reproj_rms_px:.1f} px, "
                   f"det {f.detect_ms:.0f} ms"
                   if f.ok and f.reproj_rms_px is not None
@@ -896,12 +1190,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if not on:
             if self._nav_rec is not None:
                 rec, self._nav_rec = self._nav_rec, None
-                for key in ("file", "det", "frm"):
+                for key in ("file", "det", "frm", "det2", "frm2"):
                     rec[key].close()
                 self.bus.log.emit("info",
                                   f"nav recording saved: {rec['dir']} "
                                   f"({rec['n']} fixes, {rec['frames']} frames, "
-                                  f"{rec['dets']} detections)")
+                                  f"{rec['dets']} detections"
+                                  + (f", {rec['frames2']} fallback-feed frames"
+                                     if rec.get("frames2") else "") + ")")
                 # The log belongs with the run it explains. One level up: the
                 # nav files sit in their own nav_<hhmmss>/ subfolder so
                 # plot_nav_run and build_tag_map still see the layout they
@@ -934,8 +1230,17 @@ class MainWindow(QtWidgets.QMainWindow):
             det.write(self._NAV_DET_HEADER)
             frm = open(run_dir / "frames.csv", "w", encoding="utf-8")
             frm.write(self._NAV_FRM_HEADER)
+            # The FALLBACK feed's raw observations too, in files of their own:
+            # its corners belong to a different camera with a different model,
+            # and they are what rov_gui/tools/calibrate_second_cam.py turns
+            # into that camera's intrinsics (the mat is the target).
+            det2 = open(run_dir / "detections_second.csv", "w", encoding="utf-8")
+            det2.write(self._NAV_DET_HEADER)
+            frm2 = open(run_dir / "frames_second.csv", "w", encoding="utf-8")
+            frm2.write(self._NAV_FRM_HEADER)
             self._nav_rec = {"dir": run_dir, "file": fh, "det": det,
-                             "frm": frm, "n": 0, "frames": 0, "dets": 0}
+                             "frm": frm, "det2": det2, "frm2": frm2,
+                             "n": 0, "frames": 0, "dets": 0, "frames2": 0}
             self.bus.log.emit("info", f"nav recording to {run_dir}")
             # ...and WHAT WAS FLYING while it recorded. The MpcWorker answers
             # this on its own thread with controller.json: the plant model
@@ -968,28 +1273,39 @@ class MainWindow(QtWidgets.QMainWindow):
         if rec["n"] % 40 == 0:                 # ~2 s at fix rate; crash-safe
             rec["file"].flush()
 
-    def _nav_rec_frame(self, t) -> None:
+    def _nav_rec_frame(self, t, feed: str = "main") -> None:
         """One frame of RAW observations: every detected quad + this frame's
-        camera model. Written for the localizing feed only — a second feed's
-        corners belong to a different camera and would need its own model."""
+        camera model. The localizing feed goes to frames/detections.csv; the
+        fallback feed to frames_second/detections_second.csv — a second
+        feed's corners belong to a different camera with its own model, so
+        the two are never mixed in one file."""
         rec = self._nav_rec
-        n = rec["frames"]
+        frm, det = (rec["frm"], rec["det"]) if feed == "main" else (rec["frm2"], rec["det2"])
+        key = "frames" if feed == "main" else "frames2"
+        n = rec[key]
         fx, fy, cx, cy = t.K
-        rec["frm"].write(f"{n},{t.t_capture:.4f},{fx:.4f},{fy:.4f},"
-                         f"{cx:.4f},{cy:.4f},{t.src_w},{t.src_h},"
-                         f"{len(t.quads)}\n")
+        frm.write(f"{n},{t.t_capture:.4f},{fx:.4f},{fy:.4f},"
+                  f"{cx:.4f},{cy:.4f},{t.src_w},{t.src_h},"
+                  f"{len(t.quads)}\n")
         for tid, quad in zip(t.ids, t.quads):
             pts = ",".join(f"{v:.3f}" for xy in quad for v in xy)
-            rec["det"].write(f"{n},{t.t_capture:.4f},{tid},{pts}\n")
-        rec["frames"] = n + 1
-        rec["dets"] += len(t.quads)
-        if rec["frames"] % 40 == 0:
-            rec["det"].flush()
-            rec["frm"].flush()
+            det.write(f"{n},{t.t_capture:.4f},{tid},{pts}\n")
+        rec[key] = n + 1
+        if feed == "main":
+            rec["dets"] += len(t.quads)
+        if rec[key] % 40 == 0:
+            det.flush()
+            frm.flush()
 
     def _on_mpc_status(self, s) -> None:
         was = self._mpc_engaged
-        self._mpc_engaged = bool(s.engaged)
+        # `commanding`, NOT `engaged` — this flag decides who owns the
+        # joystick, and under POLICY OBSERVE (LOW level None; --policy-observe
+        # is the launch alias) the answer is the pilot even though a mission
+        # is fully engaged and running. Every
+        # other use of `s.engaged` below is about the MISSION (a new datum,
+        # the trajectory panel), which is live either way.
+        self._mpc_engaged = bool(s.commanding)
         self.fresh["mpc"].mark(s.stamp, s.conn)
         # A NEW datum = a new run: clear the trails so the plot restarts at
         # (0,0) instead of drawing a jump from the previous frame.
@@ -1015,9 +1331,13 @@ class MainWindow(QtWidgets.QMainWindow):
             # so a held KEY would read neutral until re-pressed while the
             # vehicle coasts (review 2026-08-12).
             self.teleop.all_stop()
-        # While engaged, the teleop bars show the command actually leaving the
-        # station — the MPC's axes — labelled as such on the deadman line.
-        if s.engaged:
+        # While COMMANDING, the teleop bars show the command actually leaving
+        # the station — the MPC's axes — labelled as such on the deadman
+        # line. Under POLICY OBSERVE they must keep showing the PILOT's own
+        # sticks: `s.axes` is empty there, so this branch would have frozen
+        # all four bars at 0.00 and printed "MPC commanding — move any stick
+        # to take over" over a takeover path that is deliberately dead.
+        if s.commanding:
             ax = s.axes if len(s.axes) == 4 else (0.0, 0.0, 0.0, 0.0)
             self.teleop.show_command(PilotInput(
                 surge=ax[0], sway=ax[1], heave=ax[2], yaw=ax[3],
@@ -1026,8 +1346,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.teleop.show_command(None)
         if self._traj_panel is not None:
             self._traj_panel.add_status(s)
-        detail = {True: "ENGAGED " + ("traj" if s.traj_on else "hold"),
-                  False: (s.reason or "idle")[:28]}[bool(s.engaged)]
+        if s.observe and s.engaged:
+            # Never the word ENGAGED for a run that commands nothing: this
+            # chip is where an operator glances to answer "is it flying
+            # itself right now".
+            detail = "OBSERVE " + ("DP" if s.traj_on else "armed")
+        else:
+            detail = {True: "ENGAGED " + ("traj" if s.traj_on else "hold"),
+                      False: (s.reason or "idle")[:28]}[bool(s.engaged)]
         self._extra_sensors["MPC"] = SensorStat("MPC", None, s.conn, detail)
         self._refresh_sensors()
 
@@ -1122,6 +1448,11 @@ class MainWindow(QtWidgets.QMainWindow):
             if rec.stats.recording:
                 rec.feed(panel.burn_overlay(image))
 
+        # Ratios age on the clock, not on the arrival of the next sample —
+        # otherwise the age freezes precisely when the instrument stops
+        # measuring, which is the case it exists to expose.
+        self._tick_depth_checks()
+
         # A wedged MpcWorker cannot report its own death: while ENGAGED, aged
         # silence on mpc_status forces the release from THIS side. Order
         # matters — all_stop() BEFORE clearing the flag (loud handback rule),
@@ -1198,7 +1529,7 @@ class MainWindow(QtWidgets.QMainWindow):
             rec = (f" | REC ui {self.recorder.stats.frames}f"
                    f" -{self.recorder.stats.dropped}")
         for k, st in active:
-            rec += f" | REC {FEED_NAMES.get(k, k)} {st.frames}f -{st.dropped}"
+            rec += f" | REC {self._feed_name(k)} {st.frames}f -{st.dropped}"
         self.stats_label.setText(
             f"ui {self._ui_hz:4.1f} Hz | frames drawn {drawn} "
             f"conflated {conflated}{rec}")
@@ -1423,7 +1754,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _toggle_feed_record(self, key: str) -> None:
         rec = self.feed_recorders[key]
         panel = self.videos[key]
-        name = FEED_NAMES.get(key, key)
+        name = self._feed_name(key)
         if rec.stats.recording:
             path = rec.stop()
             self.bus.log.emit("info", f"{name} recording saved: {path}")
@@ -1431,6 +1762,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.bus.cmd_log_sensors.emit(False, "")
         else:
             stat = panel.stat()
+            # NAME THE FILE FOR WHAT IS IN IT. The recorder's stem is fixed
+            # when it is constructed, and the depth panel's content is not —
+            # so without this an FS recording landed as c3_depth_*.mp4 (and a
+            # sidecar and a sensor JSONL to match) while the button and the log
+            # both said "C3 FS Depth". Under this repo's measurement rule that
+            # file path is the provenance a later document would cite.
+            rec.name = _file_stem(name)
             # Open at the rate the feed is running now; the sidecar records what
             # actually happened, so a wrong guess is correctable, not silent.
             path = rec.start(fps=(stat.fps if stat and stat.fps > 1 else 15.0))
@@ -1612,6 +1950,10 @@ def build_and_run(opts) -> int:
     win = MainWindow(opts)
     backend = make_backend(opts.source, win.bus, win.mailboxes, opts)
     win.attach(backend)
+    # From here on a bug in a slot must not abort the process — the operator
+    # would lose DISARM along with the window. Installed AFTER the bus exists
+    # so the fault also lands in the station log, not only the terminal.
+    install_slot_guard(win.bus.log.emit)
     app.aboutToQuit.connect(win.shutdown)
     if getattr(opts, "fullscreen", False):
         win.showFullScreen()
