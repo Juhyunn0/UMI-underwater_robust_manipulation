@@ -44,6 +44,7 @@ DC="/home/bdml/Desktop/data collection"
 DS_9926_DEPTH="$DC/slam/9_9_26/dataset_depth.zarr.zip"
 DS_9926_RGBD="$DC/slam/9_9_26/dataset_rgbd.zarr.zip"
 DS_9426_9926_DEPTH="$DC/slam/dataset_depth_9426_9926.zarr.zip"
+DS_PEG_9_27_9_28="$DC/slam/dataset_depth_peg_9_27_9_28.zarr.zip"
 MIN_FREE_GB="${MIN_FREE_GB:-12}"
 
 # NAME -> "config|task|dataset|exp_name|topk_k|extra hydra overrides (space-separated, may be empty)|action_repr"
@@ -65,6 +66,11 @@ spec_for() {
     depth_7d_dinov3b)           echo "train_diffusion_transformer_umi_depth_dinov3b_workspace|umi_depth_7d|$DS_9926_DEPTH|depth7d_9926_dinov3b|2||pos_rpy_width" ;;
     rgbd_7d_dinov3b)            echo "train_diffusion_transformer_umi_rgbd_dinov3b_workspace|umi_rgbd_7d|$DS_9926_RGBD|rgbd7d_9926_dinov3b|2|dataloader.batch_size=16 val_dataloader.batch_size=16 training.gradient_accumulate_every=2|pos_rpy_width" ;;
     depth_7d_dinov3b_9426_9926) echo "train_diffusion_transformer_umi_depth_dinov3b_workspace|umi_depth_7d|$DS_9426_9926_DEPTH|depth7d_9426_9926_dinov3b|2||pos_rpy_width" ;;
+    # peg-in-hole 9/27 + 9/28 병합 (2026-09-28). config_A(ViT-B/16 CLIP) 레시피를 5d/7d 두 출력으로.
+    #   5d = [dx,dy,dz,dyaw,width]   7d = [dx,dy,dz,dyaw,droll,dpitch,width]  — width 는 어느 쪽이든 마지막 컬럼.
+    #   0924_081113_train_umi_depth_5d_vitclip_9426_9926 과 같은 overrides (batch 32, 200 epoch, topk 2).
+    peg_5d_vitclip) echo "train_diffusion_transformer_umi_depth_vit_workspace|umi_depth_5d|$DS_PEG_9_27_9_28|peg5d_vitclip_9_27_9_28|2||pos_yaw_width" ;;
+    peg_7d_vitclip) echo "train_diffusion_transformer_umi_depth_vit_workspace|umi_depth_7d|$DS_PEG_9_27_9_28|peg7d_vitclip_9_27_9_28|2||pos_rpy_width" ;;
     *)           echo "" ;;
   esac
 }
