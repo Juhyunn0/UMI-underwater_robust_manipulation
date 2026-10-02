@@ -31,6 +31,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from rov_gui.qt import qt_versions          # noqa: E402  (after sys.path fix)
+from rov_gui.perception.fs_gate import SCHEDULES as FS_SCHEDULES  # noqa: E402
 
 
 class _Parser(argparse.ArgumentParser):
@@ -453,17 +454,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "interpreter the GUI resolved.")
     g.add_argument("--fstereo-repo", default=None, metavar="DIR",
                    help="the FoundationStereo checkout (default: "
-                        "$FOUNDATION_STEREO_REPO, else "
-                        "~/Desktop/FoundationStereo/FoundationStereo)")
+                        "$FOUNDATION_STEREO_REPO, else the submodule "
+                        "external/FoundationStereo in this repo)")
     g.add_argument("--fstereo-ckpt", default=None, metavar="PTH",
                    help="checkpoint (default: <repo>/pretrained_models/"
                         "23-51-11/model_best_bp2.pth, the ViT-large model). "
                         "cfg.yaml must sit beside it.")
     g.add_argument("--fstereo-iters", type=int, default=None,
-                   help="GRU refinement iterations (default: 8, or 16 with "
-                        "--policy — the training depth store's setting "
-                        "[측정: ~/Desktop/data collection/depth/0/depth.zarr/"
-                        ".zattrs]; typing a value always wins). The "
+                   help="GRU refinement iterations (default: 8, with or "
+                        "without --policy; the training depth store was made "
+                        "at 16 [측정: ~/Desktop/data collection/depth/0/"
+                        "depth.zarr/.zattrs]; typing a value always wins). The "
                         "paper default is 32 and the reference viewer uses 16, "
                         "but at --fstereo-scale 0.5 more iterations buy "
                         "nothing: on 9 real stereo frames the disagreement "
@@ -474,8 +475,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "that costs accuracy; this one only costs time.")
     g.add_argument("--fstereo-scale", type=float, default=None,
                    help="downscale the pair before inference, <=1 (default: "
-                        "0.5, or 1.0 with --policy — the training depth "
-                        "store's setting; typing a value always wins). "
+                        "0.5, or 0.75 with --policy; the training depth store "
+                        "was made at 1.0; typing a value always wins). "
+                        "Under --policy it is also the GPU-SHARING knob: at "
+                        "0.75 one frame takes 75.7 ms, longer than the 66.7 ms "
+                        "camera interval, so the network never idles and the "
+                        "policy's forward takes 156.2 ms p50; at 0.5 a frame "
+                        "takes 45.7 ms, the network keeps up with 15 fps and "
+                        "the forward takes 38.5 ms p50 [측정: data/20260930/"
+                        "0930_220212/diag/policy_vs_fstereo_resolution.json, "
+                        "offline]. See also --policy-fs-schedule. "
                         "THE frame-rate knob, and THE accuracy "
                         "knob. Against the reference setting on 9 real stereo "
                         "frames at 8 iters [rov_gui/tools/fstereo_bench_out/"
@@ -572,8 +581,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="which map the depth PANEL draws (default: "
                         "%(default)s). native = the network's own rectified-"
                         "left 640x400 output, which is exactly what "
-                        "FoundationStereo/UMI_Underwater/"
-                        "oakd_foundation_stereo.py shows: ~100%% valid, full "
+                        "UMI_Underwater/oakd_foundation_stereo.py (~/Desktop/"
+                        "data collection) shows: ~100%% valid, full "
                         "resolution, no holes. color = the map projected onto "
                         "the colour grid, which is pixel-aligned with the RGB "
                         "panel but is a forward scatter through "
@@ -628,8 +637,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "scene lives inside ~1.5 m, i.e. the bottom fifth of "
                         "the fixed scale, and the panel goes uniformly dark — "
                         "which is what made it look broken next to "
-                        "FoundationStereo/UMI_Underwater/oakd_foundation_"
-                        "stereo.py, whose viewer has always auto-ranged. "
+                        "UMI_Underwater/oakd_foundation_stereo.py (~/Desktop/"
+                        "data collection), whose viewer has always auto-ranged. "
                         "AFFECTS ONLY THE PICTURE AND ITS COLOUR BAR: the "
                         "millimetres the cursor reads, the policy's input, "
                         "FoundationPose and every recording are untouched. "
@@ -798,7 +807,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "DOWN (needs a re-measured extrinsic in hw_nav.yaml)")
     g.add_argument("--mpc-mode", default=None,
                    choices=("none", "mpc", "dobmpc", "mpc_tuned", "dobmpc_tuned",
-                            "pid", "rl"),
+                            "pid", "rl", "rl_pwm"),
                    help="override hw_mpc.yaml mode — the LOW level (the "
                         "follower) the trajectory panel starts on; the panel "
                         "can change it between engagements. One solver serves "
@@ -968,7 +977,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--record-stereo-every", type=float, default=0.0,
                    metavar="SEC",
                    help="record at most one pair every SEC seconds (default: "
-                        "%(default)s = every pair the worker took). SAMPLING "
+                        "%(default)s = every pair FoundationStereo computed; "
+                        "under --policy-fs-schedule only, during a policy "
+                        "mission, that is the policy's two per period — the "
+                        "pairs between are discarded unprocessed). SAMPLING "
                         "COSTS SOMETHING SPECIFIC: the policy's observation is "
                         "built from a PAIR OF CONSECUTIVE depth frames, so a "
                         "sampled recording can no longer reconstruct the "
@@ -983,12 +995,47 @@ def build_parser() -> argparse.ArgumentParser:
                         "actually needs; the millimetre map is for checking "
                         "absolute distances against a tape.")
     g.add_argument("--policy-allow-fs-mismatch", action="store_true",
-                   help="fly the policy on FoundationStereo settings that "
-                        "differ from the training depth store's (iters 16, "
-                        "scale 1.0, the same checkpoint). Refused by default "
-                        "because the policy never saw depth from another "
-                        "setting; the mismatch is recorded in the run meta "
-                        "either way.")
+                   help="acknowledge flying the policy on FoundationStereo "
+                        "settings that differ from the training depth store's "
+                        "(iters 16, scale 1.0, the same checkpoint — compared "
+                        "by content, not path). A mismatch is a WARNING with "
+                        "or without this flag (it was a refusal until "
+                        "2026-09-02, when the --policy defaults themselves "
+                        "moved to iters 8 / scale 0.75); both sides' settings "
+                        "and this flag are recorded in the run meta.")
+    g.add_argument("--policy-fs-schedule", default="free",
+                   choices=FS_SCHEDULES,
+                   help="how FoundationStereo and the policy share the GPU "
+                        "(default: %(default)s). Both run in this process, and "
+                        "with the stereo network running back to back the "
+                        "policy's forward takes 152.8 ms p50 instead of the "
+                        "19.3 ms it takes alone [측정: data/20260930/"
+                        "0930_220212/diag/policy_vs_fstereo_contention.json, "
+                        "offline]. free = no coordination: every run before "
+                        "2026-10-01. yield = the stereo network does not "
+                        "START a frame while the policy is inferring; the "
+                        "policy waits, at most 150 ms [스펙: FsGate.wait_s], "
+                        "for the frame in flight; the same depth frames are "
+                        "chosen as under free, and the depth panel loses "
+                        "about one frame per plan. only = while a policy "
+                        "mission is active the stereo network computes ONLY "
+                        "the two frames the policy asks for each period — "
+                        "the depth panel then refreshes in pairs, 4 frames a "
+                        "second [유도: 2 per period_s 0.5], the policy's two "
+                        "frames are consecutive camera frames, and most colour "
+                        "frames get no depth for --pose [예측]; outside a "
+                        "mission it runs free. Needs --policy and --fstereo. "
+                        "Measured on the real workers, offline: rov_gui/tools/"
+                        "policy_fs_schedule_bench.py. The other lever needs "
+                        "no schedule: --fstereo-scale 0.5. UNVERIFIED in "
+                        "water. RECORD BOUNDARY: the schedule is in the run "
+                        "meta (policy.worker.fs_schedule, policy.run."
+                        "fs_schedule, fstereo.schedule) and on every policy "
+                        "plan line of plans.jsonl (fs_schedule); runs on "
+                        "different schedules must not be pooled on plan age "
+                        "or infer_ms, and `only` also changes the "
+                        "observation's pair spacing (obs_pair_dt_s) — do not "
+                        "pool policy behaviour across it.")
 
     g = p.add_argument_group(
         "live ORB-SLAM3 pose — OFF unless --slam")
@@ -1031,6 +1078,27 @@ def build_parser() -> argparse.ArgumentParser:
                         "alternative is no map at all.")
     g.add_argument("--slam-min-fast", type=int, default=7,
                    help="ORBextractor.minThFAST (default: %(default)s)")
+
+    g = p.add_argument_group(
+        "pool cameras (CCTV: watched and recorded, never an input to control)")
+    g.add_argument("--pool-cams", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="run the pool-corner USB cameras (pool_cam/) in a child "
+                        "process, show them on a POOL CAMS tab, and record them "
+                        "whenever REC UI records — into the same run folder, "
+                        "from the same t0 (default: off). Each camera has an "
+                        "AUTO REC switch on that tab to leave it out. "
+                        "--source demo uses synthetic cameras.")
+    g.add_argument("--pool-cam-config", default="config/pool_cams.yaml",
+                   metavar="YAML",
+                   help="camera names -> USB ports, size, fps, encoder "
+                        "(default: %(default)s; missing = every pool camera "
+                        "found, 1920x1080 @ 30)")
+    g.add_argument("--pool-cam", action="append", default=None,
+                   metavar="NAME=DEV",
+                   help="one camera, by name (DEV: N, /dev/videoN or a "
+                        "/dev/v4l/by-path link); repeat for several. Replaces "
+                        "the config file's list.")
 
     g = p.add_argument_group("ui")
     g.add_argument("--ui-fps", type=float, default=60.0,
@@ -1135,8 +1203,13 @@ FS_RATE_NOTE = (
     "pairs, RTX 5090 idle] = ~13 Hz, against 140.2 ms = ~7 Hz at the training "
     "store's iters 16 / scale 1.0. This is DELIBERATELY off the training "
     "instrument (median disagreement 0.099 px, p90 0.747 vs that reference) "
-    "and buys back the time axis: the depth pair is ~77 ms apart, near the "
-    "66.7 ms training stride, instead of 138 ms = 2.07x it. Both settings are "
+    "to buy back the time axis: the depth pair was meant to be ~77 ms apart, "
+    "near the 66.7 ms training stride, instead of 138 ms = 2.07x it. ON THE "
+    "VEHICLE it only half does: the stereo network shares the GPU with the "
+    "policy and ran at 9.7-11.2 Hz, and 313 of 665 plans had a pair 133 ms "
+    "apart [측정: data/20260930/0930_220212/diag/latency_breakdown.json, "
+    "plan_timing.json]. --policy-fs-schedule and --fstereo-scale 0.5 are the "
+    "two levers for that. Both settings are "
     "recorded in the run meta and obs_pair_dt_s is on every plan — which "
     "mismatch costs more is a hardware A/B nobody has run "
     "(KNOWN_ISSUES 2026-09-02). --fstereo-scale 1.0 --fstereo-iters 16 "
@@ -1236,9 +1309,11 @@ def check_policy(a):
     * ``--policy --fstereo`` whose FS settings differ from the training depth
       store's (read torch-free from the hydra config beside the checkpoint
       and the dataset zip's ``.zattrs``; the EFFECTIVE FS checkpoint is
-      compared, typed or default): REFUSED unless
-      ``--policy-allow-fs-mismatch``; a missing config/zip is reported, not
-      refused (the meta records what was and was not checked).
+      compared, typed or default, by identity rather than path —
+      ``same_fstereo_ckpt``): WARNING — a refusal until 2026-09-02 (see the
+      comment at the call), so ``--policy-allow-fs-mismatch`` is now only
+      recorded; a missing config/zip is reported too (the meta records what
+      was and was not checked).
     * ``--policy`` without ``--mpc``: WARNING — the worker loads and infers
       for nobody (no consumer builds a `policy` mission).
     * ``--policy-allow-device-depth``: WARNING — a bench experiment, recorded
@@ -1246,6 +1321,12 @@ def check_policy(a):
     * ``--fstereo-alpha`` below 0.5 under ``--policy``: WARNING — the 224 obs
       crop is not covered at alpha 0 (97.92 % < 98.5 %, refused by the
       builder at run time; the mission would arm and never receive a plan).
+    * ``--policy-fs-schedule`` other than ``free`` without ``--policy``, or
+      on ``--source hw`` without ``--fstereo``: REFUSED — no gate is built
+      and the run would silently be ``free``. On a non-hw source: WARNING
+      (there is no FoundationStereo worker; the flag does nothing). On hw:
+      a WARNING that names the schedule and its record boundary, plus one
+      for ``only`` with ``--pose``.
     Also says so when the --policy defaults moved the FS settings, with the
     measured rate (FS_RATE_NOTE).
     """
@@ -1339,6 +1420,29 @@ def check_policy(a):
     if float(getattr(a, "record_stereo_every", 0.0) or 0.0) < 0.0:
         return ("refuse", "--record-stereo-every cannot be negative; 0 means "
                           "every pair.")
+    _sched = str(getattr(a, "policy_fs_schedule", "free") or "free")
+    if _sched != "free":
+        # REFUSALS for the reason --record-depth's is: the gate is built only
+        # where a FoundationStereo worker feeds a policy worker, so without
+        # them the run is silently `free` and the operator compares a
+        # schedule that never ran. Without --policy nothing even records
+        # that. On the hardware source a missing --fstereo is the same story
+        # (device depth feeds the policy, there is no stereo worker); on
+        # demo/ros2 --fstereo builds no worker either way, so that case is a
+        # WARNING further down ("does nothing"), like check_fstereo's.
+        _missing = [f for f, on in (
+            ("--policy", bool(getattr(a, "policy", False))),
+            ("--fstereo", bool(getattr(a, "fstereo", False))
+             or getattr(a, "source", "demo") != "hw")) if not on]
+        if _missing:
+            return ("refuse", f"--policy-fs-schedule {_sched} needs "
+                              f"{' and '.join(_missing)}: it schedules the "
+                              f"FoundationStereo worker around the "
+                              f"diffusion-policy worker, and without "
+                              f"{'them' if len(_missing) > 1 else 'it'} there "
+                              f"is nothing to schedule — the run would be "
+                              f"`free`. Add {' and '.join(_missing)}, or drop "
+                              f"--policy-fs-schedule.")
     if not bool(getattr(a, "policy", False)):
         return None
     src = getattr(a, "source", "demo")
@@ -1387,6 +1491,42 @@ def check_policy(a):
                      "publishes status, but nothing consumes its plans "
                      "(the `policy` mission shape lives in the --mpc "
                      "controller). Add --mpc to fly it.")
+    if _sched != "free":
+        if src != "hw":
+            # check_fstereo says the same of --fstereo itself: only the
+            # hardware backend builds the learned-depth worker.
+            warns.append(f"--policy-fs-schedule {_sched} does nothing with "
+                         f"--source {src}: there is no FoundationStereo worker "
+                         f"to schedule, so this run is `free`"
+                         + (" (the run meta's policy.worker.fs_schedule "
+                            "records requested vs effective)."
+                            if src == "demo" and bool(getattr(a, "mpc", False))
+                            else "."))
+        else:
+            warns.append(
+                f"policy: FoundationStereo schedule `{_sched}` — "
+                + ("the stereo network does not start a frame while the "
+                   "policy infers. UNVERIFIED in water. Record boundary: "
+                   "meta policy.worker.fs_schedule / plans.jsonl fs_schedule "
+                   "— do not pool plan age or infer_ms with `free` runs."
+                   if _sched == "yield" else
+                   "during a policy mission the stereo network computes only "
+                   "the two frames the policy asks for each period: the depth "
+                   "panel refreshes in pairs, and the policy's two frames are "
+                   "consecutive camera frames. UNVERIFIED in water. Record "
+                   "boundary: meta policy.worker.fs_schedule / plans.jsonl "
+                   "fs_schedule — the observation's pair spacing changes as "
+                   "well as plan age and infer_ms, so do not pool policy "
+                   "behaviour with `free` or `yield` runs."))
+            if _sched == "only" and bool(getattr(a, "pose", False)):
+                warns.append("--policy-fs-schedule only with --pose: "
+                             "FoundationPose refuses a learned-depth map more "
+                             "than 250 ms older than its colour frame [스펙: "
+                             "C3VideoWorker.FS_PAIR_MAX_MS], and during a "
+                             "policy mission the maps come in pairs with a gap "
+                             "between them — most colour frames get no depth "
+                             "[예측]. Use `yield` if the two must run "
+                             "together.")
     if src == "hw" and not fs and allow_dev:
         warns.append("policy on DEVICE depth (--policy-allow-device-depth): a "
                      "bench experiment, recorded in meta (depth_scale_applied "

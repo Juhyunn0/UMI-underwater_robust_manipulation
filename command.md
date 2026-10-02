@@ -1,5 +1,21 @@
 # access GUI : `./c3 gui --source hw --allow-command --pose`
 
+./c3 gui --source hw --allow-command --mpc --fstereo --policy --mpc-mode rl_pwm
+
+# 방법 1a: 정책이 추론하는 순간에만 FoundationStereo가 새 프레임을 시작하지 않음
+./c3 gui --source hw --allow-command --mpc --fstereo --policy --mpc-mode rl_pwm --policy-fs-schedule yield
+
+
+# 
+./c3 gui --source hw --pool-cams
+# 방법 1b: 미션 중엔 FoundationStereo가 정책이 쓰는 2장만 계산 (말씀하신 "추론할 때만" 방식)
+./c3 gui --source hw --allow-command --mpc --fstereo --policy --mpc-mode rl_pwm --policy-fs-schedule only
+
+# 방법 2: FoundationStereo 해상도를 낮춤
+./c3 gui --source hw --allow-command --mpc --fstereo --policy --mpc-mode rl_pwm --fstereo-scale 0.5
+
+
+
 ./c3 gui --source hw --allow-command --mpc --fstereo --policycd /home/bdml/Desktop/RL_controller && DISPLAY=:1 /home/bdml/miniforge3/envs/env_isaaclab/bin/python -u scripts/play.py --task ROV-PoseHold-v0 --num_envs 64 --checkpoint logs/rsl_rl/rov_posehold/2026-09-21_16-53-50_traj5_s2/model_1199.p
 
 # → 패널: HIGH = Diffusion Policy, ckpt 칸의 "…"로 체크포인트 선택 (hw_mpc.yaml policy.ckpt는

@@ -5,7 +5,7 @@
 # file only holds what is DIFFERENT on the real vehicle.
 
 rov_model: heavy_gripper    # ROV_MODEL for dobmpc (heavy | heavy_c3 | heavy_gripper)
-mode: dobmpc                # none | mpc | dobmpc | mpc_tuned | dobmpc_tuned | pid
+mode: dobmpc                # none | mpc | dobmpc | mpc_tuned | dobmpc_tuned | pid | rl | rl_pwm
                             # ONE solver serves the four MPC names: 'dob' adds
                             # w_hat, '_tuned' splits the position cost into
                             # along/cross in the path frame (mpc_tuned: below).
@@ -62,6 +62,23 @@ rl:
   leash_m: 0.8            # far goals are presented at <= 0.8 m along the true bearing (trained offset clip 1.0 m)
   yaw_rate_ff: true       # K=1 plans carry r_ned == 0: recover the yaw-rate feed-forward from d(yaw_ref)/dt
   yaw_rate_max: 0.6       # rad/s, the trained goal yaw-rate range
+
+# LOW mode rl_pwm (panel: RL_PWM, 2026-09-30) — the per-thruster RL policy: 8 raw pulses, ArduSub's mixer BYPASSED.
+# UNTESTED ON THE VEHICLE [예측]: the pulses reach the thrusters only through the Lua timeout override
+# (rov_gui/control/rl_policies/pwm10_s1/rl_pwm_override.lua on the Navigator, SCR_ENABLE 1, SCR_USER1 1), which has
+# never run on this vehicle. The station reads the vehicle's parameters back and REFUSES to engage until the gate in
+# rov_gui/control/rl_pwm.py holds (motor directions as trained, scripting on, RC 9..16 free, RLPWM heartbeat). Bench it
+# with the propellers OFF first, then a per-thruster sign probe (RL_controller/README.md §10.3).
+rl_pwm:
+  policy_dir: rov_gui/control/rl_policies/pwm10_s1
+  pwm_cap: 1.0 #0.25      # |throttle| ceiling on the wire (fraction of +-400 us). 0.25 (1400..1600 us) was the
+                          # first-water value [예측]; the policy was trained at 1.0. [결정 2026-10-01 operator: 1.0 in one
+                          # step] after the 0.25 run saturated and limit-cycled (data/20261001/1001_172910: thrusters
+                          # 3/4/6 at the cap 61-91 % of ticks, 5.8 N per thruster vs 64 N trained [유도]). No per-thruster
+                          # sign probe was done. RECORD BOUNDARY: meta controller.pwm_cap.
+  leash_m: 0.8
+  yaw_rate_ff: true
+  yaw_rate_max: 0.6
 
 # Bridge tag fixes with the velocity/gyro estimate between camera frames —
 # the state (and the plot) moves at 20 Hz instead of holding each fix.
@@ -391,7 +408,13 @@ w_hat_clip: [15, 45, 45, 5, 5, 8]
 # STABILIZE runs (mpc_105945 / mpc_110306) held depth within +/-7 cm with
 # ~zero heave command because the attitude loop keeps the vertical
 # thrusters out of the deadband (pwm_dev p50 35 us vs 10 us in MANUAL).
-vehicle_net_buoyancy_n: 0.1
+# 2026-10-01: ALSO the PID's heave feed-forward (rov_gui/control/pid.py, added
+# to the z force before f_max) — before this the PID's clamped integral (i_max
+# 5 N) could not carry the peg and the vehicle sank under pid as under
+# mpc_tuned (1001_155105/mpc_154825: 0.43 -> 0.19 m) [측정]. mpcc/dobmpc still
+# ignore it. -12.0 is the peg-in-jaw value [유도: rl heave axis 0.209 -> N];
+# WITHOUT the peg put it back near 0.1 or both followers hold ~6 cm high.
+vehicle_net_buoyancy_n: -12.0 #0.1
 
 # STATION BRIDGE — a tag dropout is not a reason to stop controlling.
 # STATION MODE ONLY (rov_gui/control/station_bridge.py).
@@ -587,7 +610,7 @@ policy:
   period_s: 0.5               # [유도: n_action_steps 8 x obs_dt 66.7 ms = 0.533 s]
   knot_dt_s: 0.2              # [예측] raw 16 knots @ 66.7 ms -> 6 knots @ 0.2 s
                               # (FD-accel gain 61·σ vs 551·σ, A5)
-  obs_max_age_s: 0.6          # [유도: measured depth chain 243 ms + inference 33 ms + tick 25 ms ≈ 0.30–0.46 s at intake [측정: policy_bench_20260902_141224.json, dryrun_20260902_140513]; plan life at install ≥ 0.4 s ≥ blend_s]
+  obs_max_age_s: 0.7 #0.6          # [유도: measured depth chain 243 ms + inference 33 ms + tick 25 ms ≈ 0.30–0.46 s at intake [측정: policy_bench_20260902_141224.json, dryrun_20260902_140513]; plan life at install ≥ 0.4 s ≥ blend_s]
                               # (was 0.4: zero margin against the measured
                               # chain, ~12–28 % of plans skipped as late)
   stale_s: 1.5                # [예측] no accepted plan this long -> "policy stale"
@@ -817,6 +840,21 @@ policy:
   # extrinsic (hw_nav.yaml); a 3-vector in the C3 optical frame overrides.
   tcp_body_flu_m: [0.502, 0.0, -0.17]
   tcp_offset_cam_m: null
+  # OBS VIEW SHIFT — OFF (null). TEMPORARY switch (2026-09-30). When set, the
+  # depth obs is re-rendered from a viewpoint this many metres FORWARD of the C3
+  # along body x (the gripper axis) before the policy sees it; it changes the
+  # OBSERVATION only, never how the action is flown. For the PEG checkpoint the
+  # value is 0.05 [측정: peg root 0.254 m (ROV) vs 0.208 m (handheld 9/28) along
+  # the axis, data/20260930/0930_183320_observe/diag/rig_geometry.json]; its
+  # effect is a prediction on rebuilt obs, NOT flown [예측: .../diag/
+  # validate_builder_shift.json]. It is per PROCESS, not per checkpoint: while
+  # it is set, a can checkpoint picked in the panel gets the shifted obs too —
+  # set it only for a peg session and put null back afterwards (the can
+  # demos' handheld geometry was never compared). The station logs
+  # "OBS VIEW SHIFT" at start and at every arm; RECORD BOUNDARY: meta
+  # policy.config.obs_view_forward_m and policy.worker.obs.view_shift — do not
+  # pool with unshifted runs. null = the training recipe, byte for byte.
+  obs_view_forward_m: 0.05 # ######null 
   # DEPTH OBS (A16): the builder refuses a grid whose 224 obs coverage is below
   # this [유도: 0.985 sits at the 0.06 % tail of the training obs validity (per-frame min 0.9777, p1 1.000, 99.94 % of frames ≥ 0.985) [측정: rov_gui/tools/dp_policy_out/training_validity_20260902.txt]];
   # z_near/z_far/obs_res are the training recipe [스펙: dataset .zattrs obs].
@@ -828,7 +866,7 @@ policy:
   # [측정: /home/bdml/Desktop/data collection/slam/actions_summary.json reports[*].gripper_command — open_level_m p10–p90 0.055–0.070 (median 0.061), closed_level_m p10–p90 0.034–0.043 (median 0.040); 0.069/0.042 chosen near the upper tail [예측]];
   # thresholds = width 0.050 / 0.060 m [유도]; init = OPEN at
   # process start [가정, logged]; travel [예측]; hold_max = UMI-U's 4 s [예측].
-  gripper: false               # 2026-09-07: ON. Policy runs before this date computed
+  gripper: true               # 2026-09-07: ON. Policy runs before this date computed
                               # the jaw channel and DISCARDED it (A12 default OFF until
                               # the trajectory was proven). Proven on the 0907_145206 pool
                               # run: approach reached the object and the policy asked
@@ -843,11 +881,11 @@ policy:
   gripper_close_below: 0.30
   gripper_open_above: 0.67
   gripper_hold_max_s: 4.0
-  gripper_width_open_m: 0.069
-  gripper_width_closed_m: 0.042
-  gripper_width_init_m: 0.069
+  gripper_width_open_m: 0.090 ######0.069
+  gripper_width_closed_m: 0.007  ####0.042
+  gripper_width_init_m: 0.007 ####0.069
   gripper_travel_s: 2.0
-  gripper_lookahead_s: 0.0    # WHEN on the streamed plan the jaw hysteresis samples the width
+  gripper_lookahead_s: 0.8 #0.0    # WHEN on the streamed plan the jaw hysteresis samples the width
                               # channel: now + this [s]. 0.0 = sample the jaw channel at now
                               # (pre-2026-09-07 behaviour; on the 0907_145206 run this crosses
                               # close_below only during plan gaps — the policy puts its close at
@@ -861,7 +899,7 @@ policy:
                               # What the hysteresis saw is CSV `grip_g` (schema 13); a jaw-timing
                               # statistic must not be pooled across different values of this.
 
-  q_scale: 1.0               # POSITION-weight multiplier for the MPC-family follower
+  q_scale: 4.0 #1.0               # POSITION-weight multiplier for the MPC-family follower
                               # while a policy plan is installed (PID ignores it). Diagnosis
                               # 2026-09-07: mpc/mpc_tuned commanded |uX| p50 0.5-1.8 N for the
                               # 8-10 cm leashed error -> axis 0.01-0.03, below the T200

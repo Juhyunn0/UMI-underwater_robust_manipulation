@@ -1,0 +1,44 @@
+# Pool-corner USB cameras for `./c3 gui --pool-cams` (pool_cam/pool_cam.py).
+# CCTV only: watched on the POOL CAMS tab and recorded with REC UI. Nothing in
+# here reaches the controller, the estimator or the policy.
+
+# name -> /dev/v4l/by-path link. A by-path link names the USB PORT, so a camera
+# keeps its name across replugging and reboots (the cameras share one serial
+# number, so /dev/v4l/by-id cannot tell them apart). `./c3 poolcam --list`
+# prints the links. A listed camera that is not plugged in yet just waits.
+#
+# Empty = every pool camera found at start, named cam0, cam1, ... in USB-port
+# order -- so one missing at start shifts the names of the rest. Fill this in
+# once the four corners are cabled, e.g.:
+#
+#   devices:
+#     NE: /dev/v4l/by-path/pci-0000:13:00.0-usb-0:4:1.0-video-index0
+#     NW: /dev/v4l/by-path/...
+#     SE: /dev/v4l/by-path/...
+#     SW: /dev/v4l/by-path/...
+devices: {}
+
+# The POOL CAMS tab always has this many tiles. Cameras present at start fill
+# the first ones; the rest are EMPTY SLOTS, and a pool camera plugged in while
+# the station runs takes the first empty slot -- no restart. A slot then belongs
+# to that USB port (replug into the same port = same slot).
+slots: 4
+
+# V4L2 card names (substrings; `./c3 poolcam --list` shows each camera's) that
+# count as pool cameras for the auto names and the empty-slot scan. Any other
+# USB camera on this desktop is left alone. Empty = pool_cam.py POOL_MODELS:
+#   "USB RGB Camera"       (Realtek 0bda:2a16)
+#   "SPCA2650 AV Camera"   (Sunplus, has a microphone; second camera, 2026-09-30)
+models:
+
+# Anti-flicker: the mains frequency of the room lights. 60 here (KR and US).
+# The cameras power up at 50, which rolls horizontal bands through the picture
+# under 60 Hz lights [측정: pool_cam/bench_out/flicker_20261001.txt].
+# 50 | 60 | off | auto
+power_line: 60
+
+size: 1920x1080      # capture = recording size
+fps: 30              # this camera does 25 / 30 / 60
+encoder: auto        # auto = h264_nvenc if it works, else libx264 | nvenc | x264
+quality:             # empty = pool_cam's default (CQ 28 nvenc / CRF 23 x264)
+preview_hz: 10       # POOL CAMS tab refresh; previews stop while the tab is hidden

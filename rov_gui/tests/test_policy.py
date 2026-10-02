@@ -50,7 +50,13 @@ demo_e2e.py cover the worker). What it pins down, by spec decision
   width ramps open -> closed over 1 s) never closes — the deadlock; 0.8 s
   sees the chunk's far end, fires POLICY gripper CLOSE, auto-neutrals
   after hold_max_s, and `grip_g` records what was seen; the knob is
-  validated (finite, 0 <= v <= 3.0, coerced) for both policy and replay.
+  validated (finite, 0 <= v <= 3.0, coerced) for both policy and replay;
+* the FS SCHEDULE record (2026-10-01, --policy-fs-schedule; schema stays
+  16): every plans.jsonl line — late / skipped ones too — carries
+  fs_schedule, fs_input, fs_wait_ms, fs_wait_timeout and the three ages
+  since capture (None when the producer did not stamp it, never 0.0); the
+  schedule is pinned from the PolicyStatus at ARM into policy.run and
+  announced once per arm when it is not `free`.
 """
 
 from __future__ import annotations
@@ -1284,7 +1290,7 @@ def test_policy_every_clear_site_drops_the_jaw_and_releases_the_estimator():
             drives: list[float] = []
             bus.cmd_gripper_drive.connect(drives.append)
             _arm(w)
-            assert w.replay["grip_state"] == "open"    # est init = OPEN
+            assert w.replay["grip_state"] == "neutral"  # 2026-10-01: never seeded from the estimate
             # width 0.042 -> g = 0 < close_below: a CLOSE edge
             w.on_policy_plan(_mk_plan(w, action=_straight_action(width=0.042)))
             assert _run_until(w, lambda: -1.0 in drives, timeout_s=3.0), \
@@ -1303,6 +1309,40 @@ def test_policy_every_clear_site_drops_the_jaw_and_releases_the_estimator():
                 assert meta["policy"]["run"]["end_reason"] == "stop"
             if name != "teardown":
                 w.teardown()
+
+
+def test_policy_open_request_drives_even_when_estimator_says_open():
+    """2026-10-01 (data/20261001/1001_151431): after one policy OPEN the
+    estimator sat at 90 mm and, with the START state seeded from it, three
+    later runs swallowed the policy's open (grip_g 0.93-0.99) as a non-edge
+    — the pilot had closed the jaw from the gamepad in between, which the
+    estimator never hears. The START state is "neutral" now, so the first
+    crossing drives whatever the estimate says; and a gamepad press reported
+    on jaw_drive_seen moves the estimate like a key press does."""
+    with tempfile.TemporaryDirectory() as tmp:
+        w, bus, pilots, logs = _policy_worker(tmp, gripper=True)
+        drives: list[float] = []
+        bus.cmd_gripper_drive.connect(drives.append)
+        bus.jaw_drive_seen.connect(w.on_gripper_drive)     # wire_policy's hop
+        # a previous run's OPEN, fully travelled
+        w.on_gripper_drive(+1.0); time.sleep(0.05)
+        w._grip_est._t -= 10.0                              # 10 s of +1 drive
+        w.on_gripper_drive(0.0)
+        assert w._grip_est.g(now()) > 0.99
+        _arm(w)
+        rp = w.replay
+        assert rp["grip_state"] == "neutral", rp
+        assert rp["grip_w_at_arm"] == w._grip_est.w_open, rp   # the estimate said OPEN
+        assert any("first open/close edge drives" in m for _l, m in logs)
+        w.on_policy_plan(_mk_plan(w, action=_straight_action(width=0.069)))
+        assert _run_until(w, lambda: +1.0 in drives, timeout_s=3.0), drives
+        assert rp["grip_events"] == 1 and rp["grip_state"] == "open", rp
+        w.teardown()
+        # the gamepad squeeze, reported without being re-sent: estimate follows
+        n = len(drives)
+        bus.jaw_drive_seen.emit(-1.0); time.sleep(0.15)
+        bus.jaw_drive_seen.emit(0.0)
+        assert w._grip_est.width(now()) < w._grip_est.w_open - 1e-3 and len(drives) == n
 
 
 def test_policy_gripper_off_by_default_never_drives():
@@ -1371,7 +1411,7 @@ def test_gripper_lookahead_zero_matches_now_sample():
         seen = _spy_jaw_samples(w)
         _arm(w)
         assert w.replay["grip_lookahead_s"] == 0.0
-        assert w.replay["grip_state"] == "open"
+        assert w.replay["grip_state"] == "neutral"
         _stream_ramp_plans(w, seconds=2.0, period_s=0.5, close_at_s=1.0)
         rp = w.replay
         assert rp is not None and rp["installed"] >= 3, rp
@@ -1383,8 +1423,11 @@ def test_gripper_lookahead_zero_matches_now_sample():
         assert _ramp_action(close_at_s=1.0)[-1, 4] <= 0.042 + 1e-6
         # ... and the sample at now never got there before the next plan
         assert min(g for g, _ in seen) > 0.30, min(seen)
-        assert -1.0 not in drives and rp["grip_events"] == 0, drives
-        assert rp["grip_state"] == "open"
+        # ... the plans' near end says OPEN (width 0.069): with the state no
+        # longer seeded from the estimate that first crossing is an edge and
+        # drives +1 (2026-10-01) — still no CLOSE, the deadlock stands
+        assert -1.0 not in drives and drives[:1] == [+1.0], drives
+        assert rp["grip_events"] == 1 and rp["grip_state"] == "open", rp
         assert not any("gripper CLOSE" in e for e in events), events
         w.teardown()
         rows = w._csv_path.read_text().splitlines()
@@ -2390,6 +2433,303 @@ def test_policy_refuses_a_contouring_follower():
                 (w.reason, logs[-3:])
         finally:
             del w.ctrl.progress_m
+        w.teardown()
+
+
+# ------------------------------------------ --policy-fs-schedule (2026-10-01)
+def test_plans_jsonl_carries_the_fs_schedule_and_the_plan_timing():
+    """Schema stays 16 (keys only). Every plans.jsonl line says which
+    FoundationStereo schedule the plan was made under and where its age
+    went — a run folder is JOINED across launches 90 s apart and the file is
+    appended to, so only the LINE can tell two schedules apart:
+    ``fs_schedule`` / ``fs_input`` / ``fs_wait_ms`` / ``fs_wait_timeout`` as
+    the producer stamped them, and three ages since the observation was
+    CAPTURED (the depth reached the policy worker, the attempt began, the
+    plan was emitted). A plan whose producer stamped none of it (a
+    hand-built plan, an older worker) writes ``free`` and None — never 0.0,
+    which would read as measured. A LATE plan carries the block too: it is
+    written ahead of every gate, and a late plan is the one whose timing
+    matters most."""
+    import dataclasses
+
+    with tempfile.TemporaryDirectory() as tmp:
+        w, bus, pilots, logs = _policy_worker(tmp)
+        _arm(w)
+        base = _mk_plan(w, infer_ms=21.0)
+        plan = dataclasses.replace(
+            base, fs_schedule="yield", fs_wait_ms=12.5, fs_wait_timeout=False,
+            depth_arrive_t=base.obs_t + 0.081, trigger_t=base.obs_t + 0.085,
+            t_emit=base.obs_t + 0.123, fs_input="scale 0.75")
+        w.on_policy_plan(plan)
+        _ticks(w, 2)
+        line = _plans_jsonl(w)[-1]
+        assert line["plan_id"] == plan.plan_id, line
+        assert line["status"] in ("accept", "clip"), line["status"]
+        assert line["fs_schedule"] == "yield" and line["fs_input"] == "scale 0.75"
+        assert line["fs_wait_ms"] == 12.5 and line["fs_wait_timeout"] is False
+        assert abs(line["depth_ready_age_s"] - 0.081) < 1e-6, line["depth_ready_age_s"]
+        assert abs(line["trigger_age_s"] - 0.085) < 1e-6, line["trigger_age_s"]
+        assert abs(line["emit_age_s"] - 0.123) < 1e-6, line["emit_age_s"]
+        assert line["infer_ms"] == 21.0, "the wait is its own number, not in infer_ms"
+        # ...beside the keys the line always had
+        for k in ("age_at_intake_s", "obs_pair_dt_s", "pair_dup", "ckpt_sha1",
+                  "action_raw", "raw", "margins"):
+            assert k in line, k
+
+        # a plan built WITHOUT the fields: `free`, and None for what nobody stamped
+        bare = _mk_plan(w)
+        w.on_policy_plan(bare)
+        _ticks(w, 2)
+        line = _plans_jsonl(w)[-1]
+        assert line["plan_id"] == bare.plan_id, line
+        assert line["fs_schedule"] == "free"
+        for k in ("fs_input", "fs_wait_ms", "fs_wait_timeout",
+                  "depth_ready_age_s", "trigger_age_s"):
+            assert k in line and line[k] is None, (k, line.get(k, "ABSENT"))
+        assert line["emit_age_s"] == 0.0, "_mk_plan stamps t_emit == obs_t"
+
+        # a LATE plan (skipped ahead of the filter) still says where its time went
+        late = _mk_plan(w, obs_t=now() - 1.0)
+        late = dataclasses.replace(
+            late, fs_schedule="only", fs_wait_ms=0.4, fs_wait_timeout=True,
+            depth_arrive_t=late.obs_t + 0.2, trigger_t=late.obs_t + 0.21,
+            fs_input="size 224x224")
+        w.on_policy_plan(late)
+        _ticks(w, 2)
+        line = _plans_jsonl(w)[-1]
+        assert line["plan_id"] == late.plan_id and line["status"] == "late", line
+        assert line["fs_schedule"] == "only" and line["fs_input"] == "size 224x224"
+        assert line["fs_wait_ms"] == 0.4 and line["fs_wait_timeout"] is True
+        assert abs(line["depth_ready_age_s"] - 0.2) < 1e-6
+        assert abs(line["trigger_age_s"] - 0.21) < 1e-6
+        assert 0.99 < line["emit_age_s"] <= line["age_at_intake_s"] + 1e-6, \
+            (line["emit_age_s"], line["age_at_intake_s"])
+
+        # the run record: same schema, the schedule as of ARM, plain JSON
+        meta = w._run_meta()
+        assert meta["schema_version"] == 16
+        assert meta["policy"]["run"]["fs_schedule"] == "free"
+        json.dumps(meta)                           # serialisable WITHOUT a default
+        w.teardown()
+
+
+def test_plan_timing_never_raises_and_never_invents_a_measurement():
+    """``workers._plan_timing`` runs in the intake ahead of every gate, so
+    it must take ANY plan object: a producer that predates the fields, None,
+    non-finite or non-numeric stamps. What it cannot compute is None — and
+    what it can is plain Python (the line is written with json.dumps)."""
+    from types import SimpleNamespace
+
+    from rov_gui.control.workers import _plan_timing
+
+    keys = {"fs_schedule", "fs_input", "fs_wait_ms", "fs_wait_timeout",
+            "depth_ready_age_s", "trigger_age_s", "emit_age_s"}
+    for nothing in (object(), None, SimpleNamespace()):
+        out = _plan_timing(nothing)
+        assert set(out) == keys and all(v is None for v in out.values()), out
+    bad = SimpleNamespace(obs_t=float("nan"), t_emit=5.0, depth_arrive_t="soon",
+                          trigger_t=float("inf"), fs_wait_ms=float("nan"),
+                          fs_wait_timeout=None, fs_schedule=None, fs_input=None)
+    out = _plan_timing(bad)
+    assert set(out) == keys and all(v is None for v in out.values()), out
+    # obs_t known, the rest garbage: still no invented age
+    out = _plan_timing(SimpleNamespace(obs_t=100.0, t_emit=None,
+                                       depth_arrive_t=float("-inf"),
+                                       trigger_t=[1.0]))
+    assert out["emit_age_s"] is None and out["depth_ready_age_s"] is None
+    assert out["trigger_age_s"] is None
+    ok = SimpleNamespace(obs_t=100.0, depth_arrive_t=100.08, trigger_t=100.09,
+                         t_emit=np.float64(100.125), fs_wait_ms=np.float32(7.5),
+                         fs_wait_timeout=np.bool_(True), fs_schedule="only",
+                         fs_input="scale 0.5")
+    out = _plan_timing(ok)
+    assert out["fs_schedule"] == "only" and out["fs_input"] == "scale 0.5"
+    assert out["fs_wait_ms"] == 7.5 and type(out["fs_wait_ms"]) is float
+    assert out["fs_wait_timeout"] is True
+    assert abs(out["depth_ready_age_s"] - 0.08) < 1e-9
+    assert abs(out["trigger_age_s"] - 0.09) < 1e-9
+    assert abs(out["emit_age_s"] - 0.125) < 1e-9
+    assert out["depth_ready_age_s"] <= out["trigger_age_s"] <= out["emit_age_s"]
+    json.dumps(out)                                # no default needed
+    # a wait that did not time out is False, not None (None = not stamped)
+    assert _plan_timing(SimpleNamespace(fs_wait_timeout=False))["fs_wait_timeout"] is False
+    assert _plan_timing(SimpleNamespace(fs_wait_ms=0.0))["fs_wait_ms"] == 0.0
+
+
+def test_the_fs_schedule_is_pinned_at_arm_and_announced_once_per_arm():
+    """The schedule a policy mission flew is what the policy worker's STATUS
+    said at ARM (``PolicyStatus.fs_schedule`` — what is in effect in that
+    worker, not what was typed). It is pinned into the mission, copied into
+    ``policy.run.fs_schedule`` of the run meta, and — when it is not `free` —
+    said once per arm: a warn line and an events.log line (plan age and
+    infer_ms of such a run must not be pooled with `free` runs). A `free`
+    arm says nothing, exactly as before the switch existed. A later status
+    does not move the pin."""
+    import dataclasses
+
+    for sched in ("yield", "only", "free"):
+        with tempfile.TemporaryDirectory() as tmp:
+            w, bus, pilots, logs = _policy_worker(tmp)
+            w.on_policy_status(dataclasses.replace(
+                w._policy_status, fs_schedule=sched, stamp=now()))
+            n = len(logs)
+            _arm(w)
+            assert w.replay["fs_schedule"] == sched
+            said = [(lvl, m) for lvl, m in logs[n:] if "FS SCHEDULE" in m]
+            ev = (w._run_dir() / "events.log").read_text()
+            if sched == "free":
+                assert not said, said
+                assert "FS SCHEDULE" not in ev, ev
+            else:
+                assert len(said) == 1 and said[0][0] == "warn", said
+                assert f"FS SCHEDULE {sched}" in said[0][1], said
+                assert "--policy-fs-schedule" in said[0][1]
+                assert "do not pool" in said[0][1], said
+                assert ev.count(f"FS SCHEDULE {sched}") == 1, ev
+            # the fixture's per-tick status says `free` again: the pin stays
+            _ticks(w, 2)
+            assert w._policy_status.fs_schedule == "free"
+            meta = w._run_meta()
+            assert meta["policy"]["run"]["fs_schedule"] == sched
+            assert meta["schema_version"] == 16
+            json.dumps(meta)
+            w.teardown()
+    # a status from a worker that PREDATES the field arms as `free`
+    from types import SimpleNamespace
+    with tempfile.TemporaryDirectory() as tmp:
+        w, bus, pilots, logs = _policy_worker(tmp)
+        st = w._policy_status
+        old = SimpleNamespace(**{f.name: getattr(st, f.name)
+                                 for f in dataclasses.fields(st)
+                                 if f.name != "fs_schedule"})
+        old.stamp = now()
+        assert not hasattr(old, "fs_schedule")
+        w.on_policy_status(old)
+        n = len(logs)
+        _arm(w)
+        assert w.replay["fs_schedule"] == "free"
+        assert not any("FS SCHEDULE" in m for _l, m in logs[n:])
+        assert w._run_meta()["policy"]["run"]["fs_schedule"] == "free"
+        w.teardown()
+
+
+_TIMING_KEYS = {"fs_schedule", "fs_input", "fs_wait_ms", "fs_wait_timeout",
+                "depth_ready_age_s", "trigger_age_s", "emit_age_s"}
+
+
+def test_plan_timing_survives_hostile_values_and_the_intake_stays_engaged():
+    """Round 2: ``_plan_timing`` is the first thing the intake does with a
+    plan, ahead of every gate, so it is wrapped whole — on any surprise it
+    returns {} and the line simply lacks the keys; it must NEVER raise (an
+    exception there disengages instead of rejecting one plan). Hostile
+    inputs: a huge int (2**1024 overflows float()) in obs_t and in
+    fs_wait_ms; numpy ARRAYS where fs_schedule / fs_input / fs_wait_timeout
+    belong (strings only when a non-empty str, the flag only when a bool or
+    numpy bool); a plan whose attribute access itself raises. Every value
+    out is plain (None, float, str, bool) and json-serialisable without a
+    default. And an engaged intake fed such plans — hostile values in the
+    fields only the timing record reads (a huge obs_t is the intake's own
+    clock reject, which predates this) — neither disengages nor rejects:
+    the plans are installed, their lines carry None, or no timing keys."""
+    import dataclasses
+    from types import SimpleNamespace
+
+    from rov_gui.control.workers import _plan_timing
+
+    plain = (type(None), float, str, bool)
+
+    def check(out):
+        assert isinstance(out, dict) and set(out) <= _TIMING_KEYS, out
+        for k, v in out.items():
+            assert type(v) in plain, (k, type(v), v)
+        json.dumps(out)                            # no default needed
+        return out
+
+    huge = 2 ** 1024
+    # a huge obs_t: no age can be computed; the rest still is
+    out = check(_plan_timing(SimpleNamespace(
+        obs_t=huge, depth_arrive_t=100.08, trigger_t=100.09, t_emit=100.125,
+        fs_wait_ms=7.5, fs_schedule="only", fs_input="scale 0.5 it8",
+        fs_wait_timeout=False)))
+    assert set(out) == _TIMING_KEYS, out
+    assert out["depth_ready_age_s"] is None and out["trigger_age_s"] is None
+    assert out["emit_age_s"] is None
+    assert out["fs_wait_ms"] == 7.5 and out["fs_wait_timeout"] is False
+    assert out["fs_schedule"] == "only" and out["fs_input"] == "scale 0.5 it8"
+    # a huge fs_wait_ms (and huge stamps): None; what can be computed still is
+    out = check(_plan_timing(SimpleNamespace(
+        obs_t=100.0, fs_wait_ms=huge, depth_arrive_t=huge, trigger_t=100.09,
+        t_emit=-huge)))
+    assert set(out) == _TIMING_KEYS, out
+    assert out["fs_wait_ms"] is None and out["depth_ready_age_s"] is None
+    assert out["emit_age_s"] is None
+    assert abs(out["trigger_age_s"] - 0.09) < 1e-9
+    # numpy arrays where a string / a bool / a number belongs
+    out = check(_plan_timing(SimpleNamespace(
+        obs_t=100.0, fs_schedule=np.array(["only"]),
+        fs_input=np.array(["scale 0.5"]), fs_wait_timeout=np.array([True]),
+        fs_wait_ms=np.array([1.0, 2.0]), trigger_t=np.array([100.1, 100.2]))))
+    assert set(out) == _TIMING_KEYS, out
+    for k in ("fs_schedule", "fs_input", "fs_wait_timeout", "fs_wait_ms",
+              "trigger_age_s"):
+        assert out[k] is None, (k, out[k])
+    out = check(_plan_timing(SimpleNamespace(        # 0-d arrays too
+        fs_schedule=np.array("only"), fs_wait_timeout=np.array(True),
+        fs_input=np.array("scale 0.5"))))
+    assert out["fs_schedule"] is None and out["fs_input"] is None
+    assert out["fs_wait_timeout"] is None
+    # attribute access that RAISES, on every attribute it reads: {}
+    for name in ("obs_t", "t_emit", "depth_arrive_t", "trigger_t",
+                 "fs_wait_ms", "fs_wait_timeout", "fs_schedule", "fs_input"):
+        def boom(self, name=name):
+            raise RuntimeError(f"{name}: producer bug")
+        hostile = type("_Hostile", (), {name: property(boom)})()
+        assert check(_plan_timing(hostile)) == {}, name
+
+    # ...and the intake, engaged and armed
+    with tempfile.TemporaryDirectory() as tmp:
+        w, bus, pilots, logs = _policy_worker(tmp)
+        _arm(w)
+        _ticks(w)
+        base = _mk_plan(w)
+        plan = dataclasses.replace(
+            base, fs_schedule=np.array(["only"]), fs_input=np.array(["x"]),
+            fs_wait_ms=huge, fs_wait_timeout=np.array([True]),
+            depth_arrive_t=huge, trigger_t=np.array([1.0, 2.0]))
+        w.on_policy_plan(plan)
+        _ticks(w, 2)
+        assert w.engaged and w.traj_on and w.replay is not None, w.reason
+        line = _plans_jsonl(w)[-1]
+        assert line["plan_id"] == plan.plan_id, line
+        assert line["status"] in ("accept", "clip"), line["status"]
+        for k in _TIMING_KEYS - {"emit_age_s"}:
+            assert k in line and line[k] is None, (k, line.get(k, "ABSENT"))
+        assert line["emit_age_s"] == 0.0, "_mk_plan stamps t_emit == obs_t"
+        assert w.replay["installed"] == 1
+
+        class _RaisingPlan(PolicyPlan):
+            """A producer whose timing fields raise on access (the fields
+            nothing but the timing record reads)."""
+
+            def __getattribute__(self, name):
+                if name in ("fs_schedule", "fs_input", "fs_wait_ms",
+                            "fs_wait_timeout", "depth_arrive_t", "trigger_t"):
+                    raise RuntimeError(f"{name}: producer bug")
+                return super().__getattribute__(name)
+
+        b2 = _mk_plan(w)
+        raising = _RaisingPlan(**{f.name: getattr(b2, f.name)
+                                  for f in dataclasses.fields(b2)})
+        w.on_policy_plan(raising)
+        _ticks(w, 2)
+        assert w.engaged and w.traj_on, w.reason
+        line = _plans_jsonl(w)[-1]
+        assert line["plan_id"] == b2.plan_id, line
+        assert line["status"] in ("accept", "clip"), line["status"]
+        assert not (set(line) & _TIMING_KEYS), \
+            f"the line must simply lack the keys: {sorted(set(line) & _TIMING_KEYS)}"
+        assert w.replay["installed"] == 2
+        assert not any("replay tick raised" in m for _l, m in logs), logs[-3:]
         w.teardown()
 
 

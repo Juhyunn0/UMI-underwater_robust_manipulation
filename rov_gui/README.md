@@ -56,12 +56,16 @@ $P/pip install PyQt5==5.15.11 'depthai~=2.32.0' pymavlink
 ## 화면 구성
 
 ```
-row 0   header    (4열 span: 소스, 상태 pill 4개, 시계, REC, E-STOP)
-row 1   C3 MAIN (RGB)   | ROV CAM  | SYSTEM
-row 2   (2열 × 2행)      | C3 DEPTH | HEALTH  (2행 span)
-row 3   TELEOP | PAYLOAD | PROPULS. | SENSORS
+        header    (전폭: 소스, [STATION | POOL CAMS 탭], 상태 pill 4개, 시계, REC, E-STOP)
+row 0   C3 MAIN (RGB)   | ROV CAM  | SYSTEM
+row 1   (2열 × 2행)      | C3 DEPTH | HEALTH  (2행 span)
+row 2   TELEOP | PAYLOAD | PROPULS. | SENSORS
         status bar (UI Hz, 그린 프레임 수, conflate 수, 녹화 상태)
 ```
+
+헤더는 그리드 **밖, 위에** 있다(2026-09-30부터). `--pool-cams`를 켜면 헤더에 탭이 생기고
+그 아래가 [STATION 그리드 | POOL CAMS] 두 페이지가 된다 — 헤더(E-STOP·REC·LEAK)는 어느
+탭에서도 보인다. 플래그가 없으면 화면은 전과 같다.
 
 가운데 패널은 `--panel2`로 고른다: `rov`(기본, ROV 자체 RGB 카메라) / `stereo`
 (C3 좌측 mono) / `none`.
@@ -95,6 +99,117 @@ uint16 밀리미터 맵**을 읽는다 — 값과 그림이 다른 프레임에�
 약속이 깨진 상태였다. 센서 목록을 4번째 열로 분리해서 지금은 최소
 **1152×749**(카메라 틸트 섹션 포함)이고,
 `test_layout_fits_one_screen_and_has_no_scrollarea`가 그 선을 지킨다.
+
+## 풀장 모서리 카메라 (CCTV) — `--pool-cams` (2026-09-30)
+
+풀장 네 모서리의 USB 카메라를 **감시·기록 전용**으로 스테이션에 붙인다. 어떤 제어기·추정기·
+정책의 입력도 아니고, 그렇게 될 수 있는 경로 자체가 없게 만들었다(아래 "격리").
+
+```
+./c3 gui --source hw --pool-cams     # POOL CAMS 탭 + REC UI가 카메라도 같이 녹화
+./c3 gui --pool-cams                 # demo: 합성 카메라 4대 (하드웨어 안 엶)
+./c3 cctv                            # ROV·C3 없이 카메라만: 같은 4칸 탭 + 자체 REC 버튼
+./c3 cctv --record                   # 카메라가 다 뜨면 바로 녹화 시작
+./c3 poolcam --list                  # 꽂힌 카메라, by-path 링크, USB 컨트롤러별 대수
+./c3 poolcam --list --watch          # 하나씩 꽂으며 어느 컨트롤러에 들어가는지 실시간 확인
+./c3 poolcam                         # 저수준 OpenCV 창 (설치·각도 맞출 때)
+```
+
+`./c3 cctv`(`rov_gui/cctv.py`, 2026-10-01)는 기체를 연결하지 않았을 때 쓰는 창이다 — 스테이션의 POOL CAMS
+탭과 같은 카메라 프로세스·같은 타일·같은 AUTO REC 스위치이고, REC 버튼(Ctrl+R) 한 번이 폴더 하나:
+`data/YYYYMMDD/MMDD_HHMMSS_poolcam/`(카메라별 mp4+json, `session.json`, `log.txt`). `_poolcam` 종류라 수중
+런 통계에 섞이지 않는다. **스테이션(`--pool-cams`)과 동시에 못 연다** — 카메라는 한 프로세스만 열 수 있다.
+
+> **카메라를 스트리밍 중(특히 시작 직후)에 뽑지 말 것.** 2026-10-01 이 PC의 uvcvideo(RealSense dkms 패치판)가
+> 그 경쟁 상태에서 커널 크래시를 냈고 그 USB 컨트롤러가 재부팅 전까지 묶였다(KNOWN_ISSUES). 스테이션은
+> 카메라가 자식 프로세스라 영향이 없었다.
+
+- **REC UI를 누르면** 같이 녹화된다. 저장 위치는 UI 녹화와 **같은 런 폴더** 안의
+  `pool_<HHMMSS>/`: 카메라마다 `<name>_<stamp>.mp4` + `.json`, 그리고 `session.json`
+  (누가 녹화 대상이었고 누가 빠졌는지, 공통 t0).
+- **카메라별 AUTO REC 스위치**(POOL CAMS 탭, 각 타일 오른쪽 위): OFF면 REC UI를 눌러도 그
+  카메라는 녹화하지 않는다(화면은 계속 나온다). 녹화 중에 바꾸면 그 카메라 파일만 끊기거나,
+  다음 프레임부터 새 파일이 시작된다.
+- **항상 4칸**(`config/pool_cams.yaml slots: 4`). 시작할 때 꽂혀 있는 카메라가 앞 칸을 채우고,
+  나머지는 **EMPTY SLOT**. 스테이션이 도는 중에 카메라를 꽂으면 첫 빈 칸에 **재시작 없이** 들어간다
+  (`/dev`가 1 s 조용해진 뒤 — udev가 by-path 링크를 만든 다음). 한번 채워진 칸은 그 USB **포트**의 것:
+  같은 포트에 다시 꽂으면 같은 칸, 다른 포트면 새 카메라로 다른 빈 칸. 빈 칸은 녹화에서 빠지고
+  `session.json`의 `empty_slots`에 적힌다. REC 중에 꽂힌 카메라는 그 칸이 AUTO REC ON이면 첫 프레임부터
+  녹화한다.
+- **어떤 카메라가 풀 카메라인가**: V4L2 이름으로 고른다 — `USB RGB Camera`(첫 기종)와
+  `SPCA2650 AV Camera`(2026-09-30에 꽂은 두 번째 기종, 마이크 포함). 다른 기종을 쓰면 yaml `models:`에
+  추가한다. 이 목록에 없는 USB 카메라(다른 프로젝트 것)는 건드리지 않는다.
+- **가로 줄무늬(조명 깜빡임) 방지**: 카메라를 열 때마다 anti-flicker를 **60 Hz**로 맞춘다
+  (`config/pool_cams.yaml power_line`). 카메라들은 켜질 때 50 Hz라, 60 Hz 전기의 조명 아래서
+  화면에 가로 띠가 기어 다녔다 — 50→60 Hz로 띠가 6–12배 줄었다 [측정:
+  `pool_cam/bench_out/flicker_20261001.txt`, 재는 법 `python pool_cam/bench_flicker.py`].
+  USB를 뽑았다 꽂으면 카메라가 50 Hz로 돌아가므로 매번 다시 건다. 녹화 json에 `power_line`이 남는다.
+- 타일을 **더블클릭**하면 그 카메라만 크게, 다시 더블클릭하면 4분할.
+- 카메라 이름·포트·해상도는 [`config/pool_cams.yaml`](../config/pool_cams.yaml).
+  비워 두면 꽂힌 풀 카메라 전부를 USB 포트 순서대로 cam0..cam3으로 부르는데, 시작할 때
+  하나가 빠져 있으면 나머지 이름이 밀린다 — **네 대 배선이 끝나면 by-path로 이름을 고정할 것**
+  (`./c3 poolcam --list`가 링크를 찍어 준다). `--pool-cam NAME=DEV`(반복)는 파일 목록을 대체한다.
+
+### 동기화
+
+모든 파일이 **REC UI를 누른 순간 하나의 t0**에서 시작한다. 카메라 프레임은 드라이버의
+CLOCK_MONOTONIC 타임스탬프로 찍히고, 이 시계는 `time.monotonic()`과 같으며 **프로세스가
+달라도 같다**. 그래서:
+
+- 카메라 `.json`의 `t0_monotonic` — 그 파일 k번째 프레임 = `t0_monotonic + k/fps` (±3/4 프레임,
+  누락 프레임은 직전 프레임 반복으로 메워 시간축을 유지: pool_cam.py 상단 설명)
+- UI 녹화 sidecar의 `started_monotonic` — 같은 값 (테스트가 1e-5 s 이내 일치를 확인:
+  `test_window_rec_ui_records_the_pool_cameras_into_the_run_folder`)
+- nav `fixes.csv`의 `host_stamp` — 같은 시계
+
+### 격리 — 왜 자식 프로세스인가
+
+카메라·디코딩·인코더(ffmpeg, 가능하면 NVENC)는 `pool_cam/pool_cam.py --serve` **자식
+프로세스**가 소유한다. 스테이션은 "t0부터 이 폴더에 녹화"와 미리보기 크기만 보내고, 상태·로그·
+작은 미리보기 이미지만 받는다(`pool_cam/protocol.py`).
+
+1. **카메라가 스테이션을 못 죽인다.** 긴 USB 케이블의 카메라 네 대가 이 리그에서 제일 잘
+   빠지는 장비다. 캡처 드라이버의 네이티브 크래시는 같은 프로세스를 죽인다 — 자식이면 탭
+   하나가 죽고 MISSION LOG에 한 줄 남는다(RESTART 버튼).
+2. **GUI 스레드와 MPC/정책 워커의 CPU·GIL을 나눠 쓰지 않는다.** 명령 전송도 전용 스레드라
+   자식이 멈춰도 GUI 스레드(20 Hz 명령 하트비트)는 막히지 않는다
+   (`test_a_wedged_camera_process_never_blocks_the_caller`).
+3. **OpenCV 스레드 설정이 스테이션 것으로 남는다.** pool_cam은 `cv2.setNumThreads(1)`을
+   거는데 이건 프로세스 전역이다.
+
+스테이션 쪽 코드(`rov_gui/poolcam.py`, `rov_gui/widgets/poolcam.py`)는 DataBus를 받지 않고
+(창이 넘기는 건 로그 함수 하나), bus·state·backends·control·perception을 import하지 않는다
+— `test_poolcam_is_isolated_from_control`이 지킨다.
+
+수명: 자식은 자기 세션(터미널 Ctrl+C가 안 감)에서 돌고, **stdin이 닫히면** 녹화를 끝내고
+파일을 마무리한 뒤 종료한다 — 스테이션이 정상 종료하든 SIGKILL로 죽든 같다
+(`test_a_station_killed_mid_recording_still_leaves_finished_files`). 스테이션 종료 시엔 기체를
+중립으로 둔 **다음에** 카메라를 기다리고, 최대 10 s 뒤엔 자식이 혼자 마무리하게 둔다.
+
+### 탭이 조종을 가리지 않게 (2026-09-30 safety 감사 반영)
+
+- POOL CAMS 페이지에서도 키보드·조이스틱은 계속 기체를 조종하고(창이 키 처리자), 헤더의
+  E-STOP·REC·LEAK·상태 pill은 보인다. 대신 DISARM·MPC 패널·MISSION LOG는 가려지므로
+  **E-STOP, LEAK, MPC 무응답 해제 때는 STATION 탭으로 자동 복귀**한다.
+- 탭 갱신은 UI 틱의 **맨 끝**에서 예외를 격리해 돈다 — 탭의 버그가 MPC watchdog을 건너뛰지 못한다.
+- 자식이 죽으면 탭에 RESTART가 뜨고, REC UI가 켜져 있었으면 로그·상태바에 **"pool cams NOT
+  RECORDING"**. RESTART하면 같은 폴더에 녹화가 이어진다(새 파일, 각자의 t0). 살아 있는데 2 s
+  넘게 말이 없으면 "not answering — tiles are frozen"으로 표시한다.
+- 디스크: 시작 때 여유 5 GB 미만이면 풀 카메라 녹화를 거부, 녹화 중 2 GB 미만이면 중지한다 —
+  같은 디스크에 스테이션 자신의 nav·제어기·정책 기록이 있다. 자식은 `nice 10`(ffmpeg 포함)으로
+  돌아 코어가 모자라면 제어·정책이 먼저 받는다(카메라 쪽 누락은 sidecar가 센다).
+
+### 비용
+
+**실기 카메라 4대** × 1080p30 MJPEG, NVENC: 녹화 중 카메라 프로세스+ffmpeg **0.87 코어**, 탭을 보고
+있을 때 스테이션 쪽 **0.02 코어**, 15 s 녹화 누락 0 [측정: `pool_cam/bench_out/cost_20261001_real4_1080p30.txt`].
+재는 법: `python pool_cam/bench_cost.py --device NAME=DEV ...`.
+
+**카메라마다 PC 본체 포트 하나씩.** 한 컨트롤러의 포트 넷에 꽂아도 되는 건 대역이 PC 포트마다 따로이기
+때문이다. 1080p30에서 카메라 한 대가 USB 2.0 링크의 약 절반(196.6 Mbit/s)을 예약하므로 **허브(멀티 포트
+어댑터) 하나에 여러 대를 물리면 한 대만 나온다** [유도]. `./c3 poolcam --list`가 그 경우를 경고한다.
+탭을 안 보고 있으면 미리보기를 아예 만들지 않는다. NVENC는 CUDA 코어가 아닌 별도 인코더
+블록이지만 GPU를 정책 추론과 같이 쓰는 건 사실이다 [유도].
 
 ## 스레딩과 데이터 바인딩
 
@@ -763,6 +878,9 @@ C3의 **온디바이스 depth는 물속에서 metric이 아니다**. 캘리퍼 �
 ./c3 gui --source hw                      # 이 런의 depth는 C3 자체 스테레오다
 ```
 
+체크아웃은 리포 안 submodule `external/FoundationStereo`이고 가중치는 git 밖이다 —
+처음이거나 `FS FAULT … checkout not found`가 뜨면 아래 "FoundationStereo 체크아웃" 절부터.
+
 ### 런 하나에 계측기 하나 — 토글은 없다
 
 플래그가 켜지면 depth 패널, 커서 프로브, depth-vs-MAP 검사, `--pose`의 FoundationPose,
@@ -801,10 +919,16 @@ depth 패널 좌상단 한 줄, 그림이 그려진 뒤에도 계속 보인다:
 ```
 FS LOADING — 3s
 FOUNDATIONSTEREO  11.4 Hz  81 ms  valid 99%→95%
+FOUNDATIONSTEREO  4.0 Hz  76 ms  valid 99%→95%  [only]
 FS STARVED — no mono pair for 4.2 s
 FS STOPPED — no depth this run
 FS FAULT — FStereoError: no checkpoint
 ```
+
+`[yield]` / `[only]` 꼬리표는 `--policy-fs-schedule`(아래 policy 절, 2026-10-01)이 켜졌다는
+뜻이다. 그때 Hz는 도착 간격의 EMA가 아니라 **최근 2 s 동안 끝난 프레임 수 / 2 s**이고,
+`only` 미션 중에는 초당 4장 안팎이 정상이다 [유도: 정책이 period_s 0.5마다 2장] — 느려진
+네트워크가 아니다. 게이트가 없는(`free`) 런의 줄은 예전과 같다.
 
 > `_note`가 아니라 별도 페인트 패스인 이유: `_note`는 **NO SIGNAL 분기에서만** 그려진다.
 > 프레임이 한 장이라도 그려진 뒤엔 워커의 모든 설명이 안 보이게 되고, 한 번 돌다 멈춘
@@ -1083,6 +1207,17 @@ helper 31개에서 NameError — **첫 등록에서 추적이 죽고 시작 로�
 `cuda_graph_error`, ckpt sha1). `_pose.jsonl`의 `CAMERA` 행에 `depth_source`가 들어간다.
 **depth에서 나온 거리는 출처를 확인하기 전에 다른 런과 합산하지 말 것.**
 
+2026-10-01부터 `fstereo.schedule`: `null` = 게이트 없음(`--policy-fs-schedule free`, 기본),
+있으면 게이트 스냅숏(mode, 카운터, 대기·hold 분포). 키가 아예 없으면 이 스위치 이전 빌드이거나
+FS 워커가 없는 런이다. 게이트가 있으면 `measured_hz`는 meta를 쓰는 순간의 2 s 창 카운트다
+(`only`에선 미션 중 ~4, 미션 뒤엔 자유 주행 율 — `schedule.mission_active`가 어느 쪽인지
+말한다). 스케줄이 다른 런끼리 FS 율·플랜 나이·infer_ms를 합산하지 말 것.
+
+2026-09-30부터 `fstereo.repo`/`fstereo.ckpt`는 `…/external/FoundationStereo/…`를 가리킨다
+(이전 런은 `~/Desktop/FoundationStereo/FoundationStereo/…`). **가중치는 같다** —
+`ckpt_sha1_first_8mib`가 양쪽 다 `d277c7ff…`다(아래 체크아웃 절). 런 사이 계기 비교는
+경로가 아니라 이 sha1로 한다.
+
 ### 환경
 
 `rovgui-pose`에 셋만 더 필요하다(torch 2.11+cu128은 이미 있고 sm_120 포함):
@@ -1092,7 +1227,49 @@ helper 31개에서 NameError — **첫 등록에서 추적이 죽고 시작 로�
 ```
 
 dinov2 hub 아카이브와 timm `edgenext_small` 가중치는 `~/.cache`에 이미 있어 **첫 실행에
-네트워크가 필요 없다**. 체크포인트는 `23-51-11`(vitl)만 받아져 있다.
+네트워크가 필요 없다**(`~/.cache`를 지우면 첫 로드에 네트워크가 필요하다).
+
+### FoundationStereo 체크아웃 — `external/FoundationStereo` (2026-09-30부터)
+
+체크아웃은 **이 리포 안의 git submodule**이다: NVlabs/FoundationStereo `6e88068`
+(upstream master — 2025-12-18 이후 커밋 없음, `git ls-remote` 2026-09-30), `shallow = true`.
+새로 clone한 리포라면:
+
+```bash
+git submodule update --init external/FoundationStereo
+```
+
+경로를 꼭 붙일 것: 경로 없는 `git submodule update --init`/`git submodule status`는 `.gitmodules`
+항목 없는 기존 gitlink(`external/UMI_aquatic`, `external/iPhUMI`) 때문에 rc 128로 죽는다. 그리고
+`git clone --recurse-submodules`는 submodule clone에 `--no-single-branch`를 넘겨서, `shallow = true`여도
+upstream `website` 브랜치(glb/mp4 자산)까지 받아 master만보다 훨씬 크다 [유도: 2026-09-30 리뷰가 toy
+리포로 재현, 크기 산출물 미보존] — 쓰려면 `--single-branch`를 같이 주거나, 일반 clone 뒤 위 명령으로.
+
+**가중치는 git에 없다** — upstream `.gitignore`가 `pretrained_models/*`를 뺀다.
+`external/FoundationStereo/pretrained_models/23-51-11/`에 `model_best_bp2.pth`와
+`cfg.yaml`을 직접 넣는다(upstream readme의 Google Drive; 이 파일의 gdown id는
+`1Yh_2o9QCUrVqZrnAXZ7RUr0zTp3JrMKe`, `~/Desktop/data collection/depth_job/pipeline.sh:20`).
+같은 파일인지는 앞 8 MiB의 sha1로 확인한다 — 런 meta의 `ckpt_sha1_first_8mib`와 같은 값이고,
+2026-09-30 이전 GUI 런 423개가 전부 `d277c7ff7de5c627328cde9eaf775e181685276a`를 기록했다
+(`data/2026*/*/*.meta.json`의 `fstereo.ckpt_sha1_first_8mib`):
+
+```bash
+python -c "import hashlib; print(hashlib.sha1(open('external/FoundationStereo/pretrained_models/23-51-11/model_best_bp2.pth','rb').read(8<<20)).hexdigest())"
+```
+
+`11-33-40`(vits)도 옆에 있지만 아무것도 쓰지 않는다. 다른 체크아웃은 `--fstereo-repo DIR`
+또는 `$FOUNDATION_STEREO_REPO`, 체크포인트만 바꾸려면 `--fstereo-ckpt`(옆에 `cfg.yaml` 필요).
+
+**왜 리포 안인가.** 그전 기본값은 리포 **밖**의 `~/Desktop/FoundationStereo/FoundationStereo`였고
+그 경로는 코드(`DEFAULT_REPO`)에만 있었다 — 어떤 문서에도 없었다. 그래서 필요 없어 보여
+2026-09-27에 지워졌고(그날 22:13 depth job이 "checkout not found"로 실패:
+`~/Desktop/data collection/depth_job/run.log:3`), GUI depth 패널은
+`FS FAULT — FStereoError: FoundationStereo checkout not found at …`를 띄웠다. 지금 가중치는
+`~/Desktop/data collection/FoundationStereo/pretrained_models/`에서 복사한 바이트 동일본이다
+(`cmp`, 2026-09-30). 그 사본은 2026-09-28 재다운로드분이고, 삭제 전 가중치로 만든 depth와
+ep7 699프레임이 비트 단위로 같았다(`~/Desktop/data collection/depth_job/verify_result.txt`).
+**`~/Desktop/data collection/FoundationStereo`는 지우지 말 것** — `UMI_Underwater`의
+`replay_foundation_stereo.py`·`oakd_foundation_stereo.py`와 `depth_job/*.sh`의 기본값이다.
 
 ## 폐루프 MPC — `--mpc` (AprilTag 측위 + acados NMPC)
 
@@ -1475,6 +1652,36 @@ SENSORS는 3열 SYSTEM HEALTH 아래에 **나란히** 들어간다(세로로 쌓
   (transport `pwm_lua_override`: RC_CHANNELS_OVERRIDE ch 9..16 을 Navigator Lua `rl_pwm_override.lua` 가 100 ms timeout 으로 모터 출력에
   강제; `SERVO1..8` 은 Motor1..8 그대로 — RCIN passthrough 는 ARM/failsafe 를 우회해 **폐기**, RL_controller README §10.3; station 의 예약된
   `rc_override`(ch 1..6 조종축)와는 다른 것); `meta()["action_mode"]` 가 런 meta 에 남는다.
+* **RL_PWM 모드 (2026-09-30, 실기 미검증)**: LOW 콤보 `RL_PWM`(키 `rl_pwm`, `--mpc-mode rl_pwm`, `hw_mpc.yaml: rl_pwm:`). 추진기
+  8개에 펄스를 직접 내는 RL 정책(`action_mode: pwm`, 기본 `rl_policies/pwm10_s1`)을 station에서 난다 — ArduSub 믹서를
+  **우회**한다. 관측·기준 궤적 API는 `RL`과 같고(`rl_policy.py` `HwRlPwm(HwRl)`, 관측 116 = 29×4) 출력만 다르다: 제어기는
+  `info["pwm_us"]`에 펄스 8개를 싣고, 워커는 그것을 `bus.cmd_pwm`(`state.PwmCommand`)으로 보내며 MANUAL_CONTROL은 **중립**으로
+  보낸다. sink(`backends/hardware.py`)는 RC_CHANNELS_OVERRIDE 채널 9..16에 펄스를 싣고(1..8·17·18은 65535 = 그대로), 기체의 Lua
+  스크립트 `rl_pwm_override.lua`(정책 폴더에 사본)가 무장 + MANUAL + 프레임 신선(100 ms) 조건에서만 모터 출력에 강제한다
+  (transport `pwm_lua_override`; RCIN passthrough는 ARM/failsafe를 우회하므로 쓰지 않는다). 프레임이 끊기면 스크립트가 놓고
+  AP_Motors가 중립 MANUAL_CONTROL로 돌아간다 — DISARM·E-STOP·failsafe가 그대로 듣는다. 모터 1..8 ↔ RC 9..16 순서는 **고정**
+  (스크립트가 그렇게 읽는다; 설정으로 바꿀 수 없다).
+  **게이트**(`control/rl_pwm.py` `PwmGate`, 기체에서 읽어 온 값으로 판정, 하나라도 어긋나면 교전 거부 + 이유 표시):
+  `SERVO1..8_FUNCTION` = 33..40, `SERVO1..16`에 RCIN9..16 passthrough 없음(조명·카메라·그리퍼가 추진기 펄스를 따라가지 않게),
+  `MOT_1..8_DIRECTION` = export의 `motor_direction`, `SCR_ENABLE` 1, `SCR_USER1` 1, `RC_OPTIONS` bit1 0, `RC_OVERRIDE_TIME` > 0,
+  `RC9..16_OPTION` 0, `SYSID_MYGCS` = station sysid, 스크립트 heartbeat `RLPWM` 2 s 이내, 펄스 시작 후 1 s 안에 `RLPWM` = 1,
+  MAVLink 2 링크, 비행 모드 MANUAL(STABILIZE 불가). 파라미터는 **30 s 안에 기체가 말한 값만** 인정한다 — RL_PWM을 고른 동안
+  워커가 1 s마다 sink에 알리고(중립 `PwmCommand`, 와이어에는 아무것도 안 나감) sink가 10 s마다 다시 읽는다; 고르지 않은
+  세션은 파라미터 요청을 하나도 보내지 않는다. 흐름 도중 게이트가 깨지면 sink가 **래치**한다(워커의 정지 명령이 올 때까지 거부,
+  스냅샷에 사유) — 워커는 그동안 중립 펄스를 내고 1 s 뒤 disengage 한다. 래치는 워커의 해제(`source="stop"`)나 미교전
+  대기 신호(`"idle"`)로만 풀린다. "스크립트가 넘겨받지 않은 채 펄스가 나간 시간"은 끊김을 넘어 **누적**해서 1 s 를 넘으면 거부한다.
+  **정지 경로**: disengage·조종 입력 인계·E-STOP·ENABLE off·teardown·제어기 침묵(0.2 s) 모두 1500×8 을 즉시 3프레임 + 다음 3틱에
+  1프레임씩 보낸 뒤 override 를 멈춘다. 이 경로를 쓰지 않은(또는 다 쓴) 세션은 RC 9..16 에 아무것도 쓰지 않는다. station
+  bridge coast(태그 상실) 동안은 중립 펄스만 낸다 — **rl_pwm 에서는 coast 중 깊이 유지가 없다**.
+  **출력 상한** `rl_pwm.pwm_cap` 0.25(1400..1600 µs) [예측: 첫 입수용] — 제어기와 sink 가 각각 건다; 정책은 1.0 으로 학습됐고,
+  상한 뒤의 펄스가 다음 관측의 "직전 명령"으로 되먹는다. CSV `ax_*` 는 0, `uX..uN` 은 실제로 나간 throttle 의 **명목 wrench
+  추정**(T200 곡선 × 전압 계수 × B)이라 다른 제어기의 명령 열과 직접 비교하지 않는다; `pwm1..8` 은 기체의 SERVO_OUTPUT_RAW.
+  **물에 넣기 전에**: (1) Lua 스크립트를 Navigator `scripts/`에 올리고 `SCR_ENABLE` 1(재부팅), `SCR_USER1` 1; (2) 프로펠러를 뺀
+  벤치에서 교전해 스크립트가 넘겨받는지(`RLPWM: engaged`)와 E-STOP/해제 시 1500 으로 돌아오는지, `RLPWM: released` 가 교전
+  도중 찍히지 않는지(프레임 주기 50 ms 대 스크립트 stale 100 ms) 확인; (3) 추진기별 방향 확인(RL_controller/README.md §10.3).
+  Lua 스크립트는 기체에서 한 번도 돌지 않았다 [예측] — `mavlink:init` 인자 순서도 미확인. 검증: `tests/test_rl_pwm.py` 26건
+  (실제 pymavlink v2 프레임의 바이트 위치·게이트 항목별 거부·제어기·sink 래치/정지 경로·워커 게이트/인계) — 스크립트와
+  추진기는 포함되지 않는다.
 * **조종 입력은 언제나 이긴다.** 스틱/키가 움직이면 그 프레임은 기체로 가지 않고
   MPC 해제 요청이 된다(창의 `_pilot_gate` — pump·edge 두 경로가 같은 게이트를
   지난다). E-STOP(헤더·MPC 패널·Esc 어디서든)·DISARM·ENABLE off·태그 상실
@@ -1494,6 +1701,7 @@ SENSORS는 3열 SYSTEM HEALTH 아래에 **나란히** 들어간다(세로로 쌓
   실제 속도를 정하는 것은 (1) GUI 궤적 속도(reference), (2) `axis_cap`(0.5), (3) `rl.leash_m`(먼 목표 제시 거리)뿐이다. 접근 구간 최대 0.45 m/s.
   2026-09-21 결정: `rl.axis_cap: 0.3`(RL 모드에서만 min(axis_cap, 0.3), 속도 법칙상 정상 상태 ≈ 0.14 m/s [유도]); 0.10 m/s 기준은
   축 ≈ 0.24가 필요하므로 이 캡에서는 GUI 궤적 속도를 0.10 m/s 이하로 둔다. 더 근본적으로는 학습 보상에 속도 상한을 넣어 재학습(RL_controller README).
+  2026-10-01부터 `vehicle_net_buoyancy_n`(B−W)이 PID의 z 힘에도 상수 피드포워드로 더해진다(`f_max` 전, meta `controller.heave_trim`). 그 전엔 클램프된 heave 적분(i_max 5 N)만이 부력을 떠안아 peg를 물면 pid도 바닥에 앉았다(`data/20261001/1001_155105/mpc_154825.csv` 0.43→0.19 m). 0이면 옛 동작 그대로.
 
 기록: engage하면 CSV가 무조건 열린다(`…/mpc_<hhmmss>.csv` — 아래 "런 폴더" 참조,
 또는 진행 중인 녹화 스템에 `_mpc.csv`로 편승). 앞 9열은 sim `runs/traj_*.csv`와 동일 스키마
@@ -2649,6 +2857,20 @@ z는 CAD 수직 [유도], y=0 [예측])이고 렌즈에서 0.338 m / 광축 아�
   감쇠도 `hw_mpc.yaml plant.linear_damping[5]` 0.07 → 4.0 [유도: 같은 스텝 데이터 개루프
   재구성, 출하 모델은 같은 명령에 ±60–75° 스윙]. **둘 다 실기 미검증** — 정책을 날리기
   전에 같은 yaw-step으로 오버슈트가 줄었는지 먼저 본다.
+* **관측 시점 이동(2026-09-30, `policy.obs_view_forward_m`, 임시, 기본 `null`, 수중 미검증)**: 정책이
+  보는 depth obs를 C3보다 body x(그리퍼 축)로 이 거리만큼 앞선 가상 시점에서 다시 그린다
+  (`perception/policy_obs.py` `_shift_view`: 학습 ray로 역투영 → 평행이동 → 재투영, 샘플마다 2×2
+  픽셀에 쓰고 가까운 점 우선, 빈 곳은 상하좌우 가장 가까운 측정값 중 먼 것으로 채움). **관측만**
+  바뀌고 행동 변환(`tcp_body_flu_m`)은 그대로다. peg 데모의 핸드헬드보다 ROV 턱이 축 방향으로
+  약 5 cm 더 앞에 있어서(peg 뿌리 0.254 vs 0.208 m [측정:
+  `data/20260930/0930_183320_observe/diag/rig_geometry.json`]) peg 체크포인트가 물고 있는 peg를
+  "놓은 뒤"로 읽고 후퇴하던 것의 임시 대응. 0.05 m에서 dz<0 비율 0.90 → 0.31, proprio 폭 0.007 m
+  까지 주면 0.18 [예측: `.../diag/validate_builder_shift.json`, UI 녹화에서 복원한 obs 322 플랜].
+  빌드 0.4 → 14.7 ms/프레임 [측정: 같은 파일] — 플랜당 두 프레임이라 obs age가 약 29 ms 늘고
+  [유도], late 플랜이 그만큼 는다. **프로세스 단위 스위치라 패널에서 고른 캔 체크포인트에도
+  적용된다 — peg 세션에만 켜고 끝나면 `null`.** 기록 경계: 기동·ARM마다 로그 `OBS VIEW SHIFT …`
+  (events.log에도), meta `policy.config.obs_view_forward_m`·`policy.worker.obs.view_shift`.
+  plans.jsonl의 `depth_valid`는 채운 뒤의 값이라 이동 런에서 1.0으로 찍힌다.
 * **0.2 s 격자(A5)**: 66.7 ms 원지식 16개를 `knot_dt_s` 0.2 s 격자 6개로 창평균(knot 0은
   고정). 유한차분 가속 게이트의 이득이 551·σ → 61·σ [유도]. `jitter_rms_mm`가 기록된다.
 * **proprio는 fix 기준(A6)**: PolicyState의 `t_fix`가 전진할 때만 행을 쌓는다(20 Hz
@@ -2678,16 +2900,27 @@ z는 CAD 수직 [유도], y=0 [예측])이고 렌즈에서 0.338 m / 광축 아�
   경고가 난다(CAM_A 정렬 63.7° 화각이 정책의 CAM_B 85.6° 안에 든 부분만 덮고 [유도] +
   ×0.64 매처). `--policy`에 `--mpc`가 없으면 거부가 아니라 **경고**만(워커가 아무도
   안 먹는 플랜을 만든다).
-* **FS 계기 parity(A17)**: `--policy`가 `--fstereo-iters 16 / --fstereo-scale 1.0`을
-  기본으로 옮긴다(훈련 depth 스토어 설정 [측정: `~/Desktop/data collection/depth/0/
-  depth.zarr/.zattrs`]). `check_policy`가 체크포인트 옆 `.hydra/config.yaml` →
-  데이터셋 zip `.zattrs['depth_source']`를 torch 없이 읽어 비교하고, 다르면
-  `--policy-allow-fs-mismatch` 없인 **기동을 거부**한다(비교 대상은 타이핑한
-  `--fstereo-ckpt`가 아니라 **실제로 로드될** 체크포인트 — 기본값 포함). 이 설정에서
+* **FS 계기 parity(A17)**: 훈련 depth 스토어는 iters 16 / scale 1.0이다 [측정: `~/Desktop/data
+  collection/depth/0/depth.zarr/.zattrs`]. `--policy`의 FS 기본값은 거기서 **일부러** 벗어난
+  iters 8 / scale 0.75 / alpha 0.5다(`POLICY_DEPENDENT_DEFAULTS`, 2026-09-02~, 속도 절충 —
+  `FS_RATE_NOTE`); 계기 parity는 `--fstereo-iters 16 --fstereo-scale 1.0`. `check_policy`가 체크포인트 옆 `.hydra/config.yaml` →
+  데이터셋 zip `.zattrs['depth_source']`를 torch 없이 읽어 비교하고, 다르면 **경고**한다
+  (2026-09-02까지는 기동 거부였다 — `check_policy`의 호출부 주석; 지금
+  `--policy-allow-fs-mismatch`는 meta에 기록만 된다). 비교 대상은 타이핑한
+  `--fstereo-ckpt`가 아니라 **실제로 로드될** 체크포인트(기본값 포함)이고, 2026-09-30부터
+  **경로가 아니라 내용**으로 비교한다(`same_fstereo_ckpt`: 둘 다 있으면 앞 8 MiB sha1끼리,
+  스토어 쪽 파일이 지워졌으면 남은 파일을 upstream 공개본의 sha1 `fstereo.UPSTREAM_CKPT_SHA1`과)
+  — 스토어들이 지워진 `~/Desktop/FoundationStereo/…`나 `data collection` 사본 경로를 적고 있어서,
+  경로 비교로는 체크아웃을 옮긴 뒤 같은 가중치를 다른 모델로 읽는다. 그리고 **2026-09-14~09-30
+  런에선 이 검사가 아예 돌지 않았다**: `data/checkpoints/*.ckpt`는 run 폴더로 가는 심볼릭 링크인데
+  `hydra_config_for`가 링크를 따라가지 않아, meta `policy.worker.fstereo.training.status`가 09-14
+  이후 비-stub 178건 전부 `no_hydra_config`다(그전 `ok` 245건) [측정: `data/2026*/*/*.meta.json`,
+  2026-09-30 집계]. 09-30부터 링크 대상을 먼저 찾는다 — 기본 기동에 iters/scale 불일치 **경고**가
+  다시 뜨는 것은 이 수정 때문이고 의도된 절충이다(`FS_RATE_NOTE`). parity 설정(16 / 1.0)에서
   FoundationStereo는 7.26 Hz, solve 137 ms, panel latency 243 ms [측정: rov_gui/tools/fstereo_bench_out/policy_bench_20260902_141224.json, C3 실기, alpha 0.5, scale 1.0, iters 16, 330 frames, GPU shared with a concurrent test run] — 그래서
   한 관측의 depth 두 장은 프레임 간격 138 ms = 훈련 stride 66.7 ms의 **2.07배**
-  떨어져 있다(플랜마다 `obs_pair_dt_s`로 기록). `--fstereo-scale 0.5` +
-  `--policy-allow-fs-mismatch`면 ~15 Hz 페어를 얻는 대신 계기 불일치를 산다.
+  떨어져 있다(플랜마다 `obs_pair_dt_s`로 기록). 기본값(8 / 0.75)은 계기 불일치를 사는 대신
+  ~13 Hz다 [측정: `rov_gui/tools/fstereo_bench_out/sweep.txt`, 74.9 ms eager — `FS_RATE_NOTE`].
 * **depth 페어링(A18)**: 최신 프레임 + `t_d − obs_dt`에 가장 가까운 프레임(±0.6·obs_dt);
   없으면 **3.0·obs_dt**(200 ms; 2.5는 위 138 ms 간격에서 여유가 29 ms뿐이라 지터 한 번에
   skip이었다) 안의 더 오래된 프레임(간격을 `obs_pair_dt_s`로 정직하게 기록); 그것도
@@ -2696,12 +2929,21 @@ z는 CAD 수직 [유도], y=0 [예측])이고 렌즈에서 0.338 m / 광축 아�
   138 ms 이미지에 66.7 ms proprio라 이미지 운동이 proprio의 2배 — 훈련에 없던 조합).
   depth 스탬프가 최신 fix보다 0.5·obs_dt 이상 앞서면 `skip_fix_lag`(행이 fix에
   clamp돼 운동 단서가 몰래 줄어드는 대신 건너뛴다); 기록의 `obs_rows_t`/`obs_fix_t`는
-  실제 쓴 행 시각이다. 추론은 period(0.5 s)가 지난 뒤 **depth 프레임 도착에** 발화하고
-  (타이머 위상이 아니라 — 위상 트리거는 평균 반 프레임 69 ms를 intake 나이에 얹었다),
-  skip은 period를 태우지 않고 다음 프레임에 재시도한다. intake 신선도
+  실제 쓴 행 시각이다. 추론 시도에는 마지막 시도 이후 **도착한** 프레임이 필요하다. 다만
+  period(0.5 s) 동안 프레임이 하나라도 오면 그 표시가 남아 있으므로, 실제로는 period가
+  끝난 첫 tick(20 ms)에 **링에 이미 있던 최신 프레임**으로 발화하고, 도착을 기다리는 것은
+  그 사이 프레임이 하나도 없었을 때뿐이다(2026-10-01 정정 — 이전 문서는 "도착에
+  발화"라고 했다. meta `pairing.trigger` 문자열은 기록 호환 때문에 그대로이고
+  `pairing.trigger_detail`이 실제 동작을 적는다; 플랜마다 `trigger_age_s −
+  depth_ready_age_s`가 그 프레임이 링에서 기다린 시간이다). skip은 period를 태우지 않고
+  다음 프레임에 재시도한다. intake 신선도
   `policy.obs_max_age_s`는 0.6 s [유도: measured depth chain 243 ms + inference 33 ms +
   tick 25 ms ≈ 0.30–0.46 s at intake [측정: policy_bench_20260902_141224.json,
-  dryrun_20260902_140513]; plan life at install ≥ 0.4 s ≥ blend_s].
+  dryrun_20260902_140513]; plan life at install ≥ 0.4 s ≥ blend_s]. 그 유도의 "inference
+  33 ms"는 틀렸다: 정책 forward는 단독 19.3 ms지만 FoundationStereo와 GPU를 나눠 쓰는
+  실기에서는 207–273 ms p50이었다 [측정: data/20260930/0930_220212/diag/
+  policy_vs_fstereo_contention.json, plan_timing.json] — 아래 `--policy-fs-schedule` 절.
+  작업 트리의 `config/hw_mpc.yaml`은 0.7이다(운용자, 2026-09-30).
 * **START는 홀드 없음(2026-09-02)**: `policy`(HIGH 콤보의 `Diffusion Policy`)에 한해 클릭 한 번. 나머지 모양은
   1 s 홀드 유지(`test_offline`이 양방향으로 고정).
 * **gripper(A12)**: 2026-09-07부터 **ON**(`policy.gripper: true`; 그 전 런은 계산만 하고
@@ -2718,7 +2960,11 @@ z는 CAD 수직 [유도], y=0 [예측])이고 렌즈에서 0.338 m / 광축 아�
   있다 — KNOWN_ISSUES 참조. CSV `grip_g` 열(schema 13)이 그 틱에 hysteresis가 본 값이다.
   폭 추정은 open-loop 적분기(`GripperWidthEstimator`,
   프로세스 수명 동안 파일럿·정책 드라이브 전부 적분, `cmd_gripper_drive` →
-  `MpcWorker.on_gripper_drive`). 레벨은 open 0.069 / closed 0.042 m
+  `MpcWorker.on_gripper_drive`; 게임패드 패스스루의 그리퍼 버튼은 기체로만 가므로
+  `bus.jaw_drive_seen`으로 같은 레벨을 추정기에만 알린다, 2026-10-01). **런 START의 턱
+  상태는 추정으로 채우지 않고 "neutral"이다** — 정책의 첫 open/close 문턱 통과는 추정이
+  뭐라 하든 드라이브로 나간다(2026-10-01: 추정이 "열림"에 묶여 세 런의 open 요청을 삼킨
+  사고, `data/20261001/1001_151431`). 레벨은 open 0.069 / closed 0.042 m
   [측정: /home/bdml/Desktop/data collection/slam/actions_summary.json reports[*].gripper_command — open_level_m p10–p90 0.055–0.070 (median 0.061), closed_level_m p10–p90 0.034–0.043 (median 0.040); 0.069/0.042 chosen near the upper tail [예측]].
 * **안전 기본값(A21)**: v_max 0.08 [유도], a_max 0.20, r_max 0.50, anchor_max 0.15,
   jump_max 0.06, div_max 0.25(정책 자체의 발산 한계), workspace box
@@ -2962,6 +3208,83 @@ A1–A22 + OBSERVE + action_repr/마운트 게이트 + 2026-09-11 LOW None·ckpt
 장면, PASS/FAIL 기준: 워커 ready < 30 s, 플랜 ≥ 20, infer_ms p50 보고, 워커 오류 0,
 reject 비율 **보고**). parity 도구 `rov_gui/tools/dp_policy_parity.py`, 오프라인 게이트
 `rov_gui/tools/dp_policy_offline.py`.
+
+### FoundationStereo와 GPU 나눠 쓰기 — `--policy-fs-schedule` (2026-10-01, 수중 미검증)
+
+**문제.** 정책과 FoundationStereo(FS)는 한 프로세스에서 같은 GPU를 쓴다. `--policy` 기본값
+(iters 8, scale 0.75)의 FS는 한 장에 75.7 ms라 카메라 간격 66.7 ms보다 길어서 쉬지 않고 돌고,
+그 옆에서 정책 forward는 단독 19.3 ms가 p50 152.8 ms로 늘어난다 [측정: data/20260930/
+0930_220212/diag/policy_vs_fstereo_resolution.json, policy_vs_fstereo_contention.json, 오프라인].
+실기(2026-09-30)는 infer_ms p50 207–273 ms였고 플랜 나이 p50 0.56 s 중 0.21 s가 이것이다
+[측정: 같은 폴더 plan_timing.json, latency_breakdown.json]. 정책이 쓰는 CUDA stream이 따로라도
+GPU는 나눠 쓴다(`perception/dp_policy.py` "Timing and threads").
+
+**고르는 법 — 기본은 그대로, 플래그로 바꾼다.**
+
+```bash
+# 기존 (free): 아무 조정 없음 — 2026-10-01 이전의 모든 런
+./c3 gui --source hw --allow-command --mpc --fstereo --policy
+# 방법 1a (yield): 정책이 추론하는 동안만 FS가 새 프레임을 시작하지 않는다
+./c3 gui --source hw --allow-command --mpc --fstereo --policy --policy-fs-schedule yield
+# 방법 1b (only): 정책 미션 중엔 FS가 정책이 쓰는 2장만 계산한다
+./c3 gui --source hw --allow-command --mpc --fstereo --policy --policy-fs-schedule only
+# 방법 2 (해상도): 코드 경로는 그대로, FS 입력을 320x200으로
+./c3 gui --source hw --allow-command --mpc --fstereo --policy --fstereo-scale 0.5
+# 둘을 같이 써도 된다 (예: --fstereo-scale 0.5 --policy-fs-schedule yield)
+```
+
+* **yield**: 정책이 시도를 시작하면(사전 skip 세 개를 지난 뒤) FS는 새 프레임을 시작하지 않고,
+  정책은 forward 직전에 진행 중인 FS 프레임이 끝나기를 **최대 150 ms** 기다린 뒤(`FsGate.wait_s`)
+  혼자 GPU를 쓴다. 트리거·고르는 프레임은 `free`와 같다. depth 패널은 플랜마다 한 장쯤 덜 그린다.
+* **only**: 미션이 돌고 있고 forward가 가능할 때(신선한 fix, proprio 이력, grid, 시작 자세가
+  있을 때) 정책이 period가 끝나기 조금 전에 2장을 요청하고, FS는 그 2장만 계산하고 사이 쌍은
+  계산 없이 버린다. 두 장은 **연속 카메라 프레임**이다(FS 한 장이 카메라 간격 두 배보다 짧은 한).
+  계산이 실패하거나 정책 mailbox에 못 들어간 프레임은 요청 몫을 쓰지 않는다. forward가 불가능한
+  동안(태그 상실 등)과 미션 밖에서는 FS가 자유 주행한다. depth 패널은 미션 중 초당 4장 안팎이고
+  칩 끝에 `[only]`가 붙는다. `--pose`와 같이 쓰면 FoundationPose가 대부분의 컬러 프레임에서 depth를
+  못 받는다 [예측: 250 ms 짝맞춤 한계] — 기동 때 경고한다.
+* **해상도(`--fstereo-scale 0.5`)**: FS 한 장이 45.7 ms라 15 fps를 따라가며 쉬는 시간이 생긴다.
+  대가는 학습 depth와의 불일치: disparity 1 px 초과 화소 7.0 % → 11.1 % [측정: rov_gui/tools/
+  fstereo_bench_out/sweep.txt]. 정책이 이 차이를 견디는지는 미검증이다.
+
+**FS를 영영 멈추게 하는 길은 없다.** FS tick은 게이트에서 기다리지 않고(묻고 바로 돌아간다),
+정책의 hold는 0.5 s 임대, `only`는 정책 tick의 heartbeat(1.0 s), 요청 없는 상태 1.5 s, 요청 뒤
+0.6 s, 끝나지 않은 프레임 표시 2.5 s에서 각각 스스로 풀린다(`perception/fs_gate.py` 머리말).
+정책 쪽 대기는 실시간으로 최대 150 ms다. `free`에서는 게이트 객체가 아예 만들어지지 않는다.
+
+**오프라인 측정 — 실제 두 워커, 실제 두 네트워크** [측정: rov_gui/tools/fstereo_bench_out/
+policy_fs_schedule_20261001_115008.json, `rov_gui/tools/policy_fs_schedule_bench.py`, 모드당 30 s,
+RTX 5090, peg ViT-CLIP ckpt 8 step]. 입력은 합성이다: 육상 스테레오 9쌍을 15 fps로 재생하고
+put 시각을 촬영 시각으로 쓰므로 **카메라 전송 지연(실기 ~0.1 s)이 빠져 있고**, 기체 상태도
+합성이며 GUI·제어기가 없다. 측정 중 다른 테스트가 CPU를 쓰고 있었다(1분 load 0.9→7.5 / 16코어, JSON에 기록).
+
+| 모드 | 정책 forward p50/p90 | FS 대기 p50/p90 | 플랜 나이(emit) p50/p90 | 연속 프레임 쌍 | 미션 중 FS |
+|---|---|---|---|---|---|
+| free, scale 0.75 (기존) | 132.7 / 172.0 ms | — | 328.8 / 370.9 ms | 82.5 % | 12.93 /s |
+| yield, scale 0.75 | 19.4 / 19.9 ms | 0.0 / 19.5 ms | 224.6 / 256.3 ms | 86.0 % | 11.93 /s |
+| only, scale 0.75 | 19.4 / 19.6 ms | 0.0 / 0.0 ms | 154.5 / 165.0 ms | 100 % | 3.73 /s |
+| free, scale 0.5 | 30.8 / 56.5 ms | — | 134.5 / 191.7 ms | 100 % | 15.0 /s |
+| yield, scale 0.5 | 19.6 / 20.1 ms | 0.0 / 6.5 ms | 145.6 / 166.5 ms | 100 % | 15.0 /s |
+
+플랜 간격은 모든 모드에서 p50 0.51–0.53 s였다(period_s 0.5가 하한). 실기의 플랜 나이는 여기에
+카메라 전송과 실기 쪽 부하가 더해진다 — 2026-09-30 기존 방식 실기는 intake 나이 p50 0.556 s였다.
+
+**기록(합산 금지 경계).** run meta `policy.worker.fs_schedule`(requested / effective / why / 워커
+카운터 / `only_lead_s` / 게이트 스냅숏), `policy.run.fs_schedule`(ARM 시점), `fstereo.schedule`
+(null = 게이트 없음), `policy.worker.pairing.trigger_detail`; ARM 때 `free`가 아니면 warn 한 줄과
+events.log `FS SCHEDULE …`; `--record-stereo`의 `stereo/meta.json`에 `fstereo.policy_fs_schedule`.
+**정책 플랜 줄마다**(plans.jsonl) `fs_schedule`, `fs_input`("scale 0.75 it8"), `fs_wait_ms`,
+`fs_wait_timeout`, `depth_ready_age_s`, `trigger_age_s`, `emit_age_s`(초, 관측 촬영 시각 기준;
+None = 안 찍힘 — 이 키들은 `free` 런에도 생긴다). `age_at_intake_s − emit_age_s`가 버스·inbox·
+제어 tick 구간이다. 스케줄이 다른 런은 플랜 나이·infer_ms·FS 율을 합산하지 말 것. `only`는
+관측 쌍 간격(`obs_pair_dt_s`, `pairing.near/fallback`)과 트리거도 바꾸므로 **정책 거동**도
+`free`/`yield` 런과 합산하지 말 것. `schema_version`은 16 그대로(키 추가만).
+
+**처음 물에 넣기 전**: LOW None(`--policy-observe`) 런으로 `fs_wait_ms`·`fs_wait_timeout`·
+`policy.worker.fs_schedule.worker.burst_timeouts`·`pairing`을 먼저 본다. 검증:
+`rov_gui/tests/test_fs_gate.py`(게이트 단독), `test_policy_worker.py`(두 워커·CLI·배선),
+`test_policy.py`(기록 키), 벤치 `rov_gui/tools/policy_fs_schedule_bench.py`
+(`--arms free@0.75,yield@0.75,only@0.75,free@0.5,yield@0.5`).
 
 ### 체크포인트는 패널에서 고른다 — ckpt 칸 (2026-09-11, 실기 미검증)
 
@@ -3428,7 +3751,9 @@ mm 맵의 상위 바이트를 R, 하위 바이트를 G에 넣은 **무손실 Web
 `replay_foundation_stereo.py`)을 수중에도 준 것이다.
 
 ```bash
-./c3 gui --source hw --mpc --fstereo --record-stereo            # 모든 쌍
+./c3 gui --source hw --mpc --fstereo --record-stereo            # FoundationStereo가 계산한 모든 쌍
+#   (--policy-fs-schedule only의 정책 미션 중엔 정책이 쓴 2장/주기뿐 — 사이 쌍은 계산 없이 버려져
+#    frame_seq에 구멍이 난다; stereo/meta.json의 fstereo.policy_fs_schedule이 그 표시)
 ./c3 gui --source hw --mpc --fstereo --record-stereo \
          --record-stereo-every 2.0 --record-stereo-max 2000     # 긴 잠수는 샘플링
 ```
@@ -3601,6 +3926,25 @@ grab은 GUI 스레드에서, 인코딩은 별도 스레드에서, 사이의 큐�
 버린다**(조종 화면을 얼려서 녹화를 지키는 건 거래가 안 된다). 버린 수는
 `.json` 사이드카에 기록된다 — 12 fps라고 적힌 파일이 실제로 7 fps였다면 그
 파일로 잰 모든 시간이 40% 틀리기 때문이다.
+
+### 코덱은 H.264 — VS Code에서 바로 열린다 (2026-09-30)
+
+`ui_*.mp4`와 피드별 `c3_*.mp4`는 **시스템 `ffmpeg`(libx264)에 파이프로 넘겨 H.264로**
+쓴다. 예전에는 OpenCV `VideoWriter`의 `mp4v`(MPEG-4 Part 2)였는데, VS Code에 들어 있는
+ffmpeg에는 h264 디코더는 있어도 mpeg4 디코더가 없어서 미리보기가 *"An error occurred
+while loading the video file"*로 끝났다. pip cv2에는 H.264 인코더가 없어 `avc1`을 열지
+못하므로 ffmpeg를 직접 부른다. libx264가 있는 ffmpeg를 찾지 못하면 `mp4v`로 떨어지는데,
+그 파일은 VLC/mpv에서는 열린다. 사이드카 `"codec"`(`h264` | `mpeg4`)에 어느 쪽이었는지
+남는다. 이 필드가 없는 사이드카는 2026-09-30 이전 파일이고, 그 파일은 `mp4v`다.
+
+예전 파일을 VS Code에서 보려면 다시 인코딩한다(프레임 수는 그대로 유지된다):
+
+```bash
+f=data/<날짜>/<런>/ui_XXXX.mp4
+ffmpeg -i "$f" -an -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p \
+  -colorspace smpte170m -color_primaries smpte170m -color_trc smpte170m \
+  -movflags +faststart "${f%.mp4}.h264.mp4"
+```
 
 ### 피드별 녹화
 
@@ -4056,7 +4400,8 @@ QT_QPA_PLATFORM=offscreen ~/miniforge3/envs/robust/bin/python -m pytest rov_gui/
 QT_QPA_PLATFORM=offscreen ~/miniforge3/envs/rovgui-pose/bin/python rov_gui/tests/test_fstereo.py
 ```
 
-14개. 모델을 실제로 돌려보려면 카메라 없이 이렇게 한다(가중치와 CUDA 필요):
+14개. 모델을 실제로 돌려보려면 카메라 없이 이렇게 한다(`external/FoundationStereo`의 가중치 —
+"FoundationStereo 체크아웃" 절 — 와 CUDA 필요):
 
 ```bash
 ~/miniforge3/envs/rovgui-pose/bin/python -c "

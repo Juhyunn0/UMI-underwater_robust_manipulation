@@ -6,6 +6,157 @@
 
 ## ⚠️ 운용 안전
 
+### LOW `RL_PWM`(추진기 직접 펄스)은 0.25 캡에서 **포화·진동**한다 — 첫 수중 런 2026-10-01 17:29 (2026-09-30 등재)
+- **무엇**: `rl_pwm` 모드(`rov_gui/control/rl_pwm.py`, `rl_policy.py` `HwRlPwm`, `backends/hardware.py` `set_pwm`)가 정책 `pwm10_s1`의
+  펄스 8개를 RC_CHANNELS_OVERRIDE ch 9..16으로 보내고, 기체의 `rl_pwm_override.lua`가 모터 출력에 강제한다. ArduSub 믹서를 우회한다.
+- **확인된 것**: 오프라인 테스트 26건(`rov_gui/tests/test_rl_pwm.py`) — 실제 pymavlink v2 프레임의 바이트가 스크립트가 읽는 위치와
+  일치, 게이트 항목별 거부, sink 래치·정지 경로, 워커 게이트/정지. 데모 백엔드에서는 "전송 경로 없음"으로 거부된다.
+- **첫 수중 런(2026-10-01 17:29–17:30, `data/20261001/1001_172910`, 정책 미션 3회 42/8/24 s)**: 펄스는 나갔다(`rl_pwm: policy pulses are going out on RC 9..16`,
+  `pwm_age_s` 평균 0.14 s). 움직임: roll −8~+6°(주기 약 3 s), pitch가 −9~−18°에 치우친 채 1–4° 흔들림, yaw 최대 34° 흔들림(std 4–10°); 위치 추종 자체는
+  rms 2–4 cm·최대 15 cm [측정: `mpc_172910/172957/173011.csv` `roll_deg`·`pitch_deg`·`yaw_deg`, px−rx 등]. (같은 날 1차 보고의 "피치 ±5–10°·yaw −16°·깊이 0.1–0.4 m"는
+  기준 위치 열 `ry`/`rz`를 자세로 잘못 읽은 값 — 철회. 깊이 변화는 대부분 기준이 내려간 것이다.)
+  **원인은 캡**: 추진기 하나가 캡 0.25에서 내는 추력은 5.8 N, 학습 때(1.0)는 64 N — 정책은 11배 큰 권한을 전제로 학습됐다 [유도: `rl_pwm.py PwmModel` T200 곡선].
+  추진기 3·4·6이 시간의 61–91 %, 1·5가 44–64 % 캡에 붙어 있고, 캡이 **스케일이 아니라 클립**(`rl_policy.py:350`, `rl_pwm.py:79`)이라 여러
+  추진기가 동시에 0.25를 넘으면 추진기 간 비율(할당)이 무너진다. 지연은 아니다(tag 0.13 s, 늦은 플랜 런당 1개).
+  **방향 근거**: 같은 런에서 roll·pitch·yaw 각가속도와 상하 가속도가 모델의 uK·uM·uN·uZ와 부호가 맞는다(세 런 모두; 상관 0.1–0.4로 약함) [측정: 같은 CSV 회귀].
+  명령→펄스는 실기 로그로 ArduSub 믹서와 대조돼 있다(`RL_controller/README.md` 28행, `scripts/fit_mixer_from_logs.py`). 추진기 한 기씩의 부호 프로브(§10.3 (4))는 안 했다.
+  **2026-10-01 운용자 결정**: `pwm_cap` 1.0 (한 번에). 1.0에서는 아직 안 돌았다.
+- **2026-10-01 설치됨**: `rov_gui/tools/install_rl_pwm_lua.py --install --yes`로 `SCR_ENABLE` 0→1, `SCR_USER1` 0→1, 스크립트를 MAVLink FTP로
+  `scripts/rl_pwm_override.lua`에 올리고(읽어 되돌려 바이트 동일), 재부팅 뒤 기체가 `rl_pwm_override.lua loaded`를 보냈다 — 스크립트가 **로드는
+  된다**(`mavlink:init` 인자 순서 포함 초기화 통과) [측정: `data/20261001/1001_145846_vehicle_setup/rl_pwm_lua_install.json`]. 바꾼 값과 이전 값이 그 파일에 있다.
+  같은 날 `SERVO14_FUNCTION` 60(RCIN10 passthrough, 출력은 0 µs — RC10에 값을 보내는 주체 없음) → 0(사용 안 함), 운용자 요청
+  [측정: `data/20261001/1001_150534_vehicle_setup/servo14_function.json`]. 이제 게이트의 파라미터 항목은 전부 통과한다
+  (`install_rl_pwm_lua.py` 읽기 전용 점검). 남은 것은 스크립트 heartbeat·교전 확인 — 실제 교전에서만 볼 수 있다.
+- **확인 안 된 것 [예측]**: 스크립트가 펄스를 실제로 넘겨받는지(`set_output_pwm_chan_timeout` 동작, `RLPWM: engaged`), 프레임 주기 50 ms 대
+  스크립트 stale 100 ms의 여유, 추진기별 방향(`MOT_n_DIRECTION` 일치는 게이트가 보지만 물리 방향은 아님), `pwm_cap` 0.25에서 정책이 뜨는지(1.0으로 학습).
+- **알려진 한계**: (1) 이 기체에서 조명·카메라·그리퍼가 RCIN9..16 passthrough에 물려 있으면 게이트가 거부한다 — 옮겨야 쓸 수 있다.
+  (2) CSV에 명령 펄스 열이 없다(`pwm1..8`은 기체 보고값, `uX..uN`은 명목 추정). (3) "명령은 나가는데 추진기가 중립" 감시
+  (`_watch_actuation`)는 축 기준이라 이 모드에서 꺼져 있다 — 스크립트의 `RLPWM` 값이 대신한다. (4) station bridge coast 중에는
+  중립 펄스만 낸다(깊이 유지 없음). (5) sink는 무장/MANUAL을 직접 보지 않는다(워커와 스크립트가 본다); `SYSID_THISMAV`는 읽지 않는다.
+  (6) 태그 상실 디바운스(최대 0.4 s) 동안은 펄스도 직전 명령 갱신도 없다.
+- **입수 전 절차**: `rov_gui/control/rl_policies/pwm10_s1/README.md` — 스크립트 설치 → 프로펠러 뺀 벤치(교전·E-STOP·인계·`RLPWM: released`
+  깜빡임 확인) → 추진기별 방향 → 수중은 `pwm_cap` 0.25, 관측 가능한 얕은 곳에서.
+- **검토**: safety-code-reviewer 1차 FAIL(게이트 구멍 3건: 채널 순열 허용, grace 실패 미래치, 파라미터 세션 캐시) → 수정 → 2차 WARN
+  ("벤치 통과 후 cap 0.25 첫 수중 런 허용", 수중 전 권고 2건: grace 타이머가 끊길 때마다 리셋, sink tick 예외 시 미래치) → 둘 다 수정.
+  **마지막 수정분은 재검토를 받지 않았다.** 리뷰어는 코드를 실행하지 못했다. 남은 권고: QGC를 붙인 채 10분 이상 벤치에서 파라미터 age,
+  늦은 프레임으로 인한 오작동 래치 빈도, `RCINnScaled` 번호(139+n) 대조. 기록은 `.claude/journal/reviews.md`.
+
+### 정책 추론이 단독으로는 **19 ms**인데 스테이션에서는 0.21–0.27 s — FoundationStereo와 GPU를 나눠 쓰기 때문 (2026-10-01)
+- **측정** [`data/20260930/0930_220212/diag/policy_vs_fstereo_contention.json` + `policy_alone_timing.json`, 스크립트 같은 폴더; RTX 5090, peg ViT-CLIP ckpt, `model` weights, GUI·카메라 없음]:
+  정책 forward 단독 8 step 19.3 ms / 16 step 33.5 ms / 4 step 12.2 ms. 같은 프로세스에서 FoundationStereo(iters 8, scale 0.75, CUDA graph)를 쉬지 않고 돌리면
+  8 step p50 152.8 ms(p90 210.0), 4 step 104.4 ms. FS를 7.5 Hz로 띄엄띄엄 돌리면 8 step p50 40.3 ms(p90 86.3).
+  실기(22:02·22:16 engagement 6개)는 infer_ms p50 207–273 ms [`plan_timing.json`], FS solve p50 99 ms(정책 옆에서 쉬지 않고 돈 오프라인 벤치 76 ms — FS 단독 측정은 그 파일에 없다)·9.7–11.2 Hz [`latency_breakdown.json` — UI 녹화 10프레임을 눈으로 읽음, `depth_hud_montage.png`].
+- **플랜 나이의 구성** (rl 런 `mpc_220407`, p50 0.556 s) [`latency_breakdown.json`]: 촬영→depth 완성 0.196 s(FS solve 0.099 + 카메라 전송·대기 0.098 [유도: 차]),
+  정책 forward 0.207 s, 나머지 0.153 s [유도: 차 — 관측 만들기 2장·트리거·버스·20 Hz tick; 단계별 stamp가 기록에 없다].
+- **뜻**: 지연의 큰 덩어리는 diffusion 계산이 아니라 GPU 대기다. `num_inference_steps` 8→4는 단독 −7 ms, FS와 겹칠 때 −48 ms(−32 %)라 절반이 되지 않는다.
+- **임시 대응(구현됨, 기본 OFF, 수중 미검증, 2026-10-01)**: `--policy-fs-schedule yield|only`(기본 `free` = 위 상태 그대로) — yield는 정책이
+  추론하는 동안 FS가 새 프레임을 시작하지 않고(정책은 진행 중 프레임을 최대 150 ms 기다림), only는 정책 미션 중 FS가 정책이 쓰는 2장만 계산한다.
+  코드 변경 없는 다른 손잡이는 `--fstereo-scale 0.5`(FS 45.7 ms라 15 fps를 따라가며 쉰다). 실제 두 워커·두 네트워크로 잰 오프라인 벤치
+  [측정: `rov_gui/tools/fstereo_bench_out/policy_fs_schedule_20261001_115008.json`, 합성 입력이라 카메라 전송 지연 없음, 측정 중 CPU load 0.9→7.5/16코어]:
+  정책 forward p50 132.7 ms(free) → 19.4(yield) / 19.4(only) / 30.8(scale 0.5) / 19.6 ms(yield+0.5); 플랜 나이(emit) p50 328.8 → 224.6 / 154.5 / 134.5 / 145.6 ms;
+  연속 프레임 쌍 82.5 % → 86.0 / 100 / 100 / 100 %; 미션 중 FS 12.93 → 11.93 / 3.73 / 15.0 / 15.0 장/s. 사용법·기록 키·합산 경계는 `rov_gui/README.md`
+  "FoundationStereo와 GPU 나눠 쓰기" 절.
+  앞서 적었던 프로토타입 수치 [`data/20260930/0930_220212/diag/policy_fs_schedules.json`]는 워커가 아니라 단순 루프의 것이고, 그 JSON의 note
+  "the wait is ~0 in the station"은 측정이 아닌 가정이었다(트리거가 도착이 아니라 period 위상이라 대기는 진행 중 프레임의 남은 시간이다 — 프로토타입
+  p50 43.1 / p90 69.9 ms, 워커 벤치 p50 0.0 / p90 19.5 ms). (A)의 "패널 stale 기준 1.5 s"도 틀렸다: `--fstereo`의 depth 패널은 warn 0.75 s /
+  stale 2.5 s다(window.py `expect = min(expect, 4.0)` → widgets/video.py Freshness) — 결론(경고 안 뜸)은 같다.
+  `plans.jsonl`의 `emit_age_s`·`trigger_age_s`·`depth_ready_age_s`·`fs_wait_ms`로 "나머지 0.15 s"를 이제 나눌 수 있다(정책 플랜 줄마다, `free` 포함).
+- **제대로 고치는 법**: LOW None(observe) 런으로 실기 `fs_wait_ms`·`burst_timeouts`·플랜 나이를 먼저 보고, free / yield / only / scale 0.5 중 하나를 수중 A/B로
+  골라 기본값으로 만든다(또는 스위치를 지운다). scale 0.5의 정확도 대가는 `--record-stereo`로 수중 원본을 모은 뒤 오프라인 A/B로 본다 — 아직 미실행.
+
+### 정책 플랜이 **다음 플랜이 오기 전에 끝난다** — 기준이 끝점에 서 있는 시간이 26–78 % (2026-10-01)
+- **발견**: 2026-10-01, "추론 지연만큼 앞 action을 버려야 하지 않나"라는 질문을 코드·기록으로 확인하다가.
+- **시간 정렬 자체는 맞다(코드)**: 플랜의 시간축은 관측 시각에 고정되고(`workers.py` `compose_plan(..., t0=obs_t_rel)`, raw action k = 관측 시각 + k·66.7 ms),
+  스티처는 "지금" 시각으로 그 축을 샘플한다(`plan_stream._PlanRef.sample`) — 지연만큼의 앞부분은 저절로 건너뛴다. raw action 0은 관측 시각의 자세다
+  (|action 0| p50 0.3–0.9 mm).
+- **측정** [`data/20260930/0930_220212/diag/plan_timing.json`, 스크립트 같은 폴더 `plan_timing.py`; 22:02·22:16 engagement 6개]:
+  플랜 나이 p50 0.56–0.66 s(추론 전 체인 0.35–0.39 + 추론 0.21–0.27) → 설치 시점에 기준이 놓이는 raw action 번호 p50 **7.4–8.3**(앞 8개는 한 번도 안 날아간다).
+  설치 뒤 남은 수명 p50 0.45–0.52 s(감속 없는 플랜), 다음 설치까지 p50 0.55–2.55 s → 다음 설치 전에 끝난 플랜 **54–94 %**.
+  CSV `ref_src`: hold가 rl 런(`mpc_220407`) 26 %, mpc_tuned 5개 38–78 %; 순수 plan은 3–21 %, 나머지는 blend.
+- **원인**: 청크 길이 1.0 s(16 × 66.7 ms)에 여유가 없다. 추론은 실행과 겹쳐 돈다(관측 간격 p50 0.533 s; 다음 관측이 앞 플랜 도착 전에 찍힌 주기 73–96 %).
+  설치된 플랜만 보면 나이 p50 0.52–0.57 s, 남은 수명 p50 0.45–0.52 s라 **다음 플랜이 정상 도착하면 빈 구간은 p50 0.0–0.10 s(p90 ≤ 0.14 s)**뿐이고,
+  **다음 플랜이 late로 버려지면 p50 0.5–1.2 s(최악 런 3.9 s)**가 빈다 [측정: `data/20260930/0930_220212/diag/plan_hole.json`] — hold 시간의 대부분은 late 탈락에서 온다.
+  만료 뒤에는 `hold_tail: extrapolate`가 꺼지고 끝점 정지가 된다(`_extrapolate_tail`은 플랜이 live일 때만).
+- **곁들여**: 같은 기록에서 관측 프레임 쌍 간격이 66.7 ms인 플랜과 133 ms인 플랜이 반반이다(rl 런 234 : 182) — 아래 2026-09-02 "depth 페어" 항목과 같은 문제.
+  `--policy-fs-schedule only`와 `--fstereo-scale 0.5`는 오프라인 워커 벤치에서 연속 프레임 쌍 100 %였다(free 82.5 %) [측정: `rov_gui/tools/fstereo_bench_out/policy_fs_schedule_20261001_115008.json`].
+- **고치는 법**: 나이를 줄인다 — 바로 위 항목의 스위치(구현됨, 기본 OFF, 수중 미검증; 벤치 플랜 나이 p50 328.8 → 134.5–224.6 ms). 그 밖에 `period_s`를
+  0.35 s쯤으로 줄인다 [예측: GPU를 FS와 나눠 쓰므로 나이가 늘 수 있음, 미시험], 만료 뒤에도 외삽을 잇는다(코드), 또는 action horizon을 늘려 재학습한다(미적용).
+
+### 정책이 "그리퍼 열기"를 내도 스테이션은 열지 않는다 — 켜면 오발 위험도 있다 (2026-09-30)
+- **사실**: 2026-09-30엔 `policy.gripper: false`라 폭 채널이 버려졌다(10-01부터 true, lookahead 0.8 — 10-01 15:19 rl 런에서 첫 정책 OPEN 실행,
+  `data/20261001/1001_151431/mpc_151814.csv` grip_cmd). 남은 문제는 **오발**과 턱 피드백 부재다. peg 정책은 삽입 순간에 open을 낸다: rl 런 `mpc_212757` t=77–84 s의 6개 플랜이
+  1초 앞 폭 0.068–0.085 m를 냈고 그때 peg는 구멍 안이었다(`data/20260930/0930_211846/diag/open_moment.png`, 조종자가 85 s에 수동으로 엶).
+- **오발**: 같은 날 `mpc_213330` t=9–20 s의 5개 플랜도 open을 냈는데 peg는 구멍 밖이었다(`data/20260930/0930_211846/diag/open_moment2.png`) [측정: `data/20260930/0930_211846/diag/plan_age_and_open_requests.json`].
+- **켤 때**: `gripper: true`만으로는 안 열린다 — open은 청크의 끝(약 0.9–1.0 s 앞)에 놓이고 knot 0은 현재 폭이라, `gripper_lookahead_s` 0.0("지금" 샘플)은
+  문턱(폭 0.063 m)을 넘지 못한다. 0.6–0.8 s가 필요하다(같은 파일의 09-07 주석). 턱 피드백이 없고, 오발하면 peg를 떨어뜨린다. 수중 미검증.
+- **22시 재확인**: rl 런 `0930_220212/mpc_220407`에서 peg가 구멍 안에 있는 동안(`data/20260930/0930_220212/diag/ui_t303.png`, `ui_t318.png`) t=176–214 s에
+  플랜 17개가 open(폭 최대 0.090 m)을 냈고 CSV `grip_cmd`는 전 구간 0이다. 설치된 플랜에 `gripper_lookahead_s`를 대입하면 0.0 s는 0회, 0.8 s는 9회
+  문턱을 넘는다. 삽입 전 176 s와 같은 밤 mpc_tuned engagement 5개에서는 open 요청 0건(오발 없음) [측정: `data/20260930/0930_220212/diag/open_requests.json`].
+
+### peg-in-hole 정책(`peg5d_vitclip_9_27_9_28`)이 수중에서 **peg를 물고도 후퇴**를 낸다 — ROV 영상 속 턱+peg가 데모와 다른 자리·모양 (2026-09-30)
+- **증상**: 2026-09-30 정책 런 7개 engagement 모두 플랜이 뒤+위로 향한다. 관측 런 `data/20260930/0930_183320_observe/plans.jsonl` 1079건의
+  마지막 knot(1.0 s 앞) 평균 TCP dz −0.048 m, dz<0 비율 0.958; 추종 런에서는 선체가 실제로 뒤로 0.10–0.50 m 밀렸다
+  [측정: `data/20260930/0930_183320_observe/diag/action_direction_stats.json`, 각 런 `mpc_*.csv` px/py]. 턱은 peg를 물고 있었고 depth에도 peg가 보인다
+  [측정: `data/20260930/0930_182033/ui_20260930_182035.mp4` C3 RGB·C3 DEPTH 패널].
+- **원인(부분 규명)**: UI 녹화의 depth 패널에서 정책 입력을 복원해 다시 추론했다 (복원 obs MAE 1.4–2.1/255 [측정: `data/20260930/0930_183320_observe/diag/recon_fit_0921.json`];
+  기록 플랜과 dz 상관 0.91·부호 일치 0.95, 322 플랜 [측정: `data/20260930/0930_183320_observe/diag/final_tests.json` `_check`]). 복원 obs에서 dz<0 비율은
+  그대로 0.90 → **턱+peg를 지우면 0.31** → 턱+peg만 42 px 아래(데모의 자리)로 옮기면 0.66 → 거기에 proprio 폭 0.007 m까지 주면 0.53
+  [측정: `data/20260930/0930_183320_observe/diag/final_tests.json`]. 즉 후퇴를 만드는 것은 **ROV 영상에 찍힌 턱+peg 자체**다. ROV는 턱이 광축 아래 0.067 m, 핸드헬드는 0.129 m라
+  [설정값: `mpc_183320.meta.json policy.tcp`] 224 px obs에서 턱+peg가 약 43 px 위에 찍힌다 [유도]. proprio 폭 단독 효과는 작다(0.90 → 0.83).
+- **무엇이 다른가(측정)**: depth에서 peg 축을 맞춰 보면 카메라–그리퍼 축 기울기는 두 장비가 같다(ROV 40.8°, 핸드헬드 9/28 40.8°, 9/27 35.6°).
+  카메라에서 peg 축까지의 수직 거리도 같다(0.213 vs 0.215–0.217 m [유도: 같은 파일의 root 좌표]). 다른 것은 **축 방향 거리**: peg 뿌리가 ROV에서
+  4.6–5.9 cm 더 앞에 있다 [측정: `data/20260930/0930_183320_observe/diag/rig_geometry.json`; 양쪽 depth가 미터 단위로 맞다는 가정]. 설정값의 TCP 오프셋으로 따로 계산해도 3.9 cm 앞 [유도: meta `policy.tcp`].
+  즉 캘리브레이션(내부 파라미터·워프) 문제가 아니라 카메라–턱 간 앞뒤 거리 차이다. 자로 확인 필요(미실측).
+- **고치면 되는가(예측)**: 복원 obs를 3D로 재투영해 카메라를 그리퍼 축 따라 앞으로 옮긴 시점을 만들면 dz<0 비율이 0.90 → 0.66(3 cm) → 0.23(5 cm) → 0.22(7 cm),
+  proprio 폭 0.007 m까지 주면 5 cm에서 0.16·dz +0.018 m·폭 출력 0.008 m(쥔 채 유지) [예측: `data/20260930/0930_183320_observe/diag/virtual_camera.json`, 322 플랜; 단일 시점 depth 재투영이라 근사].
+- **철회한 것**: 같은 날 1차 진단의 "턱이 비어 있었다"는 추론. `policy.estimator.n_drives` 0은 조이스틱 버튼 구동을 세지 않아 근거가 못 된다.
+- **임시 대응(구현됨, 기본 OFF, 수중 미검증)**: `config/hw_mpc.yaml policy.obs_view_forward_m` — 정책이 보는 depth obs를 C3보다 body x로 그 거리만큼
+  앞선 가상 시점에서 다시 그린다(`rov_gui/perception/policy_obs.py` `_shift_view`; 행동 변환은 그대로). 실제 빌더로 당일 322 플랜을 재추론하면
+  dz<0 비율 0.90 → 0.31(0.05 m), proprio 폭 0.007 m까지 주면 0.18·dz +0.018 m [예측: `data/20260930/0930_183320_observe/diag/validate_builder_shift.json`]; 폭 0.007 포함 시
+  0.03 m 0.37, 0.04 m 0.23, 0.06 m 0.16, 0.07 m 0.18 [예측: `data/20260930/0930_183320_observe/diag/validate_builder_shift_sweep.json`]. 빌드 시간 0.4 → 14.7 ms/프레임
+  [측정: 같은 파일 `timing_ms`, 0921 기록 depth 97장]. 21:03–21:07의 재시도 런(`0930_210312`, `0930_210502_observe` 등)은 **스위치가 꺼진 채** 돌았다
+  (meta `policy.config.obs_view_forward_m` null, `OBS VIEW SHIFT` 로그 없음) — 기록된 dz<0 비율 0.86. 그 237 플랜의 obs에 스위치를 켜면 0.32(0.05 m),
+  폭 0.007 m까지 주면 0.15 [예측: `data/20260930/0930_183320_observe/diag/replay_2103.json`]. 켠 상태의 수중 런은 아직 0건.
+- **켤 때 알아둘 것**: (1) **프로세스 단위**다 — 켠 채로 패널에서 캔 체크포인트를 고르면 그쪽에도 적용된다. peg 세션에만 `0.05`, 끝나면 `null`
+  (`test_policy_obs.py`가 출하 설정이 `null`인지 확인한다). 경계는 기동·ARM마다 로그/events.log `OBS VIEW SHIFT`, meta `policy.worker.obs.view_shift`.
+  (2) 플랜당 obs age가 약 29 ms 는다 [유도: 2 프레임 × 14.7 ms]. 09-30 추종 런은 이미 5–10 %가 late였고 같은 분포에 29 ms를 더하면 8–18 %
+  [유도: `data/20260930/0930_183320_observe/diag/late_fraction_estimate.json`] — 첫 런에서 `age_at_intake_s`를 실측할 것. (3) plans.jsonl의 `depth_valid`는 채운 뒤 값이라 1.0으로 찍히고,
+  프레임별 채움 수는 기록되지 않는다. (4) `policy_session_replay.py`·`policy_yaw_vs_can.py`·`depth_compare.py`는 이 스위치를 모른다 — 이동 런의
+  `obs/*.png`는 이동된 영상, `depth/*.png`는 이동 전이다. (5) 가려진 뒤쪽은 배경 거리로 채운 값이지 측정이 아니다. 이동 런과 아닌 런을 합산하지 말 것.
+- **같이 해야 효과가 나는 설정(미적용)**: peg ckpt용 proprio 폭 수준 — `gripper_width_open_m` 0.090, `gripper_width_closed_m`·`gripper_width_init_m` 약 0.007
+  (현재 0.069/0.042는 peg 데이터의 폭 범위 0–0.090 m와 다르다). 캔 ckpt와 공유하는 값이라 손대지 않았다.
+- **되돌리기**: `obs_view_forward_m: null`. 스위치 자체를 걷어내려면 `policy_obs.py`의 view shift 블록, `geometry.py`·`backends/policy.py`·`workers.py`의 키,
+  `test_policy_obs.py` 7절, README 항목을 지운다. 물리적으로 맞추는 길(C3를 5 cm 앞으로 또는 그리퍼를 뒤로, 기준 그림 `data/20260930/0930_183320_observe/diag/jaw_position_reference.png`)을 택하면 이 스위치는 필요 없다.
+
+### USB 카메라를 스트림 시작 중에 뽑으면 **커널 uvcvideo가 크래시하고 그 USB 컨트롤러가 재부팅 전까지 묶인다** (2026-10-01)
+- **증상**: 18:25:40 `./c3 cctv` 카메라 프로세스가 카메라 3대를 여는 순간 포트 3-6 카메라가 USB에서 끊겼고(`usb 3-6: USB
+  disconnect`), 2 s 뒤 그 장치에 대한 STREAMON에서 `BUG: kernel NULL pointer dereference` — `usb_ifnum_to_if ←
+  usb_hcd_alloc_bandwidth ← usb_set_interface ← uvc_video_start_transfer`, Comm `python`(카메라 프로세스의 캡처 스레드)
+  [측정: `journalctl -k` 2026-10-01 18:25:42]. 그 뒤 `kworker/…+usb_hub_wq`가 D 상태, 같은 컨트롤러(PCI `0000:13:00.0`,
+  Bus 03)의 다른 카메라는 STREAMOFF(`usb_set_interface`)·포맷 조회(`uvc_v4l2_get_format`)에서 **영구 D 상태**,
+  `/sys/bus/usb/devices/3-6/product` 읽기도 멈춤. 끊긴 카메라는 58 s 뒤 다른 컨트롤러(Bus 01, `0000:11:00.0` 포트 2)에서
+  다시 잡혔다(손으로 옮긴 것인지, 스트림 시작 때 스스로 떨어진 것인지는 모름).
+- **원인(부분)**: 크래시한 모듈은 기본 커널 드라이버가 아니라 `librealsense2-dkms` 1.3.28의 패치판 uvcvideo
+  (`/lib/modules/6.8.0-138-generic/updates/dkms/uvcvideo.ko`, version `1.1.1-realsense-1.3.28`). 끊김과 STREAMON의 경쟁
+  상태에서 죽은 스레드가 컨트롤러의 대역 잠금을 쥔 채 사라진 것으로 보인다 [유도: D 상태 wchan]. 기본 uvcvideo에도 같은 경쟁이
+  있는지는 미확인. 이 리포 코드는 RealSense를 쓰지 않지만 시스템에 librealsense2·pyrealsense2가 깔려 있다(다른 프로젝트용일 수 있음).
+- **스테이션에 미친 영향**: 없음 — 카메라가 자식 프로세스라 멈춘 건 그 프로세스뿐이고, 창은 `stop()`의 제한 시간 뒤 정상
+  종료했다. 같은 프로세스였다면 스테이션 자체가 kill 불가 상태가 됐다.
+- **대응**: 재부팅(D 상태는 kill로 안 풀림). 카메라는 **스트리밍 중·시작 직후에 뽑지 않는다**. 15 s 넘게 첫 프레임이 없으면
+  타일이 "stuck … USB/driver fault?"라고 말한다(`pool_cam.py STUCK_S`).
+- **제대로 고치는 법(미실행)**: RealSense를 이 PC에서 안 쓰면 `librealsense2-dkms`를 지워 기본 uvcvideo로 돌아가는 것을 검토
+  (sudo, 다른 프로젝트 확인 먼저). 쓰면 최신 dkms 버전으로.
+
+### 스테이션 종료 시 `cmd_estop`이 **레코더 join들 뒤에** 나간다 — MPC engaged면 그동안 명령이 계속 나갈 수 있다 (2026-09-30, safety 감사에서 발견)
+- **증상(코드 읽기, 미재현)**: `rov_gui/window.py` `MainWindow.shutdown()`은 `cmd_timer`를 멈춘 뒤 UI 레코더 join(≤5 s,
+  `recorder.py` `ScreenRecorder.stop`), 켜져 있는 피드 레코더마다 join(각 ≤5 s), mission log 저장, nav 기록 닫기를 하고
+  **그다음에** `cmd_estop.emit()` + `backend.stop()`을 한다. 텔레옵 펌프는 멈췄으니 sink deadman(500 ms)이 중립을 잡지만,
+  MPC가 engaged면 MpcWorker가 그 몇 초 동안 `cmd_pilot`을 계속 보내 deadman을 먹일 수 있다 [유도; MpcWorker 쪽은 안 읽음].
+  풀 카메라(`--pool-cams`) 대기는 이미 맨 끝(중립 뒤)이라 이 문제와 무관.
+- **임시 대응**: 창을 닫기 전에 E-STOP(Esc)을 누른다 — `estop()`은 MPC disengage + `cmd_estop`을 즉시 보낸다.
+- **제대로 고치는 법**: `shutdown()` 맨 위에서 `self._mpc_engaged`면 `cmd_mpc_engage(False)`, 그리고 `cmd_estop.emit()` +
+  `backend.stop()`을 레코더 정리보다 **먼저**. 레코더·nav·mission log는 백엔드와 무관하니 순서만 바꾸면 된다(테스트로 확인 필요).
+
 ### 학습 런이 GPU를 쓰는 동안 비행하면 정책 플랜이 **전부 late**로 버려진다 (2026-09-14)
 - **증상**: `data/20260914/0914_151901/` 세 engagement에서 `plans.jsonl` 329건 **전부 `late`**(intake 시 obs age 0.84 s >
   `policy.obs_max_age_s` 0.60 s), `mpc_152047.meta.json policy.run`: received 75 / installed 0. 추론 `infer_ms` p50 **629 ms**
@@ -563,6 +714,33 @@
   `depth_compare`로 대조 — 이제 그 비교가 가능하다.
 
 
+### `--pose`(SAM2 + FoundationPose)의 상류 작업공간 두 개가 **디스크에 없다** — 켜면 로드에서 멈춘다 (2026-09-30)
+- **증상**: 기본값 `SAM2_LIVE_ROOT` = `~/Desktop/New Folder`(sam2_live, `rov_gui/perception/session.py:57`)와
+  `FOUNDATIONPOSE_ROOT` = `~/Desktop/poseEstimation/FoundationPose`(`session.py:1492`)가 둘 다 없다(`ls`, 2026-09-30;
+  휴지통 비어 있음). `--pose`를 켜면 `PoseSessionError: perception source not found at …/New Folder`, 메시 재구성은
+  `reconstruction script not found …/run_nerf_single.py`. FoundationStereo와 같은 부류(리포 밖 트리)인데, `New Folder`는
+  `rov_gui/README.md` "원본은 건드리지 않는다" 절에 **문서화돼 있었는데도** 지워졌다 — 문서만으론 부족하고 리포 안에 둬야
+  한다(FS는 2026-09-30 `external/FoundationStereo`로 복원). FoundationPose 루트는 코드와 `oakd.sh`에만 있었다.
+  평소 실행 줄(`--fstereo --policy`, `--pose` 없음)은 무관.
+- **임시 대응**: `--pose`를 쓰지 않는다. 사본이 있으면 `--pose-src`/`$SAM2_LIVE_ROOT`, `$FOUNDATIONPOSE_ROOT`로 가리킨다
+  (`rovgui-pose`의 `etc/conda/activate.d/oakd.sh`도 옛 경로를 export하지만 `./c3`는 env를 activate하지 않아 무관).
+- **제대로 고치는 법**: 두 트리를 찾거나 다시 받아 FoundationStereo처럼 리포 안(`external/`)에 두고 기본값을 리포 상대
+  경로로. sam2_live는 자체 코드라 upstream이 없을 수 있다 — 원본이 어디 있었는지부터 확인.
+
+
+### FoundationStereo 로드가 **매번 GitHub에 묻는다** — 429/5xx면 캐시가 있어도 그 런은 depth가 없다 (2026-09-30)
+- **증상(잠복, 아직 미발생)**: 업스트림 `external/FoundationStereo/depth_anything/dpt.py:157`이
+  `torch.hub.load('facebookresearch/dinov2', …)`를 ref 없이 부르고, torch 2.11 `torch/hub.py:205-212`
+  (`_parse_repo_info`)가 로드마다 `https://github.com/facebookresearch/dinov2/tree/main/`을 연다. 네트워크가 아예
+  없으면(URLError) `~/.cache/torch/hub/facebookresearch_dinov2_main`으로 넘어가지만 **404 외 HTTPError(429, 5xx)는
+  그대로 raise** → `FS FAULT` → FS는 다른 센서로 넘어가지 않으니 그 런은 depth가 없다. timeout 없는 `urlopen`이라 반쯤
+  끊긴 네트워크에선 `FS LOADING`이 길어질 수 있다 [유도].
+- **임시 대응**: 풀에서 인터넷이 불안정하면 아예 끊고 띄운다(URLError 경로 → 캐시).
+- **제대로 고치는 법**: 로드 동안만 dinov2 hub 호출을 캐시 디렉터리 `source='local'`로 돌린다 — 업스트림이
+  `dpt.py:155`에 바로 그 줄을 주석으로 남겨 두었다. 체크아웃은 건드리지 않는 원칙이니 `fstereo.py`의 기존 몽키패치
+  방식(`_patch_for_capture`처럼)으로.
+
+
 ### 기체 마커의 그리퍼 기하: **턱 x만 실측**, 나머지는 여전히 추정 (2026-09-03, 2026-09-08 갱신)
 - **상태**: `--policy-observe`와 새 기체 마커(선체+그리퍼+추진기+C3, 3-D, 앞뒤 헤딩 점선)는 풀에서
   돌았다(data/20260903/0903_183405_observe, 20260908/0908_180453 등). 마커의 첫 실물 대조가
@@ -834,6 +1012,40 @@
 
 
 ## 🐛 테스트 / 스크립트 함정
+
+### `slam/9_9_26/`이 `slam/grasp_9_9_26/`으로 바뀌었는데 옛 경로가 남아 **ablation 러너가 run을 조용히 건너뛴다** (2026-10-01)
+- **증상**: `~/Desktop/data collection/slam/`에는 이제 `grasp_9_4_26`, `grasp_9_9_26`, `peg_in_hole_9_27_26`, `peg_in_hole_9_28_26`만 있다
+  (2026-10-01 `ls`; `data/20260915/0915_131900_heldout_D_vs_A/D_dinov3b_ep195.log:2`는 옛 경로로 로드됐으므로 이름 변경은 그 뒤).
+  옛 경로를 가리키는 곳: `tools/run_ablations.sh:44-45`(`DS_9926_DEPTH`·`DS_9926_RGBD` → E/A/C/D, rgbd_*, depth_7d_*/rgbd_7d_* spec 전부),
+  `external/UMI_aquatic/diffusion_policy/config/task/umi_rgbd_5d.yaml:115`, `umi_rgbd_7d.yaml:127`, `umi_handheld/build_dp_rgbd_zarr.py:5`
+  (docstring), `external/UMI_aquatic/tests/print_rp_label_stats.py:6,48`, `dataset_rgbd.zarr.zip`의 `.zattrs`. 러너는 `:97`에서
+  "!! <name>: 데이터셋 없음 … — 건너뜀"을 찍고 **다음 run으로 넘어간다**(크래시 없음) — 밤새 배치를 걸면 아침에 해당 run이 없다.
+- **임시 대응**: 배치 시작 직후 러너 로그에서 "건너뜀"을 확인하거나, `slam/9_9_26 → grasp_9_9_26` symlink.
+- **제대로 고치는 법**: 위 경로를 `grasp_9_9_26`으로 갱신(또는 symlink를 의도적으로 두고 여기 기록)하고, 러너가 데이터셋 없음을
+  skip이 아니라 non-zero exit로 처리.
+
+### `docs/DINOV3_ENCODER_STUDY.ko.md`의 "새 캔 0913 폐루프 베이스라인"은 **대부분 캔이 아니다** (2026-10-01)
+- **증상**: `:25`, `:134`(원 수치 `docs/measurements/dinov3_encoder_study_20260913/` followup_baseline-0913-yaw.json)가 0913 8폴더를
+  "새 캔"으로 묶어 A의 r +0.116, L/R 균형 3런(163921/170213/173702) pooled r +0.034를 DINOv3가 이겨야 할 기준선으로 둔다.
+  그러나 8폴더 중 5개(161733/163921/165748/170213/173702)는 검은 긴 목 인형(청록 머리·주황 발)이고 **균형 3런은 전부 인형**이다
+  [측정: `data/20260913/0913_163921/policy_obs/rgb/000768.jpg` 인형, `data/20260913/0913_155559/policy_obs/rgb/000037.jpg` 주황 테이프 캔 —
+  2026-10-01 직접 확인; 나머지 런은 같은 날 workflow verifier가 런당 1–2장 확인]. 주황 캔이 찍힌 수중 기록은 6런
+  (0911_171926_observe/173045/175144, 0913_155559/160850/161350), JPEG 5,330장뿐이고 0913 세 런은 캔이 왼쪽에 몰려 있다
+  (L/C/R 37/1/0, 9/0/2, 10/0/0 — 같은 json). 0914–0921 수중 런은 인형.
+- **영향**: 그 r 값은 "새 캔" 기준선이 아니라 주로 인형 기준선이다. 주황 캔으로 yaw 응답을 판정할 L/R 균형 런은 아직 없다.
+- **제대로 고치는 법**: 문서 두 줄의 라벨 정정 + 주황 캔을 좌우 번갈아 둔 observe 런을 `--record-depth`로 새로 찍는다.
+
+### `rov_gui/tests`를 돌리면 git이 추적하는 MPCC 생성 솔버가 **모델 항력(4.03)으로** 덮어써진다 (2026-09-30)
+- **증상**: `rov_gui/control/_mpcc_gen/heavy_gripper/`(`.c/.o/.so` + `acados_ocp_mpcc.json`)는 커밋된 생성물이고
+  HEAD는 실기 항력 `-86.7 / -133.8`로 생성돼 있다. 테스트(예: `test_path_cost.py:677`의 `HwMpcc(MpcConfig(...))`)는
+  `plant:` 오버라이드 없이 `AcadosMPCC()`(`build=True, generate=True`)를 만들어 같은 폴더를 `-4.03 / -6.22`로 다시 쓴다
+  (2026-09-30 전체 테스트 뒤 json `f_expl_expr` 비교로 확인). 습관대로 `git add .`하면 틀린 항력의 솔버가 커밋된다.
+- **비행엔 무해**: GUI는 기동 때마다 `MpcWorker`가 `HwDobMpc`(항력 오버라이드 적용) → `HwMpcc` 순으로 **다시 생성**한다
+  (`rov_gui/control/workers.py` 1170-1203). 같은 순서의 헤드리스 재생성이면 `.c/.o/.so`가 HEAD와 바이트 동일로 돌아온다.
+- **임시 대응**: 테스트 뒤 `git status`에 `_mpcc_gen`이 보이면 커밋 전에 `git checkout -- rov_gui/control/_mpcc_gen/` 하거나
+  GUI를 한 번 띄운다. env 경로(`Makefile`·json의 `code_gen_opts`)만 다른 건 GUI 기동이 원래 만드는 차이다.
+- **제대로 고치는 법**: 테스트는 임시 디렉터리에 생성하게(`GEN_DIR` 주입)하거나, 생성물을 git에서 빼고(.gitignore) 기동 빌드에 맡긴다.
+
 
 ### depthai를 cv2/torch보다 **먼저** 초기화해야 USB 카메라가 열거된다 (2026-09-06)
 - **증상**: 한 프로세스에서 `cv2`와 FoundationStereo(=torch+CUDA)를 먼저 import하면
@@ -1683,6 +1895,17 @@ SAM2 추적(1단계), 메시 기반 6-DoF(2단계), 현장 재구성(3단계)을
 
 ## 📌 알려진 한계 (당장 고칠 계획 없음, 잊지 말 것)
 
+### 풀장 CCTV 카메라(`--pool-cams` / `./c3 cctv`): 4대 실기 확인, **`--source hw` 스테이션 런·허브 연결은 미확인** (2026-10-01)
+- **확인된 것**: 재부팅 후 4대(`SPCA2650` 1 + `USB RGB Camera` 3)를 컨트롤러 `0000:13:00.0`의 PC 포트 1·2·9·10에 한 대씩
+  꽂아 1080p30 동시 녹화 15 s — 4파일 `complete: true`, dropped 0, 29.5–30.1 fps; 녹화 중 카메라 프로세스+ffmpeg 0.87 코어,
+  스테이션 쪽 0.02 코어 [측정: `pool_cam/bench_out/cost_20261001_real4_1080p30.txt`]. 스트리밍 중 `USB RGB Camera`는
+  alt 7 = 3072 B/µframe(196.6 Mbit/s 예약)을 쓴다 [측정: sysfs `bAlternateSetting`·디스크립터 2026-10-01 19:00] — 두 대만
+  합쳐도 USB 2.0 주기 전송 한도(6000 B/µframe)를 넘는데 한 컨트롤러에서 4대가 돌았으니 대역은 **PC 포트마다 따로**다 [유도].
+- **모르는 것**: (a) **허브(멀티 포트 어댑터)**: 허브 뒤 카메라는 허브의 링크 하나를 나눠 쓰므로 1080p30이면 한 대만 들어갈
+  것이다 [유도, 미시험] — `--list`가 같은 PC 포트를 공유하는 카메라를 경고한다. (b) `./c3 gui --source hw --pool-cams` 전체 런
+  (C3·ROV·정책 GPU와 함께). (c) 4대가 모두 한 컨트롤러라, 위 uvcvideo 크래시 같은 고장이 나면 4대가 같이 멈춘다 —
+  다른 컨트롤러(`0000:11:00.0` 등) 포트로 나누면 고장 범위가 나뉜다(대역 때문은 아님).
+
 ### 2026-09-14 이전에 앱이 쓴 기록 안의 경로는 여전히 `sessions/…`를 가리킨다 (2026-09-14)
 - **증상**: 데이터 루트를 `data/YYYYMMDD/<run>[_kind]/` 하나로 접으면서(`tools/migrate_data_layout_20260914.py`,
   485건 이동) config 주석·docs·journal·memory의 인용은 새 경로로 고쳐 썼지만(292줄), **앱이 런타임에 쓴 기록**은
@@ -1799,8 +2022,11 @@ SAM2 추적(1단계), 메시 기반 6-DoF(2단계), 현장 재구성(3단계)을
   미계산], ×0.64 stopgap이 걸린 온디바이스 매처다. `--policy-allow-device-depth`는
   벤치 실험용이며 경고와 함께 meta에 `depth_scale_applied: 0.64`와 coverage가 남는다.
 - `--fstereo`도 훈련 스토어 설정(iters 16 / scale 1.0 [측정: `~/Desktop/data
-  collection/depth/0/depth.zarr/.zattrs`])과 다르면 `--policy-allow-fs-mismatch`
-  없이 거부한다(체크포인트는 타이핑 값이 아니라 실제 로드될 기본값까지 비교). 이
+  collection/depth/0/depth.zarr/.zattrs`])과 다르면 경고한다(2026-09-02까지는
+  `--policy-allow-fs-mismatch` 없이 거부; 지금 그 플래그는 meta에 기록만 된다).
+  체크포인트는 타이핑 값이 아니라 실제 로드될 기본값까지, 2026-09-30부터는 경로가 아니라
+  내용(앞 8 MiB sha1; 스토어 쪽 파일이 지워졌으면 upstream 공개본 sha1과)으로 비교한다
+  (2026-09-14~09-30 런은 `data/checkpoints` 심볼릭 링크 때문에 이 검사가 안 돌았다 — 고침). 이
   설정의 실측: 7.26 Hz, solve 137 ms, panel latency 243 ms [측정: rov_gui/tools/fstereo_bench_out/policy_bench_20260902_141224.json, C3 실기, alpha 0.5, scale 1.0, iters 16, 330 frames, GPU shared with a concurrent test run].
 
 ### policy: FS 7.26 Hz라 depth 페어가 훈련 stride의 **2.07배** — 계기 parity와 시간 parity가 충돌 (2026-09-02)
@@ -2138,25 +2364,39 @@ AprilTag PnP → EAOB+acados NMPC → MANUAL_CONTROL 폐루프(`rov_gui/control/
   이미 커밋된 값). 테스트 상한을 풀 것인지 config를 3 m로 되돌릴 것인지는 사용자 결정 —
   10 m는 풀 대각선보다 길어 사실상 상한 없음이다.
 
-### RGB+depth 정책 체크포인트(`umi_rgbd_5d`)는 스테이션에서 **아직 못 돈다** — RGB obs 빌더가 없다 (2026-09-23)
+### RGB를 먹는 정책 체크포인트(`umi_rgbd_5d`, RGB-only 포함)는 **평가할 도구가 없다** — 스테이션·리플레이·held-out 셋 다 depth 전용 (2026-09-23, 2026-10-01 갱신)
 - **무엇**: 2026-09-23 ablation의 two-stream 모델(obs `camera0_rgb` + `camera0_depth`, task
-  `external/UMI_aquatic/diffusion_policy/config/task/umi_rgbd_5d.yaml`)은 학습만 된다.
-  `rov_gui/perception/policy_obs.py`는 depth obs만 만들고 `dp_policy.py`는 shape_meta의 이미지 키를 그대로
-  기대하므로, 이 ckpt를 패널에서 고르면 `camera0_rgb`가 없어 로드/추론이 실패한다(어느 단계에서 어떻게 죽는지는
-  **미확인**). 오프라인 리플레이(`policy_session_replay.py`)도 같은 이유로 안 된다 — 기록된 `policy_obs/rgb/*.jpg`는
-  C3 컬러 원본(q85)이지 224 obs가 아니다.
+  `external/UMI_aquatic/diffusion_policy/config/task/umi_rgbd_5d.yaml`)은 학습만 된다. 세 도구가 모두 `camera0_depth`만 먹인다
+  [코드 읽기, 미실행 — 2026-10-01]:
+  - 스테이션: `rov_gui/backends/policy.py:85` `IMAGE_KEY = "camera0_depth"`, `policy_obs.py`는 depth 레시피만 만든다.
+    RGB+D ckpt는 로드에서 `ValueError`("exactly one image key", `dp_policy.py:586-603`)로 죽는다. **RGB-only ckpt(`camera0_rgb`
+    키 1개)는 더 나쁘다** — warm-up이 contract의 image_key 자리에 0을 넣어 통과하므로 READY가 되고(`dp_policy.py:983-995`),
+    그 뒤 매 tick `_check_obs`의 KeyError "obs is missing 'camera0_rgb'"(`:1019-1026`)가 `_infer_error`로 넘어가 플랜 0개·DEGRADED
+    (`backends/policy.py:1618-1622, 1664-1669`). 패널 ckpt 교체(`set_ckpt`)에도 이미지 키 검사가 없다.
+  - 오프라인 리플레이: `rov_gui/tools/policy_session_replay.py:273`이 `{"camera0_depth": img}` 고정. 기록된 `policy_obs/rgb/*.jpg`는
+    C3 컬러 원본 640x360 JPEG q85이지 224 obs가 아니고, `cv2.imread`는 BGR로 돌려준다.
+  - 육상 held-out: `rov_gui/tools/dp_policy_offline.py:385, 1111, 1173`도 `camera0_depth`만 읽는다.
 - **학습 RGB의 정체**: OAK-D-W 컬러 CAM_A `rgb.mp4`(1280x720) 센터 크롭 224, 정류·warp 없음
   (`data collection/UMI_Underwater/demonstration_processing/build_dataset.py:83-92,146-150`). 소스 store는 **BGR**이고
-  병합 store(`slam/9_9_26/dataset_rgbd.zarr.zip`)는 RGB로 뒤집어 저장했다 [측정: `umi_handheld/build_dp_rgbd_zarr.py`
-  channel-order proof, stored-vs-BGR 0.0000 / stored-vs-RGB 10.2925]. depth와 **픽셀 정렬이 아니다**(컬러 카메라 vs
-  rectified-left 격자를 C3 광학으로 warp) — two-stream이라 학습엔 무관하지만 4채널 early fusion에는 이 데이터를 쓰면 안 된다.
-- **제대로 고치는 법**: (1) `policy_obs.py`에 C3 CAM_A 컬러 → 센터 크롭 224 RGB 빌더 추가(학습 레시피와 같은 크롭,
-  BGR→RGB), (2) `dp_policy.py`의 `eval_transforms`를 키별로 적용(이미 `key_transforms`는 무시하도록 해둠), (3) 육상
-  OAK 컬러 광학과 C3 컬러 광학의 차이는 보정하지 않는다는 것을 run meta에 남길 것. 그 전까지 RGB+D ckpt는
-  held-out(학습 zarr) 평가 전용.
+  병합 store(`slam/grasp_9_9_26/dataset_rgbd.zarr.zip` — 옛 이름 `slam/9_9_26/`, 아래 🐛 경로 항목)는 RGB로 뒤집어 저장했다
+  [측정: `umi_handheld/build_dp_rgbd_zarr.py` channel-order proof, stored-vs-BGR 0.0000 / stored-vs-RGB 10.2925]. depth와
+  **픽셀 정렬이 아니다**(컬러 카메라 vs rectified-left 격자를 C3 광학으로 warp) — two-stream이라 학습엔 무관하지만 4채널
+  early fusion에는 이 데이터를 쓰면 안 된다.
+- **광학 차이의 크기 [유도, 2026-10-01]**: 학습 RGB 224는 육상 CAM_A(OV9782, 공기 중; `grasp_9_9_26/calibration.json` socket 0
+  fx 573.08 @1280x800, 14계수)로 약 72°×72°이고, 같은 레시피로 자른 C3 컬러(IMX378, 수중 EEPROM fx 3080.35 @3840 → 640x360에서
+  513.4; `calib/FOV_AUDIT.md:57`)는 약 38.6°×38.6°다 → 화면 중심 배율 약 1.8배(같은 거리 물체가 수중 obs에서 1.8배 크다),
+  육상 크롭 가장자리 배럴 13.5 %. 학습 증강(crop 0.95, ±5°)으로 못 덮는다. `umi_handheld/warp.py` `WarpStage`는 depth 없이
+  카메라모델끼리 remap하므로(`:74-84`) RGB도 C3 CAM_A로 warp할 수 있다 — 단 source는 1280x720 CAM_A 모델(fx 그대로, cy−40;
+  `CameraModel.K`의 해상도 스케일 경로를 타면 fy가 10 % 틀어진다), target C3 CAM_A yaml은 레포에 없어 런 meta
+  (`data/20260908/0908_180453_observe/mpc_180453.meta.json:707-753`)에서 만들어야 한다. warp하면 핸드헬드 손끝(광축 아래 약 22°)이
+  VFOV ±19.3° 밖으로 빠지고 ROV 턱(약 11.5°)은 보이는 비대칭이 생긴다 [유도].
+- **제대로 고치는 법**: (1) `policy_obs.py`에 C3 CAM_A 컬러 → (학습과 같은 warp 여부) 센터 크롭 224 RGB 빌더, BGR→RGB,
+  (2) `backends/policy.py`의 `IMAGE_KEY`를 ckpt contract의 image_key로 바꾸고 로드 시점에 이미지 키를 검사, (3) `dp_policy.py`의
+  `eval_transforms`를 키별로 적용(이미 `key_transforms`는 무시하도록 해둠), (4) 리플레이·held-out 도구에 `camera0_rgb` 경로,
+  (5) 광학 보정 여부(naive / C3 warp)를 run meta에 남길 것. 그 전까지 RGB ckpt는 wandb val(EMA 가중치·배치 1개)밖에 볼 수 없다.
 
 ---
-*마지막 갱신: 2026-09-23*
+*마지막 갱신: 2026-10-01*
 
 ### `demo_e2e.py dobmpc policy`가 `skip_fix_lag`로 플랜 0건 — 데모 프로세스에서 dobmpc tick이 fix보다 70–140 ms 늦다 (2026-09-26)
 - **증상**: `rov_gui/tests/demo_e2e.py dobmpc policy`(docstring 기본 추종자)는 PolicyWorker가 12/12 쌍을

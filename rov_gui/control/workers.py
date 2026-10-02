@@ -42,7 +42,8 @@ import numpy as np
 from .. import runstore
 from ..qt import Slot
 from ..state import (ACTION_REPR_POS_RPY_WIDTH, Conn, MpcStatus, NavFix,
-                     ObjectFix, PilotInput, POLICY_ACTION_REPRS_FLYABLE,
+                     ObjectFix, PilotInput, PwmCommand,
+                     POLICY_ACTION_REPRS_FLYABLE,
                      POLICY_GRID_WHY_IDLE, PolicyPlanViz, PolicyState,
                      TagOverlay, now)
 from .allocation import axes_to_wrench, slew_axes, wrench_to_axes
@@ -77,6 +78,64 @@ def _rov_drawn_geometry_meta():
     except Exception as e:                                   # noqa: BLE001
         return {"error": f"rov_shape unavailable: {e}"}
     return rov_geometry_meta()
+
+
+def _plan_timing(plan) -> dict:
+    """A PolicyPlan's own timing record, for its plans.jsonl line (policy
+    plans only — a replay plan has no producer clock and gets none of these
+    keys). Never raises: this runs ahead of every intake gate, where an
+    exception would disengage instead of rejecting one plan; on any surprise
+    it returns {} and the line simply lacks the keys.
+
+    Ages are SECONDS since the observation was CAPTURED (``obs_t``), all on
+    the producer's monotonic clock, so no mission-clock conversion is needed:
+
+      depth_ready_age_s   the newest depth frame was taken in by the policy
+                          worker (its 20 ms tick, so up to one tick after
+                          FoundationStereo put it in the mailbox)
+      trigger_age_s       the tick that began the attempt
+      emit_age_s          the plan left the policy worker
+
+    ``age_at_intake_s`` (the existing key) minus ``emit_age_s`` is then the
+    bus + inbox + control-tick hop; ``trigger_age_s - depth_ready_age_s`` is
+    how long the frame had been waiting in the ring; and
+    ``(emit_age_s - trigger_age_s) * 1000`` minus ``fs_wait_ms`` and
+    ``infer_ms`` (both MILLISECONDS) is the observation build. A value the
+    producer did not stamp is None — never 0.0, which would read as measured.
+    ``fs_schedule`` / ``fs_input`` are on every policy line because a run
+    folder is JOINED across launches 90 s apart (runstore) and plans.jsonl is
+    appended to: two schedules can share one file, and the line says which.
+    """
+    try:
+        def _f(name):
+            try:
+                v = float(getattr(plan, name, None))
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return v if math.isfinite(v) else None
+
+        def _s(name):
+            v = getattr(plan, name, None)
+            return v if (isinstance(v, str) and v) else None
+
+        def _age(v, ref):
+            return (v - ref) if (v is not None and ref is not None) else None
+
+        obs_t = _f("obs_t")
+        timed_out = getattr(plan, "fs_wait_timeout", None)
+        return {
+            "fs_schedule": _s("fs_schedule"),
+            "fs_input": _s("fs_input"),
+            "fs_wait_ms": _f("fs_wait_ms"),
+            "fs_wait_timeout": (bool(timed_out)
+                                if isinstance(timed_out, (bool, np.bool_))
+                                else None),
+            "depth_ready_age_s": _age(_f("depth_arrive_t"), obs_t),
+            "trigger_age_s": _age(_f("trigger_t"), obs_t),
+            "emit_age_s": _age(_f("t_emit"), obs_t),
+        }
+    except Exception:                                            # noqa: BLE001
+        return {}
 
 
 def _json_default(o):
@@ -1168,6 +1227,18 @@ class MpcWorker(TimerWorker):
         except Exception as e:                                   # noqa: BLE001
             self._rl_error = f"{type(e).__name__}: {e}"
             self._log("warn", f"ctrl: RL controller unavailable ({self._rl_error}) — rl mode will refuse")
+        # LOW mode rl_pwm (2026-09-30): the per-thruster RL policy. Built up front like the axes one; a missing or
+        # non-pwm export only costs that mode. It moves nothing by being built — its pulses leave on bus.cmd_pwm only
+        # while engaged, and only through a sink whose vehicle gate holds (control/rl_pwm.py).
+        self._rl_pwm = None
+        self._rl_pwm_error = None
+        self._pwm_gate_bad_since = None
+        try:
+            from .rl_policy import HwRlPwm
+            self._rl_pwm = HwRlPwm(self.cfg, log=lambda m: self._log("info", m))
+        except Exception as e:                                   # noqa: BLE001
+            self._rl_pwm_error = f"{type(e).__name__}: {e}"
+            self._log("info", f"ctrl: RL_PWM controller unavailable ({self._rl_pwm_error}) — rl_pwm mode will refuse")
         self._mpc_ctrl = None
         self._mpcc_ctrl = None
         try:
@@ -2410,7 +2481,7 @@ class MpcWorker(TimerWorker):
     # NEVER join HwDobMpc.MODES, whose setter raises for non-members and
     # whose members are all things that get stepped.
     MODES = ("none", "mpc", "dobmpc", "mpc_tuned", "dobmpc_tuned",
-             "mpcc", "dobmpcc", "pid", "rl")
+             "mpcc", "dobmpcc", "pid", "rl", "rl_pwm")
 
     def _ctrl_for(self, mode: str):
         """The controller object a mode name selects, or None if unavailable.
@@ -2435,6 +2506,8 @@ class MpcWorker(TimerWorker):
             return self._pid
         if mode == "rl":
             return getattr(self, "_rl", None)
+        if mode == "rl_pwm":
+            return getattr(self, "_rl_pwm", None)
         if mode in ("mpcc", "dobmpcc"):
             return self._mpcc_ctrl
         return self._mpc_ctrl
@@ -2494,7 +2567,9 @@ class MpcWorker(TimerWorker):
         self._apply_plan_path_cost(None)
         ctrl = self._ctrl_for(mode)
         if ctrl is None:
-            why = (getattr(self, "_rl_error", None) if mode == "rl" else None) or self._setup_error or "not built"
+            why = (getattr(self, "_rl_error", None) if mode == "rl"
+                   else getattr(self, "_rl_pwm_error", None) if mode == "rl_pwm"
+                   else None) or self._setup_error or "not built"
             self.reason = f"mode {mode} unavailable ({why})"
             self._log("error", f"ctrl: mode {mode} unavailable ({why})"
                                        f" — staying on {self.cfg.mode}")
@@ -2504,7 +2579,7 @@ class MpcWorker(TimerWorker):
         # "pid" has no mode to set; "none" must NOT touch anything — the
         # holder is the PID and `_mpc_ctrl.mode` stays whatever it was
         # (HwDobMpc's setter raises for a name outside its MODES).
-        if mode not in ("pid", "none", "rl") and mode != getattr(ctrl, "mode", mode):
+        if mode not in ("pid", "none", "rl", "rl_pwm") and mode != getattr(ctrl, "mode", mode):
             ctrl.mode = mode
         self.ctrl.reset()
         self._path_cursor = None
@@ -3081,6 +3156,77 @@ class MpcWorker(TimerWorker):
         except OSError:
             pass
 
+    #: How long the rl_pwm gate may read "not ok" (or go silent) while
+    #: engaged before the follower is dropped. One second: the sink has
+    #: already stopped the pulses by then (its own check runs every frame),
+    #: this only ends the engagement that has nothing left to command.
+    PWM_GATE_GRACE_S = 1.0
+    PWM_GATE_STALE_S = 2.0
+
+    def _pwm_transport(self) -> bool:
+        """Is the selected follower the per-thruster one (LOW mode rl_pwm)?"""
+        return getattr(self.ctrl, "transport", "") == "pwm"
+
+    def _pwm_gate_now(self, tel) -> tuple:
+        """(ok, why) of the sink's rl_pwm gate as Telemetry last carried it."""
+        g = getattr(tel, "pwm_gate", None) if tel is not None else None
+        if not isinstance(g, dict):
+            return False, ("this backend's command sink has no per-thruster "
+                           "transport (rl_pwm needs --source hw with "
+                           "--allow-command)")
+        if now() - float(g.get("stamp", 0.0) or 0.0) > self.PWM_GATE_STALE_S:
+            return False, "rl_pwm gate status is stale (command sink silent)"
+        if not bool(g.get("ok", False)):
+            return False, str(g.get("why") or "rl_pwm gate not ok")
+        # The sink built its gate from the export named in the config; this
+        # follower was built from the config too. If the two ever disagree
+        # about the thruster directions, the gate checked the wrong vehicle.
+        want = list(getattr(getattr(self.ctrl, "model", None),
+                            "motor_direction", []) or [])
+        if want and list(g.get("motor_direction") or []) != want:
+            return False, (f"the command sink's gate was built for motor "
+                           f"directions {g.get('motor_direction')}, this "
+                           f"policy expects {want} — restart the station")
+        # ...and about the cap: a sink that clamps tighter than the follower
+        # believes would feed the policy a previous action that never left.
+        cap = getattr(self.ctrl, "pwm_cap", None)
+        if cap is not None and "pwm_cap" in g and \
+                abs(float(g["pwm_cap"]) - float(cap)) > 1e-9:
+            return False, (f"the command sink caps |throttle| at "
+                           f"{float(g['pwm_cap']):.2f}, this follower at "
+                           f"{float(cap):.2f} — restart the station")
+        return True, "ok"
+
+    #: While RL_PWM is the selected follower but not engaged, the worker
+    #: tells the sink so once a second (an eight-1500 PwmCommand, which puts
+    #: nothing on the wire): the sink reads the gate's vehicle parameters
+    #: only while somebody wants the transport, and re-reads them every 10 s.
+    PWM_KEEPALIVE_S = 1.0
+
+    def _pwm_keepalive(self, t: float) -> None:
+        if self.engaged or not self._pwm_transport():
+            return
+        if t - getattr(self, "_pwm_keepalive_t", -1e9) >= self.PWM_KEEPALIVE_S:
+            self._pwm_keepalive_t = t
+            self.bus.cmd_pwm.emit(PwmCommand(source="idle"))
+
+    def _pwm_refusal(self, tel) -> str:
+        """The rl_pwm part of the engage gate; "" for every other follower."""
+        if not self._pwm_transport():
+            return ""
+        mode = ((tel.mode if tel is not None else "") or "").upper()
+        if not mode.startswith("MANUAL"):
+            return (f"rl_pwm needs MANUAL (in {mode or '?'} the vehicle's "
+                    f"script will not force the motor outputs) — press MANUAL")
+        if bool(self._attitude_cfg().get("enabled", False)):
+            return ("rl_pwm with engage.attitude_axes enabled is not "
+                    "implemented (the policy drives all eight thrusters "
+                    "itself) — turn the variant off")
+        ok, why = self._pwm_gate_now(tel)
+        if not ok:
+            return f"rl_pwm gate: {why}"
+        return ""
+
     def _engage_refusal(self) -> str:
         e = self.cfg.engage if self.cfg else {}
         if not self._ready:
@@ -3179,6 +3325,13 @@ class MpcWorker(TimerWorker):
                     return (f"flight mode changed {dt:.1f} s ago — wait "
                             f"{settle:.1f} s for the autopilot to settle, "
                             f"then press START again")
+            # LOW mode rl_pwm (2026-09-30): raw thruster pulses. Whatever
+            # engage.require_mode admits, this transport is MANUAL only (the
+            # vehicle's script forces the outputs only in MANUAL), and the
+            # sink's gate — read back from the vehicle — must hold NOW.
+            why_pwm = self._pwm_refusal(tel)
+            if why_pwm:
+                return why_pwm
             # THE 6-DoF VARIANT (2026-09-26, D7/D8/D10): with
             # engage.attitude_axes.enabled every gate must pass or the
             # engage is REFUSED — never a silent 4-DoF fallback, because the
@@ -5333,10 +5486,18 @@ class MpcWorker(TimerWorker):
         self._policy_eta_start = tuple(float(v) for v in self._eta)
         t = now()
         w0 = self._grip_est.width(t)
-        g0 = self._grip_est.g(t)
-        grip0 = ("close" if g0 < float(pc["gripper_close_below"])
-                 else "open" if g0 > float(pc["gripper_open_above"])
-                 else "neutral")
+        # THE POLICY'S FIRST EDGE ALWAYS DRIVES (2026-10-01). The state used
+        # to be seeded from the open-loop estimate, so a jaw the estimator
+        # believed open swallowed every later "open" as a non-edge — and the
+        # estimator is wrong whenever the pilot moved the jaw from the gamepad
+        # (passthrough bits bypass it): after one policy OPEN in an rl run,
+        # three mpc_tuned runs with the peg in the hole sent nothing
+        # (data/20261001/1001_151431, grip_cmd 0 while grip_g hit 0.93–0.99).
+        # "neutral" means the first threshold crossing fires whatever the jaw
+        # is doing; the cost is at most one gripper_hold_max_s drive against
+        # a stop the jaw already sits on. The estimate still feeds proprio
+        # and the record (grip_w_at_arm).
+        grip0 = "neutral"
         max_run = float(pc["observe_max_run_s"] if self.observe
                         else pc["max_run_s"])
         # THE JAW IS OFF BECAUSE THIS IS AN OBSERVE RUN, not because the
@@ -5360,6 +5521,9 @@ class MpcWorker(TimerWorker):
             "observe": bool(self.observe),
             "epoch": int(self._policy_epoch),
             "ckpt_sha1": ckpt_sha1,      # the armed network (intake gate)
+            # --policy-fs-schedule as the policy worker reported it at ARM
+            # ("free" from a worker that predates the field, or has no gate).
+            "fs_schedule": str(getattr(st, "fs_schedule", "free") or "free"),
             "pending": [], "extras": {},
             "halted": "", "end_reason": "",
             "n_plans": 0, "received": 0, "released": 0, "installed": 0,
@@ -5476,9 +5640,9 @@ class MpcWorker(TimerWorker):
                    if gripper_on else "")
                 + ("" if not self.observe
                    else " (forced off by OBSERVE)")
-                + f"; jaw width assumed "
-                f"{w0 * 1e3:.0f} mm at START (open-loop estimate, init "
-                f"{float(pc['gripper_width_init_m']) * 1e3:.0f} mm = OPEN)")
+                + f"; jaw width estimate {w0 * 1e3:.0f} mm at START "
+                f"(open-loop; the policy's first open/close edge drives "
+                f"regardless)")
         if self.observe:
             # WHAT IS DISARMED, ONCE, IN FULL. An observe run deliberately
             # removes every automatic stop, so the operator must be able to
@@ -5501,6 +5665,18 @@ class MpcWorker(TimerWorker):
                               f"(policy.z_hold_above_floor_m); the policy's "
                               f"own dz is DISCARDED. Temporary, 2026-09-12.")
             self._log_event(f"Z HOLD {float(zh):.2f} m above floor (temporary)")
+        ovf = (self.cfg.policy or {}).get("obs_view_forward_m")
+        if ovf:
+            # Loud, once per arm, like Z HOLD: the policy is NOT looking at the
+            # training recipe's obs, and the switch is per process, not per
+            # checkpoint — a can checkpoint picked in the panel gets it too.
+            self._log("warn", f"ctrl: OBS VIEW SHIFT — the policy's depth obs is "
+                              f"re-rendered {float(ovf):+.3f} m forward along "
+                              f"body x (policy.obs_view_forward_m). Meant for "
+                              f"the PEG checkpoint only; this one is "
+                              f"{Path(ckpt).name}. Temporary, 2026-09-30.")
+            self._log_event(f"OBS VIEW SHIFT {float(ovf):+.3f} m forward "
+                            f"(temporary; ckpt {Path(ckpt).name})")
         yf = (self.cfg.policy or {}).get("yaw_ref_filter")
         if yf is not None and self.observe:
             self._log("info", "ctrl: yaw ref filter configured but SKIPPED "
@@ -5518,6 +5694,29 @@ class MpcWorker(TimerWorker):
             self._log_event(f"YAW REF FILTER tau {float(yf['tau_s']):.1f} s, "
                             f"rate {float(yf['rate_deg_s']):.1f} deg/s, guard "
                             f"{float(yf['guard_deg']):.0f} deg")
+        sched = str(self.replay.get("fs_schedule", "free") or "free")
+        if sched != "free":
+            # Once per arm, like the three above. Under `yield` the policy
+            # sees the frames it would have seen (same trigger, same pair);
+            # what moves is when the two networks use the GPU, i.e. plan age
+            # and infer_ms. Under `only` the OBSERVATION changes too: the pair
+            # is two consecutive camera frames instead of the 67/133 ms mix a
+            # free-running FoundationStereo gives, and the trigger is the
+            # burst. Either way the run must say which it was.
+            self._log("warn", f"ctrl: FS SCHEDULE {sched} — FoundationStereo "
+                              + ("does not start a frame while the policy "
+                                 "infers; do not pool plan age or infer_ms "
+                                 "with `free` runs"
+                                 if sched == "yield" else
+                                 "computes only the frames the policy asks "
+                                 "for while this mission runs: the observation "
+                                 "pair spacing and the trigger differ from "
+                                 "`free` as well as plan age and infer_ms — "
+                                 "do not pool policy behaviour with `free` or "
+                                 "`yield` runs")
+                              + " (--policy-fs-schedule). Unverified in water.")
+            self._log_event(f"FS SCHEDULE {sched} (--policy-fs-schedule; "
+                            f"unverified in water)")
 
     def _policy_bridged(self) -> bool:
         """Is the controller flying on something other than a fresh tag fix
@@ -5839,6 +6038,11 @@ class MpcWorker(TimerWorker):
                       "pair_dup": getattr(plan, "pair_dup", None),
                       "ckpt_sha1": str(getattr(plan, "ckpt_sha1", "")),
                       "t_rel_at_intake": float(t_rel)}
+        # WHERE THE TIME WENT (2026-10-01): the schedule in effect and the
+        # plan's age at each stage. Here, ahead of every gate, so late /
+        # skipped / rejected lines carry it too — a late plan is the one whose
+        # timing matters most.
+        base_extra.update(_plan_timing(plan))
         if bridged:
             rp["skip_bridge"] = int(rp.get("skip_bridge", 0)) + 1
             why = ("skipped: the controller is flying on a bridged/DR state, "
@@ -6392,7 +6596,7 @@ class MpcWorker(TimerWorker):
                  "clipped", "rejected", "late", "skip_bridge", "skip_halted",
                  "drop_epoch", "drop_old", "reject_compose", "reject_blend",
                  "reject_clock", "reject_obs_dt", "reject_action_repr",
-                 "reject_ckpt", "ckpt_sha1",
+                 "reject_ckpt", "ckpt_sha1", "fs_schedule",
                  "action_repr",
                  # the 6-DoF variant (schema 16): the pin, the tracked
                  # flag and the attitude gate / divergence counters
@@ -6794,6 +6998,7 @@ class MpcWorker(TimerWorker):
             self._bridge.reset()
         self._bridge_anchor = None
         self._axes_prev = None          # never ramp from a stale command
+        self._pwm_gate_bad_since = None
         self._yaw_hold = False          # the next engagement decides again
         if self._attitude_axes or self._attitude_at_engage:
             # The RECORD keeps enabled/counters (the closing meta is written
@@ -6843,6 +7048,19 @@ class MpcWorker(TimerWorker):
                     # to neutralise: this worker has not commanded an axis
                     # all run.
                     self.bus.cmd_pilot.emit(PilotInput(source="mpc"))
+                    if self._pwm_transport():
+                        # rl_pwm: eight explicit 1500s. The sink answers
+                        # with its neutral frames and then stops overriding,
+                        # which is what makes the vehicle's script release
+                        # the outputs to AP_Motors (neutral, by the line
+                        # above).
+                        # source "stop": the one neutral the sink accepts as
+                        # the end of an engagement (it clears a latched gate
+                        # failure; an engaged follower's own neutrals do not).
+                        self.bus.cmd_pwm.emit(PwmCommand(source="stop"))
+                        note = getattr(self.ctrl, "note_applied_pwm", None)
+                        if callable(note):
+                            note(None)
                 self.reason = f"disengaged: {why}"
                 # `debug` for the same reason the ENGAGE copy is: the mission
                 # event on the next line is the one the operator reads, and
@@ -6895,6 +7113,7 @@ class MpcWorker(TimerWorker):
             return
         t = now()
         dt = 1.0 / self.cfg.ctrl_hz
+        self._pwm_keepalive(t)
         meas, health = self.asm.step(self.fix, self.imu, t, dt)
         if meas is not None and self._datum is not None:
             meas["eta"] = self._datumize(meas["eta"])
@@ -7118,7 +7337,61 @@ class MpcWorker(TimerWorker):
                     _slew = getattr(self.ctrl, "axis_slew_per_s", None)
                     _rate = (self.cfg.axis_slew_per_s if _slew is None
                              else float(_slew))
-                    if self._attitude_axes:
+                    if self._pwm_transport():
+                        # LOW mode rl_pwm (2026-09-30): the follower's output
+                        # is eight thruster pulses, not a wrench. They leave
+                        # on bus.cmd_pwm (RC override ch 9..16 -> the
+                        # vehicle's Lua timeout override) and the AXES go out
+                        # NEUTRAL: MANUAL_CONTROL keeps the pilot-input
+                        # failsafe fed and is what AP_Motors falls back to
+                        # the moment the override expires. No cap, slew or
+                        # yaw hold applies — the pulses are already capped by
+                        # the controller (rl_pwm.pwm_cap) and nothing here
+                        # may reshape a raw thruster command.
+                        pw = info.get("pwm_us")
+                        ok_pwm, why_pwm = self._pwm_gate_now(self.tel)
+                        if ok_pwm:
+                            self._pwm_gate_bad_since = None
+                        elif self._pwm_gate_bad_since is None:
+                            self._pwm_gate_bad_since = t
+                        if pw is None or (not ok_pwm and t - self._pwm_gate_bad_since
+                                          > self.PWM_GATE_GRACE_S):
+                            why = ("the follower returned no pulses" if pw is None
+                                   else f"rl_pwm gate: {why_pwm}")
+                            self._event("RL_PWM gate lost — disengaged")
+                            self._log("error", f"ctrl: {why}")
+                            self.disengage(why)
+                            axes = PilotInput(source="mpc")
+                            self._publish(meas, health, u, info, axes, t_traj)
+                            self._object_heartbeat(t)
+                            self._write_row(meas, health, u, info, axes,
+                                            t_traj, t)
+                            return
+                        pw = tuple(int(p) for p in pw)
+                        sent_live = True
+                        if not ok_pwm:
+                            # inside the grace window: the sink is refusing
+                            # (or about to) — ask for nothing, and do not
+                            # tell the policy its last command was applied.
+                            pw = PwmCommand().pulses
+                            u = np.zeros(6)
+                            sent_live = False
+                        if coasting:
+                            # STATION BRIDGE coast (tag lost): the other
+                            # followers release X/Y/N and keep depth on the
+                            # IMU. A raw-pulse policy cannot release part of
+                            # itself, and its state is the one nobody trusts
+                            # right now — so it idles: eight 1500s until the
+                            # fix is back. Depth is NOT held in a coast under
+                            # rl_pwm.
+                            pw = PwmCommand().pulses
+                            u = np.zeros(6)      # the log says what left
+                            sent_live = False
+                        self.bus.cmd_pwm.emit(PwmCommand(pulses=pw, source="mpc"))
+                        self.ctrl.note_applied_pwm(pw if sent_live else None)
+                        axes = PilotInput(source="mpc")
+                        self._axes_prev = None
+                    elif self._attitude_axes:
                         # THE 6-DoF VARIANT (2026-09-26): K/M become the
                         # roll/pitch axes, clipped to the wire caps
                         # (attitude_cap, D4) — the solver's U_MAX[3:5] may
@@ -7858,6 +8131,37 @@ class MpcWorker(TimerWorker):
                                           #    rp_track bit; dobmpc w3/w4
                                           #    change meaning with the axes
                                           #    sent (credited K/M).
+                                          #    Within 16 (2026-10-01, no
+                                          #    bump: keys only, the default
+                                          #    run behaves as before): the
+                                          #    FoundationStereo SCHEDULE
+                                          #    (--policy-fs-schedule) —
+                                          #    policy.worker.fs_schedule
+                                          #    {requested, effective, why,
+                                          #    worker, only_lead_s, gate},
+                                          #    policy.worker.pairing.
+                                          #    trigger_detail,
+                                          #    policy.run.fs_schedule (as of
+                                          #    ARM, from the PolicyStatus),
+                                          #    fstereo.schedule (null = no
+                                          #    gate); every POLICY plan line
+                                          #    of plans.jsonl gains
+                                          #    fs_schedule, fs_input,
+                                          #    fs_wait_ms, fs_wait_timeout,
+                                          #    depth_ready_age_s,
+                                          #    trigger_age_s, emit_age_s
+                                          #    (None = not stamped; replay
+                                          #    lines get none). NEVER POOL
+                                          #    plan age, infer_ms or
+                                          #    fstereo.measured_hz across
+                                          #    fs_schedule (under a gate
+                                          #    measured_hz is a 2 s window
+                                          #    count, not the arrival EMA);
+                                          #    under `only` the obs pair
+                                          #    spacing (obs_pair_dt_s,
+                                          #    pairing.near/fallback) and
+                                          #    the trigger change too — do
+                                          #    not pool policy behaviour.
             # `source` answers "was the plant real". A LAND DRY-RUN is the
             # third answer and needs saying out loud: the vehicle IS the real
             # one, but it could not move and could not be commanded, and the

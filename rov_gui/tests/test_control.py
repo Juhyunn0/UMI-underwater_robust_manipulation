@@ -764,8 +764,11 @@ def test_pid_meta_records_every_knob_not_just_the_gains():
     m = HwPid(cfg, log=lambda _m: None).meta()
     for key in ("kp", "kd", "ki", "yaw_kp", "yaw_kd", "yaw_ki", "i_max_n",
                 "yaw_i_max_nm", "e_gate_m", "yaw_gate_rad", "f_max",
-                "mz_max", "slew_n_per_s", "omega_derate", "ctrl_hz"):
+                "mz_max", "slew_n_per_s", "omega_derate", "ctrl_hz",
+                "heave_trim"):
         assert key in m, f"pid meta lost {key}"
+    assert m["heave_trim"] == {"applied": False, "vehicle_net_buoyancy_n": 0.0,
+                               "f_z_trim_n": 0.0, "note": m["heave_trim"]["note"]}
     # the recorded gains are the SCALED ones actually flown, not the design set
     assert abs(m["kp"][0] - 143.7 * 0.6 ** 2) < 1e-6, m["kp"]
     assert m["gains_provenance"].endswith("[예측]")
@@ -1208,6 +1211,47 @@ def test_pid_controller_pushes_toward_target():
     assert np.allclose(v0, [0.05, 0.0, 0.0], atol=1e-9)
     assert np.allclose(v1, [0.05, 0.0, 0.0], atol=1e-9)
     assert scen["T_run_s"] == 16.0
+
+
+def test_pid_heave_trim_is_the_vehicle_net_buoyancy():
+    """2026-10-01: with the peg the vehicle needs ~12 N up and the PID's
+    heave integral is clamped at i_max 5 N, so it sank like mpc_tuned did
+    (data/20261001/1001_155105/mpc_154825.csv: 0.43 -> 0.19 m). The same
+    hw_mpc.yaml knob the NMPC trims with now feeds the PID's z force: at zero
+    error and rest the commanded Z equals vehicle_net_buoyancy_n (NED body z
+    down-positive, so -12 N = 12 N up), it is slew-limited like any term,
+    recorded in the meta, and 0 keeps the pre-10-01 bytes."""
+    from rov_gui.control.geometry import MpcConfig
+    from rov_gui.control.pid import HwPid
+
+    cfg = MpcConfig()
+    cfg.vehicle_net_buoyancy_n = -12.0
+    logs = []
+    pid = HwPid(cfg, log=logs.append)
+    assert any("heave trim f_z -12.00 N" in m for m in logs), logs
+    pid.set_target_ned([0.0, 0.0, 0.0], 0.0)
+    eta, nu = np.zeros(6), np.zeros(6)
+    u, _ = pid.step(eta, nu, np.zeros(6), 0.0)
+    assert abs(u[2] + pid.slew * pid.dt) < 1e-9        # first tick slew-limited
+    for _ in range(10):
+        u, _ = pid.step(eta, nu, np.zeros(6), 0.0)
+    assert abs(u[2] + 12.0) < 1e-9, u                  # settles at B - W
+    assert u[0] == 0.0 == u[1] and u[5] == 0.0          # z only
+    m = pid.meta()["heave_trim"]
+    assert m["applied"] and m["f_z_trim_n"] == -12.0
+    # the trim competes for authority like any term: f_max still binds
+    cfg.vehicle_net_buoyancy_n = -40.0
+    pid = HwPid(cfg, log=lambda _m: None)
+    pid.set_target_ned([0.0, 0.0, 0.0], 0.0)
+    for _ in range(20):
+        u, _ = pid.step(eta, nu, np.zeros(6), 0.0)
+    assert abs(u[2] + pid.f_max[2]) < 1e-9
+    # off: byte-identical to before
+    cfg.vehicle_net_buoyancy_n = 0.0
+    pid = HwPid(cfg, log=lambda _m: None)
+    pid.set_target_ned([0.0, 0.0, 0.0], 0.0)
+    u, _ = pid.step(eta, nu, np.zeros(6), 0.0)
+    assert u[2] == 0.0 and not pid.meta()["heave_trim"]["applied"]
 
 
 def test_pid_tracks_reference_velocity_in_body_frame():

@@ -1,0 +1,18 @@
+# pool_cam/bench_flicker.py  2026-10-01 19:11:36
+# rolling-band = frame-to-frame row-brightness std (crawling bands); row-stripe = fixed row pattern; 1080p30 MJPEG, 45 frames after 1.5 s settle
+cam0  /dev/v4l/by-path/pci-0000:13:00.0-usb-0:1:1.0-video-index0  usb-0000:13:00.0-1  SPCA2650 AV Camera:
+    50  rolling-band  3.75   row-stripe  1.82   level 121.6   frames 45
+    60  rolling-band  0.59   row-stripe  1.65   level 120.4   frames 45
+   off  rolling-band  0.59   row-stripe  1.69   level 120.3   frames 45
+cam1  /dev/v4l/by-path/pci-0000:13:00.0-usb-0:2:1.0-video-index0  usb-0000:13:00.0-2  USB RGB Camera: USB RGB Camera
+    50  rolling-band  1.92   row-stripe  1.36   level 140.7   frames 45
+    60  rolling-band  0.25   row-stripe  1.19   level 143.4   frames 45
+   off  rolling-band  0.17   row-stripe  1.25   level 140.4   frames 45
+cam2  /dev/v4l/by-path/pci-0000:13:00.0-usb-0:9:1.0-video-index0  usb-0000:13:00.0-9  USB RGB Camera: USB RGB Camera
+    50  rolling-band  1.48   row-stripe  3.02   level 133.2   frames 45
+    60  rolling-band  0.18   row-stripe  3.06   level 126.9   frames 45
+   off  rolling-band  0.19   row-stripe  3.08   level 126.9   frames 45
+cam3  /dev/v4l/by-path/pci-0000:13:00.0-usb-0:10:1.0-video-index0  usb-0000:13:00.0-10  USB RGB Camera: USB RGB Camera
+    50  rolling-band  1.90   row-stripe  3.98   level 136.1   frames 45
+    60  rolling-band  0.16   row-stripe  4.00   level 141.6   frames 45
+   off  rolling-band  0.18   row-stripe  3.94   level 135.2   frames 45

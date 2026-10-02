@@ -20,8 +20,13 @@ Two hardware deltas, both deliberate:
     the pole-placement scalings) because the sim's ωn assumed clean 20 Hz
     state and ideal thrust; the sim's own docs say "derate ωn for hardware".
     [예측] until a pool session tunes it.
-  * no buoyancy feed-forward — the real net buoyancy is unmeasured; the
-    heave integral carries it instead.
+  * heave trim (2026-10-01): ``hw_mpc.yaml vehicle_net_buoyancy_n`` (B - W of
+    the vehicle as flown, N, + floats) is added to the heave force as a
+    constant feed-forward, the same knob the NMPC consumes. Before this the
+    heave integral alone carried the net buoyancy, and it is clamped at
+    ``i_max`` 5 N — with the peg in the jaw the vehicle needs ~12 N up and
+    sank to the floor under pid exactly as under mpc_tuned (2026-09-30/10-01
+    runs). The integral still carries the residual. 0 = off.
 
 Interface-compatible with :class:`~rov_gui.control.mpc_bridge.HwDobMpc` as
 far as MpcWorker cares (including the shared geometric-path plan API), so the
@@ -96,6 +101,15 @@ class HwPid:
         self.e_gate = float(g["e_gate"])
         self.yaw_gate = float(g["yaw_gate"])
         self.dt = 1.0 / float(cfg.ctrl_hz)
+        # Constant heave feed-forward: NED body z is down-positive, so a
+        # vehicle that sinks (B - W < 0) needs a thrust of exactly B - W on
+        # z (negative = up). Added before the f_max clip so it competes for
+        # authority like any other term.
+        self.f_z_trim = float(getattr(cfg, "vehicle_net_buoyancy_n", 0.0) or 0.0)
+        if self.f_z_trim:
+            log(f"pid: heave trim f_z {self.f_z_trim:+.2f} N (config "
+                f"vehicle_net_buoyancy_n; the integral carries the rest, "
+                f"i_max {float(self.i_max[2]):.0f} N)")
         self.omega_derate = d
         log(f"pid: sim GAINS_HEAVY_GRIPPER x omega_derate {d} -> "
             f"kp {self.kp.round(1).tolist()} yaw_kp {self.yaw_kp:.2f} [예측]")
@@ -227,6 +241,7 @@ class HwPid:
         # reference this reduces exactly to the previous ``-kd * nu`` term.
         f = (self.kp * e_b + self.kd * (v_ref_b - nu[:3])
              + self.ki * self._i_xyz)
+        f[2] += self.f_z_trim
         f = np.clip(f, -self.f_max, self.f_max)
 
         e_psi = _wrap(yaw_ref - eta[5])
@@ -292,6 +307,11 @@ class HwPid:
                 "yaw_gate_rad": float(self.yaw_gate),
                 "f_max": self.f_max.tolist(), "mz_max": self.mz_max,
                 "slew_n_per_s": float(self.slew),
+                "heave_trim": {"applied": bool(self.f_z_trim),
+                               "vehicle_net_buoyancy_n": float(self.f_z_trim),
+                               "f_z_trim_n": float(self.f_z_trim),
+                               "note": "constant feed-forward on body z, "
+                                       "2026-10-01; 0 = off (pre-10-01 runs)"},
                 "axes_note": "u = [X, Y, Z, 0, 0, N] — this controller has no "
                              "roll/pitch loop, so K and M are never commanded "
                              "(attitude_axes / attitude_track refused on pid)",

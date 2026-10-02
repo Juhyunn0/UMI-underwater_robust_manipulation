@@ -56,7 +56,10 @@ assert set(SHAPE_LABELS) == set(SHAPES), "a shape without a label, or a label wi
 MODE_LABELS = {"none": "None", "pid": "PID", "mpc": "MPC",
                "mpc_tuned": "MPC_Tuned", "dobmpc": "DOBMPC",
                "dobmpc_tuned": "DOBMPC_Tuned", "mpcc": "MPCC",
-               "dobmpcc": "DOBMPCC", "rl": "RL"}
+               "dobmpcc": "DOBMPCC", "rl": "RL",
+               # 2026-09-30: the per-thruster RL policy (8 raw pulses through
+               # the vehicle's Lua override, mixer bypassed). Last, after RL.
+               "rl_pwm": "RL_PWM"}
 #: The ckpt row shows a BASENAME, elided past this many characters (the full
 #: path is the tooltip). Character-based, not pixel-based, so the row's width
 #: never depends on the font — the panel is a fixed grid cell.

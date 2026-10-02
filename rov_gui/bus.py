@@ -108,6 +108,10 @@ class DataBus(QObject):
     # Connected with Qt.QueuedConnection so the send happens in the worker's
     # thread even though the click happened in the GUI's.
     cmd_pilot = Signal(object)        # state.PilotInput
+    # LOW mode rl_pwm (2026-09-30): eight per-thruster pulses, MpcWorker -> the command sink. A SEPARATE signal from
+    # cmd_pilot on purpose: the pilot's sticks, the keyboard and every other controller can only ever emit axes, so
+    # nothing but the rl_pwm follower can put a raw pulse on the wire. Backends without the transport do not connect it.
+    cmd_pwm = Signal(object)          # state.PwmCommand
     cmd_gripper = Signal(float)       # 0 closed .. 1 open
     cmd_lights = Signal(float)        # 0 .. 1
     cmd_estop = Signal()              # zero everything, now
@@ -123,6 +127,12 @@ class DataBus(QObject):
     # Sending a level where a press is expected steps once and then sits there;
     # sending a press where a hold is expected twitches the jaw and stops.
     cmd_gripper_drive = Signal(float)   # -1 close / 0 idle / +1 open
+    # The SAME levels when the gamepad's gripper button already reached the
+    # vehicle inside the MANUAL_CONTROL passthrough mask (2026-10-01): nothing
+    # may send that press a second time, but the open-loop jaw estimator
+    # (policy proprio + the START record) still has to hear it. Connected to
+    # the estimator only — never to a command sink.
+    jaw_drive_seen = Signal(float)      # -1 close / 0 idle / +1 open, NOT a command
     cmd_lights_step = Signal(int)       # +n brighter, -n dimmer (presses)
     # Camera mount tilt. HELD like the gripper, not stepped like the lights:
     # ArduSub services mount_tilt_up/down from its button-REPEAT path, so the

@@ -37,8 +37,13 @@ And it only infers while ``PolicyState.active`` (the mission is armed and
 running) — the GPU idles otherwise, and a plan built from a stale state would
 be dropped by the consumer's epoch rule anyway (A8).
 
-Timing (A18 / A19): the forward runs on the session's own CUDA stream so it
-never serialises behind FoundationStereo's graph replay; the worker tick is
+Timing (A18 / A19): the forward runs on the session's own CUDA stream, which
+keeps it off FoundationStereo's QUEUE but not off its GPU — with the stereo
+network running back to back beside it the same forward takes 152.8 ms p50
+instead of 19.3 ms [측정: data/20260930/0930_220212/diag/
+policy_vs_fstereo_contention.json, offline]. ``--policy-fs-schedule`` (see
+perception/fs_gate.py and ``fs_gate`` below) is the switch for that; its
+default, ``free``, is this paragraph unchanged. The worker tick is
 20 ms and the inference period ``policy.period_s`` (0.5 s ≈ n_action_steps ×
 obs_dt). Inference fires on depth-frame ARRIVAL once the period has elapsed —
 not on the period timer's own phase, which would add a mean half frame
@@ -46,7 +51,10 @@ interval (69 ms at the measured 7.26 Hz [측정: rov_gui/tools/fstereo_bench_out
 policy_bench_20260902_141224.json]) to an intake budget that has none to
 spare (verify 2026-09-02) — and ``_last_infer`` is stamped only when a
 forward actually ran, so a skipped attempt retries on the next frame instead
-of burning a whole period. A plan is emitted with EVERY field the record
+of burning a whole period. (What the code does: a frame that arrived WHILE the
+period was still running leaves the arrival flag set, so the first tick after
+the period fires on the newest frame already in the ring; it waits for an
+arrival only when none came since the last attempt.) A plan is emitted with EVERY field the record
 needs to attribute it afterwards (the two proprio row stamps — taken at the
 SAME spacing as the two depth frames, so image and proprio baselines agree —
 the bracketing fix stamps, the real depth-pair spacing, whether the newest
@@ -65,6 +73,7 @@ import numpy as np
 
 from ..qt import Slot
 from ..perception.dp_policy import RPY_CONVENTION_STATION, is_stub_ckpt
+from ..perception.fs_gate import BURST_FRAMES
 from ..state import (ACTION_REPR_POS_RPY_WIDTH, Conn, POLICY_CKPT_DEFAULT,
                      POLICY_UMI_REPO, PolicyPlan, PolicyStatus, SensorStat, now)
 from .base import TimerWorker
@@ -104,6 +113,17 @@ FIX_LAG_TOL = 0.5
 #: consumes.
 STATE_STALE_S = 1.0
 
+#: `--policy-fs-schedule only`: how long before the period ends the worker
+#: asks FoundationStereo for its two frames, so the attempt lands on the
+#: period instead of a burst later. [유도: one camera interval to wait for a
+#: fresh pair (0-66.7 ms at 15 fps) + two frames at 75.8 ms each (data/
+#: 20260930/0930_220212/diag/policy_vs_fstereo_contention.json) = 152-218 ms.]
+#: A starting value only — the worker tracks the burst time it measures,
+#: inside [ONLY_LEAD_MIN_S, ONLY_LEAD_MAX_S].
+ONLY_LEAD_S = 0.2
+ONLY_LEAD_MIN_S = 0.1
+ONLY_LEAD_MAX_S = 0.4
+
 #: The device-depth path's --depth-scale correction (C3VideoWorker applies it
 #: at the source). The builder cannot know it; the record must (v2 A16).
 DEVICE_DEPTH_SCALE_DEFAULT = 0.64
@@ -141,6 +161,7 @@ _FALLBACK_POLICY_BLOCK = {
     # 2026-09-08: jaw anchored to the C3 lens (cam_t_flu + [0.196, 0, -0.275]);
     # mirrors geometry.default_policy_block — re-derive both if cam_t_flu moves.
     "tcp_body_flu_m": [0.502, 0.0, -0.17], "tcp_offset_cam_m": None,
+    "obs_view_forward_m": None,
     "min_obs_coverage": 0.985, "z_near_m": 0.20, "z_far_m": 3.00, "obs_res": 224,
     "gripper": False, "gripper_close_below": 0.30, "gripper_open_above": 0.67,
     "gripper_hold_max_s": 4.0,
@@ -193,12 +214,25 @@ def hydra_config_for(ckpt) -> Path | None:
     hydra writes the resolved training config next to it
     (``<run>/checkpoints/<name>.ckpt`` -> ``<run>/.hydra/config.yaml``), which
     is what a torch-free launch check can read.
+
+    ``data/checkpoints/*.ckpt`` are SYMLINKS into their run folder (the
+    2026-09-14 layout; the .json beside each says so), and the link's own
+    folder has no .hydra — so the target is searched first. Until 2026-09-30
+    it was not, and every launch from data/checkpoints skipped the FS parity
+    check: run meta ``policy.worker.fstereo.training.status`` is
+    ``no_hydra_config`` on all 178 non-stub blocks from 2026-09-14 on, against
+    245 ``ok`` before [측정: data/2026*/*/*.meta.json, counted 2026-09-30].
     """
     p = Path(str(ckpt)).expanduser()
-    for parent in (p.parent.parent, p.parent):
-        cand = parent / ".hydra" / "config.yaml"
-        if cand.is_file():
-            return cand
+    try:
+        bases = dict.fromkeys((p.resolve(), p))
+    except (OSError, RuntimeError):
+        bases = (p,)
+    for base in bases:
+        for parent in (base.parent.parent, base.parent):
+            cand = parent / ".hydra" / "config.yaml"
+            if cand.is_file():
+                return cand
     return None
 
 
@@ -279,11 +313,59 @@ def fs_settings_mismatch(opts, src: dict) -> list[str]:
                    f"{float(src['scale']):g}")
     ck = effective_fstereo_ckpt(opts)
     if ck is not None and src.get("checkpoint") and \
-            Path(str(ck)).expanduser().resolve() != Path(str(src["checkpoint"])).resolve():
+            not same_fstereo_ckpt(ck, src["checkpoint"]):
         typed = bool(getattr(opts, "fstereo_ckpt", None))
         bad.append(f"{'--fstereo-ckpt' if typed else 'default fstereo ckpt'} "
                    f"{ck} vs training {src['checkpoint']}")
     return bad
+
+
+def same_fstereo_ckpt(a, b) -> bool:
+    """Are ``a`` and ``b`` the same FoundationStereo checkpoint, wherever each
+    one lives?
+
+    The same resolved path; else, both files present, the same SHA-1 of the
+    first 8 MiB (the digest every run records as ``ckpt_sha1_first_8mib``);
+    else, one of them gone, the survivor's digest against upstream's
+    published one for the gone file's model id ``<run>/<file>``
+    (``fstereo.UPSTREAM_CKPT_SHA1``) — an id it does not know cannot be
+    verified and counts as different. Only when nothing can be read is the
+    model id alone compared.
+
+    A path is not an identity: on 2026-09-30 the checkout moved into this
+    repo (external/FoundationStereo), and the training stores name
+    ~/Desktop/FoundationStereo/... (deleted) or ~/Desktop/data collection/
+    FoundationStereo/... (a byte-identical copy), so a path compare reads the
+    same weights as another model. Nor may a path this user cannot stat
+    (EACCES, ENAMETOOLONG, ``~other``) raise: this runs in the launch check
+    and at a panel pick, where the old path compare only ever warned. It is
+    treated like a missing file.
+    """
+    from ..perception.fstereo import UPSTREAM_CKPT_SHA1, _sha1_head
+
+    def probe(x):
+        try:
+            p = Path(str(x)).expanduser()
+            return p, p.is_file()
+        except (OSError, RuntimeError, ValueError):
+            return Path(str(x)), False
+
+    (pa, ha), (pb, hb) = probe(a), probe(b)
+    try:
+        if pa.resolve() == pb.resolve():
+            return True
+    except (OSError, RuntimeError):
+        pass
+    try:
+        if ha and hb:
+            return _sha1_head(pa) == _sha1_head(pb)
+        if ha or hb:
+            have, gone = (pa, pb) if ha else (pb, pa)
+            want = UPSTREAM_CKPT_SHA1.get(f"{gone.parent.name}/{gone.name}")
+            return want is not None and _sha1_head(have) == want
+    except OSError:
+        pass                            # unreadable: only the model id is left
+    return (pa.parent.name, pa.name) == (pb.parent.name, pb.name)
 
 
 def effective_fstereo_ckpt(opts):
@@ -364,11 +446,26 @@ class PolicyWorker(TimerWorker):
         #: hw_nav's R_frd_cam('main'), kept for the MOUNT check against the
         #: checkpoint's yaw-axis rotation (_check_mount, 2026-09-07).
         self._R_bc = None
+        self.obs_view_shift_cam_m = None       # policy.obs_view_forward_m in the camera frame (setup)
         self._mount_ok = True
         self._mount_why = ""
         self._mount_said = False
         self.enabled = False
         self.fstereo_meta_fn = None            # injected by HardwareBackend
+        #: perception.fs_gate.FsGate, injected by HardwareBackend when
+        #: --policy-fs-schedule is `yield` or `only` and a FoundationStereo
+        #: worker exists. None — the default `free`, the demo source, device
+        #: depth, every offline tool — makes NO call into the gate: the
+        #: pre-2026-10-01 behaviour, unchanged.
+        self.fs_gate = None
+        #: `only`: the burst this worker asked FoundationStereo for and is
+        #: waiting on ({"t": request stamp}), None between bursts.
+        self._burst = None
+        #: `only`: how long before the period ends the burst is requested, so
+        #: the attempt lands on the period. Tracks the measured burst time.
+        self._only_lead_s = ONLY_LEAD_S
+        self._sched_n = {"bursts": 0, "burst_timeouts": 0, "burst_refused": 0}
+        self._burst_warn_t = -1e9
         #: The CONTROLLER's answer to "which folder is this run". Injected by
         #: the backend as ``MpcWorker._run_dir``; see the --record-depth block
         #: in setup() for why the recorder must not resolve its own.
@@ -511,11 +608,28 @@ class PolicyWorker(TimerWorker):
         target = str(pc["target_model"])
         if not Path(target).is_absolute() and not Path(target).exists():
             target = str(REPO / target)
+        # TEMPORARY view shift (policy.obs_view_forward_m, default null = off;
+        # policy_obs module docstring). The config names a distance along the
+        # BODY x axis because that is what a ruler measures on the vehicle; the
+        # builder wants it in the camera frame, and R_bc's first row is body x
+        # seen from the camera.
+        self.obs_view_shift_cam_m = None
+        fwd = pc.get("obs_view_forward_m")
+        if fwd:
+            self.obs_view_shift_cam_m = (float(fwd) * self._R_bc[0, :]).tolist()
         self.builder = DepthObsBuilder(
             target_model=target, z_near=float(pc["z_near_m"]),
             z_far=float(pc["z_far_m"]), out_res=int(pc["obs_res"]),
             warp_size=WARP_SIZE, min_coverage=float(pc["min_obs_coverage"]),
-            fill_iters=2)
+            fill_iters=2, view_shift_cam_m=self.obs_view_shift_cam_m)
+        if self.obs_view_shift_cam_m is not None:
+            self.bus.log.emit(
+                "warn",
+                f"policy: OBS VIEW SHIFT {float(fwd):+.3f} m along body x "
+                f"(camera frame {np.round(self.obs_view_shift_cam_m, 4).tolist()}) "
+                f"— the depth obs is re-rendered from a virtual viewpoint, NOT "
+                f"the training recipe (TEMPORARY, policy.obs_view_forward_m; "
+                f"null turns it off). Do not pool these runs with unshifted ones.")
 
         # --record-depth. Constructed here, opened on the first frame
         # (_start_recorder). Nothing else in a run writes depth to disk, so
@@ -755,7 +869,8 @@ class PolicyWorker(TimerWorker):
         self.counters["depth_frames"] += 1
         self._frame_pending = True
         self._n_depth += 1
-        self._depth_marks.append(now())
+        t_in = now()
+        self._depth_marks.append(t_in)
         grid, kind = self.mailbox.grid()
         b = self.builder
         if b is not None and b.grid_kind == "" and grid is not None:
@@ -774,7 +889,7 @@ class PolicyWorker(TimerWorker):
                     self._grid_fault_said = True
                     self.bus.log.emit("error", f"policy: depth grid REFUSED — {e}")
         self._ring.append({"t": float(item["t_capture"]), "depth": item["depth"],
-                           "obs": None, "stats": None})
+                           "obs": None, "stats": None, "t_arrive": t_in})
         c = self.mailbox.counters()
         if c.get("grid_refused", 0) and not self._grid_refused_said:
             self._grid_refused_said = True
@@ -1099,6 +1214,11 @@ class PolicyWorker(TimerWorker):
         if not is_stub_ckpt(path) and not Path(path).expanduser().is_file():
             self._refuse_ckpt(f"not a file: {path}")
             return
+        # The swap is going ahead: no mission can be running (4.), so leave
+        # the schedule gate open BEFORE the slow steps below — the parity read
+        # and the old session's close() run inside this slot, with no tick in
+        # between to do it.
+        self._fs_idle()
         # 7. FS parity (check_policy's rule, at pick time)
         if bool(getattr(self.opts, "fstereo", False)):
             tds = training_depth_source(path)
@@ -1186,13 +1306,16 @@ class PolicyWorker(TimerWorker):
     def tick(self) -> None:
         s = self.session
         if s is None or not self.enabled:
+            self._fs_idle()
             self._publish_status()
             return
         self._ingest_depth()
         if s.error:
+            self._fs_idle()
             self._publish_status(note=s.error[:60])
             return
         if not s.ready:
+            self._fs_idle()
             self._publish_status(note="loading" if s.loading else "not ready")
             return
         if not self._said_ready:
@@ -1213,18 +1336,37 @@ class PolicyWorker(TimerWorker):
                         f"{'ok' if self._mount_ok else 'MISMATCH'}; sha1 "
                         f"{self._ckpt_sha1 or '-'})")
         if not self._active():
+            self._fs_idle()
             self._first_pending = True
             self._publish_status(note="idle")
             return
         t = now()
         period = float(self.pc.get("period_s", 0.5))
+        gate = self.fs_gate
+        if gate is not None and gate.mode == "only":
+            if self._burst is not None or not self._only_blocked():
+                # The heartbeat `only` keys on: while these calls keep coming
+                # FoundationStereo computes only what this worker asks for;
+                # when they stop, it runs free again.
+                gate.set_active(True)
+                self._tick_only(gate, t, period)
+                return
+            # No forward could run whatever frames arrived (no fresh fix, no
+            # proprio history yet, no grid): a burst would be computed and
+            # thrown away. Let FoundationStereo run free and fall through to
+            # the `free` trigger, which counts the skip on each arrival
+            # exactly as a `free` run does — it cannot fire a forward here,
+            # because _skip_reason() refuses on the same conditions.
+            gate.set_active(False)
         if t - self._last_infer < period:
             self._publish_status()
             return
-        # Armed: fire on the next frame ARRIVAL, so the newest frame is as
-        # fresh as the producer can make it (a period-phase trigger added a
-        # mean half frame interval to the intake age). A skip does not stamp
-        # _last_infer: the next frame retries.
+        # Armed: an attempt needs a frame that ARRIVED since the last one. A
+        # frame that arrived while the period was still running leaves the
+        # flag set, so in practice this fires on the first tick after the
+        # period, on the newest frame already in the ring; it waits for an
+        # arrival only when none came since the last attempt. A skip does not
+        # stamp _last_infer: the next frame retries.
         if not self._frame_pending:
             self._publish_status()
             return
@@ -1234,8 +1376,157 @@ class PolicyWorker(TimerWorker):
             self.counters[skip] += 1
             self._publish_status(note=skip)
             return
-        if self._infer_once():
+        if gate is not None and gate.mode == "only":
+            # Not reachable while _only_blocked() and _skip_reason() agree
+            # (the blocked branch above is the only way here under `only`).
+            # If they ever drift apart, do not run a forward beside a
+            # free-running FoundationStereo and call it `only`: the next tick
+            # takes the burst path.
+            self._publish_status()
+            return
+        if self._infer_once(t):
             self._last_infer = t
+
+    def _fs_idle(self) -> None:
+        """No policy mission is running here: tell the gate (under `only`
+        FoundationStereo then runs free) and forget any burst and hold. Called
+        on EVERY path that leaves the mission — not active, loading, a failed
+        session, a checkpoint swap, teardown — because the gate's own
+        heartbeat timeout is the backstop, not the mechanism."""
+        gate = self.fs_gate
+        if gate is None:
+            return
+        self._burst = None
+        gate.set_active(False)
+        gate.release()
+
+    def _tick_only(self, gate, t: float, period: float) -> None:
+        """One tick of an active mission under `--policy-fs-schedule only`.
+
+        FoundationStereo is idle between bursts, so nothing arrives unless
+        this asks: ``ONLY`` the request makes frames. The request goes out
+        ``_only_lead_s`` before the period ends; the attempt fires when
+        BURST_FRAMES frames have ARRIVED since the request (the pair
+        ``_pick_pair`` then takes is those two) AND the period has elapsed —
+        period_s is the lower bound on the interval between attempts in every
+        schedule. The ``free`` trigger's arrival flag is not consulted — a
+        frame left over from before the request would otherwise fire an
+        attempt on a stale observation.
+
+        Every way out without a forward (a skip, a burst that did not
+        complete) leaves ``_last_infer`` unstamped and ``_burst`` None, so the
+        next tick asks again: FoundationStereo is never left waiting for a
+        request that will not come. (tick() does not come here at all while
+        ``_only_blocked()`` — FoundationStereo then runs free.)
+        """
+        b = self._burst
+        if b is None:
+            # Never a lead longer than the period itself: with a short
+            # period_s that would ask again the moment an attempt ended and
+            # the plans would come faster than the config says.
+            lead = min(self._only_lead_s, max(0.0, period - ONLY_LEAD_MIN_S))
+            if t - self._last_infer < period - lead:
+                self._publish_status()
+                return
+            if gate.request_burst(BURST_FRAMES):
+                self._burst = {"t": t}
+                self._frame_pending = False
+                self._sched_n["bursts"] += 1
+            else:
+                self._sched_n["burst_refused"] += 1
+            self._publish_status()
+            return
+        t_req = float(b["t"])
+        # `>`: a frame ingested on the request's own tick was taken BEFORE
+        # the request (tick() ingests, then stamps t), so it is not counted.
+        got = sum(1 for e in self._ring
+                  if float(e.get("t_arrive", 0.0) or 0.0) > t_req)
+        if got < BURST_FRAMES:
+            if t - t_req > float(gate.burst_timeout_s):
+                # The frames did not come (no pair from the camera, or this
+                # thread was blocked while two arrived and the one-slot
+                # mailbox kept only the newer). Ask again — and say so: this
+                # is a plan that is late by more than a period.
+                self._burst = None
+                self._sched_n["burst_timeouts"] += 1
+                if t - self._burst_warn_t > 5.0:
+                    self._burst_warn_t = t
+                    self.bus.log.emit(
+                        "warn", f"policy: FoundationStereo delivered {got} of "
+                                f"{BURST_FRAMES} frames within "
+                                f"{float(gate.burst_timeout_s):.1f} s of the "
+                                f"request (--policy-fs-schedule only) — asking "
+                                f"again ({self._sched_n['burst_timeouts']} so "
+                                f"far)")
+                self._publish_status(note="burst_timeout")
+                return
+            self._publish_status()
+            return
+        if "t_done" not in b:
+            # The burst is in. Track how long it took, for the next lead —
+            # down at once, up slowly: a lead longer than the burst makes the
+            # frames wait for the period below (an older observation), while
+            # a lead that is too short only makes the plan a little late.
+            b["t_done"] = t
+            dur = t - t_req
+            lead = (dur if dur < self._only_lead_s
+                    else 0.8 * self._only_lead_s + 0.2 * dur)
+            self._only_lead_s = min(ONLY_LEAD_MAX_S, max(ONLY_LEAD_MIN_S, lead))
+        if t - self._last_infer < period:
+            # period_s stays the LOWER bound on the interval between
+            # attempts, as it is under `free` and `yield`: a burst that came
+            # in early (the lead was longer than this burst took) waits here.
+            self._publish_status()
+            return
+        self._burst = None
+        self._frame_pending = False
+        skip = self._skip_reason()
+        if skip:
+            self.counters[skip] += 1
+            self._publish_status(note=skip)
+            return
+        if self._infer_once(t):
+            self._last_infer = t
+
+    def _only_blocked(self) -> bool:
+        """`only`: would an attempt be skipped for a reason NO depth frame
+        can cure — no usable grid, no proprio history, the newest row not a
+        fresh fix, no start pose? These are _skip_reason()'s own tests minus
+        the two about the depth ring, which under `only` is stale between
+        bursts by design."""
+        b = self.builder
+        if b is None or not b.usable:
+            return True
+        if self.hist is None or len(self.hist) == 0:
+            return True
+        if self.hist.span() < self._obs_dt():
+            return True
+        if not self._newest_row_fresh:
+            return True
+        st = self._state
+        return st is None or st.eta_start is None
+
+    def _fs_input_tag(self) -> str:
+        """FoundationStereo's network input as asked for on the command line,
+        for the plan record: "size WxH itN" (an explicit size governs) else
+        "scale S itN"; "" when this run's depth is not FoundationStereo.
+        Alpha, the checkpoint and what the session actually ran are in the
+        run meta (fstereo.*), not here."""
+        if self.fs_gate is None and self.fstereo_meta_fn is None:
+            return ""
+        iters = getattr(self.opts, "fstereo_iters", None)
+        try:
+            it = f" it{int(iters)}" if iters is not None else ""
+        except (TypeError, ValueError):
+            it = ""
+        size = getattr(self.opts, "fstereo_size", None)
+        if size:
+            return f"size {str(size).lower()}{it}"   # argparse hands "WxH"
+        scale = getattr(self.opts, "fstereo_scale", None)
+        try:
+            return f"scale {float(scale):g}{it}" if scale is not None else ""
+        except (TypeError, ValueError):
+            return ""
 
     def _skip_reason(self) -> str:
         """The counter name of the first A9/A6/A18 gate that fails, or ''."""
@@ -1258,9 +1549,10 @@ class PolicyWorker(TimerWorker):
             return "skip_no_start"
         return ""
 
-    def _infer_once(self) -> bool:
+    def _infer_once(self, t_trigger=None) -> bool:
         """One attempt. True when the network RAN (a plan, or a predict
-        error — both consume the period); False on a pre-forward skip."""
+        error — both consume the period); False on a pre-forward skip.
+        ``t_trigger`` is the tick that began the attempt (the plan record)."""
         from ..control.policy_frames import lowdim_obs
 
         obs_dt = self._obs_dt()
@@ -1289,25 +1581,48 @@ class PolicyWorker(TimerWorker):
             return False
         t_prev, t_now = float(info["t_prev"]), float(info["t_now"])
         st = self._state
+        # FS SCHEDULE (2026-10-01; perception/fs_gate.py). Past the three
+        # pre-forward skips above the network WILL be asked, so this is where
+        # FoundationStereo is told not to start another frame: the observation
+        # build below is CPU work that the frame in flight finishes under, and
+        # the wait just before the forward covers whatever is left of it. The
+        # finally releases on every way out — the two `return True`s, an
+        # exception from the unguarded lines between them — because a tick
+        # exception is swallowed by TimerWorker._tick and nobody else would;
+        # the gate's own lease is the backstop, not the plan. `fs_gate` None
+        # (the default) makes no call at all.
+        gate = self.fs_gate
+        fs_wait_ms = None
+        fs_timed_out = None
+        if gate is not None:
+            gate.hold()
         try:
-            obs_prev, _ = self._obs_for(partner)
-            obs_now, stats_now = self._obs_for(newest)
-        except Exception as e:                                   # noqa: BLE001
-            self._infer_error(f"obs build: {type(e).__name__}: {e}")
-            return True
-        img = np.stack([obs_prev, obs_now], axis=0).astype(np.float32) / 255.0
-        img = np.ascontiguousarray(img.transpose(0, 3, 1, 2))     # (2,3,R,R)
-        w_prev = self._width_at(t_prev)
-        w_now = self._width_at(t_now)
-        lowdim = lowdim_obs(eta_prev, eta_now, st.eta_start, self.T_bt,
-                            w_prev, w_now)
-        obs = {IMAGE_KEY: img}
-        obs.update(lowdim)
-        try:
-            action, infer_ms = self.session.predict(obs)
-        except Exception as e:                                   # noqa: BLE001
-            self._infer_error(f"predict: {type(e).__name__}: {e}")
-            return True
+            try:
+                obs_prev, _ = self._obs_for(partner)
+                obs_now, stats_now = self._obs_for(newest)
+            except Exception as e:                               # noqa: BLE001
+                self._infer_error(f"obs build: {type(e).__name__}: {e}")
+                return True
+            img = np.stack([obs_prev, obs_now], axis=0).astype(np.float32) / 255.0
+            img = np.ascontiguousarray(img.transpose(0, 3, 1, 2))     # (2,3,R,R)
+            w_prev = self._width_at(t_prev)
+            w_now = self._width_at(t_now)
+            lowdim = lowdim_obs(eta_prev, eta_now, st.eta_start, self.T_bt,
+                                w_prev, w_now)
+            obs = {IMAGE_KEY: img}
+            obs.update(lowdim)
+            if gate is not None:
+                # NOT inside infer_ms (the session times its own forward):
+                # the wait is its own number on the plan.
+                fs_wait_ms, fs_timed_out = gate.wait_idle()
+            try:
+                action, infer_ms = self.session.predict(obs)
+            except Exception as e:                               # noqa: BLE001
+                self._infer_error(f"predict: {type(e).__name__}: {e}")
+                return True
+        finally:
+            if gate is not None:
+                gate.release()
         self._infer_fault = ""
         self._plan_id += 1
         self.counters["plans"] += 1
@@ -1334,7 +1649,14 @@ class PolicyWorker(TimerWorker):
             depth_coverage=float(self.builder.coverage),
             depth_valid=float(stats_now["obs_valid"]),
             ckpt_sha1=self._ckpt_sha1, obs_dt_s=float(obs_dt),
-            action_repr=self._action_repr(), stamp=t_emit)
+            action_repr=self._action_repr(),
+            depth_arrive_t=newest.get("t_arrive"),
+            trigger_t=(float(t_trigger) if t_trigger is not None else None),
+            fs_schedule=(gate.mode if gate is not None else "free"),
+            fs_wait_ms=(float(fs_wait_ms) if fs_wait_ms is not None else None),
+            fs_wait_timeout=(bool(fs_timed_out) if fs_timed_out is not None
+                             else None),
+            fs_input=self._fs_input_tag(), stamp=t_emit)
         self.bus.policy_plan.emit(plan)
         self._publish_status(force=True, note=f"plan {self._plan_id} ({how})")
         return True
@@ -1401,6 +1723,8 @@ class PolicyWorker(TimerWorker):
                   else str(self.pc.get("ckpt", "") or "")),
             ckpt_sha1=str(self._ckpt_sha1),
             ckpt_note=str(self._ckpt_note),
+            fs_schedule=(self.fs_gate.mode if self.fs_gate is not None
+                         else "free"),
             conn=self._conn(), stamp=t)
         self.bus.policy_status.emit(st)
         detail = self._sensor_detail(st)
@@ -1545,8 +1869,31 @@ class PolicyWorker(TimerWorker):
                 "tol": PAIR_TOL, "fallback_max": PAIR_FALLBACK,
                 "skip_fix_lag": int(self.counters["skip_fix_lag"]),
                 "fix_lag_tol": FIX_LAG_TOL,
-                "trigger": "depth-frame arrival after period_s",
+                "trigger": ("depth-frame arrival after period_s"
+                            if getattr(self.fs_gate, "mode", "free") != "only"
+                            else f"{BURST_FRAMES} frames requested from "
+                                 f"FoundationStereo ahead of period_s "
+                                 f"(--policy-fs-schedule only)"),
+                # `trigger` above is kept word for word for `free`/`yield`
+                # (every record since 2026-09-02 carries it), but it
+                # overstates: what the code does is this. Per plan,
+                # trigger_age_s - depth_ready_age_s in plans.jsonl is how old
+                # the newest frame already was when the attempt began.
+                "trigger_detail": (
+                    "first 20 ms tick after period_s, on the newest frame "
+                    "already in the ring; waits for an arrival only when none "
+                    "came since the last attempt"
+                    if getattr(self.fs_gate, "mode", "free") != "only" else
+                    "when the requested frames have arrived and period_s has "
+                    "elapsed; free trigger while no forward could run"),
             },
+            # Which FoundationStereo schedule this run flew (2026-10-01).
+            # RECORD BOUNDARY: plan age and infer_ms of runs on different
+            # schedules must not be pooled, and under `only` the pair spacing
+            # (pairing.near/fallback above, obs_pair_dt_s per plan) and the
+            # trigger differ too. Always written, `free` included — an absent
+            # block is a build that had no switch.
+            "fs_schedule": self._fs_schedule_meta(),
             "infer_ms": {
                 "p50": float(np.percentile(infer, 50)) if infer.size else None,
                 "max": float(infer.max()) if infer.size else None,
@@ -1559,11 +1906,42 @@ class PolicyWorker(TimerWorker):
         }
         return out
 
+    def _fs_schedule_meta(self) -> dict:
+        """What was typed, what is in effect, why they differ, and the gate's
+        own counters. Runs on the CONTROLLER's thread (``meta``): the gate's
+        snapshot copies under its own short lock, and nothing here may raise
+        (an exception replaces the whole policy block with an error line)."""
+        gate = self.fs_gate
+        requested = str(getattr(self.opts, "policy_fs_schedule", "free") or "free")
+        effective = str(getattr(gate, "mode", "free")) if gate is not None else "free"
+        out = {
+            "requested": requested, "effective": effective,
+            "why": ("" if requested == effective else
+                    "no FoundationStereo worker feeds this policy (demo source "
+                    "or device depth): there is nothing to schedule, so the "
+                    "run is `free`" if gate is None else
+                    f"a gate was injected with mode {effective}; the options "
+                    f"said {requested}"),
+            "worker": dict(self._sched_n),
+            "only_lead_s": (round(float(self._only_lead_s), 3)
+                            if effective == "only" else None),
+            "gate": None,
+        }
+        if gate is not None:
+            try:
+                out["gate"] = gate.snapshot()
+            except Exception as e:                               # noqa: BLE001
+                out["gate"] = {"error": f"{type(e).__name__}: {e}"}
+        return out
+
     # -------------------------------------------------------------- teardown
     def teardown(self) -> None:
         # set_ckpt refuses from here on; self.session is KEPT (closed, not
         # dropped) for a meta() racing this from the controller's thread.
         self._torn_down = True
+        # This worker stops BEFORE the stereo worker (Backend.stop is reverse
+        # order): leave the gate open behind it.
+        self._fs_idle()
         self.mailbox.set_wanted(False)
         self.enabled = False
         if self.depth_rec is not None:

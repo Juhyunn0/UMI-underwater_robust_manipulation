@@ -210,6 +210,30 @@ QPushButton#Danger {{
 QPushButton#Danger:pressed {{ background: {FAIL}; color: #1a0505; }}
 QPushButton#Rec:checked {{ background: {FAIL}; border-color: {FAIL}; color: #200; }}
 
+/* STATION | POOL CAMS (window.py, --pool-cams). The button language again, so
+   a page tab reads as a control and the selected one as "on". The weight and
+   spacing go on the BAR, not on ::tab: QTabBar measures a tab with the bar's
+   font, so a bolder ::tab font is drawn into a box sized for a thinner one and
+   loses its first and last letters. */
+QTabBar#PageTabs {{
+    font-weight: 600;
+    letter-spacing: 1px;
+}}
+QTabBar#PageTabs::tab {{
+    background: {PANEL_HI};
+    border: 1px solid {BORDER_HI};
+    border-radius: 4px;
+    padding: 3px 12px;
+    margin-right: 4px;
+    color: {TEXT_DIM};
+}}
+QTabBar#PageTabs::tab:hover {{ border-color: {ACCENT}; }}
+QTabBar#PageTabs::tab:selected {{
+    background: {ACCENT};
+    border-color: {ACCENT};
+    color: #04121b;
+}}
+
 /* Combo boxes and spin boxes. Written out because Qt's defaults are a LIGHT
    widget: on this palette they render as pale grey slabs with near-invisible
    text, which is exactly what the mission row looked like before

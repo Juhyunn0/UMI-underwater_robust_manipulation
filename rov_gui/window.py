@@ -4,13 +4,19 @@ window.py — the control station itself: one QGridLayout, one screen, no scroll
 
 The layout
 ----------
-    row 0   header  (spans all four columns, fixed height)
-    row 1   MAIN VIDEO       | STEREO L | SYSTEM
-    row 2   (2 cols, 2 rows) | DEPTH    | HEALTH (2 rows)
-    row 3   TELEOP | PAYLOAD | PROPULS. | SENSORS
-            status bar  (spans all four columns, fixed height)
+            header  (above the grid, full width, fixed height)
+    row 0   MAIN VIDEO       | STEREO L | SYSTEM
+    row 1   (2 cols, 2 rows) | DEPTH    | HEALTH (2 rows)
+    row 2   TELEOP | PAYLOAD | PROPULS. | SENSORS
+            status bar  (full width, fixed height)
 
-    column stretch  3 : 3 : 3 : 3      row stretch  0 : 3 : 3 : 0
+    column stretch  3 : 3 : 3 : 3      row stretch  3 : 3 : 0
+
+With ``--pool-cams`` the header grows a STATION | POOL CAMS tab bar and the
+grid becomes the first of two pages (widgets/poolcam.py is the second). The
+header — E-STOP, REC UI, the state pills, the LEAK banner — is above both, so
+no tab ever hides a stop; the keyboard keeps flying on either page, because
+the window, not the page, is the key handler.
 
 Four columns rather than three because of a height budget, not a width one.
 Every column stacks a tall panel over a short one, and with three columns the
@@ -247,11 +253,44 @@ class MainWindow(QtWidgets.QMainWindow):
         root = QtWidgets.QWidget()
         root.setObjectName("Root")
         self.setCentralWidget(root)
-        grid = QtWidgets.QGridLayout(root)
-        grid.setContentsMargins(8, 8, 8, 6)
-        grid.setSpacing(8)
+        outer = QtWidgets.QVBoxLayout(root)
+        outer.setContentsMargins(8, 8, 8, 6)
+        outer.setSpacing(8)
 
-        grid.addWidget(self._build_header(), 0, 0, 1, 4)
+        # The pool-corner cameras (--pool-cams), a page of their own. Built
+        # before the header because the header carries their tab. The camera
+        # process itself starts in attach(), with the backend.
+        self._pool_client = None
+        self.poolcams = None
+        self._pool_tick_failed = False
+        if bool(getattr(self.opts, "pool_cams", False)):
+            from .poolcam import client_from_opts
+            from .widgets.poolcam import PoolCamPanel
+
+            try:
+                self._pool_client = client_from_opts(self.opts, self.bus.log.emit)
+                self.poolcams = PoolCamPanel(self._pool_client)
+            except Exception as e:                               # noqa: BLE001
+                # A typo in pool_cams.yaml costs the cameras, not the station.
+                self._pool_client = self.poolcams = None
+                print(f"[error] pool cams OFF: {type(e).__name__}: {e}", flush=True)
+                QTimer.singleShot(0, lambda e=e: self.bus.log.emit(
+                    "error", f"pool cams OFF — {type(e).__name__}: {e}"))
+
+        outer.addWidget(self._build_header())
+        station = QtWidgets.QWidget()
+        grid = QtWidgets.QGridLayout(station)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(8)
+        self.pages = None
+        if self.poolcams is None:
+            outer.addWidget(station, 1)
+        else:
+            self.pages = QtWidgets.QStackedWidget()
+            self.pages.addWidget(station)
+            self.pages.addWidget(self.poolcams)
+            self.page_tabs.currentChanged.connect(self.pages.setCurrentIndex)
+            outer.addWidget(self.pages, 1)
 
         self.videos: dict[str, VideoPanel] = {}
         for key, title, legend in self.panels:
@@ -454,18 +493,18 @@ class MainWindow(QtWidgets.QMainWindow):
             duo.addWidget(self.propulsion)
             duo.addWidget(self.sensors)
             v.addLayout(duo)
-            grid.addWidget(col3, 1, 3, 2, 1)
-            grid.addWidget(self.teleop, 3, 0)
-            grid.addWidget(self.payload, 3, 1)
-            grid.addWidget(self._traj_panel, 3, 2, 1, 2)
+            grid.addWidget(col3, 0, 3, 2, 1)
+            grid.addWidget(self.teleop, 2, 0)
+            grid.addWidget(self.payload, 2, 1)
+            grid.addWidget(self._traj_panel, 2, 2, 1, 2)
         else:
-            grid.addWidget(self.health, 1, 3, 2, 1)
-            grid.addWidget(self.teleop, 3, 0)
-            grid.addWidget(self.payload, 3, 1)
-            grid.addWidget(self.propulsion, 3, 2)
-            grid.addWidget(self.sensors, 3, 3)
+            grid.addWidget(self.health, 0, 3, 2, 1)
+            grid.addWidget(self.teleop, 2, 0)
+            grid.addWidget(self.payload, 2, 1)
+            grid.addWidget(self.propulsion, 2, 2)
+            grid.addWidget(self.sensors, 2, 3)
 
-        # Rule 2 from the module docstring, applied where it matters: the row-3
+        # Rule 2 from the module docstring, applied where it matters: the row-2
         # panels must not compete with the video rows for vertical space.
         for w in (self.teleop, self.payload, self.propulsion, self.sensors):
             w.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred,
@@ -473,10 +512,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         for col in range(4):
             grid.setColumnStretch(col, 3)
-        grid.setRowStretch(0, 0)
+        grid.setRowStretch(0, 3)
         grid.setRowStretch(1, 3)
-        grid.setRowStretch(2, 3)
-        grid.setRowStretch(3, 0)
+        grid.setRowStretch(2, 0)
 
         self.status = QtWidgets.QStatusBar()
         self.setStatusBar(self.status)
@@ -493,9 +531,9 @@ class MainWindow(QtWidgets.QMainWindow):
         others = [k for k, _t, _l in self.panels if k != main]
         for panel in self.videos.values():
             self.grid.removeWidget(panel)
-        self.grid.addWidget(self.videos[main], 1, 0, 2, 2)
-        self.grid.addWidget(self.videos[others[0]], 1, 2)
-        self.grid.addWidget(self.videos[others[1]], 2, 2)
+        self.grid.addWidget(self.videos[main], 0, 0, 2, 2)
+        self.grid.addWidget(self.videos[others[0]], 0, 2)
+        self.grid.addWidget(self.videos[others[1]], 1, 2)
         for panel in self.videos.values():
             panel.show()
         self._main_video = main
@@ -563,6 +601,25 @@ class MainWindow(QtWidgets.QMainWindow):
         title.setStyleSheet(f"font-size:14px; font-weight:700; color:{theme.TEXT};"
                             "letter-spacing:1px;")
         lay.addWidget(title)
+
+        # STATION | POOL CAMS, only with --pool-cams. In the header rather than
+        # above the pages: the header already has the height, and the one-
+        # screen budget has none to spare. NoFocus like every control here —
+        # a tab bar that took the keyboard would stop the pilot's keys.
+        self.page_tabs = None
+        if self.poolcams is not None:
+            self.page_tabs = QtWidgets.QTabBar()
+            self.page_tabs.setObjectName("PageTabs")
+            self.page_tabs.addTab("STATION")
+            self.page_tabs.addTab("POOL CAMS")
+            self.page_tabs.setDrawBase(False)
+            self.page_tabs.setExpanding(False)
+            self.page_tabs.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            self.page_tabs.setToolTip(
+                "POOL CAMS: the pool-corner cameras (watch only).\n"
+                "The keyboard and joystick keep flying on either page,\n"
+                "and REC UI records them with the station.")
+            lay.addWidget(self.page_tabs)
 
         # Elided and Ignored-width: the backend description is the one piece of
         # header text that may be sacrificed, so it yields space to the state
@@ -718,6 +775,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.source_label.setText(backend.describe())
         self.banner.setVisible(bool(getattr(backend, "simulated", False)))
         backend.start()
+        if self._pool_client is not None:
+            self._pool_client.start()
         self.ui_timer.start()
         self.cmd_timer.start()
         if getattr(self.opts, "joystick", "auto") != "none":
@@ -1466,6 +1525,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.bus.log.emit("error",
                                   f"MPC worker unresponsive ({age:.1f}s) — "
                                   f"releasing control to the pilot")
+                self._show_station()
                 self.teleop.all_stop()
                 self.teleop.show_command(None)
                 self._mpc_engaged = False
@@ -1510,6 +1570,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self.rec_btn.setText(self.recorder.stats.label())
 
         self._update_status()
+        # LAST, and fenced: the pool cameras are a watch-only page, and a bug in
+        # it must not skip the MPC watchdog, the pills or the arm display above
+        # — the slot guard would keep the process up but drop the rest of the
+        # tick, every tick.
+        if self.poolcams is not None:
+            try:
+                self.poolcams.tick()
+            except Exception as e:                               # noqa: BLE001
+                if not self._pool_tick_failed:
+                    self._pool_tick_failed = True
+                    self.bus.log.emit("error", f"pool cams tab: {type(e).__name__}: "
+                                               f"{e} (further errors not shown)")
+
+    def _show_station(self) -> None:
+        """Back to the STATION page — the one with DISARM, the MPC panel and
+        the MISSION LOG. Called on every alarm the pilot must act on."""
+        if self.page_tabs is not None and self.page_tabs.currentIndex() != 0:
+            self.page_tabs.setCurrentIndex(0)
 
     def _sink_status(self) -> tuple[Conn, str]:
         sink = getattr(self.backend, "sink", None) if self.backend else None
@@ -1530,6 +1608,9 @@ class MainWindow(QtWidgets.QMainWindow):
                    f" -{self.recorder.stats.dropped}")
         for k, st in active:
             rec += f" | REC {self._feed_name(k)} {st.frames}f -{st.dropped}"
+        if self._pool_client is not None and self._pool_client.recording:
+            rec += (" | REC pool cams" if self._pool_client.alive
+                    else " | pool cams NOT RECORDING")
         self.stats_label.setText(
             f"ui {self._ui_hz:4.1f} Hz | frames drawn {drawn} "
             f"conflated {conflated}{rec}")
@@ -1677,6 +1758,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 # command would press the function twice — two notches per
                 # light press, two gripper bits per squeeze.
                 self.teleop._set_action(chip, now_down, notify=not passthrough)
+                if passthrough and chip in ("G", "H"):
+                    # ... but the jaw estimator must still hear the squeeze
+                    # (2026-10-01: a gamepad-closed jaw read as "open" for
+                    # the rest of the session). Same level the key path
+                    # emits; this signal reaches no command sink.
+                    self.bus.jaw_drive_seen.emit(
+                        0.0 if not now_down else (-1.0 if chip == "G" else +1.0))
         self._js_prev = pressed
 
         self.teleop.set_joystick(
@@ -1716,6 +1804,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ============================================================== controls
     def estop(self) -> None:
+        self._show_station()
         self.teleop.all_stop()
         self.teleop.show_command(None)
         self.teleop.force_disable()
@@ -1729,6 +1818,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.recorder.stats.recording:
             path = self.recorder.stop()
             self.bus.log.emit("info", f"recording saved: {path}")
+            self._pool_rec(False)
             # The log belongs with the video it explains — same run folder.
             self._save_mission_log(path.parent if path else None)
         else:
@@ -1746,10 +1836,35 @@ class MainWindow(QtWidgets.QMainWindow):
                 # down what was flying (controller.json — plant + gains), into
                 # the run folder this video just landed in.
                 self.bus.cmd_mpc_dump_meta.emit(str(path.parent))
+                self._pool_rec(True, path)
         # Locked while running: the name is baked into the filename at start,
         # so an edit mid-recording would describe a file it did not name.
         self.rec_name.setEnabled(not self.recorder.stats.recording)
         self.rec_btn.setChecked(self.recorder.stats.recording)
+
+    def _pool_rec(self, on: bool, ui_path=None) -> None:
+        """The pool cameras follow REC UI: same press, same run folder.
+
+        t0 is the UI recording's own start (ScreenRecorder.stats.started_at,
+        time.monotonic()), so every pool file and the UI video share one
+        origin on one clock. The files go in a ``pool_<HHMMSS>/`` folder of
+        their own inside the run folder, like ``nav_<HHMMSS>/``: four cameras
+        are eight files plus session.json.
+        """
+        client = self._pool_client
+        if client is None:
+            return
+        if not on:
+            if client.recording:
+                client.stop_recording()
+                self.bus.log.emit("info", "pool cams: recording stopped "
+                                          "(files are finishing)")
+            return
+        t0 = self.recorder.stats.started_at or time.monotonic()
+        outdir = ui_path.parent / f"pool_{runstore.stamp('%H%M%S')}"
+        if client.start_recording(t0, outdir, ui_video=ui_path.name,
+                                  ui_started=self.recorder.stats.started_at):
+            self.bus.log.emit("info", f"pool cams: recording to {outdir}")
 
     def _toggle_feed_record(self, key: str) -> None:
         rec = self.feed_recorders[key]
@@ -1798,6 +1913,8 @@ class MainWindow(QtWidgets.QMainWindow):
         — FS_LEAK_ENABLE=1 is "warn only".
         """
         if text:
+            if not self.alert.isVisible():
+                self._show_station()
             if self.alert.text() != text:
                 self.alert.setText(text)
                 self.alert.setToolTip(
@@ -1914,6 +2031,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.backend is not None:
             self.bus.cmd_estop.emit()      # leave the vehicle neutral
             self.backend.stop()
+        # Last, so waiting on the cameras' files never delays leaving the
+        # vehicle neutral. stop() ends the recording and waits a bounded time;
+        # a child still flushing after that finishes on its own (poolcam.py).
+        if self._pool_client is not None:
+            self._pool_client.stop()
 
     def closeEvent(self, ev) -> None:
         self.shutdown()

@@ -1,0 +1,7 @@
+# pool_cam/bench_cost.py  2026-09-30 21:52:38
+# argv: /home/bdml/Desktop/umi_underwater_robust_control/pool_cam/pool_cam.py --serve --size 1920x1080 --fps 30 --encoder auto --device P4=/dev/v4l/by-path/pci-0000:13:00.0-usb-0:4:1.0-video-index0 --device P2=/dev/v4l/by-path/pci-0000:13:00.0-usb-0:2:1.0-video-index0
+# host cores: 16
+# cameras: ['P4', 'P2']  codec: h264_nvenc (GPU), CQ 28
+idle     camera-process+ffmpeg  0.20 cores   station side  0.00 cores   previews   0.0/s   camera fps: P4 30.1, P2 29.4
+preview  camera-process+ffmpeg  0.22 cores   station side  0.01 cores   previews  19.8/s   camera fps: P4 30.1, P2 29.4
+record   camera-process+ffmpeg  0.42 cores   station side  0.01 cores   previews  19.7/s   camera fps: P4 30.1, P2 29.5

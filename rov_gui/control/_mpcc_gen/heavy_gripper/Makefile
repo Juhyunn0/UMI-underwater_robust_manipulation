@@ -153,8 +153,8 @@ ocp_cython_o: ocp_cython_c
 	-I $(INCLUDE_PATH)/blasfeo/include/ \
 	-I $(INCLUDE_PATH)/hpipm/include/ \
 	-I $(INCLUDE_PATH) \
-	-I /home/bdml/miniforge3/envs/robust/lib/python3.12/site-packages/numpy/core/include \
-	-I /home/bdml/miniforge3/envs/robust/include/python3.12 \
+	-I /home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/numpy/_core/include \
+	-I /home/bdml/miniforge3/envs/rovgui-pose/include/python3.12 \
 	acados_ocp_solver_pyx.c \
 
 ocp_cython: ocp_cython_o
@@ -182,8 +182,8 @@ sim_cython_o: sim_cython_c
 	-I $(INCLUDE_PATH)/blasfeo/include/ \
 	-I $(INCLUDE_PATH)/hpipm/include/ \
 	-I $(INCLUDE_PATH) \
-	-I /home/bdml/miniforge3/envs/robust/lib/python3.12/site-packages/numpy/core/include \
-	-I /home/bdml/miniforge3/envs/robust/include/python3.12 \
+	-I /home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/numpy/_core/include \
+	-I /home/bdml/miniforge3/envs/rovgui-pose/include/python3.12 \
 	acados_sim_solver_pyx.c \
 
 sim_cython: sim_cython_o

@@ -1,0 +1,11 @@
+# pool_cam/bench_cost.py  2026-10-01 19:01:25
+# argv: /home/bdml/Desktop/umi_underwater_robust_control/pool_cam/pool_cam.py --serve --size 1920x1080 --fps 30 --encoder auto --device P1=/dev/v4l/by-path/pci-0000:13:00.0-usb-0:1:1.0-video-index0 --device P2=/dev/v4l/by-path/pci-0000:13:00.0-usb-0:2:1.0-video-index0 --device P9=/dev/v4l/by-path/pci-0000:13:00.0-usb-0:9:1.0-video-index0 --device P10=/dev/v4l/by-path/pci-0000:13:00.0-usb-0:10:1.0-video-index0
+# host cores: 16
+# cameras: ['P1', 'P2', 'P9', 'P10']  codec: h264_nvenc (GPU), CQ 28
+idle     camera-process+ffmpeg  0.38 cores   station side  0.00 cores   previews   0.0/s   camera fps: P1 29.4, P2 30.0, P9 30.1, P10 30.1
+preview  camera-process+ffmpeg  0.41 cores   station side  0.01 cores   previews  39.2/s   camera fps: P1 29.4, P2 30.1, P9 30.1, P10 30.1
+record   camera-process+ffmpeg  0.87 cores   station side  0.02 cores   previews  38.9/s   camera fps: P1 29.5, P2 30.1, P9 30.1, P10 30.1
+# P10_2026-10-01_19-01-58.json: encoder=nvenc  frames=450  seconds=15.0  camera_frames=450  repeated=0  skipped=2  dropped=0  complete=True  error=None
+# P1_2026-10-01_19-01-58.json: encoder=nvenc  frames=449  seconds=14.967  camera_frames=441  repeated=8  skipped=0  dropped=0  complete=True  error=None
+# P2_2026-10-01_19-01-58.json: encoder=nvenc  frames=449  seconds=14.967  camera_frames=449  repeated=0  skipped=2  dropped=0  complete=True  error=None
+# P9_2026-10-01_19-01-58.json: encoder=nvenc  frames=450  seconds=15.0  camera_frames=450  repeated=0  skipped=1  dropped=0  complete=True  error=None

@@ -1,0 +1,33 @@
+# fstereo_bench.py session — 2026-09-30 17:48:55
+# gpu: NVIDIA GeForce RTX 5090, torch 2.11.0+cu128, other compute processes at start: none, at end: none, --force: False
+# frames: /home/bdml/Desktop/data collection/videos episodes ('61', '66', '12') frames (10, 90, 170)
+# rig: c3_camera.host_depth.bench_rig (synthetic C3-like geometry)
+
+9 real pairs through infer(): host rectify -> network -> mm -> 400x250 colour grid -> NEAREST to 640x360 (the station's path)
+                   setting | load s 1st ms infer ms    Hz | native % fill % loss % | provenance
+ graph, scale 0.5, iters 8 |    4.8   1465     43.8  22.8 |   100.00  99.63   0.37 | cuda_graph=True input=[1, 3, 224, 320] err=None
+                             [info] fstereo: vitl @ 23-51-11 ready in 4.8 s (iters=8 scale=0.5, cuda graph on)
+                             [info] fstereo: forward captured as one CUDA graph in 1404 ms (input 320x224, iters 8)
+ eager, scale 0.5, iters 8 |    2.4     55     53.8  18.6 |   100.00  99.63   0.37 | cuda_graph=False input=None err=None
+                             [info] fstereo: vitl @ 23-51-11 ready in 2.4 s (iters=8 scale=0.5, cuda graph off)
+   graph, 224x224, iters 8 |    2.5    998     38.0  26.3 |   100.00  99.62   0.38 | cuda_graph=True input=[1, 3, 224, 224] err=None
+                             [info] fstereo: vitl @ 23-51-11 ready in 2.5 s (iters=8 size=224x224, cuda graph on)
+                             [info] fstereo: forward captured as one CUDA graph in 956 ms (input 224x224, iters 8)
+   graph, 224x140, iters 4 |    2.2    938     30.0  33.3 |   100.00  99.63   0.36 | cuda_graph=True input=[1, 3, 160, 224] err=None
+                             [info] fstereo: vitl @ 23-51-11 ready in 2.2 s (iters=4 size=224x140, cuda graph on)
+                             [info] fstereo: forward captured as one CUDA graph in 904 ms (input 224x160, iters 4)
+graph vs eager depth maps (scale 0.5, iters 8), 9 frames: max |d| = 0 mm
+
+# --- appended by hand from the same session (2026-09-30), not by fstereo_bench.py ---
+# WHY: the checkout was deleted (~/Desktop/FoundationStereo, 2026-09-27) and restored as the
+#   submodule external/FoundationStereo @ 6e88068 with weights copied byte-identical (cmp) from
+#   ~/Desktop/data collection/FoundationStereo/pretrained_models/. This table is `cmd_session`
+#   re-run against the RESTORED default path (FOUNDATION_STEREO_REPO unset), written here instead
+#   of over session.txt (the 2026-09-02 table the code comments cite). Compare row by row with it.
+# repo : /home/bdml/Desktop/umi_underwater_robust_control/external/FoundationStereo
+# ckpt : external/FoundationStereo/pretrained_models/23-51-11/model_best_bp2.pth
+#        sha1(first 8 MiB) d277c7ff7de5c627328cde9eaf775e181685276a (= the 423 pre-2026-09-30 run metas)
+# The --policy FS setting (iters 8, scale 0.75, graph), same 9 pairs, same bench_rig:
+[policy setting] median infer ms 74.6 | model vitl @ 23-51-11 | ckpt_sha1_first_8mib d277c7ff7de5c627328cde9eaf775e181685276a | graph True input [1, 3, 320, 480] err None
+    [info] fstereo: vitl @ 23-51-11 ready in 4.8 s (iters=8 scale=0.75, cuda graph on)
+    [info] fstereo: forward captured as one CUDA graph in 1375 ms (input 480x320, iters 8)

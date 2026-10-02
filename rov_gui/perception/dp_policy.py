@@ -74,8 +74,14 @@ Architecture facts the loader relies on (checkpoint cfg, verified 2026-09-02)
 
 Timing and threads
 ------------------
-The forward runs on the session's OWN ``torch.cuda.Stream`` so it never
-serialises behind FoundationStereo's graph replay on the default stream.
+The forward runs on the session's OWN ``torch.cuda.Stream``, which keeps it
+out of FoundationStereo's queue on the default stream. It does NOT give it the
+GPU: the two networks share the device, and with FoundationStereo running back
+to back this forward takes 152.8 ms p50 against 19.3 ms alone [측정: data/
+20260930/0930_220212/diag/policy_vs_fstereo_contention.json, offline]. The
+remedy is not in this module — the session is shared by offline tools and the
+loader's warm-up — but in the worker: ``--policy-fs-schedule``
+(perception/fs_gate.py, backends/policy.py).
 ``torch.no_grad`` is applied per call (grad mode is thread-local; the worker
 thread that calls ``predict`` is not the thread that loaded the model). Load
 ends with one warm-up predict so the first live plan does not pay for cuDNN

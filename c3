@@ -145,6 +145,10 @@ tools:
   scene-html       a run as an interactive 3-D page + the depth it saw
   scene            the same scene as an mp4
   gantry           FMC4030 gantry: panel (no args) or CLI (src/gantry_runner.py)
+  cctv             the pool-corner cameras ALONE (no ROV/C3): 4-slot window +
+                   REC (rov_gui/cctv.py; with the vehicle: ./c3 gui --pool-cams)
+  poolcam          pool-corner cameras, low level: --list, OpenCV set-up window,
+                   headless recording (pool_cam/pool_cam.py)
   test             run every no-camera test file
   env              print the interpreter and versions this wrapper resolved
   <module>         any other c3_camera module name, passed through
@@ -184,6 +188,24 @@ case "$tool" in
     fi
     cd "$REPO"
     exec "$GUI_PY" -m rov_gui "$@"
+    ;;
+  cctv)
+    # The pool cameras without the vehicle: the station's POOL CAMS tab in a
+    # window of its own. Same env as `gui` -- it is the same Qt code.
+    GUI_PY="${ROVGUI_PY:-${CONDA_PREFIX_ROOT:-$HOME/miniforge3}/envs/rovgui-pose/bin/python}"
+    [[ -x "$GUI_PY" ]] || GUI_PY="$PY"
+    cd "$REPO"
+    exec "$GUI_PY" -m rov_gui.cctv "$@"
+    ;;
+  poolcam)
+    # The pool-corner cameras WITHOUT the station: list them, aim them in the
+    # set-up window, or record headless. With the station they run as its
+    # child (`./c3 gui --pool-cams`), in the station's interpreter -- so this
+    # uses the same one, and the two can never disagree about cv2.
+    PC_PY="${POOLCAM_PY:-${ROVGUI_PY:-${CONDA_PREFIX_ROOT:-$HOME/miniforge3}/envs/rovgui-pose/bin/python}}"
+    [[ -x "$PC_PY" ]] || PC_PY="$PY"
+    cd "$REPO"
+    exec "$PC_PY" pool_cam/pool_cam.py "$@"
     ;;
   run-replay)
     # Watch a recorded run back: the tag floor, the vehicle, and the policy's

@@ -152,6 +152,12 @@ POLICY_PROVENANCE = {
                       "changes (KNOWN_ISSUES 2026-09-08)]",
     "tcp_offset_cam_m": "None = derived from tcp_body_flu_m through the C3 "
                         "extrinsic (v2 A3)",
+    "obs_view_forward_m": "None = off. [측정: peg root 0.254 m (ROV) vs 0.208 m "
+                          "(handheld 9/28) along the gripper axis, "
+                          "data/20260930/0930_183320_observe/diag/"
+                          "rig_geometry.json] -> 0.05 for the peg checkpoint; "
+                          "effect on the plans is [예측: .../diag/"
+                          "validate_builder_shift.json], not flown",
     "min_obs_coverage": "[유도: 0.985 sits at the 0.06 % tail of the training "
                         "obs validity (per-frame min 0.9777, p1 1.000, 99.94 % "
                         "of frames ≥ 0.985) [측정: rov_gui/tools/dp_policy_out/"
@@ -305,6 +311,15 @@ def default_policy_block() -> dict:
         "workspace_box_ned": [[-1.0, -1.0, -0.5], [1.0, 1.0, 0.5]],
         "tcp_body_flu_m": [0.502, 0.0, -0.17],   # = cam_t_flu + [0.196, 0, -0.275] (2026-09-08)
         "tcp_offset_cam_m": None,
+        # TEMPORARY (2026-09-30, operator: "잠시 오프셋으로"): re-render the depth
+        # obs from a viewpoint this many metres FORWARD of the C3 along the
+        # body x axis (= the gripper axis), so the held peg lands where the
+        # handheld demos have it. null = off (the obs is the training recipe,
+        # byte for byte). It changes what the policy SEES and nothing about
+        # how its action is flown (tcp_body_flu_m is untouched). RECORD
+        # BOUNDARY: meta policy.config.obs_view_forward_m and
+        # policy.worker.obs.view_shift; do not pool with unshifted runs.
+        "obs_view_forward_m": None,
         "min_obs_coverage": 0.985,
         "z_near_m": 0.20,
         "z_far_m": 3.00,
@@ -458,6 +473,19 @@ def validate_policy_block(pc: dict) -> dict:
                              f"and <= 1.5 m above the tag floor, or null; "
                              f"got {zh!r}")
         pc["z_hold_above_floor_m"] = v
+    ovf = pc.get("obs_view_forward_m")
+    if ovf is not None:
+        # 0.15 m is the builder's own cap (policy_obs.VIEW_SHIFT_MAX_M): past
+        # it a single depth view has too little behind the jaw to re-render.
+        # 0 is "off" spelled as a number, and is stored as None so the record
+        # never shows a shift that did nothing.
+        # FORWARD only: a viewpoint behind the lens shrinks the scene and
+        # leaves an empty rim no fill can close.
+        v = float(ovf)
+        if not (math.isfinite(v) and 0.0 <= v <= 0.15):
+            raise ValueError(f"policy.obs_view_forward_m must be finite and in "
+                             f"[0, 0.15] m, or null; got {ovf!r}")
+        pc["obs_view_forward_m"] = v if v != 0.0 else None
     cov = float(pc["min_obs_coverage"])
     if not (math.isfinite(cov) and 0.0 <= cov <= 1.0):
         raise ValueError(f"policy.min_obs_coverage must be in [0, 1], "
@@ -1286,7 +1314,7 @@ class MpcConfig:
     until the P4 step-calibration / P3 residual fit replace them."""
 
     rov_model: str = "heavy_gripper"
-    # "none" | "mpc" | "dobmpc" | "mpc_tuned" | "dobmpc_tuned" | "pid" | "rl" (the
+    # "none" | "mpc" | "dobmpc" | "mpc_tuned" | "dobmpc_tuned" | "pid" | "rl" | "rl_pwm" (the
     # file / CLI vocabulary, validated in load()). "none" = LOW level None,
     # TELEOP (2026-09-11): the station commands nothing.
     mode: str = "dobmpc"
@@ -1296,6 +1324,9 @@ class MpcConfig:
     pid: dict = field(default_factory=dict)
     # RL follower (rov_gui/control/rl_policy.py): policy_dir (repo-relative), axis_slew_per_s override (default 0).
     rl: dict = field(default_factory=dict)
+    # LOW mode rl_pwm (2026-09-30): the per-thruster RL policy (control/rl_policy.HwRlPwm) — policy_dir, pwm_cap.
+    # Empty = the shipped default (rl_policies/pwm10_s1, cap 0.25).
+    rl_pwm: dict = field(default_factory=dict)
     # Bridge tag fixes with the velocity estimate + gyro between camera
     # frames (state_assembler): the position the EAOB/PID sees (and the plot
     # draws) moves at the control rate instead of holding the last fix.
@@ -1654,6 +1685,19 @@ class MpcConfig:
             cfg.pid = dict(raw["pid"])
         if "rl" in raw and raw["rl"]:
             cfg.rl = dict(raw["rl"])
+        if "rl_pwm" in raw and raw["rl_pwm"]:
+            cfg.rl_pwm = dict(raw["rl_pwm"])
+            # NO pwm_channels key: the vehicle's script maps RC channel 8+m to motor m and nothing else, so a
+            # configurable order could only ever swap thrusters silently (safety review 2026-09-30).
+            unknown = set(cfg.rl_pwm) - {"policy_dir", "pwm_cap", "leash_m", "yaw_rate_ff", "yaw_rate_max"}
+            if unknown:
+                # raw thruster pulses: a misspelt pwm_cap silently falling back to a default is not acceptable here
+                raise ValueError(f"rl_pwm: unknown key(s) {sorted(unknown)}")
+            cap = cfg.rl_pwm.get("pwm_cap")
+            if cap is not None and (isinstance(cap, bool) or not isinstance(cap, (int, float))
+                                    or not (math.isfinite(float(cap)) and 0.0 < float(cap) <= 1.0)):
+                # `pwm_cap: true` is YAML for 1.0 = full throttle; a number or nothing
+                raise ValueError(f"rl_pwm.pwm_cap must be a number in (0, 1], got {cap!r}")
         if "vel_propagation" in raw:
             cfg.vel_propagation = bool(raw["vel_propagation"])
         if "imu_dr" in raw and raw["imu_dr"]:
@@ -1754,10 +1798,10 @@ class MpcConfig:
         # alias) — it is NOT a member of HwDobMpc.MODES and must not become
         # one (that setter raises for non-members).
         if cfg.mode not in ("none", "mpc", "dobmpc", "mpc_tuned",
-                            "dobmpc_tuned", "pid", "rl"):
+                            "dobmpc_tuned", "pid", "rl", "rl_pwm"):
             raise ValueError(
-                f"mode must be none|mpc|dobmpc|mpc_tuned|dobmpc_tuned|pid|rl, "
-                f"got {cfg.mode!r}")
+                f"mode must be none|mpc|dobmpc|mpc_tuned|dobmpc_tuned|pid|rl|"
+                f"rl_pwm, got {cfg.mode!r}")
         return cfg
 
 

@@ -106,6 +106,35 @@ invalid by construction; ``coverage`` reports how much of the 224 obs the
 colour FOV reaches (evaluated at a 1 m reference range [유도: the ~mm-scale
 CAM_A->CAM_B baseline moves the footprint by <1 px at that range]).
 
+view shift: a TEMPORARY virtual viewpoint (2026-09-30, default OFF)
+-------------------------------------------------------------------
+``view_shift_cam_m`` (None = off, and then ``build`` is byte-for-byte what it
+was) re-renders the target-grid depth from a camera displaced by that vector,
+expressed in the REAL camera's frame, same orientation: every valid pixel is
+deprojected along its training ray (``z * ray / ray_z``), moved by ``-t``,
+projected back through the yaml K_B/D_B and scattered NEAREST with a z-buffer
+(near wins, each sample written to the 2x2 pixels around it so a magnified
+near surface stays closed); what is left empty — the disocclusions — takes
+the FARTHEST of the nearest measured pixels along the four image axes, i.e.
+the background (``_fill_farthest_4dir``). It is the ``color_aligned`` scatter
+with a translation instead of an extrinsic.
+
+Why it exists: on the ROV the jaw sits ~5 cm further along the gripper axis
+from the camera than on the handheld the peg demos were recorded with (peg
+root 0.254 m vs 0.208 m along the axis, same tilt, same height [측정:
+data/20260930/0930_183320_observe/diag/rig_geometry.json]), so the held peg
+lands ~43 px higher in the obs and the peg checkpoint reads the scene as
+"released -> retreat". Moving the viewpoint 5 cm forward is PREDICTED to turn
+dz<0 from 0.90 to 0.31 of plans, 0.18 with the proprio width at the demos'
+held value [예측: .../diag/validate_builder_shift.json, this code on the
+2026-09-30 obs rebuilt from the UI recording]; it has not flown. A single view cannot see behind the peg, so what the fill writes
+there is the floor's distance, not a measurement. RECORD BOUNDARY:
+``describe()['view_shift']`` (run meta ``policy.worker.obs`` and
+``policy_obs/meta.json``) and the controller's per-arm ``OBS VIEW SHIFT``
+event. The per-frame ``view_landed`` / ``view_filled`` counts ride on the
+stats ``build`` returns and are NOT written to plans.jsonl; ``depth_valid``
+there is the validity AFTER the fill, so it reads 1.0 on a shifted run.
+
 Provenance of the numbers above: crop origin and sizes are the training
 script's own arithmetic on a 640x400 frame; z_near/z_far are the training
 store's ``.zattrs['obs']``; the tolerances are spec v2 A16.
@@ -136,6 +165,14 @@ D_TOL = 1e-4
 #: Number of distortion coefficients the yaml carries (c3_camera/device.py:399
 #: truncates to 8; the live handler returns 14, the tail of which must be 0).
 D_YAML_N = 8
+
+#: View shift (module docstring). The cap is where a single view stops being
+#: re-renderable [예측].
+VIEW_SHIFT_MAX_M = 0.15
+#: A sample closer than this to the VIRTUAL lens is dropped rather than drawn:
+#: it would be a saturated speck (z_near is 200 mm) made of something inside
+#: the stereo matcher's minimum range [예측].
+VIEW_MIN_Z_MM = 50.0
 
 #: The training store's recipe, spelled out for describe() (build_dp_depth_zarr.py).
 RECIPE = ("depth (uint16 mm) on the producer's grid",
@@ -198,6 +235,40 @@ def grid_fingerprint(kind: str, **parts) -> str:
             s = repr(val)
         h.update(f"|{key}={s}".encode())
     return h.hexdigest()[:16]
+
+
+def _fill_farthest_4dir(depth_mm: np.ndarray) -> np.ndarray:
+    """Fill the empty (0) pixels of a re-rendered depth map with the FARTHEST
+    of the nearest measured pixels to the left, right, above and below.
+
+    What is empty after the 2x2 scatter is a disocclusion: ground the real
+    camera could not see because something near stood in front of it. The
+    truth there is the background, so the farthest of the four wins — the
+    same rule as ``host_depth.fill_scatter_gaps``. That function is not used
+    here because it grows inwards one pixel per pass from EVERY side: a hole
+    pixel next to the near object has only near neighbours on its first pass,
+    takes the object's distance, and the object comes out with a pointed tail
+    reaching into the band it vacated (a 14-row triangle on the test box).
+    Looking along the four axes sees past the hole to both of its banks at
+    once. No measured pixel is touched and no two distances are averaged; a
+    pixel with nothing measured in any of the four directions stays 0.
+    """
+    valid = depth_mm > 0
+    if valid.all():
+        return depth_mm
+    H, W = depth_mm.shape
+    best = np.zeros_like(depth_mm)
+    for axis in (1, 0):
+        n = W if axis == 1 else H
+        ar = np.arange(n).reshape((1, n) if axis == 1 else (n, 1))
+        # nearest measured index at or before / at or after each pixel
+        before = np.maximum.accumulate(np.where(valid, ar, -1), axis=axis)
+        after = np.flip(np.minimum.accumulate(
+            np.flip(np.where(valid, ar, n), axis=axis), axis=axis), axis=axis)
+        for idx, none in ((before, -1), (after, n)):
+            got = np.take_along_axis(depth_mm, np.clip(idx, 0, n - 1), axis=axis)
+            best = np.maximum(best, np.where(idx == none, 0, got))
+    return np.where(valid, depth_mm, best)
 
 
 @dataclass(frozen=True)
@@ -337,7 +408,7 @@ class DepthObsBuilder:
     def __init__(self, target_model="configs/target_camera_underwater.yaml",
                  z_near: float = 0.20, z_far: float = 3.00, out_res: int = 224,
                  warp_size=(640, 400), min_coverage: float = 0.985,
-                 fill_iters: int = 2):
+                 fill_iters: int = 2, view_shift_cam_m=None):
         if not (0.0 < float(z_near) < float(z_far)):
             raise ValueError(f"need 0 < z_near < z_far, got {z_near}, {z_far}")
         cv2 = _cv2()                          # before camera_model imports cv2 itself
@@ -364,6 +435,27 @@ class DepthObsBuilder:
         self.crop_size = s
         self.crop_y0, self.crop_x0 = (self.H - s) // 2, (self.W - s) // 2
 
+        # view shift (module docstring): None = off, the recipe is untouched.
+        self._view_t_mm = None
+        self._dirn = None
+        if view_shift_cam_m is not None:
+            t = np.asarray(view_shift_cam_m, dtype=np.float64).reshape(-1)
+            if t.shape != (3,) or not np.all(np.isfinite(t)):
+                raise ValueError(f"view_shift_cam_m must be 3 finite metres, "
+                                 f"got {view_shift_cam_m!r}")
+            if float(np.linalg.norm(t)) > VIEW_SHIFT_MAX_M + 1e-9:
+                raise ValueError(f"view_shift_cam_m |t| {np.linalg.norm(t):.3f} m "
+                                 f"> {VIEW_SHIFT_MAX_M} m: a single depth view "
+                                 f"cannot be re-rendered that far")
+            if self.rays_behind:
+                raise ValueError("view shift needs every target ray in front of "
+                                 f"the camera; {self.rays_behind} are not")
+            if np.any(t != 0.0):
+                self._view_t_mm = t * 1000.0
+                self._dirn = self._rays / self._rays[:, 2:3]      # (N,3), z == 1
+                from c3_camera import host_depth
+                self._host_depth = host_depth
+
         self._grid = None
         self._kind = ""
         self._coverage = 0.0
@@ -378,7 +470,8 @@ class DepthObsBuilder:
         self._inside = None
         # color_aligned state
         self._xn_a = self._yn_a = None
-        self._host_depth = None
+        if self._view_t_mm is None:
+            self._host_depth = None
 
     # ---------------------------------------------------------------- props
     @property
@@ -639,6 +732,70 @@ class DepthObsBuilder:
         stats.update(valid_measured=measured, valid_total=total, filled=total - measured)
         return filled, stats
 
+    # ----------------------------------------------------------- view shift
+    @property
+    def view_shift_cam_m(self):
+        """The virtual camera's position in the real camera frame [m], or None."""
+        return None if self._view_t_mm is None else (self._view_t_mm / 1000.0)
+
+    def _shift_view(self, tgt_mm: np.ndarray) -> tuple[np.ndarray, dict]:
+        """Target-grid depth (uint16 mm, z in raw CAM_B) seen from the shifted
+        viewpoint, on the same grid. 0 stays "no measurement" going in; coming
+        out, a pixel INSIDE THE CENTRE CROP is 0 only where neither a sample
+        nor the fill reached (outside the crop the holes are left as they
+        are — ``build`` discards those columns). ``view_landed`` /
+        ``view_filled`` count crop pixels.
+
+        Each sample is written to the 2x2 pixels around its projection, not to
+        the nearest one. Moving towards a surface magnifies it (z / (z - t_z),
+        1.13 at the jaw for 5 cm), so nearest-pixel samples of a NEAR surface
+        land more than a pixel apart while the far samples behind it land
+        densely in between — and the z-buffer cannot win a pixel no near
+        sample was written to. The surface came out with the background
+        showing through it as a grid (safety review 2026-09-30). The 2x2
+        footprint closes any magnification below 2 at the cost of growing a
+        near silhouette by at most one pixel of the 640x400 grid.
+        """
+        hd = self._host_depth
+        H, W = tgt_mm.shape
+        st = {"view_landed": 0, "view_filled": 0}
+        flat = np.flatnonzero(tgt_mm)
+        if flat.size == 0:
+            return np.zeros_like(tgt_mm), st
+        z = tgt_mm.ravel()[flat].astype(np.float64)
+        P = self._dirn[flat] * z[:, None] - self._view_t_mm[None, :]
+        P = P[P[:, 2] > VIEW_MIN_Z_MM]
+        if P.shape[0] == 0:
+            return np.zeros_like(tgt_mm), st
+        u, v = hd._project_with_distortion(P, self.K_b, self.D_b)
+        u0 = np.floor(u).astype(np.int64)
+        v0 = np.floor(v).astype(np.int64)
+        zs = P[:, 2].astype(np.float32)            # mm; exact to 0.004 mm at 65 m
+        zb = np.full(H * W, np.inf, dtype=np.float32)
+        for du, dv in ((0, 0), (1, 0), (0, 1), (1, 1)):
+            ui, vi = u0 + du, v0 + dv
+            inside = (ui >= 0) & (ui < W) & (vi >= 0) & (vi < H)
+            np.minimum.at(zb, vi[inside] * W + ui[inside], zs[inside])   # near wins
+        landed = np.isfinite(zb)
+        out = np.zeros(H * W, dtype=np.uint16)
+        out[landed] = np.clip(np.rint(zb[landed]), 1, 65535).astype(np.uint16)
+        out = out.reshape(H, W)
+        # Fill only what ``build`` keeps (the centre crop): the fill is the
+        # slowest step and the columns outside the crop are thrown away on the
+        # next line of the recipe. Outside the crop an empty pixel stays 0.
+        y0, x0, c = self.crop_y0, self.crop_x0, self.crop_size
+        if (H, W) == (self.H, self.W):
+            crop = out[y0:y0 + c, x0:x0 + c]
+            n_before = int(np.count_nonzero(crop))
+            out[y0:y0 + c, x0:x0 + c] = _fill_farthest_4dir(crop)
+            n_after = int(np.count_nonzero(out[y0:y0 + c, x0:x0 + c]))
+        else:                                       # not the builder's grid: fill it all
+            n_before = int(np.count_nonzero(out))
+            out = _fill_farthest_4dir(out)
+            n_after = int(np.count_nonzero(out))
+        st.update(view_landed=n_before, view_filled=n_after - n_before)
+        return out, st
+
     # ---------------------------------------------------------------- build
     def build(self, depth_mm: np.ndarray) -> tuple[np.ndarray, dict]:
         """The obs the policy consumes, and its stats.
@@ -650,6 +807,9 @@ class DepthObsBuilder:
         (test 1). Only the first line (the grid adapter) is this module's.
         """
         w, st = self.warp(depth_mm)
+        vst = None
+        if self._view_t_mm is not None:
+            w, vst = self._shift_view(w)
         cv2 = self._cv2
         R = self.out_res
         s = min(w.shape[:2])
@@ -667,6 +827,8 @@ class DepthObsBuilder:
                  "filled": int(st["filled"]),
                  "coverage": self.coverage,
                  "obs_valid": float(np.count_nonzero(valid)) / n}
+        if vst is not None:
+            stats.update(vst)
         return obs, stats
 
     # ------------------------------------------------------------- describe
@@ -691,6 +853,22 @@ class DepthObsBuilder:
             "n_builds": self._n_builds,
             "n_set_grid": self._n_set_grid,
         }
+        if self._view_t_mm is not None:
+            d["view_shift"] = {
+                "t_cam_m": _round_list(self._view_t_mm / 1000.0, 6),
+                "frame": "virtual camera centre in the REAL camera frame "
+                         "(x right, y down, z optical), same orientation",
+                "method": "deproject target-grid z along the training rays, "
+                          "translate, project through the yaml K_B/D_B, 2x2 "
+                          "scatter with z-buffer (near wins), then empty "
+                          "pixels take the farthest of the nearest measured "
+                          "pixels left/right/above/below",
+                "min_z_mm": VIEW_MIN_Z_MM,
+                "note": "TEMPORARY (2026-09-30). The obs is NOT the training "
+                        "recipe's any more: filled pixels behind near objects "
+                        "carry the background's distance, not a measurement. "
+                        "Do not pool with unshifted runs.",
+            }
         g = self._grid
         if isinstance(g, RectLeftGrid):
             d["grid"] = {"mono_size": list(g.mono_size), "alpha": g.alpha,
@@ -716,4 +894,4 @@ class DepthObsBuilder:
 __all__ = ["GridError", "RectLeftGrid", "ColorAlignedGrid", "IdentityGrid",
            "DepthObsBuilder", "normalise_depth", "grid_fingerprint", "grid_kind_of",
            "GRID_RECT_LEFT", "GRID_COLOR_ALIGNED", "GRID_IDENTITY", "GRID_KINDS",
-           "RECIPE", "K_TOL_PX", "D_TOL"]
+           "RECIPE", "K_TOL_PX", "D_TOL", "VIEW_SHIFT_MAX_M", "VIEW_MIN_Z_MM"]

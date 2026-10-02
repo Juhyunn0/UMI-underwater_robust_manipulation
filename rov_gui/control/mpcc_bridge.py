@@ -80,7 +80,7 @@ class HwMpcc:
         # record it, rather than let a session trim look applied.
         self.vehicle_net_buoyancy_n = float(getattr(cfg, "vehicle_net_buoyancy_n", 0.0))
         log(f"mpcc: vehicle_net_buoyancy_n {self.vehicle_net_buoyancy_n:+.2f} N is "
-            f"IGNORED by this controller (heave trim wired for mpc/mpc_tuned only)")
+            f"IGNORED by this controller (heave trim wired for mpc/mpc_tuned/pid only)")
 
         t0 = time.perf_counter()
         self.mpcc = AcadosMPCC()

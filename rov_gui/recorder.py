@@ -27,12 +27,26 @@ queue, and a plain worker thread encodes. The queue is bounded and *drops* when
 full: a recorder that blocks the GUI thread to keep every frame has turned a
 convenience feature into an outage. Drops are counted and written into the
 sidecar JSON, so a recording never quietly claims a frame rate it did not have.
+
+Codec
+-----
+H.264, piped into the system ``ffmpeg`` (libx264). OpenCV's own writer can only
+make MPEG-4 Part 2 (``mp4v``) here: pip's cv2 ships no H.264 encoder, and the
+VS Code video preview — whose bundled ffmpeg decodes h264 but not mpeg4 — shows
+"An error occurred while loading the video file" for every ``mp4v`` file. Where
+no ffmpeg with libx264 exists, it falls back to ``mp4v`` (plays in VLC/mpv);
+the sidecar's ``codec`` says which one a file is. ffmpeg runs in its own
+session, so if this process dies, closing its stdin still finishes the file.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import queue
+import shutil
+import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -60,6 +74,7 @@ class RecStats:
     fps: float = 0.0
     error: str = ""
     name: str = ""            # the operator's label for this recording, if any
+    codec: str = ""           # "h264" | "mpeg4" — which writer _open_writer gave
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
@@ -90,6 +105,87 @@ def _qimage_to_bgr(img: QImage) -> np.ndarray:
     buf = np.frombuffer(ptr, dtype=np.uint8)[: h * bpl]
     rgb = buf.reshape(h, bpl)[:, : w * 3].reshape(h, w, 3)
     return np.ascontiguousarray(rgb[:, :, ::-1])          # RGB -> BGR
+
+
+@functools.lru_cache(maxsize=1)
+def _ffmpeg_x264() -> str | None:
+    """Path of an ffmpeg that has libx264, or None. Asked once per process."""
+    ff = shutil.which("ffmpeg")
+    if ff is None:
+        return None
+    try:
+        out = subprocess.run([ff, "-hide_banner", "-encoders"], capture_output=True,
+                             text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return ff if " libx264 " in out else None
+
+
+class _H264Pipe:
+    """BGR frames on ffmpeg's stdin -> an H.264 mp4. Duck-types the three
+    ``cv2.VideoWriter`` calls the recorders use (isOpened/write/release)."""
+
+    def __init__(self, ffmpeg: str, path: Path, fps: float, w: int, h: int):
+        self._log = tempfile.TemporaryFile()
+        cmd = [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-nostats", "-y",
+            "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}",
+            "-framerate", f"{fps:g}", "-i", "pipe:0", "-an",
+            # same colour handling as pool_cam: BT.709 limited range, tagged,
+            # so a player does not guess the matrix
+            "-vf", "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-g", str(max(1, round(2 * fps))),          # keyframe every 2 s: quick seeking
+            "-color_primaries", "bt709", "-color_trc", "bt709",
+            "-colorspace", "bt709", "-color_range", "tv",
+            "-movflags", "+faststart",
+            str(path),
+        ]
+        # Own session: a Ctrl+C in the GUI's terminal must not reach ffmpeg.
+        self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                      stdout=subprocess.DEVNULL, stderr=self._log,
+                                      start_new_session=True)
+
+    def isOpened(self) -> bool:                                  # noqa: N802
+        return self._proc.poll() is None
+
+    def write(self, frame: np.ndarray) -> None:
+        self._proc.stdin.write(np.ascontiguousarray(frame).data)
+
+    def release(self) -> str | None:
+        """Close stdin and wait for ffmpeg to finish the file. Returns ffmpeg's
+        complaint if it failed, else None."""
+        try:
+            self._proc.stdin.close()
+        except OSError:
+            pass                       # it already died; its stderr says why
+        try:
+            rc = self._proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+            return "ffmpeg did not finish the file within 60 s; killed"
+        if rc == 0:
+            return None
+        self._log.seek(0)
+        tail = self._log.read().decode(errors="replace").strip().splitlines()[-3:]
+        return f"ffmpeg exited {rc}: {' | '.join(tail)}"
+
+
+def _open_writer(path: Path, fps: float, w: int, h: int):
+    """(writer, codec) — H.264 through ffmpeg when this machine can, else
+    OpenCV's mp4v. See the module docstring for why that order."""
+    ff = _ffmpeg_x264()
+    if ff is not None:
+        return _H264Pipe(ff, path, fps, w, h), "h264"
+    cv2 = import_cv2()
+    return (cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h)),
+            "mpeg4")
+
+
+def _release(writer, stats: RecStats) -> None:
+    err = writer.release()                 # cv2's returns None, _H264Pipe's maybe text
+    if err:                                # e.g. a BrokenPipeError, then ffmpeg's reason
+        stats.error = f"{stats.error}; {err}" if stats.error else err
 
 
 class StreamRecorder(QObject):
@@ -179,9 +275,8 @@ class StreamRecorder(QObject):
                 if writer is None:
                     w, h = w - (w % 2), h - (h % 2)
                     self.stats.size = (w, h)
-                    writer = cv2.VideoWriter(str(self.stats.path),
-                                             cv2.VideoWriter_fourcc(*"mp4v"),
-                                             self.stats.fps, (w, h))
+                    writer, self.stats.codec = _open_writer(self.stats.path,
+                                                            self.stats.fps, w, h)
                     if not writer.isOpened():
                         self.stats.error = f"could not open {self.stats.path}"
                         return
@@ -197,7 +292,7 @@ class StreamRecorder(QObject):
             self.stats.error = f"{type(e).__name__}: {e}"
         finally:
             if writer is not None:
-                writer.release()
+                _release(writer, self.stats)
 
 
 class ScreenRecorder(QObject):
@@ -251,15 +346,14 @@ class ScreenRecorder(QObject):
                     / f"ui_{runstore.stamp()}{'_' + tag if tag else ''}.mp4")
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"),
-                                 self.fps, (w, h))
+        writer, codec = _open_writer(path, self.fps, w, h)
         if not writer.isOpened():
             self.stats.error = f"could not open {path} for writing"
             return None
 
         self.stats = RecStats(recording=True, path=path, started_at=time.monotonic(),
                               size=(w, h), fps=self.fps,
-                              name=str(name or "").strip())
+                              name=str(name or "").strip(), codec=codec)
         self._q = queue.Queue(maxsize=self._q.maxsize)
         self._thread = threading.Thread(target=self._encode, args=(writer, cv2, w, h),
                                         name="ui-encoder", daemon=True)
@@ -315,7 +409,7 @@ class ScreenRecorder(QObject):
         except Exception as e:                                   # noqa: BLE001
             self.stats.error = f"{type(e).__name__}: {e}"
         finally:
-            writer.release()
+            _release(writer, self.stats)
 
     def _write_sidecar(self) -> None:
         _write_sidecar(self.stats,
@@ -342,9 +436,15 @@ def _write_sidecar(stats: RecStats, source: str) -> None:
         "frames_written": stats.frames,
         "frames_dropped": stats.dropped,
         "duration_s": round(stats.elapsed_s, 2),
+        # When it began on CLOCK_MONOTONIC (time.monotonic(), shared by every
+        # process here): the pool cameras' t0_monotonic and the nav
+        # host_stamp column are on this same axis.
+        "started_monotonic": (round(stats.started_at, 6)
+                              if stats.started_at is not None else None),
         "effective_fps": (round(stats.frames / stats.elapsed_s, 2)
                           if stats.elapsed_s > 0 else None),
         "size": list(stats.size),
+        "codec": stats.codec or None,
         "source": source,
         "error": stats.error or None,
     }

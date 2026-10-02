@@ -1,0 +1,11 @@
+# pool_cam/bench_cost.py  2026-09-30 20:16:43
+# argv: /home/bdml/Desktop/umi_underwater_robust_control/pool_cam/pool_cam.py --serve --size 1920x1080 --fps 30 --encoder auto --fake 4
+# host cores: 16
+# cameras: ['cam0', 'cam1', 'cam2', 'cam3']  codec: h264_nvenc (GPU), CQ 28
+idle     camera-process+ffmpeg  0.07 cores   station side  0.00 cores   previews   0.0/s   camera fps: cam0 30.0, cam1 30.0, cam2 30.0, cam3 30.0
+preview  camera-process+ffmpeg  0.11 cores   station side  0.01 cores   previews  39.2/s   camera fps: cam0 30.0, cam1 30.0, cam2 30.0, cam3 30.0
+record   camera-process+ffmpeg  0.73 cores   station side  0.02 cores   previews  38.9/s   camera fps: cam0 30.0, cam1 30.0, cam2 30.0, cam3 30.0
+# cam0_2026-09-30_20-17-17.json: encoder=nvenc  frames=451  seconds=15.033  camera_frames=451  repeated=0  skipped=0  dropped=0  complete=True  error=None
+# cam1_2026-09-30_20-17-17.json: encoder=nvenc  frames=451  seconds=15.033  camera_frames=451  repeated=0  skipped=0  dropped=0  complete=True  error=None
+# cam2_2026-09-30_20-17-17.json: encoder=nvenc  frames=451  seconds=15.033  camera_frames=451  repeated=0  skipped=0  dropped=0  complete=True  error=None
+# cam3_2026-09-30_20-17-17.json: encoder=nvenc  frames=451  seconds=15.033  camera_frames=451  repeated=0  skipped=0  dropped=0  complete=True  error=None

@@ -155,6 +155,10 @@ class FStereoState:
     #: or replay failed, or the upstream code could not be patched). Same
     #: numbers, slower, and the pilot should be able to see it on the chip.
     eager: bool = False
+    #: --policy-fs-schedule when it is not `free` ("yield" / "only"), else "".
+    #: On the chip because under `only` the panel refreshes in pairs with a
+    #: gap between them, and that must not read as a struggling network.
+    schedule: str = ""
     stamp: float = field(default_factory=now)
 
     @property
@@ -171,7 +175,8 @@ class FStereoState:
         return (f"FOUNDATIONSTEREO  {self.hz:.1f} Hz  {self.solve_ms:.0f} ms  "
                 f"valid {self.valid_native:.0f}%→{self.valid_out:.0f}%"
                 + (f"+{self.filled_out:.0f}" if self.filled_out >= 0.5 else "")
-                + ("  eager" if self.eager else ""))
+                + ("  eager" if self.eager else "")
+                + (f"  [{self.schedule}]" if self.schedule else ""))
 
 
 @dataclass
@@ -222,6 +227,9 @@ class Telemetry:
     attitude_axes_enabled: bool = False    # sink configured to send s/t (engage.attitude_axes)
     attitude_axes_degraded: bool = False   # sink fell back to the 4-axis frame mid-run
     rc_chan_raw: tuple | None = None       # RC_CHANNELS chan1..chan8 raw PWM (probe / trim)
+    # LOW mode rl_pwm (2026-09-30): the command sink's per-thruster gate, read back from the vehicle
+    # (control/rl_pwm.PwmGate.state + "active"/"n_sent"). None = no sink that speaks it (demo, ros2, null sink).
+    pwm_gate: dict | None = None
     # auxiliary sensors, keyed by name
     sensors: dict[str, SensorStat] = field(default_factory=dict)
     conn: Conn = Conn.OFFLINE
@@ -772,6 +780,22 @@ class MpcStatus:
 # =============================================================================
 # pilot input
 # =============================================================================
+@dataclass(frozen=True)
+class PwmCommand:
+    """Eight thruster pulses [us], ArduSub motor order 1..8 — LOW mode ``rl_pwm`` (2026-09-30).
+
+    The ONLY thing ``bus.cmd_pwm`` carries. Always explicit 1100..1900; 1500 x 8 is "stop", sent by the worker on a
+    disengage. The command sink puts them on RC_CHANNELS_OVERRIDE channels 9..16 for the vehicle's Lua timeout
+    override (control/rl_pwm.py) and refuses them unless its gate holds; a MANUAL_CONTROL keeps going out NEUTRAL
+    beside them, so what the autopilot falls back to when the override expires is 1500 us."""
+
+    pulses: tuple = (1500,) * 8
+    #: "mpc" = an engaged follower (pulses, or neutral while it waits out a gate fault); "stop" = its disengage;
+    #: "idle" = RL_PWM is selected but not engaged (keepalive). Only "stop"/"idle" clear the sink's latched gate fault.
+    source: str = ""
+    stamp: float = field(default_factory=now)
+
+
 @dataclass
 class PilotInput:
     """One teleop command, in body axes, normalised −1..+1.
@@ -961,6 +985,25 @@ class PolicyPlan:
     # unknown, in which case compose_plan infers it from the array width. The
     # consumer refuses a plan whose value is not POLICY_ACTION_REPR.
     action_repr: str = ""
+    # WHERE THE TIME WENT (2026-10-01), on the same monotonic clock as obs_t.
+    # `infer_ms` is timed inside the session and so contains neither the wait
+    # for FoundationStereo nor the observation build; with these the plan's
+    # age splits into capture -> depth arrived here -> attempt began ->
+    # emitted. None = this producer did not stamp it (a hand-built plan).
+    depth_arrive_t: float | None = None   # the newest depth frame reached the worker
+    trigger_t: float | None = None        # the tick that began this attempt
+    # --policy-fs-schedule as it was IN EFFECT for this plan ("free" when no
+    # gate exists, whatever was typed), and how long the forward waited for
+    # the FoundationStereo frame in flight. None, not 0.0, when nothing
+    # waited: a zero would read as "waited, and it took no time".
+    fs_schedule: str = "free"
+    fs_wait_ms: float | None = None
+    fs_wait_timeout: bool | None = None
+    # FoundationStereo's network input as asked for on the command line
+    # ("scale 0.75 it8" / "size 224x224 it8"; "" = unknown), so a plans.jsonl
+    # that two launches appended to can still be split by network input. The
+    # rest of the depth setting (alpha, checkpoint) is in the run meta.
+    fs_input: str = ""
     stamp: float = field(default_factory=now)
 
 
@@ -1045,5 +1088,11 @@ class PolicyStatus:
     # it in red for a few seconds; a refusal that only reached the log was
     # invisible next to a name that silently snapped back (review 2026-09-11).
     ckpt_note: str = ""
+    # --policy-fs-schedule as it is IN EFFECT in this worker ("free" when no
+    # gate was built — the default, the demo source, device depth). The
+    # controller says it at ARM: runs on different schedules must not be
+    # pooled on plan age or inference time, and `only` changes the
+    # observation's pair spacing too.
+    fs_schedule: str = "free"
     conn: Conn = Conn.OFFLINE
     stamp: float = field(default_factory=now)

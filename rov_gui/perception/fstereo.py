@@ -34,7 +34,7 @@ cursor probe and depth-vs-MAP check without any of them knowing.
 Why the RAW pair and not the device's ``rectifiedLeft/Right``
 -------------------------------------------------------------
 The reference tool this is ported from
-(``FoundationStereo/UMI_Underwater/oakd_foundation_stereo.py``) takes the
+(``~/Desktop/data collection/UMI_Underwater/oakd_foundation_stereo.py``) takes the
 device's rectified pair and converts disparity with
 ``getCameraIntrinsics(CAM_C)[0][0]``. That is the UNRECTIFIED focal length.
 DepthAI 2.32 exposes no API that returns a rectified one — only the 3x3
@@ -89,13 +89,29 @@ import numpy as np
 
 #: Where the checkpoint lives, relative to the FoundationStereo checkout.
 #: 23-51-11 is the ViT-large model (3.07 GiB). The ViT-small alternative the
-#: upstream readme mentions (11-33-40) is NOT downloaded on this machine.
+#: upstream readme mentions (11-33-40) sits beside it; nothing here uses it.
 DEFAULT_CKPT = Path("pretrained_models") / "23-51-11" / "model_best_bp2.pth"
 
-#: The FoundationStereo checkout. Nested by upstream's own layout:
-#: /home/bdml/Desktop/FoundationStereo is the WORKSPACE, and the repo is the
-#: directory of the same name inside it.
-DEFAULT_REPO = Path("/home/bdml/Desktop/FoundationStereo/FoundationStereo")
+#: SHA-1 of the first 8 MiB (:func:`_sha1_head`) of upstream's two released
+#: checkpoints, by model id ``<run>/<file>``: the reference the FS parity check
+#: (backends/policy.py ``same_fstereo_ckpt``) needs when a training store names
+#: a checkpoint file that no longer exists — the stores built before 2026-09-27
+#: name the deleted ~/Desktop/FoundationStereo copy. Computed on
+#: external/FoundationStereo/pretrained_models/*/model_best_bp2.pth on
+#: 2026-09-30; 23-51-11's is also the ckpt_sha1_first_8mib of every run before.
+UPSTREAM_CKPT_SHA1 = {
+    "23-51-11/model_best_bp2.pth": "d277c7ff7de5c627328cde9eaf775e181685276a",
+    "11-33-40/model_best_bp2.pth": "a2445fc23818abd52f8eedda3c3bf3b6b2bdc496",
+}
+
+#: The FoundationStereo checkout: the git submodule external/FoundationStereo
+#: (NVlabs upstream, pinned at 6e88068). The weights are NOT in git — upstream's
+#: own .gitignore drops pretrained_models/ — so a fresh clone of this repo has
+#: the code but must have them copied in (rov_gui/README.md, section
+#: "FoundationStereo 체크아웃"). Until 2026-09-30 this was ~/Desktop/FoundationStereo/
+#: FoundationStereo, OUTSIDE the repo, and was deleted as unused for exactly
+#: that reason; every run recorded before then names the old path in its meta.
+DEFAULT_REPO = Path(__file__).resolve().parents[2] / "external" / "FoundationStereo"
 
 #: GRU refinement iterations. 32 is the paper default and the reference tool
 #: uses 16; at the station's scale 0.5 they are indistinguishable from 8 on
@@ -517,12 +533,15 @@ class FStereoSession:
     def _load_impl(self, on_log=None) -> None:
         if not (self.repo / "core" / "foundation_stereo.py").is_file():
             raise FStereoError(
-                f"FoundationStereo checkout not found at {self.repo} — pass "
-                f"--fstereo-repo or set FOUNDATION_STEREO_REPO")
+                f"FoundationStereo checkout not found at {self.repo} — run "
+                f"'git submodule update --init external/FoundationStereo', "
+                f"or pass --fstereo-repo / set FOUNDATION_STEREO_REPO")
         if not self.ckpt.is_file():
             raise FStereoError(
-                f"checkpoint not found: {self.ckpt} — download the weights "
-                f"into {self.repo / 'pretrained_models'} first")
+                f"checkpoint not found: {self.ckpt} — the weights are not in "
+                f"git (upstream's .gitignore drops pretrained_models/); copy "
+                f"the .pth and its cfg.yaml there first (rov_gui/README.md, "
+                f"\"FoundationStereo 체크아웃\")")
         cfg_path = self.ckpt.parent / "cfg.yaml"
         if not cfg_path.is_file():
             raise FStereoError(f"no cfg.yaml beside the checkpoint: {cfg_path}")

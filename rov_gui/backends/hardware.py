@@ -52,6 +52,7 @@ import math
 import queue
 import shutil
 import subprocess
+import os
 import time
 from collections import deque
 from pathlib import Path
@@ -61,6 +62,7 @@ import numpy as np
 from .. import imaging
 # bus pulls in nothing heavier than Qt, which this module already needs.
 from ..bus import StereoMailbox
+from ..perception.fs_gate import FS_DRAIN, FS_GO, FsGate
 from ..leak import PRESSURE_REPEAT_S, LeakMonitor
 from ..net import NicMonitor
 from ..qt import Qt, Slot, import_cv2
@@ -1679,6 +1681,9 @@ class VehicleWorker(TimerWorker):
         # so Telemetry can carry firmware_version / mavlink_wire_version /
         # attitude_axes_enabled / attitude_axes_degraded for the engage gate.
         self.attitude_axes_fn = None
+        # ...and the rl_pwm gate snapshot (MavlinkCommandSink.pwm_gate_state),
+        # the same injection; None = a sink without that transport.
+        self.pwm_gate_fn = None
         # 2026-09-26 audit: BlueOS routes EVERY companion component's traffic
         # to this endpoint, so the first AUTOPILOT_VERSION on the link can be
         # a companion's — and firmware_version is sticky. AUTOPILOT_VERSION /
@@ -2000,7 +2005,14 @@ class VehicleWorker(TimerWorker):
                                for i in range(1, 9))
             except (TypeError, ValueError):
                 rc_raw = None
+        pwm_gate = None
+        if self.pwm_gate_fn is not None:
+            try:
+                pwm_gate = self.pwm_gate_fn()
+            except Exception:                                # noqa: BLE001
+                pwm_gate = None
         tel = Telemetry(
+            pwm_gate=pwm_gate,
             firmware_version=fw,
             mavlink_wire_version=str(aa.get("mavlink_wire_version") or ""),
             attitude_axes_enabled=bool(aa.get("enabled", False)),
@@ -2251,6 +2263,13 @@ class NullCommandSink(TimerWorker):
                 "warn", "commands are ENABLED but this build has no command sink "
                         "— nothing is being transmitted (start with --allow-command)")
 
+    @Slot(object)
+    def set_pwm(self, cmd) -> None:
+        """LOW mode rl_pwm (2026-09-30): accepted and dropped. This sink
+        transmits nothing, has no ``pwm_gate_state`` and therefore never
+        reports a gate — the controller refuses to engage rl_pwm on it."""
+        pass
+
     @Slot(float)
     def set_gripper(self, v: float) -> None:
         self.grip = v
@@ -2475,6 +2494,28 @@ class MavlinkCommandSink(TimerWorker):
         self._autopilot_version_raw: dict | None = None
         self.rc_chan_raw: tuple | None = None   # RC_CHANNELS chan1..8 seen on this link
         self.attitude_axes_foreign = 0       # AUTOPILOT_VERSION / RC_CHANNELS not from the vehicle
+        # ---- LOW mode rl_pwm (2026-09-30): per-thruster pulses for the
+        # vehicle's Lua timeout override (control/rl_pwm.py). Nothing below is
+        # touched, and no RC override ever leaves, unless the rl_pwm follower
+        # emits bus.cmd_pwm.
+        self._pwm_gate = None                # control/rl_pwm.PwmGate (setup)
+        self._pwm_gate_error = ""
+        self._pwm_last_rx = 0.0              # when the controller's last frame arrived
+        self._pwm_active = False             # policy pulses are flowing
+        self._pwm_neutral_left = 0           # neutral frames owed once they stop
+        self._pwm_ever_sent = False          # did an RC override leave this session
+        self._pwm_sent = 0
+        self._pwm_refused_said = ""
+        self._pwm_state: dict | None = None  # snapshot for Telemetry (built on OUR thread)
+        # A gate that drops WHILE pulses flow is latched: nothing more leaves
+        # until the worker sends its explicit stop (it disengages on the
+        # snapshot below). Without the latch the engage-grace failure cleared
+        # itself and the flow resumed 50 ms later, for ever, with the worker
+        # never told (safety review 2026-09-30).
+        self._pwm_latch = ""
+        self._pwm_late_run = 0               # consecutive policy frames that arrived old
+        self._pwm_cap = 0.0                  # |throttle| ceiling THIS sink enforces (setup)
+        self._pwm_tick_failed = ""
 
     def setup(self) -> None:
         from pymavlink import mavutil
@@ -2504,6 +2545,7 @@ class MavlinkCommandSink(TimerWorker):
             self.bus.log.emit("warn",
                               f"attitude axes OFF: could not read "
                               f"engage.attitude_axes ({type(e).__name__}: {e})")
+        self._setup_pwm_gate()
         if self.listening:
             self.bus.log.emit(
                 "info", "command sink replies to whoever pushes to that port; "
@@ -2525,6 +2567,253 @@ class MavlinkCommandSink(TimerWorker):
         self.attitude_axes = on
         self.sign_roll = float(sign[0])
         self.sign_pitch = float(sign[1])
+
+    # ------------------------------------------------- LOW mode rl_pwm
+    #: No frame from the controller for this long = it stopped (the worker
+    #: ticks at 20 Hz; three missed ticks). The vehicle's script has its own,
+    #: tighter, 100 ms rule — this one only ends OUR sending.
+    PWM_STALE_S = 0.2
+    #: Neutral frames sent when the pulses stop, one per sink tick, before the
+    #: overrides stop altogether and the script lets AP_Motors resume.
+    PWM_NEUTRAL_FRAMES = 3
+
+    def _setup_pwm_gate(self) -> None:
+        """Build the vehicle gate for LOW mode rl_pwm from the configured
+        policy's own export (its motor_direction is what MOT_n_DIRECTION is
+        checked against) and read the |throttle| ceiling this sink enforces
+        by itself. A missing/malformed export costs only that mode: the gate
+        stays None, ``pwm_gate_state`` says why, the worker refuses."""
+        try:
+            import json as _json
+
+            from ..control.geometry import MpcConfig
+            from ..control.rl_policy import HwRlPwm, REPO_ROOT
+            from ..control.rl_pwm import PWM_CAP_FIRST_WATER, PwmGate, PwmModel
+
+            cfg = MpcConfig.load(getattr(self.opts, "mpc_config",
+                                         "config/hw_mpc.yaml"))
+            raw = dict(getattr(cfg, "rl_pwm", None) or {})
+            pdir = str(raw.get("policy_dir", HwRlPwm.DEFAULT_DIR))
+            if not os.path.isabs(pdir):
+                pdir = os.path.join(REPO_ROOT, pdir)
+            with open(os.path.join(pdir, "obs_spec.json"), "r",
+                      encoding="utf-8") as fh:
+                spec = _json.load(fh)
+            model = PwmModel((spec.get("output") or {})["pwm_model"])
+            cap = float(raw.get("pwm_cap", PWM_CAP_FIRST_WATER))
+            if isinstance(raw.get("pwm_cap"), bool) or not (0.0 < cap <= 1.0):
+                raise ValueError(f"rl_pwm.pwm_cap {raw.get('pwm_cap')!r}")
+            self._pwm_cap = min(cap, float(model.cap_trained))
+            self._pwm_gate = PwmGate(model.motor_direction, self.sysid)
+            self._pwm_gate_error = ""
+        except Exception as e:                                   # noqa: BLE001
+            self._pwm_gate = None
+            self._pwm_cap = 0.0
+            self._pwm_gate_error = f"{type(e).__name__}: {e}"
+            self.bus.log.emit("warn", f"rl_pwm transport unavailable "
+                                      f"({self._pwm_gate_error}) — LOW mode "
+                                      f"RL_PWM will refuse")
+
+    def _pwm_ready(self, t: float) -> tuple[bool, str]:
+        """May a policy pulse leave right now? Every refusal names itself."""
+        g = self._pwm_gate
+        if g is None:
+            return False, (self._pwm_gate_error or "rl_pwm is not configured")
+        if self._pwm_latch:
+            return False, f"{self._pwm_latch} [latched until the follower disengages]"
+        if not self.enabled:
+            return False, "COMMAND ENABLE is off"
+        if self.master is None:
+            return False, "no command link"
+        if self.listening and self._peer_count() == 0:
+            return False, "no vehicle on the command port"
+        return g.check(t, self._link_v2())
+
+    def _send_pwm(self, pulses) -> bool:
+        """ONE rc_channels_override_send call site. Channels 9..16 carry the
+        eight pulses, every other channel 65535 (= leave). Each pulse is
+        clamped HERE to 1500 +- 400 * pwm_cap as well — the controller caps
+        too, but a raw thruster command does not rest on one line of another
+        module. A v1 dialect has no channels 9..18: TypeError, said once."""
+        from ..control.rl_pwm import (PWM_NEUTRAL_US, PWM_SPAN_US,
+                                      pack_rc_override)
+
+        g = self._pwm_gate
+        if g is None or self.master is None:
+            return False
+        span = int(round(PWM_SPAN_US * self._pwm_cap))
+        try:
+            pw = [min(PWM_NEUTRAL_US + span, max(PWM_NEUTRAL_US - span, int(p)))
+                  for p in pulses]
+            ch = pack_rc_override(pw, g.channels)
+            self.master.mav.rc_channels_override_send(
+                self.target_sys, self.target_comp, *ch)
+        except (TypeError, ValueError) as e:
+            self._pwm_refuse(f"RC_CHANNELS_OVERRIDE could not be sent "
+                             f"({type(e).__name__}: {e})")
+            return False
+        self._pwm_ever_sent = True
+        self._pwm_sent += 1
+        return True
+
+    def _pwm_refuse(self, why: str) -> None:
+        if why != self._pwm_refused_said:
+            self._pwm_refused_said = why
+            self.bus.log.emit("error", f"rl_pwm: pulses NOT sent — {why}")
+
+    def _pwm_halt(self, why: str, latch: bool = False,
+                  end: bool = False) -> None:
+        """Stop policy pulses NOW: neutral on all eight at once and again on
+        the next ticks (only if an override ever left — a session that never
+        used the path sends nothing on RC 9..16), then nothing, so the
+        vehicle's script hands the outputs back to AP_Motors. ``latch`` keeps
+        the gate shut until the follower's stop arrives; ``end`` says the
+        ENGAGEMENT is over (stop / idle / E-STOP / disable / teardown), which
+        is the only thing that resets the gate's unconfirmed-pulse time.
+        Never raises: the callers' own neutral MANUAL_CONTROL comes after."""
+        was = self._pwm_active
+        self._pwm_active = False
+        if latch and not self._pwm_latch:
+            self._pwm_latch = why
+        try:
+            if self._pwm_gate is not None:
+                if end:
+                    self._pwm_gate.note_stopped()
+                else:
+                    self._pwm_gate.note_paused()
+            if self._pwm_ever_sent and self.master is not None:
+                from ..control.rl_pwm import NEUTRAL_PULSES
+
+                for _ in range(self.PWM_NEUTRAL_FRAMES):
+                    self._send_pwm(NEUTRAL_PULSES)
+                # ...and one per tick after the burst: three frames inside
+                # one 20 ms script loop can be dropped together by a short
+                # rx queue.
+                self._pwm_neutral_left = self.PWM_NEUTRAL_FRAMES
+            else:
+                self._pwm_neutral_left = 0
+        except Exception as e:                                   # noqa: BLE001
+            self._pwm_neutral_left = self.PWM_NEUTRAL_FRAMES
+            self._pwm_refuse(f"neutral pulses failed ({type(e).__name__}: {e})")
+        if was:
+            self.bus.log.emit("warn", f"rl_pwm: pulses stopped ({why}) — "
+                                      f"neutral pulses sent")
+
+    #: Consecutive policy frames that arrived older than PWM_STALE_S before
+    #: the flow is latched shut. One late frame (a GIL pause) is dropped and
+    #: the next fresh one carries on; a sink that is late every time is not
+    #: delivering the policy's answer to the present state.
+    PWM_LATE_FRAMES = 3
+
+    @Slot(object)
+    def set_pwm(self, cmd) -> None:
+        """Eight pulses from the rl_pwm follower (bus.cmd_pwm). Sent at once —
+        the vehicle's script needs a frame every 100 ms, so waiting for this
+        sink's own 50 ms tick would spend half of that. 1500 x 8 neutralises
+        whatever is flowing, whoever sends it; only a follower that is no
+        longer engaged (source "stop" / "idle") clears a latched gate fault
+        and ends the engagement in the gate's eyes. A neutral never puts
+        anything on the wire unless there is a flow to neutralise."""
+        from ..control.rl_pwm import NEUTRAL_PULSES
+
+        t = time.monotonic()
+        try:
+            pulses = tuple(int(p) for p in cmd.pulses)
+            age = now() - float(cmd.stamp)
+        except (AttributeError, TypeError, ValueError):
+            self._pwm_refuse("malformed PwmCommand")
+            return
+        self._pwm_last_rx = t
+        if pulses == NEUTRAL_PULSES:
+            # A latched gate failure is cleared ONLY by a follower that is no
+            # longer engaged: its disengage ("stop") or its not-engaged
+            # keepalive ("idle"). The neutral frames an ENGAGED follower sends
+            # while it waits out its own grace window ("mpc") must not clear
+            # it — they did, once, and the flow came back every 1-2 s.
+            over = str(getattr(cmd, "source", "")) in ("stop", "idle")
+            self._pwm_halt("the follower asked for neutral", end=over)
+            if over:
+                self._pwm_latch = ""
+                self._pwm_refused_said = ""
+                self._pwm_late_run = 0
+            return
+        if not (age <= self.PWM_STALE_S):
+            # a frame that sat in this thread's queue is not the policy's
+            # answer to the present state: never send it late.
+            self._pwm_late_run += 1
+            self._pwm_refuse(f"policy frames arrive older than "
+                             f"{1e3 * self.PWM_STALE_S:.0f} ms (stalled sink?)")
+            if self._pwm_late_run >= self.PWM_LATE_FRAMES:
+                self._pwm_halt("policy frames keep arriving late", latch=True)
+            return
+        ok, why = self._pwm_ready(t)
+        if not ok:
+            self._pwm_refuse(why)
+            if self._pwm_active:
+                self._pwm_halt(why, latch=True)
+            return
+        if self._send_pwm(pulses):
+            self._pwm_refused_said = ""
+            self._pwm_late_run = 0
+            if not self._pwm_active:
+                self.bus.log.emit("warn", "rl_pwm: policy pulses are going "
+                                          "out on RC 9..16 (mixer bypassed)")
+            self._pwm_active = True
+            self._pwm_neutral_left = self.PWM_NEUTRAL_FRAMES
+            self._pwm_gate.note_pulses(t)
+
+    def _pwm_tick(self, t: float) -> None:
+        """Per sink tick: ask the vehicle for what the gate lacks (only while
+        somebody wants the transport), end a flow that went stale or lost its
+        gate, send the neutral tail, and publish the snapshot."""
+        g = self._pwm_gate
+        wanted = self._pwm_active or (t - self._pwm_last_rx) < 10.0
+        if g is not None and self.master is not None and wanted:
+            try:
+                for name in g.next_requests(t):
+                    self.master.mav.param_request_read_send(
+                        self.target_sys, self.target_comp, name.encode(), -1)
+            except Exception:                                    # noqa: BLE001
+                pass
+        if self._pwm_active:
+            stale = (t - self._pwm_last_rx) > self.PWM_STALE_S
+            ok, why = self._pwm_ready(t)
+            if stale:
+                # the follower went quiet (it died, or is debouncing a lost
+                # fix): neutral, no latch — its next frame may resume.
+                self._pwm_halt(f"no frame from the follower for "
+                               f"{1e3 * (t - self._pwm_last_rx):.0f} ms")
+            elif not ok:
+                self._pwm_halt(why, latch=True)
+        elif self._pwm_neutral_left > 0 and self._pwm_ever_sent:
+            from ..control.rl_pwm import NEUTRAL_PULSES
+
+            self._send_pwm(NEUTRAL_PULSES)
+            self._pwm_neutral_left -= 1
+            if self._pwm_neutral_left == 0:
+                # the flow is over and neutralised: from here on this sink is
+                # again one that writes nothing on RC 9..16 (a later E-STOP in
+                # a PID run must not touch whatever sits on those channels).
+                self._pwm_ever_sent = False
+        # the snapshot Telemetry carries: built HERE, on the sink's thread,
+        # and handed over as one reference (pwm_gate_state reads no dict that
+        # this thread is mutating).
+        if g is None:
+            self._pwm_state = {"configured": False, "ok": False,
+                               "why": self._pwm_gate_error
+                               or "rl_pwm is not configured", "stamp": now()}
+        else:
+            d = g.state(t, self._link_v2())
+            if self._pwm_latch:
+                d["ok"], d["why"] = False, self._pwm_latch
+            d.update(active=bool(self._pwm_active), n_sent=int(self._pwm_sent),
+                     enabled=bool(self.enabled), latched=bool(self._pwm_latch),
+                     pwm_cap=float(self._pwm_cap), stamp=now())
+            self._pwm_state = d
+
+    def pwm_gate_state(self) -> dict | None:
+        """The last snapshot ``_pwm_tick`` built (None before the first tick)."""
+        return self._pwm_state
 
     def attitude_axes_state(self) -> dict:
         """Plain-attribute snapshot for the telemetry producer / run meta."""
@@ -2747,6 +3036,7 @@ class MavlinkCommandSink(TimerWorker):
             self.js_buttons = 0
             self._pulses.clear()
             self._pulse_on = self._pulse_gap = 0
+            self._pwm_halt("COMMAND ENABLE off", end=True)
             self._send(PilotInput(), buttons=0)     # one explicit neutral
             self.bus.log.emit("info", "command sink disabled — sent neutral")
 
@@ -2759,6 +3049,7 @@ class MavlinkCommandSink(TimerWorker):
         self.js_buttons = 0
         self._pulses.clear()
         self._pulse_on = self._pulse_gap = 0
+        self._pwm_halt("E-STOP", end=True)          # raw pulses first
         for _ in range(3):                          # neutral, three times
             self._send(PilotInput(), buttons=0)
         self.bus.log.emit("error", "E-STOP: neutral sent, commands disabled")
@@ -2884,6 +3175,23 @@ class MavlinkCommandSink(TimerWorker):
                                    if self.tilt_deg is not None
                                    else "no button bit mapped"))),
             stamp=now()))
+        try:
+            self._pwm_tick(t)
+        except Exception as e:                                   # noqa: BLE001
+            # rl_pwm bookkeeping must never take the MANUAL_CONTROL / deadman
+            # / heartbeat lines below down with it. The gate reads shut.
+            # ...and it is LATCHED: with this tick broken nobody is watching
+            # the flow for a lost gate or a quiet follower, so no further
+            # policy frame may leave until the follower has stopped.
+            why_tick = f"rl_pwm tick failed: {type(e).__name__}: {e}"
+            self._pwm_halt(why_tick, latch=True)
+            self._pwm_state = {"configured": True, "ok": False, "stamp": now(),
+                               "latched": True, "why": why_tick}
+            if self._pwm_tick_failed != type(e).__name__:
+                self._pwm_tick_failed = type(e).__name__
+                self.bus.log.emit("error", f"rl_pwm: sink tick failed "
+                                           f"({type(e).__name__}: {e}) — the "
+                                           f"transport reads NOT OK")
         if not self.enabled:
             return
 
@@ -3021,6 +3329,12 @@ class MavlinkCommandSink(TimerWorker):
     def _note_param(self, msg) -> None:
         pid = getattr(msg, "param_id", "")
         pid = pid.strip("\x00") if isinstance(pid, str) else str(pid)
+        if self._pwm_gate is not None and self._msg_from_vehicle(msg):
+            # every PARAM_VALUE of the VEHICLE (a companion's must not write a
+            # motor direction into the gate), before the early returns below:
+            # SYSID_MYGCS is the gate's too.
+            self._pwm_gate.note_param(pid, getattr(msg, "param_value", None),
+                                      time.monotonic())
         if pid.startswith("BTN") and pid.endswith("_FUNCTION"):
             try:
                 self._note_button_function(int(pid[3:-9]), int(msg.param_value))
@@ -3087,6 +3401,16 @@ class MavlinkCommandSink(TimerWorker):
             mt = msg.get_type()
             if mt == "PARAM_VALUE":
                 self._note_param(msg)
+            elif mt == "NAMED_VALUE_FLOAT":
+                # rl_pwm_override.lua's 2 Hz heartbeat ("RLPWM" = 1 while it
+                # is forcing the outputs). Only the vehicle's own counts.
+                if self._pwm_gate is not None and self._msg_from_vehicle(msg):
+                    name = getattr(msg, "name", "")
+                    if isinstance(name, bytes):
+                        name = name.decode("ascii", "ignore")
+                    if str(name).strip("\x00") == "RLPWM":
+                        self._pwm_gate.note_heartbeat(
+                            getattr(msg, "value", None), time.monotonic())
             elif mt in ("AUTOPILOT_VERSION", "RC_CHANNELS"):
                 if not self._msg_from_vehicle(msg):
                     self.attitude_axes_foreign += 1
@@ -3286,6 +3610,7 @@ class MavlinkCommandSink(TimerWorker):
     def teardown(self) -> None:
         if self.master is not None:
             try:
+                self._pwm_halt("teardown", end=True)
                 self._send(PilotInput(), buttons=0)      # leave it neutral
                 self.master.close()
             except Exception:                             # noqa: BLE001
@@ -3312,6 +3637,14 @@ class FStereoWorker(TimerWorker):
     [측정: rov_gui/tools/fstereo_bench_out/graph.txt, session.txt], which
     makes the timer late but blocks nothing else — this thread has no other job, and a
     third thread inside the session would buy only a shutdown race.
+
+    Under ``--policy`` that is not the whole story: the defaults there (iters
+    8, scale 0.75) take 75.7 ms a frame, longer than the camera interval, so
+    this worker never idles and the policy's forward on the same GPU goes
+    from 19.3 ms to 152.8 ms p50 [측정: data/20260930/0930_220212/diag/
+    policy_vs_fstereo_resolution.json, policy_vs_fstereo_contention.json,
+    offline]. ``fs_gate`` (``--policy-fs-schedule``) is the switch for that;
+    without one, tick() is what it always was.
     """
 
     def __init__(self, bus, mailbox, opts, mailboxes):
@@ -3352,6 +3685,8 @@ class FStereoWorker(TimerWorker):
         #: How long a gap in arrivals before the panel says the feed is
         #: starved. The pair arrives at --depth-fps (15) and inference takes
         #: ~45 ms, so a healthy feed never goes quiet for anything like this.
+        #: (--policy-fs-schedule only DOES go quiet by design, ~0.35 s between
+        #: bursts and at most FsGate.starve_s 1.5 s — still under this.)
         self.IDLE_S = 2.0
         #: Consecutive inference failures before the feature gives up. Enough
         #: to ride out a genuinely bad frame, few enough that a broken
@@ -3378,6 +3713,14 @@ class FStereoWorker(TimerWorker):
         # colour-grid warp and the gap fill) plus the rig, on the `rect_left`
         # grid — the training-parity path (spec v2 A16).
         self.policy_mb = None
+        #: perception.fs_gate.FsGate — the SAME object the policy worker
+        #: holds — injected by HardwareBackend when --policy-fs-schedule is
+        #: `yield` or `only`. None (the default `free`, and every run without
+        #: --policy) leaves tick() exactly as it was: no call into the gate.
+        self.fs_gate = None
+        #: Completion stamps of the last frames, for an honest rate when a
+        #: gate makes the arrivals bursty (see the Hz note in tick()).
+        self._done_marks: deque = deque(maxlen=64)
         self._policy_grid_said = False
         self._policy_grid_err_said = False
         self._policy_grid = None
@@ -3512,6 +3855,7 @@ class FStereoWorker(TimerWorker):
             frames=int(self._frames),
             eager=bool(s is not None and getattr(s, "graph_requested", False)
                        and not s.graph),
+            schedule=str(getattr(getattr(self, "fs_gate", None), "mode", "") or ""),
             stamp=now()))
 
     def _publish_state_throttled(self, note: str = "") -> None:
@@ -3568,8 +3912,27 @@ class FStereoWorker(TimerWorker):
             self._publish_state_throttled()
             return
 
+        # FS SCHEDULE (2026-10-01; perception/fs_gate.py). Asked BEFORE the
+        # take, because take() is destructive: on a hold the pair stays in the
+        # mailbox (newest wins), so the frame started after the release is the
+        # freshest one, not the one that was waiting. Never a wait in here —
+        # this tick must keep returning to the event loop (a queued shutdown
+        # is only delivered between ticks). Under `only` the waiting pair is
+        # discarded instead, so that a burst begins on a pair that arrived
+        # after it was asked for. The publish keeps the chip's `live` honest
+        # while nothing is being computed.
+        gate = self.fs_gate
+        if gate is not None:
+            verdict = gate.fs_begin()
+            if verdict != FS_GO:
+                if verdict == FS_DRAIN and self.mailbox.take() is not None:
+                    gate.fs_drained()
+                self._publish_state_throttled()
+                return
         item = self.mailbox.take()
         if item is None:
+            if gate is not None:
+                gate.fs_end(ran=False)       # nothing was started
             # Ready, enabled, and nothing is coming. The usual cause is that
             # the rectification geometry failed to build, in which case
             # _tap_fstereo returns before it ever puts anything — and without
@@ -3626,9 +3989,11 @@ class FStereoWorker(TimerWorker):
         # throw is exactly the pair someone will want to reproduce offline.
         # The join with policy_obs/ is by t_capture either way.
         self._record_pair(item)
+        ok = False
         try:
             out = s.infer(item["left"], item["right"], item["rig"],
                           out_size=self._out_size(item))
+            ok = True
         except Exception as e:                                   # noqa: BLE001
             # One bad frame must not kill the feature — but a hundred must not
             # look like one either. Say it once per distinct fault text so a
@@ -3645,12 +4010,25 @@ class FStereoWorker(TimerWorker):
                 self._disarm(f"{self._infer_fails} consecutive inference "
                              f"failures ({text[:60]})")
             return
+        finally:
+            # The GPU is free from here (what follows is CPU: colourise, copy,
+            # the policy tap), so this is where a policy waiting in
+            # FsGate.wait_idle is let through — on the exception path too,
+            # where no map came out (ran=False: not a frame).
+            if gate is not None:
+                gate.fs_end(ran=ok)
 
         # An ARRIVAL rate, not 1/solve_ms. The two answer different questions
         # and the pose chip already made this mistake once: a rate computed
         # from compute time cannot show that frames stopped coming.
         t = now()
-        if self._last_arrival:
+        if gate is not None:
+            # Under a schedule the arrivals are not evenly spaced (`only`: two
+            # frames, then a gap), and the EMA of 1/dt below would read the
+            # pair's spacing as the rate. Count what completed in the last
+            # GATED_HZ_WINDOW_S instead.
+            self._hz = self._gated_hz(t)
+        elif self._last_arrival:
             dt = t - self._last_arrival
             inst = 1.0 / dt if dt > 1e-6 else 0.0
             self._hz = inst if self._hz <= 0.0 else 0.8 * self._hz + 0.2 * inst
@@ -3664,7 +4042,31 @@ class FStereoWorker(TimerWorker):
         self._frames += 1
         self._last = out
         self._publish(out, item)
+        n_put = self._policy_tap["put"]
         self._tap_policy(out, item)
+        if gate is not None and self._policy_tap["put"] > n_put:
+            # What a burst under `only` is counted in: frames that REACHED the
+            # policy mailbox. A frame the tap dropped does not use it up.
+            gate.fs_delivered()
+
+    #: The window `_gated_hz` counts completions over.
+    GATED_HZ_WINDOW_S = 2.0
+
+    def _gated_hz(self, t: float) -> float:
+        """Frames completed per second over the last GATED_HZ_WINDOW_S — the
+        rate shown while a schedule gate is in place (tick())."""
+        marks = self._done_marks
+        marks.append(float(t))
+        w = float(self.GATED_HZ_WINDOW_S)
+        # The window is (t - w, t]: closed at both ends it holds one frame too
+        # many (a steady 15 fps read 15.5).
+        recent = [m for m in marks if t - m < w]
+        if t - marks[0] >= w:
+            return len(recent) / w                 # a full window: count / w
+        if len(recent) < 2:
+            return 0.0
+        span = recent[-1] - recent[0]              # start-up: not w old yet
+        return (len(recent) - 1) / span if span > 1e-6 else 0.0
 
     def _tap_policy(self, out, item) -> None:
         """`depth_native` + the rig -> the policy mailbox (grid rect_left).
@@ -3739,9 +4141,15 @@ class FStereoWorker(TimerWorker):
                     self._rig_desc = rig.describe()
                 s = self.session
                 try:
-                    fs = s.describe() if s is not None else {}
+                    fs = dict(s.describe()) if s is not None else {}
                 except Exception:                                # noqa: BLE001
                     fs = {}                 # provenance, never a reason to stop
+                # Which pairs end up in this folder depends on the schedule:
+                # under `only`, during a policy mission, the pairs between
+                # bursts are discarded unprocessed and never reach here — the
+                # frame_seq gaps are that, not a camera fault.
+                fs["policy_fs_schedule"] = str(getattr(
+                    getattr(self, "fs_gate", None), "mode", "free"))
                 if not rec.start(rig_describe=self._rig_desc or {}, fstereo=fs):
                     self._rec_why = rec.why
                     self.stereo_rec = None
@@ -3898,7 +4306,9 @@ class FStereoWorker(TimerWorker):
     def meta(self) -> dict:
         """Provenance for the run folder. Written whether it ran or not."""
         if self.session is None:
-            return {"enabled": False, "why": self._fault or "not built"}
+            return {"enabled": False, "why": self._fault or "not built",
+                    "schedule": (self.fs_gate.snapshot()
+                                 if self.fs_gate is not None else None)}
         d = self.session.describe()
         d.update(enabled=bool(self.enabled), ready=bool(self.session.ready),
                  frames=self._frames, measured_hz=round(self._hz, 2),
@@ -3935,7 +4345,17 @@ class FStereoWorker(TimerWorker):
                                        self.opts, "record_stereo", False)),
                                     "why": self._rec_why or
                                     "--record-stereo not given"}),
-                 policy_tap=dict(self._policy_tap))
+                 policy_tap=dict(self._policy_tap),
+                 # --policy-fs-schedule as this worker sees it: None = no gate
+                 # (`free`). Under a gate `measured_hz` above is frames
+                 # completed over the last GATED_HZ_WINDOW_S, not the EMA of
+                 # the arrival interval — and it is the value at the moment
+                 # this is written (under `only`, ~4 during a mission and the
+                 # free rate 2 s after it; `schedule.mission_active` says
+                 # which). RECORD BOUNDARY: do not pool frame rate, plan age
+                 # or infer_ms across schedules.
+                 schedule=(self.fs_gate.snapshot()
+                           if self.fs_gate is not None else None))
         return d
 
     def teardown(self) -> None:
@@ -4569,7 +4989,9 @@ def wire_policy(bus, policy, mpc) -> None:
     * ``policy_status`` PolicyWorker -> MpcWorker (refusal/readiness; the
       window reads the SENSORS row and the log instead)
     * ``cmd_gripper_drive`` -> MpcWorker.on_gripper_drive: EVERY jaw drive
-      (pilot and policy) feeds the open-loop width estimator (A12)
+      (pilot and policy) feeds the open-loop width estimator (A12), and so
+      does ``jaw_drive_seen`` — the gamepad's gripper button when the press
+      went to the vehicle in the passthrough mask instead (2026-10-01)
     * the worker's ``failed`` signal is routed into ``policy_status`` as an
       error, so a dead worker cannot leave the controller believing "ready".
     ``mpc`` may be None (``--policy`` without ``--mpc``): the worker then
@@ -4591,6 +5013,7 @@ def wire_policy(bus, policy, mpc) -> None:
     bus.policy_plan.connect(mpc.on_policy_plan)
     bus.policy_status.connect(mpc.on_policy_status)
     bus.cmd_gripper_drive.connect(mpc.on_gripper_drive)
+    bus.jaw_drive_seen.connect(mpc.on_gripper_drive)     # gamepad passthrough presses (2026-10-01)
     mpc.policy_present = True
     mpc.policy_meta_fn = policy.meta
 
@@ -4623,6 +5046,8 @@ class HardwareBackend(Backend):
         # degraded) the engage gate reads off Telemetry (2026-09-26).
         if hasattr(self.sink, "attitude_axes_state"):
             self.vehicle.attitude_axes_fn = self.sink.attitude_axes_state
+        if hasattr(self.sink, "pwm_gate_state"):
+            self.vehicle.pwm_gate_fn = self.sink.pwm_gate_state
         self.workers = [self.video, self.vehicle, self.sink]
         # Object tracking: opt-in, and when it is off nothing is constructed,
         # nothing is imported, and C3VideoWorker does not even copy a frame.
@@ -4713,6 +5138,9 @@ class HardwareBackend(Backend):
         # latter ONLY with --policy-allow-device-depth (the CLI refuses
         # otherwise; a bench experiment, not the training-parity path).
         self.policy = None
+        #: perception.fs_gate.FsGate shared by the stereo and policy workers,
+        #: or None (--policy-fs-schedule free, the default).
+        self.fs_gate = None
         if bool(getattr(opts, "policy", False)):
             from ..bus import PolicyMailbox
             from .policy import PolicyWorker
@@ -4733,6 +5161,16 @@ class HardwareBackend(Backend):
             if self.fstereo is not None:
                 self.fstereo.policy_mb = pmb
                 self.policy.fstereo_meta_fn = self.fstereo.meta
+                # --policy-fs-schedule (2026-10-01): ONE gate, the same object
+                # in both workers, built before either thread starts. `free`
+                # (the default) builds none, and both workers then make no
+                # call into it. getattr: hand-built Opts (tools, tests) do not
+                # carry the attribute.
+                sched = str(getattr(opts, "policy_fs_schedule", "free") or "free")
+                if sched != "free":
+                    self.fs_gate = FsGate(sched)
+                    self.fstereo.fs_gate = self.fs_gate
+                    self.policy.fs_gate = self.fs_gate
             elif bool(getattr(opts, "policy_allow_device_depth", False)):
                 self.video.policy_mb = pmb
             self.workers.append(self.policy)
@@ -4785,6 +5223,10 @@ class HardwareBackend(Backend):
                 self.tagnav.suppress_land_fix = True
 
         bus.cmd_pilot.connect(self.sink.set_pilot)
+        # LOW mode rl_pwm (2026-09-30): both sinks have the slot (the wiring
+        # test reads these connections by name); only MavlinkCommandSink
+        # speaks the Lua override transport, the null sink drops the frame.
+        bus.cmd_pwm.connect(self.sink.set_pwm)
         bus.cmd_gripper.connect(self.sink.set_gripper)
         bus.cmd_lights.connect(self.sink.set_lights)
         bus.cmd_enable.connect(self.sink.set_enabled)

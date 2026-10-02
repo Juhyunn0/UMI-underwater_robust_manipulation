@@ -104,10 +104,15 @@ class HwRl(HwPid):
     """RL follower with HwPid's harness surface (reference API inherited)."""
 
     follow_ok = True
+    #: Which config block names the policy, and which action modes this class flies. HwRlPwm (LOW mode ``rl_pwm``,
+    #: 2026-09-30) overrides both; nothing else differs in how the export is read.
+    CFG_KEY = "rl"
+    ACCEPTED_MODES = ("axes", "axes6")
+    DEFAULT_DIR = DEFAULT_POLICY_DIR
 
     def __init__(self, cfg, log=print):
-        raw = dict(getattr(cfg, "rl", None) or {})
-        pdir = str(raw.get("policy_dir", DEFAULT_POLICY_DIR))
+        raw = dict(getattr(cfg, self.CFG_KEY, None) or {})
+        pdir = str(raw.get("policy_dir", self.DEFAULT_DIR))
         if not os.path.isabs(pdir):
             pdir = os.path.join(REPO_ROOT, pdir)
         self.policy_dir = pdir
@@ -121,12 +126,15 @@ class HwRl(HwPid):
         # script that forces the motor outputs with a 100 ms timeout while armed + MANUAL; motors stay on the mixer, so
         # ARM/DISARM and every failsafe keep working — RCIN passthrough was rejected for bypassing them).
         self.action_mode = str(self.spec.get("action_mode", "axes"))
-        if self.action_mode == "pwm":
+        if self.action_mode == "pwm" and "pwm" not in self.ACCEPTED_MODES:
             raise ValueError(f"rl: policy {os.path.relpath(pdir, REPO_ROOT)} is a '{self.action_mode}' policy "
-                             f"({self.spec.get('num_actions')} outputs); the station has only the MANUAL_CONTROL 4-axis transport "
+                             f"({self.spec.get('num_actions')} outputs); LOW mode rl has only the MANUAL_CONTROL 4-axis transport "
                              "— fly it with RL_controller/deploy/run_policy.py (transport pwm_lua_override: RC_CHANNELS_OVERRIDE "
-                             "ch 9..16 + the Navigator Lua timeout override; NOT the station's reserved rc_override ch 1..6) "
-                             "or export an axes policy")
+                             "ch 9..16 + the Navigator Lua timeout override; NOT the station's reserved rc_override ch 1..6), "
+                             "name it under `rl_pwm:` and pick LOW RL_PWM, or export an axes policy")
+        if self.action_mode != "pwm" and self.ACCEPTED_MODES == ("pwm",):
+            raise ValueError(f"rl_pwm: policy {os.path.relpath(pdir, REPO_ROOT)} is a '{self.action_mode}' policy — LOW "
+                             f"mode rl_pwm flies per-thruster 'pwm' exports only; name an axes policy under `rl:`")
         # axes6 (2026-09-27): the policy also commands pitch (a4) and roll (a5). They ride the 6-DoF variant's extension
         # axes (engage.attitude_axes, 2026-09-26) as K = a5*roll_nm, M = a4*pitch_nm in the pseudo-wrench; without that
         # switch the worker would DROP K/M and the policy would fly with two of its outputs silently ignored -> refuse.
@@ -135,7 +143,7 @@ class HwRl(HwPid):
             raise ValueError(f"rl: policy {os.path.relpath(pdir, REPO_ROOT)} is a 6-axis policy (surge, sway, heave, yaw, pitch, "
                              "roll) but engage.attitude_axes.enabled is false: its pitch/roll outputs would be dropped by "
                              "allocation.wrench_to_axes. Enable engage.attitude_axes (with its probe / sign gates) or use a 4-axis policy")
-        if self.action_mode not in ("axes", "axes6"):
+        if self.action_mode not in self.ACCEPTED_MODES:
             raise ValueError(f"rl: unknown action_mode {self.action_mode!r} in {os.path.relpath(pdir, REPO_ROOT)}")
         self.K = int(self.spec["history_len"])
         self.frame_dim = int(self.spec["frame_dim"])
@@ -179,7 +187,9 @@ class HwRl(HwPid):
         for _ in range(20):
             self.policy.act(np.zeros(self.policy.obs_dim))
         self.probe_ms = 1e3 * (time.perf_counter() - t0) / 20.0
-        self.pilot_gain_assumed = float(self.spec.get("pilot_gain_assumed", 0.5))
+        # a pwm export carries pilot_gain_assumed: null (no mixer, no pilot gain); HwRlPwm reports None in its meta
+        _pg = self.spec.get("pilot_gain_assumed", 0.5)
+        self.pilot_gain_assumed = 0.5 if _pg is None else float(_pg)
         log(f"rl: policy {os.path.relpath(pdir, REPO_ROOT)} ({self.spec.get('checkpoint', '?')}), obs {self.policy.obs_dim} "
             f"(K={self.K}, feed-forward={'on' if self.goal_velocity else 'off'}), act {self.n_act}, probe {self.probe_ms:.2f} ms; "
             f"assumes JS_GAIN_DEFAULT {self.pilot_gain_assumed} and no axis slew [스펙 obs_spec.json]")
@@ -272,3 +282,117 @@ class HwRl(HwPid):
                 "frames": "policy world z-up / body FLU; station NED/FRD mirrored with diag(1,-1,-1)",
                 "ref_preview": False, "path_reference": "shared spatial plan, stage 0 (+ its velocity as feed-forward)",
                 "provenance": "RL_controller (Isaac Lab, PPO), see rl_policies/<name>/RL_controller_README.md"}
+
+
+# ----------------------------------------------------------------------------- per-thruster PWM (LOW mode ``rl_pwm``)
+class HwRlPwm(HwRl):
+    """RL follower whose 8 outputs are per-thruster throttles (RL_controller ``action_mode: pwm``) — LOW mode ``rl_pwm``.
+
+    Everything about the OBSERVATION is HwRl's: the same frame, the same reference API, the same NED -> z-up mirror; the
+    frame is only wider (the previous action is 8 throttles, not 4 axes). What differs is the output. There is no
+    wrench to hand the worker's ``wrench_to_axes``: ``step`` puts the pulses in ``info["pwm_us"]`` and the worker sends
+    THOSE on ``bus.cmd_pwm`` (rc override ch 9..16 -> the vehicle's Lua timeout override, control/rl_pwm.py) beside a
+    NEUTRAL MANUAL_CONTROL. The ``u`` it returns is the nominal steady-state wrench of the capped throttles, for the
+    CSV's uX..uN — comparable with the other controllers' columns only as an estimate, never as a command.
+
+    ``pwm_cap`` is the |throttle| ceiling on the wire (fraction of +-400 us). The policy was trained at 1.0; the shipped
+    config says 0.25 because this path has never moved the vehicle (rl_pwm.PWM_CAP_FIRST_WATER). The capped pulse is
+    what the network is fed back as its previous action, as in training.
+
+    UNTESTED ON THE VEHICLE (2026-09-30) — see control/rl_pwm.py for the gate that has to pass first.
+    """
+
+    CFG_KEY = "rl_pwm"
+    ACCEPTED_MODES = ("pwm",)
+    DEFAULT_DIR = os.path.join("rov_gui", "control", "rl_policies", "pwm10_s1")
+    #: The worker reads this to pick the transport: "pwm" = pulses on bus.cmd_pwm, anything else = axes on cmd_pilot.
+    transport = "pwm"
+
+    def __init__(self, cfg, log=print):
+        from .rl_pwm import PWM_CAP_FIRST_WATER, PWM_CHANNELS_DEFAULT, PwmModel
+        super().__init__(cfg, log=lambda m: None)
+        raw = dict(getattr(cfg, self.CFG_KEY, None) or {})
+        if self.n_act != 8:
+            raise ValueError(f"rl_pwm: policy has {self.n_act} outputs, the transport carries 8 thrusters")
+        out = self.spec.get("output") or {}
+        if str(out.get("kind")) != "pwm" or not isinstance(out.get("pwm_model"), dict):
+            raise ValueError("rl_pwm: obs_spec.json has no output.pwm_model (re-export with RL_controller >= 2026-09-27)")
+        self.model = PwmModel(out["pwm_model"])
+        _cap = raw.get("pwm_cap", PWM_CAP_FIRST_WATER)
+        if isinstance(_cap, bool) or not isinstance(_cap, (int, float)) \
+                or not (math.isfinite(float(_cap)) and 0.0 < float(_cap) <= 1.0):
+            raise ValueError(f"rl_pwm.pwm_cap must be a number in (0, 1], got {_cap!r}")
+        cap = float(_cap)
+        #: never above what the policy was trained with (the env's own cap), whatever the config says
+        self.pwm_cap = min(cap, self.model.cap_trained)
+        #: fixed: the vehicle's script maps RC channel 8+m to motor m (control/rl_pwm._fixed_channels)
+        self.pwm_channels = tuple(PWM_CHANNELS_DEFAULT)
+        self.mode = "rl_pwm"
+        self.solver_kind = "rl_pwm"
+        self.axis_cap = None                       # no axes leave under this controller
+        self.last_pwm_us = None
+        log(f"rl_pwm: policy {os.path.relpath(self.policy_dir, REPO_ROOT)} ({self.spec.get('checkpoint', '?')}), obs "
+            f"{self.policy.obs_dim} (K={self.K}), 8 thruster throttles, |throttle| <= {self.pwm_cap:.2f} on the wire "
+            f"(trained {self.model.cap_trained:.2f}), rc channels {list(self.pwm_channels)}, expects MOT_1..8_DIRECTION "
+            f"{self.model.motor_direction}; transport {self.model.transport} — UNTESTED on the vehicle [예측]")
+
+    def step(self, eta_ned, nu_ned, nudot_ned, t: float):
+        """Pulses for this tick. Anything that goes wrong on the way — a non-finite state, a network output that is
+        not a number — yields eight 1500s and counts as a solver failure (the worker disengages after
+        engage.max_solver_fails in a row), never an exception that leaves the engagement up with nothing sent."""
+        from .rl_pwm import NEUTRAL_PULSES, throttles_to_pwm
+        t0 = time.perf_counter()
+        try:
+            obs = self.observation(eta_ned, nu_ned, t)
+            if not np.all(np.isfinite(obs)):
+                raise ValueError("non-finite observation")
+            a = self.policy.act(obs)
+            thr = np.clip(self.model.throttles(a), -self.pwm_cap, self.pwm_cap)
+            pwm = throttles_to_pwm(thr, self.pwm_cap)
+            u = self.model.wrench_ned_from_throttles(thr)
+            if not np.all(np.isfinite(u)):
+                raise ValueError("non-finite wrench estimate")
+            self.last_action = np.asarray(a, float).copy()
+            status = 0
+        except Exception:                                        # noqa: BLE001
+            self.n_fail += 1
+            thr = np.zeros(8)
+            pwm = tuple(NEUTRAL_PULSES)
+            u = np.zeros(6)
+            status = 1
+        ms = 1e3 * (time.perf_counter() - t0)
+        return u, {"w_hat": self.w_hat, "solve_ms": ms, "status": status, "n_fail": self.n_fail, "nis": 0.0,
+                   "pwm_us": pwm, "throttle": [float(v) for v in thr]}
+
+    def note_applied(self, tau_ned_est) -> None:
+        """The axes path's feedback does not apply: nothing this controller asked for left as an axis (the worker sends
+        a neutral MANUAL_CONTROL). The previous action comes from ``note_applied_pwm``."""
+        return None
+
+    def note_applied_pwm(self, pwm_us) -> None:
+        """The 8 pulses that actually LEFT become the policy's previous action (None = nothing left: neutral)."""
+        from .rl_pwm import NEUTRAL_PULSES, pwm_to_action
+        pw = NEUTRAL_PULSES if pwm_us is None else pwm_us
+        self.last_pwm_us = tuple(int(p) for p in pw)
+        self._prev_action = pwm_to_action(pw, self.model.throttle_max)
+
+    def reset(self) -> None:
+        super().reset()
+        self.last_pwm_us = None
+
+    def meta(self) -> dict:
+        d = super().meta()
+        d.update({"type": "rl_pwm", "solver": "rl_pwm", "pwm_cap": float(self.pwm_cap),
+                  "pwm_cap_trained": float(self.model.cap_trained), "pwm_throttle_max": float(self.model.throttle_max),
+                  "pwm_channels": list(self.pwm_channels), "motor_direction_expected": list(self.model.motor_direction),
+                  "transport": self.model.transport,
+                  "pilot_gain_assumed": None, "axis_cap": None, "axis_slew_per_s": None,
+                  "axes_note": "NO axes: 8 pulses on RC_CHANNELS_OVERRIDE ch 9..16, forced by the vehicle's Lua timeout "
+                               "override; MANUAL_CONTROL is sent NEUTRAL. CSV ax_* are 0, pwm1..8 are the vehicle's "
+                               "own SERVO_OUTPUT_RAW",
+                  "wrench_note": "uX..uN = nominal steady-state wrench of the capped throttles (T200 curve x voltage "
+                                 "scale x B) — an estimate for the log, not a command and not a measurement",
+                  "status_note": "UNTESTED on the vehicle as of 2026-09-30 [예측]"})
+        d.pop("axis_gain_for_pseudo_wrench", None)
+        return d
+

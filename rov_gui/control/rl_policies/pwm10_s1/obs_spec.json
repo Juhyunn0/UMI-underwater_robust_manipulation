@@ -1,0 +1,324 @@
+{
+  "checkpoint": "logs/rsl_rl/rov_posehold/2026-09-27_11-06-05_pwm10_s1/model_1199.pt",
+  "obs_dim": 116,
+  "act_dim": 8,
+  "history_len": 4,
+  "obs_goal_velocity": true,
+  "frame_dim": 29,
+  "core_obs_dim": 17,
+  "num_actions": 8,
+  "frame_layout": [
+    "q_des(w,x,y,z)",
+    "offset_b(3)",
+    "q_est(w,x,y,z)",
+    "v_b_est(3)",
+    "gyro_b(3)",
+    "goal_v_b(3)",
+    "goal_yaw_rate(1)",
+    "prev_action(8)"
+  ],
+  "moving_goal": {
+    "enabled": true,
+    "p_static": 0.3,
+    "speed_range": [
+      0.02,
+      0.25
+    ],
+    "vz_max": 0.03,
+    "turn_rate_max": 1.0,
+    "p_follow": 0.5,
+    "yaw_rate_max": 0.4,
+    "margin": 0.3,
+    "start_at_robot": false,
+    "init_offset_max": 0.0,
+    "init_yaw_max": 0.0,
+    "ramp_time_range": [
+      1.0,
+      3.0
+    ],
+    "speed_mod_max": 0.3,
+    "p_stop": 0.3,
+    "freq_range": [
+      0.02,
+      0.15
+    ],
+    "wall_zone": 0.6,
+    "steer_dt": 0.25,
+    "horizon_max_s": 120.0
+  },
+  "episode_length_s": 20.0,
+  "history_order": "newest first",
+  "obs_offset_clip": 1.0,
+  "obs_quat_unique": true,
+  "control_dt": 0.05,
+  "action_mode": "pwm",
+  "pwm_throttle_max": 1.0,
+  "action_convention": "per-thruster normalized throttle a_i in [-1,1], i = ArduSub motor 1..8 in the order of configs/rov_params.yaml thrusters.positions; throttle_i = 1 * a_i; pwm_i = 1500 + 400 * throttle_i [us]; positive = the mixer's positive-PWM thrust direction (rov_rl/mixer.py sigma); no mixer, no pilot gain",
+  "pilot_gain_assumed": null,
+  "output": {
+    "kind": "pwm",
+    "frame": "body NED/FRD (station MpcWorker convention; Z positive down, N positive clockwise)",
+    "order": [
+      "X",
+      "Y",
+      "Z",
+      "K",
+      "M",
+      "N"
+    ],
+    "units": [
+      "N",
+      "N",
+      "N",
+      "N*m",
+      "N*m",
+      "N*m"
+    ],
+    "actuated": [
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+    ],
+    "axis_gain": {
+      "surge_n": 60.0,
+      "sway_n": 60.0,
+      "heave_n": 60.0,
+      "yaw_nm": 20.0
+    },
+    "from_actions": "throttle = pwm_throttle_max * a; thrust = T200(throttle) * voltage_scale; u_flu = B_flu @ thrust; u = u_flu * [1,-1,-1,1,-1,-1] (deploy/pwm.py PwmModel.wrench_ned)",
+    "pwm_model": {
+      "num_thrusters": 8,
+      "motor_order": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "pwm_throttle_max": 1.0,
+      "pwm_cap_trained": 1.0,
+      "motor_direction": [
+        -1,
+        -1,
+        1,
+        1,
+        -1,
+        1,
+        1,
+        -1
+      ],
+      "transport": "pwm_lua_override",
+      "pwm_us": "1500 + 400 * throttle",
+      "t200": {
+        "deadband": 0.075,
+        "rpm_max": 3900.0,
+        "rpm_pos": [
+          3659.9,
+          345.21
+        ],
+        "rpm_neg": [
+          3494.4,
+          -433.5
+        ],
+        "kgf_pos": [
+          4.7368e-07,
+          -0.00019275,
+          0.084452
+        ],
+        "kgf_neg": [
+          -3.8442e-07,
+          -0.00016186,
+          -0.039139
+        ]
+      },
+      "voltage_scale": 0.72,
+      "B_flu": [
+        [
+          0.7071067690849304,
+          0.7071067690849304,
+          0.7071067690849304,
+          0.7071067690849304,
+          0.0,
+          -0.0,
+          -0.0,
+          0.0
+        ],
+        [
+          0.7071067690849304,
+          -0.7071067690849304,
+          -0.7071067690849304,
+          0.7071067690849304,
+          0.0,
+          -0.0,
+          -0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          -0.0,
+          -0.0,
+          1.0,
+          -1.0,
+          -1.0,
+          1.0
+        ],
+        [
+          0.06029106676578522,
+          -0.06029106676578522,
+          -0.06029106676578522,
+          0.06029106676578522,
+          -0.22387656569480896,
+          -0.21612343192100525,
+          0.22387656569480896,
+          0.21612343192100525
+        ],
+        [
+          -0.06029106676578522,
+          -0.06029106676578522,
+          -0.06029106676578522,
+          -0.06029106676578522,
+          -0.09017158299684525,
+          0.09017158299684525,
+          -0.14982841908931732,
+          0.14982841908931732
+        ],
+        [
+          0.14817291498184204,
+          -0.14269062876701355,
+          0.19884195923805237,
+          -0.19335965812206268,
+          0.0,
+          0.0,
+          0.0,
+          -0.0
+        ]
+      ],
+      "sigma": [
+        1.0,
+        1.0,
+        -1.0,
+        -1.0,
+        1.0,
+        -1.0,
+        -1.0,
+        1.0
+      ],
+      "thrust_dirs_flu": [
+        [
+          0.7071067690849304,
+          0.7071067690849304,
+          0.0
+        ],
+        [
+          0.7071067690849304,
+          -0.7071067690849304,
+          0.0
+        ],
+        [
+          0.7071067690849304,
+          -0.7071067690849304,
+          -0.0
+        ],
+        [
+          0.7071067690849304,
+          0.7071067690849304,
+          -0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ],
+        [
+          -0.0,
+          -0.0,
+          -1.0
+        ],
+        [
+          -0.0,
+          -0.0,
+          -1.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "thrust_pos_flu": [
+        [
+          0.10567158460617065,
+          -0.10387656837701797,
+          -0.08526444435119629
+        ],
+        [
+          0.10567158460617065,
+          0.09612343460321426,
+          -0.08526444435119629
+        ],
+        [
+          -0.177328422665596,
+          -0.10387656837701797,
+          -0.08526444435119629
+        ],
+        [
+          -0.177328422665596,
+          0.09612343460321426,
+          -0.08526444435119629
+        ],
+        [
+          0.09017158299684525,
+          -0.22387656569480896,
+          -0.017764441668987274
+        ],
+        [
+          0.09017158299684525,
+          0.21612343192100525,
+          -0.017764441668987274
+        ],
+        [
+          -0.14982841908931732,
+          -0.22387656569480896,
+          -0.017764441668987274
+        ],
+        [
+          -0.14982841908931732,
+          0.21612343192100525,
+          -0.017764441668987274
+        ]
+      ],
+      "wrench_flu_to_frd_sign": [
+        1,
+        -1,
+        -1,
+        1,
+        -1,
+        -1
+      ],
+      "note": "nominal steady-state chain (no command delay / lag, unit thruster gains); the training env randomizes all of these"
+    },
+    "files": {
+      "policy.onnx": "actions (1,8) in [-1,1] = per-thruster normalized throttle / pwm_throttle_max",
+      "policy_wrench.onnx": "wrench (1,6) N / N*m, nominal chain"
+    }
+  },
+  "frames": "body FLU, world z-up; deploy/obs_builder.py converts the station's NED/FRD state",
+  "estimator": {
+    "vel_lp_alpha": 0.6,
+    "propagate": true,
+    "stale_s": 0.5,
+    "min_fix_dt": 0.02
+  },
+  "dr_preset": "traj10",
+  "ang_error_mode": "full",
+  "activation": "elu",
+  "obs_normalizer": false,
+  "rsl_rl_iteration": 1199
+}

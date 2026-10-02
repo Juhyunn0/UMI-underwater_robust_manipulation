@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -3176,6 +3178,39 @@ def test_ui_recording_takes_the_operator_name_and_keeps_the_old_one_when_empty()
         assert path.parent.parent.parent == Path(td)
 
 
+def test_ui_recording_is_h264_where_ffmpeg_can_make_it():
+    """mp4v files do not play in the VS Code preview (its ffmpeg has no mpeg4
+    decoder); with a libx264 ffmpeg on PATH the recording must be H.264, and
+    the sidecar must say which codec it got either way."""
+    from rov_gui import recorder as rmod
+
+    app = _app()
+    theme.apply(app)
+    with tempfile.TemporaryDirectory() as td:
+        w = QtWidgets.QLabel("x")
+        w.resize(66, 50)
+        rec = rmod.ScreenRecorder(w, out_dir=td, fps=10.0)
+        path = rec.start()
+        assert path is not None, rec.stats.error
+        _pump(app, 400)
+        rec.stop()
+        meta = json.loads(path.with_suffix(".json").read_text())
+        assert meta["error"] is None, meta
+        assert meta["frames_written"] > 0, meta
+        if rmod._ffmpeg_x264() is None:
+            assert meta["codec"] == "mpeg4", meta
+            return
+        assert meta["codec"] == "h264", meta
+        probe = shutil.which("ffprobe")
+        if probe:
+            out = subprocess.run(
+                [probe, "-v", "error", "-count_packets", "-select_streams", "v",
+                 "-show_entries", "stream=codec_name,width,height,nb_read_packets",
+                 "-of", "csv=p=0", str(path)],
+                capture_output=True, text=True).stdout.strip()
+            assert out == f"h264,66,50,{meta['frames_written']}", out
+
+
 def test_mission_log_scrolls_back_and_is_saved_beside_a_recording():
     """The log keeps the whole session (the QLabel it replaced dropped
     everything past 12 lines), follows the newest line only while the operator
@@ -3420,7 +3455,7 @@ def test_trajectory_panel_high_low_combos_speak_keys_and_show_labels():
              for i in range(p.mode_box.count())]
     assert [k for _, k in modes] == ["none", "pid", "mpc", "mpc_tuned",
                                      "dobmpc", "dobmpc_tuned", "mpcc",
-                                     "dobmpcc", "rl"], modes
+                                     "dobmpcc", "rl", "rl_pwm"], modes
     assert modes[0] == ("None", "none")
     assert {k: lbl for lbl, k in modes} == MODE_LABELS
     # set_mode_default selects by KEY and never emits (honesty rule)

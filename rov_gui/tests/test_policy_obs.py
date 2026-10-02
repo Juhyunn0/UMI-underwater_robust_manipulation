@@ -22,7 +22,11 @@ No camera, no GPU, no torch. What is pinned:
 * color_aligned: a plane scatters into a band with an invalid border, gaps
   are filled and COUNTED apart from measured pixels, coverage < 1;
 * set_grid is idempotent for one fingerprint and refuses another;
-* an invalid (0) pixel stays 0 with valid = 0 through every grid.
+* an invalid (0) pixel stays 0 with valid = 0 through every grid;
+* view shift (TEMPORARY, 2026-09-30): off (None or zero) is the recipe bit
+  for bit; on, a plane moves by exactly the translation, a near object below
+  the axis drops/grows/comes nearer, the band it vacates is filled with the
+  BACKGROUND's distance, and the config key is optional, bounded, 0 = off.
 """
 
 from __future__ import annotations
@@ -503,6 +507,167 @@ def test_describe_is_json_serialisable_and_names_the_recipe():
         raise AssertionError("wrong-size depth accepted")
     except GridError:
         pass
+
+
+# =============================================================================
+# 7. view shift (TEMPORARY, 2026-09-30): off is the recipe; on is a translation
+# =============================================================================
+#: body x (the gripper axis) seen from the C3 [유도: config/hw_nav.yaml main
+#: camera, R_t_frd_cam('main') row 0 at the 43.3 deg mount] — pinned against
+#: the config below, so a re-mounted camera fails here and not in the water.
+_BODY_X_IN_CAM = np.array([0.0, -0.6817320540699252, 0.7316019453593604])
+
+
+def test_view_shift_axis_literal_is_the_nav_configs_body_x():
+    """backends/policy.py turns the config's scalar into ``fwd * R_bc[0, :]``.
+    Row 0 of the camera->body rotation is body x in camera coordinates: up
+    in the image (-y) and along the optical axis (+z) for a camera pitched
+    down."""
+    from rov_gui.control.geometry import NavConfig
+    R_bc, _t = NavConfig.load("config/hw_nav.yaml").R_t_frd_cam("main")
+    row = np.asarray(R_bc, float).reshape(3, 3)[0]
+    assert np.allclose(row, _BODY_X_IN_CAM, atol=1e-9), row
+    assert abs(float(np.linalg.norm(row)) - 1.0) < 1e-12
+    assert row[1] < 0.0 < row[2]
+
+
+def test_view_shift_off_is_the_training_recipe_bit_for_bit():
+    """None and an all-zero vector are both OFF: same bytes as the reference
+    recipe, no view keys in the stats, nothing in describe(), and no
+    host_depth import (the OFF path must not need depthai)."""
+    d = _synthetic_depth(seed=11)
+    ref = _reference_obs(d, normalise_depth)
+    for shift in (None, [0.0, 0.0, 0.0]):
+        b = DepthObsBuilder(TARGET_YAML, view_shift_cam_m=shift)
+        b.set_grid(IdentityGrid(size=(W, H)))
+        obs, st = b.build(d)
+        assert np.array_equal(obs, ref), shift
+        assert "view_landed" not in st and "view_filled" not in st, shift
+        assert "view_shift" not in b.describe(), shift
+        assert b.view_shift_cam_m is None, shift
+        assert b._host_depth is None, shift
+
+
+def test_view_shift_along_the_optical_axis_moves_a_plane_by_exactly_that():
+    """A fronto-parallel plane at 1 m seen from 10 cm closer is a plane at
+    0.9 m, everywhere, with nothing left empty."""
+    _need_host_depth()
+    b = DepthObsBuilder(TARGET_YAML, view_shift_cam_m=[0.0, 0.0, 0.10])
+    b.set_grid(IdentityGrid(size=(W, H)))
+    w, st = b._shift_view(np.full((H, W), 1000, np.uint16))
+    assert w.dtype == np.uint16 and w.shape == (H, W)
+    crop = w[:, 120:520]                            # what build() keeps
+    assert int(np.count_nonzero(crop == 0)) == 0, "holes left in the crop"
+    assert int(crop.min()) == 900 and int(crop.max()) == 900, (crop.min(), crop.max())
+    assert st["view_landed"] + st["view_filled"] == 400 * 400
+    # the 2x2 footprint closes a x1.11 magnification by itself
+    assert st["view_filled"] == 0, st
+    obs, st2 = b.build(np.full((H, W), 1000, np.uint16))
+    assert st2["obs_valid"] == 1.0 and "view_filled" in st2
+    v900 = int(np.clip(normalise_depth(np.array([[900]], np.uint16), 0.20, 3.00)
+                       * 255.0 + 0.5, 0, 255)[0, 0])
+    assert set(np.unique(obs[..., 0]).tolist()) == {v900}
+    vs = b.describe()["view_shift"]
+    assert vs["t_cam_m"] == [0.0, 0.0, 0.1] and "TEMPORARY" in vs["note"]
+
+
+def test_view_shift_forward_drops_a_near_object_and_fills_behind_it_with_background():
+    """The case it exists for: a near box below the optical axis in front of a
+    far plane, viewpoint moved 5 cm along the gripper axis. The box must come
+    out LOWER, WIDER, NEARER by the z part of the shift, and SOLID — no
+    background showing through the magnified surface (safety review
+    2026-09-30); what opens up behind it must carry the PLANE's distance."""
+    _need_host_depth()
+    t = 0.05 * _BODY_X_IN_CAM
+    d = np.full((H, W), 1000, np.uint16)
+    d[230:300, 300:340] = 350                       # the "jaw": near, below centre
+    b = DepthObsBuilder(TARGET_YAML, view_shift_cam_m=t)
+    b.set_grid(IdentityGrid(size=(W, H)))
+    w, st = b._shift_view(d)
+    assert int(np.count_nonzero(w[:, 120:520] == 0)) == 0
+    assert st["view_filled"] > 0                    # the vacated band was empty
+    w = w[:, 120:520]; d = d[:, 120:520]            # everything below is in the crop
+    dz = int(round(1000.0 * t[2]))                  # 37 mm
+    box = w < 600
+    assert box.any()
+    assert abs(int(np.median(w[box])) - (350 - dz)) <= 1
+    rows0, cols0 = np.nonzero(d < 600)
+    rows1, cols1 = np.nonzero(box)
+    assert rows1.min() > rows0.min() + 20, (rows0.min(), rows1.min())     # moved down
+    assert (cols1.max() - cols1.min()) > (cols0.max() - cols0.min())      # grew
+    # SOLID: inside the box's new outline (one pixel in from its bounding
+    # box; the outline is a slightly curved quadrilateral under the lens
+    # distortion, hence the margin of 3) there is not one far pixel.
+    inner = w[rows1.min() + 3:rows1.max() - 2, cols1.min() + 3:cols1.max() - 2]
+    assert inner.size > 2000 and int(inner.max()) < 600, \
+        f"{int(np.count_nonzero(inner >= 600))} background pixels show through the box"
+    # everything that is not the box is the plane, 37 mm nearer (+-2 mm for
+    # rays that are not parallel to z) — including the band the box vacated.
+    rest = w[~box]
+    assert abs(int(np.median(rest)) - (1000 - dz)) <= 2
+    assert int(rest.min()) >= 1000 - dz - 25 and int(rest.max()) <= 1000, \
+        (rest.min(), rest.max())
+    assert np.all(w[230:245, 180:220] > 900), "the vacated band took the box's depth"
+
+
+def test_view_shift_drops_what_would_sit_on_the_virtual_lens():
+    """Something 60 mm from the real lens is ~20 mm from the virtual one at a
+    5 cm shift: it is dropped, not drawn as a saturated speck."""
+    _need_host_depth()
+    t = 0.05 * _BODY_X_IN_CAM
+    d = np.full((H, W), 1000, np.uint16)
+    d[195:205, 315:325] = 60
+    b = DepthObsBuilder(TARGET_YAML, view_shift_cam_m=t)
+    b.set_grid(IdentityGrid(size=(W, H)))
+    w, _st = b._shift_view(d)
+    assert int(w[:, 120:520].min()) > 900, int(w[:, 120:520].min())
+
+
+def test_view_shift_refuses_what_it_cannot_render():
+    for bad in ([0.0, 0.0, 0.2], [float("nan"), 0.0, 0.0], [0.0, 0.05]):
+        try:
+            DepthObsBuilder(TARGET_YAML, view_shift_cam_m=bad)
+            raise AssertionError(f"accepted {bad}")
+        except ValueError:
+            pass
+    _need_host_depth()
+    # exactly the cap along a unit row must pass: geometry accepts 0.15 and
+    # the worker multiplies it by a row whose norm is 1 +- an ulp.
+    DepthObsBuilder(TARGET_YAML, view_shift_cam_m=(0.15 * _BODY_X_IN_CAM).tolist())
+
+
+def test_obs_view_forward_m_config_is_optional_forward_only_and_shipped_off():
+    """The shipped config leaves the shift OFF: it is per process, not per
+    checkpoint, and the launch checkpoint in that file is a CAN one. If this
+    fails because the key was set for a peg session, that is the reminder to
+    put null back."""
+    import re
+    import tempfile
+    from rov_gui.control.geometry import MpcConfig, default_policy_block
+    assert default_policy_block()["obs_view_forward_m"] is None, "default must be OFF"
+    src = (Path(__file__).resolve().parents[2] / "config" / "hw_mpc.yaml").read_text()
+    pat = re.compile(r"^  obs_view_forward_m:.*$", re.M)
+    assert pat.findall(src) == ["  obs_view_forward_m: null"], \
+        "config/hw_mpc.yaml ships with the obs view shift ON — set it back to null"
+
+    def load(value):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
+            fh.write(pat.sub(f"  obs_view_forward_m: {value}", src))
+        try:
+            return MpcConfig.load(fh.name).policy["obs_view_forward_m"]
+        finally:
+            os.unlink(fh.name)
+
+    assert load("null") is None
+    assert load("0.05") == 0.05
+    assert load("0.15") == 0.15
+    assert load("0.0") is None
+    for bad in ("0.3", "-0.05", ".nan"):
+        try:
+            load(bad)
+            raise AssertionError(f"accepted {bad}")
+        except ValueError:
+            pass
 
 
 # =============================================================================

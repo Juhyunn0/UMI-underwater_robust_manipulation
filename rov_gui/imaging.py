@@ -132,7 +132,7 @@ def depth_palette_knots(depth_mm: np.ndarray, steps: int = 64,
     """Ascending millimetre quantiles that histogram-equalise the palette.
 
     Ported from the reference viewer
-    (``FoundationStereo/UMI_Underwater/oakd_viewer.py:139``), which is what
+    (``~/Desktop/data collection/UMI_Underwater/oakd_viewer.py:139``), which is what
     makes its picture read as detailed where the station's read as flat. Every
     colour band then covers the same NUMBER OF PIXELS rather than the same
     number of millimetres, so a scene spanning 0.4 m to 28 m — one open doorway
@@ -246,7 +246,7 @@ def auto_depth_range(depth_mm: np.ndarray, lo_pct: float = 2.0,
     reads as "dark blue and black" — indistinguishable at a glance from the
     holes it is drawn next to. That is what made the station's depth panel
     look dirty beside the reference viewer
-    (``FoundationStereo/UMI_Underwater/oakd_viewer.py:194``), which has always
+    (``~/Desktop/data collection/UMI_Underwater/oakd_viewer.py:194``), which has always
     auto-ranged; the maps themselves were comparable.
 
     Percentiles rather than min/max so a handful of stray pixels — one hot
