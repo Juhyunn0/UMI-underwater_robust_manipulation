@@ -325,6 +325,10 @@ class HwDobMpc:
         self._plan_along_scale = None      # policy.along_scale while a policy plan is installed
         self._plan_along_scale_flown = None   # the value THIS engagement flew (None = controller's own)
         self._wt_cfg_tune = None           # the config's along/cross tune, restored after a policy plan
+        # MPC_Tuned PROFILE (2026-10-04, control/mpc_tune.py): held here,
+        # APPLIED only while the mode is "mpc_tuned" (_refresh_tune).
+        self._tune_profile = None
+        self._tune_warnings = []
         self.cfg = mpc_cfg
         d = import_dobmpc(mpc_cfg.rov_model)
         self.frames = d["frames"]
@@ -401,6 +405,12 @@ class HwDobMpc:
         # meta can state what the tuned modes WOULD have used.
         from .path_cost import PathFrameWeights
 
+        # The weights the solver was GENERATED with (mpc_acados: W =
+        # diag(Q, R), W_e = diag(QN)). An MPC_Tuned profile may replace them
+        # while mode is mpc_tuned; every other mode writes these back.
+        self._Q_build = np.asarray(P.MPC_Q, float).copy()
+        self._R_build = np.asarray(P.MPC_R, float).copy()
+        self._QN_build = np.asarray(P.MPC_QN, float).copy()
         self._wt_cfg_tune = getattr(mpc_cfg, "mpc_tuned", None)
         self._wt = PathFrameWeights(P.MPC_Q, P.MPC_R, P.MPC_QN, self._wt_cfg_tune)
         if self.tuned and self.solver_kind != "acados":
@@ -471,11 +481,21 @@ class HwDobMpc:
                 "mpc_tuned needs the acados solver (the per-stage weight is "
                 f"an acados cost_set); this build fell back to "
                 f"{self.solver_kind}")
-        self._mode = value
-        self.dob = value.startswith("dobmpc")
-        self.tuned = value.endswith("_tuned")
-        if not self.tuned:
-            self._restore_base_weights()
+        prev = self._tune_state()
+        try:
+            self._mode = value
+            self.dob = value.startswith("dobmpc")
+            self.tuned = value.endswith("_tuned")
+            if not self.tuned:
+                self._restore_base_weights()
+            # A held MPC_Tuned profile turns on/off with the mode (it applies
+            # under "mpc_tuned" only); no-op when none is held.
+            if getattr(self, "_tune_profile", None) is not None:
+                self._refresh_tune()
+        except Exception:
+            # the worker reports "staying on <prev>": make that true
+            self._tune_rollback(prev)
+            raise
 
     #: solves per probe after the warm-up one; the probe is their MEDIAN
     PROBE_N = 5
@@ -1025,8 +1045,168 @@ class HwDobMpc:
         from .path_cost import PathFrameWeights
 
         self._restore_base_weights()
+        Q, R, QN = self._base_weights()
+        self._wt = PathFrameWeights(Q, R, QN, tune)
+
+    # -------------------------------------------------- MPC_Tuned profile
+    # 2026-10-04 (operator request): the follower's tuning lives in a file
+    # (control/mpc_tune.py) and is picked like a DP checkpoint. HELD here for
+    # every mode, APPLIED only under "mpc_tuned" (mpc_tuned_7d flies that
+    # mode): Q/QN/R, the along/cross split, the heave trim, axis cap/slew and
+    # the policy follower knobs. All runtime — the cost is a cost_set and the
+    # trim a solver parameter — so a pick never rebuilds anything.
+
+    @property
+    def tune_profile(self):
+        return getattr(self, "_tune_profile", None)
+
+    @property
+    def tune_profile_active(self) -> bool:
+        """Is the held profile what this mode flies right now?"""
+        return (getattr(self, "_tune_profile", None) is not None
+                and getattr(self, "_mode", None) == "mpc_tuned")
+
+    @property
+    def tune_warnings(self) -> list:
+        return list(getattr(self, "_tune_warnings", []) or [])
+
+    def _base_weights(self):
+        """(Q, R, QN) this mode flies: the profile's under mpc_tuned with one
+        held, else the ones the solver was generated with."""
+        if self.tune_profile_active:
+            a = self._tune_profile.apply
+            return (np.asarray(a["Q"], float), np.asarray(a["R"], float),
+                    np.asarray(a["QN"], float))
         P = self.P
-        self._wt = PathFrameWeights(P.MPC_Q, P.MPC_R, P.MPC_QN, tune)
+        return (getattr(self, "_Q_build", P.MPC_Q),
+                getattr(self, "_R_build", P.MPC_R),
+                getattr(self, "_QN_build", P.MPC_QN))
+
+    def set_tune_profile(self, profile) -> list:
+        """Hold ``profile`` (mpc_tune.MpcTuneProfile) or None (= hw_mpc.yaml's
+        own blocks, the pre-2026-10-04 behaviour). The WORKER refuses this
+        while engaged or with a CSV open; here it is checked against the
+        solver's shape and compared with the running station. Returns the
+        warnings (mpc_tune.profile_warnings) — never raises for a mismatch
+        it can still fly, raises ValueError for one it cannot."""
+        from .mpc_tune import profile_warnings
+
+        warnings = []
+        if profile is not None:
+            a = profile.apply
+            nx, nu = int(self._Q_build.size), int(self._R_build.size)
+            if len(a["Q"]) != nx or len(a["QN"]) != nx or len(a["R"]) != nu:
+                raise ValueError(
+                    f"profile {profile.name}: Q/QN/R sizes "
+                    f"{len(a['Q'])}/{len(a['QN'])}/{len(a['R'])} do not fit "
+                    f"this solver ({nx}/{nx}/{nu})")
+            if self.solver_kind != "acados":
+                raise ValueError(f"profile {profile.name} needs the acados "
+                                 f"solver (cost_set); this build runs "
+                                 f"{self.solver_kind}")
+            warnings = profile_warnings(profile, P=self.P, cfg=self.cfg)
+        prev = self._tune_state()
+        try:
+            self._tune_profile = profile
+            self._tune_warnings = warnings
+            self._refresh_tune()
+        except Exception:
+            # a refused pick leaves the PREVIOUS profile flying, whole
+            self._tune_rollback(prev)
+            raise
+        return list(warnings)
+
+    _TUNE_STATE = ("_mode", "dob", "tuned", "_tune_profile", "_tune_warnings",
+                   "_wt", "_wt_cfg_tune", "vehicle_net_buoyancy_n", "w_trim")
+
+    def _tune_state(self) -> dict:
+        return {k: getattr(self, k, None) for k in self._TUNE_STATE}
+
+    def _tune_rollback(self, prev: dict) -> None:
+        """Put back everything _refresh_tune / the mode setter changed and
+        rewrite that baseline into the solver (best effort — the solver may
+        be what raised)."""
+        for k, v in prev.items():
+            setattr(self, k, v)
+        self._w_tuned = True
+        try:
+            self._restore_base_weights()
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    def _refresh_tune(self) -> None:
+        """Re-derive everything a profile changes from (profile, mode): the
+        baseline Q/R/QN and the split (``_wt``), the config tune a policy
+        plan restores to, and the heave trim. Writes the new baseline into
+        the solver at once, so no stage keeps the previous variant's W."""
+        from .geometry import check_vehicle_net_buoyancy
+        from .path_cost import PathFrameWeights, resolve_tune
+
+        active = self.tune_profile_active
+        a = self._tune_profile.apply if active else None
+        self._wt_cfg_tune = (a["path_cost"] if active
+                             else getattr(self.cfg, "mpc_tuned", None))
+        tune = self._wt_cfg_tune
+        if self._plan_along_scale is not None and self.tuned:
+            # a policy plan's along scale outlives a mode flip within the
+            # same arm only in tests; keep it rather than drop it silently
+            tune = resolve_tune(tune)
+            tune["along_scale"] = float(self._plan_along_scale)
+            tune["q_along"] = None
+        Q, R, QN = self._base_weights()
+        self._wt = PathFrameWeights(Q, R, QN, tune)
+        self.vehicle_net_buoyancy_n = check_vehicle_net_buoyancy(
+            a["vehicle_net_buoyancy_n"] if active
+            else getattr(self.cfg, "vehicle_net_buoyancy_n", 0.0))
+        self.w_trim = self.heave_trim_wrench(float(self.P.NET_BUOYANCY),
+                                             self.vehicle_net_buoyancy_n)
+        self._w_tuned = True                 # the baseline itself may have moved
+        self._restore_base_weights()
+
+    @property
+    def axis_cap(self):
+        """The profile's axis cap under mpc_tuned, else None (the station's).
+        MpcWorker._axis_cap lets a controller only TIGHTEN the ceiling."""
+        return (float(self._tune_profile.apply["axis_cap"])
+                if self.tune_profile_active else None)
+
+    @property
+    def axis_slew_per_s(self):
+        """The profile's axis slew under mpc_tuned, TIGHTEN-ONLY against the
+        station's (mpc_tune.effective_slew; the worker REPLACES the config
+        slew with a controller's, so the min is taken here), else None."""
+        if not self.tune_profile_active:
+            return None
+        from .mpc_tune import effective_slew
+
+        return effective_slew(self._tune_profile.apply["axis_slew_per_s"],
+                              getattr(self.cfg, "axis_slew_per_s", 0.0))
+
+    def policy_follow(self, q_scale, along_scale):
+        """policy.q_scale / policy.along_scale as this follower flies them:
+        the profile's under mpc_tuned, else the config values passed in."""
+        if self.tune_profile_active:
+            p = self._tune_profile.apply["policy"]
+            return float(p["q_scale"]), p["along_scale"]
+        return q_scale, along_scale
+
+    def tune_meta(self) -> dict:
+        """controller.mpc_tune — which tuning this record flew. ``active``
+        false with a profile held = the mode was not mpc_tuned, so every
+        value in this meta is hw_mpc.yaml's."""
+        prof = getattr(self, "_tune_profile", None)
+        if prof is None:
+            return {"profile": None, "active": False,
+                    "source": "hw_mpc.yaml (no profile held)",
+                    "applies_to": "mpc_tuned / mpc_tuned_7d only"}
+        m = prof.meta()
+        m.update({"active": bool(self.tune_profile_active),
+                  "source": ("profile" if self.tune_profile_active
+                             else "hw_mpc.yaml (profile held, mode "
+                                  f"{self._mode} does not use it)"),
+                  "warnings": self.tune_warnings,
+                  "applies_to": "mpc_tuned / mpc_tuned_7d only"})
+        return m
 
     #: State rows whose weight a ``NedPlan.w_stage`` mask scales: position
     #: (x, y, z) and body linear velocity (u, v, w) — the sim's state order
@@ -1265,15 +1445,22 @@ class HwDobMpc:
         so a run whose meta omits them cannot be told apart from a run at
         different weights."""
         P = self.P
+        Q, R, QN = self._base_weights()
         m = {"type": self.mode, "solver": self.solver_kind,
              "ctrl_hz": float(self.cfg.ctrl_hz), "dt_s": float(P.DT_CTRL),
              "N": int(P.MPC_N), "horizon_s": round(P.MPC_N * P.DT_CTRL, 4),
              "u_max": [float(v) for v in P.U_MAX],
              "v_max_m_s": float(P.V_MAX),
-             # x = [x y z, phi theta psi, u v w, p q r]
-             "Q": [float(v) for v in P.MPC_Q],
-             "QN": [float(v) for v in P.MPC_QN],
-             "R": [float(v) for v in P.MPC_R],
+             # x = [x y z, phi theta psi, u v w, p q r]. The baseline THIS
+             # mode flew: an MPC_Tuned profile's under mpc_tuned (2026-10-04,
+             # `weights_source` / `mpc_tune` below), else params.py's.
+             "Q": [float(v) for v in Q],
+             "QN": [float(v) for v in QN],
+             "R": [float(v) for v in R],
+             "weights_source": (f"mpc_tune profile {self._tune_profile.name}"
+                                if self.tune_profile_active
+                                else "dobmpc/params.py"),
+             "mpc_tune": self.tune_meta(),
              "state_order": "x = [x y z, phi theta psi, u v w, p q r] (NED/FRD)",
              "u_order": "u = [X Y Z K M N] (body wrench, N / N*m)",
              "w_hat_clip": [float(v) for v in self.w_clip],

@@ -43,17 +43,22 @@ from .. import runstore
 from ..qt import Slot
 from ..state import (ACTION_REPR_POS_RPY_WIDTH, Conn, MpcStatus, NavFix,
                      ObjectFix, PilotInput, PwmCommand,
-                     POLICY_ACTION_REPRS_FLYABLE,
+                     POLICY_ACTION_REPR_AUTO, POLICY_ACTION_REPRS_FLYABLE,
                      POLICY_GRID_WHY_IDLE, PolicyPlanViz, PolicyState,
                      TagOverlay, now)
 from .allocation import axes_to_wrench, slew_axes, wrench_to_axes
-from .geometry import (HANDHELD_TCP_OFFSET_CAM_M, MpcConfig, NavConfig,
-                       POLICY_ACTION_REPR, POLICY_DOWN_SAMPLE_STEPS,
-                       POLICY_PROVENANCE, SHAPES, S_FLU_FRD, yaw_from_R)
+from .geometry import (HANDHELD_TCP_OFFSET_CAM_M, LOW_7D_BASE,
+                       LOW_7D_PULSE_BASE, LOW_RP_TRACK_BASE, MpcConfig,
+                       NavConfig, POLICY_ACTION_REPR, POLICY_DOWN_SAMPLE_STEPS,
+                       POLICY_PROVENANCE, SHAPES, S_FLU_FRD,
+                       policy_rp_tracked, resolve_policy_action_repr,
+                       yaw_from_R)
 from .imu_dr import ImuCalibration, ImuDeadReckoner
+from . import dvl as DV
+from . import rl_ekf as EK
 from . import object_nav as ON
 from . import station_bridge as SB
-from .state_assembler import StateAssembler, rot_zyx
+from .state_assembler import G_NED, StateAssembler, rot_zyx
 from ..backends.base import TimerWorker
 
 
@@ -102,7 +107,8 @@ def _plan_timing(plan) -> dict:
     ``(emit_age_s - trigger_age_s) * 1000`` minus ``fs_wait_ms`` and
     ``infer_ms`` (both MILLISECONDS) is the observation build. A value the
     producer did not stamp is None — never 0.0, which would read as measured.
-    ``fs_schedule`` / ``fs_input`` are on every policy line because a run
+    ``fs_schedule`` / ``fs_input`` / ``fs_process`` are on every policy line
+    because a run
     folder is JOINED across launches 90 s apart (runstore) and plans.jsonl is
     appended to: two schedules can share one file, and the line says which.
     """
@@ -126,6 +132,7 @@ def _plan_timing(plan) -> dict:
         return {
             "fs_schedule": _s("fs_schedule"),
             "fs_input": _s("fs_input"),
+            "fs_process": _s("fs_process"),
             "fs_wait_ms": _f("fs_wait_ms"),
             "fs_wait_timeout": (bool(timed_out)
                                 if isinstance(timed_out, (bool, np.bool_))
@@ -150,6 +157,23 @@ def _json_default(o):
     if isinstance(o, (deque, set, tuple)):
         return list(o)
     return repr(o)
+
+
+def _ekf_vs_tag(m, meas) -> dict:
+    """EKF state minus the tag state, both datum frame: horizontal and
+    vertical distance (m), yaw and the larger of roll/pitch (deg, signed for
+    yaw), and the body linear-velocity difference VECTOR (m/s; the caller
+    low-passes it — the tag finite difference is noisy)."""
+    a, b = m["eta"], meas["eta"]
+    return {
+        "xy": math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1])),
+        "z": abs(float(a[2]) - float(b[2])),
+        "yaw": math.degrees(_wrap_pi(float(a[5]) - float(b[5]))),
+        "rp": math.degrees(max(abs(_wrap_pi(float(a[3]) - float(b[3]))),
+                               abs(_wrap_pi(float(a[4]) - float(b[4]))))),
+        "dv": (np.asarray(m["nu"][:3], float)
+               - np.asarray(meas["nu"][:3], float)),
+    }
 
 
 def _wrap_pi(a: float) -> float:
@@ -691,7 +715,13 @@ CSV_HEADER = ("t,px,py,pz,rx,ry,yaw_deg,pitch_deg,lap,"
               "plan_id,ref_src,grip_cmd,grip_w_est,grip_g,hold_frac,observe,"
               "pwm1,pwm2,pwm3,pwm4,pwm5,pwm6,pwm7,pwm8,pwm_age_s,"
               "batt_v,batt_a,"
-              "rroll_deg,rpitch_deg,ax_roll,ax_pitch,rp_track\n")
+              "rroll_deg,rpitch_deg,ax_roll,ax_pitch,rp_track,"
+              "vel_src,nu_u,nu_v,nu_w,fd_u,fd_v,fd_w,"
+              "dvl_u,dvl_v,dvl_w,dvl_ok,dvl_valid,dvl_fom,dvl_alt_m,dvl_age_s,"
+              "est,ekf_ok,ekf_px,ekf_py,ekf_pz,ekf_roll_deg,ekf_pitch_deg,"
+              "ekf_yaw_deg,ekf_u,ekf_v,ekf_w,ekf_sig_xy_m,ekf_age_s,"
+              "ekf_tag_late_s,ekf_n_tag,ekf_n_dvl,"
+              "i_pred_a,null_v_us,null_h_us,pwm_guard\n")
 # 2026-09-08: the eleven trailing columns. `pwm1..pwm8` are the vehicle's OWN
 # SERVO_OUTPUT_RAW microseconds per thruster (1500 = neutral; EMPTY when that
 # output is unconfigured or the vehicle has not reported yet), `pwm_age_s` is
@@ -859,7 +889,9 @@ CSV_HEADER = ("t,px,py,pz,rx,ry,yaw_deg,pitch_deg,lap,"
 # a 7-dim [dx, dy, dz, dyaw, droll, dpitch, width] policy's roll/pitch are
 # TRACKED instead of levelled). Three-state pattern, always present:
 #   * `rp_track` 1 = this row was flown with the attitude axes SENT (K/M
-#     left the station); 0 = the 4-DoF path, where K/M were dropped at
+#     left the station); 2 (2026-10-03) = the roll/pitch reference was
+#     TRACKED through per-thruster PULSES (LOW rl_pwm_7d: `ax_roll` /
+#     `ax_pitch` nan, there is no s/t axis); 0 = the 4-DoF path, where K/M were dropped at
 #     allocation exactly as every run before this date. THE BOUNDARY: never
 #     pool attitude statistics across it, and never pool dobmpc `w0..w5`
 #     across it either — with the axes sent, w3/w4 (w_hat K/M) book the
@@ -879,6 +911,104 @@ CSV_HEADER = ("t,px,py,pz,rx,ry,yaw_deg,pitch_deg,lap,"
 # `uK` / `uM` and the measured `roll_deg` / `pitch_deg` existed before 16 —
 # but until this date K/M were never applied, so a pre-16 `uK` is a torque
 # the solver asked for and nobody delivered.
+#
+# 2026-10-01: the fifteen trailing columns arrived with schema 17, the DVL
+# (control/dvl.py — written BEFORE a DVL was mounted; no run has one yet).
+# They also close an old gap: until this date the CSV carried NO body
+# velocity at all, so the state the controller was handed could not be
+# reconstructed from the file.
+#   * `nu_u, nu_v, nu_w` = nu[0:3] of the assembled state, body FRD m/s
+#     (u forward, v starboard, w DOWN — the frame of uX..uN, not of px/py).
+#   * `vel_src` = where the HORIZONTAL pair (nu_u, nu_v) came from on this
+#     row: "tag_fd" (the tag finite difference, every run before this
+#     date), "dvl" (a DVL's direct measurement — on a `bridge_tier == dvl`
+#     row its integral also carried x/y), or "bridge" (an IMU / frozen
+#     station-bridge row: no velocity sensor at all). `nu_w` is the tag
+#     finite difference on EVERY row: the DVL's vertical axis is not
+#     verified by anything and is not consumed (it is in `dvl_w`). THE
+#     BOUNDARY for anything velocity-derived: a "dvl" row and a "tag_fd" row
+#     were flown on different instruments with different noise and lag. The
+#     SWITCH (meta `dvl.use`) changes only between engagements and a run's
+#     eligibility is fixed at engage (meta `dvl.armed_at_engage`) — so a run
+#     is "tag_fd" throughout, or "dvl" with "tag_fd" exactly on the rows the
+#     DVL was not flown on (meta `dvl.rows` counts them by reason).
+#   * `fd_u, fd_v, fd_w` = the tag finite difference in the same frame,
+#     ALWAYS (nan on a row with no fresh fix), so both instruments are on
+#     disk whichever one flew.
+#   * `dvl_u, dvl_v, dvl_w` = the DVL's reading moved to the body origin
+#     (mount rotation + lever arm), nan with no DVL or no fresh sample;
+#     `dvl_ok` 1 = that sample passed every data gate this tick,
+#     `dvl_valid` = the DEVICE's own velocity_valid, `dvl_fom` m/s,
+#     `dvl_alt_m` m, `dvl_age_s` = now - time of validity. All nan/0 when
+#     no DVL was built (meta `dvl.enabled` false).
+# 2026-10-02: the sixteen trailing columns arrived with schema 18, the
+# robot_localization EKF (control/rl_ekf.py) — the paper's estimator, run
+# BESIDE the state assembler on every tick (shadow) unless --ekf off.
+#   * `est` = which estimate the CONTROLLER was handed on this row: "tag"
+#     (the state assembler — every run before this date), "ekf", "dr"
+#     (imu_dr control), or "hold" (an EKF run's debounced stale/bridged
+#     tick: NOTHING was commanded; u/w carry the observe sentinels — nan,
+#     solver_status -1). px/py/pz and every interlock are the tag state on
+#     EVERY row, whichever flew (the imu_dr rule). THE BOUNDARY: never pool
+#     an "ekf" run with a "tag" run as controller runs; the switch changes
+#     only between engagements (meta `ekf.estimator_at_engage`).
+#   * `ekf_px, ekf_py, ekf_pz` / `ekf_roll_deg, ekf_pitch_deg, ekf_yaw_deg`
+#     = the EKF's last PUBLISHED pose in the px/py/pz convention (world FLU,
+#     datum frame; angles signed like roll_deg / pitch_deg / yaw_deg).
+#     `ekf_u, ekf_v, ekf_w` = its body velocity in the nu_u frame (FRD).
+#   * `ekf_ok` 1 = usable for control this tick; `ekf_sig_xy_m` = its own
+#     horizontal 1-sigma; `ekf_age_s` = now - the published stamp (r_l
+#     publishes at the LAST MEASUREMENT time, not now); `ekf_tag_late_s` =
+#     how far past the last fused tag frame the filter had already
+#     predicted (r_l without smoothing corrects the CURRENT state with it —
+#     0 with smooth_lagged_data); `ekf_n_tag`, `ekf_n_dvl` = SESSION-
+#     cumulative accepted tag / DVL updates (difference rows for rates).
+#     All nan/0 when no EKF was built (meta `ekf.enabled` false).
+# 2026-10-10: the three trailing columns arrived with schema 19, for the
+# per-thruster LOWs (rl_pwm, rl_pwm_7d) ONLY — EMPTY (not nan) on every row
+# of every other LOW, because a mixer-allocated run has no sent pulses to
+# read them from. All three are read off the eight pulses this tick SENT on
+# bus.cmd_pwm (eight 1500s on a coast / gate-grace / disengage tick), not
+# off the vehicle's SERVO_OUTPUT_RAW report (pwm1..8, which lags and may be
+# empty). Provenance and formulae: control/rl_pwm.py.
+#   * `i_pred_a` = predicted pack current [A]: 2.1 + sum_i (0.0584 |F_i|^1.526
+#     forward | 0.0537 |F_i|^1.673 reverse), F_i = the PHYSICAL thrust of the
+#     pulse: the export's T200 curve x batt_v / 20.5 V — the fit's 1.0 is the
+#     ~20 V datasheet curve, 14.8 V -> 0.72 = the export's voltage_scale,
+#     which is the fallback when batt_v is nan [스펙 RL_controller
+#     rov_rl/thrusters.py; the convention of rov_rl/rewards.py
+#     thruster_current_proxy and rov_env /batt/I_pred_a]. 2026-10-10 (b):
+#     until then the curve was taken as the 14.8 V curve (x batt_v / 14.8),
+#     ~1.4x too much thrust and ~1.6x the current (schema 19 rows: none were
+#     flown). On the 10-03 att7pwm_s0 pattern this predicts ~26 A at 14.8 V /
+#     ~29 A at 16 V against a 41.6 A measured mean (202735, 1 Hz BATTERY_
+#     STATUS) — the datasheet proxy UNDER-predicts that co-contracting pool
+#     pattern by ~1.6x (pack sag, ESC losses, props near the floor: REPORT
+#     §1 cause 5), so the pack interlock judges `batt_a`, never this. A
+#     PREDICTION, never a measurement: `batt_a` is the measurement.
+#   * `null_v_us` = mean(pwm5..8) - 1500, `null_h_us` = ((pwm1 + pwm2) -
+#     (pwm3 + pwm4)) / 4: the pulse deviation's coordinates along the two
+#     wrench-free directions of the 8-thruster allocation (n_v = all four
+#     verticals together, n_h = front horizontals vs rear) [유도 REPORT.md
+#     §0]. A standing value is thrust that cancels itself (att7pwm_s0 in the
+#     pool: null_v +250..+290 us = 25-43 N and 26-44 A for nothing). Since
+#     2026-10-10 (b) the per-thruster NULL interlock (engage.per_thruster
+#     .null_us 80 us / 0.5 s, shipped after the 2026-10-10 replay) trips on it.
+# 2026-10-10 (b): one trailing column arrived with schema 20, pwm LOWs only
+# (EMPTY elsewhere, like the three before it):
+#   * `pwm_guard` = which policy-side observation guard acted on the state
+#     the network saw this tick (control/rl_pwm.PwmObsGuard, applied inside
+#     HwRlPwm.step — the CSV's own px/py/pz and nu_* are the worker's state,
+#     untouched): 0 none, 1 velocity slew (rl_pwm.obs_guard.vel_slew_mps2),
+#     2 fix-jump rejected under a thin fix (jump_m, n_tags < min_tags),
+#     3 HOLD — the tag gate (n_tags < min_tags or tag_age_s > age_s for
+#     hold_after_s) replaced the policy's pulses with the hold pulses (meta
+#     controller.hold_pwm_us: Z = hold_wrench_z_n NED through the minimum-
+#     norm vertical allocation). On a coast / gate-grace / disengage tick the
+#     code is still the follower's verdict (its pulses did not leave). The
+#     runtime interlocks that END an engagement are not here: they are
+#     mission-log lines (events.log "PER-THRUSTER INTERLOCK ...") and meta
+#     controller.interlocks.last_trip.
 
 
 class MpcWorker(TimerWorker):
@@ -935,6 +1065,14 @@ class MpcWorker(TimerWorker):
         self.ctrl = None
         self._pid = None
         self._mpc_ctrl = None
+        # MPC_Tuned PROFILE (2026-10-04, control/mpc_tune.py). The profile
+        # itself is held by `_mpc_ctrl`; these say why there is none when a
+        # launch named one (`_tune_error`, refuses mpc_tuned engage until a
+        # pick succeeds) and why the last panel pick was refused (shown for
+        # a few seconds on the tune row, like PolicyStatus.ckpt_note).
+        self._tune_error = ""
+        self._tune_note = ""
+        self._tune_note_t = 0.0
         self.asm: StateAssembler | None = None
         # IMU dead reckoning, built in setup() only when it is enabled. None
         # is the off state and every call site checks it, so a build with the
@@ -977,6 +1115,24 @@ class MpcWorker(TimerWorker):
         # path, byte-identical: wrench_to_axes is called with its pre-variant
         # arguments, roll/pitch stay 0.0, `_axes_prev` stays a 4-tuple.
         self._attitude_axes = False
+        # THE PULSE BIT (2026-10-03): the follower drives roll/pitch through
+        # PER-THRUSTER PULSES (the pwm transport: rl_pwm, rl_pwm_7d) on this
+        # engagement. Never s/t — `_attitude_axes` keeps meaning "K/M on the
+        # MANUAL_CONTROL extension axes". Arms the tilt ceiling (ii) for every
+        # pwm LOW, and — with a rl_pwm_7d LOW — roll/pitch TRACKING
+        # (`rp_track_live`). False everywhere else, so every other LOW is
+        # byte-identical.
+        self._attitude_pulses = False
+        self._pwm_live_tick = False        # this tick's POLICY pulses left (CSV rp_track 2)
+        self._pwm_sent_us = None           # the eight pulses this tick SENT on cmd_pwm (CSV i_pred_a / null_*)
+        # 2026-10-10 (b): the pulses that LAST left this engagement (what the
+        # null / pinned interlocks judge, one tick behind), the follower's
+        # observation-guard code this tick (CSV pwm_guard) and the per-
+        # thruster interlocks (rl_pwm.PwmInterlocks), built at every pwm
+        # engagement and kept for the closing meta. None for every other LOW.
+        self._pwm_last_sent_us = None
+        self._pwm_guard = 0
+        self._pwm_ilk = None
         self._attitude_cap = (0.2, 0.3)    # (roll, pitch) wire caps in force
         self._attitude_at_engage: dict = {}   # the record (survives disengage)
         self._att_ceiling_ticks = 0        # abort_deg debounce (interlock ii)
@@ -1034,6 +1190,55 @@ class MpcWorker(TimerWorker):
         self._bridge_xy = "hold"
         self._bridge_dr_warned = False
         self._bridge_note = ""
+        # DVL (control/dvl.py, 2026-10-01). None is the off state — built in
+        # setup() only with dvl.enabled / --dvl — and every call site checks
+        # it, so a station without one runs the tick it always ran.
+        self.dvl: DV.DvlAid | None = None
+        # Decided ONCE per engagement (_dvl_arm_run): may it fly on the DVL?
+        self._dvl_run_ok = False
+        self._dvl_run_why = ""
+        # The bridge's DVL rung: dead-reckoned x, y in the datum frame, the
+        # fix it started from, and None once the rung is closed for this
+        # dropout (re-opened only by the next fresh fix).
+        self._dvl_xy = None
+        self._dvl_xy0 = None
+        self._bridge_gyro_prev = None      # for the rung's angular nudot
+        self._dvl_logged = None            # the velocity source last LOGGED
+        self._dvl_log_t = 0.0              # rate limit for source changes
+        self._dvl_rows: dict = {}          # per-CSV: rows by vel_src / reason
+        # LATCHED if any DVL code on the TICK path ever raises: from then on
+        # the tick asks the DVL for nothing and flies the tag finite
+        # difference. A new sensor's bookkeeping must never be able to abort
+        # tick() at 20 Hz with the vehicle engaged (the replay guard's rule).
+        self._dvl_fault = ""
+        self._dvl_at_engage: dict = {}     # the record (survives disengage)
+        # THE ROBOT_LOCALIZATION EKF (control/rl_ekf.py, 2026-10-02): the
+        # paper's estimator, run beside the assembler on every tick and
+        # recorded. None = not built. `ekf_control` is the ESTIMATOR switch
+        # (bus.cmd_estimator): True = the controller is handed the EKF's
+        # state instead of the assembler's. It changes only while disengaged
+        # with no controller CSV open — one run is one estimator, the DVL
+        # switch's rule — and `meas` (the plot, px/py, every interlock) stays
+        # the tag state either way, as under imu_dr control.
+        self.ekf: EK.RlEkfNode | None = None
+        self.ekf_control = False
+        self._ekf_fault = ""               # latched, the _dvl_fault rule
+        self._ekf_out = None               # the node's last published output
+        self._ekf_meas = None              # ...as {eta, nu, nudot}, datum frame
+        self._ekf_ok = False
+        self._ekf_why = "not built"
+        self._ekf_flew = False             # this tick's controller ate it
+        self._ekf_err = None               # (m, deg) vs a FRESH tag state
+        self._ekf_div_ticks = 0
+        self._ekf_dv_lp = np.zeros(3)      # low-passed EKF-minus-tag velocity
+        self._ekf_stale = False            # not ok BECAUSE an input is stale
+        self._ekf_hold = False             # this tick: EKF run, step NOTHING
+        self._ekf_hold_ticks = 0
+        self._ekf_dvl_ref = None           # (t, refusal) cache for the DVL gate
+        self._ekf_at_engage: dict = {}
+        self._ekf_rows: dict = {}          # per CSV: rows by estimator
+        self._ekf_log = None               # per CSV: <stem>_ekf_inputs.jsonl
+        self._ekf_tick_ms_max = 0.0        # the EKF's own share of a tick
         self._eta = None                   # last assembled state (np arrays)
         self._last_nu = None               # ...and the body velocity with it,
         # kept for the run record: C(nu) and D(nu) are state-dependent, so the
@@ -1136,6 +1341,12 @@ class MpcWorker(TimerWorker):
         # review): exported in policy meta so one CSV that spans two
         # networks says so itself. Reset per CSV (_open_csv / _close_csv).
         self._ckpt_changes: list[dict] = []
+        # policy.action_repr auto (2026-10-03): the PolicyStatus the ARM refusal
+        # judged (consumed by _arm_policy, which refuses if a different status
+        # object arrived in between), and the last ARM pin while THIS CSV is
+        # open (meta policy.action_repr when no mission is in scope any more).
+        self._policy_judged = None
+        self._policy_pin_csv: str | None = None
 
         self._csv = None
         self._csv_path: Path | None = None
@@ -1153,6 +1364,13 @@ class MpcWorker(TimerWorker):
                                           "config/hw_mpc.yaml"))
         if getattr(self.opts, "mpc_mode", None):
             self.cfg.mode = str(self.opts.mpc_mode)
+        self.cfg.mode = str(self.cfg.mode).lower()
+        if self.cfg.mode not in self.MODES:
+            # tools / tests set Opts.mpc_mode directly (no argparse choices):
+            # an unknown key used to fall through _ctrl_for to the MPC and
+            # fly it under a label that names something else (2026-10-03).
+            raise ValueError(f"unknown LOW mode {self.cfg.mode!r} "
+                             f"(one of {'|'.join(self.MODES)})")
         # LOW LEVEL NONE (2026-09-11, operator request): ONE source of truth.
         # `observe` is TRUE iff the LOW level is "none". Three ways say so at
         # launch — the `--policy-observe` alias (opts.policy_observe, or a
@@ -1209,6 +1427,8 @@ class MpcWorker(TimerWorker):
             propagate=self.cfg.vel_propagation)
         self._setup_imu_dr()
         self._setup_station_bridge()
+        self._setup_dvl()
+        self._setup_ekf()
         self._setup_object_nav()
         self._setup_policy()
         # Both controller families are built up front: the PID costs nothing
@@ -1218,6 +1438,17 @@ class MpcWorker(TimerWorker):
         from .pid import HwPid
 
         self._pid = HwPid(self.cfg, log=lambda m: self._log("info", m))
+        # LOW pid_7d (2026-10-03): the same PID + a roll/pitch loop. Its own
+        # object (`_pid` is also the LOW-None reference holder); a config
+        # error costs only that mode.
+        self._pid7d = None
+        self._pid7d_error = None
+        try:
+            from .pid import HwPid7d
+            self._pid7d = HwPid7d(self.cfg, log=lambda m: self._log("info", m))
+        except Exception as e:                                   # noqa: BLE001
+            self._pid7d_error = f"{type(e).__name__}: {e}"
+            self._log("warn", f"ctrl: PID_7D unavailable ({self._pid7d_error}) — pid_7d mode will refuse")
         # RL follower (2026-09-21): numpy-only, built up front like the PID; a missing/mismatched policy file only
         # costs the ``rl`` mode (set_mode refuses it with the error), never the session.
         self._rl = None
@@ -1227,6 +1458,16 @@ class MpcWorker(TimerWorker):
         except Exception as e:                                   # noqa: BLE001
             self._rl_error = f"{type(e).__name__}: {e}"
             self._log("warn", f"ctrl: RL controller unavailable ({self._rl_error}) — rl mode will refuse")
+        # LOW mode rl_7d (2026-10-03): a 6-axis policy trained WITH a roll/pitch reference. None is trained yet, so on the
+        # shipped config this build fails with that sentence and only the rl_7d mode refuses.
+        self._rl7d = None
+        self._rl7d_error = None
+        try:
+            from .rl_policy import HwRl7d
+            self._rl7d = HwRl7d(self.cfg, log=lambda m: self._log("info", m))
+        except Exception as e:                                   # noqa: BLE001
+            self._rl7d_error = f"{type(e).__name__}: {e}"
+            self._log("info", f"ctrl: RL_7D unavailable ({self._rl7d_error}) — rl_7d mode will refuse")
         # LOW mode rl_pwm (2026-09-30): the per-thruster RL policy. Built up front like the axes one; a missing or
         # non-pwm export only costs that mode. It moves nothing by being built — its pulses leave on bus.cmd_pwm only
         # while engaged, and only through a sink whose vehicle gate holds (control/rl_pwm.py).
@@ -1239,6 +1480,16 @@ class MpcWorker(TimerWorker):
         except Exception as e:                                   # noqa: BLE001
             self._rl_pwm_error = f"{type(e).__name__}: {e}"
             self._log("info", f"ctrl: RL_PWM controller unavailable ({self._rl_pwm_error}) — rl_pwm mode will refuse")
+        # LOW mode rl_pwm_7d (2026-10-03): the pwm policy trained WITH a roll/pitch reference. Same transport, gate and cap
+        # (rl_pwm.pwm_cap) as rl_pwm; a missing or level-trained export only costs this mode.
+        self._rl_pwm7d = None
+        self._rl_pwm7d_error = None
+        try:
+            from .rl_policy import HwRlPwm7d
+            self._rl_pwm7d = HwRlPwm7d(self.cfg, log=lambda m: self._log("info", m))
+        except Exception as e:                                   # noqa: BLE001
+            self._rl_pwm7d_error = f"{type(e).__name__}: {e}"
+            self._log("info", f"ctrl: RL_PWM_7D unavailable ({self._rl_pwm7d_error}) — rl_pwm_7d mode will refuse")
         self._mpc_ctrl = None
         self._mpcc_ctrl = None
         try:
@@ -1248,16 +1499,20 @@ class MpcWorker(TimerWorker):
                 from .mpc_bridge import HwDobMpc
                 # Build under the file's mode when that mode is one this
                 # object serves; otherwise (pid, mpcc, dobmpcc) build the
-                # default and let set_mode flip it later.
+                # default and let set_mode flip it later. A *_7d launch key
+                # builds its BASE (mpc_tuned_7d -> mpc_tuned): the key itself
+                # is not a HwDobMpc mode, and building "dobmpc" for it would
+                # fly the EAOB under a label that says mpc_tuned_7d.
+                _base = LOW_7D_BASE.get(self.cfg.mode, self.cfg.mode)
                 self._mpc_ctrl = HwDobMpc(
-                    self.cfg.mode if self.cfg.mode in HwDobMpc.MODES
-                    else "dobmpc",
+                    _base if _base in HwDobMpc.MODES else "dobmpc",
                     self.cfg, log=lambda m: self._log("info", m))
         except Exception as e:                                   # noqa: BLE001
             self._setup_error = f"{type(e).__name__}: {e}"
             self._log("error", f"ctrl: MPC controller build FAILED — "
                                        f"{self._setup_error}. PID mode is "
                                        f"still available.")
+        self._setup_tune_profile()
         # MPCC is a SECOND acados solver (13 states, 7 inputs, a contouring
         # cost) and therefore a second build. Built here beside the others so
         # the mode combo never pays a code-generation wait mid-session; a
@@ -1561,6 +1816,788 @@ class MpcWorker(TimerWorker):
         self._obj_last = fx
         self.bus.object_fix.emit(fx)
 
+    # -------------------------------------------------------------------- dvl
+    def _setup_dvl(self) -> None:
+        """Build the DVL aid if a DVL is configured, and say so LOUDLY.
+
+        ``--dvl`` / ``--dvl-host`` / ``--dvl-port`` override the YAML
+        (dvl.resolve_with_opts — the backend's client resolves through the
+        same function, so the two cannot disagree about the address). OFF
+        builds nothing: ``self.dvl`` stays None and the tick is the one it
+        always was."""
+        try:
+            cfg = DV.resolve_with_opts(getattr(self.cfg, "dvl", None),
+                                       self.opts)
+        except ValueError as e:                                  # noqa: BLE001
+            self._log("error", f"dvl: {e} — DISABLED")
+            self.dvl = None
+            return
+        if not cfg["enabled"]:
+            self.dvl = None
+            return
+        if str(getattr(self.opts, "source", "")) == "demo" and (
+                cfg["mount_rpy_deg"] is None or cfg["mount_t_flu"] is None):
+            # The imu_dr demo rule: the synthetic sensor IS mounted at the
+            # origin, unrotated, so the identity is its true calibration.
+            cfg["mount_rpy_deg"] = [0.0, 0.0, 0.0]
+            cfg["mount_t_flu"] = [0.0, 0.0, 0.0]
+            self._log("info", "dvl: demo source — IDENTITY mount (the "
+                              "synthetic DVL sits at the body origin)")
+        self.cfg.dvl = cfg
+        # How much the assembler's recursive low-pass shrinks raw
+        # tag-difference noise. The input is a two-point DIFFERENCE of white
+        # position noise, for which the gain is alpha / sqrt(2 - alpha)
+        # (0.507 at 0.6) — not the white-input sqrt(alpha / (2 - alpha)).
+        al = min(1.0, max(1e-3, float(self.cfg.vel_lp_alpha)))
+        self.dvl = DV.DvlAid(cfg, fd_lp_gain=al / math.sqrt(2.0 - al))
+        m = ("mount NOT MEASURED — it can only run in shadow"
+             if not self.dvl.mount_measured else
+             f"mount rpy {cfg['mount_rpy_deg']} deg, t_flu {cfg['mount_t_flu']} m")
+        self._log(
+            "warn", f"dvl: built ({cfg['host']}:{cfg['port']}), switch "
+                    f"{'IN' if self.dvl.use else 'OUT (shadow)'}; {m}. "
+                    f"HARDWARE-UNVERIFIED — thresholds are [예측]. The switch "
+                    f"changes only while disengaged; IN needs the mount "
+                    f"proven against the tag velocity"
+                    + ("" if cfg["require_proven"] else
+                       " — require_proven is FALSE (recorded opt-out; the "
+                       "runtime trips stay armed)"))
+
+    def _omega_at(self, t: float):
+        """Body rates (p, q, r) at station time ``t``, interpolated from the
+        ATTITUDE history — or None when the history does not reach it.
+
+        A DVL report describes a velocity that was true ~0.2 s BEFORE it
+        arrived, so the lever-arm term omega x r has to use the rate of THAT
+        moment: with the newest rate instead, a yaw that is speeding up or
+        slowing down leaves (omega_now - omega_then) x r behind — up to
+        6-7 cm/s of false sway on a 0.2 m arm (review 2026-10-02)."""
+        h = self._vimu_hist
+        if not h:
+            return None
+        stale = float(self.cfg.engage["imu_stale_s"])
+        newer = None
+        for rec in reversed(h):
+            if rec[0] <= t:
+                if newer is None:               # t is past the newest record
+                    return ((rec[1], rec[2], rec[3])
+                            if t - rec[0] <= stale else None)
+                span = newer[0] - rec[0]
+                if span > 2.0 * stale:          # a hole in the history
+                    near = newer if newer[0] - t < t - rec[0] else rec
+                    return ((near[1], near[2], near[3])
+                            if abs(near[0] - t) <= stale else None)
+                w = (t - rec[0]) / max(span, 1e-9)
+                return tuple((1.0 - w) * rec[i] + w * newer[i]
+                             for i in (1, 2, 3))
+            newer = rec
+        return ((newer[1], newer[2], newer[3])
+                if newer[0] - t <= stale else None)     # before the oldest
+
+    @Slot(object)
+    def on_dvl(self, sample) -> None:
+        """One state.DvlSample (bus.dvl). The lever-arm correction needs the
+        body rate of the sample's own moment; with a lever arm and no rate
+        history reaching that moment the aid marks the sample unusable
+        (an uncorrected reading is not the body-origin velocity)."""
+        self._ekf_feed("dvl", sample)
+        if self.dvl is None or sample is None or self._dvl_fault:
+            return
+        try:
+            omega = self._omega_at(float(sample.t_valid))
+            was, trips = self.dvl.proven, self.dvl.n_trips
+            self.dvl.note_sample(sample, omega)
+            self._dvl_note_proof(was, trips)
+        except Exception as e:                                   # noqa: BLE001
+            self._dvl_trip_fault("sample", e)
+
+    @Slot(object)
+    def on_dvl_info(self, info) -> None:
+        """The device's own get_config answer (backends/dvl.py asks once per
+        connection and then every ``config_poll_s``), for the run meta — and
+        two cross-checks:
+
+        * the device rotates its output by ``mounting_rotation_offset``
+          ITSELF, so a yaw entered both there and in dvl.mount_rpy_deg is
+          applied twice;
+        * if what rotates or scales the device's output CHANGES after the
+          first answer, the proof was made on a different stream: a trip.
+        """
+        if self.dvl is None or not isinstance(info, dict) or self._dvl_fault:
+            return
+        try:
+            first = self.dvl.device_config is None
+            was, trips = self.dvl.proven, self.dvl.n_trips
+            changed = self.dvl.note_device_config(info)
+            if changed:
+                self._log("error", f"dvl: the device's configuration CHANGED "
+                                   f"({changed})")
+            self._dvl_note_proof(was, trips)
+        except Exception as e:                                   # noqa: BLE001
+            self._dvl_trip_fault("device config", e)
+            return
+        if not (first or changed):
+            return
+        off = info.get("mounting_rotation_offset")
+        rpy = self.dvl.cfg.get("mount_rpy_deg")
+        try:
+            both = (abs(float(off)) > 1e-6 and rpy is not None
+                    and abs(float(rpy[2])) > 1e-6)
+        except (TypeError, ValueError):
+            both = False
+        if both:
+            self._log("error", f"dvl: the device's mounting_rotation_offset is "
+                               f"{off} deg AND dvl.mount_rpy_deg yaw is "
+                               f"{rpy[2]} deg — the yaw is applied TWICE. Set "
+                               f"one of them to 0.")
+
+    def _dvl_note_proof(self, was: bool, trips: int) -> None:
+        """Say it ONCE when the mount becomes proven, and once per trip."""
+        d = self.dvl
+        if d.n_trips != trips:
+            msg = (f"dvl: TRIPPED — {d.last_trip}. The DVL is OUT of the "
+                   f"estimator (tag finite difference) until the switch is "
+                   f"set OUT then IN again, which needs a proof made after "
+                   f"this")
+            self._log("error", msg)
+            if self.engaged:
+                self._event(msg)
+        elif d.proven and not was:
+            f = d.proof or {}
+            tail = ("the DVL switch may now be set IN" if not d.use else
+                    "set the switch OUT then IN to re-arm" if d.tripped else
+                    "it is used from the next engagement"
+                    if (self.engaged and not self._dvl_run_ok) else
+                    "the DVL switch is IN")
+            lag = f.get("lag_s")
+            self._log("warn", f"dvl: mount PROVEN against the tag velocity "
+                              f"({f.get('n')} pairs, residual mount yaw "
+                              f"{f.get('mount_yaw_fix_deg', 0.0):+.1f} deg, "
+                              f"scale {f.get('scale') or float('nan'):.2f}"
+                              + ("" if lag is None else
+                                 f", tag velocity {lag * 1e3:+.0f} ms behind "
+                                 f"the DVL's by their stamps")
+                              + f") — {tail}")
+            # The difference monitor's threshold is absolute and the proof's
+            # tolerance relative: what the proof let through is dev x speed
+            # of standing difference. Say at what speed that alone trips.
+            dev = float(f.get("dev") or 0.0)
+            trip = float(d.cfg["agree_trip_m_s"])
+            if dev > 1e-6 and trip / dev < 0.6:
+                self._log("warn", f"dvl: the proven mount still differs "
+                                  f"from the tags by {dev:.2f} of the speed; "
+                                  f"above {trip / dev:.2f} m/s that alone "
+                                  f"trips the difference monitor "
+                                  f"({trip * 100:.0f} cm/s). Correct "
+                                  f"dvl.mount_rpy_deg yaw by "
+                                  f"{f.get('mount_yaw_fix_deg', 0.0):+.1f} "
+                                  f"deg (and restart) to remove it.")
+
+    @Slot(bool)
+    def set_dvl_use(self, on: bool) -> None:
+        """The panel's DVL button (bus.cmd_dvl_use): IN = the estimator
+        consumes the DVL, OUT = shadow. Refused while engaged or while a
+        controller CSV is open — the LOW combo's rule, for its reason: one
+        run is one estimator (operator decision 2026-10-01), and a CSV's
+        meta names one. Setting it IN is also what RE-ARMS a tripped DVL (if
+        the proof gate lets it). Every refusal is logged AND put in
+        ``reason``; the button re-syncs from MpcStatus.dvl_use (honesty
+        rule)."""
+        on = bool(on)
+        if self.dvl is None:
+            self.reason = "DVL switch refused: no DVL built (start with --dvl)"
+            self._log("warn", f"ctrl: {self.reason}")
+            return
+        rearm = bool(on and self.dvl.use and self.dvl.tripped)
+        if on == self.dvl.use and not rearm:
+            return
+        if self.engaged:
+            self.reason = "DVL switch refused while engaged"
+            self._log("warn", f"ctrl: {self.reason}")
+            return
+        if self._csv is not None:
+            self.reason = ("DVL switch refused while a controller CSV is "
+                           "open (REC) — stop the recording first")
+            self._log("warn", f"ctrl: {self.reason}")
+            return
+        if self._dvl_fault:
+            self.reason = f"DVL switch refused: code fault ({self._dvl_fault})"
+            self._log("warn", f"ctrl: {self.reason}")
+            return
+        try:
+            why = self.dvl.set_use(on)
+        except Exception as e:                                   # noqa: BLE001
+            self._dvl_trip_fault("switch", e)
+            why = "DVL code fault"
+        if why:
+            self.reason = f"DVL switch refused: {why}"
+            self._log("warn", f"ctrl: {self.reason}")
+            return
+        self.reason = (f"DVL {'IN' if on else 'OUT (shadow)'}"
+                       + (" (re-armed)" if rearm else ""))
+        self._log("warn" if on else "info",
+                  "ctrl: DVL IN — nu[0:2] (surge, sway) is the DVL's whenever "
+                  "it is usable (tag finite difference otherwise; CSV "
+                  "vel_src says which)" if on else
+                  "ctrl: DVL OUT — recorded and compared only (shadow); the "
+                  "estimator is the tag finite difference")
+        # File half held for the next run folder (the LOW-combo pattern: a
+        # click at the bench must not open a one-line run folder).
+        self._log_event(self.reason, pending=True)
+
+    def _dvl_trip_fault(self, where: str, e: Exception) -> None:
+        """Latch the DVL OUT of the tick after an exception in its own code,
+        and say so once. The estimator carries on as if no DVL were IN."""
+        if self._dvl_fault:
+            return
+        self._dvl_fault = f"{where}: {type(e).__name__}: {e}"
+        msg = (f"dvl: CODE FAULT in {self._dvl_fault} — the DVL is ignored "
+               f"for the rest of this session; velocity = tag finite "
+               f"difference")
+        self._log("error", msg)
+        if self.engaged:
+            self._event(msg)
+
+    def _dvl_arm_run(self) -> None:
+        """Decide, ONCE, whether THIS engagement may fly on the DVL.
+
+        One run = one estimator applies to the automation as much as to the
+        operator: without this, a proof completing in the middle of a
+        mission (the switch IN from the YAML, or re-proving after a trip)
+        would move the velocity source under it. So eligibility is frozen
+        here — the switch IN, not tripped, the proof gate satisfied — and a
+        run that was not eligible at engage stays on the tag finite
+        difference to its end. Within an eligible run a tick may still fall
+        back (no lock, stale, innovation), and a trip ends its DVL use."""
+        d = self.dvl
+        self._dvl_run_ok, self._dvl_run_why = False, ""
+        if d is None:
+            return
+        if not d.use:
+            self._dvl_run_why = "DVL is OUT (shadow)"
+        elif self._dvl_fault:
+            self._dvl_run_why = "DVL code fault"
+        elif d.tripped:
+            self._dvl_run_why = "DVL tripped before engage"
+        else:
+            try:
+                why = d.refusal(True)
+            except Exception as e:                               # noqa: BLE001
+                # set_engaged must not die on the DVL's bookkeeping.
+                self._dvl_trip_fault("arm", e)
+                why = "DVL code fault"
+            if why:
+                self._dvl_run_why = f"DVL not armed at engage ({why})"
+            else:
+                self._dvl_run_ok = True
+
+    def _dvl_velocity(self, t: float, running: bool | None = None,
+                      need_ref: bool = True):
+        """-> (vel_body (3,) | None, why): may this tick fly on the DVL?
+        ``running`` = judge as an engaged tick (default: ``self.engaged``).
+        ``need_ref`` False = the station bridge's rung, which has no tag
+        velocity to check the sample against (DvlAid.velocity)."""
+        if self.dvl is None:
+            return None, ""
+        if self._dvl_fault:
+            return None, "DVL code fault"
+        if (self.engaged if running is None else running) \
+                and not self._dvl_run_ok:
+            return None, self._dvl_run_why
+        try:
+            v, why = self.dvl.velocity(t, need_ref=need_ref)
+            if v is not None and not np.all(np.isfinite(v)):
+                # Belt and braces: nothing non-finite may reach meas["nu"].
+                return None, "DVL velocity not finite"
+            return v, why
+        except Exception as e:                                   # noqa: BLE001
+            self._dvl_trip_fault("velocity", e)
+            return None, "DVL code fault"
+
+    def _dvl_inputs(self, t: float, running: bool | None = None):
+        """-> (vel_xy | None, disp_xy | None, why) for ``asm.step``: the
+        horizontal body velocity, and its integral over the fix's age."""
+        v, why = self._dvl_velocity(t, running)
+        if v is None:
+            return None, None, why
+        disp = None
+        fix = self.fix
+        if fix is not None and getattr(fix, "ok", False):
+            try:
+                d3 = self.dvl.displacement(float(fix.t_capture), t)
+            except Exception as e:                               # noqa: BLE001
+                self._dvl_trip_fault("displacement", e)
+                return None, None, "DVL code fault"
+            if d3 is not None and np.all(np.isfinite(d3)):
+                disp = d3[:2]
+        return v[:2], disp, why
+
+    def _dvl_after_step(self, meas, health, vel_xy, why: str,
+                        t: float) -> None:
+        """Hand the innovation gate this tick's tag velocity and report a
+        change of velocity source. Guarded: see ``_dvl_fault``."""
+        if self.dvl is None:
+            return
+        health["dvl_why"] = why
+        if self._dvl_fault:
+            return
+        try:
+            self._dvl_after_step_inner(meas, health, vel_xy, why, t)
+        except Exception as e:                                   # noqa: BLE001
+            self._dvl_trip_fault("monitor", e)
+
+    def _dvl_after_step_inner(self, meas, health, vel_xy, why: str,
+                              t: float) -> None:
+        d = self.dvl
+        was, trips = d.proven, d.n_trips
+        if meas is not None:
+            d.note_tag_velocity(health.get("nu_fd"), t,
+                                tag_age=health.get("tag_age"))
+        else:
+            d.note_tag_velocity(None, t)      # no tag state, no reference
+        self._dvl_note_proof(was, trips)
+        if not d.use or meas is None:
+            return
+        used = vel_xy is not None
+        if self._dvl_logged is None:
+            self._dvl_logged = used           # the engage line already said
+        elif used != self._dvl_logged and t - self._dvl_log_t > 2.0:
+            # Against the last source LOGGED, not last tick's: a change that
+            # the rate limit swallowed is then reported as soon as the limit
+            # lifts, and the log's last word is never the wrong source.
+            self._dvl_log_t = t
+            self._dvl_logged = used
+            self._log("info" if used else "warn",
+                      "ctrl: velocity source -> DVL" if used else
+                      f"ctrl: velocity source -> tag finite difference ({why})")
+
+    def _dvl_meta(self) -> dict:
+        """ALWAYS written (the imu_dr rule): an absent key cannot tell "this
+        build had no DVL" from "the DVL was switched off"."""
+        if self.dvl is None:
+            return {"enabled": False,
+                    "why": ("no --dvl / dvl.enabled false"
+                            if self.cfg is not None else "not built")}
+        out = {"enabled": True}
+        try:
+            out.update(self.dvl.meta())
+        except Exception as e:                                   # noqa: BLE001
+            # The meta is written from set_engaged and from _close_csv
+            # (which a disengage inside tick() calls): the DVL's own
+            # bookkeeping must not be able to abort either.
+            self._dvl_trip_fault("meta", e)
+            out["meta_error"] = f"{type(e).__name__}: {e}"
+        e = self._dvl_at_engage
+        out["use_at_engage"] = e.get("use")
+        out["proven_at_engage"] = e.get("proven")
+        # THE run-level answer: was this engagement allowed to fly on the
+        # DVL at all (decided once, at engage), and if not, why.
+        out["armed_at_engage"] = e.get("armed")
+        out["not_armed_why"] = e.get("why") or None
+        out["rows"] = dict(self._dvl_rows)
+        out["code_fault"] = self._dvl_fault or None
+        out["switch_rule"] = ("the IN/OUT switch changes only while "
+                              "disengaged and with no controller CSV open; "
+                              "eligibility is frozen at engage; a trip is "
+                              "latched until the operator re-arms; per-row "
+                              "truth is CSV vel_src")
+        return out
+
+    # -------------------------------------------------------------------- ekf
+    def _setup_ekf(self) -> None:
+        """Build the robot_localization EKF (control/rl_ekf.py). ON by default
+        in SHADOW: it runs beside the assembler on every tick and is recorded
+        (CSV ekf_*, meta `ekf`, <stem>_ekf_inputs.jsonl), so every run
+        carries the comparison. ``--ekf off|shadow|control``. Only the
+        COMMAND LINE can start a session flying on it (the imu_dr rule: a
+        config file left in the wrong state must not arm a closed loop on a
+        new estimator); the panel's EST switch changes it later, disengaged.
+        Built after the DVL so the DVL's mount is the EKF's transform."""
+        want = str(getattr(self.opts, "ekf", "") or "")
+        raw = dict(getattr(self.cfg, "ekf", None) or {})
+        if want:
+            raw["enabled"] = want != "off"
+        try:
+            cfg = EK.resolve(raw, z_source=self.nav_cfg.z_source)
+            if not cfg["enabled"]:
+                self.ekf = None
+                self._ekf_why = "not built (ekf.enabled false / --ekf off)"
+                return
+            mount = None
+            if self.dvl is not None:
+                mount = (self.dvl.R, self.dvl.r,
+                         bool(self.dvl.mount_measured))
+            self.ekf = EK.RlEkfNode(cfg, dvl_mount=mount,
+                                    z_source=self.nav_cfg.z_source)
+        except Exception as e:                                   # noqa: BLE001
+            # ANY failure here disables the EKF only — never the worker.
+            self._log("error", f"ekf: {type(e).__name__}: {e} — DISABLED")
+            self.ekf = None
+            self._ekf_why = f"config error: {e}"
+            return
+        self._ekf_why = "no measurement yet"
+        if want == "control":
+            if self.dr_control:
+                self._log("error", "ekf: --ekf control REFUSED — imu_dr is "
+                                   "in CONTROL and only one estimate can fly; "
+                                   "the EKF runs in shadow")
+            else:
+                self.ekf_control = True
+        c = self.ekf.cfg
+        dvl = ("no DVL" if self.dvl is None else
+               f"DVL {c['dvl_fuse']} while the DVL switch is IN"
+               if self.ekf.dvl_R is not None else
+               "DVL mount NOT measured — not fused (no transform)")
+        msg = (f"ekf: robot_localization EKF ({EK.RL_SOURCE}) at "
+               f"{c['frequency_hz']:g} Hz, smooth_lagged_data "
+               f"{str(c['smooth_lagged_data']).lower()}; tag {c['tag_fuse']}, "
+               f"imu {c['imu_fuse']}, z {c['z_source']}, {dvl}; "
+               + ("CONTROL — the controller flies on it" if self.ekf_control
+                  else "shadow (recorded and compared only)")
+               + ". HARDWARE-UNVERIFIED; noise values are [예측]")
+        self._log("warn" if self.ekf_control else "info", msg)
+        if self.ekf_control:
+            self._event("ESTIMATOR EKF (--ekf control)", defer=True)
+
+    def _ekf_trip_fault(self, where: str, e: Exception) -> None:
+        """Latch the EKF out after an exception in its own code (the DVL
+        rule: a new estimator's bookkeeping must never abort tick()). A run
+        flying on it ends on the next tick (_ekf_runtime_fault)."""
+        if self._ekf_fault:
+            return
+        self._ekf_fault = f"{where}: {type(e).__name__}: {e}"
+        self._ekf_ok, self._ekf_meas = False, None
+        self._ekf_why = f"CODE FAULT — {self._ekf_fault}"
+        msg = (f"ekf: CODE FAULT in {self._ekf_fault} — the EKF is ignored "
+               f"for the rest of this session"
+               + ("; the engagement flying on it ends" if
+                  self.engaged and self.ekf_control else ""))
+        self._log("error", msg)
+        if self.engaged:
+            self._event(msg)
+
+    def _ekf_feed(self, kind: str, obj) -> None:
+        """One input into the EKF's queue, stamped with its ARRIVAL here (the
+        moment a ROS callback would have run). The pressure depth goes in
+        with the assembler's own offset, so both estimators sit at one z."""
+        if self.ekf is None or self._ekf_fault or obj is None:
+            return
+        try:
+            t = now()
+            if kind == "fix":
+                self.ekf.feed_tag(obj, t)
+                self._ekf_log_input(t, "fix", obj)
+            elif kind == "imu":
+                self.ekf.feed_imu(obj, t)
+                self._ekf_log_input(t, "imu", obj)
+                off = self.asm.z_offset if self.asm is not None else None
+                if (self.ekf.cfg["z_source"] == "pressure" and off is not None
+                        and obj.depth_m is not None
+                        and obj.t_baro is not None):
+                    z = float(obj.depth_m) + float(off)
+                    self.ekf.feed_depth(z, float(obj.t_baro), t)
+                    self._ekf_log_input(t, "depth", (z, float(obj.t_baro)))
+            elif kind == "dvl":
+                # THE DVL'S OWN GATES APPLY (safety review 2026-10-02): the
+                # EKF fuses the DVL only while the operator's DVL switch is IN
+                # (which needs the mount PROVEN, or the recorded opt-out) and
+                # nothing has tripped it. r_l has no such gate — but r_l is
+                # not what proves a mount's sign, and a wrong-signed velocity
+                # fused with the device's covariance turns the D term into
+                # negative damping while the tags keep x/y looking fine. Every
+                # report is still LOGGED (fed = whether it went in), so
+                # `ekf_replay --dvl-all` can show the ungated EKF offline.
+                fed = self._ekf_dvl_may(t)
+                if fed:
+                    self.ekf.feed_dvl(obj, t)
+                self._ekf_log_input(t, "dvl", obj, fed=fed)
+        except Exception as e:                                   # noqa: BLE001
+            self._ekf_trip_fault(f"feed {kind}", e)
+
+    def _ekf_dvl_may(self, t: float) -> bool:
+        """May the EKF be given this DVL report? The switch IN, no trip, no
+        DVL code fault — and the PROOF gate itself (`DvlAid.refusal`), since
+        a YAML `dvl.use: true` starts IN without ever passing it (re-audit
+        2026-10-02). Engaged, the run's own arm decision (`_dvl_run_ok`,
+        which went through the same gate at engage) is the answer;
+        disengaged, refusal() is asked at most every 0.5 s (it runs the
+        agreement fit). Any exception here = not given, never an EKF trip."""
+        d = self.dvl
+        if d is None or not d.use or d.tripped or self._dvl_fault:
+            return False
+        if self.engaged:
+            return bool(self._dvl_run_ok)
+        c = self._ekf_dvl_ref
+        if c is None or t - c[0] > 0.5 or t < c[0]:
+            try:
+                why = d.refusal(True)
+            except Exception as e:                               # noqa: BLE001
+                why = f"{type(e).__name__}: {e}"
+            self._ekf_dvl_ref = c = (t, why)
+        return not c[1]
+
+    def _ekf_log_input(self, t: float, kind: str, obj, fed: bool = True
+                       ) -> None:
+        """<stem>_ekf_inputs.jsonl: every input exactly as the node got it
+        (arrival + payload), so `rov_gui.tools.ekf_replay` can re-run the
+        EKF offline with another configuration on the same run. Repeated
+        snapshots are written too; the node's own dedupe handles them."""
+        f = self._ekf_log
+        if f is None:
+            return
+        try:
+            self._ekf_log_write(f, t, kind, obj, fed)
+        except Exception as e:                                   # noqa: BLE001
+            # A logging problem stops the LOG, once and loudly; it must never
+            # trip the EKF (which would end a run flying on it).
+            self._ekf_close_log()
+            self._log("warn", f"ekf: inputs log stopped ({type(e).__name__}:"
+                              f" {e}) — the EKF itself is unaffected")
+
+    @staticmethod
+    def _ekf_log_write(f, t: float, kind: str, obj, fed: bool) -> None:
+        if kind == "fix":
+            rec = {"k": "fix", "ta": t, "tc": float(obj.t_capture),
+                   "p": [float(v) for v in obj.p_ned],
+                   "R": [float(v) for v in obj.R_ned_body]}
+        elif kind == "imu":
+            def fl(v):
+                return None if v is None else float(v)
+            rec = {"k": "imu", "ta": t, "t_att": fl(obj.t_att),
+                   "t_imu": fl(obj.t_imu),
+                   "stamp": fl(obj.stamp), "rpy": [fl(obj.roll),
+                   fl(obj.pitch), fl(obj.yaw)],
+                   "pqr": [fl(obj.p), fl(obj.q), fl(obj.r)],
+                   "acc": [fl(obj.ax), fl(obj.ay), fl(obj.az)]}
+        elif kind == "depth":
+            rec = {"k": "depth", "ta": t, "z": obj[0], "t": obj[1]}
+        else:
+            rec = {"k": "dvl", "ta": t, "tv": float(obj.t_valid),
+                   "v": (None if obj.v_dvl is None else
+                         [float(v) for v in obj.v_dvl]),
+                   "valid": bool(obj.valid), "kind": str(obj.kind),
+                   "cov": (None if obj.covariance is None else
+                           [float(v) for v in obj.covariance]),
+                   "fed": bool(fed)}
+        f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+
+    def _ekf_tick(self, t: float, meas, health) -> None:
+        """Run the EKF's timer up to now and read what it has PUBLISHED —
+        every tick, engaged or not, so it is warm and on disk whichever
+        estimator flies. ``meas``/``health`` are this tick's tag state, for
+        the divergence the runtime gate watches (only against a FRESH tag
+        state: a bridged one is itself an estimate)."""
+        self._ekf_flew = False
+        self._ekf_hold = False        # re-decided by _ekf_runtime_fault
+        self._ekf_err = None
+        if self.ekf is None or self._ekf_fault:
+            self._ekf_meas, self._ekf_ok = None, False
+            return
+        t0 = time.perf_counter()
+        try:
+            self.ekf.advance(t)
+            out = self.ekf.output()
+            self._ekf_out = out
+            m, why = None, ""
+            if out is None:
+                why = "not initialized (no measurement yet)"
+            elif not EK.finite(out):
+                why = "state is not finite"
+            else:
+                m = EK.to_meas(out)
+                if self._datum is not None:
+                    m["eta"] = self._datumize(m["eta"])
+                # FRESHNESS = what was FUSED recently, per input — not the
+                # published stamp, which r_l's timeout prediction keeps at
+                # "now" with no input at all (safety review 2026-10-02).
+                e = self.cfg.engage
+                why = self.ekf.stale_inputs(
+                    t, tag_s=float(e["tag_stale_s"]),
+                    imu_s=float(e["imu_stale_s"]),
+                    acc_s=max(1.0, float(e["imu_stale_s"])))
+                if meas is not None and health.get("ok"):
+                    err = _ekf_vs_tag(m, meas)
+                    # The velocity reference is the tag FINITE DIFFERENCE,
+                    # whose noise scales with the tag noise (the demo's 1 cm
+                    # gave 30 cm/s spikes and ended a healthy run). The
+                    # DIFFERENCE vector is low-passed (tau 0.5 s) and its
+                    # norm judged: a bias that walks away persists, noise
+                    # does not.
+                    a = (1.0 / self.cfg.ctrl_hz) / (0.5 + 1.0 / self.cfg.ctrl_hz)
+                    self._ekf_dv_lp = ((1.0 - a) * self._ekf_dv_lp
+                                       + a * err["dv"])
+                    err["vel"] = float(np.linalg.norm(self._ekf_dv_lp))
+                    self._ekf_err = err
+            self._ekf_meas = m
+            self._ekf_ok = bool(m is not None and not why)
+            self._ekf_stale = bool(m is not None and why)
+            self._ekf_why = why
+        except Exception as e:                                   # noqa: BLE001
+            self._ekf_trip_fault("tick", e)
+        ms = 1e3 * (time.perf_counter() - t0)
+        if ms > self._ekf_tick_ms_max:
+            self._ekf_tick_ms_max = ms
+
+    def _ekf_control_refusal(self) -> str:
+        """Why the controller may NOT be handed the EKF right now ("" = it
+        may). The switch and the engage gate ask the same question."""
+        if self.ekf is None:
+            return f"no EKF built ({self._ekf_why})"
+        if self._ekf_fault:
+            return f"EKF code fault ({self._ekf_fault})"
+        if self.dr_control:
+            return "imu_dr is in CONTROL (one estimate flies)"
+        if not self._ekf_ok:
+            return f"EKF not ready: {self._ekf_why}"
+        # Every "here" target (the engage hold, a mission's origin) is set
+        # from the TAG state, so the two must AGREE when the EKF is handed
+        # the loop — else the first command is a step of their difference.
+        err = self._ekf_err
+        if err is None:
+            return ("no fresh tag state to check the EKF against this tick "
+                    "— try again with the tags in view")
+        c = self.ekf.cfg
+        lim, lim_y = (float(c["control_engage_max_divergence_m"]),
+                      float(c["control_engage_max_yaw_deg"]))
+        if max(err["xy"], err["z"]) > lim or abs(err["yaw"]) > lim_y:
+            return (f"EKF and tag state disagree ({100 * err['xy']:.1f} cm "
+                    f"xy, {100 * err['z']:.1f} cm z, {err['yaw']:.1f} deg; "
+                    f"limits {100 * lim:.0f} cm / {lim_y:g} deg) — hold "
+                    f"still with the tags in view")
+        return ""
+
+    def _ekf_runtime_fault(self, health, t: float) -> str:
+        """The runtime twins of the engage gate, flying on the EKF only: it
+        faulted or stopped publishing, or it walked away from the tag state
+        (the interlocks read the TAG; this is what ties the flown state to
+        it). Debounced 0.25 s, like the attitude ceiling."""
+        self._ekf_hold = False
+        if not self.ekf_control or self.observe:
+            return ""
+        if self.ekf is None or self._ekf_fault:
+            return f"EKF lost ({self._ekf_why})"
+        if self._ekf_meas is None:                 # uninitialized / not finite
+            return f"EKF not usable: {self._ekf_why}"
+        bridged = not health.get("ok")
+        if bridged or (not self._ekf_ok and self._ekf_stale):
+            # A BRIDGED tick (station hold, tag lost) or a stale EKF input.
+            # The bridge's ladder is built for the TAG estimator; under it
+            # the EKF would fly on uncorrected IMU (+DVL) integration with
+            # nothing comparing it to anything, and a coast retarget would
+            # write its drift into the target (safety review 2026-10-02,
+            # critical): an EKF run is NOT carried across a dropout. It is
+            # DEBOUNCED like the tag path's stale gate (tag_stale_hold_s) —
+            # a frame landing just after the last 50 Hz cycle, or a tag back
+            # after a short gap, must not end a healthy run (re-audit) — and
+            # while held the tick commands NOTHING (tick: `_ekf_hold`), so
+            # the controller never flies the bridge's state instead.
+            # the tag path's own counter (see _runtime_fault)
+            self._stale_ticks += 1
+            self._ekf_hold_ticks = self._stale_ticks
+            need = max(1, int(round(float(self.cfg.engage.get(
+                "tag_stale_hold_s", 0.4)) * self.cfg.ctrl_hz)))
+            if self._stale_ticks >= need:
+                return ("tag lost while flying on the EKF — the station "
+                        "bridge does not carry an EKF run" if bridged else
+                        f"EKF not usable: {self._ekf_why}")
+            self._ekf_hold = True
+            return ""
+        self._ekf_hold_ticks = 0
+        if not self._ekf_ok:
+            return f"EKF not usable: {self._ekf_why}"
+        err = self._ekf_err
+        if err is None:
+            return ""
+        c = self.ekf.cfg
+        bad = []
+        for key, lim, unit, k in (
+                ("xy", c["control_max_tag_divergence_m"], "cm", 100.0),
+                ("z", c["control_max_z_divergence_m"], "cm", 100.0),
+                ("yaw", c["control_max_yaw_divergence_deg"], "deg", 1.0),
+                ("rp", c["control_max_rp_divergence_deg"], "deg", 1.0),
+                ("vel", c["control_max_velocity_divergence_m_s"], "cm/s",
+                 100.0)):
+            if abs(err[key]) > float(lim):
+                bad.append(f"{key} {k * abs(err[key]):.0f} {unit} "
+                           f"(> {k * float(lim):g})")
+        if bad:
+            self._ekf_div_ticks += 1
+            if self._ekf_div_ticks >= max(1, int(round(0.25
+                                                       * self.cfg.ctrl_hz))):
+                return ("EKF diverged from the tag state for 0.25 s: "
+                        + ", ".join(bad))
+        else:
+            self._ekf_div_ticks = 0
+        return ""
+
+    @Slot(str)
+    def set_estimator(self, name: str) -> None:
+        """The panel's EST switch (bus.cmd_estimator): "ekf" = the
+        controller is handed the robot_localization EKF's state, "tag" =
+        the state assembler's (every run before 2026-10-02). Refused while
+        engaged or while a controller CSV is open (one run = one estimator,
+        recorded in meta `ekf.estimator_at_engage`), and EKF is refused
+        until it is ready. Every refusal goes to ``reason``; the button
+        re-syncs from MpcStatus.ekf_control (honesty rule)."""
+        name = str(name or "").lower()
+        if name not in ("tag", "ekf"):
+            self.reason = f"estimator switch refused: unknown {name!r}"
+            self._log("warn", f"ctrl: {self.reason}")
+            return
+        on = name == "ekf"
+        if on == self.ekf_control:
+            return
+        if self.ekf is None:
+            why = f"no EKF built ({self._ekf_why})"
+        elif self.engaged:
+            why = "not while engaged"
+        elif self._csv is not None:
+            why = ("not while a controller CSV is open (REC) — stop the "
+                   "recording first")
+        else:
+            why = self._ekf_control_refusal() if on else ""
+        if why:
+            self.reason = f"estimator switch refused: {why}"
+            self._log("warn", f"ctrl: {self.reason}")
+            return
+        self.ekf_control = on
+        self._ekf_div_ticks = 0
+        self.reason = ("ESTIMATOR EKF (robot_localization)" if on else
+                       "ESTIMATOR TAG (state assembler)")
+        self._log("warn" if on else "info",
+                  "ctrl: ESTIMATOR EKF — the controller is handed the "
+                  "robot_localization EKF's state; the plot, px/py and every "
+                  "interlock stay on the tag state (CSV est says which flew)"
+                  if on else
+                  "ctrl: ESTIMATOR TAG — the controller is handed the state "
+                  "assembler's state; the EKF keeps running in shadow")
+        self._log_event(self.reason, pending=True)
+
+    def _ekf_meta(self) -> dict:
+        """ALWAYS written (the imu_dr / dvl rule)."""
+        if self.ekf is None:
+            return {"enabled": False, "why": self._ekf_why}
+        e = self._ekf_at_engage
+        out = {"enabled": True,
+               "estimator_at_engage": e.get("estimator"),
+               "ready_at_engage": e.get("ok"),
+               "not_ready_why": e.get("why") or None,
+               "estimator_now": "ekf" if self.ekf_control else "tag",
+               "rows": dict(self._ekf_rows),
+               "code_fault": self._ekf_fault or None,
+               "switch_rule": ("the EST switch changes only while disengaged "
+                               "and with no controller CSV open; per-row "
+                               "truth is CSV est"),
+               "inputs_log": bool(self._ekf_log is not None),
+               # NOT inside tick_ms (that brackets the controller step)
+               "tick_ms_max": round(float(self._ekf_tick_ms_max), 3)}
+        try:
+            out["node"] = self.ekf.meta()     # SESSION-cumulative counters
+        except Exception as e:                                   # noqa: BLE001
+            self._ekf_trip_fault("meta", e)
+            out["meta_error"] = f"{type(e).__name__}: {e}"
+        return out
+
     def _setup_station_bridge(self) -> None:
         """Build the ladder and its own estimator (station_bridge.py).
 
@@ -1643,6 +2680,32 @@ class MpcWorker(TimerWorker):
             if rec is not None:
                 self._note_bridge_recovery(rec, meas)
             self._bridge_anchor = np.asarray(meas["eta"], float).copy()
+            # The DVL rung integrates from HERE (datum frame, like the rest)
+            # — and a fresh fix is the only thing that re-opens it. Only a
+            # DVL that was actually FLOWN on this tick, though: a sample the
+            # innovation gate (or any gate) held back while the tag was
+            # there to contradict it is not made trustworthy by that tag
+            # going away (review 2026-10-02, reproduced: a false 0.25 m/s
+            # rejected on the last tagged ticks was taken by the rung on the
+            # first lost one, and walked the estimate 0.5 m).
+            if health.get("vel_src") == DV.VEL_DVL:
+                self._dvl_xy = np.asarray(meas["eta"], float)[:2].copy()
+            else:
+                self._dvl_xy = None
+            # ...and what the rung is bounded against, and returns to when
+            # it refuses its DVL: where the TAGS last put the vehicle — the
+            # fix itself, not this tick's eta, which may already carry a
+            # DVL integral over the fix's age (review 2026-10-02: an eta
+            # taken while a false lock was being integrated sent the ladder
+            # "back to the last fix" 0.125 m from it).
+            p_fix = getattr(self.fix, "p_ned", None)
+            if p_fix is not None and np.all(np.isfinite(
+                    np.asarray(p_fix, float))):
+                self._dvl_xy0 = self._map_to_datum_p(
+                    np.asarray(p_fix, float))[:2].copy()
+            elif self._dvl_xy is not None:
+                self._dvl_xy0 = self._dvl_xy.copy()
+            self._bridge_gyro_prev = None
             self._bridge_yaw = float(meas["eta"][5])
             self._bridge_z = float(meas["eta"][2])
             self._bridge_vz = float(
@@ -1651,20 +2714,49 @@ class MpcWorker(TimerWorker):
             if self._bridge_dr is not None:
                 self._drain_dr()
                 self._bridge_dr.note_depth(*self._dr_depth())
-                # nu is BODY frame; the anchor wants it in the world.
-                v_w = (rot_zyx(*meas["eta"][3:6])
-                       @ np.asarray(meas["nu"], float)[:3])
+                # The TAG finite difference, not meas["nu"]: with the DVL IN
+                # those are the DVL's (u, v), and the IMU rung must never
+                # inherit a DVL velocity — it would integrate it for the rest
+                # of imu_hold_s, outside every DVL bound (review 2026-10-02,
+                # reproduced: a false lock accepted while the fix aged walked
+                # the IMU rung 0.84 m on a vehicle at rest). Without a DVL
+                # the two are the same numbers. Body frame -> world.
+                nu_fd = health.get("nu_fd")
+                nu_b = (np.asarray(nu_fd, float).reshape(3)
+                        if nu_fd is not None
+                        else np.asarray(meas["nu"], float)[:3])
+                v_w = rot_zyx(*meas["eta"][3:6]) @ nu_b
                 self._bridge_dr.anchor(meas["eta"], nu_world_ned=v_w, t=t,
                                        zero_velocity=False)
             return meas
         if not station or self._bridge_anchor is None:
-            return meas
+            self._dvl_xy = None     # a tick the rung did not integrate: its
+            return meas             # position has a hole from here on
         if not SB.is_bridgeable(health.get("why", "")):
             # imu stale / pressure stale / no autopilot: the very sensors the
             # bridge would fly on. Those still disengage.
+            self._dvl_xy = None
             return meas
         m = None
-        if self._bridge_xy == "imu" and self._bridge_dr is not None:
+        # THE DVL RUNG (2026-10-01): a usable DVL the operator has switched
+        # IN carries x/y by integrating its bottom velocity from the last
+        # fix. Tried first; the moment it is not usable the ladder below is
+        # exactly the pre-DVL one. `base` is the freeze state (z, attitude,
+        # gyro yaw) and is computed ONCE per tick — it integrates the yaw.
+        base = None
+        dvl_ok = False
+        if self.dvl is not None and self._dvl_xy is not None \
+                and self.dvl.use and self._dvl_run_ok \
+                and not self._dvl_fault and br.dvl_allowed(dt):
+            # (the switch and the engage-time arm are asked HERE, before the
+            # freeze state is built: building it integrates the gyro yaw, and
+            # a DVL that is OUT must not change a single number of the
+            # ladder below)
+            base = self._bridge_meas_freeze(t, dt)
+            m = self._bridge_meas_dvl(base, t, dt)
+            dvl_ok = m is not None
+        if m is None and self._bridge_xy == "imu" \
+                and self._bridge_dr is not None:
             self._drain_dr()
             self._bridge_dr.note_depth(*self._dr_depth())
             st = self._bridge_dr.state(t, imu_vehicle=self.imu)
@@ -1684,14 +2776,28 @@ class MpcWorker(TimerWorker):
             # from the autopilot, yaw from its gyro. Nothing here is double
             # integrated, so it does not degrade with time the way the accel
             # path does — it is simply blind to real horizontal motion.
-            m = self._bridge_meas_freeze(t, dt)
+            m = (base if base is not None
+                 else self._bridge_meas_freeze(t, dt))
         if m is None:
             # Not even the freeze is available (autopilot or barometer gone).
             # Fall through to the normal interlock: a bridge that has itself
-            # gone blind must never look like a hold.
-            br.reset()
+            # gone blind must never look like a hold. The ladder's clock
+            # restarts, exactly as it always has on such a tick (so without
+            # a DVL the tiers are what they were — KNOWN_ISSUES has the
+            # consequence); what keeps the DVL rung from climbing back on
+            # after the hole is _dvl_xy: only a fresh fix sets it again.
+            # end_dropout, not reset: the engagement's counters are kept.
+            br.end_dropout()
+            self._dvl_xy = None
             return meas
-        tier = br.note_lost(dt)
+        tier = br.note_lost(dt, dvl_ok=dvl_ok)
+        if tier != SB.TIER_DVL:
+            # The chain broke (or the hold ran out): the rung stays closed
+            # until the next fresh fix, whatever the DVL says afterwards.
+            self._dvl_xy = None
+        # What this row's velocity was (CSV vel_src): the DVL's on its own
+        # rung, nothing measured on the IMU / freeze rungs.
+        health["vel_src"] = (DV.VEL_DVL if tier == SB.TIER_DVL else "bridge")
         self.phase_detail = br.detail()
         if tier == SB.TIER_COAST and br.n_coast and int(
                 br.elapsed * self.cfg.ctrl_hz) % int(
@@ -1744,11 +2850,154 @@ class MpcWorker(TimerWorker):
                                        float(imu.r)])])
         return {"eta": eta, "nu": nu, "nudot": np.zeros(6)}
 
+    def _bridge_meas_dvl(self, base, t, dt):
+        """The DVL rung's state, or None if the DVL may not carry this tick.
+
+            x, y        the last tag fix + the integral of the DVL's (u, v),
+                        rotated by (roll, pitch, gyro-carried yaw)
+            u, v        the DVL's, as on every other tick it is IN
+            w, z, attitude, rates
+                        ``base`` — the freeze state: barometer z and heave,
+                        autopilot roll/pitch, yaw = last fix + integrated gyro
+            nudot       the assembler's own formula (accelerometer + gravity
+                        - omega x v), so the EAOB is not told "moving, yet
+                        not accelerating" for ten seconds
+
+        NOTHING cross-checks the DVL here — the tag that proved it is what
+        is missing — so the rung is bounded by what a station hold IS
+        (station_bridge.py): above ``dvl_max_speed_m_s``, or further than
+        ``dvl_max_disp_m`` from the fix it started at, the DVL is describing
+        something else and the rung closes for the rest of the dropout.
+
+        Also moves the freeze anchor (and the IMU rung's estimator, at
+        rest) onto the integrated position, so if the DVL GOES AWAY
+        mid-dropout (lock lost, link stale) the next rung carries on from
+        where the vehicle was last known to be rather than snapping back to
+        the fix — within dvl_max_disp_m of it, and with no velocity the DVL
+        gave it. When the rung closes because the DVL's own story is
+        implausible, the opposite: see ``_dvl_rung_closed``."""
+        if base is None:
+            return None
+        # the guarded entry point; no tag velocity exists to check against
+        v, _why = self._dvl_velocity(t, need_ref=False)
+        if v is None:
+            return None
+        cfg = self._bridge.cfg
+        speed = float(math.hypot(v[0], v[1]))
+        if speed > cfg["dvl_max_speed_m_s"]:
+            self._dvl_rung_closed(
+                f"it reads {speed:.2f} m/s during a station hold "
+                f"(> {cfg['dvl_max_speed_m_s']:.2f})", base, t)
+            return None
+        eta = np.asarray(base["eta"], float).copy()
+        nu = np.asarray(base["nu"], float).copy()
+        nu[0], nu[1] = float(v[0]), float(v[1])
+        xy = DV.integrate_xy(self._dvl_xy, nu[:3], eta[3], eta[4], eta[5], dt)
+        disp = float(math.hypot(xy[0] - self._dvl_xy0[0],
+                                xy[1] - self._dvl_xy0[1]))
+        if disp > cfg["dvl_max_disp_m"]:
+            self._dvl_rung_closed(
+                f"its integral is {disp:.2f} m from the last fix "
+                f"(> {cfg['dvl_max_disp_m']:.2f})", base, t)
+            return None
+        self._dvl_xy = xy
+        eta[0], eta[1] = float(xy[0]), float(xy[1])
+        self._bridge_anchor[0] = eta[0]
+        self._bridge_anchor[1] = eta[1]
+        nudot = np.zeros(6)
+        imu = self.imu
+        gyro = nu[3:6].copy()
+        if (self.cfg.nudot_source == "imu" and imu is not None
+                and imu.ax is not None and imu.t_imu is not None
+                and t - float(imu.t_imu) <= float(
+                    self.cfg.engage["imu_stale_s"])):
+            f = np.array([float(imu.ax), float(imu.ay), float(imu.az)])
+            R = rot_zyx(eta[3], eta[4], eta[5])
+            nudot[:3] = f + R.T @ G_NED - np.cross(gyro, nu[:3])
+            if self._bridge_gyro_prev is not None:
+                nudot[3:] = (gyro - self._bridge_gyro_prev) / max(1e-3, dt)
+        self._bridge_gyro_prev = gyro
+        if self._bridge_dr is not None:
+            # The IMU rung's estimator was anchored at the last FIX and
+            # knows nothing of the motion the DVL has measured since.
+            # Re-anchored here every DVL tick at the DVL's POSITION — which
+            # the caps above bound — but AT REST, the station hold's own
+            # premise: never with the DVL's velocity. A false lock that
+            # ends by going away (lost lock, silence, a snap back caught by
+            # the jump gate) is not a cap closure, and its velocity handed
+            # to the IMU rung was integrated for the rest of imu_hold_s:
+            # 0.67-0.84 m on a vehicle at rest, past dvl_max_disp_m (review
+            # 2026-10-02, reproduced).
+            self._drain_dr()
+            self._bridge_dr.note_depth(*self._dr_depth())
+            self._bridge_dr.anchor(eta, nu_world_ned=None, t=t,
+                                   zero_velocity=True)
+        return {"eta": eta, "nu": nu, "nudot": nudot}
+
+    def _dvl_rung_closed(self, why: str, base, t: float) -> None:
+        """The DVL rung refused its own DVL. Said once per dropout — the
+        caller closes the rung, so this cannot repeat until the next fix.
+
+        What that DVL integrated is not kept either. The rung has just
+        judged it to be describing something other than a station hold, so
+        the rungs below start from the last FIX, at rest — until 2026-10-02
+        they inherited the DVL's position (up to dvl_max_disp_m off) and its
+        velocity, and the controller kept pushing against a displacement the
+        ladder itself had called implausible (review, reproduced: 0.34 m of
+        estimate error held to the end of imu_hold_s). If the vehicle really
+        did drift that far, the estimate is now wrong by that much instead,
+        with nothing pushing — which is what a freeze is."""
+        msg = f"station_bridge: DVL rung closed — {why}"
+        self._log("warn", f"ctrl: {msg}; back to the last fix and on down "
+                          f"the ladder")
+        self._event(msg)
+        if self._dvl_xy0 is None or self._bridge_anchor is None:
+            return
+        x0, y0 = float(self._dvl_xy0[0]), float(self._dvl_xy0[1])
+        self._bridge_anchor[0], self._bridge_anchor[1] = x0, y0
+        if base is not None:
+            base["eta"][0], base["eta"][1] = x0, y0
+            if self._bridge_dr is not None:
+                self._drain_dr()
+                self._bridge_dr.note_depth(*self._dr_depth())
+                self._bridge_dr.anchor(base["eta"], nu_world_ned=np.zeros(3),
+                                       t=t, zero_velocity=True)
+
     def _note_bridge_recovery(self, rec: dict, meas) -> None:
         """The tag came back. Log how far the bridge had drifted — this is the
         one number that turns the [예측] IMU budget into a measurement, and it
         is free every time a dropout ends."""
         err = None
+        if rec.get("tier") == SB.TIER_DVL and self._dvl_xy is not None:
+            # The DVL rung's own answer, for the same reason: every recovery
+            # is a free measurement of the [예측] dvl_hold_s budget — but ONLY
+            # when the DVL carried the dropout to its END. If the chain broke
+            # earlier, the distance to the fix is mostly what the vehicle did
+            # AFTER the DVL let go, and writing that down as "DVL error"
+            # would hand a later reader a number that measured something
+            # else (review 2026-10-02).
+            d_err = float(math.hypot(
+                float(self._dvl_xy[0]) - float(meas["eta"][0]),
+                float(self._dvl_xy[1]) - float(meas["eta"][1])))
+            y_err = math.degrees(math.atan2(
+                math.sin(self._bridge_yaw - float(meas["eta"][5])),
+                math.cos(self._bridge_yaw - float(meas["eta"][5]))))
+            rec["dvl_err_m"] = d_err
+            rec["yaw_err_deg"] = y_err     # the gyro-carried yaw, same span
+            msg = (f"station_bridge: fix back after {rec['elapsed']:.2f}s "
+                   f"(tier dvl, DVL dead reckoning was {d_err * 100:.1f} cm "
+                   f"off, gyro yaw {y_err:+.1f} deg off)")
+            self.phase_detail = ""
+            self._event(msg)
+            self._log("info", f"ctrl: {msg}")
+            return
+        if float(rec.get("dvl_s", 0.0) or 0.0) > 0.0:
+            # Carried part of the way on the DVL, then lost it: say so, and
+            # attribute NO error to it.
+            self._log("info", f"ctrl: station_bridge: the DVL carried the "
+                              f"first {rec['dvl_s']:.1f}s of that dropout "
+                              f"(its error is not measurable: the chain broke "
+                              f"before the fix came back)")
         if self._bridge_dr is not None and self._bridge_dr.anchored:
             p = np.asarray(self._bridge_dr.p, float)
             err = float(math.hypot(p[0] - float(meas["eta"][0]),
@@ -1855,6 +3104,16 @@ class MpcWorker(TimerWorker):
     def on_nav_fix(self, fix) -> None:
         if getattr(fix, "ok", False):
             self.fix = fix
+            self._ekf_feed("fix", fix)
+            if self.dvl is not None and not self._dvl_fault:
+                # The raw tag difference the DVL is judged against. Every fix,
+                # engaged or not: the proof has to exist BEFORE the switch.
+                try:
+                    was, trips = self.dvl.proven, self.dvl.n_trips
+                    self.dvl.note_fix(fix, self.imu)
+                    self._dvl_note_proof(was, trips)
+                except Exception as e:                           # noqa: BLE001
+                    self._dvl_trip_fault("fix", e)
             if self._obj is not None:
                 # RAW and undatumized, keyed by the frame's CAPTURE stamp —
                 # the only form in which the camera extrinsic still cancels
@@ -1868,6 +3127,7 @@ class MpcWorker(TimerWorker):
     @Slot(object)
     def on_vehicle_imu(self, imu) -> None:
         self.imu = imu
+        self._ekf_feed("imu", imu)
         # A short history of the autopilot's ATTITUDE message, kept ONLY for
         # the dead reckoner's settle-window calibration: the rates so the gyro
         # bias can be differenced against the vehicle's real rotation, and the
@@ -1917,19 +3177,42 @@ class MpcWorker(TimerWorker):
     #: attitude_axes_probe.py writes it); any other JSON is not a probe.
     ATTITUDE_PROBE_TOOL = "rov_gui.tools.attitude_axes_probe"
     POLICY_ATTITUDE_DEFAULTS = {
-        "attitude_track": False, "rp_max_deg": 20.0, "rp_reject_deg": 30.0,
+        "attitude_track": True, "rp_max_deg": 20.0, "rp_reject_deg": 30.0,
         "pq_max_rad_s": 0.35, "rp_jump_max_deg": 5.0,
         "anchor_leash_rp_deg": 3.0, "div_max_rp_deg": 15.0,
         "blend_rp_rate_max": 0.5, "heave_trim_attitude_rotated": False,
         "rp_ref_filter": None, "attitude_q_scale": 1.0,
     }
-    #: LOW levels that may fly the attitude axes without an extra flag
-    #: (D10): plain NMPC, whose K/M go out uncredited to any observer. The
-    #: dobmpc family needs engage.attitude_axes.dobmpc_allowed (crediting a
-    #: [유도] roll_nm/pitch_nm to the EAOB is a multiplicative plant-gain
-    #: error at the DOB bandwidth); pid / rl / mpcc have no K/M path at all.
-    ATTITUDE_LOW_ALLOWED = ("mpc", "mpc_tuned")
+    #: The LOW levels whose K/M go out as MANUAL_CONTROL s/t (2026-10-03:
+    #: the *_7d followers, geometry.LOW_7D_BASE — operator request "pid_7d,
+    #: mpc_tuned_7d, RL_7d"). THE LOW DECIDES: with engage.attitude_axes
+    #: .enabled (the station-launch capability: the sink reads it once at
+    #: setup) a *_7d LOW must pass every attitude gate or the engage is
+    #: REFUSED, and every other LOW engages 4-DoF with K/M dropped at the
+    #: allocation — pid, rl, rl_pwm, mpcc, dobmpc* and, since 2026-10-03,
+    #: plain mpc / mpc_tuned (2026-09-26..10-02 they flew K/M whenever the
+    #: block was enabled: zero water runs on record, so no record is
+    #: reinterpreted; meta run.attitude_axes.low_attitude is the boundary).
+    #: A dobmpc-family 7d LOW would still need dobmpc_allowed (D10 — crediting
+    #: a [유도] roll_nm/pitch_nm to the EAOB); none exists.
+    ATTITUDE_LOW_ALLOWED = tuple(LOW_7D_BASE)
     RP_RESIDUAL_ARM_MAX_DEG = 10.0     # [예측] interlock (iv)
+
+    @property
+    def rp_track_live(self) -> bool:
+        """Can THIS engagement track a roll/pitch reference? K/M on s/t under
+        a *_7d LOW, or pulses under a rl_pwm_7d LOW (2026-10-03). Keys the
+        policy truth table, the rp plan composition, div_rp and the CSV
+        reference columns; == `_attitude_axes` for every s/t LOW."""
+        return bool(self._attitude_axes or (
+            self._attitude_pulses and self.cfg is not None
+            and str(self.cfg.mode) in LOW_7D_PULSE_BASE))
+
+    @property
+    def attitude_actuated(self) -> bool:
+        """Does the follower command roll/pitch at all on this engagement
+        (s/t K/M or per-thruster pulses)? Keys the tilt ceiling (ii)."""
+        return bool(self._attitude_axes or self._attitude_pulses)
 
     def _attitude_cfg(self) -> dict:
         e = self.cfg.engage if self.cfg is not None else {}
@@ -1948,12 +3231,38 @@ class MpcWorker(TimerWorker):
         v = pc.get(key, self.POLICY_ATTITUDE_DEFAULTS[key])
         return self.POLICY_ATTITUDE_DEFAULTS[key] if v is None and key != "rp_ref_filter" else v
 
-    def _policy_pinned_repr(self) -> str:
-        """The action representation THIS side flies: policy.action_repr
-        (config, default state.POLICY_ACTION_REPR), pinned per mission at
-        ARM into rp["action_repr_pinned"] / scen["action_repr"]."""
+    def _policy_repr_config(self) -> str:
+        """The CONFIG spelling of policy.action_repr (code default
+        state.POLICY_ACTION_REPR): pos_yaw_width | pos_rpy_width — or
+        ``auto`` (2026-10-03), which is NOT a representation. The flown value
+        is the pin, resolved ONCE in _arm_policy
+        (geometry.resolve_policy_action_repr) and kept in
+        rp["action_repr_pinned"] / scen["action_repr"]; nothing after ARM
+        resolves it again."""
         pc = self.cfg.policy if self.cfg is not None else {}
         return str(pc.get("action_repr") or POLICY_ACTION_REPR)
+
+    def _policy_meta_repr(self) -> str | None:
+        """meta policy.action_repr. An explicit config: its value, exactly as
+        before. Under auto: the ARM pin of the policy mission that is LIVE
+        now, else — while a controller CSV is open — the last pin armed
+        while THAT CSV was open, else None. Never "auto", never the
+        write-time status (policy.status.action_repr records that), and
+        never a mission that ended before this record began (`_replay_last`
+        may still hold one: policy.run describes it, this key does not —
+        review 2026-10-03)."""
+        cfg_repr = self._policy_repr_config()
+        if cfg_repr != POLICY_ACTION_REPR_AUTO:
+            return cfg_repr
+        return self._policy_live_pin() or (
+            self._policy_pin_csv if self._csv is not None else None)
+
+    def _policy_live_pin(self) -> str | None:
+        """The ARM pin of the policy mission flying right now, or None."""
+        rp = self.replay
+        if rp is not None and rp.get("kind") == "policy":
+            return str(rp.get("action_repr_pinned") or "") or None
+        return None
 
     @staticmethod
     def _parse_fw(v) -> tuple | None:
@@ -1976,10 +3285,10 @@ class MpcWorker(TimerWorker):
             return False
 
     def _attitude_refusal(self, tel) -> str:
-        """Why engage.attitude_axes.enabled may NOT be honoured at this
-        engage ("" = every gate passed). Each cause its own sentence, the
-        `_follow_refusal` rule. Called ONLY when the block is enabled and the
-        vehicle gates apply (not land_dry_run, not observe)."""
+        """Why a *_7d LOW may NOT fly its K/M at this engage ("" = every
+        gate passed). Each cause its own sentence, the `_follow_refusal`
+        rule. Called ONLY for a *_7d LOW with the block enabled and the
+        vehicle gates applying (not land_dry_run, not observe)."""
         a = self._attitude_cfg()
         tr = str(a.get("transport") or "manual_control_ext")
         if tr != "manual_control_ext":
@@ -1990,9 +3299,8 @@ class MpcWorker(TimerWorker):
         if bool(a.get("require_manual", True)) and not mode.startswith("MANUAL"):
             return (f"attitude_axes needs MANUAL (in {getattr(tel, 'mode', None) or '?'} "
                     f"the MANUAL_CONTROL s/t extension axes are LEAN-ANGLE "
-                    f"targets and the autopilot would fight the NMPC's K/M "
-                    f"torques) — press MANUAL or set engage.attitude_axes."
-                    f"enabled: false")
+                    f"targets and the autopilot would fight the follower's K/M "
+                    f"torques) — press MANUAL or pick a 4-DoF LOW")
         low = str(self.cfg.mode)
         if low.startswith("dobmpc"):
             if not bool(a.get("dobmpc_allowed", False)):
@@ -2002,8 +3310,7 @@ class MpcWorker(TimerWorker):
                         f"mpc first, D10)")
         elif low not in self.ATTITUDE_LOW_ALLOWED:
             return (f"attitude_axes has no K/M path on {low} — pick "
-                    f"{'|'.join(self.ATTITUDE_LOW_ALLOWED)} (dobmpc* with "
-                    f"dobmpc_allowed)")
+                    f"{'|'.join(self.ATTITUDE_LOW_ALLOWED)}")
         if not self._alloc_has_attitude():
             return ("this build's allocation has no attitude path "
                     "(wrench_to_axes lacks `attitude=`) — the variant cannot "
@@ -2042,6 +3349,106 @@ class MpcWorker(TimerWorker):
                     "artefact with sign_proven true) and engage.attitude_axes."
                     "first_water_caps is null — nothing would bound an "
                     "inverted sign; pin first_water_caps or the artefact")
+        return ""
+
+    def _attitude_caps_in_force(self, att: dict, chk: dict) -> tuple:
+        """``(caps (roll, pitch), set, why)`` — the caps on the wire for this
+        engage (safety audit 2026-09-26): full cap_roll/cap_pitch only with a
+        sign_probe artefact proving the sign, else first_water_caps
+        (elementwise min); the last branch is reachable only where nothing
+        is actuated (the gate refuses an unproven sign with null caps)."""
+        caps_full = (float(att.get("cap_roll", 0.2)),
+                     float(att.get("cap_pitch", 0.3)))
+        fwc = att.get("first_water_caps")
+        fwc = (None if fwc is None else (float(fwc[0]), float(fwc[1])))
+        if chk["sign_proven"]:
+            return (caps_full, "full",
+                    f"wire sign proven: sign_probe {att.get('sign_probe')!r} "
+                    f"sign_proven true (sha1 "
+                    f"{str(chk['sign_probe_sha1'] or '')[:12]})")
+        if fwc is not None:
+            return ((min(caps_full[0], fwc[0]), min(caps_full[1], fwc[1])),
+                    "first_water",
+                    "wire sign NOT proven ("
+                    + (f"sign_probe {att.get('sign_probe')!r} sign_proven false"
+                       if att.get("sign_probe") else
+                       "no sign_probe artefact pinned; require_sign_probe "
+                       "false = recorded opt-out")
+                    + ") — first_water_caps in force, cap_roll/cap_pitch "
+                      "withheld")
+        return (caps_full, "full",
+                "first_water_caps null with an unproven sign — the engage "
+                "gate refuses this on a vehicle; reached only with nothing "
+                "actuated (observe / land dry-run)")
+
+    def _pid7d_pulse_refusal(self) -> str:
+        """LOW pid_7d only (safety audit 2026-10-03, MEDIUM): its roll/pitch
+        loop is delay-limited and its phase margin collapses on a stiff hull
+        (free-decay period below ~3.2 s at 0.2 s delay [유도: rov_gui/tests/
+        fixtures/sim_pid7d_attitude_20261003.txt]) into a ~1 Hz limit cycle no
+        interlock catches. A vehicle engage needs the pulse-and-release record
+        (pid_7d.pulse_test: a JSON with free_decay_period_s [roll, pitch]),
+        or the RECORDED opt-out pid_7d.require_pulse_test: false. Whatever was
+        decided is written to the follower (meta controller.rp_loop.pulse_test)."""
+        if self.cfg.mode != "pid_7d" or self.ctrl is None:
+            return ""
+        c = self.ctrl
+        if not bool(getattr(c, "require_pulse_test", True)):
+            c.pulse_test_record = {"required": False, "opt_out": True,
+                                   "note": "pid_7d.require_pulse_test false — RECORDED opt-out"}
+            return ""
+        path = getattr(c, "pulse_test", None)
+        if not path:
+            return ("pid_7d: no pulse-and-release record (pid_7d.pulse_test) — the "
+                    "roll/pitch loop's margin depends on the hull's restoring "
+                    "stiffness, never measured; run the open-loop pulse first "
+                    "(KNOWN_ISSUES 2026-10-03) or set pid_7d.require_pulse_test: "
+                    "false (recorded)")
+        d, sha, why = self._read_json_artefact(path)
+        if d is None:
+            return f"pid_7d.pulse_test {path!r} {why}"
+        per = d.get("free_decay_period_s")
+        try:
+            per = [float(per[0]), float(per[1])]
+            if not all(math.isfinite(v) and v > 0.0 for v in per):
+                raise ValueError
+        except (TypeError, ValueError, IndexError, KeyError):
+            return (f"pid_7d.pulse_test {path!r} has no finite free_decay_period_s "
+                    f"[roll, pitch] (got {d.get('free_decay_period_s')!r})")
+        need = float(getattr(c, "min_free_decay_period_s", 3.2))
+        if min(per) < need:
+            return (f"pid_7d: free-decay period {min(per):.2f} s < {need:.1f} s "
+                    f"(pid_7d.pulse_test) — a stiff hull: the shipped roll/pitch "
+                    f"gains lose their phase margin at this delay; retune pid_7d "
+                    f"from the test (KNOWN_ISSUES 2026-10-03) before engaging")
+        c.pulse_test_record = {"required": True, "path": str(path), "sha1": sha,
+                               "free_decay_period_s": per,
+                               "min_free_decay_period_s": need}
+        return ""
+
+    def _rl7d_caps_refusal(self, tel) -> str:
+        """LOW rl_7d only: a policy whose roll/pitch actions would be CLIPPED
+        below what it was trained with is fed back an out-of-distribution
+        previous action — the 2026-10-01 rl_pwm cap-0.25 run limit-cycled on
+        exactly that (data/20261001/1001_172910, memory rl-pwm-action-mode).
+        Refused unless rl_7d.allow_caps_below_trained (recorded in meta)."""
+        if self.cfg.mode != "rl_7d":
+            return ""
+        trained = getattr(self.ctrl, "attitude_cap_trained_station", None)
+        if trained is None or bool(getattr(self.ctrl, "allow_caps_below_trained", False)):
+            return ""
+        a = self._attitude_cfg()
+        chk = self._attitude_artefacts(a, str(getattr(tel, "firmware_version", "") or ""))
+        caps, cset, _why = self._attitude_caps_in_force(a, chk)
+        short = [n for i, n in enumerate(("roll", "pitch"))
+                 if caps[i] < float(trained[i]) - 1e-9]
+        if short:
+            return (f"rl_7d: the {'/'.join(short)} cap in force ({cset}: "
+                    f"{caps[0]:.3f}/{caps[1]:.3f} station units) is below what "
+                    f"the policy was trained with ({float(trained[0]):.3f}/"
+                    f"{float(trained[1]):.3f}) — a clipped policy limit-cycles "
+                    f"(rl_pwm 2026-10-01); prove the wire sign (sign_probe) or "
+                    f"set rl_7d.allow_caps_below_trained: true (recorded)")
         return ""
 
     @staticmethod
@@ -2197,6 +3604,58 @@ class MpcWorker(TimerWorker):
         self._att_sat = {0: None, 1: None}
         self._attitude_sat_ticks = 0
 
+    def _arm_pwm_interlocks(self) -> None:
+        """(vi) THE PER-THRUSTER INTERLOCKS (2026-10-10 b, REPORT.md §3 step
+        5): built fresh at every engagement of a pwm LOW (rl_pwm, rl_pwm_7d)
+        from engage.per_thruster, at the follower's cap, and evaluated every
+        tick in _runtime_fault after the attitude ceiling. None for every
+        other LOW (byte-identical). The object outlives the disengage so the
+        closing meta (controller.interlocks) carries the trip."""
+        self._pwm_last_sent_us = None
+        self._pwm_guard = 0
+        if not self._attitude_pulses:
+            self._pwm_ilk = None
+            return
+        from .rl_pwm import PwmInterlocks
+
+        cap = float(getattr(self.ctrl, "pwm_cap", 1.0))
+        self._pwm_ilk = PwmInterlocks(self.cfg.engage.get("per_thruster"),
+                                      self.cfg.ctrl_hz, cap)
+        msg = (f"PER-THRUSTER INTERLOCKS ARMED ({self.cfg.mode}): "
+               f"{self._pwm_ilk.describe()} [예측 engage.per_thruster]")
+        self._log("warn", f"ctrl: {msg}")
+        self._log_event(msg)
+
+    def _pwm_interlock_fault(self, meas) -> str:
+        """One tick of the per-thruster interlocks on the MEASURED state
+        (roll/pitch and the vehicle's gyro from `meas`, the latest pack
+        sample from telemetry, the pulses that last left) -> "" or the trip
+        sentence with its numbers. The trip is also a mission line; the
+        caller disengages (neutral pulses) with the sentence."""
+        ilk = self._pwm_ilk
+        if ilk is None:
+            return ""
+        try:
+            eta = np.asarray(meas["eta"], float)
+            nu = np.asarray(meas["nu"], float)
+            roll, pitch = float(eta[3]), float(eta[4])
+            p, q = float(nu[3]), float(nu[4])
+        except (KeyError, TypeError, ValueError, IndexError):
+            return ""
+        tel = self.tel
+        why = ilk.step(roll, pitch, p, q,
+                       batt_a=(getattr(tel, "current_a", None)
+                               if tel is not None else None),
+                       batt_v=(getattr(tel, "battery_v", None)
+                               if tel is not None else None),
+                       pwm_us=self._pwm_last_sent_us)
+        if why:
+            name = str((ilk.last_trip or {}).get("name", "?")).upper()
+            self._event(f"PER-THRUSTER INTERLOCK {name} — disengaged "
+                        f"(neutral pulses)")
+            self._log("error", f"ctrl: {why}")
+        return why
+
     #: Interlock (iii): an axis leaves its cap-pinned window only after this
     #: fraction of a second of CONSECUTIVE unpinned ticks (safety audit
     #: 2026-09-26: one unpinned tick used to reset the window, so an axis
@@ -2248,13 +3707,24 @@ class MpcWorker(TimerWorker):
         eta = np.asarray(meas["eta"], float)
         ref = self._ref_attitude(t_traj)
         tol = math.radians(1.0)
+        # A follower whose own ceiling sits BELOW the wire cap (HwPid7d: its
+        # integral is clamped to 0.8 x the wire torque, Kp small) never pins
+        # the axis — it reports its exhausted authority instead, and that is
+        # judged like a pinned axis (safety audit 2026-10-03, HIGH: an
+        # inverted wire sign settled at a wrong tilt with nothing tripping).
+        _ex = getattr(self.ctrl, "attitude_authority_exhausted", None)
+        try:
+            exhausted = tuple(bool(v) for v in _ex()) if callable(_ex) else (False, False)
+        except Exception:                                        # noqa: BLE001
+            exhausted = (False, False)
         for i, name in enumerate(("roll", "pitch")):
             val = float(getattr(axes, name, 0.0))
             cap = float(self._attitude_cap[i])
             ref_i = float(ref[i])
             att_i = float(eta[3 + i])
             e = abs(_wrap_pi(ref_i - att_i))
-            pinned = cap > 0.0 and abs(val) >= cap - 1e-9
+            pinned = (cap > 0.0 and abs(val) >= cap - 1e-9) or (
+                len(exhausted) > i and exhausted[i] and abs(val) > 1e-9)
             st = self._att_sat[i]
             if not pinned:
                 if st is not None:
@@ -2290,8 +3760,8 @@ class MpcWorker(TimerWorker):
                 continue
             how = ("moved AGAINST the command"
                    if progress < -tol else "did not move with the command")
-            return (f"attitude {name} axis pinned at its cap "
-                    f"({val:+.2f}, cap {cap:.2f}) for {hold:.1f} s while the "
+            return (f"attitude {name} axis pinned at its cap or its follower's "
+                    f"authority limit ({val:+.2f}, cap {cap:.2f}) for {hold:.1f} s while the "
                     f"measured {name} {how} "
                     f"({math.degrees(progress):+.1f} deg along it; error "
                     f"{math.degrees(st['e0']):.1f} -> {math.degrees(e):.1f} "
@@ -2481,7 +3951,14 @@ class MpcWorker(TimerWorker):
     # NEVER join HwDobMpc.MODES, whose setter raises for non-members and
     # whose members are all things that get stepped.
     MODES = ("none", "mpc", "dobmpc", "mpc_tuned", "dobmpc_tuned",
-             "mpcc", "dobmpcc", "pid", "rl", "rl_pwm")
+             "mpcc", "dobmpcc", "pid", "rl", "rl_pwm") + tuple(LOW_7D_BASE) \
+        + tuple(LOW_7D_PULSE_BASE)
+    # The *_7d keys (2026-10-03, geometry.LOW_7D_BASE) are LOW levels, not
+    # solver names: mpc_tuned_7d flies `_mpc_ctrl` in HwDobMpc mode
+    # "mpc_tuned" (set_mode maps it; "mpc_tuned_7d".endswith("_tuned") is
+    # False, so passing the key itself would fly the isotropic cost), pid_7d
+    # and rl_7d are their own objects (HwPid7d / HwRl7d — never `_pid`,
+    # which is also the LOW-None reference holder).
 
     def _ctrl_for(self, mode: str):
         """The controller object a mode name selects, or None if unavailable.
@@ -2504,13 +3981,21 @@ class MpcWorker(TimerWorker):
         ``set_mode("none")`` never touches ``_mpc_ctrl.mode``."""
         if mode in ("pid", "none"):
             return self._pid
+        if mode == "pid_7d":
+            return getattr(self, "_pid7d", None)
         if mode == "rl":
             return getattr(self, "_rl", None)
+        if mode == "rl_7d":
+            return getattr(self, "_rl7d", None)
         if mode == "rl_pwm":
             return getattr(self, "_rl_pwm", None)
+        if mode == "rl_pwm_7d":
+            return getattr(self, "_rl_pwm7d", None)
         if mode in ("mpcc", "dobmpcc"):
             return self._mpcc_ctrl
-        return self._mpc_ctrl
+        if mode in ("mpc", "dobmpc", "mpc_tuned", "dobmpc_tuned", "mpc_tuned_7d"):
+            return self._mpc_ctrl
+        return None                       # an unknown key never falls through to the MPC
 
     def _low_none_banner(self) -> str:
         """The full DISARM list for LOW level None, one sentence — the same
@@ -2531,6 +4016,128 @@ class MpcWorker(TimerWorker):
                 "workspace box, tag-loss disengage. Jaw forced off; run clock "
                 f"policy.observe_max_run_s; records go to data/*/*_{kind}/ "
                 "(observe=1) and are NOT closed-loop results.")
+
+    # ------------------------------------------------- MPC_Tuned profile
+    #: The LOW levels an MPC_Tuned profile applies to (HwDobMpc mode
+    #: "mpc_tuned"; mpc_tuned_7d flies that mode, geometry.LOW_7D_BASE).
+    TUNE_LOWS = ("mpc_tuned", "mpc_tuned_7d")
+
+    def _setup_tune_profile(self) -> None:
+        """Hold the launch profile: ``--mpc-tune`` (opts.mpc_tune) over
+        hw_mpc.yaml ``mpc_tuned_profile``. A named profile that fails to load
+        is NOT replaced by hw_mpc.yaml's values: mpc_tuned then refuses to
+        engage (`_engage_refusal`) until a panel pick succeeds — flying the
+        file's blocks under a launch that asked for a profile is the "meta
+        says one thing, the run flew another" failure."""
+        from .mpc_tune import is_no_profile, load_profile
+
+        cli = getattr(self.opts, "mpc_tune", None)
+        name = cli if cli is not None else self.cfg.mpc_tuned_profile
+        src = "--mpc-tune" if cli is not None else "hw_mpc.yaml mpc_tuned_profile"
+        self._tune_error = ""
+        if is_no_profile(name):
+            if cli is not None or self.cfg.mpc_tuned_profile is not None:
+                self._log("info", f"ctrl: MPC_Tuned profile: none ({src}) — "
+                                  f"mpc_tuned flies hw_mpc.yaml's own blocks")
+            return
+        if self._mpc_ctrl is None or not hasattr(self._mpc_ctrl, "set_tune_profile"):
+            # the MPC failed to build (or a test factory has no hook): that
+            # refusal is already the louder one
+            return
+        try:
+            prof = load_profile(name)
+            warns = self._mpc_ctrl.set_tune_profile(prof)
+        except Exception as e:                                   # noqa: BLE001
+            self._tune_error = f"{type(e).__name__}: {e}"
+            self._log("error", f"ctrl: MPC_Tuned profile {name!r} ({src}) "
+                               f"FAILED — {self._tune_error}. mpc_tuned will "
+                               f"refuse to engage until one is picked on the "
+                               f"LOW row")
+            return
+        self._log("warn" if warns else "info",
+                  f"ctrl: MPC_Tuned profile {prof.name} ({src}, sha1 "
+                  f"{prof.sha1[:8]})" + self._tune_summary(prof)
+                  + " — under mpc_tuned these replace the hw_mpc.yaml trim/"
+                    "split the mpc: lines above print"
+                  + (f" — WARN: {'; '.join(warns)}" if warns else ""))
+
+    @staticmethod
+    def _tune_summary(prof) -> str:
+        a = prof.apply
+        pc, po = a["path_cost"], a["policy"]
+        return (f": along/cross {pc['along_scale']:g}/{pc['cross_scale']:g}, "
+                f"policy q_scale {po['q_scale']:g} along "
+                f"{'own' if po['along_scale'] is None else format(po['along_scale'], 'g')}, "
+                f"trim {a['vehicle_net_buoyancy_n']:+g} N, cap "
+                f"{a['axis_cap']:g}, slew {a['axis_slew_per_s']:g}/s "
+                f"(applies under mpc_tuned / mpc_tuned_7d only)")
+
+    def _refuse_tune(self, why: str) -> None:
+        self.reason = f"MPC_Tuned profile refused: {why}"
+        self._tune_note, self._tune_note_t = why, now()
+        self._log("warn", f"ctrl: {self.reason}")
+
+    @Slot(str)
+    def set_mpc_tune(self, name: str) -> None:
+        """The panel's tune row (bus.cmd_mpc_tune): hold the profile NAME or
+        path; ``none`` = hw_mpc.yaml's blocks. Refused while engaged or with
+        a controller CSV open — one run is one tune, and the CSV's meta names
+        one (``controller.mpc_tune``). The row re-syncs from MpcStatus
+        (honesty rule); a refusal goes to ``reason`` and the tune note."""
+        from .mpc_tune import is_no_profile, load_profile
+
+        name = str(name or "").strip()
+        if self.cfg is None or not self._ready:
+            self._refuse_tune("controller still building — pick again when READY")
+            return
+        if self.engaged:
+            self._refuse_tune("not while engaged")
+            return
+        if self._csv is not None:
+            self._refuse_tune("not while a controller CSV is open (REC) — "
+                              "stop the recording first")
+            return
+        ctrl = self._mpc_ctrl
+        if ctrl is None or not hasattr(ctrl, "set_tune_profile"):
+            self._refuse_tune(f"no MPC controller ({self._setup_error or 'not built'})")
+            return
+        try:
+            prof = None if is_no_profile(name) else load_profile(name)
+            warns = ctrl.set_tune_profile(prof)
+        except Exception as e:                                   # noqa: BLE001
+            # the PREVIOUS profile stays held (set_tune_profile raised before
+            # assigning), so a bad pick never leaves the follower half-tuned
+            self._refuse_tune(f"{type(e).__name__}: {e}")
+            return
+        self._tune_error = ""
+        self._tune_note = ""
+        if prof is None:
+            self.reason = "MPC_Tuned profile: none — hw_mpc.yaml's blocks"
+            self._log("info", f"ctrl: {self.reason}")
+        else:
+            self.reason = f"MPC_Tuned profile {prof.name}"
+            self._log("warn" if warns else "info",
+                      f"ctrl: MPC_Tuned profile {prof.name} (sha1 "
+                      f"{prof.sha1[:8]})" + self._tune_summary(prof)
+                      + (f" — WARN: {'; '.join(warns)}" if warns else ""))
+        self._event(self.reason, pending=True)
+
+    def _tune_status(self) -> tuple:
+        """(name, path, state, note) for MpcStatus. state: "" no profile |
+        "ok" | "warn" (held, flies with differences; note lists them) |
+        "error" (a launch profile failed; mpc_tuned refuses) | "refused" (the
+        last pick, for 6 s; note says why — the held profile is unchanged)."""
+        ctrl = self._mpc_ctrl
+        prof = getattr(ctrl, "tune_profile", None) if ctrl is not None else None
+        name, path = (prof.name, prof.path) if prof is not None else ("", "")
+        if self._tune_note and now() - self._tune_note_t < 6.0:
+            return (name, path, "refused", self._tune_note)
+        if self._tune_error:
+            return ("", "", "error", self._tune_error)
+        if prof is None:
+            return ("", "", "", "")
+        warns = list(getattr(ctrl, "tune_warnings", []) or [])
+        return (name, path, "warn" if warns else "ok", "; ".join(warns))
 
     @Slot(str)
     def set_mode(self, mode: str) -> None:
@@ -2569,18 +4176,30 @@ class MpcWorker(TimerWorker):
         if ctrl is None:
             why = (getattr(self, "_rl_error", None) if mode == "rl"
                    else getattr(self, "_rl_pwm_error", None) if mode == "rl_pwm"
+                   else getattr(self, "_rl_pwm7d_error", None) if mode == "rl_pwm_7d"
+                   else getattr(self, "_rl7d_error", None) if mode == "rl_7d"
+                   else getattr(self, "_pid7d_error", None) if mode == "pid_7d"
                    else None) or self._setup_error or "not built"
             self.reason = f"mode {mode} unavailable ({why})"
             self._log("error", f"ctrl: mode {mode} unavailable ({why})"
                                        f" — staying on {self.cfg.mode}")
             return
         prev = str(self.cfg.mode)
-        self.ctrl = ctrl
         # "pid" has no mode to set; "none" must NOT touch anything — the
         # holder is the PID and `_mpc_ctrl.mode` stays whatever it was
-        # (HwDobMpc's setter raises for a name outside its MODES).
-        if mode not in ("pid", "none", "rl", "rl_pwm") and mode != getattr(ctrl, "mode", mode):
-            ctrl.mode = mode
+        # (HwDobMpc's setter raises for a name outside its MODES). A *_7d key
+        # sets its BASE (mpc_tuned_7d -> "mpc_tuned"); pid_7d / rl_7d own
+        # their objects. Set BEFORE self.ctrl is swapped, so a setter that
+        # raises leaves the worker on the previous LOW, whole.
+        base = LOW_RP_TRACK_BASE.get(mode, mode)
+        if base not in ("pid", "none", "rl", "rl_pwm") and base != getattr(ctrl, "mode", base):
+            try:
+                ctrl.mode = base
+            except (ValueError, RuntimeError) as e:
+                self.reason = f"mode {mode} unavailable ({e})"
+                self._log("error", f"ctrl: mode {mode} unavailable ({e}) — staying on {prev}")
+                return
+        self.ctrl = ctrl
         self.ctrl.reset()
         self._path_cursor = None
         self._path_err = (None, None)
@@ -2621,6 +4240,15 @@ class MpcWorker(TimerWorker):
                             f"again", pending=True)
         self._log("info", f"ctrl: mode = {mode} "
                                   f"({self.ctrl.solver_kind})")
+        if mode in LOW_7D_BASE and not bool(self._attitude_cfg().get("enabled", False)):
+            # Selectable (land dry-run / observe actuate nothing), but say NOW
+            # what ENGAGE will say on a vehicle, not at the pool edge.
+            self._log("warn", f"ctrl: LOW {mode} commands roll/pitch, but "
+                              f"engage.attitude_axes.enabled is false — "
+                              f"ENGAGE will be refused on a vehicle (the "
+                              f"command sink reads that switch at launch: "
+                              f"restart the station with it, plus its probe "
+                              f"gates)")
         self._slam_tree_caveat()
 
     def _slam_tree_caveat(self) -> None:
@@ -2686,18 +4314,42 @@ class MpcWorker(TimerWorker):
             return
         self.asm.reset()
         self.asm.calibrate_z_offset(self.fix, self.imu)
-        meas, h = self.asm.step(self.fix, self.imu, now(), 1.0 / self.cfg.ctrl_hz)
+        t_e = now()
+        # THE ESTIMATOR OF THIS RUN (2026-10-01), decided here and nowhere
+        # else: the DVL switch is frozen from now to the disengage
+        # (set_dvl_use refuses while engaged) and so is the run's
+        # ELIGIBILITY to use it (_dvl_arm_run).
+        self._dvl_arm_run()
+        vel_xy, disp_xy, _dvl_why = self._dvl_inputs(t_e, running=True)
+        meas, h = self.asm.step(self.fix, self.imu, t_e,
+                                1.0 / self.cfg.ctrl_hz, vel_xy=vel_xy,
+                                disp_xy=disp_xy)
         if meas is None:
             self.reason = f"engage refused: {h['why']}"
             self._log("warn", f"ctrl: {self.reason}")
             self._log_event(self.reason)
             return
+        self._dvl_logged = None
+        self._dvl_xy = None
+        self._dvl_xy0 = None
+        self._bridge_gyro_prev = None
+        self._dvl_at_engage = (
+            {} if self.dvl is None else
+            {"use": bool(self.dvl.use), "proven": bool(self.dvl.proven),
+             "armed": bool(self._dvl_run_ok), "why": self._dvl_run_why})
+        self._ekf_div_ticks = 0
+        self._ekf_hold_ticks = 0
+        self._ekf_at_engage = (
+            {} if self.ekf is None else
+            {"estimator": "ekf" if self.ekf_control else "tag",
+             "ok": bool(self._ekf_ok), "why": self._ekf_why})
         # THE datum moment: this pose, in the tag frame, is (0,0,0)/yaw 0 for
         # the whole run. The EAOB and NMPC are (re)built in the datum frame
         # from their first tick, so nothing ever jumps mid-engagement.
         eta_tag = meas["eta"]
         self._datum = {"p0": eta_tag[:3].copy(), "yaw0": float(eta_tag[5]),
                        "Rz": rot_zyx(0.0, 0.0, -float(eta_tag[5]))}
+        self._ekf_log_datum(t_e)
         meas["eta"] = self._datumize(eta_tag)
         self.ctrl.reset()
         if self._bridge is not None:
@@ -2748,9 +4400,19 @@ class MpcWorker(TimerWorker):
         # RECORDED. Off under observe / land dry-run: nothing is actuated
         # there, so K/M would be a claim about a wire that carries nothing.
         att = self._attitude_cfg()
-        want = bool(att.get("enabled", False))
+        # 2026-10-03: the LOW decides — K/M only under a *_7d follower, and
+        # only on a station launched with the capability (the gate above
+        # refused a *_7d LOW without it on a vehicle).
+        capability = bool(att.get("enabled", False))
+        low_attitude = str(self.cfg.mode) in LOW_7D_BASE
+        want = bool(capability and low_attitude)
         self._attitude_axes = bool(want and not self.land_dry_run
                                    and not self.observe)
+        # Per-thruster pulses (2026-10-03): any pwm-transport LOW drives
+        # roll/pitch itself; nothing is actuated under observe / land dry-run.
+        self._attitude_pulses = bool(self._pwm_transport()
+                                     and not self.land_dry_run
+                                     and not self.observe)
         # THE CAPS IN FORCE (safety audit 2026-09-26: first_water_caps was
         # validated and never applied). The wire sign is PROVEN only by a
         # sign_probe artefact with sign_proven true; without it the caps on
@@ -2767,38 +4429,20 @@ class MpcWorker(TimerWorker):
         fwc = att.get("first_water_caps")
         fwc = (None if fwc is None else
                (float(fwc[0]), float(fwc[1])))
-        if chk["sign_proven"]:
-            self._attitude_cap = caps_full
-            caps_set = "full"
-            caps_why = (f"wire sign proven: sign_probe "
-                        f"{att.get('sign_probe')!r} sign_proven true "
-                        f"(sha1 {str(chk['sign_probe_sha1'] or '')[:12]})")
-        elif fwc is not None:
-            self._attitude_cap = (min(caps_full[0], fwc[0]),
-                                  min(caps_full[1], fwc[1]))
-            caps_set = "first_water"
-            caps_why = ("wire sign NOT proven ("
-                        + (f"sign_probe {att.get('sign_probe')!r} sign_proven "
-                           f"false"
-                           if att.get("sign_probe") else
-                           "no sign_probe artefact pinned; "
-                           "require_sign_probe false = recorded opt-out")
-                        + ") — first_water_caps in force, cap_roll/cap_pitch "
-                          "withheld")
-        else:
-            self._attitude_cap = caps_full
-            caps_set = "full"
-            caps_why = ("first_water_caps null with an unproven sign — the "
-                        "engage gate refuses this on a vehicle; reached only "
-                        "with nothing actuated (observe / land dry-run)")
+        self._attitude_cap, caps_set, caps_why = self._attitude_caps_in_force(att, chk)
         if not self._attitude_axes:
             caps_set = None
-            caps_why = ("axes not live: nothing on the wire ("
-                        + ("variant off" if not want else
+            caps_why = ("axes not live: nothing on the s/t wire ("
+                        + (f"LOW {self.cfg.mode} drives roll/pitch with "
+                           f"per-thruster pulses, never s/t"
+                           if self._attitude_pulses else
+                           "variant off" if not capability else
+                           f"LOW {self.cfg.mode} is 4-DoF" if not low_attitude else
                            "observe" if self.observe else "land dry-run")
                         + ")")
         self._reset_attitude_interlocks()
         self._att_degraded_at = None
+        self._arm_pwm_interlocks()
         if self._attitude_axes:
             # The slew memory starts at NEUTRAL (safety audit 2026-09-26):
             # with None the first frame passed through unslewed and a
@@ -2818,7 +4462,11 @@ class MpcWorker(TimerWorker):
         pitch_nm = float(gains.get("pitch_nm", 7.2))
         self._attitude_at_engage = {
             "enabled": bool(self._attitude_axes),
-            "configured": want,
+            "configured": capability,
+            # 2026-10-03 RECORD BOUNDARY: which LOW decided. K/M are live only
+            # when the capability AND a *_7d LOW agree (`low_attitude`).
+            "low": str(self.cfg.mode),
+            "low_attitude": bool(low_attitude),
             "transport": str(att.get("transport") or "manual_control_ext"),
             "roll_nm": roll_nm, "pitch_nm": pitch_nm,
             "cap_roll": self._attitude_cap[0],
@@ -2848,18 +4496,47 @@ class MpcWorker(TimerWorker):
             "u_max_wire_nm": ([self._attitude_cap[0] * roll_nm,
                                self._attitude_cap[1] * pitch_nm]
                               if self._attitude_axes else None),
+            # 2026-10-03 RECORD BOUNDARY: HOW roll/pitch were actuated and
+            # which interlocks were armed (absent = a run before this date).
+            "rp_transport": ("manual_control_ext" if self._attitude_axes else
+                             "pwm_pulses" if self._attitude_pulses else None),
+            "rp_track_live": bool(self.rp_track_live),
+            "rp_track_low": str(self.cfg.mode) if self.rp_track_live else None,
+            "ceiling_armed": bool(self.attitude_actuated),
+            "sat_watch_armed": bool(self._attitude_axes),
         }
         set_att = getattr(self.ctrl, "set_attitude_axes", None)
         if callable(set_att):
             # The follower learns whether its K/M reach the wire (meta
             # controller.allocation.attitude, the w_hat[3:5] boundary).
-            set_att(bool(self._attitude_axes),
+            # rl_pwm_7d: True with no wire torque (its roll/pitch ride the
+            # pulses); every s/t LOW: rp_track_live == _attitude_axes.
+            set_att(bool(self.rp_track_live),
                     u_max_wire_nm=self._attitude_at_engage["u_max_wire_nm"])
         if want and not self._attitude_axes:
             self._log("info", f"ctrl: engage.attitude_axes is enabled but the "
                               f"axes are NOT sent on this run "
                               f"({'observe' if self.observe else 'land dry-run'}"
                               f": nothing is actuated)")
+        elif capability and not low_attitude and not self.observe \
+                and not self._attitude_pulses:
+            self._log("info", f"ctrl: engage.attitude_axes is enabled (station "
+                              f"capability) — LOW {self.cfg.mode} is 4-DoF: "
+                              f"K/M are NOT sent on this run (pick a *_7d LOW "
+                              f"for roll/pitch)")
+        if self._attitude_pulses:
+            # The pwm follower drives all six axes itself; what the station
+            # adds is the TILT CEILING (2026-10-03: plain rl_pwm had none) and,
+            # under rl_pwm_7d, roll/pitch tracking through q_des.
+            self._log("warn", f"ctrl: {self.cfg.mode} drives roll/pitch with "
+                              f"per-thruster pulses — TILT CEILING ARMED "
+                              f"(|roll| or |pitch| > "
+                              f"{float(att.get('abort_deg', 35.0)):.0f} deg for "
+                              f"0.25 s -> disengage)"
+                              + ("; roll/pitch TRACKED via q_des (plan rp "
+                                 "clipped to the trained envelope)"
+                                 if self.rp_track_live else
+                                 "; reference LEVEL (q_des yaw-only)"))
         self._warmup_left = max(1, int(round(
             float(self.cfg.engage["warmup_s"]) * self.cfg.ctrl_hz)))
         self._fail_streak = 0
@@ -2874,6 +4551,25 @@ class MpcWorker(TimerWorker):
         self._event(f"ENGAGED ({self.cfg.mode}) — holding "
                     f"({meas['eta'][0]:+.2f}, {meas['eta'][1]:+.2f}, "
                     f"{meas['eta'][2]:+.2f}) NED")
+        if self.dvl is not None and self.dvl.use:
+            self._log_event(
+                f"DVL IN at engage — "
+                + (f"ARMED for this run (velocity source now "
+                   f"{h.get('vel_src')})" if self._dvl_run_ok else
+                   f"NOT armed for this run: {self._dvl_run_why}"))
+            if not self._dvl_run_ok:
+                self._log("warn", f"ctrl: the DVL switch is IN but this run "
+                                  f"flies on the tag finite difference — "
+                                  f"{self._dvl_run_why}")
+            if self._dvl_run_ok and str(self.cfg.mode) in ("rl", "rl_pwm", "rl_7d", "rl_pwm_7d"):
+                # rl_policies/*/RL_controller_README.md: these followers were
+                # trained against a SIMULATED tag-finite-difference estimator
+                # ("DVL 없음"), so a direct velocity is an input they never saw.
+                self._log("warn", f"ctrl: {self.cfg.mode} was trained on a "
+                                  f"simulated tag-finite-difference velocity, "
+                                  f"not a DVL's — this run feeds it a "
+                                  f"different observation distribution (meta "
+                                  f"dvl.use_at_engage)")
         self._log_event(f"ENGAGED ({self.cfg.mode}) datum p0="
                         f"{[round(float(v), 3) for v in self._datum['p0']]} "
                         f"yaw0 {math.degrees(self._datum['yaw0']):.1f} deg; "
@@ -2906,7 +4602,7 @@ class MpcWorker(TimerWorker):
         if self._attitude_axes:
             ae = self._attitude_at_engage
             self._log("warn",
-                      f"ctrl: ATTITUDE AXES ON — the NMPC's K/M go out as "
+                      f"ctrl: ATTITUDE AXES ON — {self.cfg.mode}'s K/M go out as "
                       f"MANUAL_CONTROL s/t (caps IN FORCE: {ae['caps_in_force']} "
                       f"roll {ae['cap_roll']:.2f} / pitch {ae['cap_pitch']:.2f} "
                       f"— {ae['caps_in_force_why']}; configured "
@@ -2917,8 +4613,8 @@ class MpcWorker(TimerWorker):
                       f"{ae['mavlink_wire_version'] or '?'}, probe sha1 "
                       f"{str(ae['probe_sha1'] or '-')[:12]}, sign_probe sha1 "
                       f"{str(ae['sign_probe_sha1'] or '-')[:12]}). Level reference "
-                      f"= ACTIVE LEVELLING; a tracked attitude needs "
-                      f"policy.attitude_track. Interlocks: ceiling "
+                      f"= ACTIVE LEVELLING; a 7-dim policy's roll/pitch are "
+                      f"tracked (policy.attitude_track vetoes). Interlocks: ceiling "
                       f"{float(att.get('abort_deg', 35.0)):.0f} deg, "
                       f"cap-pinned-without-progress "
                       f"{float(att.get('sat_ineffective_s', 1.0)):.1f} s, "
@@ -3186,15 +4882,20 @@ class MpcWorker(TimerWorker):
         if want and list(g.get("motor_direction") or []) != want:
             return False, (f"the command sink's gate was built for motor "
                            f"directions {g.get('motor_direction')}, this "
-                           f"policy expects {want} — restart the station")
-        # ...and about the cap: a sink that clamps tighter than the follower
-        # believes would feed the policy a previous action that never left.
+                           f"policy expects {want} — restart the station "
+                           f"(the gate is built from rl_pwm.policy_dir's export; "
+                           f"every pwm LOW must expect the same directions)")
+        # ...and about the cap: a sink whose window is tighter than the
+        # follower's cap would refuse every frame (2026-10-10: it refuses,
+        # never clamps), one that is wider would let a bug through.
         cap = getattr(self.ctrl, "pwm_cap", None)
         if cap is not None and "pwm_cap" in g and \
                 abs(float(g["pwm_cap"]) - float(cap)) > 1e-9:
             return False, (f"the command sink caps |throttle| at "
                            f"{float(g['pwm_cap']):.2f}, this follower at "
-                           f"{float(cap):.2f} — restart the station")
+                           f"{float(cap):.2f} — restart the station (both read "
+                           f"rl_pwm.pwm_cap, each clipped to its own export's "
+                           f"pwm_cap_trained: the exports differ)")
         return True, "ok"
 
     #: While RL_PWM is the selected follower but not engaged, the worker
@@ -3218,13 +4919,36 @@ class MpcWorker(TimerWorker):
         if not mode.startswith("MANUAL"):
             return (f"rl_pwm needs MANUAL (in {mode or '?'} the vehicle's "
                     f"script will not force the motor outputs) — press MANUAL")
-        if bool(self._attitude_cfg().get("enabled", False)):
-            return ("rl_pwm with engage.attitude_axes enabled is not "
-                    "implemented (the policy drives all eight thrusters "
-                    "itself) — turn the variant off")
+        # (2026-10-03) engage.attitude_axes.enabled no longer refuses rl_pwm:
+        # it is now the station's CAPABILITY, and the K/M path is live only
+        # under a *_7d LOW — never under rl_pwm, whose policy drives all
+        # eight thrusters itself and whose MANUAL_CONTROL stays neutral.
         ok, why = self._pwm_gate_now(tel)
         if not ok:
             return f"rl_pwm gate: {why}"
+        # 2026-10-10 (REPORT §3 step 5). Both are judged at BUILD by the
+        # follower and are refused here again, from the object that flies:
+        # (a) a config cap below the trained cap without the LOW's recorded
+        #     opt-out (the 10-01 runs flew a cap-1.0 policy through a 0.25
+        #     clip and limit-cycled);
+        # (b) the per-thruster sign-probe artefact (rl_pwm.ThrusterProbeCheck:
+        #     recent, not a dry run, this export's sigma, this vehicle's
+        #     MOT_n_DIRECTION, every motor PASS) — the sink's gate carries
+        #     the same check every frame; this is the engage-time copy with
+        #     the follower's own reader, so the panel names the reason even
+        #     when a backend's snapshot would only say "not ok".
+        if bool(getattr(self.ctrl, "caps_below_trained", False)) and \
+                not bool(getattr(self.ctrl, "allow_caps_below_trained", False)):
+            return (f"{self.cfg.mode}: rl_pwm.pwm_cap "
+                    f"{float(getattr(self.ctrl, 'pwm_cap', float('nan'))):.2f} "
+                    f"is below the policy's trained cap "
+                    f"{float(getattr(getattr(self.ctrl, 'model', None), 'cap_trained', float('nan'))):.2f} "
+                    f"and allow_caps_below_trained is false")
+        probe = getattr(self.ctrl, "probe_refusal", None)
+        if callable(probe):
+            why = probe()
+            if why:
+                return str(why)
         return ""
 
     def _engage_refusal(self) -> str:
@@ -3232,7 +4956,18 @@ class MpcWorker(TimerWorker):
         if not self._ready:
             return "worker not ready"
         if self.ctrl is None:
-            return f"no controller ({self._setup_error})"
+            why = {"pid_7d": getattr(self, "_pid7d_error", None),
+                   "rl_7d": getattr(self, "_rl7d_error", None),
+                   "rl": getattr(self, "_rl_error", None),
+                   "rl_pwm": getattr(self, "_rl_pwm_error", None),
+                   "rl_pwm_7d": getattr(self, "_rl_pwm7d_error", None)}.get(
+                       str(self.cfg.mode) if self.cfg else "", None)
+            return f"no controller ({why or self._setup_error})"
+        if self._tune_error and str(self.cfg.mode) in self.TUNE_LOWS:
+            # the launch named an MPC_Tuned profile that did not load; the
+            # file's blocks are not a stand-in for it (_setup_tune_profile)
+            return (f"MPC_Tuned profile failed to load ({self._tune_error}) — "
+                    f"pick one on the LOW row's tune …")
         # POLICY OBSERVE (LOW level None) skips every COMMAND-PATH gate below
         # — the real-time probe included (moved inside on 2026-09-11: it is
         # a command-path gate, the holder is never stepped) — and the three
@@ -3332,13 +5067,27 @@ class MpcWorker(TimerWorker):
             why_pwm = self._pwm_refusal(tel)
             if why_pwm:
                 return why_pwm
-            # THE 6-DoF VARIANT (2026-09-26, D7/D8/D10): with
-            # engage.attitude_axes.enabled every gate must pass or the
+            # THE 6-DoF VARIANT (2026-09-26, D7/D8/D10; LOW-driven since
+            # 2026-10-03): a *_7d LOW must pass EVERY attitude gate or the
             # engage is REFUSED — never a silent 4-DoF fallback, because the
             # follower would then be told (set_attitude_axes) that it can
-            # tilt when it cannot. Off = none of this runs.
-            if bool(self._attitude_cfg().get("enabled", False)):
+            # tilt when it cannot. Any other LOW engages 4-DoF whatever the
+            # capability says, and none of this runs.
+            if self.cfg.mode in LOW_7D_BASE:
+                if not bool(self._attitude_cfg().get("enabled", False)):
+                    return (f"{self.cfg.mode} commands roll/pitch, but "
+                            f"engage.attitude_axes.enabled is false — the "
+                            f"command sink has no s/t path (it reads the "
+                            f"switch at launch): restart the station with it "
+                            f"(+ its probe gates), or pick "
+                            f"{LOW_7D_BASE[self.cfg.mode]}")
                 why = self._attitude_refusal(tel)
+                if why:
+                    return why
+                why = self._rl7d_caps_refusal(tel)
+                if why:
+                    return why
+                why = self._pid7d_pulse_refusal()
                 if why:
                     return why
         elif not self.ctrl.realtime_ok:
@@ -3354,6 +5103,10 @@ class MpcWorker(TimerWorker):
             return "tag fix stale"
         if self.imu is None or self.imu.roll is None:
             return "no vehicle attitude"
+        if self.ekf_control and not self.observe:
+            why = self._ekf_control_refusal()
+            if why:
+                return f"ESTIMATOR is EKF but {why}"
         # No position gate here, and since 2026-08-14 none anywhere: the
         # geofence that used to gate START and abort at runtime was removed.
         return ""
@@ -3419,7 +5172,10 @@ class MpcWorker(TimerWorker):
             self.follow = None            # 1 of 4: see MpcWorker.follow
             self._clear_replay()
             if self._bridge is not None:
-                self._bridge.reset()      # the ladder is a STATION feature
+                # the ladder is a STATION feature — stop bridging, but keep
+                # the engagement's dropout counters for the closing meta
+                self._bridge.end_dropout()
+            self._dvl_xy = None
             self.phase, self.phase_detail = "", ""
             self.reason = "trajectory stopped (DP hold)"
             self._log("info", "ctrl: trajectory stopped — DP hold")
@@ -4413,6 +6169,13 @@ class MpcWorker(TimerWorker):
         # can carry them; the default replay path stays level (rp None).
         load_kw = {}
         track_att = bool(r.get("track_attitude", False)) and self._attitude_axes
+        if bool(r.get("track_attitude", False)) and not self._attitude_axes \
+                and self.rp_track_live:
+            # A replay has no T1 clip / rp FilterLimits / div_rp (KNOWN_ISSUES);
+            # a pulse follower flies it LEVEL until those guards exist.
+            self._log("warn", f"ctrl: replay.track_attitude set, but {self.cfg.mode} "
+                              f"tracks roll/pitch with pulses — the replay flies "
+                              f"LEVEL (replay attitude guards are s/t-only)")
         if track_att:
             try:
                 if "with_rp" in inspect.signature(load_replay_track).parameters:
@@ -5287,7 +7050,9 @@ class MpcWorker(TimerWorker):
     # disengage (A23).
     def _policy_refusal(self) -> str:
         """Why a policy mission may NOT be armed — each cause its own
-        sentence (the ``_follow_refusal`` rule)."""
+        sentence (the ``_follow_refusal`` rule). "" = may arm, and then
+        ``_policy_judged`` holds the PolicyStatus that was judged."""
+        self._policy_judged = None
         if hasattr(self.ctrl, "progress_m"):
             return (f"{self.cfg.mode} contours its own path and ignores "
                     f"streamed plans (set_path_plan_ned is a no-op there) — "
@@ -5354,12 +7119,25 @@ class MpcWorker(TimerWorker):
         # 2026-09-26: the ONE this side flies is policy.action_repr (config,
         # default state.POLICY_ACTION_REPR = pos_yaw_width), allow-listed by
         # state.POLICY_ACTION_REPRS_FLYABLE and pinned per mission at ARM.
+        # 2026-10-03: `auto` pins the loaded checkpoint's OWN contract (the
+        # panel pick decides 5-dim vs 7-dim, no YAML edit). The allow-list
+        # then applies to the RESOLVED value: "" (no contract) and pose10d
+        # are refused, never defaulted; pos_rpy_width still needs mount_ok.
         repr_st = str(getattr(st, "action_repr", "") or "")
-        pinned = self._policy_pinned_repr()
-        if pinned not in POLICY_ACTION_REPRS_FLYABLE:
+        cfg_repr = self._policy_repr_config()
+        pinned, _src = resolve_policy_action_repr(cfg_repr, repr_st)
+        if cfg_repr == POLICY_ACTION_REPR_AUTO:
+            if pinned not in POLICY_ACTION_REPRS_FLYABLE:
+                return (f"policy checkpoint contract action_repr "
+                        f"{pinned or '(unset)'} is not flyable "
+                        f"({'|'.join(POLICY_ACTION_REPRS_FLYABLE)}) — "
+                        f"policy.action_repr auto pins the loaded "
+                        f"checkpoint's contract at ARM and never defaults "
+                        f"it; pick a 5-dim or 7-dim checkpoint in the panel")
+        elif pinned not in POLICY_ACTION_REPRS_FLYABLE:
             return (f"policy.action_repr {pinned!r} is not flyable "
                     f"({'|'.join(POLICY_ACTION_REPRS_FLYABLE)})")
-        if repr_st != pinned:
+        elif repr_st != pinned:
             return (f"policy action_repr mismatch — worker (checkpoint "
                     f"contract) {repr_st or '(unset)'} vs policy.action_repr "
                     f"{pinned} (POLICY_ACTION_REPR default "
@@ -5374,27 +7152,25 @@ class MpcWorker(TimerWorker):
             return ("policy.workspace_box_ned is unset — the policy shape "
                     "REQUIRES the box (the only position-based protection "
                     "since the geofence removal); set it in hw_mpc.yaml")
-        # THE TRUTH TABLE (2026-09-26, design safety): attitude_track needs
-        # a 7-dim network, the K/M path live on THIS engagement, the mount
-        # keys (mount_ok above — for pos_rpy_width the yaw_axis keys are
-        # REQUIRED by backends/policy.py) and a trusted attitude measurement.
-        # Any failure REFUSES ARM; the explicit fallback is attitude_track:
-        # false with the 7-dim network (dropped-and-logged), the mandatory
-        # first flight of any 7-dim checkpoint.
-        if bool(self._policy_att("attitude_track")):
-            if pinned != ACTION_REPR_POS_RPY_WIDTH:
-                return (f"policy.attitude_track needs action_repr "
-                        f"{ACTION_REPR_POS_RPY_WIDTH} (a {pinned} checkpoint "
-                        f"has nothing to track) — set attitude_track: false")
+        # THE TRUTH TABLE (2026-09-26, design safety; LOW-driven since
+        # 2026-10-03): a mission TRACKS roll/pitch iff the LOW is a *_7d
+        # follower AND the checkpoint is 7-dim AND policy.attitude_track (now
+        # a veto, shipped true) allows it. Tracking then needs the K/M path
+        # live on THIS engagement, the mount keys (mount_ok above — for
+        # pos_rpy_width the yaw_axis keys are REQUIRED by
+        # backends/policy.py) and a trusted attitude measurement; any failure
+        # REFUSES ARM. A 7-dim network on a 4-DoF LOW (or under the veto)
+        # flies dropped-and-logged — the first flight of any 7-dim network.
+        if self._policy_wants_attitude_track(pinned):
             if self.observe:
-                return ("policy.attitude_track is refused under LOW None "
-                        "(observe): nothing is actuated, fly the 7-dim network "
-                        "with attitude_track: false (dropped-and-logged) to "
-                        "watch its roll/pitch")
-            if not self._attitude_axes:
-                return ("policy.attitude_track needs engage.attitude_axes "
-                        "live on this engagement (K/M path) — engaged without "
-                        "it; enable the block, re-engage")
+                return ("roll/pitch tracking is refused under LOW None "
+                        "(observe): nothing is actuated")
+            if not self.rp_track_live:
+                return (f"LOW {self.cfg.mode} tracks the 7-dim network's "
+                        f"roll/pitch but the K/M path is not live on this "
+                        f"engagement ({'land dry-run' if self.land_dry_run else 'engage.attitude_axes off'}) "
+                        f"— fly it on {LOW_RP_TRACK_BASE.get(str(self.cfg.mode), 'a 4-DoF LOW')} "
+                        f"(dropped-and-logged) or set policy.attitude_track: false")
             rr = self._last_health.get("rp_residual_deg")
             if rr is None or not math.isfinite(float(rr)):
                 return ("policy.attitude_track needs the tag-vs-IMU attitude "
@@ -5404,7 +7180,20 @@ class MpcWorker(TimerWorker):
                         f"{float(rr):.1f} deg > {self.RP_RESIDUAL_ARM_MAX_DEG:.0f} "
                         f"deg — the attitude measurement is not trusted "
                         f"enough to track (interlock iv)")
+        # THE STATUS THIS VERDICT IS ABOUT (2026-10-03): _arm_policy pins the
+        # representation, the network (ckpt, sha1) and the tracked/levelled
+        # decision from THIS object and refuses if another arrived since.
+        self._policy_judged = st
         return ""
+
+    def _policy_wants_attitude_track(self, pinned: str) -> bool:
+        """The 2026-10-03 rule: a *_7d LOW + a 7-dim (pos_rpy_width) PIN +
+        policy.attitude_track (veto) — not yet whether it CAN (axes live,
+        residual), which _policy_refusal judges. The pin is REQUIRED: under
+        `auto` the config spelling is no representation at all
+        (geometry.policy_rp_tracked, the panel forecast's rule too)."""
+        return policy_rp_tracked(self.cfg.mode, pinned,
+                                 self._policy_att("attitude_track"))
 
     def _policy_obs_dt_cfg(self) -> float:
         """obs_dt as THIS side derives it (POLICY_DOWN_SAMPLE_STEPS /
@@ -5429,12 +7218,34 @@ class MpcWorker(TimerWorker):
         if box is None:                   # _policy_refusal already said no
             self._refuse("policy.workspace_box_ned is unset")
             return
+        # THE STATUS (2026-10-03): ONE read, and it must be the object
+        # _policy_refusal just judged — the representation pin, the network
+        # pin (ckpt, sha1 below) and the tracked/levelled decision all come
+        # from it. Today both run in one MpcWorker slot (set_traj), so this
+        # only fails if a status could ever be delivered in between.
+        st = self._policy_status
+        judged, self._policy_judged = self._policy_judged, None
+        if st is None or st is not judged:
+            self._refuse("policy status changed between the ARM check and "
+                         "ARM — press START again")
+            return
+        # THE PIN: an explicit policy.action_repr as before; `auto` = this
+        # checkpoint's own contract. Never "auto", never "", never pose10d
+        # (the refusal said so; checked again here, the box pattern).
+        pinned, repr_src = resolve_policy_action_repr(
+            self._policy_repr_config(), getattr(st, "action_repr", ""))
+        if pinned not in POLICY_ACTION_REPRS_FLYABLE:
+            self._refuse(f"policy action_repr {pinned or '(unset)'} is not "
+                         f"flyable at ARM")
+            return
+        if self._csv is not None:            # meta, after the mission ends:
+            self._policy_pin_csv = pinned    # latched into the OPEN record only
         # ATTITUDE (2026-09-26): the rp gates are set ONLY for a tracked
         # mission and only when this build's FilterLimits carries them;
         # otherwise the limits object is the pre-variant one, field for
         # field (test_policy_filter_limits_equal_config).
-        attitude_track = (bool(self._policy_att("attitude_track"))
-                          and bool(self._attitude_axes) and not self.observe)
+        attitude_track = (self._policy_wants_attitude_track(pinned)
+                          and bool(self.rp_track_live) and not self.observe)
         rp_lim = {}
         if attitude_track:
             have = {f.name for f in dataclasses.fields(FilterLimits)}
@@ -5513,7 +7324,7 @@ class MpcWorker(TimerWorker):
         # obs_dt pattern: the intake rejects a plan whose ckpt_sha1 is not
         # this one. `_policy_refusal` already required a READY status, so a
         # real checkpoint has its sha here; the stub has "" on both sides.
-        st = self._policy_status
+        # (`st` = the judged status, read once at the top.)
         ckpt = str(getattr(st, "ckpt", "") or pc["ckpt"])
         ckpt_sha1 = str(getattr(st, "ckpt_sha1", "") or "")
         self.replay = {
@@ -5535,7 +7346,7 @@ class MpcWorker(TimerWorker):
             "action_repr": "",           # of the last COMPOSED plan
             # THE PIN (2026-09-26): what this mission flies; the intake
             # rejects a plan whose contract is not this.
-            "action_repr_pinned": self._policy_pinned_repr(),
+            "action_repr_pinned": pinned,
             # roll/pitch TRACKED (7-dim + attitude axes live) vs levelled.
             "attitude_track": bool(attitude_track),
             "reject_rp_mag": 0, "clip_rp_rate": 0,
@@ -5563,6 +7374,16 @@ class MpcWorker(TimerWorker):
             "yaw_filt": {"omega": 0.0, "t0_prev": None, "n": 0,
                          "guard_clamps": 0, "rate_clips": 0},
         }
+        # The follower knobs as THIS follower flies them: an MPC_Tuned
+        # profile's under mpc_tuned / mpc_tuned_7d (2026-10-04,
+        # HwDobMpc.policy_follow), else policy.q_scale / along_scale.
+        _pf = getattr(self.ctrl, "policy_follow", None)
+        q_scale, along_scale = (float(pc["q_scale"]), pc.get("along_scale"))
+        if callable(_pf):
+            q_scale, along_scale = _pf(q_scale, along_scale)
+        knob_src = ("mpc_tune profile"
+                    if getattr(self.ctrl, "tune_profile_active", False)
+                    else "hw_mpc.yaml policy")
         scen = {
             "kind": "policy",
             "ckpt": ckpt,                # what the worker HOLDS (status), else config
@@ -5577,8 +7398,12 @@ class MpcWorker(TimerWorker):
             # representation this mission was pinned to, and whether its
             # roll/pitch were tracked. Absent (older meta) = pos_yaw_width
             # / false.
-            "action_repr": self._policy_pinned_repr(),
+            "action_repr": pinned,
             "attitude_track": bool(attitude_track),
+            # 2026-10-03: tracking is decided by the LOW (*_7d) + a 7-dim
+            # checkpoint; policy.attitude_track is a veto. Both recorded.
+            "attitude_track_low": str(self.cfg.mode),
+            "attitude_track_veto": not bool(self._policy_att("attitude_track")),
             "rp_max_deg": float(self._policy_att("rp_max_deg")),
             "anchor_leash_rp_deg": float(self._policy_att("anchor_leash_rp_deg")),
             "hold_tail": str(pc["hold_tail"]),
@@ -5589,7 +7414,9 @@ class MpcWorker(TimerWorker):
             "yaw_fixed_ned_deg": math.degrees(yaw0),
             "gripper": gripper_on,
             "gripper_lookahead_s": float(pc["gripper_lookahead_s"]),
-            "q_scale": float(pc["q_scale"]),
+            "q_scale": float(q_scale),
+            "along_scale": (None if along_scale is None else float(along_scale)),
+            "follow_knobs_source": knob_src,
             # The panel and every reader of `trajectory` in the run meta learn
             # from ONE key that this reference was drawn and never followed.
             "observe": bool(self.observe),
@@ -5608,8 +7435,8 @@ class MpcWorker(TimerWorker):
             # holder would be a record claim (`plan_q_scale_flown`) about a
             # follower that never flew (the holder is the PID anyway, which
             # has neither hook — this guard says so in words).
-            self._apply_plan_cost_scale(float(pc["q_scale"]))
-            self._apply_plan_path_cost(pc.get("along_scale"))
+            self._apply_plan_cost_scale(float(q_scale))
+            self._apply_plan_path_cost(along_scale)
         self.traj_on = True
         self.station = None
         self._t0_traj = now()
@@ -5620,14 +7447,18 @@ class MpcWorker(TimerWorker):
         head = "POLICY OBSERVE" if self.observe else "POLICY"
         what = (f"{head} {Path(ckpt).name}"
                 f"{f' (sha1 {ckpt_sha1[:12]})' if ckpt_sha1 else ''}: "
-                f"action {self._policy_pinned_repr()}"
+                f"action {pinned}"
+                + (" (auto: the checkpoint's contract)"
+                   if repr_src == "checkpoint" else "")
                 + (f", roll/pitch TRACKED (rp_max "
                    f"{float(self._policy_att('rp_max_deg')):.0f} deg, reject "
                    f"{float(self._policy_att('rp_reject_deg')):.0f} deg, "
                    f"div {float(self._policy_att('div_max_rp_deg')):.0f} deg)"
                    if attitude_track else
-                   (", roll/pitch DROPPED-AND-LOGGED (attitude_track false)"
-                    if self._policy_pinned_repr() == ACTION_REPR_POS_RPY_WIDTH
+                   ((", roll/pitch DROPPED-AND-LOGGED ("
+                     + (f"LOW {self.cfg.mode} is 4-DoF" if str(self.cfg.mode) not in LOW_RP_TRACK_BASE
+                        else "policy.attitude_track false") + ")")
+                    if pinned == ACTION_REPR_POS_RPY_WIDTH
                     else ""))
                 + f", max {max_run:.0f} s, "
                 f"anchor {pc['anchor']} (leash {pc['anchor_leash_m']:.2f} m), "
@@ -5666,7 +7497,22 @@ class MpcWorker(TimerWorker):
                               f"own dz is DISCARDED. Temporary, 2026-09-12.")
             self._log_event(f"Z HOLD {float(zh):.2f} m above floor (temporary)")
         ovf = (self.cfg.policy or {}).get("obs_view_forward_m")
-        if ovf:
+        from ..perception.policy_obs import OBS_SRC_C3_RGB
+        if ovf and str(getattr(self._policy_status, "depth_src", "")
+                       or "") == OBS_SRC_C3_RGB:
+            # An RGB checkpoint (2026-10-03): the view shift is a DEPTH
+            # re-render and the worker does not apply it to a colour obs, so
+            # announcing it as flown would be a false record.
+            self._log("info", f"ctrl: OBS VIEW SHIFT configured "
+                              f"({float(ovf):+.3f} m) but NOT applied — "
+                              f"{Path(ckpt).name} is an RGB checkpoint "
+                              f"(C3 colour obs)")
+            # ...and in events.log, where the shift is announced when it IS
+            # flown: the config dump alone would read as applied (safety
+            # review 2026-10-03, #10).
+            self._log_event(f"OBS VIEW SHIFT configured {float(ovf):+.3f} m, "
+                            f"NOT applied (RGB ckpt {Path(ckpt).name})")
+        elif ovf:
             # Loud, once per arm, like Z HOLD: the policy is NOT looking at the
             # training recipe's obs, and the switch is per process, not per
             # checkpoint — a can checkpoint picked in the panel gets it too.
@@ -6130,16 +7976,27 @@ class MpcWorker(TimerWorker):
             except ValueError:
                 plan_repr = ""
         base_extra["action_repr"] = plan_repr or None
-        pinned = str(rp.get("action_repr_pinned") or self._policy_pinned_repr())
+        # The ARM pin only — never the live status (2026-10-03): under auto a
+        # missing pin reads "auto", which matches no plan (fails closed).
+        cfg_repr = self._policy_repr_config()
+        pinned = str(rp.get("action_repr_pinned") or cfg_repr)
         if plan_repr != pinned:
             rp["reject_action_repr"] = int(rp.get("reject_action_repr", 0)) + 1
             rp["rejected"] = int(rp.get("rejected", 0)) + 1
-            why = (f"action_repr mismatch: plan {plan_repr or 'unknown'} "
-                   f"(action {tuple(action.shape) if action.ndim else '?'}, "
-                   f"checkpoint contract) vs policy.action_repr {pinned} "
-                   f"(pinned at ARM; POLICY_ACTION_REPR default "
-                   f"{POLICY_ACTION_REPR}) — this mission composes only the "
-                   f"pinned action; rejected, no strike.")
+            if cfg_repr == POLICY_ACTION_REPR_AUTO:
+                why = (f"action_repr mismatch: plan {plan_repr or 'unknown'} "
+                       f"(action {tuple(action.shape) if action.ndim else '?'}, "
+                       f"checkpoint contract) vs the ARM pin {pinned} "
+                       f"(policy.action_repr auto: the checkpoint's contract "
+                       f"at ARM) — this mission composes only the pinned "
+                       f"action; rejected, no strike.")
+            else:
+                why = (f"action_repr mismatch: plan {plan_repr or 'unknown'} "
+                       f"(action {tuple(action.shape) if action.ndim else '?'}, "
+                       f"checkpoint contract) vs policy.action_repr {pinned} "
+                       f"(pinned at ARM; POLICY_ACTION_REPR default "
+                       f"{POLICY_ACTION_REPR}) — this mission composes only the "
+                       f"pinned action; rejected, no strike.")
             self._log("error", f"ctrl: policy plan {pid} rejected — "
                                        f"{why}")
             self._log_plan(None, Verdict("reject", None, {}, [why]),
@@ -6495,6 +8352,12 @@ class MpcWorker(TimerWorker):
                                 else "max_run_s"),
             },
             "config": {k: pc[k] for k in sorted(pc)},
+            # config.q_scale / along_scale are hw_mpc.yaml's text; under an
+            # MPC_Tuned profile the follower flew the profile's (2026-10-04)
+            "config_knobs_note": ("q_scale / along_scale FLOWN = "
+                                  "trajectory.q_scale / along_scale "
+                                  "(follow_knobs_source); config.* is the "
+                                  "file's text"),
             "config_provenance": dict(POLICY_PROVENANCE),
             # WHICH NETWORK (2026-09-11, the panel picker): `config.ckpt` is
             # only what loaded at launch; the worker's status says what it
@@ -6520,8 +8383,12 @@ class MpcWorker(TimerWorker):
             # 2026-09-26 the config's policy.action_repr (default
             # POLICY_ACTION_REPR), pinned per mission in trajectory /
             # run.action_repr_pinned; the checkpoint's own is under
-            # status.action_repr / worker.session.
-            "action_repr": self._policy_pinned_repr(),
+            # status.action_repr / worker.session. 2026-10-03: under
+            # `auto` (policy.config.action_repr) this is the ARM pin of the
+            # LIVE mission, else the last pin armed while this CSV was
+            # open, else null — never "auto", never the write-time status,
+            # never a mission that ended before this record began.
+            "action_repr": self._policy_meta_repr(),
             "action_repr_default": POLICY_ACTION_REPR,
             "action_reprs_flyable": list(POLICY_ACTION_REPRS_FLYABLE),
             # The attitude knobs with their defaults when the config predates
@@ -6995,8 +8862,13 @@ class MpcWorker(TimerWorker):
         self._apply_plan_cost_scale(1.0)
         self._apply_plan_path_cost(None)
         if self._bridge is not None:
-            self._bridge.reset()
+            # end_dropout, NOT reset: the closing meta is written further
+            # down (_close_csv) and must still hold this engagement's
+            # dropouts / reached_coast / last_recovery. The next ENGAGE does
+            # the full reset.
+            self._bridge.end_dropout()
         self._bridge_anchor = None
+        self._dvl_xy = None
         self._axes_prev = None          # never ramp from a stale command
         self._pwm_gate_bad_since = None
         self._yaw_hold = False          # the next engagement decides again
@@ -7008,6 +8880,7 @@ class MpcWorker(TimerWorker):
             if self._att_degraded_at is not None:
                 self._attitude_at_engage["degraded_at"] = self._att_degraded_at
         self._attitude_axes = False
+        self._attitude_pulses = False
         # NOT here: `self._bridge.attitude_axes = False` — StationBridge.meta()
         # derives `released_in_coast` from that bit AT CALL TIME, and the
         # closing meta is written below (_close_csv); dropping it first made
@@ -7058,6 +8931,8 @@ class MpcWorker(TimerWorker):
                         # the end of an engagement (it clears a latched gate
                         # failure; an engaged follower's own neutrals do not).
                         self.bus.cmd_pwm.emit(PwmCommand(source="stop"))
+                        self._pwm_sent_us = tuple(PwmCommand().pulses)
+                        self._pwm_last_sent_us = None
                         note = getattr(self.ctrl, "note_applied_pwm", None)
                         if callable(note):
                             note(None)
@@ -7085,7 +8960,8 @@ class MpcWorker(TimerWorker):
             if self._bridge is not None:
                 self._bridge.attitude_axes = False
             set_att = getattr(self.ctrl, "set_attitude_axes", None)
-            if callable(set_att) and self._attitude_at_engage.get("enabled"):
+            if callable(set_att) and (self._attitude_at_engage.get("enabled")
+                                      or self._attitude_at_engage.get("rp_track_live")):
                 try:
                     set_att(False)
                 except Exception as e:                           # noqa: BLE001
@@ -7113,8 +8989,15 @@ class MpcWorker(TimerWorker):
             return
         t = now()
         dt = 1.0 / self.cfg.ctrl_hz
+        self._pwm_live_tick = False   # set only when POLICY pulses leave this tick
+        self._pwm_sent_us = None      # set by whatever this tick puts on cmd_pwm
+        self._pwm_guard = 0           # the follower's obs-guard code (CSV pwm_guard)
         self._pwm_keepalive(t)
-        meas, health = self.asm.step(self.fix, self.imu, t, dt)
+        vel_xy, disp_xy, dvl_why = self._dvl_inputs(t)
+        meas, health = self.asm.step(self.fix, self.imu, t, dt,
+                                     vel_xy=vel_xy, disp_xy=disp_xy)
+        self._dvl_after_step(meas, health,
+                             vel_xy if meas is not None else None, dvl_why, t)
         if meas is not None and self._datum is not None:
             meas["eta"] = self._datumize(meas["eta"])
         # A FOLLOW THAT LOSES THE TAG IS DEMOTED FIRST, then bridged.
@@ -7140,6 +9023,7 @@ class MpcWorker(TimerWorker):
         # interlock keeps working. See station_bridge.py.
         meas = self._station_bridge(meas, health, t, dt)
         self._last_health = health
+        self._ekf_tick(t, meas, health)
         u = np.zeros(6)
         info = {}
         axes = None
@@ -7162,18 +9046,33 @@ class MpcWorker(TimerWorker):
             self.dr.note_tick(dt)
             if self.dr_control and self._dr_last["ok"]:
                 meas_ctrl = self._dr_last["meas"]
+        # THE ESTIMATOR SWITCH (2026-10-02): the EKF's state replaces only
+        # what the controller is handed, on a tick that HAS a tag state. When
+        # the EKF is not usable the runtime gate below ends the engagement
+        # on this same tick — it never falls back to the tag state silently.
+        if self.ekf_control and meas is not None and self._ekf_ok \
+                and self._ekf_meas is not None:
+            meas_ctrl = self._ekf_meas
+            self._ekf_flew = bool(self.engaged and not self.observe)
 
         if self.engaged:
             why = self._runtime_fault(meas, health, t)
             if why:
                 self.disengage(why)
-            elif meas is None:
+            elif meas is None or self._ekf_hold:
                 # Debouncing a brief staleness (see _runtime_fault): there is
                 # no state to control on, so this tick commands NOTHING and
                 # the sink's 500 ms deadman keeps the vehicle honest. What we
                 # do NOT do is run the controller on a stale or absent state.
+                # (`_ekf_hold`: the same for a run on the EKF whose input is
+                # stale or whose tag state is bridged — see
+                # _ekf_runtime_fault; never the bridge's state instead.)
                 self._tau_t = t
-                if not self.observe:
+                if self._ekf_hold and not self.observe:
+                    self.phase_detail = (f"EKF held — commanding nothing "
+                                         f"({self._ekf_hold_ticks}): "
+                                         f"{self._ekf_why or 'tag bridged'}")
+                elif not self.observe:
                     # Under OBSERVE `_runtime_fault` has already written the
                     # note that says what this costs — "NO FIX — plans
                     # skipped" — and it is the more useful of the two: an
@@ -7278,6 +9177,16 @@ class MpcWorker(TimerWorker):
                 # 6.5 s inside the failure path recorded 1.15 ms), and HwPid
                 # returns the constant 0.05. One bracket around the step
                 # covers all three and cannot be gamed by the thing it times.
+                if self._pwm_transport():
+                    # 2026-10-10 (b): the pwm follower's own observation
+                    # guards (HwRlPwm.obs_guard) judge the fix QUALITY the
+                    # state assembler does not pass on — tag count and age —
+                    # told every tick BEFORE the step. Every other follower
+                    # is untouched.
+                    note_fix = getattr(self.ctrl, "note_fix", None)
+                    if callable(note_fix):
+                        note_fix(self.fix.n_tags if self.fix is not None else 0,
+                                 health.get("tag_age"))
                 _t_step = time.perf_counter()
                 u, info = self.ctrl.step(meas_ctrl["eta"], meas_ctrl["nu"],
                                          meas_ctrl["nudot"], t_traj)
@@ -7389,6 +9298,15 @@ class MpcWorker(TimerWorker):
                             sent_live = False
                         self.bus.cmd_pwm.emit(PwmCommand(pulses=pw, source="mpc"))
                         self.ctrl.note_applied_pwm(pw if sent_live else None)
+                        self._pwm_live_tick = sent_live
+                        self._pwm_sent_us = tuple(int(p) for p in pw)
+                        # 2026-10-10 (b): what the null / pinned interlocks
+                        # judge next tick, and the guard code this row logs
+                        self._pwm_last_sent_us = self._pwm_sent_us
+                        try:
+                            self._pwm_guard = int(info.get("pwm_guard", 0) or 0)
+                        except (TypeError, ValueError):
+                            self._pwm_guard = 0
                         axes = PilotInput(source="mpc")
                         self._axes_prev = None
                     elif self._attitude_axes:
@@ -7574,7 +9492,17 @@ class MpcWorker(TimerWorker):
                 self.phase_detail = "NO FIX — plans skipped (observe)"
                 return ""
             return why
-        self._stale_ticks = 0
+        why_ekf = self._ekf_runtime_fault(health, t)
+        if why_ekf:
+            return why_ekf
+        if not self._ekf_hold:
+            # Reset only on a tick that will actually be flown: an EKF hold
+            # tick commands nothing too, so it must not restart the tag
+            # path's debounce (re-audit 2026-10-02 — interleaved late frames
+            # stretched the commandless window to ~2.9 s). ONE counter for
+            # both kinds of no-step tick bounds an episode by
+            # tag_stale_hold_s.
+            self._stale_ticks = 0
         # The runtime twins of the three engage gates, skipped for the same
         # reason (_engage_refusal): a LAND DRY-RUN has no command sink, so
         # "disarmed" is the expected and desired state, not a fault. Without
@@ -7599,6 +9527,7 @@ class MpcWorker(TimerWorker):
             # THE 6-DoF VARIANT's runtime twins (D9). (v) the sink degraded
             # to the 4-axis frame mid-run: a run that silently lost its
             # attitude actuation must not continue as a 6-DoF record.
+            # s/t ONLY (2026-10-03): a pulse follower never uses that frame.
             tel = self.tel
             if tel is not None and bool(getattr(tel, "attitude_axes_degraded",
                                                 False)):
@@ -7607,9 +9536,13 @@ class MpcWorker(TimerWorker):
                 return ("attitude axes DEGRADED — the command sink fell back "
                         "to the 4-axis MANUAL_CONTROL frame (K/M no longer "
                         "reach the vehicle)")
+        if self.attitude_actuated:
             # (ii) the attitude CEILING: |roll| or |pitch| past abort_deg for
-            # >= 0.25 s -> neutral (K/M = 0, passive righting). Measured
-            # state, debounced like every other interlock here.
+            # >= 0.25 s -> neutral (K/M = 0 / eight 1500 us pulses, passive
+            # righting). Measured state, debounced like every other interlock
+            # here. Since 2026-10-03 also for every per-thruster (pwm) LOW —
+            # plain rl_pwm actuates roll/pitch through its pulses and had NO
+            # tilt ceiling at all (its Lua override has no attitude logic).
             a = self._attitude_cfg()
             lim = math.radians(float(a.get("abort_deg", 35.0)))
             eta = np.asarray(meas["eta"], float)
@@ -7624,6 +9557,19 @@ class MpcWorker(TimerWorker):
                             f"0.25 s — neutral, passive righting")
             else:
                 self._att_ceiling_ticks = 0
+        if self._attitude_pulses and self._pwm_ilk is not None:
+            # (vi) THE PER-THRUSTER INTERLOCKS (2026-10-10 b): pwm LOWs only,
+            # AFTER the ceiling above (35 deg stays the outer limit; the
+            # inner tilt 20 deg / 0.25 s, rate 40 deg/s / 0.15 s, pack 50 A /
+            # 1.0 s + 13.5 V, null 80 us / 0.5 s and >= 3 pinned / 1.0 s
+            # are engage.per_thruster, every number [예측]). Same debounce
+            # pattern as the ceiling, one implementation shared with the
+            # offline replay (control/rl_pwm.PwmInterlocks). Judged on the
+            # MEASURED state (`meas`: the tag state, or the bridge's with
+            # the vehicle's own roll/pitch/gyro), never on the estimate.
+            why_pt = self._pwm_interlock_fault(meas)
+            if why_pt:
+                return why_pt
         # No position abort. Until 2026-08-14 leaving the geofence box (plus a
         # margin) disengaged the controller here; the fence was removed at the
         # operator's request, so the runtime faults are now exactly: disarm,
@@ -7697,6 +9643,8 @@ class MpcWorker(TimerWorker):
             s.yaw_flu_deg = math.degrees(-meas["eta"][5])
         s.rp_residual_deg = health.get("rp_residual_deg")
         s.rp_residual_rp_deg = health.get("rp_residual_rp_deg")
+        (s.mpc_tune, s.mpc_tune_path, s.mpc_tune_state,
+         s.mpc_tune_note) = self._tune_status()
         # THE FOLLOW LOOP's own three numbers. The OBJECT's position is
         # deliberately NOT here — it rides `bus.object_fix` in the map frame,
         # because it exists with nothing engaged and must not move on screen
@@ -7711,7 +9659,16 @@ class MpcWorker(TimerWorker):
             v_w = rot_zyx(*meas["eta"][3:6]) @ np.asarray(meas["nu"], float)[:3]
             s.speed_m_s = float(math.hypot(v_w[0], v_w[1]))
         s.ref_speed_m_s = self._ref_speed()
+        if self._bridge is not None:
+            # ALWAYS, not only with --imu-dr: until 2026-10-02 these two were
+            # set inside _publish_dr, behind `if self.dr is None: return`, so
+            # on an ordinary run the panel's loud "NO TAG — COASTING" could
+            # never fire — the ladder coasted with the chip saying nothing.
+            s.bridge_tier = self._bridge.tier
+            s.bridge_s = self._bridge.elapsed
         self._publish_dr(s, meas)
+        self._publish_dvl(s, meas, health)
+        self._publish_ekf(s)
         if self.engaged and self.ctrl is not None:
             p_ref, yaw_ref, _v_ref = self.ctrl.ref_ned_at(t_traj or 0.0)
             rx, ry, rz = _flu_of_ned(*p_ref)
@@ -7734,6 +9691,230 @@ class MpcWorker(TimerWorker):
             if self.traj_on and self.ctrl.scenario:
                 s.lap = self._path_lap(t_traj)
         self.bus.mpc_status.emit(s)
+
+    def _publish_dvl(self, s: MpcStatus, meas, health) -> None:
+        """The DVL half of a status row. Nothing is set without a DVL, so
+        the panel's button stays hidden on a station that has none."""
+        d = self.dvl
+        if d is None:
+            return
+        try:
+            self._publish_dvl_inner(s, meas, health)
+        except Exception as e:                                   # noqa: BLE001
+            self._dvl_trip_fault("status", e)
+        if self._dvl_fault:
+            s.dvl_note = f"CODE FAULT — {self._dvl_fault}"
+
+    def _publish_dvl_inner(self, s: MpcStatus, meas, health) -> None:
+        d = self.dvl
+        t = now()
+        s.vel_src = str(health.get("vel_src", "") or "") if meas is not None \
+            else ""
+        s.dvl_use = bool(d.use)
+        s.dvl_proven = bool(d.proven)
+        # The tick's own reason, not a second question to the aid: the
+        # gate's reference has moved on since, and asking again could answer
+        # differently (review 2026-10-02: the panel said "fallback" with no
+        # reason on a tick the gate had held back).
+        if meas is None:
+            why = "no tag state this tick (the DVL needs one to be checked)"
+        elif s.vel_src == "bridge":
+            tier = self._bridge.tier if self._bridge is not None else "?"
+            why = (f"station bridge on tier {tier} (the DVL rung is not "
+                   f"carrying this dropout)")
+        else:
+            why = health.get("dvl_why") or None
+        s.dvl_state, s.dvl_note = d.state(
+            t, used=(s.vel_src == DV.VEL_DVL),
+            why=(str(why) if why else None))
+        if self.engaged and not self._dvl_run_ok \
+                and s.dvl_state == DV.ST_FALLBACK:
+            # The aid knows nothing of the engage-time decision; without
+            # this the chip read "DVL held back" with no reason at all.
+            s.dvl_note = self._dvl_run_why
+        sm = d.sample
+        if sm is not None:
+            s.dvl_age_s = max(0.0, t - float(sm.t_valid))
+            s.dvl_alt_m = sm.altitude
+            s.dvl_fom = sm.fom
+            s.dvl_hz = sm.hz
+        s.dvl_res_m_s = d.residual_m_s
+
+    def _dvl_row(self, meas, health, t) -> list:
+        """The fifteen velocity / DVL columns, in CSV_HEADER order (schema
+        17). Body FRD m/s. `nan` says "not measured"; a row never carries a
+        stale DVL reading as if it were this tick's."""
+        def v3(v):
+            return ([f"{float(x):.5f}" for x in v] if v is not None
+                    else ["nan"] * 3)
+        src = str(health.get("vel_src", "") or "") if meas is not None else ""
+        row = [src]
+        row += v3(meas["nu"][:3] if meas is not None else None)
+        row += v3(health.get("nu_fd"))
+        blank = ["nan"] * 3 + ["0", "0", "nan", "nan", "nan"]
+        d = self.dvl
+        if d is not None and self.engaged:
+            # The run's own answer to "how much of it flew on the DVL", and
+            # why the rest did not (meta dvl.rows).
+            key = src or "none"
+            self._dvl_rows[key] = self._dvl_rows.get(key, 0) + 1
+            if d.use and src == "bridge":
+                # A bridged row below the DVL rung. Its dvl_why is the
+                # pre-bridge "no tag velocity" answer and would read as the
+                # post-gap gate; what matters here is which rung carried it.
+                tier = self._bridge.tier if self._bridge is not None else "?"
+                k2 = f"bridge: tier {tier}"
+                self._dvl_rows[k2] = self._dvl_rows.get(k2, 0) + 1
+            elif d.use and src != DV.VEL_DVL:
+                why = str(health.get("dvl_why", "") or "other")
+                k2 = "fallback: " + why.split(" (")[0]   # drop per-tick numbers
+                self._dvl_rows[k2] = self._dvl_rows.get(k2, 0) + 1
+        if d is None or d.sample is None:
+            return row + blank
+        try:
+            return row + self._dvl_cols(d, src, health, t)
+        except Exception as e:                                   # noqa: BLE001
+            # The row must keep its width whatever happens in here: a short
+            # row shifts every later reader by name-less columns.
+            self._dvl_trip_fault("csv", e)
+            return row + blank
+
+    def _ekf_row(self, t) -> list:
+        """The sixteen estimator / EKF columns, in CSV_HEADER order (schema
+        18). Positions in the px/py/pz frame (world FLU, datum), velocity in
+        the nu_u frame (body FRD)."""
+        if self.engaged and self._ekf_hold:
+            # an EKF run's held tick: nothing was commanded (the u/w columns
+            # carry the "not computed" sentinels — see _write_row)
+            est = "hold"
+        elif self._ekf_flew and self.engaged:
+            # (`engaged` too: a tick whose runtime gate disengaged it after the
+            # switch handed over did not fly on anything)
+            est = "ekf"
+        elif self.engaged and self.dr_control and self._dr_last is not None \
+                and self._dr_last.get("ok"):
+            est = "dr"
+        else:
+            est = "tag"
+        if self.engaged:
+            self._ekf_rows[est] = self._ekf_rows.get(est, 0) + 1
+        blank = ["0"] + ["nan"] * 12 + ["0", "0"]
+        node = self.ekf
+        if node is None:
+            return [est] + blank
+        try:
+            m, out = self._ekf_meas, self._ekf_out
+            n = node.n
+            counts = [str(int(n[EK.TOPIC_TAG]["used"])),
+                      str(int(n[EK.TOPIC_DVL]["used"]))]
+            if m is None or out is None:
+                return [est, "0"] + ["nan"] * 12 + counts
+            eta, nu = m["eta"], m["nu"]
+            px, py, pz = _flu_of_ned(float(eta[0]), float(eta[1]),
+                                     float(eta[2]))
+            lt = node.last_tag_used
+            return [est, str(int(bool(self._ekf_ok))),
+                    f"{px:.5f}", f"{py:.5f}", f"{pz:.5f}",
+                    f"{math.degrees(float(eta[3])):.3f}",
+                    f"{math.degrees(-float(eta[4])):.3f}",
+                    f"{math.degrees(-float(eta[5])):.3f}",
+                    f"{float(nu[0]):.5f}", f"{float(nu[1]):.5f}",
+                    f"{float(nu[2]):.5f}",
+                    f"{EK.sigma(out, (EK.X, EK.Y)):.5f}",
+                    f"{t - float(out['stamp']):.3f}",
+                    (f"{lt[1]:.3f}" if lt is not None else "nan")] + counts
+        except Exception as e:                                   # noqa: BLE001
+            # The row keeps its width whatever happens (the _dvl_row rule).
+            self._ekf_trip_fault("csv", e)
+            return [est] + blank
+
+    def _publish_ekf(self, s: MpcStatus) -> None:
+        """The EKF half of a status row; nothing without an EKF, so the EST
+        button stays hidden on a station that has none."""
+        if self.ekf is None:
+            return
+        s.ekf_control = bool(self.ekf_control)
+        s.ekf_flew = bool(self._ekf_flew and self.engaged
+                          and not self._ekf_hold)
+        if self._ekf_fault:
+            s.ekf_state, s.ekf_note = "fault", f"CODE FAULT — {self._ekf_fault}"
+            return
+        s.ekf_state = "ready" if self._ekf_ok else "not_ready"
+        s.ekf_note = self._ekf_why
+        if self._ekf_err is not None:
+            s.ekf_err_m = float(self._ekf_err["xy"])
+            s.ekf_err_yaw_deg = float(self._ekf_err["yaw"])
+        out = self._ekf_out
+        if out is not None and EK.finite(out):
+            s.ekf_sig_m = EK.sigma(out, (EK.X, EK.Y))
+            lt = self.ekf.last_tag_used
+            s.ekf_tag_late_s = None if lt is None else float(lt[1])
+            m = self._ekf_meas
+            if m is not None:
+                e = m["eta"]
+                s.p_ekf_flu = _flu_of_ned(float(e[0]), float(e[1]),
+                                          float(e[2]))
+
+    def _ekf_open_log(self, stem: Path) -> None:
+        """<stem>_ekf_inputs.jsonl beside the CSV (see _ekf_log_input). A
+        header line carries the resolved config, so a replay knows what the
+        live node ran."""
+        self._ekf_close_log()
+        if self.ekf is None or self._ekf_fault:
+            return
+        try:
+            path = Path(f"{stem}_ekf_inputs.jsonl")
+            self._ekf_log = open(path, "w", encoding="utf-8")
+            hdr = {"k": "header", "schema": 1, "source": EK.RL_SOURCE,
+                   "config": self.ekf.cfg,
+                   "dvl_transform": self.ekf.meta()["dvl_transform"],
+                   "t0_csv": self._t0_csv,
+                   # the live 50 Hz grid, so a replay's cycles fall on it
+                   "timer_phase": self.ekf.timer_phase}
+            self._ekf_log.write(json.dumps(hdr) + "\n")
+            self._ekf_log_datum(now())
+        except (OSError, TypeError, ValueError) as e:            # noqa: BLE001
+            self._log("warn", f"ekf: inputs log not written ({e})")
+            self._ekf_close_log()
+
+    def _ekf_log_datum(self, t: float) -> None:
+        """The datum the CSV's px/py are in (it changes at every engage), so
+        a replay can put its EKF in the same frame."""
+        if self._ekf_log is None or self._datum is None:
+            return
+        d = self._datum
+        try:
+            self._ekf_log.write(json.dumps(
+                {"k": "datum", "ta": t,
+                 "p0": [float(v) for v in d["p0"]],
+                 "yaw0": float(d["yaw0"])}) + "\n")
+        except (OSError, ValueError, TypeError):
+            self._ekf_close_log()
+
+    def _ekf_close_log(self) -> None:
+        f, self._ekf_log = self._ekf_log, None
+        if f is not None:
+            try:
+                f.close()
+            except OSError:
+                pass
+
+    def _dvl_cols(self, d, src: str, health, t) -> list:
+        """The eight device columns of ``_dvl_row``."""
+        def v3(v):
+            return ([f"{float(x):.5f}" for x in v] if v is not None
+                    else ["nan"] * 3)
+        row = []
+        sm = d.sample
+        age = t - float(sm.t_valid)
+        ok, _why = d.data_ok(t)
+        fresh = age <= float(d.cfg["stale_s"])
+        row += v3(d.v_body if fresh else None)
+        row += [str(int(bool(ok))), str(int(bool(sm.valid))),
+                (f"{sm.fom:.5f}" if sm.fom is not None else "nan"),
+                (f"{sm.altitude:.4f}" if sm.altitude is not None else "nan"),
+                f"{age:.3f}"]
+        return row
 
     def _publish_dr(self, s: MpcStatus, meas) -> None:
         """Fill the dead-reckoning half of a status row.
@@ -7825,15 +10006,28 @@ class MpcWorker(TimerWorker):
                 self._flight_modes_seen = []
                 self._yaw_hold_at_engage = False
                 self._attitude_at_engage = {}     # nor its attitude axes
+                self._dvl_at_engage = {}          # nor its DVL arm decision
+                self._ekf_at_engage = {}          # nor its estimator
             # Wall clock, for meta.json. Separate from _t0_csv (monotonic, the
             # CSV's own t=0) because only the wall clock lines a run up against
             # a video file or a note.
             self._csv_started = time.strftime("%Y-%m-%d %H:%M:%S")
             self._rows = 0
             self._ckpt_changes = []          # per CSV (on_policy_status)
+            # per CSV (_arm_policy); a mission already flying when the CSV
+            # opens (REC pressed mid-mission) belongs to this record too
+            self._policy_pin_csv = self._policy_live_pin()
+            self._dvl_rows = {}              # per CSV (_dvl_row)
+            self._ekf_rows = {}              # per CSV (_ekf_row)
+            self._ekf_open_log(stem)
             self._write_meta()
             self._log("info", f"mpc csv -> {path}")
             self._raw_logs(True, stem)
+            if self.dvl is not None:
+                # The DVL's verbatim reports beside this run, always — a new
+                # sensor's first recordings are worth more than their bytes,
+                # and unlike the IMU streams this one is ~15 lines/s.
+                self.bus.cmd_log_dvl.emit(True, str(stem))
         except OSError as e:
             self._csv = None
             self._log("error", f"mpc csv: {e}")
@@ -7856,17 +10050,21 @@ class MpcWorker(TimerWorker):
         if self._csv is None:
             return
         self._raw_logs(False, None)
+        if self.dvl is not None:
+            self.bus.cmd_log_dvl.emit(False, "")
         try:
             self._csv.close()
         except OSError:
             pass
         self._write_meta()                    # final row count
+        self._ekf_close_log()                 # after: the meta says it was kept
         self._log("info", f"mpc csv closed: {self._rows} rows "
                                   f"({self._csv_path})")
         self._csv = None
         self._run_dir_pin = None   # see _run_dir()
         self._csv_auto = False
         self._ckpt_changes = []    # the closing meta above already has them
+        self._policy_pin_csv = None
 
     def _plant(self) -> dict:
         """The M / C(nu) / D(nu) / g(eta) the controller believes in, cached.
@@ -7921,7 +10119,7 @@ class MpcWorker(TimerWorker):
             except OSError:
                 pass
         return {
-            "schema_version": 16,         # 2: + plant, mission, meta_trigger
+            "schema_version": 20,         # 2: + plant, mission, meta_trigger
                                           # 3: + imu_dr, hardware.cam_tilt_deg
                                           # 4: + circle; `trajectory` is now
                                           #    PER-SHAPE (a circle carries
@@ -8162,6 +10360,121 @@ class MpcWorker(TimerWorker):
                                           #    pairing.near/fallback) and
                                           #    the trigger change too — do
                                           #    not pool policy behaviour.
+                                          # 17: + dvl (ALWAYS written) and
+                                          #    fifteen trailing CSV columns
+                                          #    (vel_src, nu_u/v/w, fd_u/v/w,
+                                          #    dvl_u/v/w, dvl_ok, dvl_valid,
+                                          #    dvl_fom, dvl_alt_m,
+                                          #    dvl_age_s) — the first body
+                                          #    velocity this CSV has ever
+                                          #    carried. station_bridge gains
+                                          #    use_dvl / dvl_hold_s /
+                                          #    dropouts_on_dvl and CSV
+                                          #    bridge_tier the value `dvl`.
+                                          #    With no DVL built (dvl.enabled
+                                          #    false — every run so far) the
+                                          #    estimator is bit-identical to
+                                          #    16 and vel_src reads tag_fd.
+                                          #    NEVER POOL velocity-derived
+                                          #    statistics across vel_src, nor
+                                          #    runs across dvl.use_at_engage.
+                                          # 18: + ekf (ALWAYS written; the
+                                          #    robot_localization EKF,
+                                          #    control/rl_ekf.py) and
+                                          #    sixteen trailing CSV columns
+                                          #    (est, ekf_ok, ekf_px/py/pz,
+                                          #    ekf_roll/pitch/yaw_deg,
+                                          #    ekf_u/v/w, ekf_sig_xy_m,
+                                          #    ekf_age_s, ekf_tag_late_s,
+                                          #    ekf_n_tag, ekf_n_dvl), plus
+                                          #    <stem>_ekf_inputs.jsonl. With
+                                          #    the EST switch on TAG (the
+                                          #    default) the flown state is
+                                          #    bit-identical to 17 and est
+                                          #    reads tag. NEVER POOL runs
+                                          #    across ekf.estimator_at_engage
+                                          #    or the CSV est column.
+                                          #    Within 18 (2026-10-03, no
+                                          #    bump: keys only; a 4-DoF
+                                          #    LOW and an explicit
+                                          #    policy.action_repr record
+                                          #    as before): the LOW decides
+                                          #    roll/pitch — *_7d LOWs
+                                          #    (pid_7d, mpc_tuned_7d,
+                                          #    rl_7d, rl_pwm_7d),
+                                          #    controller.type = the LOW
+                                          #    (+ base_type), trajectory.
+                                          #    attitude_track_low /
+                                          #    attitude_track_veto,
+                                          #    run.attitude_axes.{low,
+                                          #    rp_transport, rp_track_live,
+                                          #    rp_track_low, ceiling_armed,
+                                          #    sat_watch_armed}, CSV
+                                          #    rp_track 2 = tracked by
+                                          #    per-thruster pulses (ax_*
+                                          #    nan). policy.action_repr
+                                          #    `auto` (shipped from
+                                          #    2026-10-03; policy.config
+                                          #    echoes "auto"): the loaded
+                                          #    checkpoint's contract,
+                                          #    pinned at ARM; meta
+                                          #    policy.action_repr = that
+                                          #    pin (the LIVE mission, else
+                                          #    the last one armed while
+                                          #    this CSV was open) or null
+                                          #    — then read
+                                          #    policy.status.action_repr or
+                                          #    plans.jsonl action_repr.
+                                          #    Pool policy runs on
+                                          #    trajectory.action_repr.
+                                          # 19 (2026-10-10): + three CSV
+                                          #    columns for the pwm LOWs
+                                          #    (i_pred_a, null_v_us,
+                                          #    null_h_us — empty on every
+                                          #    other LOW; CSV_HEADER's
+                                          #    2026-10-10 note) and the
+                                          #    controller keys
+                                          #    pwm_cap_mode (scale | clip),
+                                          #    pwm_cap_config,
+                                          #    caps_below_trained,
+                                          #    allow_caps_below_trained,
+                                          #    require_thruster_probe,
+                                          #    thruster_probe. RECORD
+                                          #    BOUNDARY: a pwm run before
+                                          #    this date flew the cap as a
+                                          #    per-thruster CLIP (every
+                                          #    2026-10-01..05 run); never
+                                          #    pool across pwm_cap_mode.
+                                          # 20 (2026-10-10 b): + CSV column
+                                          #    pwm_guard (the pwm LOWs' obs-
+                                          #    guard code, empty elsewhere)
+                                          #    and the controller keys
+                                          #    obs_guard, hold_pwm_us,
+                                          #    hold_throttles, interlocks
+                                          #    (engage.per_thruster: the
+                                          #    thresholds in force + the
+                                          #    trip). i_pred_a changed its
+                                          #    thrust convention to the
+                                          #    physical one (batt_v / 20.5
+                                          #    V, was / 14.8): no schema-19
+                                          #    row was ever flown. RECORD
+                                          #    BOUNDARY: never pool across
+                                          #    obs_guard.config or
+                                          #    interlocks.thresholds.
+                                          #    Within 20 (2026-10-12, no
+                                          #    bump: keys only, the default
+                                          #    run behaves as before):
+                                          #    --fstereo-process —
+                                          #    fstereo.process (always:
+                                          #    {"mode": "in-station"} or the
+                                          #    child's pid/rpc_ms/ipc_ms),
+                                          #    policy.worker.fstereo
+                                          #    .requested.process / .worker
+                                          #    .process, and every POLICY
+                                          #    plan line gains fs_process.
+                                          #    RECORD BOUNDARY: never pool
+                                          #    plan age / infer_ms / FS rate
+                                          #    across fstereo.process.mode.
             # `source` answers "was the plant real". A LAND DRY-RUN is the
             # third answer and needs saying out loud: the vehicle IS the real
             # one, but it could not move and could not be commanded, and the
@@ -8255,7 +10568,7 @@ class MpcWorker(TimerWorker):
                  "holder": self.ctrl.meta()}
                 if (self.cfg is not None and self.cfg.mode == "none"
                     and self.ctrl is not None)
-                else (self.ctrl.meta() if self.ctrl is not None else None)),
+                else self._controller_meta()),
             # The vehicle model the controller was flown against: M, C(nu),
             # D(nu), g(eta) and the coefficients that generate them. Added
             # 2026-08-14 at the operator's request — a CSV says what the vehicle
@@ -8343,6 +10656,12 @@ class MpcWorker(TimerWorker):
                 # What the loop ACTUALLY capped at, which differs from
                 # axis_cap when a DR-control run lowers it.
                 "axis_cap_used": self._axis_cap() if self.cfg else None,
+                # ...and the slew it ACTUALLY applied: a controller's own
+                # (HwRl 0, an MPC_Tuned profile's, 2026-10-04) over the config's
+                "axis_slew_used": (
+                    (float(getattr(self.ctrl, "axis_slew_per_s"))
+                     if getattr(self.ctrl, "axis_slew_per_s", None) is not None
+                     else self.cfg.axis_slew_per_s) if self.cfg else None),
                 "axis_gain_provenance": "[예측] T200 curve + mixer geometry — "
                                         "replace after the P4 step calibration",
                 "intrinsics": "C3 EEPROM factory calibration (UNDERWATER; "
@@ -8362,9 +10681,7 @@ class MpcWorker(TimerWorker):
             # key cannot tell "this build had no ladder" from "the ladder was
             # switched off", and the dropout counters are the run's own answer
             # to "did the localizer actually drop out".
-            "station_bridge": (self._bridge.meta() if self._bridge is not None
-                               else {"enabled": False,
-                                     "why": "not built"}),
+            "station_bridge": self._station_bridge_meta(),
             # PLAN STREAM (replay / future policy source). Always written,
             # same rule: filter counts are the run's own answer to "did the
             # stream ever get clipped or rejected".
@@ -8394,7 +10711,55 @@ class MpcWorker(TimerWorker):
             # provenance, TCP geometry, jaw estimator, worker meta, the run's
             # counters and end_reason, and `synthetic`.
             "policy": self._policy_meta(),
+            # DVL (schema 17). ALWAYS written, the imu_dr rule. `use` /
+            # `use_at_engage` say whether the estimator could CONSUME it;
+            # `rows` says how many rows actually did (CSV vel_src), and why
+            # the others fell back.
+            "dvl": self._dvl_meta(),
+            "ekf": self._ekf_meta(),
         }
+
+    def _station_bridge_meta(self) -> dict:
+        """StationBridge.meta(), corrected for the pwm transport (2026-10-03):
+        its `released_in_coast` sentence describes the s/t / 4-axis path, but
+        a per-thruster follower COASTS AS EIGHT 1500 us PULSES (tick's pwm
+        branch) — nothing, depth and attitude included, is held."""
+        if self._bridge is None:
+            return {"enabled": False, "why": "not built"}
+        m = self._bridge.meta()
+        if isinstance(m, dict) and self._pwm_transport():
+            m = dict(m)
+            m["released_in_coast"] = ("ALL: eight 1500 us pulses (per-thruster "
+                                      "transport) — depth and attitude NOT held")
+        return m
+
+    def _controller_meta(self):
+        """ctrl.meta(), with a *_7d LOW stamped over the object's own type
+        (2026-10-03): mpc_tuned_7d flies the SAME HwDobMpc as mpc_tuned, whose
+        meta says type "mpc_tuned" — and plot_runs pools on controller.type,
+        so an unstamped 7d run would pool with 4-DoF runs. `base_type` keeps
+        what the object reported."""
+        if self.ctrl is None:
+            return None
+        m = self.ctrl.meta()
+        low = str(self.cfg.mode) if self.cfg is not None else ""
+        if low in LOW_RP_TRACK_BASE and isinstance(m, dict):
+            m = dict(m)
+            if m.get("type") != low:
+                m["base_type"] = m.get("type")
+                m["type"] = low
+            m["low"] = low
+        if self._pwm_transport() and isinstance(m, dict):
+            # 2026-10-10 (b): the per-thruster interlocks in force on this
+            # engagement (thresholds, debounce ticks, peaks, the trip if one
+            # ended it). "armed" false = never engaged in this file.
+            m = dict(m)
+            m["interlocks"] = (self._pwm_ilk.meta() if self._pwm_ilk is not None
+                               else {"armed": False,
+                                     "thresholds": dict(
+                                         (self.cfg.engage.get("per_thruster")
+                                          or {}) if self.cfg else {})})
+        return m
 
     def _attitude_axes_meta(self) -> dict:
         """run.attitude_axes (schema 16): the engage-time record of the
@@ -8454,9 +10819,28 @@ class MpcWorker(TimerWorker):
                 int(self._attitude_sat_ticks) if self._attitude_axes else 0),
             "u_max_wire_nm": rec.get("u_max_wire_nm"),
             "low_allowed": list(self.ATTITUDE_LOW_ALLOWED),
-            "note": ("K/M = NMPC torques as MANUAL_CONTROL extension axes "
-                     "s = pitch, t = roll (MANUAL only); absent/false = K/M "
-                     "dropped at allocation (the pre-2026-09-26 behaviour)"),
+            # 2026-10-03 RECORD BOUNDARY: the LOW that decided (K/M live only
+            # under a *_7d LOW on a station launched with the capability).
+            # Absent = a run before 2026-10-03, when an enabled block alone
+            # put mpc/mpc_tuned's K/M on the wire.
+            "low": rec.get("low", str(self.cfg.mode) if self.cfg else None),
+            "low_attitude": bool(rec.get("low_attitude",
+                                         str(self.cfg.mode) in LOW_7D_BASE if self.cfg else False)),
+            "decided_by": "low (2026-10-03)",
+            # HOW roll/pitch were actuated on this engagement and which
+            # interlocks were armed (2026-10-03; absent = an earlier run).
+            # rp_transport pwm_pulses = a per-thruster follower drove roll/
+            # pitch itself (no s/t, so `enabled`/`live` stay false for it).
+            "rp_transport": rec.get("rp_transport"),
+            "rp_track_live": bool(rec.get("rp_track_live", False)),
+            "rp_track_low": rec.get("rp_track_low"),
+            "ceiling_armed": bool(rec.get("ceiling_armed", False)),
+            "sat_watch_armed": bool(rec.get("sat_watch_armed", False)),
+            "note": ("K/M = the *_7d follower's torques as MANUAL_CONTROL "
+                     "extension axes s = pitch, t = roll (MANUAL only); "
+                     "absent/false = K/M dropped at allocation (4-DoF). "
+                     "rp_transport pwm_pulses = roll/pitch driven by "
+                     "per-thruster pulses (rl_pwm / rl_pwm_7d), never s/t"),
         }
         return out
 
@@ -8662,6 +11046,33 @@ class MpcWorker(TimerWorker):
                 str(int(bool(fx.pair_exact))), str(fx.state),
                 f_state, f_err_s]
 
+    def _pwm_row(self) -> list[str]:
+        """The three schema-19 columns (2026-10-10) and the schema-20 one
+        (2026-10-10 b): the predicted pack current and the two null-space
+        coordinates of the eight pulses this tick SENT on cmd_pwm (eight
+        1500s on a coast / gate-grace / disengage tick), and the follower's
+        observation-guard code. EMPTY for every non-pwm LOW and for a pwm
+        tick that put nothing on cmd_pwm (not engaged) — a mixer-allocated
+        run has no sent pulses to read them from. See CSV_HEADER's
+        2026-10-10 notes."""
+        pw = self._pwm_sent_us
+        if pw is None or not self._pwm_transport():
+            return ["", "", "", ""]
+        try:
+            from .rl_pwm import null_space_us, predicted_pack_current_a
+
+            model = getattr(self.ctrl, "model", None)
+            tel = self.tel
+            bv = getattr(tel, "battery_v", None) if tel is not None else None
+            nv, nh = null_space_us(pw)
+            i_pred = (predicted_pack_current_a(pw, model, bv)
+                      if model is not None else float("nan"))
+            return [f"{i_pred:.2f}", f"{nv:.2f}", f"{nh:.2f}",
+                    str(int(self._pwm_guard))]
+        except Exception:                                        # noqa: BLE001
+            # the row keeps its width whatever happens (the _dvl_row rule)
+            return ["nan", "nan", "nan", "nan"]
+
     def _write_row(self, meas, health, u, info, axes, t_traj, t) -> None:
         if self._csv is None:
             return
@@ -8716,6 +11127,17 @@ class MpcWorker(TimerWorker):
             # the one reading CSV_HEADER, the schema-11 note and the launch
             # banner all promise cannot appear in an observe file. A guard at
             # the emitter cannot be routed around by a caller.
+            u = np.full(6, np.nan)
+            w = np.full(6, np.nan)
+            ax = (float("nan"),) * 4
+            nis = float("nan")
+            status = OBSERVE_SOLVER_STATUS
+            solve_ms = None
+            tick_ms = float("nan")
+        elif self.engaged and self._ekf_hold:
+            # AN EKF RUN'S HELD TICK (2026-10-02): the controller did not
+            # step, so this row must not read "commanded zero, solver fine"
+            # (the observe rule, same sentinels; CSV est = "hold").
             u = np.full(6, np.nan)
             w = np.full(6, np.nan)
             ax = (float("nan"),) * 4
@@ -8826,8 +11248,31 @@ class MpcWorker(TimerWorker):
                     f"{math.degrees(-th_n):.3f}",
                     f"{float(getattr(axes, 'roll', 0.0)):.4f}",
                     f"{float(getattr(axes, 'pitch', 0.0)):.4f}", "1"]
+        elif (self.rp_track_live and axes is not None and not self.observe
+              and self._pwm_live_tick):
+            # 2026-10-03: rl_pwm_7d tracks roll/pitch through PULSES — the
+            # reference it flies (envelope-clipped, trained-rate-limited), no
+            # s/t axes (nan), and rp_track 2 = "tracked via per-thruster
+            # pulses" (1 stays "axes sent"). Only on a tick whose POLICY
+            # pulses left (review 2026-10-03): a coast or gate-grace tick
+            # sends eight 1500s and is nan x4 / 0, like plain rl_pwm.
+            phi_n, th_n = self._ref_attitude(t_traj)
+            row += [f"{math.degrees(phi_n):.3f}",
+                    f"{math.degrees(-th_n):.3f}", "nan", "nan", "2"]
         else:
             row += ["nan", "nan", "nan", "nan", "0"]
+        # VELOCITY + DVL (schema 17): which instrument nu[0:2] came from, the
+        # state's own body velocity, the tag finite difference beside it, and
+        # the DVL's reading. See CSV_HEADER's 2026-10-01 note.
+        row += self._dvl_row(meas, health, t)
+        # THE EKF (schema 18): which estimate the controller was handed, and
+        # the robot_localization EKF's own state beside the tag's. See
+        # CSV_HEADER's 2026-10-02 note.
+        row += self._ekf_row(t)
+        # THE PWM LOWs (schema 19): predicted pack current and the null-space
+        # content of the pulses this tick SENT; empty elsewhere. See
+        # CSV_HEADER's 2026-10-10 note.
+        row += self._pwm_row()
         try:
             self._csv.write(",".join(row) + "\n")
             self._rows += 1

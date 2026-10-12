@@ -1,0 +1,146 @@
+{
+ "tool": "rov_gui/tools/fstereo_two_process_bench.py",
+ "when": "20261011_235457",
+ "gpu": "NVIDIA GeForce RTX 5090, 570.211.01, 0 %, 15 MiB",
+ "ckpt": "data/checkpoints/umi_depth_5d_peg5d_vitclip_9_27_9_28_20260929_012539.ckpt",
+ "fs": "iters 8, cuda graph, scale per arm",
+ "n_per_arm": 40,
+ "steps": 8,
+ "policy_period_s": 0.5,
+ "mps": "not started",
+ "note": "no camera / GUI / vehicle / IPC; twoproc = best case for a separate FS server (no frame transport); same inputs as data/20260930/0930_220212/diag/policy_vs_fstereo_contention.py",
+ "arms": [
+  {
+   "arm": "alone",
+   "policy_ms": {
+    "p10": 19.3,
+    "p50": 19.4,
+    "p90": 19.4,
+    "max": 20.0,
+    "n": 40
+   },
+   "fs_ms": null,
+   "fs_hz": null
+  },
+  {
+   "arm": "inproc@0.75@0",
+   "policy_ms": {
+    "p10": 98.7,
+    "p50": 151.7,
+    "p90": 209.1,
+    "max": 219.7,
+    "n": 40
+   },
+   "fs_ms": {
+    "p10": 75.6,
+    "p50": 75.9,
+    "p90": 77.1,
+    "max": 81.5,
+    "n": 263
+   },
+   "fs_hz": 13.15,
+   "layout": "one process: FS thread + policy (own CUDA stream)"
+  },
+  {
+   "arm": "twoproc@0.75@0",
+   "policy_ms": {
+    "p10": 34.6,
+    "p50": 47.2,
+    "p90": 48.8,
+    "max": 49.2,
+    "n": 40
+   },
+   "fs_ms": {
+    "p10": 73.4,
+    "p50": 73.7,
+    "p90": 88.5,
+    "max": 94.8,
+    "n": 262
+   },
+   "fs_hz": 13.1,
+   "layout": "two processes: FS child (own CUDA context) + policy here",
+   "fs_pid": 30173,
+   "dp_pid": 30174
+  },
+  {
+   "arm": "inproc@0.75@7.5",
+   "policy_ms": {
+    "p10": 19.1,
+    "p50": 31.7,
+    "p90": 79.1,
+    "max": 82.3,
+    "n": 40
+   },
+   "fs_ms": {
+    "p10": 75.3,
+    "p50": 76.4,
+    "p90": 77.3,
+    "max": 79.3,
+    "n": 150
+   },
+   "fs_hz": 7.5,
+   "layout": "one process: FS thread + policy (own CUDA stream)"
+  },
+  {
+   "arm": "twoproc@0.75@7.5",
+   "policy_ms": {
+    "p10": 19.1,
+    "p50": 30.2,
+    "p90": 48.4,
+    "max": 49.2,
+    "n": 40
+   },
+   "fs_ms": {
+    "p10": 73.5,
+    "p50": 74.6,
+    "p90": 89.7,
+    "max": 96.2,
+    "n": 150
+   },
+   "fs_hz": 7.5,
+   "layout": "two processes: FS child (own CUDA context) + policy here",
+   "fs_pid": 30856,
+   "dp_pid": 30857
+  },
+  {
+   "arm": "inproc@0.5@15",
+   "policy_ms": {
+    "p10": 27.4,
+    "p50": 42.2,
+    "p90": 56.6,
+    "max": 57.0,
+    "n": 40
+   },
+   "fs_ms": {
+    "p10": 45.1,
+    "p50": 45.7,
+    "p90": 47.2,
+    "max": 48.9,
+    "n": 300
+   },
+   "fs_hz": 15.0,
+   "layout": "one process: FS thread + policy (own CUDA stream)"
+  },
+  {
+   "arm": "twoproc@0.5@15",
+   "policy_ms": {
+    "p10": 19.5,
+    "p50": 30.3,
+    "p90": 42.2,
+    "max": 45.4,
+    "n": 40
+   },
+   "fs_ms": {
+    "p10": 43.1,
+    "p50": 43.6,
+    "p90": 46.2,
+    "max": 61.2,
+    "n": 299
+   },
+   "fs_hz": 14.95,
+   "layout": "two processes: FS child (own CUDA context) + policy here",
+   "fs_pid": 31732,
+   "dp_pid": 31733
+  }
+ ]
+}

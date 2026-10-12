@@ -688,7 +688,9 @@ def test_policy_attitude_keys_validate():
 
     pc = default_policy_block()
     assert pc["action_repr"] == POLICY_ACTION_REPR == ACTION_REPR_POS_YAW_WIDTH
-    assert pc["attitude_track"] is False and pc["rp_ref_filter"] is None
+    # 2026-10-03: attitude_track is a VETO (True = a *_7d LOW may track a
+    # 7-dim network); it changes nothing on a 4-DoF LOW or a 5-dim checkpoint
+    assert pc["attitude_track"] is True and pc["rp_ref_filter"] is None
     for k in ("action_repr", "attitude_track", "rp_max_deg", "rp_reject_deg",
               "pq_max_rad_s", "rp_jump_max_deg", "anchor_leash_rp_deg",
               "div_max_rp_deg", "blend_rp_rate_max", "heave_trim_attitude_rotated",
@@ -697,7 +699,16 @@ def test_policy_attitude_keys_validate():
     validate_policy_block(pc)
     pc["action_repr"] = ACTION_REPR_POS_RPY_WIDTH
     validate_policy_block(pc)
-    for bad in ({"action_repr": "pose10d"}, {"rp_max_deg": 0.0},
+    # 2026-10-03: `auto` = the held checkpoint's contract, pinned at ARM. A
+    # CONFIG sentinel: validated, kept verbatim (meta policy.config echoes it),
+    # never a flyable representation; the code default stays pos_yaw_width.
+    from rov_gui.state import POLICY_ACTION_REPR_AUTO, POLICY_ACTION_REPRS_FLYABLE
+    pc["action_repr"] = POLICY_ACTION_REPR_AUTO
+    validate_policy_block(pc)
+    assert pc["action_repr"] == "auto"
+    assert "auto" not in POLICY_ACTION_REPRS_FLYABLE
+    for bad in ({"action_repr": "pose10d"}, {"action_repr": "AUTO"},
+                {"action_repr": "Auto "}, {"rp_max_deg": 0.0},
                 {"rp_max_deg": 35.0, "rp_reject_deg": 30.0}, {"pq_max_rad_s": -1},
                 {"anchor_leash_rp_deg": -1}, {"rp_ref_filter": {"rate_deg_s": 1}},
                 {"attitude_q_scale": 0.0}, {"rp_reject_deg": 70.0}):
@@ -758,7 +769,12 @@ def test_4dof_resolved_config_is_unchanged_on_every_pre_existing_key():
     raw = yaml.safe_load(src.read_text(encoding="utf-8"))
     full = MpcConfig.load(src)
     assert full.engage["attitude_axes"]["enabled"] is False
-    assert full.policy["attitude_track"] is False
+    # the veto ships True (2026-10-03): inert on every 4-DoF LOW and on the
+    # s/t *_7d LOWs while the capability is off — but NOT on rl_pwm_7d (pulses,
+    # no capability needed): with action_repr auto, a 7-dim pick on LOW
+    # RL_PWM_7D tracks roll/pitch with no YAML step (the panel says TRACKED)
+    assert full.policy["attitude_track"] is True
+    assert full.policy["action_repr"] == "auto"
     assert full.engage["attitude_axes"]["transport"] == "manual_control_ext"
     with tempfile.TemporaryDirectory() as tmp:
         f = Path(tmp) / "hw_mpc_4dof.yaml"

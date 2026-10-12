@@ -303,6 +303,9 @@ class _FakeBridge:
     def reset(self):
         pass
 
+    def end_dropout(self):          # disengage / STOP TRAJ (2026-10-02)
+        pass
+
     def meta(self):
         return {"enabled": False, "why": "fake"}
 
@@ -1073,7 +1076,7 @@ def test_run_meta_carries_action_repr():
         _arm(w)
         _ticks(w)
         meta = w._run_meta()
-        assert meta["schema_version"] == 16     # 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
+        assert meta["schema_version"] == 20     # 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
         pm = meta["policy"]
         assert pm["action_repr"] == POLICY_ACTION_REPR == "pos_yaw_width"
         assert pm["status"]["action_repr"] == "pos_yaw_width"
@@ -1472,7 +1475,7 @@ def test_gripper_lookahead_closes_on_intent():
         assert min(g_now for _, g_now in seen) > 0.30
         assert min(g for g, _ in seen) < 0.30
         meta = w._run_meta()
-        assert meta["schema_version"] == 16     # 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
+        assert meta["schema_version"] == 20     # 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
         assert meta["policy"]["config"]["gripper_lookahead_s"] == 0.8
         assert meta["policy"]["estimator"]["lookahead_s"] == 0.8
         assert meta["policy"]["run"]["grip_lookahead_s"] == 0.8
@@ -1683,7 +1686,7 @@ def test_policy_meta_csv_and_plans_jsonl_carry_the_record():
         w.on_policy_plan(_mk_plan(w, infer_ms=42.0))
         _ticks(w, 2)
         meta = w._run_meta()
-        assert meta["schema_version"] == 16     # 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
+        assert meta["schema_version"] == 20     # 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
         assert meta["trajectory"]["kind"] == "policy"
         assert meta["reference_clock"]["strategy"] == "plan_stream_policy"
         assert meta["plan_stream"]["enabled"] is True
@@ -1815,7 +1818,8 @@ def test_policy_without_a_mission_leaves_other_shapes_untouched():
         assert meta["policy"]["run"] is None
         w.teardown()
         rows = w._csv_path.read_text().splitlines()
-        assert rows[-1].split(",")[-2] == "nan"       # hold_frac
+        hdr = rows[0].split(",")
+        assert rows[-1].split(",")[hdr.index("hold_frac")] == "nan"
         assert (rows[-1].split(",")[rows[0].split(",").index("observe")]
                 == "0")                                   # observe
 
@@ -2507,7 +2511,7 @@ def test_plans_jsonl_carries_the_fs_schedule_and_the_plan_timing():
 
         # the run record: same schema, the schedule as of ARM, plain JSON
         meta = w._run_meta()
-        assert meta["schema_version"] == 16
+        assert meta["schema_version"] == 20
         assert meta["policy"]["run"]["fs_schedule"] == "free"
         json.dumps(meta)                           # serialisable WITHOUT a default
         w.teardown()
@@ -2522,8 +2526,9 @@ def test_plan_timing_never_raises_and_never_invents_a_measurement():
 
     from rov_gui.control.workers import _plan_timing
 
-    keys = {"fs_schedule", "fs_input", "fs_wait_ms", "fs_wait_timeout",
-            "depth_ready_age_s", "trigger_age_s", "emit_age_s"}
+    keys = {"fs_schedule", "fs_input", "fs_process", "fs_wait_ms",
+            "fs_wait_timeout", "depth_ready_age_s", "trigger_age_s",
+            "emit_age_s"}
     for nothing in (object(), None, SimpleNamespace()):
         out = _plan_timing(nothing)
         assert set(out) == keys and all(v is None for v in out.values()), out
@@ -2591,7 +2596,7 @@ def test_the_fs_schedule_is_pinned_at_arm_and_announced_once_per_arm():
             assert w._policy_status.fs_schedule == "free"
             meta = w._run_meta()
             assert meta["policy"]["run"]["fs_schedule"] == sched
-            assert meta["schema_version"] == 16
+            assert meta["schema_version"] == 20
             json.dumps(meta)
             w.teardown()
     # a status from a worker that PREDATES the field arms as `free`
@@ -2613,8 +2618,9 @@ def test_the_fs_schedule_is_pinned_at_arm_and_announced_once_per_arm():
         w.teardown()
 
 
-_TIMING_KEYS = {"fs_schedule", "fs_input", "fs_wait_ms", "fs_wait_timeout",
-                "depth_ready_age_s", "trigger_age_s", "emit_age_s"}
+_TIMING_KEYS = {"fs_schedule", "fs_input", "fs_process", "fs_wait_ms",
+                "fs_wait_timeout", "depth_ready_age_s", "trigger_age_s",
+                "emit_age_s"}
 
 
 def test_plan_timing_survives_hostile_values_and_the_intake_stays_engaged():
@@ -3303,7 +3309,7 @@ def test_run_meta_under_none_marks_the_holder_and_the_solver_none():
         assert w.engaged, w.reason
         _ticks(w, 6)
         m = w._run_meta()
-        assert m["schema_version"] == 16     # 16: + 6-DoF attitude axes (2026-09-26)
+        assert m["schema_version"] == 20     # 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26)
         assert m["mode"] == "none" and m["policy_observe"] is True
         c = m["controller"]
         assert c["type"] == "none" == w.cfg.mode
@@ -3817,9 +3823,10 @@ def _feed7(w, **kw):
 
 def _policy_att_worker(tmp, attitude_track=True, **policy_over):
     """A worker with engage.attitude_axes LIVE (every gate satisfied by
-    `_feed_att`'s telemetry, probes not required), LOW mpc, the policy
+    `_feed_att`'s telemetry, probes not required), LOW mpc_tuned_7d (the LOW
+    decides since 2026-10-03; `_mpc_ctrl` is the test stub), the policy
     block pinned to pos_rpy_width, engaged and warmed up with shape=policy."""
-    w, bus, pilots, logs, statuses = _att_worker(tmp, mode="mpc")
+    w, bus, pilots, logs, statuses = _att_worker(tmp, mode="mpc_tuned_7d")
     w.cfg.policy.update({"action_repr": ACTION_REPR_POS_RPY_WIDTH,
                          "attitude_track": bool(attitude_track)})
     w.cfg.policy.update(policy_over)
@@ -3865,7 +3872,20 @@ def test_policy_pinned_action_repr_gates_arm_and_intake_both_ways():
         assert line["status"] == "reject" and line["rp_tracked"] is False
         assert any("action_repr mismatch" in r and "pos_rpy_width" in r
                    and "pos_yaw_width" in r for r in line["reasons"]), line
-        assert w._run_meta()["policy"]["run"]["action_repr_pinned"] == "pos_yaw_width"
+        # BYTE-IDENTICAL under an explicit pin (2026-10-03 auto review): the
+        # whole sentence, no auto wording anywhere, no new meta keys
+        assert ("action_repr mismatch: plan pos_rpy_width (action (16, 7), "
+                "checkpoint contract) vs policy.action_repr pos_yaw_width "
+                "(pinned at ARM; POLICY_ACTION_REPR default pos_yaw_width) — "
+                "this mission composes only the pinned action; rejected, no "
+                "strike.") in line["reasons"], line["reasons"]
+        assert not any("auto" in m for _l, m in logs if "action" in m), logs
+        m = w._run_meta()
+        assert m["policy"]["run"]["action_repr_pinned"] == "pos_yaw_width"
+        assert m["policy"]["action_repr"] == "pos_yaw_width"
+        assert m["policy"]["config"]["action_repr"] == "pos_yaw_width"
+        assert not any(k.startswith("action_repr_") and k not in
+                       ("action_repr_default",) for k in m["policy"]), sorted(m["policy"])
         w.teardown()
     with tempfile.TemporaryDirectory() as tmp:
         w, bus, pilots, logs = _policy_worker(
@@ -3913,30 +3933,296 @@ def test_policy_pinned_action_repr_gates_arm_and_intake_both_ways():
         assert all(r.endswith(",nan,nan") for r in pcsv[1:]), pcsv[1:3]
 
 
-def test_policy_attitude_track_truth_table_refuses_each_cause():
-    """attitude_track needs: the pos_rpy_width pin, the axes LIVE on this
-    engagement (so never under observe), and a trusted attitude measurement
-    (rp_residual <= 10 deg). Each failure refuses ARM with its own
-    sentence; the full table arms with the rp filter gates set."""
+def _reprs_in_meta(m) -> list:
+    """Every representation-valued record key of a run meta (never 'auto')."""
+    pol = m.get("policy") or {}
+    return [pol.get("action_repr"), (m.get("trajectory") or {}).get("action_repr"),
+            (pol.get("run") or {}).get("action_repr_pinned")]
+
+
+def test_policy_action_repr_auto_pins_the_checkpoint_at_arm_and_never_re_resolves():
+    """policy.action_repr auto (2026-10-03, operator request: a 7-dim pick must
+    need no YAML edit): the representation is the HELD checkpoint's contract at
+    START, pinned per mission — a later status (the default 5-dim one every
+    tick re-feeds here) changes nothing: a 7-dim plan installs, a 5-dim one is
+    rejected with the auto wording, and every record key carries the pin,
+    never the literal 'auto' (policy.config echoes it)."""
     with tempfile.TemporaryDirectory() as tmp:
-        w, bus, pilots, logs = _policy_worker(tmp, attitude_track=True)
+        w, bus, pilots, logs = _policy_worker(tmp, action_repr="auto")
+        assert w.cfg.policy["action_repr"] == "auto"
+        _feed_status(w, action_repr=ACTION_REPR_POS_RPY_WIDTH)
+        _arm(w)
+        assert w.replay["action_repr_pinned"] == "pos_rpy_width"
+        assert w.ctrl.scenario["action_repr"] == "pos_rpy_width"
+        assert w.replay["attitude_track"] is False                # 4-DoF LOW
+        arm = [m for _l, m in logs if "action pos_rpy_width" in m]
+        assert arm and "(auto: the checkpoint's contract)" in arm[-1], logs[-3:]
+        assert "DROPPED-AND-LOGGED" in arm[-1] and "4-DoF" in arm[-1], arm[-1]
+        _ticks(w)                                  # a 5-dim status now: ignored
+        w.on_policy_plan(_mk_plan(w, action=_straight_action7(pitch_end_deg=4.0),
+                                  action_repr=ACTION_REPR_POS_RPY_WIDTH))
+        _ticks(w)
+        assert w.replay["installed"] == 1 and w.replay["rejected"] == 0, w.replay
+        w.on_policy_plan(_mk_plan(w, action=_straight_action()))
+        _ticks(w)
+        assert w.replay["reject_action_repr"] == 1 and w.replay["installed"] == 1
+        why = _plans_jsonl(w)[-1]["reasons"]
+        assert any("action_repr mismatch" in r and "pos_yaw_width" in r
+                   and "the ARM pin pos_rpy_width" in r and "auto" in r
+                   for r in why), why
+        m = w._run_meta()
+        assert _reprs_in_meta(m) == ["pos_rpy_width"] * 3, _reprs_in_meta(m)
+        assert m["policy"]["status"]["action_repr"] == "pos_yaw_width"  # write-time status
+        assert m["policy"]["config"]["action_repr"] == "auto"
+        assert m["policy"]["action_repr_default"] == "pos_yaw_width"
+        assert "auto" not in m["policy"]["action_reprs_flyable"]
+        json.dumps(m)
+        w.set_traj(False)                           # STOP: _replay_last keeps it
+        _ticks(w)
+        assert w._run_meta()["policy"]["action_repr"] == "pos_rpy_width"
+        w.teardown()
+
+
+def test_policy_action_repr_auto_refuses_unset_and_non_flyable_contracts():
+    """Under auto the allow-list applies to the RESOLVED value: a READY status
+    without a contract and the legacy pose10d are refused with their own
+    sentence (never 'mismatch', never defaulted); a 7-dim contract still needs
+    its mount; a 5-dim one then arms pinned to itself."""
+    with tempfile.TemporaryDirectory() as tmp:
+        w, bus, pilots, logs = _policy_worker(tmp, action_repr="auto")
+        for contract, word in (("", "(unset)"), ("pose10d", "pose10d")):
+            _feed_status(w, action_repr=contract)
+            w.set_traj(True)
+            assert not w.traj_on, contract
+            assert word in w.reason and "not flyable" in w.reason, w.reason
+            assert "auto" in w.reason and "mismatch" not in w.reason, w.reason
+        _feed_status(w, action_repr=ACTION_REPR_POS_RPY_WIDTH, mount_ok=False,
+                     mount_why="no yaw_axis keys")
         w.set_traj(True)
-        assert not w.traj_on and "attitude_track needs action_repr" in w.reason, w.reason
-        assert "nothing to track" in w.reason
+        assert not w.traj_on and "mount mismatch" in w.reason, w.reason
+        _feed_status(w)                                       # 5-dim
+        _arm(w)
+        assert w.replay["action_repr_pinned"] == "pos_yaw_width"
+        assert w.ctrl.scenario["action_repr"] == "pos_yaw_width"
+        assert any("action pos_yaw_width (auto: the checkpoint's contract)" in m
+                   for _l, m in logs), logs[-3:]
+        w.teardown()
+
+
+def test_policy_action_repr_auto_arm_refuses_a_status_that_changed_after_the_check():
+    """The pin, the network pin and the tracked/levelled decision come from the
+    ONE PolicyStatus the ARM refusal judged: if another status object landed
+    between the check and ARM (impossible today — both run in one slot — but
+    the invariant is enforced, not assumed), ARM is refused and nothing is
+    pinned."""
+    with tempfile.TemporaryDirectory() as tmp:
+        w, bus, pilots, logs = _policy_worker(tmp, action_repr="auto")
+        orig = w._policy_refusal
+
+        def racing():
+            why = orig()
+            _feed_status(w, action_repr=ACTION_REPR_POS_RPY_WIDTH)   # lands in between
+            return why
+        w._policy_refusal = racing
+        w.set_traj(True)
+        assert not w.traj_on and "status changed" in w.reason, w.reason
+        assert w.replay is None or w.replay.get("kind") != "policy"
+        del w._policy_refusal
+        _arm(w)                                  # the honest path still arms
+        assert w.replay["action_repr_pinned"] == "pos_rpy_width"
+        w.teardown()
+
+
+def test_policy_action_repr_auto_intake_fails_closed_without_a_pin():
+    """The intake compares with the ARM pin ONLY: with the pin gone it reads
+    the config spelling 'auto', which matches no plan — never the live
+    status."""
+    with tempfile.TemporaryDirectory() as tmp:
+        w, bus, pilots, logs = _policy_worker(tmp, action_repr="auto")
+        _feed_status(w, action_repr=ACTION_REPR_POS_RPY_WIDTH)
+        _arm(w)
+        w.replay.pop("action_repr_pinned")
+        _feed_good_state(w)
+        _feed_status(w, action_repr=ACTION_REPR_POS_RPY_WIDTH)
+        w.tick()
+        w.on_policy_plan(_mk_plan(w, action=_straight_action7(),
+                                  action_repr=ACTION_REPR_POS_RPY_WIDTH))
+        _feed_good_state(w)
+        _feed_status(w, action_repr=ACTION_REPR_POS_RPY_WIDTH)
+        w.tick()
+        assert w.replay["reject_action_repr"] == 1 and w.replay["installed"] == 0
+        w.teardown()
+
+
+def test_policy_action_repr_auto_meta_keeps_the_pin_per_csv_and_never_guesses():
+    """meta policy.action_repr under auto: null before any policy mission in
+    the record (never 'auto', never the status), the ARM pin while a mission is
+    in scope, and — for a REC CSV that spans engagements — the last pin armed
+    while THAT CSV was open, after a new ENGAGE dropped the mission and a
+    5-dim status arrived. Closing the CSV forgets it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        w, bus, pilots, logs = _worker(tmp)
+        w.cfg.policy.update({"action_repr": "auto"})
+        validate_policy_block(w.cfg.policy)
+        w.policy_present = True
+        w.set_scenario({"shape": "policy"})
+        w.set_sensor_log(True, str(Path(tmp) / "rec_one"))
+        assert w._csv is not None and not w._csv_auto
+        assert w._run_meta()["policy"]["action_repr"] is None
+        w.on_enable(True)
+        _feed(w)
+        w.set_engaged(True)
+        assert w.engaged, w.reason
+        _ticks(w, 4)
+        assert w._run_meta()["policy"]["action_repr"] is None
+        _feed_status(w, action_repr=ACTION_REPR_POS_RPY_WIDTH)
+        _arm(w)
+        assert w._run_meta()["policy"]["action_repr"] == "pos_rpy_width"
+        w.set_traj(False)
+        w.set_engaged(False)
+        _feed(w)                                          # 5-dim status now
+        w.set_engaged(True)                               # same REC CSV
+        assert w.engaged, w.reason
+        _ticks(w, 4)
+        m = w._run_meta()
+        assert m["policy"]["run"] is None                  # no mission in scope
+        assert m["policy"]["action_repr"] == "pos_rpy_width", m["policy"]["action_repr"]
+        assert m["policy"]["status"]["action_repr"] == "pos_yaw_width"
+        w.set_engaged(False)
+        w.set_sensor_log(False, "")
+        assert w._csv is None
+        assert w._run_meta()["policy"]["action_repr"] is None
+        w.teardown()
+
+
+def test_policy_action_repr_auto_meta_pin_belongs_to_the_open_record_only():
+    """Review 2026-10-03: under auto the meta pin is the LIVE mission's, else
+    the last one armed while THIS CSV was open — never a mission that ended
+    before the record began (policy.run may still describe it), never a latch
+    taken with no CSV open; a CSV opened mid-mission owns that mission."""
+    with tempfile.TemporaryDirectory() as tmp:
+        # (a) mission A flown and ended; a REC CSV opened afterwards, disengaged
+        w, bus, pilots, logs = _policy_worker(tmp, action_repr="auto")
+        _feed_status(w, action_repr=ACTION_REPR_POS_RPY_WIDTH)
+        _arm(w)
+        w.set_traj(False)
+        w.set_engaged(False)                               # auto CSV closed
+        assert w._csv is None and w._policy_pin_csv is None
+        _feed(w)                                           # a 5-dim pick now
+        w.set_sensor_log(True, str(Path(tmp) / "rec_after"))
+        m = w._run_meta()
+        assert m["policy"]["action_repr"] is None, m["policy"]["action_repr"]
+        assert (m["policy"]["run"] or {}).get("action_repr_pinned") == "pos_rpy_width"  # A, labelled as run
+        w.set_sensor_log(False, "")
         w.teardown()
     with tempfile.TemporaryDirectory() as tmp:
+        # (b) REC CSV closed mid-engagement, then ARM with NO csv open: no latch
+        w, bus, pilots, logs = _worker(tmp)
+        w.cfg.policy.update({"action_repr": "auto"})
+        validate_policy_block(w.cfg.policy)
+        w.policy_present = True
+        w.set_scenario({"shape": "policy"})
+        w.set_sensor_log(True, str(Path(tmp) / "rec_b"))
+        w.on_enable(True)
+        _feed(w)
+        w.set_engaged(True)
+        assert w.engaged, w.reason
+        _ticks(w, 4)
+        w.set_sensor_log(False, "")                        # the record ends here
+        assert w._csv is None
+        _feed_status(w, action_repr=ACTION_REPR_POS_RPY_WIDTH)
+        _arm(w)
+        assert w._policy_pin_csv is None                   # nothing to latch into
+        assert w._run_meta()["policy"]["action_repr"] == "pos_rpy_width"   # live
+        # (c) REC pressed MID-MISSION: the new CSV owns the flying mission
+        w.set_sensor_log(True, str(Path(tmp) / "rec_c"))
+        assert w._policy_pin_csv == "pos_rpy_width"
+        w.set_traj(False)
+        _feed_good_state(w)
+        w.tick()
+        assert w.replay is None
+        assert w._run_meta()["policy"]["action_repr"] == "pos_rpy_width"   # this record flew it
+        w.set_sensor_log(False, "")
+        assert w._run_meta()["policy"]["action_repr"] is None
+        w.teardown()
+
+
+def test_policy_action_repr_auto_observe_arms_a_7dim_pick_dropped():
+    """LOW None (observe) under auto: a 7-dim pick arms, pinned, levelled."""
+    with tempfile.TemporaryDirectory() as tmp:
+        w, bus, pilots, grips, logs = _observe_worker(tmp, action_repr="auto")
+        _feed_status(w, action_repr=ACTION_REPR_POS_RPY_WIDTH)
+        w.set_traj(True)
+        assert w.traj_on, w.reason
+        assert w.replay["action_repr_pinned"] == "pos_rpy_width"
+        assert w.replay["attitude_track"] is False
+        w.teardown()
+
+
+def test_policy_action_repr_auto_tracks_on_a_7d_low_and_keeps_tracking():
+    """auto + a *_7d LOW + a 7-dim pick: the SAME truth table as an explicit
+    pos_rpy_width pin — the residual gate refuses, then ARM tracks with the rp
+    filter gates; a later 5-dim status changes neither the pin nor the
+    tracked flag, and a 7-dim plan installs tracked."""
+    if not _alloc_has_attitude():
+        import pytest
+        pytest.skip("allocation without the attitude path (output group)")
+    with tempfile.TemporaryDirectory() as tmp:
+        w, bus, pilots, logs, st = _policy_att_worker(tmp, action_repr="auto",
+                                                      yaw_ref_filter=None)
+        assert w.cfg.policy["action_repr"] == "auto"
+        _ticks7(w, 2, roll=math.radians(15.0))
+        w.set_traj(True)
+        assert not w.traj_on and "residual" in w.reason, w.reason
+        _ticks7(w, 2)
+        _arm(w)
+        rp = w.replay
+        assert rp["attitude_track"] is True and rp["action_repr_pinned"] == "pos_rpy_width"
+        assert abs(w._plan_filter.limits.rp_reject_rad - math.radians(30.0)) < 1e-12
+        assert any("roll/pitch TRACKED" in m and "(auto" in m for _l, m in logs), logs[-3:]
+        _feed_att(w)
+        _feed_status(w)                                   # a 5-dim status
+        w.tick()
+        assert w.replay["attitude_track"] is True
+        assert w.replay["action_repr_pinned"] == "pos_rpy_width"
+        w.on_policy_plan(_mk_plan(w, action=_straight_action7(pitch_end_deg=4.0),
+                                  action_repr=ACTION_REPR_POS_RPY_WIDTH))
+        _ticks7(w, 2)
+        assert w.replay["installed"] == 1, w.replay
+        line = [ln for ln in _plans_jsonl(w) if ln["status"] in ("accept", "clip")][-1]
+        assert line["rp_tracked"] is True
+        w.teardown()
+
+
+def test_policy_attitude_track_truth_table_refuses_each_cause():
+    """THE LOW DECIDES (2026-10-03): a mission tracks roll/pitch iff the LOW
+    is a *_7d follower AND the checkpoint is 7-dim AND policy.attitude_track
+    (a veto, default true). A 5-dim checkpoint, a 4-DoF LOW or LOW None arm
+    LEVEL / dropped-and-logged — never refused for it. A tracked mission
+    needs the axes LIVE on this engagement and a trusted attitude
+    measurement (rp_residual <= 10 deg); each failure refuses ARM with its
+    own sentence; the full table arms with the rp filter gates set."""
+    with tempfile.TemporaryDirectory() as tmp:
+        # a 5-dim checkpoint: nothing to track, the veto is inert -> arms level
+        w, bus, pilots, logs = _policy_worker(tmp, attitude_track=True)
+        _arm(w)
+        assert w.replay["attitude_track"] is False
+        w.teardown()
+    with tempfile.TemporaryDirectory() as tmp:
+        # a 7-dim checkpoint on a 4-DoF LOW: dropped-and-logged, not refused
         w, bus, pilots, logs = _policy_worker(
             tmp, action_repr=ACTION_REPR_POS_RPY_WIDTH, attitude_track=True)
         _feed_status(w, action_repr=ACTION_REPR_POS_RPY_WIDTH)
-        w.set_traj(True)
-        assert not w.traj_on and "needs engage.attitude_axes" in w.reason, w.reason
+        _arm(w)
+        assert w.replay["attitude_track"] is False
+        assert any("DROPPED-AND-LOGGED" in m and "4-DoF" in m for _l, m in logs), logs[-3:]
         w.teardown()
     with tempfile.TemporaryDirectory() as tmp:
         w, bus, pilots, grips, logs = _observe_worker(
             tmp, action_repr=ACTION_REPR_POS_RPY_WIDTH, attitude_track=True)
         _feed_status(w, action_repr=ACTION_REPR_POS_RPY_WIDTH)
         w.set_traj(True)
-        assert not w.traj_on and "observe" in w.reason, w.reason
+        assert w.traj_on and w.replay["attitude_track"] is False, w.reason
         w.teardown()
     if not _alloc_has_attitude():
         import pytest
@@ -4135,7 +4421,9 @@ def test_policy_records_on_the_4dof_path_carry_the_schema16_keys():
         assert viz and viz[-1].rp is None
         m = w._run_meta()
         assert m["policy"]["action_repr"] == "pos_yaw_width"
-        assert m["policy"]["attitude"]["attitude_track"] is False
+        # the config echo is the VETO (2026-10-03, default true); what flew is
+        # trajectory.attitude_track below
+        assert m["policy"]["attitude"]["attitude_track"] is True
         assert m["policy"]["attitude"]["rp_max_deg"] == 20.0
         assert m["policy"]["run"]["action_repr_pinned"] == "pos_yaw_width"
         assert m["policy"]["run"]["reject_rp_mag"] == 0

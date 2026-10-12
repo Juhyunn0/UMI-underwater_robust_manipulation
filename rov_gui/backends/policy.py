@@ -84,6 +84,22 @@ REPO = Path(__file__).resolve().parents[2]
 #: ``policy_frames.lowdim_obs``.
 IMAGE_KEY = "camera0_depth"
 
+#: The RGB checkpoint's image key (umi_rgb_5d, 2026-10-03). Fed from the C3
+#: COLOUR frame — the centre lens, the frame the tag localizer runs on —
+#: through ``bus.PolicyColorMailbox`` and ``policy_obs.ColorObsBuilder``.
+#: Which of the two keys a run feeds is read from the LOADED checkpoint's
+#: contract (``_adopt_obs_contract``), never from a flag: before this, an RGB
+#: checkpoint loaded READY and every predict raised KeyError (2026-10-03,
+#: data/20261003/1003_151227: three STARTs, zero plans).
+IMAGE_KEY_RGB = "camera0_rgb"
+
+#: A colour frame and a tag fix are the SAME C3 frame when their stamps agree
+#: to within this. Both are ``now() - age_ms`` of that frame, read by two taps
+#: (hardware.py ``_tap_pose`` for the localizer, ``_tap_policy_color`` here)
+#: microseconds apart; a frame interval is 33 ms, so a neighbour can never
+#: match.
+COLOR_FIX_MATCH_S = 0.005
+
 #: The training target grid (raw CAM_B 640x400) the builder warps onto.
 WARP_SIZE = (640, 400)
 
@@ -234,6 +250,28 @@ def hydra_config_for(ckpt) -> Path | None:
             if cand.is_file():
                 return cand
     return None
+
+
+def training_image_keys(ckpt) -> list | None:
+    """The image obs keys (``shape_meta.obs`` entries of type rgb) the
+    checkpoint was trained on, read from the hydra config beside it — no
+    torch. None when it cannot be read (a stub, no config): the caller then
+    keeps its depth-era behaviour."""
+    if is_stub_ckpt(ckpt):
+        return None
+    cfg_path = hydra_config_for(ckpt)
+    if cfg_path is None:
+        return None
+    try:
+        import yaml
+
+        with open(cfg_path, encoding="utf-8") as fh:
+            cfg = yaml.safe_load(fh) or {}
+        obs = ((cfg.get("task") or {}).get("shape_meta") or {}).get("obs") or {}
+        return [str(k) for k, v in obs.items()
+                if isinstance(v, dict) and v.get("type") == "rgb"]
+    except Exception:                                            # noqa: BLE001
+        return None
 
 
 def training_depth_source(ckpt) -> dict:
@@ -425,6 +463,11 @@ class PolicyWorker(TimerWorker):
     ``TagNavWorker`` and pick the session from the config block)."""
 
     RING = 12
+    #: The RGB ring is longer (2026-10-03, review N5): colour arrives at 30 Hz
+    #: and the anchor is the newest FIX's frame, so the ring must still hold
+    #: that frame when the localizer is slow — 24 frames ~0.8 s, above
+    #: obs_max_age_s, ~17 MB of 640x360 BGR.
+    RING_RGB = 24
 
     def __init__(self, bus, mailbox, opts, *, cfg=None, nav_cfg=None,
                  session_factory=None):
@@ -474,6 +517,28 @@ class PolicyWorker(TimerWorker):
         #: backend under --record-depth. None = no colour is filed; the depth
         #: recording is unaffected either way.
         self.color_mb = None
+        #: bus.PolicyColorMailbox — the C3 COLOUR frames an RGB checkpoint
+        #: consumes, injected by the backend (hardware: the C3 camera worker;
+        #: demo: the synthetic main feed). Wanted only while the loaded
+        #: checkpoint's image key is IMAGE_KEY_RGB. None = this backend cannot
+        #: feed an RGB checkpoint, which then FAULTs instead of arming.
+        self.policy_color_mb = None
+        #: "depth" (IMAGE_KEY: DepthObsBuilder on the depth mailbox, the FS
+        #: schedule) or "rgb" (IMAGE_KEY_RGB: ColorObsBuilder on
+        #: policy_color_mb, no FS schedule) — set from the checkpoint's
+        #: contract on the tick that first sees it READY (_adopt_obs_contract).
+        self._obs_mode = "depth"
+        self._image_key = IMAGE_KEY
+        self._depth_builder = None
+        self._color_builder = None
+        self._rgb_rec_said = False
+        #: The image key the loaded checkpoint's contract ASKED for, recorded
+        #: even when it was refused (meta; _image_key stays the fed one).
+        self._contract_image_key = ""
+        #: RGB: the ring entry the last forward was built around. A fix stall
+        #: leaves the anchor where it was while colour frames keep arriving;
+        #: the same observation is not planned twice (review 2026-10-03, #7).
+        self._last_anchor = None
         self._fault = ""
         self._grid_fault = ""
         self._grid_fault_said = False
@@ -519,7 +584,10 @@ class PolicyWorker(TimerWorker):
             "plans": 0, "skip_degenerate": 0, "skip_pair": 0, "skip_fresh": 0,
             "skip_history": 0, "skip_no_depth": 0, "skip_stale_depth": 0,
             "skip_no_start": 0, "skip_grid": 0, "skip_not_ready": 0,
-            "skip_fix_lag": 0,
+            "skip_fix_lag": 0, "skip_same_obs": 0,
+            # RGB checkpoints: colour frames dropped by ColorObsBuilder.adopt
+            # (size changed / not uint8 BGR) — dropped, not latched.
+            "color_refused": 0,
             "pair_dup": 0, "pair_fallback": 0, "pair_near": 0,
             "infer_errors": 0, "epoch_changes": 0, "depth_frames": 0,
             "states": 0, "history_rows": 0,
@@ -622,6 +690,7 @@ class PolicyWorker(TimerWorker):
             z_far=float(pc["z_far_m"]), out_res=int(pc["obs_res"]),
             warp_size=WARP_SIZE, min_coverage=float(pc["min_obs_coverage"]),
             fill_iters=2, view_shift_cam_m=self.obs_view_shift_cam_m)
+        self._depth_builder = self.builder
         if self.obs_view_shift_cam_m is not None:
             self.bus.log.emit(
                 "warn",
@@ -662,10 +731,10 @@ class PolicyWorker(TimerWorker):
         self.enabled = True
         self.mailbox.set_wanted(True)
         self.session.start_async(on_log=self._say)
-        # The stub is ready synchronously: its (mount-free) contract is
-        # checked here; a real checkpoint's is checked when tick() first sees
-        # it ready.
-        self._check_mount()
+        # The stub is ready synchronously: its contract (mount, obs image) is
+        # adopted here; a real checkpoint's when tick() first sees it ready.
+        if self.session.ready:
+            self._on_ready()
         stub = bool(self.session.describe().get("stub", False))
         self.bus.log.emit(
             "info",
@@ -836,6 +905,7 @@ class PolicyWorker(TimerWorker):
             self._newest_row_fresh = False
             self._first_pending = True
             self._rec_check_pending = True      # see _rotate_recorder_if_moved
+            self._rgb_rec_said = False          # said once per epoch (run)
         active = bool(st.active) and not bool(st.halted)
         if active and not self._was_active:
             self._first_pending = True          # first inference after START
@@ -862,7 +932,11 @@ class PolicyWorker(TimerWorker):
 
     # ----------------------------------------------------------------- depth
     def _ingest_depth(self) -> bool:
-        """Take the mailbox frame into the ring. True when one arrived."""
+        """Take the mailbox frame into the ring. True when one arrived.
+        An RGB checkpoint's frames come from the colour mailbox instead
+        (_ingest_color); the name predates them."""
+        if self._obs_mode == "rgb":
+            return self._ingest_color()
         item = self.mailbox.take()
         if item is None:
             return False
@@ -899,7 +973,66 @@ class PolicyWorker(TimerWorker):
                          "not adopted; frames on it are dropped")
         return True
 
+    def _ingest_color(self) -> bool:
+        """An RGB checkpoint's frame: the C3 colour mailbox -> the ring.
+
+        The builder adopts the frame size from the first frame and refuses a
+        different one later (ColorObsBuilder.adopt) — the depth grid's rule:
+        a camera reconfigured mid-run would change the crop, and with it the
+        field of view the network sees, without a word. A refused frame is
+        dropped and counted (``color_refused``) and the status turns DEGRADED;
+        the builder stays usable for the adopted size, so the next frame of
+        that size clears it (review 2026-10-03, N2)."""
+        from ..perception.policy_obs import GridError, OBS_SRC_C3_RGB
+
+        mb = self.policy_color_mb
+        item = mb.take() if mb is not None else None
+        if item is None:
+            return False
+        self.counters["depth_frames"] += 1       # = image frames; name kept
+        self._frame_pending = True
+        self._n_depth += 1
+        t_in = now()
+        self._depth_marks.append(t_in)
+        b = self.builder
+        first = (b.grid_kind == "")
+        try:
+            b.adopt(item["image"])
+        except GridError as e:
+            self.counters["color_refused"] += 1
+            self._grid_fault = str(e)
+            if not self._grid_fault_said:
+                self._grid_fault_said = True
+                self.bus.log.emit("error", f"policy: colour frame REFUSED — {e}")
+            return True
+        if self._grid_fault:
+            # A frame of the adopted size again: the refusal was a frame, not
+            # the feed. (A depth grid fault never reaches here: the mode
+            # switch re-derives _grid_fault from the builder.)
+            self._grid_fault, self._grid_fault_said = "", False
+        if first:
+            self._depth_kind = OBS_SRC_C3_RGB
+            d = b.describe()
+            self.bus.log.emit(
+                "info", f"policy: obs source C3 colour {d['src_size'][0]}x"
+                        f"{d['src_size'][1]} -> centre {d['crop']['size']}px "
+                        f"square -> {b.out_res} RGB")
+        self._ring.append({"t": float(item["t_capture"]), "depth": None,
+                           "image": item["image"], "obs": None, "stats": None,
+                           "t_arrive": t_in})
+        return True
+
     def _obs_for(self, entry: dict):
+        if entry["obs"] is None and self._obs_mode == "rgb":
+            entry["obs"], entry["stats"] = self.builder.build(entry["image"])
+            if self.depth_rec is not None and not self._rgb_rec_said:
+                # The recorder files DEPTH obs (perception/depth_record.py);
+                # an RGB run's obs would be a different record. Said once.
+                self._rgb_rec_said = True
+                self.bus.log.emit(
+                    "warn", "policy: --record-depth files depth obs only — "
+                            "this RGB checkpoint's colour obs are NOT recorded")
+            return entry["obs"], entry["stats"]
         if entry["obs"] is None:
             entry["obs"], entry["stats"] = self.builder.build(entry["depth"])
             # Record on FIRST build only, so each unique depth frame lands
@@ -965,12 +1098,14 @@ class PolicyWorker(TimerWorker):
                                       f"start ({type(e).__name__}: {e}); the "
                                       f"run continues without it")
 
-    def _pick_pair(self, obs_dt: float, allow_dup: bool):
-        """(partner entry, how) per v2 A18, or (None, "skip")."""
-        newest = self._ring[-1]
+    def _pick_pair(self, obs_dt: float, allow_dup: bool, newest=None):
+        """(partner entry, how) per v2 A18, or (None, "skip"). ``newest`` is
+        the attempt's anchor (:meth:`_anchor`); the ring's newest when None."""
+        if newest is None:
+            newest = self._ring[-1]
         t_d = newest["t"]
         target = t_d - obs_dt
-        older = [e for e in list(self._ring)[:-1] if e["t"] < t_d]
+        older = [e for e in self._ring if e["t"] < t_d]
         if older:
             best = min(older, key=lambda e: abs(e["t"] - target))
             if abs(best["t"] - target) <= PAIR_TOL * obs_dt:
@@ -983,6 +1118,143 @@ class PolicyWorker(TimerWorker):
         if allow_dup:
             return newest, "dup"
         return None, "skip"
+
+    def _anchor(self):
+        """The ring entry an attempt is built around, or None.
+
+        Depth: the newest frame (the pre-2026-10-03 rule, unchanged). RGB:
+        the newest colour frame that is not NEWER than the newest tag fix —
+        in practice the fix's own frame (COLOR_FIX_MATCH_S). The localizer
+        publishes a frame's fix after detecting on it, so the newest colour
+        frame is routinely a frame or two ahead of every fix; built around
+        it, the proprio "now" row would be clamped to an older fix than the
+        image (FIX_LAG_TOL's case) or the attempt skipped. Around the fix's
+        own frame, image and proprio are the same instant. None = every
+        frame in the ring is newer than the newest fix (no fix for 0.4 s).
+        """
+        if not self._ring:
+            return None
+        if self._obs_mode != "rgb":
+            return self._ring[-1]
+        hist = self.hist
+        if hist is None or len(hist) == 0:
+            return self._ring[-1]
+        latest = float(hist.latest_t)
+        for e in reversed(self._ring):
+            if e["t"] <= latest + COLOR_FIX_MATCH_S:
+                return e
+        return None
+
+    def _gate(self):
+        """The FS schedule gate for the LOADED checkpoint: None for an RGB
+        one — FoundationStereo makes nothing it consumes, so there is nothing
+        to schedule (it keeps running free for the depth panel)."""
+        return self.fs_gate if self._obs_mode == "depth" else None
+
+    def _adopt_obs_contract(self) -> None:
+        """Feed the image the LOADED checkpoint asks for (2026-10-03).
+
+        ``camera0_depth`` -> the depth path, exactly as before.
+        ``camera0_rgb`` -> the C3 colour frame (ColorObsBuilder). The run
+        record's optics note follows the checkpoint's training store
+        (``contract['image_optics']`` <- ``.zattrs rgb.optics``, 2026-10-04):
+        a store warped onto the C3 colour optics gets the C3-WARPED note, any
+        other RGB store the NAIVE one (unwarped handheld RGB, the scene ~1.8x
+        magnified against training — policy_obs.RGB_OPTICS_NOTE). Anything else -> ``_fault``: ERROR on the
+        panel and the controller refuses to arm, where before this the
+        session went READY and every predict raised KeyError. Called on the
+        tick that first sees a session READY (setup's stub included)."""
+        try:
+            c = self.session.contract
+            key = str(c.get("image_key", "") or "")
+        except (AttributeError, TypeError):
+            c, key = {}, ""
+        self._contract_image_key = key
+        if key == IMAGE_KEY:
+            self._set_obs_mode("depth")
+            return
+        why = ""
+        shape = tuple(c.get("image_shape") or ())
+        order = c.get("image_channel_order")
+        if key == IMAGE_KEY_RGB:
+            if self.policy_color_mb is None:
+                why = "this backend wired no C3 colour feed to the policy"
+            elif not (len(shape) == 3 and int(shape[0]) == 3
+                      and int(shape[1]) == int(shape[2]) > 0):
+                why = (f"image_shape {shape} is not (3, R, R) — the colour "
+                       f"builder makes square CHW obs")
+            elif not str(order or "").upper().startswith("RGB"):
+                # The station feeds RGB. A store built straight from
+                # build_dataset.py is BGR on disk; an unknown order is not
+                # assumed (review 2026-10-03, #2).
+                why = (f"training store channel order {order!r} — the "
+                       f"station feeds RGB (needs .zattrs rgb."
+                       f"stored_channel_order 'RGB…')")
+        if key == IMAGE_KEY_RGB and not why:
+            if self._color_builder is not None and not self._color_builder.usable:
+                self._color_builder.reset()      # a fresh adoption per load
+            self._set_obs_mode("rgb", out_res=int(shape[-1]),
+                               optics=c.get("image_optics"))
+            self.bus.log.emit("warn", f"policy: RGB checkpoint — obs "
+                                      f"{IMAGE_KEY_RGB} = the C3 colour frame "
+                                      f"(centre lens). "
+                                      f"{self._color_builder.optics_note}")
+            if self.obs_view_shift_cam_m is not None:
+                self.bus.log.emit(
+                    "info", "policy: OBS VIEW SHIFT (policy.obs_view_forward_m) "
+                            "is a DEPTH re-render — NOT applied to this RGB "
+                            "checkpoint's obs")
+            return
+        if key == IMAGE_KEY_RGB:
+            self._fault = f"unsupported ckpt obs {key!r}: {why}"
+        else:
+            self._fault = (f"unsupported ckpt obs {key or '(none)'!r}: the "
+                           f"station feeds {IMAGE_KEY} or {IMAGE_KEY_RGB}")
+        self.bus.log.emit("error", f"policy: {self._fault} — refusing to fly it")
+        # NOW, not on the 1 s cadence: the last status said ready with no
+        # error, and an ARM inside that second would read it.
+        self._publish_status(force=True, note="unsupported ckpt")
+
+    def _set_obs_mode(self, mode: str, out_res: int = 224, optics=None) -> None:
+        """Switch the image source. The ring is cleared on a change: a depth
+        frame must never pair with a colour one, nor be built by the other
+        builder."""
+        if mode == "rgb":
+            from ..perception.policy_obs import ColorObsBuilder
+            if self._color_builder is None or self._color_builder.out_res != out_res:
+                self._color_builder = ColorObsBuilder(out_res=out_res, optics=optics)
+            else:
+                # The builder outlives a checkpoint swap; its optics note
+                # must not (a naive -> warped swap would keep "NAIVE").
+                self._color_builder.set_optics(optics)
+            builder, key = self._color_builder, IMAGE_KEY_RGB
+        else:
+            builder, key = self._depth_builder, IMAGE_KEY
+        if mode == self._obs_mode and builder is self.builder:
+            return
+        self._ring = deque(maxlen=self.RING_RGB if mode == "rgb" else self.RING)
+        self._last_anchor = None
+        self._frame_pending = False
+        self._first_pending = True
+        # The fault belongs to the builder: a depth grid refused earlier is
+        # still refused when a depth checkpoint comes back.
+        self._grid_fault = ("" if builder.usable or builder.grid_kind == ""
+                            else builder.why)
+        self._grid_fault_said = bool(self._grid_fault)
+        self.builder = builder
+        self._image_key = key
+        self._obs_mode = mode
+        self._depth_kind = builder.grid_kind
+        if mode == "rgb":
+            self.mailbox.set_wanted(False)
+            self.policy_color_mb.set_wanted(True)
+            self._fs_idle()
+        else:
+            if self.policy_color_mb is not None:
+                self.policy_color_mb.set_wanted(False)
+            self.mailbox.set_wanted(True)
+        self.bus.log.emit("info", f"policy: obs image {key} "
+                                  f"({'C3 colour' if mode == 'rgb' else 'depth'})")
 
     # ------------------------------------------------------------------ tick
     def _active(self) -> bool:
@@ -1219,8 +1491,16 @@ class PolicyWorker(TimerWorker):
         # and the old session's close() run inside this slot, with no tick in
         # between to do it.
         self._fs_idle()
-        # 7. FS parity (check_policy's rule, at pick time)
-        if bool(getattr(self.opts, "fstereo", False)):
+        # 7. FS parity (check_policy's rule, at pick time) — only for a
+        # network that consumes depth: an RGB checkpoint's RGB-D training
+        # store still carries a depth_source, and a "FS settings the policy
+        # did NOT train on" warning about a depth it never reads misleads.
+        img_keys = training_image_keys(path)
+        if img_keys is not None and IMAGE_KEY not in img_keys:
+            self.bus.log.emit("info", f"policy: {name}: FS-vs-training parity "
+                                      f"not checked — the checkpoint consumes "
+                                      f"no depth (obs images {img_keys})")
+        elif bool(getattr(self.opts, "fstereo", False)):
             tds = training_depth_source(path)
             if tds.get("status") == "ok":
                 bad = fs_settings_mismatch(self.opts, tds)
@@ -1258,6 +1538,16 @@ class PolicyWorker(TimerWorker):
         self._first_pending = True
         self._last_infer = 0.0
         self._frame_pending = False
+        # The previous network's rate and timings are not this one's: the
+        # SENSORS row and the run meta read them, and on 2026-10-03 an RGB
+        # run's meta carried the depth run's plan_hz 1.94 and its 32 timings
+        # (data/20261003/1003_151227/mpc_151355.meta.json vs mpc_151305).
+        # counters stay cumulative per worker life (ckpt_swaps marks swaps).
+        self._plan_marks.clear()
+        self._hz = 0.0
+        self._infer_ms = float("nan")
+        self._infer_hist.clear()
+        self._pair_dts.clear()
         self.pc["ckpt"] = path
         factory = self._session_factory or make_policy_session
         try:
@@ -1273,9 +1563,10 @@ class PolicyWorker(TimerWorker):
             self._publish_status(force=True, note="ckpt failed")
             return
         self.session.start_async(on_log=self._say)
-        # The stub is ready synchronously (contract checked here); a real
-        # checkpoint's mount is checked when tick() first sees it ready.
-        self._check_mount()
+        # The stub is ready synchronously (its contract is adopted here); a
+        # real checkpoint's when tick() first sees it ready.
+        if self.session.ready:
+            self._on_ready()
         self.counters["ckpt_swaps"] += 1
         self._ckpt_note = ""
         # --record-depth: the recorder stays armed across the swap (same run
@@ -1319,22 +1610,13 @@ class PolicyWorker(TimerWorker):
             self._publish_status(note="loading" if s.loading else "not ready")
             return
         if not self._said_ready:
-            self._said_ready = True
-            self.ready_after_s = now() - self._t_setup
-            d = s.describe()
-            self._ckpt_sha1 = str(d.get("ckpt_sha1_head", "") or "")
-            self._check_mount()
-            self._note_rec_ready()
-            # The session logs its own load/warm-up numbers (they are
-            # assigned a moment AFTER `ready` flips, so reading them here
-            # would print nan); this line is the worker's clock.
-            self.bus.log.emit(
-                "info", f"policy: READY after {self.ready_after_s:.1f} s "
-                        f"(obs_dt {self._obs_dt() * 1e3:.1f} ms, fps source: "
-                        f"{s.contract.get('fps_source', '?')}; action "
-                        f"{self._action_repr() or '?'}; mount "
-                        f"{'ok' if self._mount_ok else 'MISMATCH'}; sha1 "
-                        f"{self._ckpt_sha1 or '-'})")
+            self._on_ready()
+        if self._fault:
+            # An unsupported checkpoint (_adopt_obs_contract): no obs is built
+            # and no forward runs; the status carries the fault as `error`.
+            self._fs_idle()
+            self._publish_status(note="unsupported ckpt")
+            return
         if not self._active():
             self._fs_idle()
             self._first_pending = True
@@ -1342,7 +1624,7 @@ class PolicyWorker(TimerWorker):
             return
         t = now()
         period = float(self.pc.get("period_s", 0.5))
-        gate = self.fs_gate
+        gate = self._gate()
         if gate is not None and gate.mode == "only":
             if self._burst is not None or not self._only_blocked():
                 # The heartbeat `only` keys on: while these calls keep coming
@@ -1386,6 +1668,44 @@ class PolicyWorker(TimerWorker):
             return
         if self._infer_once(t):
             self._last_infer = t
+
+    def _on_ready(self) -> None:
+        """Once per session, the first time it is seen READY: identity,
+        mount, the obs contract (which image to feed, or a fault), the
+        recorder's extras — and only THEN may the status say ready
+        (``_publish_status`` reads ``_said_ready``): a status that said
+        ready before the contract was adopted could be armed on (safety
+        review 2026-10-03, #4). Called from tick(), and from setup() /
+        set_ckpt() for a session that is ready synchronously (the stub)."""
+        s = self.session
+        self._said_ready = True
+        self.ready_after_s = now() - self._t_setup
+        d = s.describe()
+        self._ckpt_sha1 = str(d.get("ckpt_sha1_head", "") or "")
+        self._check_mount()
+        try:
+            self._adopt_obs_contract()
+        except Exception as e:                                   # noqa: BLE001
+            # Never retried (_said_ready is set): fail CLOSED, or this would
+            # be the pre-2026-10-03 READY-with-zero-plans state again.
+            self._fault = f"obs contract: {type(e).__name__}: {e}"
+            self.bus.log.emit("error", f"policy: {self._fault} — refusing to "
+                                       f"fly it")
+        self._note_rec_ready()
+        # The session logs its own load/warm-up numbers (they are
+        # assigned a moment AFTER `ready` flips, so reading them here
+        # would print nan); this line is the worker's clock.
+        self.bus.log.emit(
+            "info", f"policy: READY after {self.ready_after_s:.1f} s "
+                    f"(obs_dt {self._obs_dt() * 1e3:.1f} ms, fps source: "
+                    f"{s.contract.get('fps_source', '?')}; action "
+                    f"{self._action_repr() or '?'}; mount "
+                    f"{'ok' if self._mount_ok else 'MISMATCH'}; obs "
+                    f"{self._contract_image_key or '?'}"
+                    f"{' REFUSED' if self._fault else ''}; sha1 "
+                    f"{self._ckpt_sha1 or '-'})")
+        self._publish_status(force=True,
+                             note="unsupported ckpt" if self._fault else "")
 
     def _fs_idle(self) -> None:
         """No policy mission is running here: tell the gate (under `only`
@@ -1506,6 +1826,16 @@ class PolicyWorker(TimerWorker):
         st = self._state
         return st is None or st.eta_start is None
 
+    def _fs_process_tag(self) -> str:
+        """Where FoundationStereo ran, for the plan record: "child"
+        (--fstereo-process) / "in-station"; "" when this run's depth is not
+        FoundationStereo — the same condition as :meth:`_fs_input_tag`, so a
+        demo or device-depth plan does not claim a layout it never used."""
+        if not self._fs_input_tag():
+            return ""
+        return ("child" if bool(getattr(self.opts, "fstereo_process", False))
+                else "in-station")
+
     def _fs_input_tag(self) -> str:
         """FoundationStereo's network input as asked for on the command line,
         for the plan record: "size WxH itN" (an explicit size governs) else
@@ -1514,6 +1844,8 @@ class PolicyWorker(TimerWorker):
         run meta (fstereo.*), not here."""
         if self.fs_gate is None and self.fstereo_meta_fn is None:
             return ""
+        if self._obs_mode == "rgb":
+            return ""                   # the network consumed no FS depth
         iters = getattr(self.opts, "fstereo_iters", None)
         try:
             it = f" it{int(iters)}" if iters is not None else ""
@@ -1535,7 +1867,10 @@ class PolicyWorker(TimerWorker):
             return "skip_grid"
         if not self._ring:
             return "skip_no_depth"
-        t_d = self._ring[-1]["t"]
+        anchor = self._anchor()
+        if anchor is None:
+            return "skip_fix_lag"
+        t_d = anchor["t"]
         if now() - t_d > float(self.pc.get("obs_max_age_s", 0.6)):
             return "skip_stale_depth"
         if self.hist is None or len(self.hist) == 0:
@@ -1556,9 +1891,21 @@ class PolicyWorker(TimerWorker):
         from ..control.policy_frames import lowdim_obs
 
         obs_dt = self._obs_dt()
-        newest = self._ring[-1]
+        newest = self._anchor()
+        if newest is None:
+            self.counters["skip_fix_lag"] += 1
+            self._publish_status(note="skip_fix_lag")
+            return False
+        if self._obs_mode == "rgb" and newest is self._last_anchor:
+            # A fix stall: colour frames keep arriving but the anchor (the
+            # newest fix's frame) has not moved — the same observation would
+            # be planned again. Not a forward, so the period is not burnt.
+            self.counters["skip_same_obs"] += 1
+            self._publish_status(note="skip_same_obs")
+            return False
         t_d = newest["t"]
-        partner, how = self._pick_pair(obs_dt, allow_dup=self._first_pending)
+        partner, how = self._pick_pair(obs_dt, allow_dup=self._first_pending,
+                                       newest=newest)
         if partner is None:
             self.counters["skip_pair"] += 1
             self._publish_status(note="skip_pair")
@@ -1581,6 +1928,7 @@ class PolicyWorker(TimerWorker):
             return False
         t_prev, t_now = float(info["t_prev"]), float(info["t_now"])
         st = self._state
+        self._last_anchor = newest      # the forward is going ahead (RGB rule)
         # FS SCHEDULE (2026-10-01; perception/fs_gate.py). Past the three
         # pre-forward skips above the network WILL be asked, so this is where
         # FoundationStereo is told not to start another frame: the observation
@@ -1590,8 +1938,9 @@ class PolicyWorker(TimerWorker):
         # exception from the unguarded lines between them — because a tick
         # exception is swallowed by TimerWorker._tick and nobody else would;
         # the gate's own lease is the backstop, not the plan. `fs_gate` None
-        # (the default) makes no call at all.
-        gate = self.fs_gate
+        # (the default) makes no call at all — nor does an RGB checkpoint
+        # (_gate: FoundationStereo makes nothing it consumes).
+        gate = self._gate()
         fs_wait_ms = None
         fs_timed_out = None
         if gate is not None:
@@ -1609,7 +1958,7 @@ class PolicyWorker(TimerWorker):
             w_now = self._width_at(t_now)
             lowdim = lowdim_obs(eta_prev, eta_now, st.eta_start, self.T_bt,
                                 w_prev, w_now)
-            obs = {IMAGE_KEY: img}
+            obs = {self._image_key: img}
             obs.update(lowdim)
             if gate is not None:
                 # NOT inside infer_ms (the session times its own forward):
@@ -1656,7 +2005,8 @@ class PolicyWorker(TimerWorker):
             fs_wait_ms=(float(fs_wait_ms) if fs_wait_ms is not None else None),
             fs_wait_timeout=(bool(fs_timed_out) if fs_timed_out is not None
                              else None),
-            fs_input=self._fs_input_tag(), stamp=t_emit)
+            fs_input=self._fs_input_tag(),
+            fs_process=self._fs_process_tag(), stamp=t_emit)
         self.bus.policy_plan.emit(plan)
         self._publish_status(force=True, note=f"plan {self._plan_id} ({how})")
         return True
@@ -1699,8 +2049,11 @@ class PolicyWorker(TimerWorker):
         self._last_status_pub = t
         s = self.session
         n_skip = sum(v for k, v in self.counters.items() if k.startswith("skip_"))
+        g = self._gate()
         st = PolicyStatus(
-            ready=bool(s is not None and s.ready),
+            # Ready only once the contract is ADOPTED (_on_ready), never on
+            # the session's own flag alone (safety review 2026-10-03, #4).
+            ready=bool(s is not None and s.ready and self._said_ready),
             loading=bool(s is not None and s.loading),
             error=(s.error if s is not None and s.error else self._fault),
             hz=float(self._hz), infer_ms=float(self._infer_ms),
@@ -1723,8 +2076,8 @@ class PolicyWorker(TimerWorker):
                   else str(self.pc.get("ckpt", "") or "")),
             ckpt_sha1=str(self._ckpt_sha1),
             ckpt_note=str(self._ckpt_note),
-            fs_schedule=(self.fs_gate.mode if self.fs_gate is not None
-                         else "free"),
+            # The EFFECTIVE schedule: an RGB checkpoint has none (_gate).
+            fs_schedule=(g.mode if g is not None else "free"),
             conn=self._conn(), stamp=t)
         self.bus.policy_status.emit(st)
         detail = self._sensor_detail(st)
@@ -1771,7 +2124,9 @@ class PolicyWorker(TimerWorker):
         """The policy block of the run record (``mpc.policy_meta_fn``).
         Plain fields only — called from the controller's thread."""
         s = self.session
-        b = self.builder
+        # One snapshot of the obs source (read from the controller's thread;
+        # a swap on the worker thread must not tear these three apart).
+        b, obs_key, obs_mode = self.builder, self._image_key, self._obs_mode
         _rec = self.depth_rec          # snapshot; see "depth_record" below
         pc = dict(self.pc)
         stub = bool(s is not None and s.describe().get("stub", False))
@@ -1787,6 +2142,8 @@ class PolicyWorker(TimerWorker):
                        "ckpt", "ckpt_sha1_first_8mib", "measured_hz")}
                 rig = fs_all.get("rig") or {}
                 fs["alpha"] = rig.get("alpha") if isinstance(rig, dict) else None
+                proc = fs_all.get("process") or {}
+                fs["process"] = proc.get("mode") if isinstance(proc, dict) else None
             except Exception as e:                               # noqa: BLE001
                 fs = {"error": f"{type(e).__name__}: {e}"}
         out = {
@@ -1803,6 +2160,19 @@ class PolicyWorker(TimerWorker):
             "policy_block_source": self.policy_block_source,
             "session": s.describe() if s is not None else {"error": self._fault},
             "obs": b.describe() if b is not None else None,
+            # WHICH IMAGE the network was fed (2026-10-03): the depth recipe,
+            # or the C3 colour frame for an RGB checkpoint — a RECORD
+            # BOUNDARY; `obs.optics` says what the RGB obs is not.
+            "obs_image_key": obs_key,
+            "obs_mode": obs_mode,
+            "obs_contract_image_key": self._contract_image_key,
+            # policy.obs_view_forward_m is a DEPTH re-render: configured but
+            # not applied to an RGB checkpoint's obs (None = not configured or
+            # a depth run, where obs.view_shift says what was applied).
+            "view_shift_configured_not_applied_m": (
+                pc.get("obs_view_forward_m") if obs_mode == "rgb" else None),
+            "color_mailbox": (self.policy_color_mb.counters()
+                              if self.policy_color_mb is not None else None),
             "depth_src": self._depth_kind,
             "depth_scale_applied": (float(getattr(self.opts, "depth_scale",
                                                   DEVICE_DEPTH_SCALE_DEFAULT)
@@ -1845,9 +2215,16 @@ class PolicyWorker(TimerWorker):
                 "requested": {"iters": getattr(self.opts, "fstereo_iters", None),
                               "scale": getattr(self.opts, "fstereo_scale", None),
                               "size": getattr(self.opts, "fstereo_size", None),
-                              "alpha": getattr(self.opts, "fstereo_alpha", None)},
+                              "alpha": getattr(self.opts, "fstereo_alpha", None),
+                              "process": ("child" if bool(getattr(
+                                  self.opts, "fstereo_process", False))
+                                  else "in-station")},
                 "worker": fs,
-                "training": training_depth_source(pc.get("ckpt", "")),
+                "training": (
+                    {"status": "not_consumed",
+                     "why": "RGB checkpoint: the network reads no depth"}
+                    if obs_mode == "rgb"
+                    else training_depth_source(pc.get("ckpt", ""))),
                 "allow_mismatch": bool(getattr(self.opts, "policy_allow_fs_mismatch",
                                                False)),
             },
@@ -1869,7 +2246,10 @@ class PolicyWorker(TimerWorker):
                 "tol": PAIR_TOL, "fallback_max": PAIR_FALLBACK,
                 "skip_fix_lag": int(self.counters["skip_fix_lag"]),
                 "fix_lag_tol": FIX_LAG_TOL,
-                "trigger": ("depth-frame arrival after period_s"
+                "trigger": ("colour-frame arrival after period_s, built "
+                            "around the newest fix's frame (RGB checkpoint)"
+                            if obs_mode == "rgb" else
+                            "depth-frame arrival after period_s"
                             if getattr(self.fs_gate, "mode", "free") != "only"
                             else f"{BURST_FRAMES} frames requested from "
                                  f"FoundationStereo ahead of period_s "
@@ -1913,10 +2293,15 @@ class PolicyWorker(TimerWorker):
         (an exception replaces the whole policy block with an error line)."""
         gate = self.fs_gate
         requested = str(getattr(self.opts, "policy_fs_schedule", "free") or "free")
-        effective = str(getattr(gate, "mode", "free")) if gate is not None else "free"
+        rgb = self._obs_mode == "rgb"
+        effective = ("free" if rgb or gate is None
+                     else str(getattr(gate, "mode", "free")))
         out = {
             "requested": requested, "effective": effective,
             "why": ("" if requested == effective else
+                    "RGB checkpoint: FoundationStereo makes nothing the "
+                    "network consumes, so no schedule applies (it runs free "
+                    "for the depth panel)" if rgb else
                     "no FoundationStereo worker feeds this policy (demo source "
                     "or device depth): there is nothing to schedule, so the "
                     "run is `free`" if gate is None else
@@ -1943,6 +2328,8 @@ class PolicyWorker(TimerWorker):
         # order): leave the gate open behind it.
         self._fs_idle()
         self.mailbox.set_wanted(False)
+        if self.policy_color_mb is not None:
+            self.policy_color_mb.set_wanted(False)
         self.enabled = False
         if self.depth_rec is not None:
             # close() is idempotent and bounded (CLOSE_TIMEOUT_S ~ 1 s, well
@@ -1963,4 +2350,5 @@ class PolicyWorker(TimerWorker):
 __all__ = ["PolicyWorker", "rect_left_grid_from_rig", "training_depth_source",
            "fs_settings_mismatch", "effective_fstereo_ckpt", "hydra_config_for",
            "PAIR_TOL", "PAIR_FALLBACK", "FIX_LAG_TOL", "STATE_STALE_S",
-           "IMAGE_KEY"]
+           "IMAGE_KEY", "IMAGE_KEY_RGB", "COLOR_FIX_MATCH_S",
+           "training_image_keys"]

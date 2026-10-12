@@ -47,7 +47,9 @@ MAX_SENSOR_ROWS = 10
 # them in arrival order put them past the cap, so on 2026-08-21 an operator
 # watched nine mapped tags outlined in the video with no position on the plot
 # and no row on screen saying which gate had rejected them.
-SENSOR_ORDER = ("Leak", "Enclosure", "TagNav", "Object", "Pose (C3)",
+# "DVL" sits with the other estimator inputs (2026-10-01): with a DVL
+# switched IN it is one of the three instruments the vehicle is flying on.
+SENSOR_ORDER = ("Leak", "Enclosure", "TagNav", "DVL", "Object", "Pose (C3)",
                 "IMU (ROV)", "IMU (C3)", "Barometer", "Compass", "EKF",
                 "Heartbeat", "MPC", "GPS")
 

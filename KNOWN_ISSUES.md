@@ -6,11 +6,279 @@
 
 ## ⚠️ 운용 안전
 
+### MPC_Tuned 프로필 도입 후 **peg 부력 trim이 두 군데**에 있다 — hw_mpc.yaml만 고치면 mpc_tuned는 그대로 −12 N (2026-10-04)
+- **증상**: mpc_tuned(·_7d)는 프로필을 쥔 동안 `apply.vehicle_net_buoyancy_n`을 날고(기본 `20261004_default` = **−12 N, peg 장착**),
+  PID·mpc는 hw_mpc.yaml `vehicle_net_buoyancy_n`을 난다. peg를 빼고 hw_mpc.yaml만 0.1로 고치면 **PID는 맞고 mpc_tuned는 여전히
+  peg 무게만큼(~12 N) 위로 미는 feedforward**를 낸다 — hw_mpc.yaml 주석대로 약 6 cm 높게 hold [유도: 그 주석, 미실측].
+  hw_mpc.yaml `mpc_tuned:` 블록과 `policy.q_scale/along_scale`도 같은 이유로 mpc_tuned에는 안 먹는다.
+- **임시 대응**: 두 값이 다르면 tune 행이 **WARN**("vehicle_net_buoyancy_n … ≠ hw_mpc.yaml … — is the payload the same?")을
+  띄운다(2026-10-04 안전 리뷰 반영) — 경고일 뿐 막지는 않는다. peg 유무를 바꿀 때 그 상태로 저장한 프로필을 고르거나
+  `--mpc-tune none`으로 기동. 프로필 이름에 payload를 적는다(예: `..._nopeg`). 기록은 meta `controller.mpc_tune.warnings`·`heave_trim`.
+- **제대로 고치는 법**: payload(peg 유무)를 프로필이 아닌 **세션 상태**(패널 토글 + 한 곳의 값)로 빼서 PID·mpc·mpc_tuned가 같은
+  trim을 읽게 하거나, 프로필의 trim을 hw_mpc.yaml과 다를 때 START에서 확인 받게 한다. 운용자가 2026-10-04에 "trim도 프로필로
+  적용"을 골랐으므로 바꾸려면 운용자 결정이 필요.
+- **관련 테스트 실패(기존)**: `test_path_cost.py::test_net_buoyancy_is_validated_and_recorded`는 `|vehicle_net_buoyancy_n| ≤ 2`이고
+  land_dp.yaml과 같은 값이라고 단언한다 — 2026-10-01 peg 값 −12 N 이후 계속 실패(land_dp.yaml은 0.1). 테스트 단언을 peg 상태에
+  맞게 고치거나 payload를 위처럼 분리하면 같이 풀린다.
+
+### 논문식 EKF(`rl_ekf.py`, 패널 EST 버튼)가 **실기 미검증** — "논문 = robot_localization"은 추론, 잡음·입력 선택은 [예측] (2026-10-02)
+- **상태**: `rov_gui/control/rl_ekf.py`는 robot_localization `ekf_localization_node`(noetic @ 9ef26a57)를 옮긴 것이고,
+  기본 켜짐·shadow다. `test_rl_ekf.py` 38/38, `demo_e2e_ekf.py`(실제 창), 합성 비교 `sim_ekf_compare.py`, r_l 독립
+  재전사와의 대조(상태 차이 ≤ 5.5e-14)는 **논리**만 고정한다. 수중 런 0회. 안전 감사 FAIL → 수정 → 재감사 2회 PASS_WITH_FIXES(README 참조).
+- **비교의 의미**: 논문 launch 파일은 미공개다. 이 EKF는 "논문의 EKF"가 아니라 "r_l 기본값 + 이 리포의 선택(태그 x,y,yaw /
+  IMU roll,pitch,각속도,가속도 / 수심 z / DVL vx,vy, mavros IMU 잡음)"이다. 결과를 논문 재현이라고 인용하지 말 것.
+- **r_l 기본 지연 처리(smooth_lagged_data false)는 위치가 속도 × 태그 지연만큼 뒤처진다** [예측: 합성
+  `rov_gui/tests/fixtures/sim_ekf_compare_20261002.txt`, 0.3 m/s에서 33 mm rms]. EST EKF로 날면 이 지연이 제어 루프에 들어간다.
+  비교용으로 `smooth_lagged_data: true, history_length_s: 1.0`도 날려 볼 것(또는 `ekf_replay --set`).
+- **mavros IMU 잡음은 가속도계를 거의 완전히 믿는다**(stdev 0.0003): 바이어스 0.1 m/s², DVL 없으면 속도 오차 15 cm/s
+  [예측: 같은 파일]. 기체 SCALED_IMU2의 바이어스는 미측정. 속도 발산 인터록(15 cm/s, 0.25 s)이 런을 끝내지만 그 전에
+  D항·EAOB에 들어간다.
+- **IMU·수심 스탬프는 호스트 도착 시각**이다(ATTITUDE 측정 시각 아님 — assembler와 같은 한계). 수십 ms 늦음이 미보정.
+- **태그 소실(station hold)이면 EKF 런은 끝난다** — bridge가 EKF 런을 실어 나르지 않는다(안전 감사 치명 수정). 음의 부력
+  기체는 disengage 후 가라앉는다. 논문처럼 IMU+DVL로 다리를 놓으려면 별도 설계·감사가 필요하다.
+- **"여기" 타깃은 태그 상태에서 정해진다**(engage hold, 미션 원점, replay fallback). engage/전환 때 5 cm / 3° 일치를
+  요구하지만, 미션 도중의 새 원점은 그 순간의 EKF−태그 차이(최대 15 cm / 10°)만큼 계단 입력이 된다.
+- **정책(DP) 미션**: 정책의 proprio·앵커는 태그 상태로 계속 계산되고 EKF로 나는 추종자와 cm 단위로 어긋날 수 있다(`_policy_bridged`는
+  EKF 비행을 bridged로 보지 않는다).
+- **EKF 비행에는 별도 권한 상한이 없다**(imu_dr의 `axis_cap_dr` 같은 것). 인터록 한계값 전부 [예측] — 특히 속도 한계
+  15 cm/s는 yaml 자신의 예측(바이어스 0.1, DVL 없음 → 15 cm/s)과 같은 값이라 정상 바이어스에서도 trip할 수 있고, 속도 차이엔
+  heave(아래 보는 카메라의 광축 = PnP가 가장 나쁜 축의 FD)가 들어 있다(재감사 2026-10-02). 입수 전에 기록된 런을 `ekf_replay`로
+  돌려 `_ekf_vs_tag` 채널별 분포를 산출하고 그 산출물로 한계를 정할 것. 오탐은 안전 방향(disengage)이지만 depth hold를 잃는다.
+- **가속도계가 죽어도 최대 1 s는 EKF가 ok다**(첨부 규칙 0.3 s와 freshness 1.0 s 사이 — SCALED_IMU2가 2–3 Hz일 때
+  게이트가 깜빡이지 않게 한 값). 그동안 가속도 상태는 마지막 값으로 고정돼 속도로 적분되고, 잡는 건 속도 게이트(LP 0.5 s)뿐이다
+  (0.3 m/s 오차를 ~0.6 s에 [유도]). SCALED_IMU2 실측 rate를 보고 `acc_s`를 조정할 것.
+- **DVL의 샘플별 판정은 EKF에 적용되지 않는다**: EKF는 run 단위 자격(`_dvl_run_ok` / `refusal`)과 trip만 보고, assembler가
+  tick마다 하는 innovation hold·stale·lock 판정은 안 본다(r_l처럼 `valid`만). 0.15 m/s 미만의 false lock은 trip(~1 s 지속)
+  전까지 들어간다. DVL 미장착이라 잠복. 실장치 covariance 대각은 정지에서 ≈ 8e-7 m²/s²(σ ≈ 0.9 mm/s) [측정:
+  data/20261011/1011_155235_dvl_probe/station_client_live.json first_sample]이고 `dvl_rejection_threshold` 기본은 None이라,
+  opt-out(장착값 설정 + `require_proven: false`)에서는 기체에 안 붙은·false lock DVL의 ~0 속도가 **매우 높은 가중치**로 융합된다.
+- **engage 직후 과도**: `set_engaged`의 `asm.reset()`으로 assembler 속도가 ~2 프레임 0에서 다시 시작해 속도 채널이 |nu_ekf|를
+  읽는다(trip은 engage 속도 ~0.37 m/s 이상에서만 [유도]); z_source pressure면 z offset 재보정으로 EKF z가 1–2 샘플 어긋난다.
+- **replay는 콜드 스타트**(CSV 첫 행부터)이고 CSV `t`의 0.1 ms 반올림 때문에 가끔 한 행이 다르다 — 변형은 "replay(라이브 설정)"과 비교할 것.
+- **제대로 고치는 법**: 첫 수중 세션은 shadow로 날며 `ekf_*` 열과 `est` 확인 → SCALED_IMU2 정지 바이어스 측정 →
+  `ekf_replay`로 smoothing on/off·IMU 잡음 변형 비교 → 그다음에 EST EKF로 짧은 station hold.
+
+### DVL 경로(`--dvl`) 전체가 **실기 미검증** — 장착값 null, 임계값 전부 [예측], 지연·잡음 미실측 (2026-10-01)
+- **상태**: `rov_gui/control/dvl.py` · `backends/dvl.py` · station bridge의 `dvl` 단은 DVL A50이 장착되기 **전에**
+  프로토콜 문서와 벤더 데모 장치 캡처(`rov_gui/tests/fixtures/dvl_a50_demo_capture_20261001.jsonl`)만 보고 썼다.
+  `rov_gui/tests/test_dvl.py` 96/96, `demo_e2e_dvl.py`, 합성 타이밍 시뮬레이션 `sim_dvl_monitors.py`는 논리를
+  고정할 뿐 이 기체·이 풀에 대한 근거가 아니다.
+  기본 OFF(`hw_mpc.yaml dvl.enabled: false`)라 켜지 않으면 추정 경로는 이전과 비트 단위로 같다.
+- **모르는 것**: (1) 장착 `mount_rpy_deg` / `mount_t_flu` — null, 재기 전에는 IN이 거부된다. (2) `stale_s 0.6`,
+  `fom_max 0.05`, `reentry_s 0.5`, `a_max_m_s2 2.0`, `innov_max_m_s 0.15`, `agree_*`, `station_bridge.dvl_hold_s 10`
+  / `dvl_max_speed_m_s 0.3` / `dvl_max_disp_m 0.5` — 전부 [예측]. (3) 실제 지연과 속도 잡음. 2026-10-11 첫 장치
+  읽기(정지, 물 담은 용기, 고도 0.083 m)에서 `tot − tov` 80.5–113.9 ms [측정: data/20261011/1011_155235_dvl_probe/
+  dvl_lines_A.jsonl] — 그러나 `time` 필드가 **다음** tov 간격과 맞고 모든 연속 쌍에서 tot[i] > tov[i+1]이라, tov가
+  한 ping(~80 ms) 늦은 스탬프일 수 있다(그러면 실제 처리 지연 3–30 ms이고 `DeviceClock`의 t_valid·나이가 ~80 ms 과대)
+  [유도: 같은 파일, 그 폴더 analysis/]. 이동 시험에서 proof의 `lag_s`(태그 대비)로 판별할 것. 이동 중 잡음은 미측정
+  (정지 fom ≈ 1 mm/s뿐). (4) 얕은 풀(고도 < 1 m), 태그 매트 바닥, 벽 반사
+  (multipath), 추진기 기포에서 bottom lock이 유지되는지, false lock이 `velocity_valid`/fom으로 걸러지는지 — 용기 속 정지
+  캡처는 샘플 게이트를 150/150 통과했다(벽·다중반사 lock도 샘플 수준에서는 "좋은 데이터"다; 판정은 proof만 한다).
+  (5) **착저하면 고도 < 5 cm로 lock을 잃는다** — 정책 런이 바닥에 앉는 문제(2026-09-14)와 겹친다. (6) 장치
+  `mounting_rotation_offset`이 **180**이다(2026-10-11, 같은 폴더 api/config.json) — 장치가 velocity·DR을 Z축 180° 돌려
+  낸다. README "장착" 절의 "LED 앞 → `mount_rpy_deg: [0, 0, 0]`"은 장치 offset 0을 전제하므로, LED 앞 장착 + 장치 180 +
+  그 레시피면 surge·sway 부호가 **둘 다** 뒤집히고 설정 단계 검사(yaw 중복 error)는 못 잡는다(proof만 잡는다).
+  `state.py` DvlSample docstring의 "x forward = the LED edge"도 이 설정에선 틀리다. README "풀에서 처음 켤 때"
+  2단계도 로그의 `mounting_rotation_offset`이 **0**인지 확인하라고 한다(스테이션 관례 = 회전은 `mount_rpy_deg`). 그런데
+  BlueOS 확장 → ArduSub 경로는 장치 offset만 쓰므로, LED 뒤 장착이면 장치 180 + `mount_rpy_deg` yaw 0이 두 경로를 다 맞춘다
+  (스테이션은 둘 다 0이 아닐 때만 error — `workers.py` `on_dvl_info`). LED 앞 장착이면 장치 0 + yaw 0으로 둘 다 단순.
+  장치는 roll/pitch 장착은 보정하지 않는다 [스펙].
+  음속도 기본 1475 m/s(≈ 17.7 °C 담수) — 거리·속도가 c_set/c_true로 축척되므로 풀 수온 값으로 맞출 것 [유도].
+  (7) `rl` / `rl_pwm`에 DVL 속도를 먹였을 때의 거동(학습 분포 밖).
+  (8) BlueOS DVL extension이 같은 DVL로 **ArduSub EKF3를 보조**한다(VISION_POSITION_DELTA 12 Hz, "EKF3 IMU0 started
+  relative aiding" — 같은 폴더 mavlink2rest_*.json). DVL이 기체에 고정·정렬되기 전에는 ArduSub의 위치·고도 기반 모드
+  (POSHOLD, 패널 DEPTH = ALT_HOLD)가 기체와 무관한 속도를 쓴다. 확장을 끄면 prearm이 "VisOdom: not healthy" 등으로
+  거부할 수 있다 [예측: SYS_STATUS VISION_POSITION 비트 — AP_Arming 미확인].
+- **설계상 한계 (리뷰 6회, 2026-10-02에서 확인, 미해결)**:
+  - **false lock이 길면 trip이고, 그 trip도 재검증을 요구한다.** +14 cm/s × 1 s 또는 +10 cm/s × 2 s면 trip(한 번이든
+    10 s마다든); +10 cm/s × 1 s, +14 cm/s × 0.5 s, 리포트 4개 이하는 trip하지 않는다 [예측: `rov_gui/tests/fixtures/
+    sim_dvl_monitors_20261002.txt` A5b]. 의도한 동작이다(없는 운동을 1초 보고하는 DVL로는 날 수 없다). 다만 그런
+    trip은 장착과 무관한데도 검증을 버리고 새 검증 pass를 요구한다 — 풀 벽 근처에서 false lock이 잦으면 매번 재검증
+    해야 한다. 닫으려면 "DVL만 움직인" 차이 trip은 래치만 걸고 검증은 남기도록 trip을 둘로 나눈다(미구현). 경계값은
+    전부 [예측].
+  - **글리치와 잡음은 trip 대신 hold로 DVL을 뺀다 — 잦으면 그만큼 DVL 없이 난다.** 3 s마다 4-리포트 글리치면 정지 중
+    DVL로 난 tick이 39–60 %, DVL 잡음 2.5 cm/s면 정지 중 48 %, 3 cm/s 이상이면 거의 검증되지 않아 OUT에 머문다 [예측:
+    같은 출력 파일 A5]. hold가 걸리고 풀릴 때마다 속도원이 바뀐다(두 값의 차는 잡음 수준). 래치는 없다.
+  - **수직축 미검증 → heave 속도는 DVL을 쓰지 않는다.** 검증이 surge·sway만 보기 때문. 닫으려면 baro depth rate
+    (또는 태그 z 차분) ↔ DVL vz의 1-D 회귀를 추가하고 상하 pass로 부호·스케일을 확인한 뒤에만 `nu[2]`를 교체.
+  - **장착 기울기(roll/pitch)와 lever arm은 검증도 감시도 보지 못한다.** pitch 오차 e는 한 행을 cos e배 할 뿐이라
+    ~37°까지 통과하고 [유도], lever arm 오차 δr은 ω × δr로 들어가 yaw 중에만 나타난다. `mount_t_flu: [0, 0, 0]`도
+    "측정됨"으로 통과한다. 줄자가 유일한 방어. 틀린 팔이 만드는 가짜 속도는 DVL만 보는 운동이어서 "DVL만 움직인 것은
+    장착 증거가 아니다" 규칙(`COHERENT_MIN`)이 일부러 무시한다: 합성 시뮬레이션에서 0.3 rad/s yaw sweep 중 팔 3 cm,
+    10 cm 오차 모두 trip 0/36 [예측: `rov_gui/tests/fixtures/sim_dvl_monitors_20261002.txt` A4] — 10 cm 오차면
+    yaw 중 3 cm/s의 가짜 sway가 그대로 추정기에 들어간다 [유도: 0.3 rad/s × 0.1 m]. 제자리 yaw pass에서 r_z를
+    회귀 변수로 넣으면 수평 arm 두 성분은 식별 가능(미구현).
+  - **검증 적합이 DVL 잡음을 무시한다.** 약한 축 excitation이 문턱(2.5 cm/s) 근처이고 DVL 잡음이 ≥ 1.25 cm/s면
+    기울기가 0.75 아래로 줄어 맞는 장착이 "스케일 1.33×"로 반박될 수 있다 [유도]. 합성 시뮬레이션에서 DVL 잡음
+    1–2 cm/s는 문제없고, 3 cm/s면 검증이 거의 성립하지 않으며(정지·5 cm/s 운동 6런 중 1런), 5 cm/s면 0 [예측: 같은
+    출력 파일 A5] — 그 정도로 시끄러운 DVL은 사실상 IN이 안 된다(결과는 안전하지만 이유 표시는 "스케일"이라 오해를
+    부른다). 장치가 보내는 covariance(파싱만 하고 미사용)나 DVL 연속 샘플 차분으로 잡음 분산을 빼면 구조적으로
+    해결. 지금은 "더 빨리, 직선으로 움직여라"가 대응. 잡음이 사상을 0.8 아래로 끌어내리면(`gain_min` <
+    `COHERENT_MIN`) "장착에 대해 아무것도 말하지 않는다"로 분류돼 trip 대신 hold — **DVL 잡음 자체를 trip으로 잡는
+    감시는 없고**, 걸러 주는 것은 [예측] 값인 `fom_max`와 hold뿐이다. 같은 이유로 **1.25× 이상의 순수 스케일 오차**
+    (예: 음속 설정 오류)도 trip이 아니라 hold다.
+  - **두 계측기의 스탬프 어긋남 δ에 검증과 감시가 둘 다 민감하다.** 둘 다 태그 차분과 DVL 속도를 스탬프로 짝짓기
+    때문. 속도 벡터가 ω로 도는 운동(surge·sway가 위상차를 갖는 타원)에서 δ는 겉보기 회전 ω·δ가 된다 [유도].
+    합성 시뮬레이션에서 태그 스탬프 50 ms 오차 + 0.5–1.5 Hz 타원 진동은 **올바른 장착을 trip**시켰다(50 ms 2–3/36,
+    100 ms 8/36, 150 ms 8/36; 직선 운동에서는 0건) [예측: 같은 출력 파일 A4]. 대응: 검증 pass는 직선 두 번으로,
+    그리고 `mount PROVEN` 로그의 `lag_s`(δ의 하한 추정 — 0 쪽으로 치우친다)가 수십 ms를 넘으면 IN 전에 스탬프부터
+    고친다. 카메라 `t_capture`와 DVL `time_of_validity` 매핑(DeviceClock의 최소지연 가정) 어느 쪽이 틀렸는지는
+    `lag_s`만으로는 구별되지 않는다.
+  - **opt-out(`require_proven: false`)에서 비행 중 감시가 못 잡는 틀린 장착**: ① station keeping(1–2 cm/s)의 모든 틀린
+    장착과 ~2 cm/s rms 미만으로 움직이는 반전 축(DVL 잡음 2 cm/s면 alignment hold로 틀린 DVL로 난 tick이 66–86 %로
+    줄 뿐), ② **다른 축에서 14.5° 이내의 직선 운동에서의 반전 축 — 속도와 무관**(20+3.5 cm/s 직선, 30+7.5 cm/s 동위상
+    0.5 Hz 모두 NEVER; 직선 운동에서 축 반전은 운동 방향 각도의 2배 회전과 구별되지 않는다 [유도]), ③ ~15 cm/s 미만
+    에서의 30° 이하 회전, ~8 cm/s 미만에서의 2× 스케일 [예측: 같은 출력 파일 B의 NEVER 칸; ③은 차이 벡터 문턱
+    8 cm/s에서 유도]. 기본값(`true`)에서는 전부 사전 검증에 걸린다(②는 검증이 아예 성립하지 않는다). ②의 속도
+    오차는 반전된 축 속도의 2배라 작지 않다. 그 시뮬레이션은 개루프라, 부호가 틀린 피드백이 폐루프에서 운동을 키워
+    직선성을 깨고 감시에 드러나는지는 모른다. opt-out은 검증 pass를 건너뛰는 편의이지 안전 장치가 아니다. trip은
+    하지 않아도 적합이 반박하면 DVL은 래치 없이 빠진다(`DVL held back (the fit refutes it)`): 같은 표에서 2× 스케일·
+    6 cm/s 진동은 틀린 DVL로 난 tick이 16 %. NEVER 칸 대부분은 적합이 판정조차 못 하는 운동(느리거나 한 방향)이라
+    98 % 그대로다.
+  - **검증을 통과한 장착도 속도를 내면 trip할 수 있다.** 검증 허용은 상대(속도의 0.25), 차이 벡터 문턱은 절대
+    (8 cm/s). 잔여 yaw 12° 또는 스케일 1.2×로 검증된 장착은 0.4 m/s 이상에서 trip(3/4, 4/4), 5°는 0.5 m/s까지 0건
+    [예측: 같은 출력 파일 A6]. 대응: `mount PROVEN` 직후의 warn(`… above X m/s that alone trips the difference
+    monitor … Correct dvl.mount_rpy_deg yaw by +D deg`)이 뜨면 장착 yaw를 그만큼 고치고 재시작.
+  - **innovation hold는 새 카메라 프레임이 동의해야만 풀린다.** 그래서 태그가 보이는 동안 기체가 세게(~1 m/s²) 차이면
+    정직한 DVL도 지연된 태그 속도와 15 cm/s 넘게 벌어져 hold가 걸리고, 그 순간 태그가 사라지면 DVL 단 대신 기존
+    IMU/동결 사다리가 맡는다 — DVL이 없을 때와 같은 동작이다(가짜 lock과 진짜 외란을 그 순간에는 구별할 수 없다).
+    같은 종류로, 태그 속도가 0.25 s 넘게 없었던 직후의 첫 tick은 항상 태그 속도로 난다(`DVL unchecked`). 그리고 hold가
+    풀리는 tick에는 게이트가 받아들인 샘플이 fix 나이만큼 들어간다 — 태그가 0.3 s 늦고 그 샘플이 0.14 m/s면 한 tick에
+    4 cm [유도: 0.14 × 0.30], 다음 tick부터 사라진다. 게이트가 거부했던 샘플은 fix-age 적분에서 빠진다(6차 감사의 수정).
+  - **태그가 늦을수록 innovation 게이트가 넓어진다** — 0.15 + a_max × (fix 나이 − 0.25 s): 태그가 0.3 s 늦으면
+    0.25 m/s, 0.4 s면 0.45 m/s [유도]. 그보다 작은 false lock은 태그가 보이는 동안에도 게이트를 통과하고 차이 감시가
+    ~1 s 뒤에야 잡는다. 그 사이 태그가 사라지면 DVL 단이 그것을 상한(0.5 m)까지 실어 나른 뒤 fix로 돌아간다.
+    같은 이유로, **fix가 묵어 가는 동안(마지막 0.25–0.45 s) 시작된 false lock**도 넓어진 게이트를 통과해 DVL 단이
+    상한까지 싣는다(다섯 번째 감사의 R5-W2; 정지 기체에서 추정 0.49 m, 약 2 s). 둘 다 상한이 묶는다.
+    `config/hw_mpc.yaml` engage 블록의 `tag_stale_s` 주석은 dobmpc에서 태그 나이 p50 0.26 s / p95 0.40 s라고 적는다
+    (2026-08-14; 그 주석에는 산출물 경로가 없다) — 그 값대로라면 첫 경우는 실제 운용 범위다.
+  - **정렬 감시는 운동의 7 % 미만인 방향을 판정하지 않는다**(`ALIGN_MIN_SHARE`). 그런 방향의 회귀는 글리치 하나에
+    흔들려 올바른 장착을 trip시켰다(0.3 m/s 왕복 + 4–6 리포트 surge 글리치: 0에서 20/128, 0.07에서 0/128). 대가는
+    opt-out에서 **빠른 주 운동 위의 작은 부 운동**에 있는 반전 축이다 — 직선 운동만이 아니다: sway가 반전된 장착으로
+    0.15–0.3 m/s surge에 3 cm/s sway 진동을 섞으면 0에서는 2.0–3.5 s에 trip하던 것이 0.07에서는 30 s 동안 trip도
+    hold도 없이 tick의 98 %를 틀린 DVL로 난다; 4–8 cm/s sway면 1.2–1.9 s → 5.2 s(8 cm/s + 왕복은 둘 다 1.0 s). 그때는
+    적합(쌍 60개 + 반박 15회)만 남는다 [예측: 합성, 6차 감사 실험 — 산출물은 리포에 없음]. 기본값(`require_proven:
+    true`)에서는 사전 검증이 이런 장착을 반박한다.
+  - **태그 상태가 3–4 tick 끊겼다 돌아온 첫 tick은 넓어진 한계로 DVL을 받는다.** 그 사이 잡힌 false lock이 한 tick
+    (50 ms) 들어갈 수 있다 — 다음 tick의 신선한 거부가 innovation hold를 건다. 이것을 막으려면 공백 뒤 첫 tick을
+    "unchecked"로 해야 하는데, 그러면 태그가 4 Hz·지연 0.25 s처럼 느릴 때 fix 주기마다 속도원이 한 번씩 바뀐다
+    (세 번째 감사의 지적). 한 tick의 영향이 작아(추정 3 cm, D항 충격 0.04 m/s [유도]) 그대로 둠.
+  - **장치 시계가 뒤로 10 s 미만 step하면 최대 30 s 동안 샘플 시각이 그만큼 틀린다**(`DeviceClock`은 10 s 넘는 step만
+    즉시 다시 잡는다). 0.6 s 넘는 step은 "stale"로 떨어져 안전하고, 그보다 작으면 짝이 어긋나 오경보 trip이 날 수
+    있다. 장치의 NTP가 운용 중에 시계를 step해야 생기는 일이라 그대로 둠.
+  - **(DVL과 무관, 기존 동작) station bridge는 blind tick에서 hold 시계를 다시 시작한다.** 태그가 없는 동안 오토파일럿
+    ATTITUDE나 기압계까지 한 tick 늦으면 사다리가 그 tick을 "dropout 끝"으로 처리하고, 다음 tick부터 `imu_hold_s`를
+    처음부터 다시 센다 — 그런 tick이 섞이면 수평 hold가 설정값보다 길어진다(`imu_hold_s` 3.0에서 2.5 s 시점에
+    blind tick 하나 → COAST가 3.05 s가 아니라 5.60 s [유도: 사다리 산술, 재감사에서 실행으로 확인]). DVL 작업 도중 한 번 "시계를 계속 돌리게"
+    고쳤다가, DVL이 없는 런의 사다리가 커밋된 코드와 달라지는 것이어서 되돌렸다. 고칠지는 별도 결정.
+  - **DVL 단의 hold 시간·적분 dt는 tick 개수(공칭 0.05 s) 기준**이라 tick이 밀리면 실제 hold가 더 길다
+    (기존 사다리와 같은 성질).
+- **임시 대응**: 첫 세션은 `DVL OUT`(shadow)으로만 난다. README "풀에서 처음 켤 때" 5단계.
+- **제대로 닫는 법**: shadow 런 한 번의 CSV(`dvl_u/v` vs `fd_u/v`, `dvl_age_s`, `dvl_fom`, `dvl_alt_m`)와
+  `<stem>_dvl.jsonl`로 지연·잡음·fom 분포를 실측해 [예측] 값을 교체하고, station hold에서 태그를 가려
+  `DVL dead reckoning was N cm off` 로그(dropout이 DVL 단에서 끝난 경우에만 나온다)로 `dvl_hold_s`를 실측한다.
+  위 "설계상 한계"는 각각 따로 닫는다. 전부 닫히면 이 항목을 삭제.
+
+### 기체 STATUSTEXT 중 **EMERGENCY(severity 0)는 스테이션에 안 뜬다** — `int(sev or 6)` (2026-10-11)
+- **증상**: `rov_gui/backends/hardware.py:1870` `elif text and int(sev or 6) <= 4:` — severity 0은 falsy라 6(INFO)으로
+  바뀌어 버려진다. ALERT(1)~WARNING(4)은 뜬다. 버려지는 것: BlueOS DVL extension의 "DVL is too hot (T C). Please cool it
+  down."(DVL 45 °C 초과 시 30 s마다, severity EMERGENCY, 헤더 1/1 [스펙: 확장 master `dvl.py:418-431`, helper `:332` —
+  사본 data/20261011/1011_155235_dvl_probe/analysis/wf/src_master/])와 ArduSub 자신의 EMERGENCY 메시지. leak/pressure/
+  config는 그 위 분기에서 먼저 분류되므로 영향 없음. mavlink2rest(REST) transport에서는 severity가 dict라 `int(dict)`가
+  TypeError로 tick을 실패시킨다는 검증자 보고가 있다(미재현).
+- **임시 대응**: DVL 과열은 SENSORS DVL 행(status bit0 → `HIGH TEMPERATURE`, lock이 있을 때만)과 QGC/BlueOS 화면으로 본다.
+- **제대로 고치는 법**: `int(6 if sev is None else sev)` + REST 경로 정규화, severity 0 STATUSTEXT가 warn으로 뜨는 회귀 테스트.
+
+### ATTITUDE 레이트 요청은 **접속 때 1회**뿐 — ArduSub 재부팅이나 BlueOS DVL extension의 5 Hz 요청이 덮으면 그 세션 내내 5–10 Hz (2026-10-11)
+- **증상**: 스테이션은 `c3_camera/mavlink_log.py` start에서 첫 메시지를 받으면 `_request_rates()`를 **한 번** 보낸다(ATTITUDE
+  `--mavlink-rate` 기본 200 Hz; 시작 후 텔레메트리가 없으면 아예 안 보냄). ArduSub이 재부팅되면(배터리 교체 등) 이 요청은
+  사라지고, BlueOS DVL extension은 DVL을 찾을 때 ATTITUDE·VFR_HUD를 **5 Hz**로 요청한다 — 2026-10-11 부팅에서 요청 뒤
+  ATTITUDE 5.0 Hz, 요청 전 ≈ 9.6 Hz, AHRS2는 10 Hz [측정: data/20261011/1011_155235_dvl_probe/mavlink2rest_225506Z.json,
+  mavlink2rest_225619Z.json counter 차]. 확장 요청이 스테이션 요청보다 늦게 나가면(DVL 늦게 발견, 컨테이너 재시작) 200 Hz를
+  덮는다. `engage.imu_stale_s 0.3`에 5 Hz면 여유 100 ms라 ATTITUDE 하나 유실로 imu stale [유도]. health `Compass` 행은
+  max(ATTITUDE, AHRS2)라 AHRS2 10 Hz가 이 저하를 가린다. 스테이션 링크에서의 실제 ATTITUDE 레이트는 아직 재지 않았다.
+- **임시 대응**: 스테이션이 켜진 채 기체를 재부팅했거나 DVL을 늦게 연결했으면 스테이션도 재시작(그래야 200 Hz 요청이 마지막이 된다).
+- **제대로 고치는 법**: ATTITUDE 실측 Hz를 감시해 요청값보다 크게 낮으면 재요청(주기적 재요청), ATTITUDE를 health에 따로 표시.
+
+### LOW `RL_PWM_7D`(roll/pitch를 펄스로 추종하는 RL): 정책 `att7pwm_s0`는 시뮬 승격 기준 미달인 채 켜져 있고, **수중 런 2회(2026-10-03 DP 추종, 2026-10-05 station hold) 모두 실패** — 수직 공동수축·침강·태그 튐에 대한 고이득 반응 (2026-10-03, 10-05 갱신)
+- **무엇**: `rl_pwm_7d` = RL_PWM과 같은 전송(펄스 8개, Lua override, MANUAL, 기체에서 읽은 게이트, 상한 `rl_pwm.pwm_cap`)에 roll/pitch
+  기준으로 학습한 정책(`HwRlPwm7d`). 학습: RL_controller `att7pwm_s0..2`, preset `traj10att`, **정지수**(파도·조류 없음 — 테더 모사 외력
+  0–4 N은 traj10 레시피 그대로 남음), 각 34–35분 [측정: `RL_controller/logs/train_att7pwm_s*.log`].
+- **시뮬 평가(정지수, Isaac, nominal 동역학, 세계 3개 × 프로그램 15개)** [측정: `RL_controller/logs/eval/ATT_COMPARE_20261003.md`,
+  `logs/eval/att_att7pwm_s{0,1,2}/metrics.csv`, 대조 `att_pwm10_s1_ood/`]: 재학습은 효과가 있다 — 수평 세계 pitch RMS(평균) s0 1.46° vs
+  수평 학습 pwm10_s1 10.93°, pd20 정상오차 +1.1° vs +27.3°. **그러나**: (a) 트림 세계(cob −0.029/−0.035)에서 s0 정상 pitch 오차 최대
+  −7.1/−8.4°(pu20), roll 최대 −4.9°; (b) 수평 유지 중에도 roll e RMS 2.8°(pwm10_s1 0.6°) — 흔들림; (c) 수직 |throttle| 0.70(pwm10_s1 0.30),
+  포화 틱 24–38 %(s1 57–83 %, s2 98–100 %); (d) 설계의 승격 기준 [예측](최악 |ss pitch| ≤ 2°, |ss roll| ≤ 1.5°)을 세 시드 모두 미달.
+  표준 수평 평가: 사각형 위치 RMS s0 0.041 m·포화 16 % vs pwm10_s1 0.036 m·1 % [측정: `logs/eval/traj_att7pwm_s0_square/metrics.csv`,
+  `traj_pwm10_s1_square/metrics.csv`]. 그래서 `rov_gui/control/rl_policies/att7pwm_s0/`는 처음엔 꺼진 후보로
+  출하됐고, **2026-10-03 운용자 요청으로 켰다**(`config/hw_mpc.yaml rl_pwm_7d.policy_dir: rov_gui/control/rl_policies/att7pwm_s0`;
+  끄려면 `null`). 위 (a)–(d)는 그대로 남은 문제다 — 수중 첫 비행은 수평 기준(station hold 또는 5-dim 정책)부터 [예측].
+- **첫 수중 런 2026-10-03 20:27 — 실패** [측정: `data/20261003/1003_202721/`]: RL_PWM_7D + 7-dim `20260929_peg7d_vitclip`,
+  교전 3회 1.7 / 6.3 / 2.5 s, 모두 조종사 해제(`events.log`). 원인(2026-10-04 진단, 기록 재계산):
+  (1) **수직 공동수축** — 수평 유지에서도 T5/T8 위·T6/T7 아래로 +230~+340 µs(`mpc_2027*.csv` pwm5..8, 플랜 전 행 평균), 시뮬
+  수평 유지와 같은 패턴(`RL_controller/logs/eval/att_att7pwm_s0/timeseries.csv` level, t≥5 s: +281/+289/+278/+280 µs) = 학습된
+  버릇이지 배포 버그가 아님(기록 상태 오프라인 재생 잔차 ≤0.18 N, `/tmp` 진단 스크립트 — 보존 안 됨). 부호는 맞다: 같은 폴더
+  mpc_tuned(믹서) 비행의 회귀에서 위로 = T5/T8 PWM>1500, T6/T7 PWM<1500 → 정책의 (+,−,−,+)는 의도대로 5/8 위·6/7 아래.
+  대가: 전류 22~42 A 평균(`batt_a`; 같은 날 mpc_tuned 3.6~4.5 A), 전압 15.4→14.2 V(UI 영상 HUD), 순 수직력이 두 ~50 N의 차라
+  모델 오차가 그대로 순력 오차가 됨. (2) **실제로 가라앉음** — 공칭 +19 N 위 명령에도 수평 유지 중 ~5 cm/s 침강; 압력 깊이
+  0.66→0.74 m(첫 플랜 전)→0.83 m(`ui_20261003_202732.mp4` HUD DEPTH, 20:27:35→37→40). peg −12 N은 학습 DR(−4.9~+6.9 N) 밖.
+  (3) **수직 힘 ±90 N 반전**(교전 1·3) — 정책이 차분 속도 nu_w에 고이득(1틱 +0.1 m/s → 약 −28 N [유도: 재생]); 태그 z가 20~47 mm
+  튄 fix 9회(교전 3, 33 ms 간격; 교전 2는 0회 최대 12 mm) + 보조 카메라 fix z 72 mm 불일치(교전 1)(`mpc_2027*_ekf_inputs.jsonl`
+  fix 차분). 부호 반전 비율 0.41/틱(교전 3) vs 0.14(교전 2), corr(uZ, nu_w) −0.71/−0.50(CSV). (4) DP는 주 원인이 아님 — 교전 1은
+  플랜 0개, 교전 3의 pitch +10.8°·roll −7.5°는 첫 플랜 전(`plan_id` nan); 교전 2는 DP가 기수 들기(NED +8~+12°)를 요청했고
+  기체가 +14.8°로 넘어간 뒤 +13~+14.5°에 머묾 — 원점 높이 0.197~0.216 m(태그)·깊이 0.83 m 정체로 보아 선미 착저일 가능성 높음
+  [유도: 그린 형상 underside −0.217 m, 실측 아님]. 제어 주기(20 Hz)·태그 지연(p50 0.12~0.15 s)은 mpc_tuned와 같음 → 파이프라인 정상.
+- **둘째 수중 런 2026-10-05 21:22 — DP 없이 STATION hold(tag 47)만으로도 같은 실패** [측정: `data/20261005/1005_212023/`
+  `mpc_212239.csv`·`mpc_212257.csv`·`mpc_212304.csv`, 분석 `data/20261005/1005_rlpwm7d_station_diag_offline/{diag.py,report.txt}`]:
+  교전 3회 1.6 / 1.7 / 2.8 s, 모두 조종사 해제, 플랜 0개(`plan_id` nan, rroll/rpitch 0) → 위 (4)의 "DP는 주 원인 아님"이 실험으로 확정.
+  (1) 펄스 첫 틱부터 수직 4개 모두 +150~+300 µs 공동수축(T5..T8 평균 +178/+175/+159/+227, +263/+247/+191/+298, +251/+247/+200/+290 µs;
+  서로 상쇄되는 몫 166~374 µs, 순 위 방향 +71~+124 µs — 같은 저녁 mpc_tuned 믹서의 순 위 +163 µs보다 작음) → 전류 평균 26~29 A·최대 71 A
+  (믹서 모드 3.3~4.6 A), 16.0→14.4 V, 포화 틱 19~33 %, 침강 +4.5~+6.1 cm/s(교전 2·3, `*_ekf_inputs.jsonl` fix z). (2) 펄스 0.4~0.6 s 뒤
+  급한 자세 변화(pitch −7.9→+3.8°, 0.35 s)로 C3 태그 수 23→15→1→0(`nav_212237/fixes.csv`; 영상 `1005_210544/ui_20261005_211603.mp4`
+  21:23:06 프레임은 모션 블러·태그 3개) — `hw_nav.yaml min_tags: 1`이라 단일 태그 fix가 +59/−100/+98 mm 튄 채 통과(host 0.56 s) → 차분 속도
+  nu_u −0.94 / nu_w +0.89 m/s → `state_assembler.py`가 fix 공백 0.15 s 동안 그 속도로 외삽(px −0.25→−0.38 m) → 정책 heave −130 → +167 N
+  반전(pwm6 1100 / pwm5 1900), roll −14.7°·pitch ±10°(교전 1). 같은 저녁 믹서 모드도 태그 수 ≤2 틱 8~99 %, 속도 튐 최대 5.1 m/s를
+  겪었지만 |uZ| p95 11~59 N으로 비행을 유지 → 센서 결함이 아니라 정책의 이득이 결정 요인. 로그의 다른 경고는 원인이 아님: MPC_TUNED_7D
+  engage 거부 ×4(`engage.attitude_axes.enabled` false — 스테이션 재시작 필요), "commands are leaving … every thruster sits at neutral"
+  (모두 ENGAGED와 같은 초 — SERVO_OUTPUT_RAW 보고 지연의 거짓 경보, 그 뒤 정상 비행), EST 전환 거부(EKF z 24.8 cm 불일치 — 게이트 정상 동작).
+- **개선 후보 [예측]**: 행동 크기·추진기별 L1 벌점 강화(수직 공동수축 억제), 트림 범위를 실측 트림에 맞춰 좁히기, 학습 iteration 증가,
+  roll 오차 항 분리. 어느 것도 시도 안 함.
+- **스테이션 쪽 미해결**: (1) 펄스판 sat-ineffective (iii) 없음 — 축이 없어 s/t 버전이 구조적으로 맹목. 기울기 천장(35°)·div_rp만 있다.
+  (2) 스테이션 안에서 pwm 폐루프를 오프라인으로 돌릴 경로가 없다(데모에 펄스 전송 없음) — 추종 성능은 RL_controller 평가로만 본다.
+  (3) sink 게이트는 `rl_pwm.policy_dir` export로 만들어진다 — 그 export가 깨지면 rl_pwm_7d도 거부된다(fail-closed). (4) div_rp는
+  stitcher 기준(T1 20° 클립)으로 판정하고 추종자의 envelope(roll 9.7°) 클립 기준이 아니다 — 보수적. (5) 추진기별 부호 프로브는 여전히
+  안 했다(RL_PWM과 같음). (6) replay `track_attitude`는 이 LOW에서 수평으로 난다(replay 자세 가드가 s/t 전용). (7) 기울기 천장
+  `abort_deg` 35° / 0.25 s 디바운스는 s/t 축(K/M 캡) 기준으로 정한 값을 그대로 쓴다 — 펄스 전송(|throttle| ≤ `rl_pwm.pwm_cap`)의
+  roll/pitch 권한으로 다시 정하지 않았다. 펄스가 더 빨리 기울일 수 있으면 디바운스 동안 더 넘어간다 [예측, 미실측] (리뷰 2026-10-03:
+  결함은 아님, 기록만).
+- **2026-10-10 정정(재분석 `RL_controller/logs/eval/pwm_cocontraction_analysis_20261010/REPORT.md`, workflow wf_412fe90b)** — 위 문단은 그대로
+  두고 바로잡는다. (1) **CSV 부호**: 스테이션 CSV의 `pitch_deg`는 `-pitch_NED`다(`rov_gui/control/workers.py:10836`; 같은 교전의
+  `*_ekf_inputs.jsonl` ATTITUDE와 대조 CSV −15.9° ↔ ATTITUDE +16.0°) — **음수 = 기수 위**. 위 각도들은 이 부호로 읽어야 하고, 10-05
+  `diag.py`의 "negative = nose UP" 주석이 맞았다. (2) **학습 세계의 트림 부호가 틀렸다**: `traj10att`의 `cob_trim_x_range_m [-0.035, 0.005]`
+  (0.15 m 팔)는 기수 **아래** 13°~위 2°의 세계인데, 실기는 09-21에 +10.6° 기수 위(턱 빈 채, 중층), 10월엔 peg를 문 채 +0~+3°, 없으면
+  +7.5° 기수 위였다 [측정: station CSV]. 복원강성도 시뮬 20.2 N·m/rad(0.15 m 팔) 대 실측 4–11(정적 균형 3.7–7.6, peg 단차 8.4, 자유주기
+  2.6–3.5 s) — 3–5배 과강성. (3) **att7pwm_s0가 실제로 한 것**: 8추진기 할당행렬 B(6×8)의 null space = span{n_v = 수직 4개 같은 +PWM
+  (FR 위·FL 아래·RR 아래·RL 위), n_h = 앞 수평 전진·뒤 수평 후진}이고, 6교전 모두 **n_v +250~+290 µs + n_h −125~−140 µs**를 냈다 —
+  추력의 85–96 %가 렌치 0, 수직 25–43 N이 서로 상쇄, 26–44 A(그중 28–42 A가 렌치 0 몫), 16.0→14.0 V, 공칭 +9~+16 N 순 상향 명령 아래
+  4.5–6 cm/s 침강 [측정: 같은 폴더 `scratch/hw-decomp/report.txt`]. 위 (1)의 "수직 공동수축"은 맞고 수평 쌍 n_h가 빠져 있었다. 태그 붕괴는
+  자세 변화 **뒤**에만 왔고(앞선 적 0회) 고도(<0.3 m에서 P(n_tags≤2) 0.8–0.95)·자세 속도가 결정하지 피치각이 아니다. 시뮬이 이를 배우는
+  이유는 지연이 아니라 정지대역이 있는 볼록한 T200 곡선(상수 바이어스 = 공짜 이득; 유일한 비용 exp(−|a|²)은 이미 74–96 % 소진). 조치:
+  재학습 `pwm11`(바른 트림 부호·0.05 m 팔·null-space 벌점, RL_controller README §13), 비행 전 프로브 블록; 스테이션 캡·게이트 변경은
+  같은 날 별도 항목. **att7pwm_s0..2는 어떤 캡에서도 다시 날리지 않는다.**
+
 ### LOW `RL_PWM`(추진기 직접 펄스)은 0.25 캡에서 **포화·진동**한다 — 첫 수중 런 2026-10-01 17:29 (2026-09-30 등재)
 - **무엇**: `rl_pwm` 모드(`rov_gui/control/rl_pwm.py`, `rl_policy.py` `HwRlPwm`, `backends/hardware.py` `set_pwm`)가 정책 `pwm10_s1`의
   펄스 8개를 RC_CHANNELS_OVERRIDE ch 9..16으로 보내고, 기체의 `rl_pwm_override.lua`가 모터 출력에 강제한다. ArduSub 믹서를 우회한다.
 - **확인된 것**: 오프라인 테스트 26건(`rov_gui/tests/test_rl_pwm.py`) — 실제 pymavlink v2 프레임의 바이트가 스크립트가 읽는 위치와
   일치, 게이트 항목별 거부, sink 래치·정지 경로, 워커 게이트/정지. 데모 백엔드에서는 "전송 경로 없음"으로 거부된다.
+  (2026-10-01 운용자의 `pwm_cap` 1.0 변경 뒤 이 중 11건이 출하값 0.25를 고정해 **실패**하고 있었다 — 2026-10-03 출하값에 의존하지
+  않게 고쳐 26/26.)
+- **2026-10-03 바뀐 것**: (a) **기울기 천장이 생겼다** — 그 전까지 rl_pwm 에는 기울기 인터록이 없었다(천장은 s/t 경로에만 걸렸고 Lua
+  스크립트에도 자세 로직이 없다). 이제 |roll|/|pitch| > `abort_deg` 35° 가 0.25 s 이어지면 disengage(중립 펄스). 10-01 런의 pitch
+  −9~−18° 는 트립하지 않는 값이다. 되돌리려면 `workers._runtime_fault`의 `self.attitude_actuated`를 `self._attitude_axes`로. (b) 상한은 이제
+  전송 단위 키 `rl_pwm.pwm_cap` 하나(`rl_pwm_7d`도 읽음). (c) `HwRlPwm.reset`이 `n_fail`을 0으로 — 직전 교전의 실패 수가 다음 교전 첫 틱에
+  거짓 "solver FAILURE"(fail-streak 1)로 찍히던 잠복 결함. (d) meta `station_bridge.released_in_coast`가 pwm 에서는 "8개 모두 1500 µs —
+  깊이·자세 유지 없음"(그 전 문장 "heave and attitude kept"는 거짓이었다).
 - **첫 수중 런(2026-10-01 17:29–17:30, `data/20261001/1001_172910`, 정책 미션 3회 42/8/24 s)**: 펄스는 나갔다(`rl_pwm: policy pulses are going out on RC 9..16`,
   `pwm_age_s` 평균 0.14 s). 움직임: roll −8~+6°(주기 약 3 s), pitch가 −9~−18°에 치우친 채 1–4° 흔들림, yaw 최대 34° 흔들림(std 4–10°); 위치 추종 자체는
   rms 2–4 cm·최대 15 cm [측정: `mpc_172910/172957/173011.csv` `roll_deg`·`pitch_deg`·`yaw_deg`, px−rx 등]. (같은 날 1차 보고의 "피치 ±5–10°·yaw −16°·깊이 0.1–0.4 m"는
@@ -21,6 +289,61 @@
   **방향 근거**: 같은 런에서 roll·pitch·yaw 각가속도와 상하 가속도가 모델의 uK·uM·uN·uZ와 부호가 맞는다(세 런 모두; 상관 0.1–0.4로 약함) [측정: 같은 CSV 회귀].
   명령→펄스는 실기 로그로 ArduSub 믹서와 대조돼 있다(`RL_controller/README.md` 28행, `scripts/fit_mixer_from_logs.py`). 추진기 한 기씩의 부호 프로브(§10.3 (4))는 안 했다.
   **2026-10-01 운용자 결정**: `pwm_cap` 1.0 (한 번에). 1.0에서는 아직 안 돌았다.
+- **2026-10-10 바뀐 것** (근거: `RL_controller/logs/eval/pwm_cocontraction_analysis_20261010/REPORT.md` §1 원인 4 "deployment cap as a
+  per-thruster CLIP" · §3 5단계): (a) **캡이 클립이 아니라 추력 공간의 배율**이 됐다 — `rl_pwm.pwm_cap_mode: scale`(기본; `clip`은 A/B용)
+  `rov_gui/control/rl_pwm.py scale_throttles`: 8개 추력에 단일 배율 s 를 곱하고 닫힌꼴 역곡선(`T200CurveNp.inverse`, 양·음 분기 왕복 오차
+  1.4e-8 N)으로 되돌린다. 할당 방향 유지(att7pwm_s0 풀 패턴 [−115,−125,+125,+120,+260,+220,+200,+270] µs 를 cap 0.5 로: s 0.578, cos 1.000,
+  max|throttle| 0.500; 같은 패턴의 클립은 cos < 0.999) [측정: `rov_gui/tests/test_rl_pwm_scale.py`]. 캡을 넘는 펄스는 이제 어디서도 클립되지
+  않고 **거부**된다(추종자 `throttles_to_pwm(strict=True)` → 중립 + n_fail; sink `set_pwm` → 거부 + 래치 + 중립). 한계 [측정: 같은 테스트,
+  seed 20261010]: 배율이 추진기를 정지대역 아래로 밀면 "켜진 추진기는 가장자리(+1.44/−1.10 N)에 둔다"는 규칙이 방향을 꺾는다 — 균일 난수
+  10⁴ 벡터에서 cap 0.5 최악 cos 0.98, cap 0.25(cap-1.0 정책, s≈0.09) 최악 0.46. 즉 **학습 캡보다 훨씬 낮은 캡은 scale 로도 안전하지
+  않다**(그래서 (b)). (b) **학습 캡 아래의 설정 캡은 생성 단계에서 거부** — `rl_pwm.pwm_cap` < export `pwm_cap_trained` 이면 `HwRlPwm`
+  이 두 숫자를 들어 거부하고 `rl_pwm.allow_caps_below_trained: true`(기록됨, meta `controller.allow_caps_below_trained`)만 푼다;
+  `rl_pwm_7d` 는 자기 블록의 키. 10-01 런(cap 1.0 정책 + 0.25 클립)이 바로 이 경우였다. (c) **추진기별 부호 프로브 산출물 게이트**
+  `rl_pwm.require_thruster_probe: true`(기본): `rov_gui/tools/thruster_probe.py` 가 쓰는 `data/*/*_probe/thruster_sign_probe.json`(schema 1)
+  이 dry_run 아님·`thruster_probe_max_age_days`(30 [예측]) 이내·이 export 의 sigma·기체의 현재 MOT_1..8_DIRECTION·8기 all_pass 여야
+  교전된다(워커 `_pwm_refusal` + sink `PwmGate.check`, `rov_gui/control/rl_pwm.py ThrusterProbeCheck`; 읽기 모듈
+  `rov_gui/control/thruster_probe_artifact.py` 없음/파일 없음도 거부). **프로브는 아직 한 번도 안 찍었다** → 출하 설정으로는 RL_PWM 교전이
+  거부된다(의도). (d) CSV schema 19: 보낸 펄스의 **예측 팩 전류 `i_pred_a`**(2.1 + Σ 0.0584|F|^1.526 / 0.0537|F|^1.673, F 는 export T200
+  곡선 × batt_v/14.8, 전압 없으면 0.72 [유도: T200 공개 데이터시트 15 V 열 피팅; REPORT 202735 패턴 42.3 A 예측 vs 41.6 A 실측 평균])과
+  **null-space 모니터 `null_v_us` = mean(pwm5..8)−1500, `null_h_us` = ((pwm1+pwm2)−(pwm3+pwm4))/4** [유도 REPORT §0] — pwm LOW 행에만,
+  다른 LOW 는 빈칸. 기록만 하고 트립 임계값(100–150 µs, 50 A)은 후속. 테스트: `test_rl_pwm.py` 26 + `test_rl_pwm_7d.py` 14 + 신규
+  `test_rl_pwm_scale.py`. 실기 0런, 미커밋.
+- **2026-10-10 (b) 바뀐 것** (REPORT §3 5단계 후반 "interlocks … policy-side tag gate → hold wrench, replay-tested on the 14
+  engagements"): (a) **추진기 직접 펄스 LOW 전용 런타임 인터록** `engage.per_thruster:`(`rov_gui/control/rl_pwm.py PwmInterlocks`,
+  `workers._runtime_fault` 가 매 틱 35° 천장 다음에 판정, 천장과 같은 틱 카운터 디바운스; 트립 = disengage(중립 펄스) + 미션 로그/
+  events.log "PER-THRUSTER INTERLOCK <이름> — disengaged" + 측정값이 든 문장 + meta `controller.interlocks.last_trip`): **출하값
+  (v2, 같은 날 재생 결과로 교체)** tilt |roll|/|pitch| > 20° 0.25 s, rate |p|/|q| > **40** deg/s 0.15 s [측정 REPORT §1 원인 2: 캐스케이드
+  33–65 deg/s; 첫 안 60 은 재생에서 14회 중 2회 미검출], pack batt_a > 50 A 1.0 s(BATTERY_STATUS ~1 Hz 최신값) [스펙 BR 18 Ah 60 A
+  연속] / batt_v < 13.5 V 즉시, null 보낸 펄스의 |null_v|/|null_h| > **80 µs 0.5 s** [측정 REPORT: 믹서 0, pwm10_s1 +82..+107, att7pwm
+  +250..+290 µs; 첫 안 120 µs/1.0 s 는 pwm10_s1 squeeze 를 못 잡고 1.3–1.7 s 교전 2건을 놓침], pinned 캡에 붙은 추진기 ≥ 3 기 1.0 s.
+  전부 [예측]. 다른 LOW 는 블록을 읽지 않는다(기존 스위트 green). (b) **정책 쪽 관측 가드** `rl_pwm.obs_guard:`(`PwmObsGuard`,
+  `HwRlPwm.step` 안에서만; 공용 state_assembler·CSV 상태 열은 그대로): 정책이 보는 몸체 속도 축별 slew 2.0 m/s² [유도: 정책 최대
+  가속 ≤ 4.5], n_tags < **2**(min_tags; 첫 안 3 은 믹서 런에서도 틱의 5–99 % 를 HOLD 로 보냈을 값 [측정 재생]) 일 때 한 틱 0.15 m 초과
+  fix 점프 거부(직전 fix 유지), 태그 게이트 n_tags < 2 또는 fix 나이 > 0.3 s 가 0.2 s 이상 → 정책 펄스 대신
+  **HOLD 펄스**(Z −4.0 N NED = 4 N 위 [측정 REPORT §1 원인 5: 10월 순중량 peg 2.5–5.4 N] 를 export 최소노름 수직 할당 + T200 역곡선으로;
+  pwm10_s1 export 에서 [1500,1500,1500,1500,1537,1452,1470,1530] µs ≈ 3.7 N 위 [유도], 수평 중립; 되먹이는 prev_action 은 나간 hold),
+  태그가 0.2 s 돌아오면 복귀. CSV schema **20**: `pwm_guard` 열(0 없음/1 slew/2 jump/3 hold; pwm 행만). (c) `i_pred_a` 의 추력 규약을
+  RL_controller 와 같은 **물리 규약**으로: F = T200(thr) × batt_v/20.5 V(피팅 1.0 = ~20 V 곡선, 14.8 V → 0.72 = export voltage_scale,
+  전압 없으면 0.72) [스펙 rov_rl/thrusters.py; rov_env `_nominal_voltage` 0.72] — 이전(×batt_v/14.8)은 추력 1.4배 과대. att7pwm_s0 풀
+  패턴은 이 규약으로 14.8 V 25.9 A / 16 V 28.9 A 예측 vs 실측 평균 41.6 A(202735) — **데이터시트 프록시가 공수축 패턴을 ~1.6배
+  과소예측**한다(팩 sag·ESC 손실·바닥 근접 [예측]); 그래서 pack 인터록은 `batt_a` 를 본다. (d) **오프라인 재생**
+  `rov_gui/tools/rl_pwm_interlock_replay.py`(같은 `PwmInterlocks`; 입력은 CSV 의 ATTITUDE 각·BATTERY·기체 보고 pwm1..8(보낸 펄스가
+  아니라 ~0.14 s 늦은 SERVO_OUTPUT_RAW)·자이로는 `*_ekf_inputs.jsonl` pqr(10-03/05) 또는 각도 유한차분(10-01)) → `data/20261010/
+  1010_interlock_replay_offline/report.txt`(첫 안 60/120/1.0 s, null 80·100·120 비교), `report_sensitivity_rate40_null05s.txt`,
+  **`report_shipped_v2.txt`(출하 v2)**). **첫 안 결과 [측정: report.txt]**: 믹서 모드 91 파일 트립 0; pwm 14 교전 중 null 120 으로
+  12 트립 — 10-01 cap-0.25 pwm10_s1 5건 전부 **pinned**(+0.96..+2.89 s; rate 24–38 deg/s 라 rate 는 안 걸리고, squeeze 95–100 µs 라
+  null 은 100 에서도 120 에서도 **안 잡힌다**), 10-03 cap-1.0 pwm10_s1 3건은 tilt +1.00/+1.25 s 와 **무트립 1건**(180854, 1.3 s 런:
+  rate 62 deg/s 가 0.15 s 를 못 채움, null 139 µs 가 1 s 를 못 채움), att7pwm 6건은 null +0.95 s ×5 와 **무트립 1건**(212239, 1.6 s
+  런: null 297 µs 가 0.95 s 뒤 한 틱 꺼짐) — "rate 또는 null 로 ~0.5 s 안에" 라는 기대 [예측] 는 첫 안으로는 불성립(1.0 s 디바운스가
+  지배). **출하 v2 결과 [측정: report_shipped_v2.txt]**: null 80 µs/0.5 s 로 **14/14 전부 null 트립, +0.43..+0.60 s**(10-01 5건
+  +0.44..+0.60, 10-03 pwm10_s1 3건 +0.45, att7pwm 6건 +0.43..+0.45), 믹서 모드 **0/91** 그대로; 같은 데이터에서 null 100 이면 14/14
+  (null 8·pinned 5·tilt 1), 120 이면 13/14. 즉 출하값에서는 null 이 첫 트립이고 tilt/rate/pinned 는 뒷단 보호다(rate 40 은 재생
+  14건 중 어느 것도 먼저 걸리지 않았다 — 가장 빠른 null 보다 늦거나 같다). **따라서 pwm10_s1 / att7pwm_s* 은 출하 인터록 아래서
+  0.5 s 안에 끝난다**(REPORT §3 6단계 "다시 날리지 않는다" 와 일치; 오프라인 하네스에서도 pwm10_s1 의 정지 프레임 출력 null_h ≈ +144 µs
+  가 0.5 s 만에 트립 [측정 test_rl_pwm_interlocks]). 한계: 재생의 펄스는 기체 보고(SERVO_OUTPUT_RAW, ~0.14 s 지연)지 보낸 펄스가 아니다;
+  10-01 의 각속도는 각도 유한차분. 테스트: 신규 `test_rl_pwm_interlocks.py` 13 + 기존 57 + test_thruster_probe 18 green; schema 핀
+  19→20 갱신. 실기 0런, 미커밋.
 - **2026-10-01 설치됨**: `rov_gui/tools/install_rl_pwm_lua.py --install --yes`로 `SCR_ENABLE` 0→1, `SCR_USER1` 0→1, 스크립트를 MAVLink FTP로
   `scripts/rl_pwm_override.lua`에 올리고(읽어 되돌려 바이트 동일), 재부팅 뒤 기체가 `rl_pwm_override.lua loaded`를 보냈다 — 스크립트가 **로드는
   된다**(`mavlink:init` 인자 순서 포함 초기화 통과) [측정: `data/20261001/1001_145846_vehicle_setup/rl_pwm_lua_install.json`]. 바꾼 값과 이전 값이 그 파일에 있다.
@@ -40,6 +363,19 @@
   ("벤치 통과 후 cap 0.25 첫 수중 런 허용", 수중 전 권고 2건: grace 타이머가 끊길 때마다 리셋, sink tick 예외 시 미래치) → 둘 다 수정.
   **마지막 수정분은 재검토를 받지 않았다.** 리뷰어는 코드를 실행하지 못했다. 남은 권고: QGC를 붙인 채 10분 이상 벤치에서 파라미터 age,
   늦은 프레임으로 인한 오작동 래치 빈도, `RCINnScaled` 번호(139+n) 대조. 기록은 `.claude/journal/reviews.md`.
+- **2026-10-10 정정(재분석 `RL_controller/logs/eval/pwm_cocontraction_analysis_20261010/REPORT.md`)** — 위 문단은 그대로 두고 바로잡는다.
+  (1) **CSV 부호**: `pitch_deg`는 `-pitch_NED`(`workers.py:10836`)라 위 "pitch −9~−18°"는 **기수 위 9–18°**다(음수 = 기수 위).
+  (2) **학습 세계의 트림 부호 오류**: pwm10_s1의 세계(`traj10`, `cob_trim_x_m -0.029`)는 09-21 CSV 값 −10.6을 기수 아래로 읽어 만든
+  기수-**아래** 10.6° 세계인데 실기는 +10.6° 기수 위(09-21, 턱 빈 채), 10월엔 peg 문 채 +0~+3° [측정: station CSV]; 복원강성도 시뮬
+  20.2 N·m/rad 대 실측 4–11(3–5배 과강성). 정책은 기수-아래 세계용 +2.8~+3.5 N·m 기수-위 전향 모멘트를 배웠고, 8교전(10-01 캡 0.25
+  5회 119 s + 10-03 18:08 캡 1.0 3회 2.9/7.3/1.3 s, `data/20261003/1003_180545/mpc_1808{20,35,54}.csv`) 모두 **명령한 방향으로**
+  기수 위로 기울었다(최대 +13~+25°, 자이로 I·α = 재구성 모멘트의 73–97 %) — 부호 반전·배선 뒤바뀜이 아니다(독립 검증 3개가 기각).
+  추진기별 부호 프로브(§10.3 (4))는 그래도 필수. (3) **캡 0.25에서 수직 공동수축은 없었다**(c_v −17~−43 µs); 대신 수평 null 방향
+  n_h(앞 전진·뒤 후진) **+82~+107 µs = 12–17 N**의 렌치 0 조임이 T3/T4/T6를 캡에 붙였다(틱의 48–94 %); 전류 6.8–7.1 A 평균(캡 1.0:
+  9–12 A). (4) **착저 오염**: 10-01 hold 대부분이 바닥에 가라앉았고(착저 자세 +7~+10° 기수 위; 172910은 바닥에서 시작) 위 자세·추종
+  수치는 바닥 접촉이 섞인 값이다. 시뮬 쪽 재현: pwm10_s1을 0.05 m 팔·기수 위 트림 세계에서 다시 평가하면 +14~+16° 기수 위로 기운다
+  [측정: `RL_controller/logs/eval/sweep_rl_pwm10_s1_{hwlike,nominal05}`]. 조치는 위 RL_PWM_7D 항목의 정정과 같다(`pwm11`, 프로브
+  블록, RL_controller README §13); 캡 구현·게이트 변경은 같은 날 별도 항목. **pwm10_s1·pwm10_s2는 어떤 캡에서도 다시 날리지 않는다.**
 
 ### 정책 추론이 단독으로는 **19 ms**인데 스테이션에서는 0.21–0.27 s — FoundationStereo와 GPU를 나눠 쓰기 때문 (2026-10-01)
 - **측정** [`data/20260930/0930_220212/diag/policy_vs_fstereo_contention.json` + `policy_alone_timing.json`, 스크립트 같은 폴더; RTX 5090, peg ViT-CLIP ckpt, `model` weights, GUI·카메라 없음]:
@@ -47,9 +383,9 @@
   8 step p50 152.8 ms(p90 210.0), 4 step 104.4 ms. FS를 7.5 Hz로 띄엄띄엄 돌리면 8 step p50 40.3 ms(p90 86.3).
   실기(22:02·22:16 engagement 6개)는 infer_ms p50 207–273 ms [`plan_timing.json`], FS solve p50 99 ms(정책 옆에서 쉬지 않고 돈 오프라인 벤치 76 ms — FS 단독 측정은 그 파일에 없다)·9.7–11.2 Hz [`latency_breakdown.json` — UI 녹화 10프레임을 눈으로 읽음, `depth_hud_montage.png`].
 - **플랜 나이의 구성** (rl 런 `mpc_220407`, p50 0.556 s) [`latency_breakdown.json`]: 촬영→depth 완성 0.196 s(FS solve 0.099 + 카메라 전송·대기 0.098 [유도: 차]),
-  정책 forward 0.207 s, 나머지 0.153 s [유도: 차 — 관측 만들기 2장·트리거·버스·20 Hz tick; 단계별 stamp가 기록에 없다].
+  정책 forward 0.207 s, 나머지 0.153 s [유도: 차 — 관측 만들기 2장·트리거·버스·20 Hz tick; 2026-10-01부터 plans.jsonl의 `depth_ready_age_s`/`trigger_age_s`/`emit_age_s`로 나뉜다: obs build+pack p50 0.046–0.081 s [유도: emit−trigger−infer, `data/20261012/1012_fs_server_review_offline/plan_timing_by_schedule.json`], 카메라 전송 ~0.098 s는 여전히 stamp 없는 차].
 - **뜻**: 지연의 큰 덩어리는 diffusion 계산이 아니라 GPU 대기다. `num_inference_steps` 8→4는 단독 −7 ms, FS와 겹칠 때 −48 ms(−32 %)라 절반이 되지 않는다.
-- **임시 대응(구현됨, 기본 OFF, 수중 미검증, 2026-10-01)**: `--policy-fs-schedule yield|only`(기본 `free` = 위 상태 그대로) — yield는 정책이
+- **임시 대응(구현됨, 기본 OFF, 2026-10-01; 수중 결과는 아래 2026-10-12 항)**: `--policy-fs-schedule yield|only`(기본 `free` = 위 상태 그대로) — yield는 정책이
   추론하는 동안 FS가 새 프레임을 시작하지 않고(정책은 진행 중 프레임을 최대 150 ms 기다림), only는 정책 미션 중 FS가 정책이 쓰는 2장만 계산한다.
   코드 변경 없는 다른 손잡이는 `--fstereo-scale 0.5`(FS 45.7 ms라 15 fps를 따라가며 쉰다). 실제 두 워커·두 네트워크로 잰 오프라인 벤치
   [측정: `rov_gui/tools/fstereo_bench_out/policy_fs_schedule_20261001_115008.json`, 합성 입력이라 카메라 전송 지연 없음, 측정 중 CPU load 0.9→7.5/16코어]:
@@ -61,8 +397,19 @@
   p50 43.1 / p90 69.9 ms, 워커 벤치 p50 0.0 / p90 19.5 ms). (A)의 "패널 stale 기준 1.5 s"도 틀렸다: `--fstereo`의 depth 패널은 warn 0.75 s /
   stale 2.5 s다(window.py `expect = min(expect, 4.0)` → widgets/video.py Freshness) — 결론(경고 안 뜸)은 같다.
   `plans.jsonl`의 `emit_age_s`·`trigger_age_s`·`depth_ready_age_s`·`fs_wait_ms`로 "나머지 0.15 s"를 이제 나눌 수 있다(정책 플랜 줄마다, `free` 포함).
+- **수중 확인 + '별도 프로세스' 벤치 (2026-10-12 검토)**: 10-01 수중(같은 ckpt, `data/20261012/1012_fs_server_review_offline/plan_timing_by_schedule.json`)
+  free@0.75 age p50 0.53 s / infer 212 ms / 다음 설치 전 만료 47 % → yield@0.75 0.36 s / 44–46 ms / 0.3 % → only@0.75 0.28–0.31 s / 27–35 ms / 2 %;
+  free@0.5 0.35–0.40 s / 113–133 ms / 4–7 %. 사용자는 16:48부터 free@0.5로 복귀했고 **이유 미기록**(게이트 timeout 0). yield@0.5는 0런.
+  랩 제안 'FS를 별도 프로세스로'는 벤치 [`rov_gui/tools/fstereo_bench_out/two_process_20261011_235457.json`, IPC·카메라·GUI 없음, MPS 미사용]에서
+  forward 151.7→**47.2 ms**(p90 209→49)로 줄 뿐 단독 19.4 ms로 돌아가지 않고(같은 GPU time-slicing; FS p90 77→88.5 ms), yield(19.4)에 못 미친다.
+  **미귀속**: 스테이션의 forward가 같은 배치의 벤치보다 ~3배 느림(free@0.5 113–165 vs 30–42 ms, yield 44–46 vs 19.4) — GPU-bound인지 CPU launch-bound인지 모름.
+- **방법 3 `--fstereo-process` (2026-10-12, 수중 0런)**: FS 네트워크만 자식 프로세스에서. 출력 비트 동일(18/18, |Δ| 0 mm)
+  [측정: `rov_gui/tools/fstereo_bench_out/proc_parity_20261012_120951.json`]. 실제 워커 벤치 forward p50 scale 0.75에서 121.6→40.8 ms
+  (yield 19.4), 플랜 나이(emit) p50 321.2→222.3 ms(yield 233.3); scale 0.5에서는 forward 30.6–31.4→29.5–32.6 ms, 플랜 나이 p50
+  133→129–133 ms(yield 143–147), p90 191–192→171–179 ms(yield 164–167) [측정: `policy_fs_schedule_20261012_100908.json`,
+  `policy_fs_schedule_20261012_121018.json`]. 위 '미귀속' 3배 차이가 FS의 CPU/GIL 몫이면 분리가 수중에서 더 나을 수 있고, GPU 몫이면 아니다.
 - **제대로 고치는 법**: LOW None(observe) 런으로 실기 `fs_wait_ms`·`burst_timeouts`·플랜 나이를 먼저 보고, free / yield / only / scale 0.5 중 하나를 수중 A/B로
-  골라 기본값으로 만든다(또는 스위치를 지운다). scale 0.5의 정확도 대가는 `--record-stereo`로 수중 원본을 모은 뒤 오프라인 A/B로 본다 — 아직 미실행.
+  골라 기본값으로 만든다(또는 스위치를 지운다). 2026-10-12부터 후보에 `--fstereo-process`도 넣는다(같은 세션 ABAB). scale 0.5의 정확도 대가는 `--record-stereo`로 수중 원본을 모은 뒤 오프라인 A/B로 본다 — 아직 미실행.
 
 ### 정책 플랜이 **다음 플랜이 오기 전에 끝난다** — 기준이 끝점에 서 있는 시간이 26–78 % (2026-10-01)
 - **발견**: 2026-10-01, "추론 지연만큼 앞 action을 버려야 하지 않나"라는 질문을 코드·기록으로 확인하다가.
@@ -292,6 +639,15 @@
   턱에 문 병의 축은 기체 축 **오른쪽 0.011 m**다 [측정: data/20260908/0908_180453_observe/policy_obs/rgb/000160.jpg,
   같은 런 프레임 0/80도 동일]. 37.5 + 11 ≈ 49 mm가 위 34~50 mm에 맞는다 — 후보일 뿐 미확정(기준선
   방향 부호와 "덩어리 = 턱" 여부 미확인).
+- **2026-10-05 갱신 — 기준선 부호를 확인했다(검증 에이전트 1표, [유도]).**
+  - `c3_camera/host_depth.py:298-305` ColorRig 규약은 `P_color = R·P_rectleft + t`이고 t_x −37.55 mm다. 따라서 colour 중심은
+    rect-left보다 **37.5 mm 오른쪽**이다. q1 분석은 rect-left 중심을 colour 렌즈(cam_t_flu)에 두었으므로, 위 34~50 mm의 대부분은 이
+    반기선이다. 이를 빼면 colour 기준 턱은 렌즈 오른쪽 약 1.1–1.5 cm다(병 축 PnP; FS 배율 가정에 따라 −0.4~+1.3 cm).
+  - 그래서 `tcp_body_flu_m` y = 0 [예측]의 오차는 횡 여유 약 ±11 mm와 같은 자릿수다.
+  - 같은 프레임 혼합이 핸드헬드 대비 턱 불일치에도 있다. 핸드헬드 `tcp.offset_m`은 rect-LEFT 프레임 값이고
+    (`~/Desktop/data collection/slam/grasp_9_4_26/actions_summary.json` config.tcp._comment), ROV 턱은 colour 프레임 값이다.
+    rect-left로 맞추면 턱은 손끝보다 약 1.3–1.7 cm **오른쪽**이다. '첫 파지 약 3.6 cm 왼쪽 빗나감' 예측과 방향이 반대다 [유도].
+  - 남은 확인: 닫힌 턱에 작은 태그나 원통을 물리고, 같은 colour 프레임 PnP로 렌즈→턱 횡오프셋을 여러 프레임에서 잰다.
 
 ### C3 외부파라미터 cam_t_flu의 x/z가 의심된다 — 렌즈가 ~9 cm 뒤·5 cm 위일 수 있다 (2026-09-08)
 - **발견 경위**: 0908_180453(POLICY OBSERVE, 기체 44 s 정지, 매트 위, 기수 5.3° 상향)에서 조종사가 턱에 문
@@ -450,10 +806,52 @@
   roll/pitch PID와 나눠 써 접촉 국면 heave 권한 감소 [유도]. (6) 스테이션 UI에 STAB 상태 칩/툴팁 없음(거부 문구만).
 - 첫 세션 절차와 측정 항목은 README 해당 절. 그 산출물이 생기기 전엔 STABILIZE 런의 수치를 MANUAL 런과 합산·인용 금지.
 
+### 7d LOW 추종자(`PID_7D` / `MPC_Tuned_7D` / `RL_7D`)가 **실기 0런** — PID_7D 게인은 지연·복원강성 미측정 위에 서 있고, RL_7D는 학습된 정책이 없다 (2026-10-03)
+- **무엇**: roll/pitch까지 제어하는 LOW 세 개(README "7d LOW 추종자" 절). K/M은 `*_7d` LOW + `engage.attitude_axes.enabled`일 때만
+  나간다. 아래 6-DoF 변형 항목의 펌웨어 s/t·부호·플랜트 미확인이 전부 그대로 적용된다.
+- **PID_7D 게인은 [예측]이고 복원강성 k에 따라 안정 여유가 갈린다**: ωn 0.5 rad/s·Kp/Kd pole placement·Ki 0.15·FF 1.35는
+  총 지연 0.2 s, 구동 이득 ×0.4~×2.5에서 k ≤ ~2.3(roll)/3.6(pitch) N·m/rad일 때만 PM ≥ ~50°, k ≈ 20(RL 쪽 로그 적합)이면
+  PM 3–41° [유도: `rov_gui/tests/fixtures/sim_pid7d_attitude_20261003.txt`]. 실제 k·지연·구동 이득·감쇠는 미측정.
+  **임시 대응**: 물에서 루프를 닫기 전에 pulse-and-release 1회(개루프 pitch 0.15 axis 0.5–1 s → 유지 → 해제; 초기 방향 = 선 부호,
+  첫 자이로 반응까지 = 지연, 초기 각가속도 = g/I, 정적 기울기 = g/k, 자유감쇠 주기·로그 감쇠율 = k/I·d/I). 자유감쇠 주기
+  ≥ 3.2 s면 현 세트, 1.9–3.2 s면 이득 교정 후, < 1.9 s면 Kp = Kd = 0 + FF 0.8·k̂ + 작은 Ki(control-theory-advisor 자문,
+  `.claude/journal/consults.md` 2026-10-03). **제대로 고치는 법**: 그 측정으로 `pid_7d.rp_k_model/rp_k_ff/rp_wn`을 다시 정한다.
+- **PID_7D의 "권위 소진" 판정은 [예측] 임계값 위에 있다**(안전 감사 2026-10-03 HIGH 수정의 잔여): 적분이 선 토크의 0.8배에서
+  멈춰 축이 캡에 안 닿으므로, HwPid7d가 "권위 소진"(명령 클립 / 적분 한계 + 오차 > `rp_pin_err_rad` 1° / 오차 ≥ 게이트 20°)을
+  알리고 인터록 (iii)이 그것을 캡 고정과 같이 본다 — 뒤집힌 부호·도달 불가 기울기(강성 선체)는 1 s 뒤 disengage된다(의도).
+  남은 위험: 정상 추종인데 정적 모멘트가 커서 적분이 한계에 닿고 오차가 1°를 조금 넘는 경우의 **거짓 disengage**(1°는 [예측];
+  demo 진자에선 발생 안 함, 실기 미확인). 반대로 오차가 1° 이하로 남는 권위 부족은 잡지 않는다.
+- **pid_7d 실기 engage는 pulse 기록을 요구한다**: `pid_7d.pulse_test`(운용자가 시험에서 작성하는 JSON, `free_decay_period_s
+  [roll, pitch]`) 최솟값 ≥ 3.2 s 또는 기록되는 우회 `require_pulse_test: false`. 이 기록을 쓰는 도구는 없다(수동). 주기 외의 측정치
+  (지연·g/I·감쇠)는 게이트가 읽지 않는다 — 그 값으로 `rp_wn/rp_k_ff`를 다시 정하는 것은 사람의 일.
+- **기준 자세가 기록에 한 틱 앞서 찍힌다**(HwDobMpc와 같은 순서): D5 램프는 step 안에서 감쇠되고 워커는 그 뒤에 `ref_attitude_ned_at`을
+  읽으므로, 램프 중 CSV `rroll/rpitch`와 (iii)의 기준이 실제로 쓴 값보다 한 틱(≈1°) 앞선다. 고치는 법: step 전에 스냅샷.
+- **RL_7D의 roll/pitch slew(1.5/s)는 학습에 없던 액추에이터다**: 첫 프레임 ±cap 방지(2026-09-26 감사 수정)를 RL에도 적용한
+  안전 쪽 선택이지만, 되먹이는 직전 행동이 분포 밖일 수 있다(rl_pwm 캡 클립 한계진동과 같은 계열 [예측]). 학습 후 첫 시험에서 확인.
+- **EKF/DR로 날 때 판정 불일치(미검토)**: `ekf_control`/`dr_control`이면 7d 루프는 `meas_ctrl` 자세로 닫히고 ceiling·(iii)은 `meas`로
+  판정한다. roll/pitch는 둘 다 IMU 기반이라 차이가 작을 것으로 보지만 감사 범위 밖이었다.
+- **RL_7D에는 학습된 export가 없다**(운용자 결정: 코드만, 학습 보류). `config/hw_mpc.yaml rl_7d.policy_dir: null`이라 모드는
+  사유와 함께 거부된다. 학습은 RL_controller `scripts/_pipeline_att7_seed.sh <seed>`(preset `traj10att`, axes6, 1200 it;
+  3시드 병렬 ≈ 32 분 [유도: traj10 3개 병렬 32:06–32:14, `RL_controller/logs/train_traj10_s*.log`]) → export → 스테이션
+  `rov_gui/control/rl_policies/<name>/`. 학습 후에도: (a) 학습 캡(0.5/0.75 정책 단위 = 스테이션 0.2/0.3)보다 낮은 first-water 캡으로는
+  engage 거부(부호 프로브로 full 캡을 얻거나 `rl_7d.allow_caps_below_trained` 기록 우회), (b) RL 쪽 평가 스크립트(eval_sweep/
+  eval_trajectory/summarize_results)는 아직 roll/pitch 기준 단계·지표가 없다 — 학습 곡선 `/att/err_full_deg`만 있다.
+- **RL_PWM(pwm10_s1)은 roll/pitch 기준을 추종하지 못한다**: 수평 q_des로만 학습됐다(능동 수평 유지만). 7-dim 정책과 함께 쓰려면
+  pwm 모드로 att7 레시피를 학습해야 하고, 스테이션 `HwRlPwm`도 HwRl7d처럼 q_des에 자세를 실어야 한다(미구현).
+- **기존 RL 추종자의 yaw-rate FF 스파이크(rl/rl_pwm/rl_7d 공통, 2026-10-03 조사에서 발견)**: `HwRl.observation`이
+  `_yaw_ref_prev`를 r_ref == 0인 틱에서만 갱신해서, r ≠ 0 플랜 구간 뒤 첫 hold 틱에 goal_yaw_rate가 −0.6 rad/s로 한 틱 튄다
+  (코드 동작, 실측 아님). 고치는 법: 매 틱 `_yaw_ref_prev` 갱신 — rl/rl_pwm 기록의 비교 가능성 때문에 이번 변경에 넣지 않았다.
+- **Replay 자세 추종(`replay.track_attitude`)은 정책보다 가드가 약하다**(기존): T1 클립·rp FilterLimits·div_rp 없음, T3(30°)만.
+  `*_7d` LOW에서 replay에 자세를 실을 때 해당.
+- **의미 변경 = 기록 경계(2026-10-03)**: `engage.attitude_axes.enabled`는 "K/M 송신"이 아니라 "스테이션 능력", `policy.attitude_track`은
+  스위치가 아니라 거부권(기본 true). 09-26~10-02에 이 스위치로 돈 런(물속 0, 시뮬·데모만)은 meta `run.attitude_axes.low`가 없다.
+
 ### 6-DoF 변형(roll/pitch 추종, `pos_rpy_width` + `engage.attitude_axes`)이 **실기 0런** — 펌웨어 s/t 소비·부호·플랜트가 전부 미확인 (2026-09-26)
 - **무엇**: 정책이 `[dx,dy,dz,dyaw,droll,dpitch,width]` 7-dim을 내고 NMPC가 roll/pitch 참조를 추종해 K/M 토크를
   MANUAL_CONTROL 확장축(s = pitch, t = roll, `enabled_extensions=0b11`)으로 보내는 변형. 기본값은 전부 OFF
-  (`policy.action_repr: pos_yaw_width`, `policy.attitude_track: false`, `engage.attitude_axes.enabled: false`)이고
+  (`engage.attitude_axes.enabled: false`; 2026-10-03부터 K/M은 `*_7d` LOW에서만 나가고 `policy.attitude_track`은 거부권으로
+  기본 true — 위 7d LOW 항목; 같은 날부터 `policy.action_repr`은 배포값 `auto` = 패널에서 고른 체크포인트의 계약을 ARM 때 고정,
+  명시값 `pos_yaw_width`/`pos_rpy_width`는 예전처럼 세션 고정)이고
   OFF면 4-DoF 경로는 바이트 동일(테스트 고정). 설계·첫 비행 순서는 `docs/DP_6DOF_PLAN.ko.md`. 아래는 켜기 전에 남은 것.
 - **펌웨어가 s/t를 읽는지·어느 부호로 읽는지 미확인**: 이 ROV의 ArduSub 버전 자체가 미확인(위 STABILIZE 항목 (4))이고 s/t는
   Sub 4.1.2(2024-02-22)부터만 소비된다 — 4.1.0/4.1.1이면 **조용히 무시**. `joystick.cpp`의 s/t 줄(채널 인덱스·rpyScale·부호·
@@ -503,8 +901,13 @@
   미전달된 K/M으로 pitch 6.83°까지 흘러 rad_max 14.5 cm(`bluerov2_mujoco_marinegym/recordings/20260926/attitude_hold_211917/
   results.csv`, `dropped_*` 행) — `dobmpc_allowed: false`를 유지하는 이유는 임계가 아니라 이 드리프트다. (ii) S2 hold 그리드는 NONE만 돌았고 C/CDW 셀은 미실행(`verify_attitude_hold.py --modes C,CDW`);
   (iii) S5 데드밴드 플러그인은 heavy(+1.1 N 근중립)만, heavy_gripper(−5.7 N 침강)의 리밋사이클은 미실행;
-  (iv) `pos_rpy_width` 체크포인트가 아직 없다(`tools/run_ablations.sh depth_7d_*` 미실행) → held-out 수용·OOD 리플레이·
-  `dp_policy_reference.py` 패리티 픽스처 전부 미실행; (v) `tests/test_dobmpc.py main()`은 기존 NU=4 vs 6 실패로 여전히
+  (iv) 첫 `pos_rpy_width` 체크포인트가 생겼다(2026-10-03: `data/checkpoints/20260929_peg7d_vitclip.ckpt` → `data/20260929/peg7d_vitclip/`,
+  bdml-server에서 학습, epoch 190, 계약 키 `action_repr`/`yaw_axis_*`/`rpy_convention` 있음; 라벨 |dpitch| p95 3.28° p99 6.03°,
+  |droll| p95 2.94° p99 5.02° — `data/20260929/peg7d_vitclip/rp_label_stats.txt`) → 그러나 held-out 수용·OOD 리플레이·
+  `dp_policy_reference.py` 패리티 픽스처는 여전히 미실행. **`action_repr: auto`(2026-10-03) 이후 이 체크포인트를 고르고 LOW
+  `RL_PWM_7D`를 고르면 YAML 단계 없이 START 한 번에 roll/pitch를 추종한다**(RL_PWM_7D 정책도 시뮬 승격 기준 미달, 위 항목) —
+  패널이 START 전에 `TRACKED on RL_PWM_7D`(경고색)로, ARM 뒤 칩이 `· 7d rp TRACKED`로 말하지만 막지는 않는다. ④ dropped-and-logged
+  기록(4-DoF LOW)이 먼저다; (v) `tests/test_dobmpc.py main()`은 기존 NU=4 vs 6 실패로 여전히
   red, 새 자세 테스트 6개는 이름을 줘서 개별 실행.
 
 ### ArduSub **조이스틱 gain**이 스테이션이 보내는 모든 축을 곱하는데, 읽지도 기록하지도 않는다 (2026-09-07)
@@ -589,16 +992,6 @@
 - **제대로 고치는 법**: z-hold 항목을 예정대로 삭제한 뒤, demo 플랜트 또는 e2e 기대치를 `hold_tail: extrapolate`/`anchor: measured`에
   맞게 재조정(`div_max_m` 0.25 대비 합성 플랜트의 응답)해 `demo_e2e.py policy`를 다시 green으로 만들고, 그때 LOW None 변형
   (`Opts.mpc_mode = "none"`)도 드라이버 인자로 돌릴 수 있게 한다(지금은 main()이 mpc/dobmpc/…/pid만 받는다).
-
-### `demo_e2e.py mpc policy`가 한 번 "a plan was installed after STOP"으로 FAIL — 재현 안 됨 (2026-09-07)
-- **증상**: 추종자 모드 확인 중 `demo_e2e.py mpc policy` 6회 중 1회(첫 실행, dobmpc_tuned 직후 연속 실행)가
-  STOP 뒤 플랜 1개가 설치됐다며 FAIL. 같은 인자로 2회 재실행·pid/mpc_tuned/dobmpc_tuned/dobmpc 모두 OK
-  ("after STOP: 0 plans emitted, 0 installed"). 하네스는 wall-clock으로 돌고 acados 빌드 직후라 타이밍
-  플레이크일 가능성이 크지만, 실제 워커에서 STOP 뒤 in-flight 청크가 epoch/inactive 규칙을 뚫는 경로가
-  있다면 안전 문제라 기록해 둔다.
-- **임시 대응**: 없음(재현 시 그 런의 plans.jsonl `epoch`/`t_rel`과 STOP 이벤트 시각을 대조).
-- **제대로 고치는 법**: demo_e2e의 STOP 검사에 플랜의 epoch·obs_t·intake 시각을 출력하게 해 다음 재현 때
-  "STOP 이전 epoch의 지연 도착"인지 "STOP 이후 epoch"인지 즉시 갈리게 한다.
 
 ### 학습 리포의 val 곡선이 **EMA 가중치 기준**이라 체크포인트 선택을 거꾸로 시킨다 (2026-09-07)
 - **증상**: 2026-09-07 5-dim 재학습에서 `logs.json.txt`의 32-윈도 `val_action_mse_error_pos`(= workspace의
@@ -831,6 +1224,51 @@
 - **제대로 고치는 법**: 재등록 pose에 last-known 대비 위치/yaw 게이트를 perception 쪽에
   두고, 포기 카운터가 recovered-trigger 재등록도 세게 한다.
 
+### FoundationPose 포즈에 **푼 프레임이 아니라 마지막으로 제출한 프레임**의 시각이 붙고, 재등록 중엔 옛 포즈가 `tracking`으로 재발행된다 — `pair_exact`는 "라벨이 같다"일 뿐이다 (2026-10-05)
+- **증상**: `PoseWorker.tick`은 mailbox에서 마지막으로 꺼낸 colour 프레임의 `t_capture`를 `_last_t_cap`에 넣고, 그 값을 발행
+  포즈에 붙인다(`rov_gui/backends/hardware.py:4732-4739`). 그런데 포즈 내용은 FpWorker가 마지막으로 **끝낸** 해다
+  (`rov_gui/perception/session.py:1336-1343`). 바로 위 주석(4724-4731)은 "submit 안에서 inline으로 푼다"고 적었지만 데이터와
+  맞지 않는다. 0823 수중 세 런에서는 0.6–1.4 s짜리 재등록 동안에도 발행이 10 Hz로 이어졌고 `frame_seq`가 행마다 +2씩 늘었다.
+  연속 `tracking` 행 쌍의 11–17 %는 위치·회전이 비트 단위로 같았고, 7행 이상 이어진 긴 동결은 대부분 `n_register`+1로 끝났다
+  [리뷰 계산·미저장: `data/20260823/0823_{182628,195927,210304}/c3_depth_*_pose.csv`]. `poll()`은 T가 None일 때만 `registering`을
+  보고한다(`session.py:1371-1375`). `--fstereo`에서는 FS 맵이 colour보다 250 ms 넘게 오래되면 FP 제출 자체가 빠지는데(`session.py:648`),
+  그때도 라벨은 새로 붙는다.
+- **결과**: `object_nav.pick_fix`는 float 동치만 비교한다. 그래서 `pair_exact`=1이어도 같은 프레임이라는 보장이 없고, extrinsic
+  상쇄가 깨진다. 동결 동안에는 물체의 MAP 위치가 카메라와 함께 움직이고(병진 이득 1), FD 속도는 기체 속도를 따라가며,
+  라벨 나이로 재는 신선도는 LIVE로 남는다. 기준이 기체와 같이 움직이므로 div guard는 구조적으로 이를 볼 수 없다.
+  크기는 기체 속도 × 동결 시간 ≈ 0.023–0.055 m/s × 0.8–1.4 s ≈ 2–8 cm다 [유도]. 단 이 동결 통계는 비metric 메시와 1.5–2.5 m 거리의
+  실패 영역에서 나온 것이다.
+- **같은 경로의 시각 오차 둘**:
+  (1) `--fstereo`에서 FP용 depth는 최신 colour에 아직 소비하지 않은 최신 FS 맵을 붙인다. 그래서 250 ms는 꼬리가 아니라 상한이고,
+  상시 skew가 약 0.06–0.18 s다 [유도: HUD 지연 차 + FS 주기]. 같은 '최신 대 최신' 짝짓기의 기록 skew는 중앙값 195 ms였다
+  (p5 86, p95 365 ms; `data/20260907/0907_133358_observe/policy_obs/index.csv` `rgb_dt_ms`, n 514).
+  (2) `config/hw_mpc.yaml:645`의 `pair_tol_s` 유도(레버암 0.2855 m × 0.5 rad/s ≈ 1.1 cm)는 지배항인 시선 회전 ρ·r·τ를 빠뜨렸다.
+  물체 거리 ρ 0.5–1.5 m에서 이 항은 수 cm다 [유도].
+- **임시 대응**: 오늘은 `--pose`가 아예 로드되지 않는다(위 2026-09-30 항목). 복원한 뒤에도 재등록·LOST 직후의 `obj_*`와 follow FF는 믿지
+  않는다. 물체 위치를 기준 경로에 넣는 새 기능(예: 움직이는 물체용 DP 플랜 보정)은 아래 수리 전까지 폐루프로 돌리지 않는다.
+- **제대로 고치는 법**:
+  - FpWorker(삭제된 sam2_live 안)를 다시 만들 때 해마다 입력 프레임의 `(t_capture, seq, solve_id)`를 돌려준다. 새 해가 없으면 발행하지
+    않거나 "no new solve"로 표시한다.
+  - 수신 측은 중복 `solve_id`와 비트 동일 T를 버리고, **푼 프레임의 fix**와만 합성한다.
+  - 옛 T가 남아 있어도 재등록 중이면 `registering`을, depth가 없으면 STALE을 발행한다. pose jsonl에 `solved_seq`를 기록한다.
+  - FS depth는 colour 이력에서 FS 스탬프에 가장 가까운 프레임과 짝짓는다(`LatestFrame.nearest` 방식).
+  - 회귀 테스트: 150 ms 비동기 가짜 FpWorker + 움직이는 카메라 + 정지 물체 → 물체 MAP 위치 변화 0.
+
+### `ObjectAnchor`의 물체 속도가 등속에서 **2배**로 나온다 — 원시 위치를 EMA로 걸러진 위치와 차분한다 (2026-10-05)
+- **증상**: `ObjectAnchor.update`는 `v_raw = (p_new − self.p)/dt`를 계산하는데, `self.p`는 이미 `pos_lp_alpha`로 걸러진 위치다
+  (`rov_gui/control/object_nav.py:411`; 갱신은 418). 등속이면 걸러진 위치가 v·dt만큼 뒤처지므로 정상상태에서 v̂ = v/α다.
+  배포값 `pos_lp_alpha 0.5`(`config/hw_mpc.yaml:657`)에서는 **2v**다 [유도; 인메모리 복제로 2.00v]. 속도를 검사하는 테스트는 모두 α 1.0을 써서
+  (`rov_gui/tests/test_object_nav.py:300, 325-326, 338-339, 486`) 이 편향을 잡지 못한다.
+- **영향**: 다음이 모두 같은 배율로 틀어진다.
+  - follow 미션의 목표 속도 FF(`v_track`)가 2배가 된다.
+  - `follow_ff_max_m_s 0.30`이 실제로는 약 0.15 m/s에서 포화한다.
+  - `predict()` 외삽이 틀어진다.
+  - '물체 속도가 3×cap을 1 s 넘으면 STATION 강등' 문턱이 틀어진다.
+  정지 물체에서도 FF 잡음이 커진다. 0824 정지 구간에서 발행된 FF는 p90 0.062–0.110 m/s였다
+  [리뷰 계산·미저장: `data/20260824/0824_105751/mpc_*.csv`].
+- **임시 대응**: follow는 08-24 이후 실기 0런이고 `--pose`도 로드되지 않으므로 지금 당장 피해는 없다. 복원 뒤 follow를 날리기 전에 고친다.
+- **제대로 고치는 법**: 원시 위치끼리 차분하거나, 캡처 시각 기준 CV Kalman(α-β)으로 바꾼다. α<1인 등속 램프 테스트를 추가한다.
+
 ### 태그맵의 같은 ID 사본(54, 65)이 급기동 중 wrong-copy 매칭을 일으킨다 (2026-08-24)
 - **증상**: `nav_213749/fixes.csv`에 "wrong-copy tag(s) dropped: 54, 65"(csv_t
   48.66–48.79, 49.76–50.13) — 정상 추종 650행 베이스라인에서는 0건, 급격한 yaw 스윙
@@ -1011,7 +1449,33 @@
   매 프레임 갱신해 런 종료 시 한 줄로 남긴다(또는 `frames.csv`에 사유 열 추가).
 
 
+### 스테이션을 **90 s 안에 다시 띄우면** 같은 런 폴더에 합류하고, `--record-stereo`/`--record-depth` 녹화가 **앞 런 것을 덮어쓴다** (2026-10-12)
+- **증상**: `runstore.run_dir`은 같은 종류의 폴더가 `JOIN_WINDOW_S` 90 s 안에 시작됐으면 그 폴더에 합류한다
+  (`rov_gui/runstore.py:144`). 그런데 녹화기는 폴더를 연 뒤 `index.csv`를 **`"w"`로** 열고 프레임 번호를 0부터 다시 쓴다
+  (`rov_gui/perception/frame_record.py:320`, StereoRecorder·depth 레코더 공용). 그래서 플래그를 바꿔 곧바로 재기동하면
+  (`--policy-fs-schedule`/`--fstereo-process` A/B가 정확히 그렇다) 새 런의 녹화가 앞 런의 `index.csv`·`000000.png…`·`meta.json`을
+  덮는다. `mission_log.txt`도 새 세션 로그로 바뀐다(`window.py` 세션 로그). 2026-10-12 리뷰 critic이 scratch에서 StereoRecorder 두 번으로
+  재현(index.csv에 두 번째 런의 행만 남음 — 스크래치패드 산출물이라 인용 불가, 코드 근거는 위 두 줄).
+- **임시 대응**: 녹화를 켠 런 사이에는 **90 s 넘게 기다렸다가** 재기동한다. 기동 로그·`data/<날짜>/` 폴더 이름으로 새 폴더가
+  생겼는지 확인한다.
+- **제대로 고치는 법**: 녹화기가 이미 `index.csv`가 있는 폴더를 열면 새 하위 폴더(`stereo_2/`, launch id 접미사)로 가거나 `"a"`로
+  이어 쓰며 seq를 이어 받게 한다. 또는 `run_dir`이 프로세스(launch)마다 다른 leaf를 내게 한다(합류는 같은 launch의 writer끼리만).
+
 ## 🐛 테스트 / 스크립트 함정
+
+### `filter_plan_yaw`가 `PlanMsg`를 필드 나열로 다시 만든다 — 새 trailing 필드는 yaw 필터가 켜진 live 경로에서 **조용히 사라진다** (2026-10-05)
+- **증상**: `rov_gui/control/policy_frames.py:1329-1331`이 `PlanMsg(plan_id=…, obs_t=…, arrival_t=…, rp=rp_msg)`로 새 객체를 만든다.
+  `PlanFilter`의 dilation은 `dataclasses.replace`로 모든 필드를 보존하지만, 이 함수는 적힌 필드만 옮긴다.
+  `policy.yaw_ref_filter`는 켜져 있다(`config/hw_mpc.yaml:846-849`).
+- **임시 대응**: `PlanMsg`에 필드를 추가하면 이 함수도 같이 고친다.
+- **제대로 고치는 법**: `dataclasses.replace(msg, p_ned=…, yaw=…, rp=…)`로 바꾸고, 모든 필드가 보존되는지 테스트한다.
+
+### `fixes.csv`의 `detect_ms`는 검출 시간이 아니라 **PnP 풀이 시간**이다 (2026-10-05)
+- **증상**: main 피드의 `NavFix.detect_ms`는 `TagNav._solve_raw` 시작부터 잰 `perf_counter` 경과다(`rov_gui/control/tagnav.py:673, 765, 881`).
+  그래서 0.1–1.6 ms로 찍힌다. 실제 검출 시간(`rov_gui/control/workers.py:410-412`)은 overlay로만 간다. RGB fallback 행에만 4–6 ms 같은
+  실제 검출 값이 보인다.
+- **임시 대응**: main 행의 `detect_ms`를 검출 시간으로 인용하지 않는다.
+- **제대로 고치는 법**: 필드 이름을 `solve_ms`로 바꾸고, 검출 시간을 별도 열로 기록한다. 바꾸는 날을 기록 경계로 표시한다.
 
 ### `slam/9_9_26/`이 `slam/grasp_9_9_26/`으로 바뀌었는데 옛 경로가 남아 **ablation 러너가 run을 조용히 건너뛴다** (2026-10-01)
 - **증상**: `~/Desktop/data collection/slam/`에는 이제 `grasp_9_4_26`, `grasp_9_9_26`, `peg_in_hole_9_27_26`, `peg_in_hole_9_28_26`만 있다
@@ -1628,6 +2092,12 @@
   **컬러 캘리브는 정상, 스테레오 depth 경로만 non-metric**이다.
   아래 "물체가 아닌 것을 삼킨다" 분석은 **부분 원인으로 강등**: 거리별 산포 증가(smear)는
   실측 사실이나, 지배 항은 이 스케일이다. 470 mm 메시 = 스케일 × smear.
+- **2026-10-05 정정 — 위 '결정 증거'는 공기 중 캡처다.** 187 mm 메시의 참조뷰
+  `data/20260823/0823_210135_obj/rgb/000000.png`는 실험실 바닥에서 손에 든 PVC 엘보를 찍은 것이다(직접 확인).
+  C3 공장 캘리브는 수중 값이라 공기 중 depth는 원래 약 1.33배 길게 읽힌다(아래 2026-08-04 항목).
+  그러므로 이 1.562배를 '물속 1.56배'의 근거로 인용하지 않는다. 물속 근거로 남는 것은 두 가지다.
+  - 0824 두 런의 물체 재투영 과대 1.55/1.57×(`data/20260824/{0824_101807,0824_101251}`, `.claude/journal/consults.md` 2026-08-24).
+  - 바닥 스윕 depth-vs-MAP 1.71×. 화면 판독이며 파일로 기록되지 않았다.
 - **대응(2026-08-23 추가)**: `--depth-scale K` — depth 밀리미터를 **소스에서 한 번** 곱해
   모든 소비자(커서 프로브·캡처·FoundationPose·depth-vs-MAP)가 같은 보정 스트림을 본다.
   시작값 **0.64**(=1/1.562). 적용하면 depth-vs-MAP가 ~1.0x로 내려와야 하고(그 줄이 보정의
@@ -2364,18 +2834,29 @@ AprilTag PnP → EAOB+acados NMPC → MANUAL_CONTROL 폐루프(`rov_gui/control/
   이미 커밋된 값). 테스트 상한을 풀 것인지 config를 3 m로 되돌릴 것인지는 사용자 결정 —
   10 m는 풀 대각선보다 길어 사실상 상한 없음이다.
 
-### RGB를 먹는 정책 체크포인트(`umi_rgbd_5d`, RGB-only 포함)는 **평가할 도구가 없다** — 스테이션·리플레이·held-out 셋 다 depth 전용 (2026-09-23, 2026-10-01 갱신)
-- **무엇**: 2026-09-23 ablation의 two-stream 모델(obs `camera0_rgb` + `camera0_depth`, task
-  `external/UMI_aquatic/diffusion_policy/config/task/umi_rgbd_5d.yaml`)은 학습만 된다. 세 도구가 모두 `camera0_depth`만 먹인다
-  [코드 읽기, 미실행 — 2026-10-01]:
-  - 스테이션: `rov_gui/backends/policy.py:85` `IMAGE_KEY = "camera0_depth"`, `policy_obs.py`는 depth 레시피만 만든다.
-    RGB+D ckpt는 로드에서 `ValueError`("exactly one image key", `dp_policy.py:586-603`)로 죽는다. **RGB-only ckpt(`camera0_rgb`
-    키 1개)는 더 나쁘다** — warm-up이 contract의 image_key 자리에 0을 넣어 통과하므로 READY가 되고(`dp_policy.py:983-995`),
-    그 뒤 매 tick `_check_obs`의 KeyError "obs is missing 'camera0_rgb'"(`:1019-1026`)가 `_infer_error`로 넘어가 플랜 0개·DEGRADED
-    (`backends/policy.py:1618-1622, 1664-1669`). 패널 ckpt 교체(`set_ckpt`)에도 이미지 키 검사가 없다.
-  - 오프라인 리플레이: `rov_gui/tools/policy_session_replay.py:273`이 `{"camera0_depth": img}` 고정. 기록된 `policy_obs/rgb/*.jpg`는
-    C3 컬러 원본 640x360 JPEG q85이지 224 obs가 아니고, `cv2.imread`는 BGR로 돌려준다.
-  - 육상 held-out: `rov_gui/tools/dp_policy_offline.py:385, 1111, 1173`도 `camera0_depth`만 읽는다.
+### RGB 체크포인트: 스테이션은 2026-10-03부터 C3 컬러를 먹인다(naive 광학·수중 0런) — RGB+D는 여전히 불가, 오프라인 도구는 depth 전용 (2026-09-23, 2026-10-01, 2026-10-03 갱신)
+- **고쳐진 것 (2026-10-03, 여기서 지움)**: RGB-only ckpt가 READY 뒤 매 tick KeyError로 플랜 0개이던 것 — 실기 재현
+  [측정: `data/20261003/1003_151227/events.log` RGB START 3회·`plans.jsonl` RGB 플랜 0행, meta `infer_errors` 누적 39→158].
+  이제 계약의 이미지 키로 입력을 고른다(README "RGB 체크포인트 — C3 가운데 렌즈를 먹인다"). 같이 고친 것: 공급할 수 없는 키·채널
+  순서 불명·정사각 아닌 `image_shape`는 READY 대신 ERROR + ARM 거부, ckpt 교체 시 `plan_hz`/`infer_ms`/pairing 리셋, RGB ckpt의
+  OBS VIEW SHIFT 오공지·FS parity 경고 제거, fix가 멈추면 같은 obs 재계획 안 함(`skip_same_obs`). 안전 감사 PASS_WITH_FIXES·정확성 리뷰
+  버그 0(`.claude/journal/reviews.md` 2026-10-03).
+- **남은 것**:
+  - **RGB+D two-stream ckpt**(`umi_rgbd_5d_*`, 이미지 키 2개)는 스테이션 로드에서 `ValueError`("exactly one image key",
+    `dp_policy.py` `_obs_shapes_from_meta`)로 ERROR — 두 이미지를 한 obs에 동시 공급하는 경로가 없다.
+  - **오프라인 도구는 depth 전용**: `rov_gui/tools/policy_session_replay.py`(`{"camera0_depth": img}` 고정)와
+    `rov_gui/tools/dp_policy_offline.py`(held-out)가 `camera0_rgb`를 못 먹는다. `--record-depth`도 RGB obs는 기록하지 않는다
+    (warn 한 줄) — 수중 RGB 런은 지금 재생·재평가할 원자료가 없다(`policy_obs/rgb/*.jpg`는 C3 원본 640x360 JPEG q85이지 224 obs가 아니다).
+  - **광학은 naive**(운영자 결정 2026-10-03): 아래 수치대로 수중 C3 obs는 학습보다 약 1.8배 확대 [유도]. meta
+    `policy.worker.obs_mode = rgb`·`obs.optics`가 경계 — warp한 RGB 런과 합산 금지. **2026-10-04 진행 중**: C3 광학으로 warp한
+    store(`slam/dataset_rgb_c3warp_peg_9_27_9_28.zarr.zip`, `umi_handheld/build_dp_rgb_c3warp_zarr.py`, 크롭이 스테이션과 같아 스테이션
+    수정 불필요)로 재학습 중(`data/20261004/1004_025349_train_umi_rgb_c3warp_5d_…`) — 끝나면 이 항목의 naive 문장은 그 ckpt에 해당 없음.
+    run 기록은 2026-10-04부터 ckpt를 따라간다: meta `obs.optics_kind` `c3_warped` | `naive`(학습 store `.zattrs rgb.optics`에서).
+  - **FS 스케줄**: RGB ckpt에서는 게이트를 안 쓴다(`effective` = free) — FoundationStereo가 패널용으로 계속 돌며 정책 forward와 GPU를
+    나눠 쓴다(depth 런의 contention 수치는 [[policy-plan-latency-budget]] 메모, `data/20260930/0930_220212/diag/`). `yield`식 hold를
+    RGB에도 주는 것은 미구현(정확성 리뷰 R1).
+  - **실기 0런**: 첫 수중 런은 LOW None(observe)으로 — plans.jsonl에서 `obs_t − obs_fix_t[-1]`이 µs 수준인지, `skip_fix_lag`/
+    `skip_same_obs`가 낮은지 확인한 뒤 closed loop(안전 감사 권고).
 - **학습 RGB의 정체**: OAK-D-W 컬러 CAM_A `rgb.mp4`(1280x720) 센터 크롭 224, 정류·warp 없음
   (`data collection/UMI_Underwater/demonstration_processing/build_dataset.py:83-92,146-150`). 소스 store는 **BGR**이고
   병합 store(`slam/grasp_9_9_26/dataset_rgbd.zarr.zip` — 옛 이름 `slam/9_9_26/`, 아래 🐛 경로 항목)는 RGB로 뒤집어 저장했다
@@ -2387,16 +2868,34 @@ AprilTag PnP → EAOB+acados NMPC → MANUAL_CONTROL 폐루프(`rov_gui/control/
   513.4; `calib/FOV_AUDIT.md:57`)는 약 38.6°×38.6°다 → 화면 중심 배율 약 1.8배(같은 거리 물체가 수중 obs에서 1.8배 크다),
   육상 크롭 가장자리 배럴 13.5 %. 학습 증강(crop 0.95, ±5°)으로 못 덮는다. `umi_handheld/warp.py` `WarpStage`는 depth 없이
   카메라모델끼리 remap하므로(`:74-84`) RGB도 C3 CAM_A로 warp할 수 있다 — 단 source는 1280x720 CAM_A 모델(fx 그대로, cy−40;
-  `CameraModel.K`의 해상도 스케일 경로를 타면 fy가 10 % 틀어진다), target C3 CAM_A yaml은 레포에 없어 런 meta
-  (`data/20260908/0908_180453_observe/mpc_180453.meta.json:707-753`)에서 만들어야 한다. warp하면 핸드헬드 손끝(광축 아래 약 22°)이
+  `CameraModel.K`의 해상도 스케일 경로를 타면 fy가 10 % 틀어진다); target은 2026-10-04 `configs/target_camera_c3_cam_a_640x360.yaml`로
+  만들었다(런 meta `fstereo.rig.color`에서 환산, `data/20260908/0908_180453_observe/diag/solve_frame.py:22` K와 일치). warp하면 핸드헬드 손끝(광축 아래 약 22°)이
   VFOV ±19.3° 밖으로 빠지고 ROV 턱(약 11.5°)은 보이는 비대칭이 생긴다 [유도].
-- **제대로 고치는 법**: (1) `policy_obs.py`에 C3 CAM_A 컬러 → (학습과 같은 warp 여부) 센터 크롭 224 RGB 빌더, BGR→RGB,
-  (2) `backends/policy.py`의 `IMAGE_KEY`를 ckpt contract의 image_key로 바꾸고 로드 시점에 이미지 키를 검사, (3) `dp_policy.py`의
-  `eval_transforms`를 키별로 적용(이미 `key_transforms`는 무시하도록 해둠), (4) 리플레이·held-out 도구에 `camera0_rgb` 경로,
-  (5) 광학 보정 여부(naive / C3 warp)를 run meta에 남길 것. 그 전까지 RGB ckpt는 wandb val(EMA 가중치·배치 1개)밖에 볼 수 없다.
 
 ---
-*마지막 갱신: 2026-10-01*
+*마지막 갱신: 2026-10-05*
+
+### 정책+GUI 테스트를 한 pytest 프로세스로 길게 이어 돌리면 `pupil_apriltags`에서 멈춘다(힙 손상) — HEAD에서도 재현 (2026-10-03)
+- **증상**: `test_policy_*`·`test_plan_stream`·`test_replay` 묶음 뒤에 `test_control.py`를 같은 프로세스로 돌리면 `test_control` 초반
+  (TagNavWorker 생성 → `pupil_apriltags.Detector`)에서 영원히 멈춘다. 한 번은 glibc가 `malloc(): mismatching next->prev_size
+  (unsorted)`를 찍었다 — 앞선 네이티브 코드가 힙을 망가뜨리고, 뒤의 malloc/free가 락을 쥔 채 멈춘 것.
+  [측정: `rov_gui/tests/fixtures/pytest_chain_hang_worktree_20261003.txt`(malloc 메시지),
+  `…_worktree_tagnav_20261003.txt`(Detector.__init__ glob에서 정지), `…_HEAD5c50f99_20261003.txt`(오늘 변경이 하나도 없는
+  커밋 HEAD 5c50f99의 worktree에서도 같은 지점 — `bindings.py:450 __del__`에서 정지)].
+- **아닌 것**: 2026-10-03의 RGB obs 변경 탓이 아니다(HEAD에서 재현). 파일별·두 파일 조합(`test_policy_worker`+`test_control` 등)은 통과.
+- **우회**: 스위트를 파일 단위로 돌린다. 원인 라이브러리(acados·cv2·pupil_apriltags 중 무엇이 힙을 망가뜨리는지)는 미확정 —
+  `PYTHONMALLOC=malloc_debug` 또는 `MALLOC_CHECK_=3`으로 첫 손상 지점을 잡는 것이 다음 단계.
+
+---
+*마지막 갱신: 2026-10-03*
+
+
+### 기록 결함 둘: plans.jsonl `follower`가 항상 "mpc", `*_ekf_inputs.jsonl`의 IMU `acc`가 항상 0 (2026-10-04 발견)
+- **증상**: (a) `rov_gui/control/workers.py`의 plans.jsonl 줄이 `"follower": ("observe" if self.observe else "mpc")`로 하드코딩 —
+  rl_pwm_7d·pid 런에서도 "mpc"(`data/20261003/1003_202721/plans.jsonl`). (b) `mpc_*_ekf_inputs.jsonl`의 imu 레코드 `acc`가
+  전부 `[0.0, 0.0, 0.0]`(같은 폴더) — 가속도가 EKF 재생에 들어가지 않는다.
+- **영향**: 진단·풀링 시 follower는 meta `controller.type`/CSV `mode`로 읽을 것. EKF 재생의 가속도 융합은 이 기록으론 재현 불가.
+- **제대로 고치는 법**: (a) `self.cfg.mode`(LOW)를 쓰기, (b) IMU 가속도 경로(ArduSub SCALED_IMU/RAW_IMU)가 상태에 실리는지 확인.
 
 ### `demo_e2e.py dobmpc policy`가 `skip_fix_lag`로 플랜 0건 — 데모 프로세스에서 dobmpc tick이 fix보다 70–140 ms 늦다 (2026-09-26)
 - **증상**: `rov_gui/tests/demo_e2e.py dobmpc policy`(docstring 기본 추종자)는 PolicyWorker가 12/12 쌍을
@@ -2408,6 +2907,16 @@ AprilTag PnP → EAOB+acados NMPC → MANUAL_CONTROL 폐루프(`rov_gui/control/
 - **경계**: 2026-09-11 저널에 이미 "`demo_e2e.py policy` 녹색 베이스라인 없음"으로 기록된 행. 실기 dobmpc 정책 런에는 다른 프로세스 배치라
   그대로 옮겨 읽지 말 것.
 - **후속**: dobmpc tick 소요를 데모에서 재고(EAOB 첫 tick 비용 / 플랜트 RK4), 또는 demo_e2e의 policy 행 기본 추종자를 mpc로 고정.
+- **재관측 2026-10-03**: `demo_e2e.py policy`(기본 LOW = 배포 `dobmpc`) 2회 모두 같은 FAIL(`skip_fix_lag` 11–12회, 플랜 0). 배포
+  설정을 `action_repr: pos_yaw_width`로 바꾼 사본으로도 동일 → 같은 날의 `action_repr: auto`와 무관 [측정: 세션 스크래치 로그,
+  보존 안 함]. `mpc_tuned policy`·`mpc_tuned policy auto`는 통과.
+
+### `test_trajectory_panel_ckpt_widgets_share_the_high_row_and_add_no_height`가 **단독 실행**하면 실패 — 파일 전체로는 통과 (2026-10-03 발견)
+- **증상**: `pytest rov_gui/tests/test_offline.py -k share_the_high_row` 단독 → `policy must add no row`, `minimumSizeHint`
+  높이 223 vs 224(policy가 station보다 1 px **낮음**). 같은 파일 전체 실행(122개)에서는 통과.
+- **경계**: HEAD(`git archive HEAD`)의 사본에서도 단독 실행이 똑같이 223 vs 224로 실패 → 2026-10-03 변경(패널 7-dim 표시)과 무관한
+  순서 의존(앞선 테스트가 만든 폰트/스타일 상태로 보임 [유도]).
+- **제대로 고치는 법**: 테스트가 측정 전에 폰트·스타일을 고정하거나, 비교를 "policy가 행을 추가하지 않는다"(≤)로 바꾼다.
 
 ### `demo_e2e.py dobmpc square`가 이 작업트리에서 red — 설정의 `plant.linear_damping` 덮어쓰기 vs 데모 플랜트, 그리고 드라이버 예산 (2026-09-26)
 - **증상**: `rov_gui/tests/demo_e2e.py dobmpc square` → `[error] ctrl[dobmpc]: w_hat has been PINNED to its clip for 3 s (X=15, Y=45)`

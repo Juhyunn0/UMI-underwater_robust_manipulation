@@ -99,7 +99,7 @@ class _Opts:
     rov_model = None
 
 
-def _worker(tmp, factory=None, *, run_dir_fn=None, grid=True):
+def _worker(tmp, factory=None, *, run_dir_fn=None, grid=True, color_mb=None):
     """A PolicyWorker set up on THIS thread with the stub session (or the
     ``factory`` given) and an identity grid declared on its mailbox; plus
     the bus and collectors. ``run_dir_fn`` (the controller's ``_run_dir``
@@ -126,6 +126,9 @@ def _worker(tmp, factory=None, *, run_dir_fn=None, grid=True):
     w = PolicyWorker(bus, mb, opts, session_factory=factory)
     if run_dir_fn is not None:
         w.run_dir_fn = run_dir_fn
+    # The backends inject the C3 colour mailbox BEFORE setup (an RGB stub's
+    # contract is adopted inside setup — it is ready synchronously).
+    w.policy_color_mb = color_mb
     plans, statuses, sensors, logs = [], [], [], []
     bus.policy_plan.connect(plans.append)
     bus.policy_status.connect(statuses.append)
@@ -133,7 +136,8 @@ def _worker(tmp, factory=None, *, run_dir_fn=None, grid=True):
     bus.log.connect(lambda lvl, msg: logs.append((lvl, msg)))
     w.setup()
     assert w.session.ready, "the stub must be ready synchronously"
-    assert mb.wanted(), "setup must want depth frames"
+    if w._obs_mode == "depth":
+        assert mb.wanted(), "setup must want depth frames"
     if grid:
         assert mb.set_grid(IdentityGrid(size=(640, 400)), GRID_IDENTITY)
     return w, bus, mb, plans, statuses, sensors, logs
@@ -1398,6 +1402,9 @@ def test_both_backends_wire_the_policy_hops_the_same_way():
         assert 'getattr(opts, "policy", False)' in src or \
             "getattr(opts, 'policy', False)" in src, cls.__name__
         assert ".policy_mb = pmb" in src, cls.__name__
+        # the C3-colour feed of an RGB checkpoint (2026-10-03), both backends
+        assert any(c.endswith("PolicyColorMailbox") for c in calls), cls.__name__
+        assert ".policy_color_mb = pcm" in src, cls.__name__
     src = inspect.getsource(hardware.wire_policy)
     for hop in ("bus.policy_state.connect(policy.on_policy_state)",
                 "bus.policy_plan.connect(mpc.on_policy_plan)",
@@ -1439,6 +1446,8 @@ def test_wiring_runs_against_the_demo_backend_and_routes_a_failure():
         assert be.mpc.policy_present is True
         assert be.mpc.policy_meta_fn == be.policy.meta
         assert be.video.policy_mb is be.policy.mailbox
+        assert be.video.policy_color_mb is be.policy.policy_color_mb
+        assert be.policy.policy_color_mb is not None
         got = []
         win.bus.policy_status.connect(got.append)
         be.policy.failed.emit("dp-policy: boom")
@@ -4112,12 +4121,15 @@ def test_fstereo_meta_without_a_session_and_the_stereo_recording_name_the_schedu
     _app()
     fsw = FStereoWorker(DataBus(), None, _Opts(), {})
     m = fsw.meta()
-    assert m == {"enabled": False, "why": "not built", "schedule": None}, m
+    # "process" is ALWAYS written (--fstereo-process, 2026-10-12)
+    assert m == {"enabled": False, "why": "not built", "schedule": None,
+                 "process": {"mode": "in-station"}}, m
     fsw._fault = "ImportError: no module named torch"
     gate = FsGate("only")
     fsw.fs_gate = gate
     m = fsw.meta()
-    assert set(m) == {"enabled", "why", "schedule"} and "policy_tap" not in m, m
+    assert set(m) == {"enabled", "why", "schedule", "process"} \
+        and "policy_tap" not in m, m
     assert m["enabled"] is False and m["why"] == "ImportError: no module named torch"
     assert m["schedule"]["mode"] == "only" and set(m["schedule"]) == set(gate.snapshot())
     json.dumps(m)
@@ -4372,3 +4384,364 @@ def test_pos_rpy_width_without_yaw_axis_keys_or_convention_is_refused():
         w, *_ = _worker(tmp)
         assert w._mount_ok is True
 
+
+
+# ------------------------------------------------- RGB checkpoint (2026-10-03)
+class _RecordingStub(StubPolicySession):
+    """The stub, keeping every obs dict the worker hands to predict."""
+
+    def __init__(self, *a, seen=None, **kw):
+        super().__init__(*a, **kw)
+        self.seen = seen if seen is not None else []
+
+    def predict(self, obs, **kw):
+        self.seen.append({k: np.array(v, copy=True) for k, v in obs.items()})
+        return super().predict(obs, **kw)
+
+
+def _rgb_factory(seen=None, optics=None):
+    """`stub_rgb*` -> an RGB contract (camera0_rgb), anything else -> depth:
+    the panel picker's two kinds of checkpoint, offline. `stub_rgbwarp*`
+    declares the C3-warped training store (``image_optics``), or pass
+    `optics` for every RGB stub."""
+    def factory(pc, o, ckpt=None):
+        name = ckpt or "stub_rgb"
+        low = str(name).lower()
+        key = "camera0_rgb" if low.startswith("stub_rgb") else "camera0_depth"
+        opt = optics
+        if opt is None and low.startswith("stub_rgbwarp"):
+            opt = "C3 CAM_A underwater (warped)"
+        return _RecordingStub(name, "", dataset_fps=float(pc["dataset_fps"]),
+                              image_key=key, seen=seen, image_optics=opt)
+    return factory
+
+
+def _colour(b=10, g=100, r=200, w=640, h=360, strip=(0, 0, 255)):
+    """A C3-sized BGR frame: the centre square (b, g, r), the side strips
+    outside it `strip` — a centre crop must never let the strips in."""
+    img = np.zeros((h, w, 3), np.uint8)
+    img[:] = strip
+    x0 = (w - h) // 2
+    img[:, x0:x0 + h] = (b, g, r)
+    return img
+
+
+def _rgb_worker(tmp, seen=None, optics=None):
+    from rov_gui.bus import PolicyColorMailbox
+
+    pcm = PolicyColorMailbox()
+    w, bus, mb, plans, statuses, sensors, logs = _worker(
+        tmp, factory=_rgb_factory(seen, optics=optics), color_mb=pcm)
+    w.tick()
+    return w, bus, mb, pcm, plans, statuses, logs
+
+
+def _cframe(w, pcm, t, **kw):
+    assert pcm.put(_colour(**kw), t)
+    w._ingest_depth()
+
+
+def test_an_rgb_checkpoint_is_fed_the_c3_colour_frame_on_the_fix_frame():
+    """The RGB-only checkpoint (umi_rgb_5d, 2026-10-03): the contract's image
+    key picks the C3 colour feed; the obs is the training recipe (centre
+    square, INTER_AREA, BGR->RGB, /255); and the attempt is built around the
+    colour frame of the newest FIX, not the newest frame — a frame the
+    localizer has not fixed yet would leave the proprio 'now' row behind the
+    image."""
+    from rov_gui.backends.policy import IMAGE_KEY_RGB
+    from rov_gui.perception.policy_obs import OBS_SRC_C3_RGB
+
+    with tempfile.TemporaryDirectory() as tmp:
+        seen: list = []
+        w, bus, mb, pcm, plans, statuses, logs = _rgb_worker(tmp, seen)
+        assert w._obs_mode == "rgb" and w._image_key == IMAGE_KEY_RGB
+        assert pcm.wanted() and not mb.wanted(), \
+            "an RGB checkpoint wants colour frames and no depth"
+        assert any(lvl == "warn" and "RGB checkpoint" in m and "NAIVE" in m
+                   for lvl, m in logs), logs[-5:]
+        t = now()
+        _feed_history(w, t)                  # fixes ..., t - 0.1, t
+        _cframe(w, pcm, t - OBS_DT)          # the partner
+        _cframe(w, pcm, t)                   # the newest FIX's own frame
+        _cframe(w, pcm, t + 0.033, b=0, g=0, r=0)   # not fixed yet: black
+        w._last_infer = 0.0
+        w.tick()
+        assert len(plans) == 1, (w.counters, w._note)
+        p = plans[0]
+        assert p.obs_t == t, "the anchor is the fix frame, not the newest"
+        assert p.depth_src == OBS_SRC_C3_RGB and p.depth_coverage == 1.0
+        assert p.obs_rows_t == (t - OBS_DT, t)
+        obs = seen[-1]
+        assert set(obs) >= {IMAGE_KEY_RGB} and "camera0_depth" not in obs
+        img = obs[IMAGE_KEY_RGB]
+        assert img.shape == (2, 3, 224, 224) and img.dtype == np.float32
+        # RGB order, the centre square only (no strip), [0, 1]
+        assert np.allclose(img[:, 0], 200 / 255.0)
+        assert np.allclose(img[:, 1], 100 / 255.0)
+        assert np.allclose(img[:, 2], 10 / 255.0)
+        st = statuses[-1]
+        assert st.depth_src == OBS_SRC_C3_RGB and st.grid_ok and st.ready
+        m = w.meta()
+        assert m["obs_mode"] == "rgb" and m["obs_image_key"] == IMAGE_KEY_RGB
+        assert "NAIVE" in m["obs"]["optics"] and m["obs"]["src_size"] == [640, 360]
+        assert m["color_mailbox"]["put"] == 3
+
+
+def test_a_c3_warped_rgb_checkpoint_is_recorded_as_warped_not_naive():
+    """The optics note in the run record follows the checkpoint's training
+    store (2026-10-04): a store that declares the C3 warp (``.zattrs
+    rgb.optics``, build_dp_rgb_c3warp_zarr.py) is recorded C3-WARPED, in the
+    meta and the arm-time log line; the obs itself is the same crop. And the
+    builder outlives a checkpoint swap but its note must not: naive ->
+    warped -> naive is re-read each time."""
+    from rov_gui.perception.policy_obs import (RGB_OPTICS_C3WARP,
+                                               RGB_OPTICS_NAIVE)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        w, bus, mb, pcm, plans, statuses, logs = _rgb_worker(
+            tmp, optics="C3 CAM_A underwater (warped)")
+        assert w._obs_mode == "rgb"
+        assert any(lvl == "warn" and "RGB checkpoint" in m and "C3-WARPED" in m
+                   and "NAIVE" not in m for lvl, m in logs), logs[-5:]
+        m = w.meta()
+        assert m["obs"]["optics"].startswith("C3-WARPED")
+        assert m["obs"]["optics_kind"] == RGB_OPTICS_C3WARP
+        assert m["obs"]["store_optics"] == "C3 CAM_A underwater (warped)"
+        builder = w._color_builder
+        w._set_obs_mode("rgb", out_res=224, optics=None)          # a naive ckpt
+        assert w._color_builder is builder
+        assert w.meta()["obs"]["optics_kind"] == RGB_OPTICS_NAIVE
+        assert w.meta()["obs"]["optics"].startswith("NAIVE")
+        w._set_obs_mode("rgb", out_res=224, optics="C3 CAM_A underwater (warped)")
+        assert w.meta()["obs"]["optics_kind"] == RGB_OPTICS_C3WARP
+
+
+def test_rgb_frames_newer_than_every_fix_are_skipped_not_mispaired():
+    """No colour frame at or before the newest fix -> skip_fix_lag, no plan
+    (the localizer has fixed none of the frames still held)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        w, bus, mb, pcm, plans, statuses, logs = _rgb_worker(tmp)
+        t = now()
+        _feed_history(w, t - 0.2)            # newest fix 0.2 s ago
+        _cframe(w, pcm, t - 0.033)
+        _cframe(w, pcm, t)
+        w._last_infer = 0.0
+        w.tick()
+        assert not plans and w.counters["skip_fix_lag"] == 1, w.counters
+
+
+def test_the_colour_builder_refuses_a_frame_size_change():
+    """A camera reconfigured mid-run changes the crop and the field of view:
+    its frames are REFUSED (dropped, counted, DEGRADED, one error line) — but
+    not latched: a frame of the adopted size clears it (review N2)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        w, bus, mb, pcm, plans, statuses, logs = _rgb_worker(tmp)
+        _cframe(w, pcm, now())
+        n_ring = len(w._ring)
+        for _ in range(2):
+            assert pcm.put(_colour(w=1280, h=720), now())
+            w._ingest_depth()
+        assert len(w._ring) == n_ring, "a refused frame must not enter the ring"
+        assert w.counters["color_refused"] == 2
+        assert "size changed" in w._grid_fault and w.builder.usable
+        w._publish_status(force=True)
+        assert statuses[-1].conn is Conn.DEGRADED
+        assert sum(lvl == "error" and "colour frame REFUSED" in m
+                   for lvl, m in logs) == 1
+        _cframe(w, pcm, now())                  # the adopted size again
+        assert w._grid_fault == "" and len(w._ring) == n_ring + 1
+        # a non-uint8 frame is refused the same way
+        assert pcm.put(_colour().astype(np.uint16), now())
+        w._ingest_depth()
+        assert w.counters["color_refused"] == 3 and "uint8" in w._grid_fault
+
+
+def test_an_unsupported_or_unfed_image_key_is_an_error_not_ready():
+    """Before 2026-10-03 an RGB checkpoint loaded READY and every predict
+    raised KeyError. Now: a key the station cannot feed is a FAULT the
+    controller refuses to arm on, and no forward runs."""
+    with tempfile.TemporaryDirectory() as tmp:
+        # (a) an RGB contract on a backend that wired no colour feed
+        w, bus, mb, plans, statuses, sensors, logs = _worker(
+            tmp, factory=_rgb_factory())
+        w.tick()
+        st = statuses[-1]
+        assert st.conn is Conn.FAULT and "unsupported ckpt obs" in st.error
+        assert "camera0_rgb" in st.error
+        t = now()
+        _feed_history(w, t)
+        _frame(w, mb, t - OBS_DT)
+        _frame(w, mb, t)
+        w._last_infer = 0.0
+        w.tick()
+        assert not plans and w.counters["infer_errors"] == 0
+        # (b) a key nobody feeds
+        w, bus, mb, plans, statuses, sensors, logs = _worker(
+            tmp, factory=lambda pc, o, ckpt=None: StubPolicySession(
+                "stub", "", dataset_fps=float(pc["dataset_fps"]),
+                image_key="camera0_ir"))
+        w.tick()
+        assert "camera0_ir" in statuses[-1].error
+        assert "station feeds" in statuses[-1].error
+
+
+def test_a_swap_between_rgb_and_depth_switches_the_feed_and_the_rates():
+    """The panel picker swaps kinds at runtime: the feed follows the new
+    contract, the ring is emptied (never a depth frame paired with a colour
+    one), and the previous network's rate/timings do not carry over."""
+    import dataclasses
+
+    with tempfile.TemporaryDirectory() as tmp:
+        from rov_gui.bus import PolicyColorMailbox
+        pcm = PolicyColorMailbox()
+        w, bus, mb, plans, statuses, sensors, logs = _worker(
+            tmp, factory=_rgb_factory(), color_mb=pcm)
+        # (the factory's launch session is stub_rgb: start from depth instead)
+        w.on_policy_state(dataclasses.replace(
+            _state(now(), (0.0,) * 6, active=False), engaged=False))
+        w.set_ckpt("stub")
+        w.tick()
+        assert w._obs_mode == "depth" and mb.wanted() and not pcm.wanted()
+        _infer(w, mb, plans, epoch=2)        # a new epoch: a fresh history
+        assert w._infer_hist and w._plan_marks
+        w.on_policy_state(dataclasses.replace(
+            _state(now(), (0.0,) * 6, active=False), engaged=False))
+        w.set_ckpt("stub_rgb")
+        assert not w._infer_hist and not w._plan_marks and w._hz == 0.0
+        w.tick()
+        assert w._obs_mode == "rgb" and pcm.wanted() and not mb.wanted()
+        assert not w._ring, "the depth frames must not survive into RGB"
+        w.on_policy_state(dataclasses.replace(
+            _state(now(), (0.0,) * 6, active=False), engaged=False))
+        w.set_ckpt("stub")
+        w.tick()
+        assert w._obs_mode == "depth" and mb.wanted() and not pcm.wanted()
+
+
+class _ContractStub(StubPolicySession):
+    """The RGB stub with contract fields overridden (review fixes 2026-10-03)."""
+
+    def __init__(self, *a, override=None, **kw):
+        super().__init__(*a, **kw)
+        self._contract.update(override or {})
+
+
+def test_an_rgb_contract_with_an_unknown_channel_order_or_shape_is_refused():
+    """The station feeds RGB (C3 BGR flipped). A training store whose channel
+    order is not declared RGB (a raw build_dataset.py store is BGR on disk),
+    or a non-square / non-CHW image_shape, is a FAULT before any obs is built
+    — never a READY session fed the wrong image (safety review #2, #5)."""
+    from rov_gui.bus import PolicyColorMailbox
+
+    cases = (({"image_channel_order": None}, "channel order"),
+             ({"image_channel_order": "BGR (as decoded)"}, "channel order"),
+             ({"image_shape": (3, 224, 200)}, "not (3, R, R)"),
+             ({"image_shape": (224, 224, 3)}, "not (3, R, R)"))
+    with tempfile.TemporaryDirectory() as tmp:
+        for override, want in cases:
+            pcm = PolicyColorMailbox()
+            w, bus, mb, plans, statuses, sensors, logs = _worker(
+                tmp, color_mb=pcm,
+                factory=lambda pc, o, ckpt=None, ov=override: _ContractStub(
+                    "stub_rgb", "", dataset_fps=float(pc["dataset_fps"]),
+                    image_key="camera0_rgb", override=ov))
+            st = statuses[-1]
+            assert st.conn is Conn.FAULT and want in st.error, (override, st.error)
+            assert w._obs_mode == "depth" and not pcm.wanted(), override
+            assert w.meta()["obs_contract_image_key"] == "camera0_rgb"
+
+
+def test_a_fix_stall_does_not_replan_the_same_rgb_observation():
+    """Colour frames keep arriving while the localizer has no new fix: the
+    anchor (the newest fix's frame) has not moved, so a second forward would
+    plan the SAME observation — skipped as skip_same_obs (review #7)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        w, bus, mb, pcm, plans, statuses, logs = _rgb_worker(tmp)
+        t = now()
+        _feed_history(w, t)
+        _cframe(w, pcm, t - OBS_DT)
+        _cframe(w, pcm, t)
+        w._last_infer = 0.0
+        w.tick()
+        assert len(plans) == 1
+        _cframe(w, pcm, t + 0.033)            # no fix for these
+        _cframe(w, pcm, t + 0.066)
+        w._last_infer = 0.0
+        w.tick()
+        assert len(plans) == 1 and w.counters["skip_same_obs"] == 1, w.counters
+        # a new fix (and its frame) moves the anchor: planning resumes
+        w.on_policy_state(_state(t + 0.1, (0.005, 0, 0.8, 0, 0, 0.1)))
+        _cframe(w, pcm, t + 0.1)
+        w._last_infer = 0.0
+        w.tick()
+        assert len(plans) == 2 and plans[-1].obs_t == t + 0.1
+
+
+def test_ready_is_published_only_after_the_contract_is_adopted():
+    """A loading session that flips ready between ticks must not be reported
+    READY (an ARM could land on it) until the worker has adopted its obs
+    contract on its own tick (safety review #4)."""
+    class _Slow(StubPolicySession):
+        def start_async(self, on_log=None):
+            self.loading = True               # the GPU load is "running"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _app()
+        from rov_gui.backends.policy import PolicyWorker
+
+        to = _test_opts(tmp)
+        opts = _Opts()
+        opts.nav_config, opts.mpc_config = to.nav_config, to.mpc_config
+        bus = DataBus()
+        statuses = []
+        bus.policy_status.connect(statuses.append)
+        w = PolicyWorker(bus, PolicyMailbox(), opts,
+                         session_factory=lambda pc, o, ckpt=None: _Slow(
+                             "stub", "", dataset_fps=float(pc["dataset_fps"])))
+        w.setup()
+        assert not statuses[-1].ready
+        w.session.ready, w.session.loading = True, False    # the load finished
+        w._publish_status(force=True)                      # before any tick
+        assert not statuses[-1].ready, "READY before the contract was adopted"
+        w.tick()
+        assert statuses[-1].ready and w._said_ready
+
+
+def test_fs_parity_is_not_checked_for_a_checkpoint_that_reads_no_depth():
+    """An RGB checkpoint's RGB-D training store still carries a depth_source;
+    the pick-time FS parity warning would be about a depth the network never
+    reads (review #9). training_image_keys reads the hydra shape_meta."""
+    import dataclasses
+
+    from rov_gui.backends.policy import training_image_keys
+
+    with tempfile.TemporaryDirectory() as tmp:
+        def run(keys):
+            run_dir = Path(tmp) / ("run_" + "_".join(keys))
+            (run_dir / ".hydra").mkdir(parents=True)
+            (run_dir / "checkpoints").mkdir()
+            obs = "".join(f"      {k}:\n        type: rgb\n" for k in keys)
+            (run_dir / ".hydra" / "config.yaml").write_text(
+                "task:\n  shape_meta:\n    obs:\n" + obs
+                + "      robot0_eef_pos:\n        type: low_dim\n")
+            ck = run_dir / "checkpoints" / "x.ckpt"
+            ck.write_bytes(b"not a pickle")
+            return ck
+
+        rgb, depth = run(["camera0_rgb"]), run(["camera0_depth"])
+        assert training_image_keys(rgb) == ["camera0_rgb"]
+        assert training_image_keys(depth) == ["camera0_depth"]
+        assert training_image_keys("stub") is None
+        w, bus, mb, plans, statuses, sensors, logs = _worker(tmp)
+        w.opts.fstereo = True
+        w.on_policy_state(dataclasses.replace(
+            _state(now(), (0.0,) * 6, active=False), engaged=False))
+        n = len(logs)
+        w.set_ckpt(str(rgb))
+        new = [m for _, m in logs[n:]]
+        assert any("parity not checked" in m and "no depth" in m for m in new), new
+        assert not any("did NOT train on" in m for m in new), new
+        n = len(logs)
+        w.set_ckpt(str(depth))
+        new = [m for _, m in logs[n:]]
+        assert not any("consumes no depth" in m for m in new), new

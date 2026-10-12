@@ -13,7 +13,11 @@ in the controller's native NED/FRD, from the two sensors the vehicle has:
     eta[5]   yaw         tag PnP (the compass is a consistency check ONLY —
                          steel pool walls and thruster currents corrupt it)
     nu[0:3]  u, v, w     finite-difference of the tag position, low-passed
-                         (vel_lp_alpha), rotated into the body frame
+                         (vel_lp_alpha), rotated into the body frame — or,
+                         for u and v only, a DVL's direct measurement when
+                         the caller hands ``step`` a ``vel_xy``
+                         (control/dvl.py decides per tick; UNVERIFIED on
+                         hardware)
     nu[3:6]  p, q, r     ArduSub gyro (ATTITUDE rollspeed/pitchspeed/yawspeed)
     nudot    a           SCALED_IMU2 specific force + gravity - omega x v
                          ("imu" mode), or finite-difference of nu ("fd" mode
@@ -109,13 +113,36 @@ class StateAssembler:
         return True
 
     # --------------------------------------------------------------- step
-    def step(self, fix, imu, t_now: float, dt: float):
+    def step(self, fix, imu, t_now: float, dt: float, vel_xy=None,
+             disp_xy=None):
         """-> (meas dict for EAOB.update | None, health dict).
 
         ``meas`` is None whenever either sensor is missing or stale — the
         caller decides what that means (refuse engage / disengage). ``fix``
         may be the SAME object across several ticks (camera slower than the
         control loop); the velocity filter only updates on a NEW t_capture.
+
+        ``vel_xy`` (2026-10-01, control/dvl.py) is a MEASURED body-origin
+        (surge, sway) velocity in FRD — a DVL's, already rotated by its
+        mount and lever-arm corrected — or None. Given, it REPLACES the tag
+        finite difference as nu[0:2], in the fix-age bridging and in the
+        nudot transport term. The HEAVE rate nu[2] stays the finite
+        difference either way: nothing verifies a DVL's vertical axis yet
+        (dvl.py). The finite-difference filter keeps running underneath
+        (``health["nu_fd"]``) so it is warm the tick the DVL drops out and
+        the two can be compared on every row.
+
+        ``disp_xy`` (only with ``vel_xy``) is the body-frame INTEGRAL of that
+        velocity from the fix's capture time to now. With it the bridge is
+        p_tag + R @ integral — a real integral — instead of "the newest
+        velocity x the age", which is not one once the velocity keeps
+        updating while the fix grows old (review 2026-10-02: at a kick the
+        estimate ran ahead and then back). None = velocity x age.
+
+        ``vel_xy=None`` is the pre-DVL path with the same operations in the
+        same order, so ``meas`` is bit-identical to a build without these
+        arguments (pinned by test_dvl). Position source, yaw, z, roll/pitch
+        and the rates are NOT touched either way: a DVL is a velocity sensor.
         """
         h = {"tag_age": None, "imu_age": None, "ok": False, "why": ""}
         if fix is None or not fix.ok:
@@ -199,13 +226,30 @@ class StateAssembler:
             self._prev_fix_t, self._prev_p = tc, p_tag.copy()
 
         # velocity bridging of x/y (and tag-z) across the fix age
-        if age > 0.0:
-            p[0] += self._v_ned[0] * age
-            p[1] += self._v_ned[1] * age
-            if z_src == "tag":
-                p[2] += self._v_ned[2] * age
-
         nu_lin = R.T @ self._v_ned
+        h["nu_fd"] = nu_lin              # the tag finite difference, always
+        h["vel_src"] = "tag_fd"
+        if vel_xy is None:
+            if age > 0.0:
+                p[0] += self._v_ned[0] * age
+                p[1] += self._v_ned[1] * age
+                if z_src == "tag":
+                    p[2] += self._v_ned[2] * age
+        else:
+            vel_xy = np.asarray(vel_xy, float).reshape(2)
+            # (u, v) measured, w still the finite difference's
+            nu_lin = np.array([vel_xy[0], vel_xy[1], nu_lin[2]])
+            h["vel_src"] = "dvl"
+            if age > 0.0:
+                if disp_xy is not None:
+                    d = np.asarray(disp_xy, float).reshape(2)
+                    step = R @ np.array([d[0], d[1], nu_lin[2] * age])
+                else:
+                    step = (R @ nu_lin) * age
+                p[0] += step[0]
+                p[1] += step[1]
+                if z_src == "tag":
+                    p[2] += step[2]
         gyro = np.array([float(imu.p), float(imu.q), float(imu.r)])
         nu = np.concatenate([nu_lin, gyro])
 

@@ -207,7 +207,7 @@ def test_replay_arms_at_current_pose_and_completes():
         # 10 (2026-09-02): + policy block / grip_w_est,hold_frac columns —
         # a replay run still reads plan_stream_replay, never _policy.
         meta = w._run_meta()
-        assert meta["schema_version"] == 16     # 16: + 6-DoF attitude axes (2026-09-26); 15: + top-level mode / LOW None holder (2026-09-11)
+        assert meta["schema_version"] == 20     # 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + top-level mode / LOW None holder (2026-09-11)
         assert meta["policy"]["enabled"] is False        # always written
         assert meta["plan_stream"]["enabled"] is True
         assert meta["plan_stream"]["run"]["installed"] >= 1
@@ -471,7 +471,7 @@ def test_replay_track_attitude_needs_the_axes_live_and_carries_rp():
         pytest.skip("allocation without the attitude path (output group)")
     with tempfile.TemporaryDirectory() as tmp:
         sess = _fake_session(tmp)
-        w, bus, pilots, logs, st = _att_worker(tmp, mode="mpc")
+        w, bus, pilots, logs, st = _att_worker(tmp, mode="mpc_tuned_7d")   # the LOW decides (2026-10-03)
         w.cfg.replay["session"] = str(sess)
         w.cfg.replay["v_max_m_s"] = 0.20
         w.cfg.replay["track_attitude"] = True

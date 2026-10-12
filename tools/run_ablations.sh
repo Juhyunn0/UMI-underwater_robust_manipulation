@@ -45,6 +45,10 @@ DS_9926_DEPTH="$DC/slam/9_9_26/dataset_depth.zarr.zip"
 DS_9926_RGBD="$DC/slam/9_9_26/dataset_rgbd.zarr.zip"
 DS_9426_9926_DEPTH="$DC/slam/dataset_depth_9426_9926.zarr.zip"
 DS_PEG_9_27_9_28="$DC/slam/dataset_depth_peg_9_27_9_28.zarr.zip"
+# RGB+depth 병합본(2026-10-01, build_dp_rgbd_zarr.py 날짜별 → concat_dp_zarr.py). 라벨·episode·depth는 위 depth 병합본과 비트동일.
+DS_PEG_9_27_9_28_RGBD="$DC/slam/dataset_rgbd_peg_9_27_9_28.zarr.zip"
+# RGB를 C3 컬러 광학으로 warp한 store(2026-10-04, build_dp_rgb_c3warp_zarr.py). 라벨·episode는 위와 비트동일.
+DS_PEG_9_27_9_28_RGB_C3WARP="$DC/slam/dataset_rgb_c3warp_peg_9_27_9_28.zarr.zip"
 MIN_FREE_GB="${MIN_FREE_GB:-12}"
 
 # NAME -> "config|task|dataset|exp_name|topk_k|extra hydra overrides (space-separated, may be empty)|action_repr"
@@ -71,6 +75,11 @@ spec_for() {
     #   0924_081113_train_umi_depth_5d_vitclip_9426_9926 과 같은 overrides (batch 32, 200 epoch, topk 2).
     peg_5d_vitclip) echo "train_diffusion_transformer_umi_depth_vit_workspace|umi_depth_5d|$DS_PEG_9_27_9_28|peg5d_vitclip_9_27_9_28|2||pos_yaw_width" ;;
     peg_7d_vitclip) echo "train_diffusion_transformer_umi_depth_vit_workspace|umi_depth_7d|$DS_PEG_9_27_9_28|peg7d_vitclip_9_27_9_28|2||pos_rpy_width" ;;
+    # peg RGB-only (2026-10-01): depth 없이 camera0_rgb 하나, DINOv3 ViT-B/16, 5d. RGB 레시피는 rgbd_dinov3b의 RGB 스트림과 같다
+    #   (crop 0.95 + ±5° + ColorJitter, Normalize 없음). 단일 스트림이라 batch 32 그대로(D와 같은 그래프).
+    peg_rgb_dinov3b) echo "train_diffusion_transformer_umi_rgb_dinov3b_workspace|umi_rgb_5d|$DS_PEG_9_27_9_28_RGBD|peg5d_rgb_dinov3b_9_27_9_28|2||pos_yaw_width" ;;
+    # 위와 같은 레시피, 입력만 C3 광학으로 warp한 RGB(2026-10-04). naive와의 차이 = warp 하나.
+    peg_rgbwarp_dinov3b) echo "train_diffusion_transformer_umi_rgb_dinov3b_workspace|umi_rgb_c3warp_5d|$DS_PEG_9_27_9_28_RGB_C3WARP|peg5d_rgbc3warp_dinov3b_9_27_9_28|2||pos_yaw_width" ;;
     *)           echo "" ;;
   esac
 }

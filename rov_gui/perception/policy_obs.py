@@ -891,7 +891,192 @@ class DepthObsBuilder:
         return d
 
 
+# =============================================================================
+# The RGB builder (2026-10-03)
+# =============================================================================
+#: The obs source of an RGB checkpoint (shape_meta image key ``camera0_rgb``):
+#: the C3's own colour camera — the CENTRE lens, CAM_A, the frame the tag
+#: localizer runs on. Not a depth grid (it is not in GRID_KINDS); it rides
+#: the same ``grid_kind`` / ``PolicyPlan.depth_src`` slot so the record says
+#: which instrument fed every plan.
+OBS_SRC_C3_RGB = "c3_rgb"
+
+#: The per-frame recipe of the TRAINING store's camera0_rgb, transcribed from
+#: ``data collection/UMI_Underwater/demonstration_processing/build_dataset.py``
+#: ``square(img, out_res, "center")`` (centre square of side min(h, w), then
+#: ``cv2.resize(..., INTER_AREA)``) and the merge's channel flip
+#: (``umi_handheld/build_dp_rgbd_zarr.py``: the store holds RGB).
+RECIPE_RGB = ("C3 CAM_A colour frame as decoded (BGR uint8, 640x360 on the "
+              "station)",
+              "centre crop to square: side = min(h, w)",
+              "cv2.resize to out_res x out_res, INTER_AREA",
+              "BGR -> RGB (the training store holds RGB)",
+              "uint8 (out_res, out_res, 3); the worker divides by 255")
+
+#: What this obs is NOT, written into every record (describe()). The training
+#: frames are the handheld's colour camera in AIR, centre-cropped unwarped;
+#: the station's are the C3's in WATER through a flat port. Same recipe,
+#: different optics: at 224 the training focal length is ~178 px and the C3's
+#: ~319 px, so the scene is ~1.8x magnified against training [유도: fx 573.08
+#: @1280 (peg calibration.json socket 0) x 224/720 vs fx 513.4 @640
+#: (calib/FOV_AUDIT.md CAM_A 3080.3 @3840 / 6) x 224/360]. A naive test of an
+#: unwarped checkpoint, chosen by the operator 2026-10-03; the proper fix is
+#: retraining on RGB warped to the C3 optics (umi_handheld/warp.py).
+RGB_OPTICS_NOTE = ("NAIVE: C3 colour (water) centre crop fed to a checkpoint "
+                   "trained on the handheld colour camera (air), NOT warped to "
+                   "the training optics — the scene is ~1.8x magnified vs "
+                   "training [유도]. Do not pool with a warped-RGB run.")
+#: The same field for a checkpoint whose TRAINING store declares that its RGB
+#: was re-projected onto this camera (2026-10-04):
+#: umi_handheld/build_dp_rgb_c3warp_zarr.py writes ``.zattrs rgb.optics =
+#: "C3 CAM_A underwater (warped)"`` and gives every frame the crop below, so the
+#: live obs has the training field of view. Colour/medium and scene still differ.
+RGB_OPTICS_NOTE_C3WARP = ("C3-WARPED: C3 colour (water) centre crop fed to a "
+                          "checkpoint whose training RGB was re-projected onto "
+                          "this camera's optics with this same crop — the "
+                          "field of view matches training; colour/medium and "
+                          "scene still differ. Do not pool with a naive-RGB run.")
+RGB_OPTICS_NAIVE, RGB_OPTICS_C3WARP = "naive", "c3_warped"
+
+
+def rgb_optics(store_optics) -> tuple:
+    """``(kind, note)`` for an RGB checkpoint, from its training store's
+    ``.zattrs rgb.optics`` (``contract['image_optics']``). Only a store that
+    DECLARES the C3 warp is ``c3_warped``; a store that says nothing — every
+    RGB store built before 2026-10-04 — is the naive case it really is."""
+    s = str(store_optics or "").lower()
+    if "c3" in s and "warp" in s:
+        return RGB_OPTICS_C3WARP, RGB_OPTICS_NOTE_C3WARP
+    return RGB_OPTICS_NAIVE, RGB_OPTICS_NOTE
+
+
+class ColorObsBuilder:
+    """The C3 colour frame -> an RGB checkpoint's (out_res, out_res, 3) uint8.
+
+    The same surface as :class:`DepthObsBuilder` where the worker and the
+    controller read it (``grid_kind`` / ``usable`` / ``why`` / ``coverage`` /
+    ``min_coverage`` / ``describe`` / ``build``), so the arm check and the
+    record need no second path. There is no projection to adopt: the "grid" is
+    the frame size, taken from the FIRST frame (:meth:`adopt`). A frame of a
+    different size later means the camera was reconfigured mid-run, and it is
+    refused (``GridError``) exactly as a changed depth grid's frames are — the
+    crop, and with it the field of view the network sees, would change
+    silently. Refused, not latched (review 2026-10-03, N2): the frame is
+    dropped and the builder stays usable for the adopted size, the depth
+    mailbox's rule, so one odd frame cannot end an RGB session.
+    """
+
+    def __init__(self, out_res: int = 224, optics=None):
+        self.out_res = int(out_res)
+        if self.out_res <= 0:
+            raise ValueError(f"out_res must be positive, got {out_res}")
+        self.set_optics(optics)
+        self._cv2 = _cv2()
+        self.min_coverage = 0.0
+        self._size = None                    # (w, h) of the adopted frames
+        self._usable = False
+        self._why = POLICY_GRID_WHY_IDLE
+        self._n_builds = 0
+
+    def set_optics(self, store_optics) -> None:
+        """What the run record says about optics: the loaded checkpoint's
+        training store ``rgb.optics`` (None = the store does not say ->
+        naive). Set on every checkpoint adoption — the builder outlives a
+        checkpoint swap, the note must not."""
+        self.store_optics = store_optics
+        self.optics_kind, self.optics_note = rgb_optics(store_optics)
+
+    @property
+    def grid_kind(self) -> str:
+        return OBS_SRC_C3_RGB if self._size is not None else ""
+
+    @property
+    def coverage(self) -> float:
+        """Every obs pixel is a camera pixel (a crop never reaches outside)."""
+        return 1.0 if self._usable else 0.0
+
+    @property
+    def usable(self) -> bool:
+        return bool(self._usable)
+
+    @property
+    def why(self) -> str:
+        return self._why
+
+    def adopt(self, image) -> None:
+        """Take the frame size from ``image``; raise ``GridError`` when a
+        different size was adopted before, or the frame is not 3-channel."""
+        shape = getattr(image, "shape", ())
+        if len(shape) != 3 or shape[2] != 3:
+            raise GridError(f"colour frame has shape {tuple(shape)}, expected "
+                            f"(h, w, 3) BGR")
+        if getattr(image, "dtype", None) != np.uint8:
+            # The worker divides by 255: a uint16/float frame would be fed at
+            # the wrong scale (safety review 2026-10-03, #6).
+            raise GridError(f"colour frame dtype {getattr(image, 'dtype', None)}"
+                            f", expected uint8")
+        size = (int(shape[1]), int(shape[0]))
+        if self._size is not None:
+            if size == self._size:
+                return
+            raise GridError(f"colour frame size changed mid-run: {self._size[0]}x"
+                            f"{self._size[1]} adopted, {size[0]}x{size[1]} "
+                            f"offered — the crop (and the field of view the "
+                            f"network sees) would change; frame dropped")
+        self._size = size
+        self._usable, self._why = True, ""
+
+    def build(self, bgr: np.ndarray) -> tuple[np.ndarray, dict]:
+        """RECIPE_RGB, line for line. ``bgr`` is not modified."""
+        if not self._usable:
+            raise GridError(f"colour obs builder not usable: {self._why}")
+        h, w = bgr.shape[:2]
+        if (w, h) != self._size:
+            raise GridError(f"colour frame {w}x{h} != adopted "
+                            f"{self._size[0]}x{self._size[1]}")
+        cv2 = self._cv2
+        side = min(h, w)
+        y0, x0 = (h - side) // 2, (w - side) // 2
+        sq = bgr[y0:y0 + side, x0:x0 + side]
+        R = self.out_res
+        small = cv2.resize(sq, (R, R), interpolation=cv2.INTER_AREA)
+        obs = np.ascontiguousarray(small[..., ::-1])            # BGR -> RGB
+        self._n_builds += 1
+        return obs, {"coverage": 1.0, "obs_valid": 1.0}
+
+    def describe(self) -> dict:
+        w, h = self._size if self._size is not None else (None, None)
+        side = min(w, h) if self._size is not None else None
+        return {
+            "obs_source": OBS_SRC_C3_RGB,
+            "recipe": list(RECIPE_RGB),
+            "optics": self.optics_note,
+            "optics_kind": self.optics_kind,
+            "store_optics": self.store_optics,
+            "camera": "C3 CAM_A (the centre lens), the tag localizer's frame",
+            "src_size": [w, h] if self._size is not None else None,
+            "crop": ({"y0": (h - side) // 2, "x0": (w - side) // 2, "size": side}
+                     if self._size is not None else None),
+            "out_res": self.out_res,
+            "channel_order": "RGB",
+            "grid_kind": self.grid_kind,
+            "coverage": self.coverage,
+            "usable": self.usable,
+            "why": self.why,
+            "n_builds": self._n_builds,
+            # policy.obs_view_forward_m is a DEPTH re-render; never applied
+            # here (the worker meta names a configured value it ignored).
+            "view_shift": None,
+        }
+
+    def reset(self) -> None:
+        self._size = None
+        self._usable, self._why = False, POLICY_GRID_WHY_IDLE
+
+
 __all__ = ["GridError", "RectLeftGrid", "ColorAlignedGrid", "IdentityGrid",
            "DepthObsBuilder", "normalise_depth", "grid_fingerprint", "grid_kind_of",
            "GRID_RECT_LEFT", "GRID_COLOR_ALIGNED", "GRID_IDENTITY", "GRID_KINDS",
-           "RECIPE", "K_TOL_PX", "D_TOL", "VIEW_SHIFT_MAX_M", "VIEW_MIN_Z_MM"]
+           "RECIPE", "K_TOL_PX", "D_TOL", "VIEW_SHIFT_MAX_M", "VIEW_MIN_Z_MM",
+           "ColorObsBuilder", "OBS_SRC_C3_RGB", "RECIPE_RGB", "RGB_OPTICS_NOTE",
+           "RGB_OPTICS_NOTE_C3WARP", "RGB_OPTICS_NAIVE", "RGB_OPTICS_C3WARP", "rgb_optics"]

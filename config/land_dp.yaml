@@ -30,7 +30,7 @@
 # file only holds what is DIFFERENT on the real vehicle.
 
 rov_model: heavy_gripper    # ROV_MODEL for dobmpc (heavy | heavy_c3 | heavy_gripper)
-mode: pid                   # none | mpc | dobmpc | mpc_tuned | dobmpc_tuned | pid
+mode: pid                   # none | mpc | dobmpc | mpc_tuned | dobmpc_tuned | pid | rl | rl_pwm | pid_7d | mpc_tuned_7d | rl_7d
                             # LAND: the controller output is discarded by the
                             # NullCommandSink, so the only thing acados would
                             # add here is failure modes — a lazy solver build
@@ -445,9 +445,15 @@ policy:
                               # MUST equal rov_gui/state.py POLICY_CKPT_DEFAULT
                               # (rov_gui/tests/test_policy_ckpt_paths.py); the
                               # 2026.09.01 10-dim ckpt is refused at arm
-                              # (action_repr mismatch). "stub" = canned
+                              # (pose10d is not flyable). "stub" = canned
                               # straight-ahead chunk, no torch (demo_e2e /
                               # policy_dryrun)
+  action_repr: auto           # 2026-10-03, as hw_mpc.yaml: the held checkpoint's
+                              # contract (5-dim | 7-dim), pinned at ARM — so the land
+                              # rehearsal arms the same picks the pool run does. A
+                              # 7-dim pick on a 4-DoF LOW flies dropped-and-logged;
+                              # *_7d LOWs stay refused here (K/M not live in a land
+                              # dry-run). Explicit pos_yaw_width | pos_rpy_width pin.
   repo: /home/bdml/Desktop/umi_underwater_robust_control/external/UMI_aquatic
   weights: model              # which state dict inside the ckpt: model (raw trained)
                               # or ema_model. The EMA copy carries the BatchNorm

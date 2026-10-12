@@ -51,6 +51,35 @@ from rov_gui.state import Conn, PilotInput, PwmCommand, Telemetry, now  # noqa: 
 MOT = [-1, -1, 1, 1, -1, 1, 1, -1]
 
 
+def _rl_pwm_cap_line(src: str):
+    """The rl_pwm block's `  pwm_cap:` line (the first one in the file — only rl_pwm carries the key)."""
+    m = re.search(r"^rl_pwm:\n(?:(?:  .*|#.*|)\n)*?(  pwm_cap: .*)$", src, re.M)
+    assert m, "the shipped config has an rl_pwm block with a pwm_cap line"
+    return m
+
+
+def _set_rl_pwm_cap(src: str, value: str) -> str:
+    m = _rl_pwm_cap_line(src)
+    return src[:m.start(1)] + f"  pwm_cap: {value}" + src[m.end(1):]
+
+
+def _with_rl_pwm_line(src: str, extra: str) -> str:
+    """Insert `  <extra>` right after the rl_pwm block's pwm_cap line."""
+    m = _rl_pwm_cap_line(src)
+    return src[:m.end(1)] + f"\n  {extra}" + src[m.end(1):]
+
+
+def _set_rl_pwm_key(src: str, key: str, value: str) -> str:
+    """Set `  <key>: <value>` in the rl_pwm block: replace the line if the shipped config carries the key (the
+    2026-10-10 keys are shipped explicitly), else insert it after pwm_cap. A YAML duplicate key would be taken
+    silently (last one wins), which is why this never inserts a second copy."""
+    m = re.search(rf"^rl_pwm:\n(?:(?:  .*|#.*|)\n)*?(  {re.escape(key)}: [^\n]*)$", src, re.M)
+    if m:
+        return src[:m.start(1)] + f"  {key}: {value}" + src[m.end(1):]
+    return _with_rl_pwm_line(src, f"{key}: {value}")
+
+
+
 # =============================================================================
 # 1. the wire frame and the gate
 # =============================================================================
@@ -83,7 +112,9 @@ def test_the_channel_order_is_not_configurable_anywhere():
     assert PwmGate(MOT, 255).channels == PWM_CHANNELS_DEFAULT
     src = (ROOT / "config" / "hw_mpc.yaml").read_text()
     with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
-        fh.write(src.replace("  pwm_cap: 0.25", "  pwm_cap: 0.25\n  pwm_channels: [16, 15, 14, 13, 12, 11, 10, 9]", 1))
+        # anchored on the rl_pwm block's pwm_cap LINE, whatever its value (the operator moved it 0.25 -> 1.0 on
+        # 2026-10-01; a literal "pwm_cap: 0.25" anchor then injected nothing and the test passed vacuously-red)
+        fh.write(_with_rl_pwm_line(src, "pwm_channels: [16, 15, 14, 13, 12, 11, 10, 9]"))
     try:
         with pytest.raises(ValueError, match="unknown key"):
             MpcConfig.load(fh.name)
@@ -252,7 +283,11 @@ def test_hw_rl_pwm_builds_from_the_shipped_export_and_stays_inside_its_cap():
     from rov_gui.control.rl_policy import HwRl, HwRlPwm
 
     said = []
-    r = HwRlPwm(MpcConfig(), log=said.append)
+    cfg = MpcConfig()
+    # 2026-10-10: the code-default cap (0.25) is below pwm10_s1's trained 1.0 and is REFUSED unless recorded, and the
+    # sign-probe gate needs an artefact — both have their own tests (test_rl_pwm_scale.py); opted out here, recorded
+    cfg.rl_pwm = {"allow_caps_below_trained": True, "require_thruster_probe": False}
+    r = HwRlPwm(cfg, log=said.append)
     assert r.transport == "pwm" and r.mode == "rl_pwm" and r.n_act == 8
     assert r.policy.obs_dim == 116 and r.frame_dim == 29 and r.K == 4
     assert r.pwm_cap == 0.25, "the shipped default is the first-water cap"
@@ -284,7 +319,9 @@ def test_hw_rl_pwm_answers_a_broken_state_with_neutral_and_a_counted_failure():
     from rov_gui.control.geometry import MpcConfig
     from rov_gui.control.rl_policy import HwRlPwm
 
-    r = HwRlPwm(MpcConfig(), log=lambda s: None)
+    cfg = MpcConfig()
+    cfg.rl_pwm = {"allow_caps_below_trained": True, "require_thruster_probe": False}     # 2026-10-10, see above
+    r = HwRlPwm(cfg, log=lambda s: None)
     r.set_target_ned([0.3, 0.0, -0.5], 0.0)
     n0 = r.n_fail
     eta = np.zeros(6)
@@ -316,7 +353,10 @@ def test_config_loads_the_rl_pwm_block_and_rejects_unknown_keys():
     from rov_gui.control.geometry import MpcConfig
 
     cfg = MpcConfig.load("config/hw_mpc.yaml")
-    assert cfg.rl_pwm["policy_dir"].endswith("pwm10_s1") and cfg.rl_pwm["pwm_cap"] == 0.25
+    cap = cfg.rl_pwm["pwm_cap"]
+    # the SHIPPED value is an operator decision (0.25 first-water -> 1.0 on 2026-10-01 -> 0.5 with pwm11k0.2_s0 on 2026-10-10):
+    # pin its validity, not its value; the shipped policy must be the pwm11 candidate (pwm10_s1 is banned, README §13.8)
+    assert cfg.rl_pwm["policy_dir"].endswith("pwm11k0.2_s0") and isinstance(cap, (int, float)) and 0.0 < float(cap) <= 1.0
     src = (ROOT / "config" / "hw_mpc.yaml").read_text()
 
     def load(text):
@@ -328,10 +368,10 @@ def test_config_loads_the_rl_pwm_block_and_rejects_unknown_keys():
             os.unlink(fh.name)
 
     with pytest.raises(ValueError, match="unknown key"):
-        load(src.replace("  pwm_cap: 0.25", "  pwm_cap: 0.25\n  pwm_capp: 0.9", 1))
+        load(_with_rl_pwm_line(src, "pwm_capp: 0.9"))
     for bad in ("1.5", "true"):
         with pytest.raises(ValueError, match="pwm_cap"):
-            load(src.replace("  pwm_cap: 0.25", f"  pwm_cap: {bad}", 1))
+            load(_set_rl_pwm_cap(src, bad))
     assert re.search(r"^mode: \w+", src, re.M), "the shipped config names a mode at the start of a line"
     assert load(re.sub(r"^mode: \w+", "mode: rl_pwm", src, count=1, flags=re.M)).mode == "rl_pwm"
 
@@ -404,13 +444,31 @@ class _Msg:
         return self._comp
 
 
+_FIRST_WATER_CFG = None
+
+
+def _first_water_config() -> str:
+    """The shipped config with rl_pwm.pwm_cap pinned to the first-water 0.25 (a temp copy, written once): the sink
+    tests below exercise the cap's arithmetic at 0.25, independently of the operator's shipped value. The
+    sign-probe gate (2026-10-10) is opted out in this copy — RECORDED, as on a vehicle — because these tests are
+    about the parameter items; the artefact gate has its own sink tests in test_rl_pwm_scale.py."""
+    global _FIRST_WATER_CFG
+    if _FIRST_WATER_CFG is None or not os.path.exists(_FIRST_WATER_CFG):
+        src = (ROOT / "config" / "hw_mpc.yaml").read_text()
+        with tempfile.NamedTemporaryFile("w", suffix="_rlpwm_cap025.yaml", delete=False) as fh:
+            fh.write(_set_rl_pwm_key(_set_rl_pwm_cap(src, "0.25"), "require_thruster_probe", "false"))
+        _FIRST_WATER_CFG = fh.name
+    return _FIRST_WATER_CFG
+
+
 def _sink(v2=True):
     from rov_gui.backends.hardware import MavlinkCommandSink
     from rov_gui.qt import QtWidgets
 
     QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     bus = types.SimpleNamespace(log=_Log(), payload=types.SimpleNamespace(emit=lambda *_: None))
-    opts = types.SimpleNamespace(cmd_sysid=255, mavlink_out="udpin:0.0.0.0:14552")
+    opts = types.SimpleNamespace(cmd_sysid=255, mavlink_out="udpin:0.0.0.0:14552",
+                                 mpc_config=_first_water_config())
     s = MavlinkCommandSink(bus, opts)
     s.master = _Master(v2)
     s.listening = True
@@ -472,9 +530,22 @@ def test_sink_enforces_the_cap_itself_and_never_sends_a_frame_that_arrives_old()
     s, log = _sink()
     _answer_all(s)
     s.enabled = True
+    s.set_pwm(PwmCommand(pulses=PW, source="mpc"))
+    assert s._pwm_active and len(s.master.mav.rc) == 1
+    n = len(s.master.mav.rc)
+    # 2026-10-10: a frame outside 1500 +- 400 x 0.25 is REFUSED, neutralised and LATCHED — never clamped (the clamp
+    # that stood here was a second copy of the per-thruster clip that collapsed the allocation on 2026-10-01; the
+    # cap is a thrust-space scale upstream, rl_pwm.scale_throttles, and a follower that did not scale is a fault)
     s.set_pwm(PwmCommand(pulses=(1900, 1100, 1700, 1300, 1601, 1399, 1500, 1600), source="mpc"))
-    assert _motors(s.master.mav.rc[-1]) == (1600, 1400, 1600, 1400, 1600, 1400, 1500, 1600), \
-        "clamped to 1500 +- 400 x 0.25 whatever the follower asked"
+    after = s.master.mav.rc[n:]
+    assert after and all(_motors(f) == NEUTRAL_PULSES for f in after), "neutralised, not clamped"
+    assert not s._pwm_active and "outside the cap window" in s._pwm_latch
+    assert any(lvl == "error" and "refused, not clamped" in m for lvl, m in log.lines)
+    s.set_pwm(PwmCommand(source="stop"))             # the follower's disengage clears the latch
+    assert s._pwm_latch == ""
+    s.set_pwm(PwmCommand(pulses=(1600, 1400, 1600, 1400, 1600, 1400, 1500, 1600), source="mpc"))
+    assert _motors(s.master.mav.rc[-1]) == (1600, 1400, 1600, 1400, 1600, 1400, 1500, 1600), "AT the cap: passes"
+    assert s._pwm_active
     # ONE late frame (a GIL pause) is dropped, not sent, and the flow carries on with the next fresh one
     n = len(s.master.mav.rc)
     s.set_pwm(PwmCommand(pulses=PW, source="mpc", stamp=now() - 1.0))
@@ -694,9 +765,16 @@ def _gate(ok=True, why="ok", age=0.0, mot=None, cap=0.25):
 
 
 def _pwm_worker(tmp):
+    from rov_gui.control.rl_policy import HwRlPwm
     from rov_gui.tests.test_control import _worker
 
     w, bus, pilots, logs = _worker(tmp)
+    # 2026-10-10: the test yaml has no rl_pwm block, so the follower the worker built at setup was REFUSED (the code
+    # default cap 0.25 is below pwm10_s1's trained 1.0). Rebuilt with the two RECORDED opt-outs these transport tests
+    # need; the refusals and the sign-probe gate have their own worker tests in test_rl_pwm_scale.py.
+    w.cfg.rl_pwm = {"pwm_cap": 0.25, "allow_caps_below_trained": True, "require_thruster_probe": False}
+    w._rl_pwm = HwRlPwm(w.cfg, log=lambda m: None)
+    w._rl_pwm_error = None
     pwms = []
     bus.cmd_pwm.connect(pwms.append)
     return w, bus, pilots, pwms, logs

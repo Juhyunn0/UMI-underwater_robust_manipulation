@@ -139,7 +139,8 @@ def main(argv=None) -> int:
                     help="override hw_mpc.yaml policy.ckpt ('stub' = no torch)")
     ap.add_argument("--repo", default=None, help="override policy.repo")
     ap.add_argument("--mpc-mode", default="dobmpc",
-                    choices=("dobmpc", "mpc", "dobmpc_tuned", "mpc_tuned", "pid", "rl"))
+                    choices=("dobmpc", "mpc", "dobmpc_tuned", "mpc_tuned", "pid", "rl",
+                             "pid_7d", "mpc_tuned_7d", "rl_7d"))
     ap.add_argument("--rec-dir", default="data",
                     help="ROOT of the dated run tree the record lands in "
                          "(default: %(default)s); the leaf is always "

@@ -159,6 +159,9 @@ class FStereoState:
     #: On the chip because under `only` the panel refreshes in pairs with a
     #: gap between them, and that must not read as a struggling network.
     schedule: str = ""
+    #: "proc" when the network runs in its own process (--fstereo-process),
+    #: else "". On the chip because the two layouts are a record boundary.
+    process: str = ""
     stamp: float = field(default_factory=now)
 
     @property
@@ -176,7 +179,8 @@ class FStereoState:
                 f"valid {self.valid_native:.0f}%→{self.valid_out:.0f}%"
                 + (f"+{self.filled_out:.0f}" if self.filled_out >= 0.5 else "")
                 + ("  eager" if self.eager else "")
-                + (f"  [{self.schedule}]" if self.schedule else ""))
+                + (f"  [{' '.join(t for t in (self.schedule, self.process) if t)}]"
+                   if (self.schedule or self.process) else ""))
 
 
 @dataclass
@@ -602,6 +606,54 @@ class VehicleImu:
 
 
 @dataclass
+class DvlSample:
+    """One bottom-track velocity report from the DVL — the estimator's THIRD
+    sensor (control/dvl.py). HARDWARE-UNVERIFIED: written 2026-10-01 against
+    the vendor protocol page, before a DVL existed on this vehicle.
+
+    ``v_dvl`` is exactly what the device said, in the DEVICE's output frame
+    (Water Linked: x forward = the LED edge, y starboard, z down toward the
+    transducers [스펙: docs.waterlinked.com/dvl/axes, read 2026-10-01]). The
+    mounting rotation and the lever arm to the body origin are the
+    estimator's business (``dvl.DvlAid``), not the transport's — the same
+    split ``ImuBatch`` makes, for the same reason: a recording must be
+    re-processable after the mount is re-measured.
+
+    Two clocks, both the station's ``now()``:
+
+    * ``t_rx`` — when the line ARRIVED (stamped by the reader thread);
+    * ``t_valid`` — when the velocity was TRUE: ``t_rx`` minus the device's
+      own ``time_of_transmission - time_of_validity``. Only the DIFFERENCE of
+      the two device stamps is used, so the DVL's clock need not be
+      synchronised to anything (it boots at an arbitrary time). The network
+      hop is NOT subtracted ([스펙] ~4 ms typical on the vendor's bench).
+
+    ``valid`` is the device's ``velocity_valid`` and nothing else. Whether
+    the sample may enter the loop is a different, stricter question that
+    ``DvlAid`` answers; unknown stays ``None`` here, never 0.0.
+    """
+
+    t_valid: float = 0.0
+    t_rx: float = 0.0
+    v_dvl: tuple | None = None       # (vx, vy, vz) m/s, device output frame
+    valid: bool = False              # the device's velocity_valid
+    fom: float | None = None         # m/s, the device's figure of merit
+    altitude: float | None = None    # m, distance to the reflecting surface
+    covariance: tuple | None = None  # 9 floats row-major, (m/s)^2
+    status: int = 0                  # bit 0 = high temperature
+    n_beams: int = 0                 # transducers with beam_valid
+    dt_ms: float | None = None       # the report's own `time` field
+    tov_us: int | None = None        # device stamps, verbatim (Unix us)
+    tot_us: int | None = None
+    kind: str = "velocity"           # "velocity" | "velocity_water"
+    hz: float | None = None          # measured arrival rate
+    source: str = "a50"              # "a50" | "demo"
+    conn: Conn = Conn.OFFLINE
+    note: str = ""
+    stamp: float = field(default_factory=now)
+
+
+@dataclass
 class ImuBatch:
     """Every C3 BNO086 sample since the last drain — a DIFFERENT sensor from
     ``VehicleImu``, on a different board and a different clock.
@@ -667,7 +719,9 @@ class MpcStatus:
     observe: bool = False
     traj_on: bool = False
     # The LOW level the worker is on: "none" | "pid" | "mpc" | "dobmpc" |
-    # "mpc_tuned" | "dobmpc_tuned" | "mpcc" | "dobmpcc". "none" is TELEOP —
+    # "mpc_tuned" | "dobmpc_tuned" | "mpcc" | "dobmpcc" | "rl" | "rl_pwm" |
+    # "pid_7d" | "mpc_tuned_7d" | "rl_7d" | "rl_pwm_7d" (2026-10-03: the *_7d
+    # followers also command roll/pitch; rl_pwm_7d through pulses). "none" is TELEOP —
     # the station commands nothing (observe is True iff mode is "none"); the
     # panel's LOW combo is re-synced from this field (honesty rule).
     mode: str = ""
@@ -773,6 +827,57 @@ class MpcStatus:
     # ...and signed, split into (roll, pitch). The magnitude alone
     # cannot be acted on: cam_tilt_deg corrects a PITCH.
     rp_residual_rp_deg: tuple | None = None
+    # ---- DVL (control/dvl.py, 2026-10-01; HARDWARE-UNVERIFIED) --------------
+    # `dvl_state` is "" when no DVL was built (the pre-DVL station, and every
+    # run before this date); otherwise one of dvl.STATES. `dvl_use` is the
+    # operator's switch as the WORKER holds it — the panel button reflects
+    # this field and nothing else (honesty rule) — and `vel_src` is what this
+    # tick's nu[0:2] (surge, sway) actually came from: "tag_fd" | "dvl". The
+    # two differ whenever the DVL is IN but not flown on: no bottom lock, a
+    # stale link, an outlier held back, a run that was not armed for it at
+    # engage, or a TRIP (state "tripped": evidence it is wrong, latched until
+    # the operator re-arms). The estimator then uses the tag finite
+    # difference and says so here and in the CSV. The heave rate nu[2] never
+    # comes from the DVL.
+    dvl_state: str = ""
+    dvl_use: bool = False
+    dvl_proven: bool = False
+    vel_src: str = ""
+    dvl_note: str = ""               # why it is not usable / not proven
+    dvl_age_s: float | None = None
+    dvl_alt_m: float | None = None
+    dvl_fom: float | None = None
+    dvl_hz: float | None = None
+    dvl_res_m_s: float | None = None     # |v_dvl - v_tag_fd| horizontal, low-passed
+    # ---- EKF (control/rl_ekf.py, 2026-10-02; HARDWARE-UNVERIFIED) -----------
+    # The robot_localization EKF run beside the assembler. `ekf_state` is ""
+    # when none was built, else "ready" | "not_ready" | "fault".
+    # `ekf_control` is the ESTIMATOR switch as the WORKER holds it (the
+    # panel's EST button reflects this and nothing else); `ekf_flew` = this
+    # tick's controller was actually handed the EKF's state. `ekf_err_m` /
+    # `ekf_err_yaw_deg` = EKF minus a FRESH tag state (None on bridged or
+    # tagless ticks); `p_ekf_flu` = its position in the p_flu convention.
+    ekf_state: str = ""
+    ekf_control: bool = False
+    ekf_flew: bool = False
+    ekf_note: str = ""
+    ekf_err_m: float | None = None
+    ekf_err_yaw_deg: float | None = None
+    ekf_sig_m: float | None = None
+    ekf_tag_late_s: float | None = None
+    p_ekf_flu: tuple | None = None
+    # ---- MPC_Tuned PROFILE (control/mpc_tune.py, 2026-10-04) ---------------
+    # What the worker HOLDS — the panel's tune row reflects these and nothing
+    # else (honesty rule). `mpc_tune` "" = no profile (mpc_tuned flies
+    # hw_mpc.yaml's blocks). `mpc_tune_state`: "" | "ok" | "warn" (held,
+    # flies with differences from the station it was saved on — the note
+    # lists them) | "error" (a launch profile failed: mpc_tuned refuses) |
+    # "refused" (the last pick, for ~6 s; the held profile is unchanged).
+    # `mpc_tune_note` is that list, the error, or why the pick was refused.
+    mpc_tune: str = ""
+    mpc_tune_path: str = ""
+    mpc_tune_state: str = ""
+    mpc_tune_note: str = ""
     conn: Conn = Conn.OFFLINE
     stamp: float = field(default_factory=now)
 
@@ -895,20 +1000,32 @@ ACTION_REPR_POS_YAW_WIDTH = "pos_yaw_width"
 #: the camera on the C3 mount (yaw_action.encode_pos_rpy; transcribed in
 #: control/policy_frames.py). Signs FRD: +dyaw = CW from above, +dpitch =
 #: nose-up, +droll = starboard-down. Whether the roll/pitch columns are FLOWN
-#: or dropped-and-logged is config policy.attitude_track (default false).
+#: or dropped-and-logged is decided by the LOW (a *_7d follower tracks) with
+#: config policy.attitude_track as a veto (default true) — 2026-10-03.
 ACTION_REPR_POS_RPY_WIDTH = "pos_rpy_width"
 ACTION_REPR_BY_DIM = {10: ACTION_REPR_POSE10D, 5: ACTION_REPR_POS_YAW_WIDTH,
                       7: ACTION_REPR_POS_RPY_WIDTH}
 ACTION_DIM_BY_REPR = {v: k for k, v in ACTION_REPR_BY_DIM.items()}
-#: The DEFAULT of config ``policy.action_repr`` [스펙: ckpt cfg
-#: shape_meta.action], pinned PER MISSION at ARM: the worker's checkpoint
-#: contract must equal the pinned value to arm, and every plan is checked
-#: against it at intake (the obs_dt pattern) -- so a stale policy.ckpt pointing
-#: at the 10-dim network is refused instead of silently decoded.
+#: The CODE default of config ``policy.action_repr`` when the key is absent
+#: [스펙: ckpt cfg shape_meta.action] (the shipped hw_mpc.yaml / land_dp.yaml
+#: say ``auto`` since 2026-10-03). The flown value is pinned PER MISSION at
+#: ARM: the worker's checkpoint contract must equal an explicit config value to
+#: arm, and every plan is checked against the pin at intake (the obs_dt
+#: pattern) -- so a stale policy.ckpt pointing at the 10-dim network is refused
+#: instead of silently decoded.
 POLICY_ACTION_REPR = ACTION_REPR_POS_YAW_WIDTH
-#: The representations a mission may be armed on (config policy.action_repr
-#: must be one of these; the legacy pose10d is decodable for old records only).
+#: The representations a mission may be armed on: the RESOLVED ARM pin must be
+#: one of these (the legacy pose10d is decodable for old records only). The
+#: config may also say POLICY_ACTION_REPR_AUTO.
 POLICY_ACTION_REPRS_FLYABLE = (ACTION_REPR_POS_YAW_WIDTH, ACTION_REPR_POS_RPY_WIDTH)
+#: A CONFIG sentinel, never a representation (2026-10-03, operator request:
+#: "checkpoint를 7d로 하면 알아서 7d 세팅을 바꾸게"): ``policy.action_repr:
+#: auto`` = fly the contract of the checkpoint the policy worker holds when
+#: START is pressed, pinned per mission at ARM from the same PolicyStatus the
+#: ARM refusal judged (control/geometry.resolve_policy_action_repr). Not in
+#: POLICY_ACTION_REPRS_FLYABLE and never written into a representation record
+#: key; an unresolved contract ("" / pose10d) is refused, never defaulted.
+POLICY_ACTION_REPR_AUTO = "auto"
 #: The ONE default checkpoint path (dp_policy.DEFAULT_CKPT, geometry's policy
 #: block, the backend fallback block and the parity reference tool all derive
 #: from here). Updated when a retrain is selected; the YAML policy.ckpt lines
@@ -983,7 +1100,7 @@ class PolicyPlan:
     obs_dt_s: float = 0.0
     # The checkpoint contract's action representation (ACTION_REPR_*); "" =
     # unknown, in which case compose_plan infers it from the array width. The
-    # consumer refuses a plan whose value is not POLICY_ACTION_REPR.
+    # consumer refuses a plan whose value is not the mission's ARM pin.
     action_repr: str = ""
     # WHERE THE TIME WENT (2026-10-01), on the same monotonic clock as obs_t.
     # `infer_ms` is timed inside the session and so contains neither the wait
@@ -1004,6 +1121,11 @@ class PolicyPlan:
     # that two launches appended to can still be split by network input. The
     # rest of the depth setting (alpha, checkpoint) is in the run meta.
     fs_input: str = ""
+    # Where FoundationStereo ran for this plan: "child" (--fstereo-process) /
+    # "in-station"; "" when this run's depth is not FoundationStereo. On the
+    # line for the same reason as fs_schedule: plans.jsonl is appended to
+    # across launches. RECORD BOUNDARY (2026-10-12).
+    fs_process: str = ""
     stamp: float = field(default_factory=now)
 
 

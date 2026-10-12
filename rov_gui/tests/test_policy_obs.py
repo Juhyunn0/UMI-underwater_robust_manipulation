@@ -673,6 +673,95 @@ def test_obs_view_forward_m_config_is_optional_forward_only_and_shipped_off():
 # =============================================================================
 # runner (same shape as test_replay.py — works with or without pytest)
 # =============================================================================
+def test_colour_builder_is_the_training_rgb_recipe_bit_for_bit():
+    """ColorObsBuilder (RGB checkpoints, 2026-10-03) == the training store's
+    per-frame recipe: build_dataset.py ``square(img, 224, "center")`` (centre
+    square of side min(h, w), cv2.resize INTER_AREA) then the merge's
+    BGR->RGB flip (build_dp_rgbd_zarr.py). Inline reference, random frame."""
+    from rov_gui.perception.policy_obs import ColorObsBuilder, OBS_SRC_C3_RGB
+
+    rng = np.random.default_rng(3)
+    bgr = rng.integers(0, 256, size=(360, 640, 3), dtype=np.uint8)
+    keep = bgr.copy()
+    b = ColorObsBuilder(out_res=224)
+    assert b.grid_kind == "" and not b.usable
+    b.adopt(bgr)
+    obs, st = b.build(bgr)
+    side = 360
+    y0, x0 = 0, (640 - side) // 2
+    ref = cv2.resize(bgr[y0:y0 + side, x0:x0 + side], (224, 224),
+                     interpolation=cv2.INTER_AREA)[..., ::-1]
+    assert obs.shape == (224, 224, 3) and obs.dtype == np.uint8
+    assert np.array_equal(obs, ref), "not the training recipe"
+    assert np.array_equal(bgr, keep), "the input frame must not be modified"
+    assert b.grid_kind == OBS_SRC_C3_RGB and b.coverage == 1.0
+    assert st["obs_valid"] == 1.0
+    d = b.describe()
+    import json
+    json.dumps(d)
+    assert d["crop"] == {"y0": 0, "x0": 140, "size": 360}
+    assert "NAIVE" in d["optics"] and d["channel_order"] == "RGB"
+
+
+def test_colour_builder_optics_note_follows_the_training_store():
+    """Only a store that DECLARES the C3 warp is recorded warped; a store
+    that says nothing (every RGB store before 2026-10-04) stays NAIVE. The
+    crop is the same either way — only the record differs."""
+    from rov_gui.perception.policy_obs import (
+        ColorObsBuilder, rgb_optics, RGB_OPTICS_C3WARP, RGB_OPTICS_NAIVE,
+        RGB_OPTICS_NOTE, RGB_OPTICS_NOTE_C3WARP)
+
+    assert rgb_optics("C3 CAM_A underwater (warped)") == (
+        RGB_OPTICS_C3WARP, RGB_OPTICS_NOTE_C3WARP)
+    for unknown in (None, "", "colour CAM_A, unrectified", "warped"):
+        assert rgb_optics(unknown) == (RGB_OPTICS_NAIVE, RGB_OPTICS_NOTE), unknown
+    rng = np.random.default_rng(4)
+    bgr = rng.integers(0, 256, size=(360, 640, 3), dtype=np.uint8)
+    naive, warped = ColorObsBuilder(), ColorObsBuilder(
+        optics="C3 CAM_A underwater (warped)")
+    for b in (naive, warped):
+        b.adopt(bgr)
+    assert np.array_equal(naive.build(bgr)[0], warped.build(bgr)[0])
+    assert naive.describe()["optics_kind"] == RGB_OPTICS_NAIVE
+    d = warped.describe()
+    assert d["optics_kind"] == RGB_OPTICS_C3WARP and "C3-WARPED" in d["optics"]
+    assert d["store_optics"] == "C3 CAM_A underwater (warped)"
+    warped.set_optics(None)
+    assert warped.describe()["optics"] == RGB_OPTICS_NOTE
+
+
+def test_colour_builder_refuses_a_size_change_and_a_non_colour_frame():
+    from rov_gui.perception.policy_obs import ColorObsBuilder
+
+    b = ColorObsBuilder()
+    b.adopt(np.zeros((360, 640, 3), np.uint8))
+    b.adopt(np.zeros((360, 640, 3), np.uint8))          # idempotent
+    for bad, why in ((np.zeros((720, 1280, 3), np.uint8), "size changed"),
+                     (np.zeros((360, 640, 3), np.uint16), "uint8")):
+        try:
+            b.adopt(bad)
+        except GridError as e:
+            assert why in str(e), e
+        else:
+            raise AssertionError(f"adopted a frame that should fail: {why}")
+    # refused, not latched: the adopted size still builds
+    assert b.usable
+    b.build(np.zeros((360, 640, 3), np.uint8))
+    try:
+        b.build(np.zeros((720, 1280, 3), np.uint8))
+    except GridError:
+        pass
+    else:
+        raise AssertionError("built an obs from a frame of another size")
+    g = ColorObsBuilder()
+    try:
+        g.adopt(np.zeros((360, 640), np.uint8))
+    except GridError as e:
+        assert "BGR" in str(e)
+    else:
+        raise AssertionError("a mono frame was adopted as colour")
+
+
 def main() -> int:
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]

@@ -40,9 +40,9 @@ from ..bus import FrameMailbox
 from ..net import NicMonitor
 from ..qt import Slot
 from ..sensorlog import SensorLog
-from ..state import (Conn, ImuBatch, NavFix, PayloadState, PilotInput,
-                     PoseTrack, SensorStat, Telemetry, ThrusterState,
-                     VehicleImu, VideoStat, now)
+from ..state import (Conn, DvlSample, ImuBatch, NavFix, PayloadState,
+                     PilotInput, PoseTrack, SensorStat, Telemetry,
+                     ThrusterState, VehicleImu, VideoStat, now)
 from .base import Backend, TimerWorker
 
 # Demo thruster mixer: rows are the 8 motors of a BlueROV2 Heavy, columns are
@@ -156,6 +156,10 @@ class DemoVideoWorker(TimerWorker):
         # warp.
         self.policy_mb = None
         self._policy_grid_done = False
+        # ...and its COLOUR mailbox (2026-10-03): the synthetic main feed,
+        # for an RGB checkpoint (`stub_rgb` offline). Wanted only while one
+        # is loaded, like the hardware tap.
+        self.policy_color_mb = None
 
     def setup(self) -> None:
         self._t0 = time.monotonic()
@@ -186,6 +190,18 @@ class DemoVideoWorker(TimerWorker):
                 bgr = self.scene.render(t, 960, 540)
                 res = (960, 540)
                 enc = "mjpeg"
+                if name == "main":
+                    # Guarded like the hardware tap: an optional policy feed
+                    # must never cost the demo its picture.
+                    try:
+                        self._tap_policy_color(bgr)
+                    except Exception as e:                       # noqa: BLE001
+                        if (self.bus is not None
+                                and getattr(self, "_pc_fault", "") != str(e)):
+                            self._pc_fault = str(e)
+                            self.bus.log.emit(
+                                "warn", f"policy: colour tap failed "
+                                        f"({type(e).__name__}: {e})")
             small = imaging.scale_to_fit(bgr, tw, th)
             img = imaging.bgr_to_qimage(small)
             stat = VideoStat(name=name, width=res[0], height=res[1],
@@ -197,6 +213,16 @@ class DemoVideoWorker(TimerWorker):
                 self.bus.video_stat.emit(stat)
         if (t - self._last_pub) > 0.5:
             self._last_pub = t
+
+    def _tap_policy_color(self, bgr: np.ndarray) -> None:
+        """The synthetic colour frame -> the policy's colour mailbox.
+        Stamped ``now()`` like the depth tap (no sensor latency here); the
+        demo's fixes are not frame-stamped, so the worker's anchor is simply
+        the newest frame no newer than the newest fix."""
+        mb = self.policy_color_mb
+        if mb is None or not mb.wanted():
+            return
+        mb.put(bgr.copy(), now())
 
     def _tap_policy(self, depth_mm: np.ndarray) -> None:
         """The synthetic depth -> the policy mailbox, grid `identity`.
@@ -329,6 +355,13 @@ class DemoVehicleWorker(TimerWorker):
         self.pose_locked = False
         self._log: SensorLog | None = None
         self._imu_log: SensorLog | None = None
+        # A SYNTHETIC DVL (2026-10-01), so the DVL switch, the agreement
+        # proof and the station bridge's DVL rung can be exercised with no
+        # hardware. Off unless --dvl / dvl.enabled (resolved in setup()).
+        self.dvl_on = False
+        self._dvl_rng = np.random.default_rng(11)
+        self._dvl_n = 0
+        self._dvl_t_prev = None
 
     def setup(self) -> None:
         # The same switch the real sink reads (engage.attitude_axes), so a
@@ -347,6 +380,9 @@ class DemoVehicleWorker(TimerWorker):
             self.pitch_nm = float(cfg.axis_gain.get("pitch_nm", 7.2))
         except Exception:                                        # noqa: BLE001
             self.set_attitude_axes(False)
+        from .dvl import dvl_config
+
+        self.dvl_on = self.mpc_on and dvl_config(self.opts) is not None
 
     def set_attitude_axes(self, enabled: bool, sign=(1.0, 1.0)) -> None:
         """The command sink's slot, mirrored (hardware.MavlinkCommandSink)."""
@@ -750,6 +786,45 @@ class DemoVehicleWorker(TimerWorker):
             depth_m=float(self.depth), t_att=t, t_imu=t, t_baro=t,
             conn=Conn.ONLINE, stamp=t))
         self._publish_camera_imu(f, omega, t, dt)
+        if self.dvl_on:
+            self._publish_dvl(nu, t)
+
+    def _publish_dvl(self, nu, t: float) -> None:
+        """A SYNTHETIC DvlSample every other tick (10 Hz): the plant's own
+        body velocity plus 3 mm/s of noise, valid while more than 5 cm above
+        the mat. FABRICATED like everything in this module — the rate, the
+        noise and the zero latency are placeholders that only have to make
+        the plumbing run, and say nothing about the real device.
+
+        ``opts.demo_dvl_yaw_deg`` rotates the reported velocity about the
+        down axis: a deliberately WRONG mount, so the refusal the agreement
+        gate gives can be seen (and tested) before it is ever needed.
+        ``opts.demo_dvl_lock`` False = no bottom lock."""
+        self._dvl_n += 1
+        if self._dvl_n % 2:
+            return
+        yaw = math.radians(float(getattr(self.opts, "demo_dvl_yaw_deg", 0.0)
+                                 or 0.0))
+        c, sn = math.cos(yaw), math.sin(yaw)
+        v = np.array([c * nu[0] + sn * nu[1], -sn * nu[0] + c * nu[1], nu[2]])
+        v = v + self._dvl_rng.normal(0.0, 0.003, 3)
+        alt = self.mat_depth - self.depth
+        lock = bool(getattr(self.opts, "demo_dvl_lock", True)) and alt >= 0.05
+        hz = (None if self._dvl_t_prev is None
+              else 1.0 / max(1e-3, t - self._dvl_t_prev))
+        self._dvl_t_prev = t
+        self.bus.dvl.emit(DvlSample(
+            t_valid=t, t_rx=t,
+            v_dvl=(tuple(float(x) for x in v) if lock else (0.0, 0.0, 0.0)),
+            valid=lock, fom=(0.003 if lock else 10.0),
+            altitude=(float(alt) if lock else -1.0), status=0,
+            n_beams=(4 if lock else 0), dt_ms=100.0, hz=hz, source="demo",
+            conn=(Conn.ONLINE if lock else Conn.DEGRADED),
+            note="synthetic", stamp=t))
+        self.bus.sensor_stat.emit(SensorStat(
+            "DVL", hz, Conn.ONLINE if lock else Conn.DEGRADED,
+            (f"{hz:.0f} Hz alt {alt:.2f} m (sim)" if lock and hz
+             else "no bottom lock (sim)")))
 
     # Demo C3 IMU: samples per 20 Hz tick, i.e. 200 Hz like the real BNO086.
     # The point is not realism, it is that the dead reckoner sees the SAME
@@ -900,6 +975,10 @@ class DemoBackend(Backend):
             bus.pose.connect(self.mpc.on_pose)
             bus.vehicle_imu.connect(self.mpc.on_vehicle_imu)
             bus.camera_imu.connect(self.mpc.on_camera_imu)
+            bus.dvl.connect(self.mpc.on_dvl)
+            bus.dvl_info.connect(self.mpc.on_dvl_info)
+            bus.cmd_dvl_use.connect(self.mpc.set_dvl_use)
+            bus.cmd_estimator.connect(self.mpc.set_estimator)
             bus.telemetry.connect(self.mpc.on_telemetry)
             bus.cmd_mode.connect(self.mpc.on_mode_request)
             bus.thrusters.connect(self.mpc.on_thrusters)
@@ -907,6 +986,7 @@ class DemoBackend(Backend):
             bus.cmd_mpc_traj.connect(self.mpc.set_traj)
             bus.cmd_mpc_start.connect(self.mpc.start_mission)
             bus.cmd_mpc_mode.connect(self.mpc.set_mode)
+            bus.cmd_mpc_tune.connect(self.mpc.set_mpc_tune)
             bus.cmd_mpc_scenario.connect(self.mpc.set_scenario)
             bus.cmd_mpc_dump_meta.connect(self.mpc.dump_run_meta)
             bus.cmd_enable.connect(self.mpc.on_enable)
@@ -931,6 +1011,12 @@ class DemoBackend(Backend):
             pmb = PolicyMailbox()
             self.video.policy_mb = pmb
             self.policy = PolicyWorker(bus, pmb, opts)
+            # The colour mailbox for an RGB checkpoint (2026-10-03), the
+            # hardware backend's wiring.
+            from ..bus import PolicyColorMailbox
+            pcm = PolicyColorMailbox()
+            self.video.policy_color_mb = pcm
+            self.policy.policy_color_mb = pcm
             # See HardwareBackend: --record-depth files its frames in the
             # CONTROLLER's run folder, which owns both the tree and the pin.
             if self.mpc is not None:

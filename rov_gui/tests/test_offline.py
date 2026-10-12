@@ -480,6 +480,83 @@ def test_layout_fits_one_screen_and_has_no_scrollarea():
     win.close()
 
 
+def test_status_text_never_moves_the_station_grid():
+    """No STATUS SENTENCE may resize the grid (2026-10-03, operator: "가끔
+    trajectory 패널쪽이 커지고 카메라 패널들이 압축돼").
+
+    The trajectory panel's chip was a plain QLabel, so its text was the
+    panel's minimum width: a START refusal or a localizer note widened
+    columns 2-3, squeezed the main video, and the longest refusal the worker
+    can send pushed the window's minimum past the operator's screen. The
+    sentences below go in through the real slots, at the operator's maximised
+    client area (1834x1016, xwininfo 2026-10-03), and every cell must stay
+    exactly where it was — while the chip still carries the whole sentence.
+    """
+    from rov_gui.state import Conn, MpcStatus, NavFix
+    from rov_gui.window import MainWindow
+
+    root = Path(__file__).resolve().parents[2]
+
+    class MpcOpts(Opts):
+        mpc = True
+        mpc_config = str(root / "config" / "hw_mpc.yaml")
+        nav_config = str(root / "config" / "hw_nav.yaml")
+        nav_geometry = None
+
+    app = _app()
+    theme.apply(app)
+    win = MainWindow(MpcOpts())
+    panel = win._traj_panel
+    win.resize(1834, 1016)
+    win.show()
+    _pump(app, 250)
+
+    def grid():
+        g = win.grid
+        return ([g.cellRect(0, c).width() for c in range(g.columnCount())],
+                [g.cellRect(r, 0).height() for r in range(g.rowCount())],
+                win.minimumSizeHint().width())
+
+    before = grid()
+    # The longest refusal control/workers.py `_refuse` can produce (the
+    # facing-tag one), shown over the phase while engaged, in bold.
+    refusal = ("START refused: facing tag 97 needs the yaw axis, but the "
+               "vehicle engaged in STABILIZE with engage.stabilize.yaw_axis: "
+               "hold — the autopilot's heading hold owns heading. Engage in "
+               "MANUAL, or set engage.stabilize.yaw_axis: command")
+    note = "; ".join(f"tag {i} reproj 4.{i % 10}px > 3px" for i in range(20, 32))
+    # The localizer note goes LAST: add_status keeps it on the chip for 2 s
+    # by design (add_fix), so anything after it would never be shown.
+    sentences = [
+        (MpcStatus(engaged=True, mode="mpc_tuned", conn=Conn.ONLINE,
+                   err_xy=0.02, reason=refusal), None, "refused"),
+        (MpcStatus(engaged=False, conn=Conn.ONLINE,
+                   reason="disengaged: " + refusal), None, "disengaged"),
+        (MpcStatus(engaged=False, conn=Conn.DEGRADED, reason=""),
+         NavFix(t_capture=0.0, n_tags=0, tag_ids=(79, 80),
+                conn=Conn.DEGRADED, note=note), "nav: tag 20"),
+    ]
+    for st, fix, want in sentences:
+        if fix is not None:
+            panel.add_fix(fix)
+        panel.add_status(st)
+        _pump(app, 60)
+        assert want in panel.chip.text(), panel.chip.text()
+        assert grid() == before, (
+            f"{want!r}: the grid moved {before} -> {grid()}")
+        assert panel.chip.toolTip().startswith(panel.chip.text()), \
+            "the full sentence must head the tooltip"
+        assert "DEEPER" in panel.chip.toolTip(), "the sign legend must stay"
+    # Deleted HERE, not whenever the GC gets to it: a window collected later
+    # destroys its combos' popup list views under whatever app-wide event
+    # filter a later test has installed (test_ckpt_dialog_escape_is_estop_and
+    # _closes' CkptDialog), and the dead QListView reaching that filter's
+    # super().eventFilter aborted the run (2026-10-03).
+    win.close()
+    win.deleteLater()
+    _pump(app, 30)
+
+
 def test_screen_recorder_writes_a_file_and_an_honest_sidecar():
     from rov_gui.recorder import ScreenRecorder
 
@@ -3453,9 +3530,12 @@ def test_trajectory_panel_high_low_combos_speak_keys_and_show_labels():
     # LOW: keys in the designed order, None first, labels as designed
     modes = [(p.mode_box.itemText(i), p.mode_box.itemData(i))
              for i in range(p.mode_box.count())]
-    assert [k for _, k in modes] == ["none", "pid", "mpc", "mpc_tuned",
+    # 2026-10-03: each *_7d right after its base
+    assert [k for _, k in modes] == ["none", "pid", "pid_7d", "mpc",
+                                     "mpc_tuned", "mpc_tuned_7d",
                                      "dobmpc", "dobmpc_tuned", "mpcc",
-                                     "dobmpcc", "rl", "rl_pwm"], modes
+                                     "dobmpcc", "rl", "rl_7d", "rl_pwm",
+                                     "rl_pwm_7d"], modes
     assert modes[0] == ("None", "none")
     assert {k: lbl for lbl, k in modes} == MODE_LABELS
     # set_mode_default selects by KEY and never emits (honesty rule)
@@ -3858,6 +3938,119 @@ def test_trajectory_panel_ckpt_widgets_share_the_high_row_and_add_no_height():
     p.close()
 
 
+def test_trajectory_panel_forecasts_roll_pitch_before_start():
+    """policy.action_repr auto (2026-10-03): the PICK decides 5-dim vs 7-dim,
+    so the panel says, before START, what the held checkpoint is (ckpt row:
+    "READY · 7-dim", FAIL + why when START will refuse it) and what the
+    current LOW will do with its roll/pitch (mission label, WARN when
+    TRACKED or the LOW cannot engage, DIM when dropped / level). The rule is
+    the worker's (geometry); nothing is said unseeded, while loading or on an
+    error, and a 5-dim pick on a 4-DoF LOW leaves the label as it always
+    was. After ARM the chip says it from the ARM-pinned scenario."""
+    from rov_gui import theme
+    from rov_gui.state import MpcStatus, PolicyStatus
+    from rov_gui.widgets.trajectory import TrajectoryWindow
+
+    _app()
+    p = TrajectoryWindow()
+    p.set_mode_default("mpc_tuned")
+    p.set_shape("policy")
+    base = p.mission_lbl.text()
+    assert base.startswith("run the diffusion policy from HERE"), base
+    p.set_policy_status(PolicyStatus(ready=True, action_repr="pos_rpy_width"))
+    assert p.ckpt_state.text() == "READY · 7-dim", p.ckpt_state.text()
+    assert "pos_rpy_width" in p.ckpt_state.toolTip()
+    assert p.mission_lbl.text() == base, "unseeded: no forecast"
+    p.set_policy_config_default("auto", True, False)
+    t = p.mission_lbl.text()
+    assert t.startswith("7-dim ckpt: roll/pitch DROPPED-AND-LOGGED (MPC_Tuned is 4-DoF) · "), t
+    assert "ckpt from the picker" in t
+    assert theme.TEXT_DIM in p.mission_lbl.styleSheet()
+    p.set_policy_config_default("auto", True, True)          # capability on
+    assert "(MPC_Tuned is 4-DoF; MPC_Tuned_7D tracks)" in p.mission_lbl.text()
+    p.mode_box.setCurrentIndex(p.mode_box.findData("mpc_tuned_7d"))
+    assert p.mission_lbl.text().startswith(
+        "7-dim ckpt: roll/pitch TRACKED on MPC_Tuned_7D (if the ARM gates pass)"), p.mission_lbl.text()
+    assert theme.WARN in p.mission_lbl.styleSheet()
+    p.set_policy_config_default("auto", True, False)         # capability off
+    assert p.mission_lbl.text().startswith(
+        "MPC_Tuned_7D needs engage.attitude_axes (off in the YAML) — ENGAGE will be refused"), p.mission_lbl.text()
+    assert theme.WARN in p.mission_lbl.styleSheet()
+    p.mode_box.setCurrentIndex(p.mode_box.findData("rl_pwm_7d"))
+    assert "TRACKED on RL_PWM_7D" in p.mission_lbl.text()     # pulses: no capability
+    p.mode_box.setCurrentIndex(p.mode_box.findData("rl_pwm"))
+    assert "(RL_PWM is 4-DoF; RL_PWM_7D tracks)" in p.mission_lbl.text()
+    p.mode_box.setCurrentIndex(p.mode_box.findData("mpc_tuned"))
+    assert "(MPC_Tuned is 4-DoF)" in p.mission_lbl.text(), "no hint to a LOW that cannot engage"
+    # review 2026-10-03: the hint follows the worker's rule — no sibling is
+    # named when it has no export, under the veto, or in a land dry-run
+    p.mode_box.setCurrentIndex(p.mode_box.findData("rl_pwm"))
+    p.set_policy_config_default("auto", True, False, unavailable=("rl_pwm_7d",))
+    assert "(RL_PWM is 4-DoF)" in p.mission_lbl.text(), p.mission_lbl.text()
+    p.set_policy_config_default("auto", False, False)        # the veto
+    assert "(RL_PWM is 4-DoF)" in p.mission_lbl.text(), p.mission_lbl.text()
+    p.set_policy_config_default("auto", True, False, land_dry_run=True)
+    assert "(RL_PWM is 4-DoF)" in p.mission_lbl.text(), p.mission_lbl.text()
+    p.mode_box.setCurrentIndex(p.mode_box.findData("rl_pwm_7d"))
+    t = p.mission_lbl.text()                                 # land dry-run: ARM refuses a tracked mission
+    assert t.startswith("7-dim ckpt: RL_PWM_7D cannot track in a land dry-run — START will be refused (use RL_PWM)"), t
+    assert theme.WARN in p.mission_lbl.styleSheet()
+    # the contouring pair refuses every policy START: nothing is forecast
+    p.set_policy_config_default("auto", True, True)
+    p.mode_box.setCurrentIndex(p.mode_box.findData("mpcc"))
+    assert p.mission_lbl.text() == base, p.mission_lbl.text()
+    p.mode_box.setCurrentIndex(p.mode_box.findData("rl_pwm_7d"))
+    p.set_policy_config_default("auto", False, False)        # the veto
+    assert "DROPPED-AND-LOGGED (policy.attitude_track false)" in p.mission_lbl.text()
+    # an explicit pin that disagrees: the ROW says START will refuse it
+    p.set_policy_config_default("pos_yaw_width", True, False)
+    assert p.ckpt_state.text() == "READY · 7-dim · ≠ config pos_yaw_width", p.ckpt_state.text()
+    assert "policy.action_repr pos_yaw_width" in p.ckpt_state.toolTip()
+    assert "START will be refused" in p.ckpt_state.toolTip()
+    assert theme.FAIL in p.ckpt_state.styleSheet()
+    assert p.mission_lbl.text() == base
+    p.set_policy_config_default("auto", True, False)
+    assert p.ckpt_state.text() == "READY · 7-dim" and theme.OK in p.ckpt_state.styleSheet()
+    p.set_policy_status(PolicyStatus(ready=True, action_repr="pos_rpy_width", mount_ok=False))
+    assert p.ckpt_state.text() == "READY · 7-dim · MOUNT MISMATCH"
+    assert theme.FAIL in p.ckpt_state.styleSheet() and p.mission_lbl.text() == base
+    p.set_policy_status(PolicyStatus(ready=True, action_repr="pose10d"))
+    assert p.ckpt_state.text() == "READY · 10-dim · not flyable"
+    assert p.mission_lbl.text() == base
+    p.set_policy_status(PolicyStatus(ready=True, action_repr="pos_rpy_width",
+                                     error="obs contract: bad"))
+    assert p.ckpt_state.text().startswith("ERROR") and p.mission_lbl.text() == base
+    p.set_policy_status(PolicyStatus(loading=True))
+    assert p.mission_lbl.text() == base
+    p.set_policy_status(PolicyStatus(ready=True, action_repr="pos_yaw_width"))
+    assert p.ckpt_state.text() == "READY · 5-dim"
+    assert p.mission_lbl.text().startswith("5-dim ckpt: RL_PWM_7D holds roll/pitch level")
+    p.mode_box.setCurrentIndex(p.mode_box.findData("pid_7d"))   # s/t LOW, capability off:
+    assert p.mission_lbl.text().startswith(                     # cannot engage, whatever the ckpt
+        "PID_7D needs engage.attitude_axes"), p.mission_lbl.text()
+    p.mode_box.setCurrentIndex(p.mode_box.findData("rl_pwm_7d"))
+    p.mode_box.setCurrentIndex(p.mode_box.findData("mpc_tuned"))
+    assert p.mission_lbl.text() == base, "5-dim on a 4-DoF LOW: the label as before"
+    assert theme.TEXT_FAINT in p.mission_lbl.styleSheet()
+    p.set_policy_status(PolicyStatus(ready=True, action_repr="pos_rpy_width"))
+    p.mode_box.setCurrentIndex(p.mode_box.findData("none"))
+    t = p.mission_lbl.text()
+    assert t.startswith("LOW None (teleop)"), t
+    assert t.endswith(" · 7-dim ckpt: roll/pitch DROPPED-AND-LOGGED (LOW None)"), t
+    p.set_policy_status(PolicyStatus(ready=True))            # no contract
+    assert p.ckpt_state.text() == "READY"
+    # AFTER ARM: the chip, from the ARM-pinned scenario (never the panel)
+    sc = {"kind": "policy", "action_repr": "pos_rpy_width", "attitude_track": True}
+    p.add_status(MpcStatus(engaged=True, traj_on=True, mode="rl_pwm_7d", scenario=dict(sc)))
+    assert "7d rp TRACKED" in p.chip.text(), p.chip.text()
+    p.add_status(MpcStatus(engaged=True, traj_on=True, mode="rl_pwm",
+                           scenario=dict(sc, attitude_track=False)))
+    assert "7d rp DROPPED" in p.chip.text(), p.chip.text()
+    p.add_status(MpcStatus(engaged=True, traj_on=True, mode="rl_pwm",
+                           scenario=dict(sc, action_repr="pos_yaw_width")))
+    assert "7d rp" not in p.chip.text(), p.chip.text()
+
+
 def test_window_wires_the_ckpt_picker_and_seeds_it_from_the_yaml():
     """--mpc builds the panel; the window seeds the ckpt row from hw_mpc.yaml
     policy.ckpt (the launch seed, beside the mission defaults and the LOW
@@ -3896,6 +4089,14 @@ def test_window_wires_the_ckpt_picker_and_seeds_it_from_the_yaml():
     _pump(app, 30)
     assert panel.ckpt_name.text() == "picked.ckpt"
     assert panel.ckpt_state.text() == "READY"
+    # ...and the forecast's config from the SAME file (2026-10-03, auto)
+    assert panel._pol_cfg == (str(cfg.policy["action_repr"]),
+                              bool(cfg.policy["attitude_track"]),
+                              bool(cfg.engage["attitude_axes"]["enabled"]))
+    assert panel._pol_cfg[0] == "auto"
+    assert panel._pol_land is False
+    assert panel._pol_unavailable == tuple(
+        k for k in ("rl_7d", "rl_pwm_7d") if not (getattr(cfg, k) or {}).get("policy_dir"))
     logs: list = []
     win.bus.log.connect(lambda lvl, msg: logs.append((lvl, msg)))
     panel.btn_ckpt.click()                     # no --policy: no dialog

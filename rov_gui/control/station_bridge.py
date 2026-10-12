@@ -37,6 +37,29 @@ so:
                                                   and attitude still held —
                                                   INDEFINITELY
 
+and, since 2026-10-01 (control/dvl.py, HARDWARE-UNVERIFIED), one more rung
+for a vehicle that carries a DVL the operator has switched IN:
+
+    tier DVL     0 .. dvl_hold_s, only while the  all axes; x/y integrate the
+                 DVL stays usable WITHOUT a gap   DVL's bottom velocity from
+                 from the first lost tick         the last fix — drift grows
+                                                  with t, not t^2
+
+A DVL measures velocity over the floor, so x/y no longer rest on a double
+integral and may be carried longer than ``imu_hold_s``. The moment it stops
+being usable the ladder is exactly the one above, judged on the same elapsed
+time — and it does NOT climb back onto the DVL later in the same dropout:
+the position would then have a hole of unknown motion in it.
+
+The DVL rung is the one stretch where NOTHING cross-checks the DVL (the tag
+that proved it is the thing that is missing), so it is bounded by what a
+station hold IS: a vehicle nominally at rest over one point. A DVL that
+reports more than ``dvl_max_speed_m_s``, or whose integral has wandered more
+than ``dvl_max_disp_m`` from the last fix, is describing something other
+than a station hold — a false bottom lock off a wall, most likely — and the
+rung is dropped for the rest of the dropout (review 2026-10-02: without
+these, 10 s of a bogus 0.2 m/s is 2 m of full-authority push the wrong way).
+
 COAST is the point of the design, and it is deliberately not a disengage.
 Pushing on a horizontal estimate that is drifting actively drives the vehicle
 somewhere wrong, and nothing in this station stops it by position any more
@@ -74,6 +97,7 @@ import numpy as np
 
 TIER_NONE = "none"      # the tag fix is fresh; not bridging
 TIER_IMU = "imu"        # carrying every axis on the bridge estimate
+TIER_DVL = "dvl"        # ...with x/y integrated from the DVL's velocity
 TIER_COAST = "coast"    # depth + attitude only; horizontal released
 
 #: Faults the bridge may carry. EVERYTHING else still disengages — most
@@ -94,6 +118,19 @@ DEFAULTS = {
     "xy_source": "auto",
     # null = the mission's normal axis_cap (operator decision 2026-08-18).
     "axis_cap": None,
+    # DVL rung (2026-10-01). Used ONLY when a DVL is built, switched IN and
+    # usable at the dropout; otherwise these two keys change nothing.
+    # 10 s: at the A50's stated +-1 % of speed and a few mm/s of noise the
+    # integrated error over a station hold is millimetres, and the yaw it is
+    # rotated by is the same gyro-carried one tier IMU uses [예측 — no DVL
+    # has been in this pool; replace with the drift each recovery logs].
+    "use_dvl": True,
+    "dvl_hold_s": 10.0,
+    # The rung's own plausibility bounds (see the module doc). A station
+    # hold that is really moving at 0.3 m/s, or has really drifted half a
+    # metre, has stopped being one. Both [예측].
+    "dvl_max_speed_m_s": 0.3,
+    "dvl_max_disp_m": 0.5,
 }
 
 KEYS = tuple(DEFAULTS)
@@ -123,6 +160,22 @@ def resolve(raw: dict | None) -> dict:
     cfg["xy_source"] = str(cfg["xy_source"])
     if cfg["axis_cap"] is not None:
         cfg["axis_cap"] = float(cfg["axis_cap"])
+    if not isinstance(cfg["use_dvl"], bool):
+        raise ValueError(f"station_bridge.use_dvl must be true or false, "
+                         f"got {cfg['use_dvl']!r}")
+    cfg["dvl_hold_s"] = float(cfg["dvl_hold_s"])
+    if not cfg["dvl_hold_s"] >= 0.0:
+        raise ValueError(f"station_bridge.dvl_hold_s must be >= 0, "
+                         f"got {cfg['dvl_hold_s']}")
+    for k in ("dvl_max_speed_m_s", "dvl_max_disp_m"):
+        try:
+            v = float(cfg[k])
+        except (TypeError, ValueError):
+            v = float("nan")
+        if isinstance(cfg[k], bool) or not v > 0.0:     # also catches NaN
+            raise ValueError(f"station_bridge.{k} must be a number > 0, "
+                             f"got {cfg[k]!r}")
+        cfg[k] = v
     return cfg
 
 
@@ -153,12 +206,24 @@ class StationBridge:
 
     # ---------------------------------------------------------------- state
     def reset(self) -> None:
-        self.tier = TIER_NONE
-        self._t_lost = None          # when the last fresh fix was seen
+        """A NEW engagement: the ladder and its counters start from zero."""
         self.n_entered = 0           # how many dropouts this engagement
         self.n_coast = 0             # ...and how many reached the coast tier
+        self.n_dvl = 0               # ...and how many were carried on the DVL
         self.worst_s = 0.0           # longest dropout so far
-        self.last_recover = None     # {"elapsed", "err_m", "tier"}
+        self.last_recover = None     # {"elapsed", "tier", "dvl_s", ...}
+        self.end_dropout()
+
+    def end_dropout(self) -> None:
+        """Stop bridging, KEEP the counters. For a disengage or a STOP TRAJ:
+        the closing meta is written after them, and until 2026-10-02 it was
+        written from a ladder ``reset()`` had already zeroed — every run's
+        ``dropouts`` / ``reached_coast`` / ``last_recovery`` closed as 0 /
+        0 / null on disk whatever had happened in the water."""
+        self.tier = TIER_NONE
+        self._t_lost = None          # when the last fresh fix was seen
+        self._dvl_chain = False      # DVL usable on EVERY lost tick so far
+        self._dvl_s = 0.0            # seconds of THIS dropout on the DVL rung
 
     @property
     def enabled(self) -> bool:
@@ -182,22 +247,51 @@ class StationBridge:
         if self._t_lost is None:
             self.tier = TIER_NONE
             return None
-        rec = {"elapsed": float(self._t_lost), "tier": self.tier}
+        rec = {"elapsed": float(self._t_lost), "tier": self.tier,
+               # how much of it the DVL rung carried (0.0 = none of it)
+               "dvl_s": round(float(self._dvl_s), 3)}
         self._t_lost = None
+        self._dvl_chain = False
+        self._dvl_s = 0.0
         self.tier = TIER_NONE
         self.last_recover = rec
         return rec
 
-    def note_lost(self, dt: float) -> str:
-        """One tick with no fresh fix. Returns the tier now in force."""
+    def dvl_allowed(self, dt: float) -> bool:
+        """May the NEXT lost tick still be carried on the DVL rung? True at
+        the start of a dropout, and afterwards only while the chain is
+        unbroken and ``dvl_hold_s`` has not run out. Asked BEFORE
+        ``note_lost`` so the state the caller builds and the tier that call
+        returns can never disagree."""
+        if not self.cfg["use_dvl"]:
+            return False
+        if self._t_lost is None:
+            return True
+        return bool(self._dvl_chain) and (
+            self._t_lost + max(0.0, float(dt)) <= self.cfg["dvl_hold_s"])
+
+    def note_lost(self, dt: float, dvl_ok: bool = False) -> str:
+        """One tick with no fresh fix. Returns the tier now in force.
+
+        ``dvl_ok`` = the caller integrated a usable DVL velocity THIS tick.
+        The DVL rung holds only while that has been true on every lost tick
+        of this dropout (``_dvl_chain``)."""
+        dvl_ok = bool(dvl_ok) and bool(self.cfg["use_dvl"])
         if self._t_lost is None:
             self._t_lost = 0.0
             self.n_entered += 1
             self.tier = TIER_IMU
+            self._dvl_chain = dvl_ok
+            if dvl_ok:
+                self.n_dvl += 1
         else:
             self._t_lost += max(0.0, float(dt))
+            self._dvl_chain = self._dvl_chain and dvl_ok
         self.worst_s = max(self.worst_s, self._t_lost)
-        if self._t_lost > self.cfg["imu_hold_s"]:
+        if self._dvl_chain and self._t_lost <= self.cfg["dvl_hold_s"]:
+            self.tier = TIER_DVL
+            self._dvl_s += max(0.0, float(dt))
+        elif self._t_lost > self.cfg["imu_hold_s"]:
             if self.tier != TIER_COAST:
                 self.n_coast += 1
             self.tier = TIER_COAST
@@ -232,6 +326,8 @@ class StationBridge:
 
     def detail(self) -> str:
         """The one line the panel and the mission log show."""
+        if self.tier == TIER_DVL:
+            return f"DVL bridge {self.elapsed:.1f}s"
         if self.tier == TIER_IMU:
             return f"IMU bridge {self.elapsed:.1f}s"
         if self.tier == TIER_COAST:
@@ -243,7 +339,12 @@ class StationBridge:
                 "imu_hold_s": float(self.cfg["imu_hold_s"]),
                 "xy_source": self.cfg["xy_source"],
                 "axis_cap": self.cfg["axis_cap"],
+                "use_dvl": bool(self.cfg["use_dvl"]),
+                "dvl_hold_s": float(self.cfg["dvl_hold_s"]),
+                "dvl_max_speed_m_s": float(self.cfg["dvl_max_speed_m_s"]),
+                "dvl_max_disp_m": float(self.cfg["dvl_max_disp_m"]),
                 "dropouts": int(self.n_entered),
+                "dropouts_on_dvl": int(self.n_dvl),
                 "reached_coast": int(self.n_coast),
                 "worst_dropout_s": round(float(self.worst_s), 3),
                 "last_recovery": self.last_recover,

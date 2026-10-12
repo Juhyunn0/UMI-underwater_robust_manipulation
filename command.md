@@ -14,6 +14,10 @@
 # 방법 2: FoundationStereo 해상도를 낮춤
 ./c3 gui --source hw --allow-command --mpc --fstereo --policy --mpc-mode rl_pwm --fstereo-scale 0.5
 
+# 방법 3 : 2 process
+./c3 gui --source hw --allow-command --mpc --fstereo --policy --fstereo-scale 0.5 --fstereo-process
+
+
 
 
 ./c3 gui --source hw --allow-command --mpc --fstereo --policycd /home/bdml/Desktop/RL_controller && DISPLAY=:1 /home/bdml/miniforge3/envs/env_isaaclab/bin/python -u scripts/play.py --task ROV-PoseHold-v0 --num_envs 64 --checkpoint logs/rsl_rl/rov_posehold/2026-09-21_16-53-50_traj5_s2/model_1199.p

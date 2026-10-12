@@ -248,12 +248,16 @@ RPY_CONVENTION_STATION = {
 #: (the dropped-and-logged wiring test); ``stub_rp`` = the same with a
 #: 5 deg [예측] pitch ramp reaching the last knot, so demo_e2e can push a
 #: KNOWN non-zero attitude request through compose -> filter -> stitcher ->
-#: NedPlan -> xref -> allocation (design S8). ``is_stub_ckpt`` is the ONE
-#: predicate the backend uses in place of ``== "stub"``.
+#: NedPlan -> xref -> allocation (design S8). ``stub_rgb`` (2026-10-03) =
+#: the 5-dim stub whose obs image is ``camera0_rgb`` instead of the depth key,
+#: so the worker's C3-colour obs path runs offline as the RGB-only checkpoint
+#: (umi_rgb_5d) would drive it. ``is_stub_ckpt`` is the ONE predicate the
+#: backend uses in place of ``== "stub"``.
 STUB_CKPT_VARIANTS = {
     "stub": {},
     "stub7": {"action_repr": ACTION_REPR_POS_RPY_WIDTH},
     "stub_rp": {"action_repr": ACTION_REPR_POS_RPY_WIDTH, "pitch_ramp_deg": 5.0},
+    "stub_rgb": {"image_key": "camera0_rgb"},
 }
 
 
@@ -760,6 +764,20 @@ class DpPolicySession:
                 raise ValueError("expected transforms[0] to be the RandomCrop "
                                  f"entry, got {raw_tf[:1]}")
             ratio = float(raw_tf[0]["ratio"])
+            # A PER-KEY crop (``key_transforms[image_key][0]``, 2026-09-23)
+            # is what the image key was actually trained with; the shared
+            # entry above is applied at eval. They agree on every checkpoint
+            # so far (0.95 / 0.95); one that disagrees is refused rather
+            # than evaluated at the wrong crop (review 2026-10-03, R2).
+            key_tf = list((enc_cfg.get("key_transforms") or {}).get(image_key)
+                          or [])
+            if key_tf and key_tf[0].get("type") == "RandomCrop" \
+                    and abs(float(key_tf[0]["ratio"]) - ratio) > 1e-9:
+                raise ValueError(
+                    f"key_transforms[{image_key!r}] crop ratio "
+                    f"{float(key_tf[0]['ratio'])} != transforms[0] ratio "
+                    f"{ratio}: the station's eval crop would not be the "
+                    f"key's training crop")
             crop = int(image_shape[-1] * ratio)
             resize = T.Resize(size=image_shape[-1], antialias=True)
             if self.eval_transforms == "center":
@@ -891,6 +909,20 @@ class DpPolicySession:
                 fps_source = (f"policy.dataset_fps arg (training zip "
                               f"{dataset_path!r} not readable)")
             obs_dt = down_sample_steps / fps
+            # The channel order the TRAINING store holds for an RGB image key
+            # (2026-10-03): the station feeds RGB, and a store built straight
+            # from build_dataset.py is BGR on disk. None = the store does not
+            # say (the backend then refuses the checkpoint).
+            rgb_attrs = (zattrs or {}).get("rgb") if zattrs else None
+            image_channel_order = None
+            # ... and what optics it holds (2026-10-04): a store built by
+            # build_dp_rgb_c3warp_zarr.py says "C3 CAM_A underwater (warped)";
+            # None = it does not say (naive). Only the run record reads it.
+            image_optics = None
+            if image_key != "camera0_depth" and isinstance(rgb_attrs, dict) \
+                    and rgb_attrs.get("key", image_key) == image_key:
+                image_channel_order = rgb_attrs.get("stored_channel_order")
+                image_optics = rgb_attrs.get("optics")
             contract = {
                 "obs_keys": list(obs_keys),
                 "image_key": image_key,
@@ -918,6 +950,8 @@ class DpPolicySession:
                 "fps": float(fps),
                 "fps_source": fps_source,
                 "image_shape": tuple(image_shape),
+                "image_channel_order": image_channel_order,
+                "image_optics": image_optics,
                 "lowdim_shapes": {k: tuple(v) for k, v in lowdim_shapes.items()},
             }
 
@@ -1164,8 +1198,11 @@ class StubPolicySession:
                  image_shape=(3, 224, 224),
                  action_repr: str = ACTION_REPR_POS_YAW_WIDTH,
                  dyaw_rate_rad_s: float = 0.0,
-                 roll_ramp_deg: float = 0.0, pitch_ramp_deg: float = 0.0):
+                 roll_ramp_deg: float = 0.0, pitch_ramp_deg: float = 0.0,
+                 image_key: str = "camera0_depth", image_optics=None):
         self.ckpt, self.repo = str(ckpt), str(repo)
+        self.image_key = str(image_key)
+        self.image_optics = image_optics
         self.num_inference_steps = int(num_inference_steps)
         self.eval_transforms = str(eval_transforms)
         self.weights = str(weights)
@@ -1210,8 +1247,8 @@ class StubPolicySession:
         self._infer_ms = deque(maxlen=_INFER_HISTORY)
         obs_dt = int(down_sample_steps) / self.dataset_fps
         self._contract = {
-            "obs_keys": list(self.OBS_KEYS),
-            "image_key": "camera0_depth",
+            "obs_keys": [self.image_key] + list(self.OBS_KEYS[1:]),
+            "image_key": self.image_key,
             "obs_horizon": int(obs_horizon),
             "action_horizon": int(action_horizon),
             "action_dim": int(ACTION_DIM_BY_REPR[self.action_repr]),
@@ -1228,6 +1265,11 @@ class StubPolicySession:
             "fps": self.dataset_fps,
             "fps_source": "stub (policy.dataset_fps)",
             "image_shape": tuple(int(s) for s in image_shape),
+            "image_channel_order": ("RGB (stub)"
+                                    if self.image_key != "camera0_depth"
+                                    else None),
+            "image_optics": (self.image_optics
+                             if self.image_key != "camera0_depth" else None),
             "lowdim_shapes": dict(self.LOWDIM_SHAPES),
         }
 

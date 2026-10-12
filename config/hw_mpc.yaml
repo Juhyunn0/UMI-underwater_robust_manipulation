@@ -6,6 +6,12 @@
 
 rov_model: heavy_gripper    # ROV_MODEL for dobmpc (heavy | heavy_c3 | heavy_gripper)
 mode: dobmpc                # none | mpc | dobmpc | mpc_tuned | dobmpc_tuned | pid | rl | rl_pwm
+                            # | pid_7d | mpc_tuned_7d | rl_7d  (2026-10-03: the
+                            # same followers that ALSO command roll/pitch — K/M
+                            # on MANUAL_CONTROL s/t; they need
+                            # engage.attitude_axes.enabled, see there)
+                            # | rl_pwm_7d (2026-10-03: the per-thruster RL policy
+                            # trained to track roll/pitch — pulses, no s/t)
                             # ONE solver serves the four MPC names: 'dob' adds
                             # w_hat, '_tuned' splits the position cost into
                             # along/cross in the path frame (mpc_tuned: below).
@@ -40,6 +46,49 @@ pid:
   omega_derate: 0.9
   # kp/kd/ki/yaw_* overrides accepted here; see rov_gui/control/pid.py
 
+# LOW pid_7d (panel PID_7D, 2026-10-03, operator request "pid_7d 버전"): the pid
+# set above for x/y/z/yaw UNCHANGED (same gains, same omega_derate) plus a
+# roll/pitch PID (rov_gui/control/pid.py HwPid7d) that tracks a 7-dim policy's
+# roll/pitch, ramps to level when a tracked plan ends, and LEVELS otherwise.
+# K/M leave the station only as MANUAL_CONTROL s/t under engage.attitude_axes
+# (refused without it on a vehicle). Design (control-theory-advisor consult
+# 2026-10-03, .claude/journal/consults.md): Kp/Kd = 3rd-order pole placement on
+# the heavy_gripper inertia at wn 0.5 rad/s — a HARDWARE value limited by the
+# DELAY (ATTITUDE ~52 ms old at the tick [측정 data/20261001/1001_154825/
+# mpc_154825.csv], +ZOH, +sink phase, +thruster lag), omega_derate NOT applied;
+# Ki set apart (0.15); restoring feed-forward on the REFERENCE angles. Margins
+# [유도, linear]: PM >= ~50 deg at 0.2 s delay and actuator gain x0.4..x2.5
+# ONLY while the hull's restoring stiffness k <= ~2.3/3.6 N m/rad (free-decay
+# period >= 3.2 s); at k ~20 (RL repo lumped fit) 3-41 deg — so a
+# pulse-and-release test (k/I, d, gain, delay) comes BEFORE this loop is closed
+# in water. EVERY NUMBER [예측]; never flown. Unknown keys RAISE. RECORD
+# BOUNDARY: meta controller.rp_loop.
+pid_7d:
+  rp_wn: 0.5                # rad/s [예측] (no omega_derate on top)
+  rp_zeta: 0.9
+  rp_alpha: 0.2
+  rp_inertia: [0.50154, 0.8978]   # roll, pitch kg m^2 [유도: rov_model heavy_gripper IX/IY + 0.12 added-mass placeholder]
+  rp_k_model: [0.0, 0.0]    # restoring subtracted from the formula's Kp (0 = ignored on purpose)
+  rp_d_model: [0.0, 0.0]
+  rp_ki: [0.15, 0.15]       # N m/(rad s), set apart from the formula (its I alpha wn^3 = 0.013/0.022 assumes k = 0)
+  rp_k_ff: 1.35             # N m/rad restoring FF on the reference angles (= the NMPC's ZG*W, the low end of k)
+  rp_i_max: [2.64, 2.16]    # N m ceiling of the integral ...
+  rp_i_cap_frac: 0.8        # ... and |I| <= 0.8 x the wire torque in force (first-water: 1.06 / 0.86 N m)
+  rp_gate_rad: 0.35         # integrate while |e| < 20 deg (the reference clip); conditional integration does the rest
+  rp_max_nm: [2.64, 2.16]   # = full caps x roll_nm/pitch_nm [유도]; the caps in force win
+  trim_rotated: true        # heave trim rotated with the measured attitude (world-vertical buoyancy)
+  # Safety audit 2026-10-03: the integral sits below the wire cap, so the AXIS alone never pins — "integral at its limit
+  # with > rp_pin_err_rad of error left" is reported to interlock (iii) as pinned (an inverted wire sign otherwise settled
+  # at a wrong tilt with nothing tripping) [예측].
+  rp_pin_err_rad: 0.0175    # 1 deg
+  # PULSE-AND-RELEASE GATE: a vehicle engage on pid_7d needs the open-loop pulse record (a JSON you write from the test,
+  # {"free_decay_period_s": [roll, pitch], ...}) with min period >= min_free_decay_period_s — below it the shipped gains
+  # lose their phase margin at ~0.2 s delay [유도: rov_gui/tests/fixtures/sim_pid7d_attitude_20261003.txt]. Or the
+  # RECORDED opt-out require_pulse_test: false (meta controller.rp_loop.pulse_test). Procedure: KNOWN_ISSUES 2026-10-03.
+  require_pulse_test: true
+  pulse_test: null
+  min_free_decay_period_s: 3.2
+
 # RL follower (mode: rl — 2026-09-21, rov_gui/control/rl_policy.py). The exported actor from
 # /home/bdml/Desktop/RL_controller (Isaac Lab PPO, obs = tag pose + IMU + reference + feed-forward, act = 4 MANUAL_CONTROL
 # axes) is shipped under rov_gui/control/rl_policies/<name>/ with its obs_spec.json. It assumes JS_GAIN_DEFAULT 0.5 and
@@ -48,12 +97,14 @@ pid:
 # 0.45 m/s, so rl.axis_cap 0.3 was introduced. engage.approach_speed_m_s 0.20 outruns that cap (~0.14 m/s by the speed
 # law): the approach setpoint parks at its leash and the policy rides the cap until it arrives (bounded, not unsafe).
 rl:
-  # 2026-09-22: traj10_s1 (narrow reward terms, nose-down trim in training, tether-like bias force). In a sim world with the
-  # vehicle's current -11 deg trim: square 0.047 m / circle 0.036 m vs traj5_s2 0.066 / 0.064, along-track bias 0 vs +3 cm,
-  # capped-step overshoot 0.014 m [measured RL_controller README 8.4]. NOT yet pool-tested. Revert: policy_dir ->
-  # rov_gui/control/rl_policies/traj5_s2 (pool-tested 2026-09-21). If the vehicle is re-ballasted level, go back to
-  # traj5_s2 until a policy trained across both trims exists (traj10 was trained at -11 +-6 deg).
-  policy_dir: rov_gui/control/rl_policies/traj10_s1
+  # 2026-10-05 (operator: "오늘 학습한걸 써보고 싶어"): traj12_s2 = traj10 recipe, but the training path starts AT the vehicle
+  # (5 cm ball), reference <= 0.10 m/s, speed penalty 1.0 per m/s above 0.12. Square 1 m @0.10 m/s, -11 deg sim: pos RMS
+  # 3.3 cm vs traj10_s1 3.7 cm; |v_xy| > 0.12 while moving 27 % vs 24 % [measured RL_controller/logs/eval/
+  # traj_traj12_s2_square010_trim, traj_traj10_s1_square010_trim]. STIFFER at small errors than traj10_s1 (surge at 0.10 m
+  # 0.55 vs 0.41) and flips heave at z +1.0 m (never trained beyond ~0.3 m offsets) [measured RL_controller/logs/eval/
+  # start_dist_review_20261005/{static_probe,zprobe}_traj12.out]. Fly it in DP policy missions only (references start at
+  # the robot). NOT pool-tested. Revert: policy_dir -> rov_gui/control/rl_policies/traj10_s1 (flew 0930-1003 DP missions).
+  policy_dir: rov_gui/control/rl_policies/traj12_s2
   axis_slew_per_s: 0.0
   axis_cap: 0.3           # |axis| ceiling in RL mode = min(axis_cap above, this). The policy has no speed target of its
                           # own: it saturates its command at ~0.2 m of error and hit 0.45 m/s under 0.5 (2026-09-21
@@ -68,17 +119,112 @@ rl:
 # (rov_gui/control/rl_policies/pwm10_s1/rl_pwm_override.lua on the Navigator, SCR_ENABLE 1, SCR_USER1 1), which has
 # never run on this vehicle. The station reads the vehicle's parameters back and REFUSES to engage until the gate in
 # rov_gui/control/rl_pwm.py holds (motor directions as trained, scripting on, RC 9..16 free, RLPWM heartbeat). Bench it
-# with the propellers OFF first, then a per-thruster sign probe (RL_controller/README.md §10.3).
+# with the propellers OFF first, then a per-thruster sign probe (RL_controller/README.md §10.3) — since 2026-10-10 the
+# probe's artefact is itself an engage gate (require_thruster_probe below), the cap is a thrust-space SCALE
+# (pwm_cap_mode), and a cap below the export's trained cap is refused (allow_caps_below_trained). The CSV gains
+# i_pred_a / null_v_us / null_h_us (schema 19) on pwm rows: workers.py CSV_HEADER 2026-10-10 note. 2026-10-10 (b):
+# the per-thruster runtime interlocks live in engage.per_thruster (tilt / rate / pack / null / pinned), the policy-side
+# observation guards in obs_guard below (velocity slew, fix-jump reject, tag gate -> HOLD pulses; CSV pwm_guard,
+# schema 20), and i_pred_a uses the physical thrust convention (T200 x batt_v / 20.5 V). Replay of the recorded
+# engagements: rov_gui/tools/rl_pwm_interlock_replay.py -> data/20261010/1010_interlock_replay_offline/report.txt.
 rl_pwm:
-  policy_dir: rov_gui/control/rl_policies/pwm10_s1
-  pwm_cap: 1.0 #0.25      # |throttle| ceiling on the wire (fraction of +-400 us). 0.25 (1400..1600 us) was the
+  # 2026-10-10 (operator): pwm11k0.2_s0 = 보정된 세계(기수-위 정지각, 팔 0.05 m) + null-space 벌점으로 재학습한 후보, 시뮬 게이트
+  # 전부 통과 [측정 RL_controller/logs/eval/PWM11_GATE.md], 수조 미검증 (rl_policies/pwm11k0.2_s0/README.md). 추진기별 부호 프로브
+  # 아티팩트가 없으면 교전 거부(require_thruster_probe). 이전 pwm10_s1 은 수조 실패 원인 정책이라 비행 금지(RL_controller README §13.8).
+  policy_dir: rov_gui/control/rl_policies/pwm11k0.2_s0   # was rov_gui/control/rl_policies/pwm10_s1 (2026-09-30 .. 10-10)
+  pwm_cap: 0.5            # = pwm11k0.2_s0 의 학습 캡 pwm_cap_trained (env.pwm_cap 0.5); 스케일 모드에서 추력 공간 균일 축소. 이력:
+                          # 1.0 #0.25  # |throttle| ceiling on the wire (fraction of +-400 us). 0.25 (1400..1600 us) was the
                           # first-water value [예측]; the policy was trained at 1.0. [결정 2026-10-01 operator: 1.0 in one
                           # step] after the 0.25 run saturated and limit-cycled (data/20261001/1001_172910: thrusters
                           # 3/4/6 at the cap 61-91 % of ticks, 5.8 N per thruster vs 64 N trained [유도]). No per-thruster
                           # sign probe was done. RECORD BOUNDARY: meta controller.pwm_cap.
+                          # TODO(2026-10-10): 다음 정책군 pwm11 은 env.pwm_cap 0.5 로 학습한다(REPORT §3 step 3) —
+                          # 그 export 를 policy_dir 에 올릴 때 이 값을 0.5 로 (export 의 pwm_cap_trained 와 같게; 아래
+                          # allow_caps_below_trained 참조). 출하값 1.0 은 pwm10_s1 의 학습 캡이며 여기서 바꾸지 않았다.
+  # ---- 2026-10-10 (RL_controller/logs/eval/pwm_cocontraction_analysis_20261010/REPORT.md §1 원인 4, §3 5단계) ----
+  # pwm_cap_mode: 캡을 거는 방식. scale = 추력 공간의 단일 배율(rov_gui/control/rl_pwm.py scale_throttles: 8개 추력
+  #   F=T200(thr) 에 s=min(1, T200(+cap)/max F⁺, |T200(−cap)|/max|F⁻|) 를 곱하고 T200⁻¹ 로 되돌림 — 할당 방향 유지,
+  #   가장 큰 |throttle| 이 정확히 cap). clip = 2026-09-30~10-09 의 추진기별 클립(A/B 비교용으로만 남김). 10-01 런은
+  #   cap-1.0 정책을 0.25 클립으로 날려 추진기 3/4/6 이 61–94 % 캡에 붙고 할당이 무너졌다(cos(렌치, 비캡) 0.73
+  #   [측정 REPORT scratch/design-systems/alloc_numbers.txt]; scale 은 cos 1.000). 캡을 넘는 펄스는 이제 어디서도
+  #   클립되지 않고 거부된다(추종자: 중립 + n_fail, sink: 거부 + 래치). RECORD BOUNDARY: meta controller.pwm_cap_mode.
+  pwm_cap_mode: scale
+  # allow_caps_below_trained: pwm_cap 이 export 의 pwm_cap_trained 보다 낮으면 추종자 생성을 거부한다(학습 때 본 적
+  #   없는 이전 행동이 되먹임됨 — 10-01 의 한계 진동). true = 기록되는 opt-out(meta controller.allow_caps_below_trained).
+  #   rl_pwm_7d 는 자기 블록의 같은 키를 쓴다(이 키가 대신하지 않음).
+  allow_caps_below_trained: false
+  # require_thruster_probe: 추진기별 부호 프로브 산출물 게이트(rov_gui/control/rl_pwm.py ThrusterProbeCheck —
+  #   교전 시 워커가, 그리고 sink 의 PwmGate 가 매 프레임 판정). 프로브 도구 rov_gui/tools/thruster_probe.py 가 쓰는
+  #   data/<날짜>/<런>_probe/thruster_sign_probe.json(schema 1) 이 (a) dry_run 이 아니고 (b) thruster_probe_max_age_days
+  #   보다 새롭고 (c) 이 export 의 sigma 와 (d) 기체가 지금 말하는 MOT_1..8_DIRECTION 으로 찍혔고 (e) 8기 모두 PASS
+  #   (all_pass) 여야 펄스가 나간다. 없으면/읽기 모듈이 없으면 거부. 2026-10-10 현재 프로브는 한 번도 안 했다
+  #   [측정 없음: REPORT §4 "no such data exist"]. false = 기록되는 opt-out(테스트용; 수중 전 금지).
+  require_thruster_probe: true
+  # thruster_probe_path: null = 가장 최근 data/*/*_probe/thruster_sign_probe.json(수정 시각 기준). 경로를 적으면 그
+  #   파일만(리포 상대 또는 절대).
+  thruster_probe_path: null
+  # thruster_probe_max_age_days: 이보다 오래된 산출물은 거부(배선·파라미터가 바뀌었을 수 있다) [예측: 30일, 근거 없음 —
+  #   풀 세션 간격이 1–2주라 한 달이면 한 번은 다시 찍는다는 가정].
+  thruster_probe_max_age_days: 30
+  # ---- 2026-10-10 (b) (REPORT.md §3 5단계 후반: "policy-side tag gate -> hold wrench") ----
+  # obs_guard: 정책이 보는 상태에만 거는 관측 가드(rov_gui/control/rl_pwm.py PwmObsGuard, HwRlPwm.step 안에서 적용;
+  #   공용 state_assembler·CSV px/py/pz·nu_*·다른 LOW 는 손대지 않는다). rl_pwm_7d 도 이 블록(전송 블록)을 읽는다.
+  #   CSV `pwm_guard`(schema 20): 0 없음, 1 slew, 2 jump 거부, 3 hold. 모르는 키는 RAISE. RECORD BOUNDARY: meta
+  #   controller.obs_guard.config.
+  obs_guard:
+    vel_slew_mps2: 2.0      # 정책이 보는 몸체 속도의 축별 변화율 상한 [m/s^2] [유도: 정책의 최대 권한 가속도 <= 4.5 m/s^2;
+                            # 단일 태그 속도 스파이크는 그 10-100배 — REPORT §1 원인 2 "±100..170 N heave flips"]
+    jump_m: 0.15            # n_tags < min_tags 인 동안 한 틱(50 ms)에 이보다 더 움직인 fix 는 거부, 직전 fix 유지 [예측: 3 m/s]
+    min_tags: 2             # 태그 게이트: 태그 수가 이 미만이거나 (3 이면 믹서 모드 비행의 5~99 % 틱이 HOLD — 바닥 태그는 흔히 1~2개 [측정 리플레이]) [측정 REPORT §1 원인 2: n_tags <= 2 가 자세 발산과 같은 틱 또는 뒤]
+    age_s: 0.3              # fix 나이가 이보다 오래된 상태가 [예측]
+    hold_after_s: 0.2       # 이 시간 이상 이어지면 정책 펄스 대신 HOLD 펄스를 보낸다 [예측]
+    release_after_s: 0.2    # 태그가 돌아와 이 시간 이상 좋으면 정책으로 복귀 [예측]
+    hold_wrench_z_n: -4.0   # HOLD 의 수직 힘 [N, NED: 음수 = 위]. export 의 최소노름 수직 할당 + T200 역곡선, 수평 추진기 중립.
+                            # [측정 REPORT §1 원인 5: 10월 순중량 peg 장착 2.5-5.4 N, 미장착 0.8-1.6 N] -> 4 N 위.
+                            # 추진기당 ~1 N 은 정지대역 가장자리(+1.44/−1.10 N) 아래라 실제 펄스는 가장자리 패턴
+                            # (pwm10_s1 export: [1500,1500,1500,1500,1537,1452,1470,1530] µs ≈ 3.7 N 위 [유도])
   leash_m: 0.8
   yaw_rate_ff: true
   yaw_rate_max: 0.6
+
+# LOW mode rl_pwm_7d (panel RL_PWM_7D, 2026-10-03, operator request "RL_PWM 학습 … wave/current 없이"): the
+# PER-THRUSTER RL policy trained WITH a roll/pitch reference in q_des (RL_controller att7pwm_s*: dr preset traj10att,
+# STILL WATER — no waves, no current; tether-like bias force 0-4 N as every traj10 recipe). It flies the rl_pwm
+# TRANSPORT unchanged (RC_CHANNELS_OVERRIDE ch 9..16 + the vehicle's Lua override, MANUAL only, the vehicle-read
+# PwmGate, the transport's ONE cap rl_pwm.pwm_cap — no pwm_cap key here); roll/pitch go out as PULSES, never as
+# s/t, so engage.attitude_axes is NOT needed. q_des = the plan's roll/pitch clipped to the trained envelope; the tilt
+# ceiling (engage.attitude_axes.abort_deg) and div_rp apply. Refused at build when rl_pwm.pwm_cap is below the export's
+# trained cap unless allow_caps_below_trained (recorded). Unknown keys RAISE. UNTESTED on the vehicle; the per-thruster
+# sign probe (RL_controller README §10.3) has never been done. ENABLED 2026-10-03 at the operator's request with
+# att7pwm_s0 although it FAILED the sim promotion gate [예측] (steady pitch error up to 7-9 deg in trim worlds, roll
+# wobble, saturation 24-38 % — RL_controller/logs/eval/ATT_COMPARE_20261003.md). null disables the LOW again.
+rl_pwm_7d:
+  # 2026-10-10 (operator): att7pwm_s0 은 수조 실패(수직+수평 공동수축 26~44 A, 침강) 정책이라 비행 금지 → null = LOW 꺼짐.
+  # roll/pitch 기준 추종 pwm 정책은 pwm11 이 수조 래더를 통과한 뒤 pwm11att 로 다시 학습한다 [예측].
+  policy_dir: null   # was rov_gui/control/rl_policies/att7pwm_s0 (2026-10-03 operator request)
+  leash_m: 0.8
+  yaw_rate_ff: true
+  yaw_rate_max: 0.6
+  allow_caps_below_trained: false
+
+# LOW mode rl_7d (panel RL_7D, 2026-10-03): a 6-axis RL policy (axes6: x/y/z/r
+# + s/t) TRAINED WITH A ROLL/PITCH REFERENCE in its goal quaternion
+# (RL_controller scripts/_pipeline_att7_seed.sh, dr preset traj10att; obs_spec
+# attitude_reference.trained true — anything else is REFUSED, the layout of a
+# level-trained export is identical). NONE IS TRAINED (2026-10-03: code only,
+# training deferred by the operator), so policy_dir is null and the mode
+# refuses with that sentence. Needs engage.attitude_axes.enabled; engage is
+# also refused while the attitude caps in force are below the trained ones
+# (first_water_caps until a sign probe proves the wire sign) unless
+# allow_caps_below_trained (recorded) — a clipped RL policy limit-cycled on
+# 2026-10-01 (rl_pwm cap 0.25, data/20261001/1001_172910). Unknown keys RAISE.
+rl_7d:
+  policy_dir: null
+  axis_cap: 0.3
+  leash_m: 0.8
+  yaw_rate_ff: true
+  yaw_rate_max: 0.6
+  allow_caps_below_trained: false
 
 # Bridge tag fixes with the velocity/gyro estimate between camera frames —
 # the state (and the plot) moves at 20 Hz instead of holding each fix.
@@ -363,6 +509,11 @@ path_creep_m_s: 0.02
 # 0.25 / 4.0 (a 16x anisotropy) is a FIRST GUESS [예측], not a measured
 # optimum, and no tuned run has been flown in water. Sweep it offline first:
 #   python -m rov_gui.tools.sweep_path_cost --grid
+#
+# 2026-10-04: UNDER LOW mpc_tuned / mpc_tuned_7d THIS BLOCK IS NOT READ while
+# an MPC_Tuned profile is held (mpc_tuned_profile below) — the profile's
+# apply.path_cost is. It still serves dobmpc_tuned, and mpc_tuned under
+# `--mpc-tune none`.
 mpc_tuned:
   along_scale: 0.25      # q_along = along_scale * 300
   cross_scale: 4.0       # q_cross = cross_scale * 300
@@ -372,6 +523,25 @@ mpc_tuned:
   split_velocity: false  # also split the linear-velocity weight (see path_cost.py)
   v_along_scale: 1.0
   v_cross_scale: 1.0
+
+# MPC_Tuned PROFILE (2026-10-04, operator request: "mpc_tuned를 선택하면
+# diffusion policy처럼 튜닝 파라미터를 불러와서 적용"). A file in
+# config/mpc_tuned_profiles/ holding EVERYTHING the mpc_tuned follower flies
+# — Q/QN/R, the along/cross split (the block above), policy.q_scale /
+# along_scale, vehicle_net_buoyancy_n, axis_cap, axis_slew_per_s — APPLIED
+# while LOW is mpc_tuned / mpc_tuned_7d only (runtime cost_set + solver
+# parameter, no rebuild). Every other LOW (pid, mpc, dobmpc, dobmpc_tuned,
+# ...) keeps THIS file's values. Re-pick on the trajectory panel (LOW row,
+# `tune …`) or `--mpc-tune NAME|none`; null = no profile = this file's
+# blocks, exactly as before 2026-10-04. The plant damping / axis_gain are NOT
+# carried in (solver build / shared vehicle model): a profile saved against
+# different ones flies with a WARN listing them (controller.mpc_tune.warnings).
+# 20261004_default = this file + params.py as of 2026-10-04 (peg-in-jaw trim
+# -12 N). To make a new one: `python -m rov_gui.tools.mpc_tune save NEW --from
+# 20261004_default`, edit NEW.yaml's apply:, pick it on the panel — or edit the
+# blocks here, fly with --mpc-tune none, then `save NEW --from-config`.
+# A profile trim that differs from vehicle_net_buoyancy_n below shows WARN.
+mpc_tuned_profile: 20261004_default
 
 # Per-axis w_hat clip [X,Y,Z,K,M,N] (N / N·m) applied BEFORE the solver — the
 # KNOWN_ISSUES replacement for the scalar ±50 backstop in mpc_acados.py.
@@ -414,6 +584,10 @@ w_hat_clip: [15, 45, 45, 5, 5, 8]
 # mpc_tuned (1001_155105/mpc_154825: 0.43 -> 0.19 m) [측정]. mpcc/dobmpc still
 # ignore it. -12.0 is the peg-in-jaw value [유도: rl heave axis 0.209 -> N];
 # WITHOUT the peg put it back near 0.1 or both followers hold ~6 cm high.
+# 2026-10-04: under LOW mpc_tuned with an MPC_Tuned profile held
+# (mpc_tuned_profile above) the PROFILE's apply.vehicle_net_buoyancy_n is
+# flown instead of this line — change the peg there too (or pick a profile
+# saved without it). PID / mpc still read this line.
 vehicle_net_buoyancy_n: -12.0 #0.1
 
 # STATION BRIDGE — a tag dropout is not a reason to stop controlling.
@@ -471,6 +645,24 @@ station_bridge:
   # 1.8 m/s^2 bias — 8 m of drift in 3 s — so `auto` is not a convenience.
   xy_source: auto        # auto | imu | hold
   axis_cap: null         # null = the normal axis_cap (operator decision 2026-08-18)
+  # THE DVL RUNG (2026-10-01, 실기 미검증). Only with a DVL built AND switched
+  # IN (dvl: below): a dropout is then carried by integrating the DVL's bottom
+  # velocity from the last fix, every axis held, for up to dvl_hold_s — and
+  # only while the DVL stays usable without a gap. After that, or the moment
+  # it drops out, the ladder above applies unchanged. With no DVL these two
+  # keys change nothing.
+  # 10 s [예측: 드리프트는 속도 오차 x 시간 — 이 풀에서 DVL을 켜 본 적이 없다.
+  # 복귀할 때마다 로그에 남는 "DVL dead reckoning was N cm off"로 교체할 것 —
+  # 그 로그는 DVL이 dropout을 끝까지 실어 나른 경우(복귀 tier = dvl)에만 나온다.
+  # 중간에 끊겼으면 그 뒤 표류가 섞이므로 숫자를 남기지 않는다].
+  use_dvl: true
+  dvl_hold_s: 10.0
+  # 이 단에서는 DVL을 교차검증할 태그가 없다. 그래서 "station hold = 한 점 위에
+  # 거의 정지"라는 전제로 묶는다: DVL이 이보다 빠르다고 하거나, 적분 위치가
+  # 마지막 fix에서 이보다 멀어지면 (벽 반사의 false lock일 가능성) 그 dropout의
+  # 나머지 동안 DVL 단을 닫고 위 사다리로 내려간다. 둘 다 [예측].
+  dvl_max_speed_m_s: 0.3
+  dvl_max_disp_m: 0.5
 
 # OBJECT FOLLOW — put the --pose tracked object into the pool's frame, and
 # (shape: follow) hold the relative pose START was pressed at.
@@ -580,7 +772,7 @@ policy:
                               # MUST equal rov_gui/state.py POLICY_CKPT_DEFAULT
                               # (rov_gui/tests/test_policy_ckpt_paths.py); the
                               # 2026.09.01 10-dim ckpt is refused at arm
-                              # (action_repr mismatch). "stub" = canned
+                              # (pose10d is not flyable). "stub" = canned
                               # straight-ahead chunk, no torch (demo_e2e /
                               # policy_dryrun)
   repo: /home/bdml/Desktop/umi_underwater_robust_control/external/UMI_aquatic
@@ -945,21 +1137,49 @@ policy:
                               # controller.plan_along_scale_flown is the record boundary. `mpc`
                               # (isotropic) ignores it. [측정: .../0908_165517/diag/fwd_C_out.txt,
                               # fwd_B_out.txt] 실기 미검증.
-  # ---- THE 6-DoF VARIANT (2026-09-26, design_final D1-D3/D9/D12/D13) ----
-  # action_repr: the checkpoint contract this mission flies, pinned at ARM and
-  # checked at every plan intake (allow-list: pos_yaw_width | pos_rpy_width).
-  # A 7-dim ckpt (pos_rpy_width: [dx,dy,dz,dyaw,droll,dpitch,width]) with
-  # attitude_track false is the "dropped-and-logged" mode — the MANDATORY
-  # first flight of any 7-dim network: the NMPC levels, the policy's
-  # roll/pitch are recorded (plans.jsonl rp_raw, dropped_rp_deg). attitude_track
-  # true makes the NMPC TRACK them and needs engage.attitude_axes.enabled +
-  # MANUAL + LOW in {mpc, mpc_tuned} (+ dobmpc with dobmpc_allowed) + the
-  # firmware/probe gates + rp_residual_deg <= 10 [예측]; anything else REFUSES
-  # ARM. Every number below is [예측] until the sim S2-S7 artefacts and the
-  # offline gate stats exist (rov_gui/control/geometry.py POLICY_PROVENANCE).
-  # RECORD BOUNDARY: meta trajectory.attitude_track + policy.action_repr.
-  action_repr: pos_yaw_width
-  attitude_track: false
+                              # 2026-10-04: q_scale AND along_scale come from the MPC_Tuned
+                              # profile's apply.policy under LOW mpc_tuned / mpc_tuned_7d
+                              # while one is held (mpc_tuned_profile); trajectory meta
+                              # `follow_knobs_source` says which. mpc / dobmpc read these two.
+  # ---- THE 6-DoF VARIANT (2026-09-26, design_final D1-D3/D9/D12/D13;
+  #      LOW-driven since 2026-10-03) ----
+  # action_repr: WHICH action contract a policy mission flies, pinned at ARM
+  # and checked at every plan intake. `auto` (2026-10-03, operator request:
+  # switching 5-dim <-> 7-dim checkpoints in the panel must need no YAML edit)
+  # = the contract of the checkpoint the policy worker HOLDS when START is
+  # pressed: pos_yaw_width (5-dim) or pos_rpy_width (7-dim). A checkpoint with
+  # no contract, or the legacy pose10d, is REFUSED (never defaulted); a 7-dim
+  # one still needs its mount keys. An explicit pos_yaw_width | pos_rpy_width
+  # pins the session as before (another contract: "action_repr mismatch").
+  # The panel's ckpt row says "READY · 5-dim | 7-dim" and, before START, what
+  # the current LOW does with the roll/pitch (TRACKED in WARN colour /
+  # DROPPED-AND-LOGGED). NOTE: under auto + attitude_track true, a 7-dim pick
+  # on LOW RL_PWM_7D TRACKS roll/pitch on the first START with no YAML step —
+  # fly a new 7-dim network on a 4-DoF LOW first (dropped-and-logged).
+  # A 7-dim ckpt (pos_rpy_width: [dx,dy,dz,dyaw,droll,dpitch,width]) is
+  # TRACKED (roll/pitch followed) iff the LOW is a *_7d follower (pid_7d |
+  # mpc_tuned_7d | rl_7d | rl_pwm_7d) and attitude_track below is true. The
+  # s/t followers (pid_7d | mpc_tuned_7d | rl_7d) then need
+  # engage.attitude_axes live (MANUAL + the firmware/probe gates) and
+  # rp_residual_deg <= 10 [예측], else ARM is REFUSED. rl_pwm_7d tracks
+  # through PER-THRUSTER PULSES: it needs only the rl_pwm gate (the sink's
+  # Lua/RC override, rl_pwm.pwm_cap), never engage.attitude_axes — the tilt
+  # ceiling abort_deg and div_rp still apply. On a 4-DoF LOW (pid,
+  # mpc_tuned, rl, rl_pwm, ...) a 7-dim ckpt flies "dropped-and-logged": levelled
+  # 5-dim arithmetic, the policy's roll/pitch recorded (plans.jsonl rp_raw,
+  # dropped_rp_deg) — the recommended FIRST flight of any 7-dim network.
+  # attitude_track is now a VETO (2026-10-03; was the switch itself, false by
+  # default, 2026-09-26): false makes a *_7d LOW fly a 7-dim ckpt
+  # dropped-and-logged while still levelling actively. It has no effect on a
+  # 4-DoF LOW or a 5-dim ckpt. Every number below is [예측] until the sim
+  # S2-S7 artefacts and the offline gate stats exist (rov_gui/control/
+  # geometry.py POLICY_PROVENANCE). RECORD BOUNDARY: meta
+  # trajectory.action_repr (the ARM pin — pool on it) / attitude_track /
+  # attitude_track_low / attitude_track_veto + policy.action_repr (the pin;
+  # null under auto when no policy mission is in the record) +
+  # policy.config.action_repr ("auto" from 2026-10-03).
+  action_repr: auto
+  attitude_track: true
   rp_max_deg: 20.0            # T1: compose_plan per-axis CLIP of the decoded absolute roll/pitch
   rp_reject_deg: 30.0         # T2/T3: PlanFilter hard reject + set_path_plan_ned ValueError
   pq_max_rad_s: 0.35          # attitude Euler-rate ceiling (dilation) + the HwDobMpc hold ramp rate
@@ -1060,6 +1280,271 @@ imu_dr:
   abort_err_m: null           # disengage when |p_dr - p_tag| exceeds this
   abort_max_s: null           # ...or after this long under DR control
   axis_cap_dr: null           # null = use axis_cap above
+
+# DVL — the state estimate's THIRD sensor: AprilTag + IMU + DVL.
+# rov_gui/control/dvl.py (추정 쪽) + rov_gui/backends/dvl.py (TCP 클라이언트).
+#
+# **실기 미검증 (2026-10-01).** DVL이 장착되기 전에, Water Linked DVL A50의
+# 프로토콜 문서만 보고 작성했다. 아래 숫자는 전부 [스펙](문서에서 읽은 값) 또는
+# [예측](아직 근거 없는 첫 값)이며, 이 기체에서 측정한 값은 하나도 없다.
+#
+# WHAT IT CHANGES. Position (x, y, yaw) stays the tag's, z / roll / pitch /
+# rates stay the autopilot's. Only the HORIZONTAL body velocity nu[0:2]
+# (surge, sway) changes source: the low-passed finite difference of tag
+# positions (today) -> the DVL's direct bottom-track measurement. The heave
+# rate nu[2] stays on the tag difference: the proof below sees surge and sway
+# only, so nothing would catch a tilted bracket or a wrong z sign (the DVL's
+# own w is recorded as CSV dvl_w). The same velocity, integrated, also bridges
+# the position between camera frames, and — for a STATION hold only — across
+# a tag dropout (station_bridge.use_dvl above).
+#
+# THREE SWITCHES:
+#   enabled        build the TCP client at all (also: --dvl). false = nothing
+#                  is constructed; the control tick is bit-identical.
+#   use            the DVL button's position at startup. false = OUT = SHADOW:
+#                  the stream is received, gated, compared with the tag
+#                  velocity and recorded, but the estimator does not consume
+#                  it. The button changes it ONLY while disengaged and with no
+#                  controller CSV open (operator decision 2026-10-01: one run
+#                  = one estimator).
+#   (automatic)    while IN, a tick whose sample fails a gate below falls back
+#                  to the tag finite difference by itself. CSV `vel_src` says
+#                  which instrument each row flew on.
+#
+# IN IS REFUSED until (1) the mount below is filled in and (2) the mount is
+# PROVEN this session: the DVL velocity and the tag finite difference must
+# describe the same motion (a 2x2 least-squares map within agree_tol of
+# identity BY THREE STANDARD ERRORS) over >= agree_min_pairs moving samples
+# with motion in BOTH surge and sway. A wrong mount yaw or a mirrored axis is
+# invisible at rest and is velocity feedback of the wrong sign in motion —
+# hence the gate. In practice: with tags in view, drive forward-and-back and
+# left-and-right for some seconds; the log says "mount PROVEN" (or what is
+# wrong, with the yaw to add; or "not decided yet — keep moving").
+#
+# WHETHER A RUN MAY USE THE DVL IS DECIDED AT ENGAGE, once: switch IN, proof
+# satisfied, not tripped. A proof that completes mid-run does not move the
+# velocity source under the mission; it counts from the next engagement.
+#
+# A TRIP IS LATCHED. Evidence that the DVL is wrong — the fit refuting the
+# mount, a standing difference from the tag velocity, the two velocities not
+# pointing the same way, the device's own rotation/sound-speed setting
+# changing — takes the DVL out of the estimator until YOU press the button
+# OUT and then IN again (which the proof must allow). This holds whatever
+# require_proven says. A lost bottom lock or a stale link is NOT a trip: the
+# DVL returns by itself after reentry_s of good samples.
+dvl:
+  enabled: false
+  use: false
+  # [스펙: Blue Robotics의 BlueROV2용 DVL A50 설치 가이드가 지정하는 주소.
+  #  장치 자체의 공장 fallback은 192.168.194.95 — docs.waterlinked.com/dvl/networking]
+  host: 192.168.2.95
+  # [스펙: docs.waterlinked.com/dvl/dvl-json-protocol — TCP 16171, 줄 단위 JSON.
+  #  두 클라이언트 동시 접속을 벤더 DEMO 장치에서 관찰(2026-10-01,
+  #  rov_gui/tests/fixtures/dvl_a50_demo_capture_20261001.README.md — 실기 미확인)
+  #  → BlueOS DVL extension과 이 스테이션이 함께 읽을 수 있을 것 [예측]]
+  port: 16171
+  connect_timeout_s: 2.0
+  reconnect_s: 2.0
+  # The station only READS the device. get_config (itself a read) is asked
+  # once per connection and then this often: the device rotates/scales its own
+  # output by settings changeable in its web GUI, and a change there after
+  # the proof is a trip. 0 = once per connection only. [예측]
+  config_poll_s: 10.0
+  # THE MOUNT — null until MEASURED on the vehicle. While either is null the
+  # DVL runs in shadow only (identity rotation, zero lever arm).
+  #   mount_rpy_deg  [roll, pitch, yaw] of the DVL's output frame in body FRD.
+  #                  The device frame is x forward (the LED edge), y starboard,
+  #                  z down [스펙: docs.waterlinked.com/dvl/axes], so
+  #                  [0, 0, 0] = LED forward, transducers down.
+  #                  The device can ALSO rotate its own output (its "mounting
+  #                  rotation offset", web GUI). Use ONE of the two — a yaw in
+  #                  both is applied twice; the station logs an error if so.
+  #   mount_t_flu    the DVL's measurement origin [x fwd, y left, z up] in
+  #                  metres from the SAME body origin cam_t_flu uses
+  #                  (hw_nav.yaml). The origin is 28 mm above the back plate
+  #                  on the A50 [스펙: axes page]. It is the lever arm: at
+  #                  0.3 rad/s of yaw a 0.2 m arm is 6 cm/s of apparent
+  #                  velocity [유도: v = omega x r].
+  mount_rpy_deg: null
+  mount_t_flu: null
+  # ---- per-sample gates (a sample failing any is not used that tick) ----
+  # Oldest sample age still used. The vendor's own example report is 0.19 s
+  # old when transmitted [스펙 예시 1건: time_of_transmission - time_of_validity
+  # = 189 ms, 고도 0.49 m]; reports arrive at 15 Hz below 0.6 m and 10 Hz up
+  # to 3 m [스펙: range-mode page]; "periodic cycling" drops a few every 10 s
+  # [스펙: configuration page]. 0.6 s = [예측].
+  stale_s: 0.6
+  fom_max: 0.05          # m/s, the device's own accuracy figure [예측]
+  min_altitude_m: 0.05   # [스펙: A50 고도 범위 5 cm ~ 50 m] — 착저하면 lock을 잃는다
+  v_max_m_s: 1.5         # sanity only, raw AND lever-arm-corrected [예측]
+  reentry_s: 0.5         # good this long before it is used (again) — also
+                         # after a silence longer than stale_s [예측]
+  # A fom or altitude MISSING from a report that claims a lock is a failed
+  # gate, not a passed one.
+  # The fastest this vehicle can change velocity: 30 N (axis_cap 0.5 x 60 N)
+  # over ~19 kg with added mass = 1.6 m/s^2 [유도], rounded up. A sample
+  # further than a_max*dt + 5 cm/s from the last good one is a spike. [예측]
+  a_max_m_s2: 2.0
+  # With a current tag velocity to compare against, a sample this far from it
+  # (horizontal) is not used — a false bottom lock off a wall. Not a trip.
+  # Widened to 4 sigma of the tag-velocity noise the proof measured, and by
+  # a_max x (tag age beyond 0.25 s). Once rejected the DVL stays out —
+  # "innovation hold" — until a tag velocity from a NEWER camera frame agrees;
+  # the same frame ageing as the tags fade does not let it back in. [예측]
+  innov_max_m_s: 0.15
+  # ---- agreement with the tag velocity ----
+  # false = recorded opt-out of the FIRST proof only: IN is allowed without
+  # it while this session's data has said nothing against the DVL. After a
+  # trip, or a refuting fit seen in shadow, IN needs a proof made afterwards
+  # whatever this says; and every trip stays armed. The runtime monitors
+  # alone do NOT catch every wrong mount (see the NOT-caught list below) —
+  # the opt-out skips a proving pass, it is not a safety device.
+  require_proven: true
+  # All [예측], from a SYNTHETIC prototype (tag noise 0.8 mm at 15 Hz, DVL
+  # noise 3 mm/s — neither is this DVL): 8 s of 8-12 cm/s surge and sway
+  # identified the map to +-0.01 and the mount yaw to +-0.3 deg.
+  agree_min_pairs: 60
+  agree_min_excitation_m_s: 0.025   # rms speed along the WEAKER body axis
+  agree_tol: 0.25                   # max |A - I|: ~14 deg of yaw, or 25 % scale
+  agree_v_min_m_s: 0.02             # slower pairs are not admitted to the fit
+  agree_window_s: 60.0              # ...so a DVL that disagreed with the tags
+                                    # cannot be re-proven for about this long
+  agree_refute_n: 15                # consecutive refuting fits to UN-prove
+  # Runtime monitors (either one TRIPS, latched). Both are fed by the proof's
+  # own evidence — one time-ALIGNED pair per new tag fix: the raw tag
+  # difference against the DVL velocity interpolated to its midpoint — so
+  # they do not depend on how late either stream arrives:
+  #  - the low-passed (agree_trip_s) horizontal difference VECTOR above
+  #    trip_m_s: a standing offset, a lasting false lock. A reversed mount is
+  #    invisible to it below 4 cm/s [유도], and so is any oscillation. Each
+  #    pair counts as at most innov_max_m_s apart (a FIXED clip, whatever the
+  #    tag noise): one jumped tag fix or one short burst cannot trip, a DVL
+  #    grossly wrong pair after pair trips in ~0.8 s.
+  #  - ALIGNMENT: along each direction the vehicle is moving in (principal
+  #    axes of the DVL velocity over the last agree_trip_s, each judged only
+  #    above ratio_v_min of rms speed), 1 - |A e - e| for the least-squares
+  #    map A: tag <- DVL. 1 = the same motion, -1 = reversed, -0.4 = a quarter
+  #    turn (directions under 7 % of the motion are not judged: their
+  #    regression is ill-conditioned). Below ratio_min by 3 standard errors it
+  #    holds the DVL back
+  #    ("alignment hold"); it TRIPS only when the tags also see >= 80 % of
+  #    that motion, for 0.4 s on end. This is the one that sees a station hold
+  #    oscillating on wrong-signed feedback. A mount inside agree_tol cannot
+  #    trip it.
+  # What trips, in short: the MOUNT (the tags see the motion the DVL reports
+  # and put it elsewhere — alignment) and a FALSE LOCK that lasts (the DVL
+  # stands > trip_m_s from the tag velocity for ~trip_s, whatever the tags
+  # saw — the difference vector: +14 cm/s for 1 s, +10 cm/s for 2 s). What
+  # does not: a glitch of a few reports (once or every few seconds), zero-mean
+  # DVL noise. Those are held back — innovation hold, alignment hold, and
+  # while the fit refutes the DVL (newest refuting evaluation within 3 s) —
+  # and the DVL returns by itself [예측: 합성 시뮬레이션
+  # rov_gui/tests/sim_dvl_monitors.py, 출력
+  # rov_gui/tests/fixtures/sim_dvl_monitors_20261002.txt 표 A5, A5b].
+  # Any trip needs a new proof before the switch goes IN again.
+  # NOT caught when require_proven is false: any wrong mount at station-keeping
+  # speeds (1-2 cm/s); a reversed axis moving below
+  # ~2 cm/s rms; a reversed axis on a STRAIGHT line within 14.5 deg of the
+  # other axis, at any speed; a reversed axis carrying only a small motion
+  # (~3 cm/s) under a fast one (0.15-0.3 m/s) — directions under 7 % of the
+  # motion are not judged; a mount 30 deg out below ~15 cm/s; a 2x scale
+  # below ~8 cm/s [예측: 같은 파일 표 B; KNOWN_ISSUES].
+  # A CORRECT mount trips (a) if the two sensors' stamps are >= 50 ms apart
+  # while the vehicle circles at 0.5 Hz or faster [예측: 같은 파일 표 A4] —
+  # check the "ms behind" number in the "mount PROVEN" log line before going
+  # IN; (b) above ~0.4 m/s if it was proven with 12 deg of residual yaw or a
+  # 1.2x scale [예측: 표 A6] — the proof's tolerance is relative, trip_m_s
+  # absolute; the log says so when the proof is made.
+  agree_trip_m_s: 0.08
+  agree_trip_s: 1.0
+  agree_ratio_min: 0.5
+  agree_ratio_v_min_m_s: 0.02
+
+# ---------------------------------------------------------------------------
+# THE ROBOT_LOCALIZATION EKF (control/rl_ekf.py, 2026-10-02; HARDWARE-
+# UNVERIFIED) — the Learning-to-Swim estimator ("IMU, DVL, April Tag ->
+# Fused state estimation (50Hz)", an EKF "implemented in ROS"), run BESIDE
+# the state assembler so the two can be compared on the same run.
+#
+# WHY robot_localization: the paper gives no state vector, noise or delay
+# handling, its code (warplab/isaac-auv-env) is the simulator only, and the
+# lab's state-estimation repo (warplab/robot-state-estimation, empty)
+# describes itself as "using the ROS localization package". So this is
+# ekf_localization_node ported line for line (cra-ros-pkg/robot_localization
+# noetic-devel @ 9ef26a57): 15-state kinematic EKF, r_l's default process
+# noise, Joseph-form correct, its measurement queue and timer, its lever arm
+# (with the STATE's body rate) and gravity removal (with the IMU MESSAGE's
+# orientation). Every number below that is not an r_l default is a CHOICE.
+#
+# ON by default, in SHADOW: recorded every tick (CSV est + ekf_*, meta `ekf`,
+# <stem>_ekf_inputs.jsonl for `python -m rov_gui.tools.ekf_replay`). The EST
+# button on the trajectory panel hands the CONTROLLER the EKF's state
+# instead (only while disengaged, no CSV open; only `--ekf control` can start
+# a session that way). The plot, px/py and every interlock stay on the tag
+# state; a run on the EKF ENDS (never falls back silently) on the limits at
+# the end of this block.
+#
+# THE DVL'S OWN GATES APPLY: the EKF fuses the DVL only while the DVL switch
+# is IN, its proof gate passes (DvlAid.refusal — a YAML `dvl.use: true` is
+# IN without having passed it) and nothing has tripped it (r_l has no such gate; it is not what
+# proves a mount's sign). Every report is logged; `ekf_replay --dvl-all`
+# shows the ungated EKF offline.
+#
+# WHAT THE SYNTHETIC COMPARISON SAYS (open loop, every sensor number assumed
+# — [예측: rov_gui/tests/sim_ekf_compare.py, 출력
+# rov_gui/tests/fixtures/sim_ekf_compare_20261002.txt]):
+#   * r_l's DEFAULT delay handling (smooth_lagged_data false) corrects the
+#     CURRENT state with a tag frame ~0.12 s old, so the position trails the
+#     vehicle by about speed x tag latency (passes at 0.3 m/s: 33 mm rms vs
+#     the assembler's 5 mm) and the yaw by yaw-rate x latency. That is the
+#     most likely configuration of an unpublished launch file, so it is the
+#     default here — the comparison is with what the paper most likely ran.
+#   * smooth_lagged_data: true (r_l's own fix: rewind and re-fuse) removes
+#     it (6 mm) and gives the best velocity of all estimators (0.7 cm/s),
+#     because the accelerometer is fused at the right moment too.
+#   * the mavros IMU noise (accel stdev 0.0003) trusts the accelerometer
+#     completely: an accel bias of 0.1 m/s^2 with no DVL gives 15 cm/s of
+#     velocity error. The DVL masks it.
+ekf:
+  enabled: true
+  frequency_hz: 50.0              # [스펙: 논문 Fig. 2 "50Hz"] (r_l default 30)
+  sensor_timeout_s: null          # null = 1/frequency (r_l default)
+  smooth_lagged_data: false       # r_l default — see above
+  history_length_s: 0.0           # r_l default; set ~1.0 with smoothing
+  # tag pose: x, y, yaw (+ z by itself when hw_nav z_source is tag) — the
+  # same information the assembler takes, so a difference is the FUSION.
+  tag_fuse: [x, y, yaw]
+  tag_pos_sigma_m: 0.01           # [예측]
+  tag_yaw_sigma_deg: 1.0          # [예측]
+  depth_sigma_m: 0.01             # [예측] pressure depth + the assembler's offset
+  # vehicle IMU (ATTITUDE + the latest SCALED_IMU2, as mavros' imu/data
+  # composes them). Compass yaw NOT fused (state_assembler: steel walls).
+  imu_fuse: [roll, pitch, vroll, vpitch, vyaw, ax, ay, az]
+  imu_remove_gravitational_acceleration: true
+  imu_orientation_stdev: 1.0              # [스펙: mavros imu plugin default]
+  imu_angular_velocity_stdev: 0.000349066 # [스펙: mavros default, 0.02 deg/s]
+  imu_linear_acceleration_stdev: 0.0003   # [스펙: mavros default]
+  # DVL (vx, vy) — the assembler's (u, v) — in the DVL's mount (dvl:
+  # mount_rpy_deg / mount_t_flu); an unmeasured mount = no transform = not
+  # fused, as r_l drops a message it cannot transform. Only `valid` reports.
+  dvl_fuse: [vx, vy]
+  dvl_sigma_m_s: 0.01             # [예측] used only when a report has no covariance
+  imu_accel_stale_s: 0.3          # [예측] an older SCALED_IMU2 is left out
+  # FLYING ON THE EKF ONLY. The run ends when an input it fuses goes stale
+  # (tag > engage.tag_stale_s, IMU attitude/rate > engage.imu_stale_s,
+  # accelerometer > 1 s, depth > 1.5 s) or the tag state is bridged (an EKF
+  # run is not carried across a tag dropout) — both debounced by
+  # engage.tag_stale_hold_s, commanding NOTHING meanwhile — or when it sits
+  # this far from a FRESH tag state for 0.25 s.
+  # Switching in / engaging needs the tighter control_engage_* agreement,
+  # because every "here" target is set from the tag state.
+  control_max_tag_divergence_m: 0.15        # [예측] x, y
+  control_max_z_divergence_m: 0.15          # [예측]
+  control_max_yaw_divergence_deg: 10.0      # [예측]
+  control_max_rp_divergence_deg: 10.0       # [예측]
+  control_max_velocity_divergence_m_s: 0.15 # [예측] |LP(nu_ekf - nu_tag)|, tau 0.5 s
+  control_engage_max_divergence_m: 0.05     # [예측]
+  control_engage_max_yaw_deg: 3.0           # [예측]
 
 # nudot for the EAOB: 'imu' = SCALED_IMU2 specific force (+gravity, -omega x v);
 # 'fd' = finite-difference of nu (the sim's definition — much noisier here
@@ -1304,11 +1789,17 @@ engage:
   follow_ff_max_m_s: 0.30
   max_solver_fails: 3       # consecutive acados failures before disengage
   tick_overrun_ms: 100.0
-  # THE 6-DoF VARIANT'S ACTUATION SWITCH (2026-09-26, design_final D4/D7/D8/
-  # D9). enabled: false = the 4-DoF station, byte-identical on every control
-  # output, xref and wire frame (rov_gui/tests/test_attitude_axes.py). With
-  # it on, the NMPC's K / M leave the station as the MANUAL_CONTROL v2
-  # extension axes s (pitch) / t (roll), enabled_extensions = 0b11, which
+  # THE 6-DoF VARIANT'S ACTUATION CAPABILITY (2026-09-26, design_final D4/D7/
+  # D8/D9; since 2026-10-03 a station CAPABILITY, the LOW decides).
+  # enabled: false = the 4-DoF station, byte-identical on every control
+  # output, xref and wire frame (rov_gui/tests/test_attitude_axes.py), and the
+  # *_7d LOWs (pid_7d | mpc_tuned_7d | rl_7d) REFUSE to engage. enabled: true
+  # = the command sink is built with the s/t path (it reads this ONCE at
+  # launch) and a *_7d LOW's K / M leave the station — every OTHER LOW (pid,
+  # mpc, mpc_tuned, dobmpc*, rl, rl_pwm, mpcc) still engages 4-DoF with K/M
+  # dropped (2026-09-26..10-02 plain mpc/mpc_tuned flew K/M whenever this was
+  # on; zero water runs exist from that window). K / M go out as the
+  # MANUAL_CONTROL v2 extension axes s (pitch) / t (roll), enabled_extensions = 0b11, which
   # ArduSub reads as torque demands in MANUAL from Sub 4.1.2 (2024-02-22)
   # [스펙: ArduSub ReleaseNotes Sub 4.1.2, joystick.cpp 원문 미열람];
   # 4.1.0 / 4.1.1 IGNORE them silently, which is why the engage gate needs
@@ -1340,15 +1831,37 @@ engage:
     first_water_caps: [0.1, 0.15]   # IN FORCE while the wire sign is unproven (no sign_probe with sign_proven true) [예측]; null + unproven sign -> engage refused
     slew_per_s: 1.5           # roll/pitch axis slew, 1/s (= axis_slew_per_s)
     sign: {roll: 1.0, pitch: 1.0}   # wire sign vs NED K/M [가정 until sign_probe]
-    abort_deg: 35.0           # |roll| or |pitch| above this for 0.25 s -> disengage [예측]
+    abort_deg: 35.0           # |roll| or |pitch| above this for 0.25 s -> disengage [예측]; since 2026-10-03 also the tilt ceiling of every per-thruster LOW (rl_pwm, rl_pwm_7d), whatever `enabled` says
     sat_ineffective_s: 1.0    # axis pinned at its cap this long, error not decreasing -> disengage [예측]
     require_manual: true
     require_probe: true       # the bench probe JSON must parse + pass + match this vehicle's firmware/wire to arm
     require_sign_probe: true  # the sign_probe JSON must carry sign_proven true; false = RECORDED opt-out, first_water_caps in force
     probe: null               # data/<day>/<run>_probe/attitude_axes_probe.json
     sign_probe: null          # armed in-water sign probe artefact (mission kind: not in this cut -> nothing writes one yet)
-    dobmpc_allowed: false     # dobmpc/dobmpc_tuned refused until roll_nm/pitch_nm are calibrated (D10)
+    dobmpc_allowed: false     # reserved (D10): no dobmpc-family *_7d LOW exists (2026-10-03); a future one stays refused until roll_nm/pitch_nm are calibrated
     min_firmware: "4.1.2"
+  # ---- 2026-10-10 (b): 추진기 직접 펄스 LOW(rl_pwm, rl_pwm_7d) 전용 런타임 인터록 (REPORT.md §3 5단계) ----
+  # workers._runtime_fault 가 매 틱, 위 attitude_axes.abort_deg(35°, 바깥 천장) 다음에 판정한다. 디바운스는 천장과 같은
+  # 방식(연속 틱 카운터, round(s × ctrl_hz) 틱에서 트립). 트립 = disengage(중립 펄스 8개) + 미션 로그/events.log 한 줄
+  # ("PER-THRUSTER INTERLOCK <이름> — disengaged" + 측정값이 든 문장) + meta controller.interlocks.last_trip.
+  # 구현 하나(rov_gui/control/rl_pwm.py PwmInterlocks)를 워커와 오프라인 재생 도구
+  # (rov_gui/tools/rl_pwm_interlock_replay.py — 2026-10-01/03/05 의 pwm 교전 14건 재생, 결과
+  # data/20261010/1010_interlock_replay_offline/report.txt)가 같이 쓴다. 다른 LOW 는 이 블록을 읽지 않는다(바이트 동일).
+  # 모르는 키는 RAISE. 숫자는 전부 [예측] (근거가 있는 것만 표시). RECORD BOUNDARY: meta controller.interlocks.thresholds.
+  per_thruster:
+    abort_deg: 20.0         # |roll| 또는 |pitch| 가 이 값을 넘어 abort_s 지속 -> 트립 (첫 수중; 35° 천장은 그대로 바깥 한계)
+    abort_s: 0.25
+    rate_dps: 40.0          # |p| 또는 |q|(기체 자이로, ATTITUDE rollspeed/pitchspeed) [deg/s] 가 이 값을 넘어 rate_s 지속. 2026-10-10 리플레이: 60 은 14회 중 2회를 놓치고 +0.95 s, 40 은 14/14 를 +0.43..0.60 s 에 잡고 믹서 모드 91 파일 오탐 0 [측정 data/20261010/1010_interlock_replay_offline/report_sensitivity_rate40_null05s.txt]
+                            # [측정 REPORT.md §1 원인 2: 풀 캐스케이드는 피치 각속도 33-65 deg/s 에서 시작; 4축 정책은 <= 13 deg/s]
+    rate_s: 0.15
+    current_a: 50.0         # batt_a(BATTERY_STATUS ~1 Hz, 최신 샘플 유지) 가 이 값을 넘어 current_s 지속 [스펙 BR 18 Ah 팩: 60 A 연속]
+    current_s: 1.0
+    volt_min: 13.5          # batt_v 가 이 아래면 어느 틱이든 즉시 (10-03 공수축 정책에서 16.0 -> 14.0 V [측정 REPORT §1 원인 3])
+    null_us: 80.0           # 보낸 펄스의 |null_v_us| 또는 |null_h_us| 가 이 값을 넘어 null_s 지속. 80 µs = pwm10_s1 의 수평 squeeze(+82..+107 µs)도 잡는 값; 시뮬 게이트를 통과한 pwm11 은 |c| <= 0.1 = 40 µs [측정 logs/eval/PWM11_GATE.md] [측정 REPORT.md: 믹서 모드 0 µs,
+                            # pwm10_s1 squeeze +82..+107 µs, att7pwm +250..+290 µs; sim 게이트를 통과한 pwm11 은 |c| <= 0.1 = 40 µs]
+    null_s: 0.5             # 2026-10-10 리플레이 민감 설정(0.5 s): 짧은 교전(1.3~1.7 s)도 트립
+    pinned_n: 3             # 캡에 붙은 추진기가 이 수 이상인 상태가 pinned_s 지속 (10-01 붕괴 서명 [측정 KNOWN_ISSUES: 캡 61-94 %])
+    pinned_s: 1.0
 
 # ROOT of the dated run tree (rov_gui/runstore.py), NOT the folder written to.
 # NOTE: `--rec-dir` OVERRIDES this, so one run always lands in one tree — the

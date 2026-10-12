@@ -643,11 +643,22 @@ def test_tick_emits_pilot_and_csv_superset():
         # 08-21 follow, 08-24 tick, 08-30 replay's plan columns, 09-02 the
         # policy mission's gripper-width estimate + hold-tail fraction,
         # 09-08 the vehicle's own per-thruster actuation telemetry, 09-26
-        # the 6-DoF variant's attitude reference / axes / boundary bit
+        # the 6-DoF variant's attitude reference / axes / boundary bit,
+        # 10-01 the body velocity + its source + the DVL's reading, 10-02
+        # which estimate flew + the robot_localization EKF's state, 10-10 the
+        # pwm LOWs' predicted pack current + null-space content of the sent
+        # pulses (empty on every other LOW), 10-10 (b) the pwm LOWs' obs-guard
+        # code pwm_guard (empty elsewhere too)
         assert text[0].endswith(
             "grip_g,hold_frac,observe,"
             "pwm1,pwm2,pwm3,pwm4,pwm5,pwm6,pwm7,pwm8,pwm_age_s,batt_v,batt_a,"
-            "rroll_deg,rpitch_deg,ax_roll,ax_pitch,rp_track")
+            "rroll_deg,rpitch_deg,ax_roll,ax_pitch,rp_track,"
+            "vel_src,nu_u,nu_v,nu_w,fd_u,fd_v,fd_w,"
+            "dvl_u,dvl_v,dvl_w,dvl_ok,dvl_valid,dvl_fom,dvl_alt_m,dvl_age_s,"
+            "est,ekf_ok,ekf_px,ekf_py,ekf_pz,ekf_roll_deg,ekf_pitch_deg,"
+            "ekf_yaw_deg,ekf_u,ekf_v,ekf_w,ekf_sig_xy_m,ekf_age_s,"
+            "ekf_tag_late_s,ekf_n_tag,ekf_n_dvl,"
+            "i_pred_a,null_v_us,null_h_us,pwm_guard")
         # the ASKED-for command still ends where it did; the REPORTED block
         # was appended after it rather than interleaved
         assert ",hold_frac,observe,pwm1," in text[0]
@@ -659,7 +670,7 @@ def test_tick_emits_pilot_and_csv_superset():
         assert abs(float(first[1])) < 0.05              # px (FLU x = NED x)
         assert abs(float(first[2])) < 0.05
         meta = json.loads(Path(path).with_suffix(".meta.json").read_text())
-        assert meta["schema_version"] == 16     # 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
+        assert meta["schema_version"] == 20     # 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
         # Written even with no replay flown, the imu_dr rule.
         assert meta["plan_stream"]["enabled"] is False
         # Written even when the estimator is off: an absent key cannot tell
@@ -2961,7 +2972,7 @@ def test_run_meta_records_the_estimator_as_a_record_boundary():
     # and the CSV plan_id/ref_src/grip_cmd columns. 7 added tick_ms and the
     # follow boundary; 6 added object_nav and the ten obj_*/follow_* columns;
     # 5 added station_bridge (bridge_s / bridge_tier).
-    assert m["schema_version"] == 16     # 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
+    assert m["schema_version"] == 20     # 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
     # Written even with no --pose, for the imu_dr reason: an absent key cannot
     # tell "this build had no object nav" from "it was switched off".
     assert m["object_nav"]["enabled"] is False
@@ -4255,21 +4266,33 @@ def _fake_rl_export(tmp_path, mode, n_act, frame_dim):
     return pdir
 
 
-def test_rl_axes6_needs_the_attitude_axes_switch_and_carries_k_m(tmp_path):
-    """A 6-axis policy (2026-09-27) is refused unless engage.attitude_axes is enabled; with it, pitch/roll ride K/M of the
-    pseudo-wrench and note_applied feeds them back like the other axes."""
+def test_rl_axes6_moved_to_rl_7d_and_carries_k_m(tmp_path):
+    """2026-10-03: a 6-axis policy is REFUSED on LOW rl (4-DoF: its pitch/roll would be dropped) and on LOW rl_7d unless
+    the export says it was trained with a roll/pitch reference; on rl_7d pitch/roll ride K/M of the pseudo-wrench and
+    note_applied feeds them back like the other axes (the K/M arithmetic of the 2026-09-27 axes6 path, unchanged)."""
+    import json
     import pytest
     from rov_gui.control.geometry import MpcConfig
-    from rov_gui.control.rl_policy import HwRl
+    from rov_gui.control.rl_policy import RL7D_FRAME_LAYOUT, HwRl, HwRl7d
     pdir = _fake_rl_export(tmp_path, "axes6", 6, 27)
     cfg = MpcConfig()
     cfg.rl = {"policy_dir": str(pdir)}
-    with pytest.raises(ValueError, match="6-axis policy.*attitude_axes"):
+    with pytest.raises(ValueError, match="6-axis policy.*rl_7d"):
         HwRl(cfg, log=lambda m: None)
-    cfg.engage = dict(cfg.engage or {})
-    cfg.engage["attitude_axes"] = dict(cfg.engage.get("attitude_axes") or {}, enabled=True)
-    rl = HwRl(cfg, log=lambda m: None)
-    assert rl.n_act == 6 and rl.meta()["action_mode"] == "axes6"
+    cfg.rl_7d = {"policy_dir": str(pdir)}
+    spec = json.load(open(pdir / "obs_spec.json"))
+    spec["frame_layout"] = list(RL7D_FRAME_LAYOUT)
+    json.dump(spec, open(pdir / "obs_spec.json", "w"))
+    with pytest.raises(ValueError, match="LEVEL goal"):
+        HwRl7d(cfg, log=lambda m: None)              # no attitude_reference = trained level
+    spec["attitude_reference"] = {"trained": True, "roll_max_rad": 0.17, "pitch_max_rad": 0.35}
+    json.dump(spec, open(pdir / "obs_spec.json", "w"))
+    with pytest.raises(ValueError, match="rate_max_rad_s"):
+        HwRl7d(cfg, log=lambda m: None)              # the trained goal rate is required (review 2026-10-03)
+    spec["attitude_reference"]["rate_max_rad_s"] = 0.35
+    json.dump(spec, open(pdir / "obs_spec.json", "w"))
+    rl = HwRl7d(cfg, log=lambda m: None)
+    assert rl.n_act == 6 and rl.meta()["action_mode"] == "axes6" and rl.meta()["type"] == "rl_7d"
     rl.set_target_ned([0.0, 0.0, -0.7], 0.0)
     u, _ = rl.step(np.array([0.0, 0.0, -0.7, 0.0, 0.0, 0.0]), np.zeros(6), np.zeros(6), 0.0)
     a = rl.last_action
@@ -4426,8 +4449,10 @@ def _sign_probe_json(proven=True) -> dict:
             "note": "synthetic — proves nothing about a vehicle"}
 
 
-def _att_worker(tmp, mode="mpc", factory=_AttStub, **att_over):
-    """A worker whose config ENABLES engage.attitude_axes on LOW ``mode``:
+def _att_worker(tmp, mode="mpc_tuned_7d", factory=_AttStub, **att_over):
+    """A worker whose config ENABLES engage.attitude_axes on LOW ``mode``
+    (2026-10-03: a *_7d LOW — the LOW decides whether K/M go out; the default
+    mpc_tuned_7d flies `_mpc_ctrl`, here the _AttStub factory):
     the bench probe is not required (require_probe false) and a SYNTHETIC
     sign_probe artefact with sign_proven true is pinned so the full caps
     (cap_roll / cap_pitch) are in force — a test of the unproven-sign path
@@ -4531,7 +4556,7 @@ def test_attitude_axes_off_is_byte_identical_on_the_4dof_path():
         assert aa["enabled_extensions_sent"] is False
         assert aa["transport"] == "manual_control_ext"
         assert m["run"]["stabilize"]["rp_axis"] == "hold"
-        assert m["schema_version"] == 16
+        assert m["schema_version"] == 20
         json.dumps(m)
         w.teardown()
 
@@ -4559,19 +4584,23 @@ def test_attitude_axes_engage_gates_each_refuse_and_all_pass():
         refuse("firmware version unknown", firmware_version="")
         refuse(">= 4.1.2", firmware_version="4.1.1")
         refuse("DEGRADED", attitude_axes_degraded=True)
-        # LOW allow-list: pid has no K/M path; dobmpc needs the flag
-        w.set_mode("pid")
-        refuse("no K/M path")
-        w.set_mode("dobmpc")
-        refuse("dobmpc_allowed")
-        w.cfg.engage["attitude_axes"]["dobmpc_allowed"] = True
-        _feed_att(w)
-        w.set_engaged(True)
-        assert w.engaged and w._attitude_axes, w.reason
-        w.disengage("test")
-        assert w._attitude_axes is False
-        w.cfg.engage["attitude_axes"]["dobmpc_allowed"] = False
-        w.set_mode("mpc")
+        # THE LOW DECIDES (2026-10-03): under the capability every 4-DoF LOW
+        # ENGAGES 4-DoF (K/M not live, recorded) — no longer refused — and a
+        # *_7d LOW without the capability is refused with its own sentence.
+        for low in ("pid", "dobmpc", "mpc", "mpc_tuned"):
+            w.set_mode(low)
+            assert w.cfg.mode == low, (low, w.reason)
+            _feed_att(w)
+            w.set_engaged(True)
+            assert w.engaged and not w._attitude_axes, (low, w.reason)
+            assert w._attitude_at_engage["low_attitude"] is False
+            assert w._attitude_at_engage["configured"] is True
+            w.disengage("test")
+        w.set_mode("mpc_tuned_7d")
+        assert w.ctrl is w._mpc_ctrl and w._mpc_ctrl.mode == "mpc_tuned"
+        w.cfg.engage["attitude_axes"]["enabled"] = False
+        refuse("engage.attitude_axes.enabled is false")
+        w.cfg.engage["attitude_axes"]["enabled"] = True
         # transport: only manual_control_ext is built (scope trim a)
         w.cfg.engage["attitude_axes"]["transport"] = "rc_override"
         refuse("not implemented")
@@ -4994,7 +5023,7 @@ def test_attitude_axes_not_sent_under_observe_or_land_dry_run():
         import pytest
         pytest.skip("allocation without the attitude path (output group)")
     with tempfile.TemporaryDirectory() as tmp:
-        w, bus, pilots, logs, st = _att_worker(tmp, mode=None)
+        w, bus, pilots, logs, st = _att_worker(tmp)      # LOW mpc_tuned_7d
         w.land_dry_run = True
         w.on_enable(True)
         _feed_att(w)

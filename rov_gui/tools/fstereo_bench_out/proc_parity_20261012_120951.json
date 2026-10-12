@@ -1,0 +1,151 @@
+{
+ "tool": "rov_gui/tools/fstereo_proc_parity.py",
+ "when": "20261012_120951",
+ "pairs": 9,
+ "repeat": 2,
+ "iters": 8,
+ "out_size": [
+  640,
+  360
+ ],
+ "rig": "bench_rig alpha 0.5, align 400x250",
+ "gpu": [
+  "# gpu: NVIDIA GeForce RTX 5090, torch 2.11.0+cu128, other compute processes at start: none, at end: none, --force: False"
+ ],
+ "results": [
+  {
+   "scale": 0.5,
+   "compare": {
+    "n": 18,
+    "native_equal": 18,
+    "mm_equal": 18,
+    "native_max_abs_mm": 0,
+    "mm_max_abs_mm": 0,
+    "native_diff_px_pct_max": 0.0,
+    "valid_equal": 18
+   },
+   "in_station": {
+    "load_s": 4.24,
+    "first_frame_ms": 1329.6,
+    "infer_ms_after_first": {
+     "p50": 45.52,
+     "max": 46.67
+    },
+    "close_s": 0.01
+   },
+   "child": {
+    "load_s_station": 4.52,
+    "first_frame_ms": 1358.5,
+    "infer_ms_after_first": {
+     "p50": 45.87,
+     "max": 46.94
+    },
+    "close_s": 0.51,
+    "exit_code": 0,
+    "process_meta": {
+     "mode": "child",
+     "pid": 188578,
+     "alive": true,
+     "exit_code": null,
+     "python": "/home/bdml/miniforge3/envs/rovgui-pose/bin/python",
+     "transport": "two AF_UNIX socketpairs, multiprocessing.connection framing (pickled numpy)",
+     "protocol": 2,
+     "load_s_child": 4.42,
+     "load_s_station": 4.5,
+     "frames_ok": 18,
+     "frames_error": 0,
+     "first_frame_ms": 1358.5,
+     "rpc_ms": {
+      "p50": 45.86,
+      "p90": 46.67,
+      "max": 46.93,
+      "n": 17
+     },
+     "ipc_ms": {
+      "p50": 0.33,
+      "p90": 0.46,
+      "max": 0.57,
+      "n": 17
+     },
+     "stats_scope": "the last <= 2000 round trips of this STATION SESSION when the meta was written, frame 1 excluded (first_frame_ms) \u2014 not this CSV's window alone",
+     "rig_sends": 1,
+     "timeouts_s": {
+      "first_infer": 10.0,
+      "infer": 5.0,
+      "load": 120.0,
+      "send_per_message": 5.0
+     }
+    },
+    "cuda_graph": true,
+    "ckpt_sha1_first_8mib": "d277c7ff7de5c627328cde9eaf775e181685276a"
+   }
+  },
+  {
+   "scale": 0.75,
+   "compare": {
+    "n": 18,
+    "native_equal": 18,
+    "mm_equal": 18,
+    "native_max_abs_mm": 0,
+    "mm_max_abs_mm": 0,
+    "native_diff_px_pct_max": 0.0,
+    "valid_equal": 18
+   },
+   "in_station": {
+    "load_s": 2.23,
+    "first_frame_ms": 1109.9,
+    "infer_ms_after_first": {
+     "p50": 75.52,
+     "max": 76.37
+    },
+    "close_s": 0.01
+   },
+   "child": {
+    "load_s_station": 4.46,
+    "first_frame_ms": 1464.4,
+    "infer_ms_after_first": {
+     "p50": 77.16,
+     "max": 77.87
+    },
+    "close_s": 0.51,
+    "exit_code": 0,
+    "process_meta": {
+     "mode": "child",
+     "pid": 188760,
+     "alive": true,
+     "exit_code": null,
+     "python": "/home/bdml/miniforge3/envs/rovgui-pose/bin/python",
+     "transport": "two AF_UNIX socketpairs, multiprocessing.connection framing (pickled numpy)",
+     "protocol": 2,
+     "load_s_child": 4.38,
+     "load_s_station": 4.45,
+     "frames_ok": 18,
+     "frames_error": 0,
+     "first_frame_ms": 1464.3,
+     "rpc_ms": {
+      "p50": 77.15,
+      "p90": 77.78,
+      "max": 77.86,
+      "n": 17
+     },
+     "ipc_ms": {
+      "p50": 0.47,
+      "p90": 0.55,
+      "max": 0.79,
+      "n": 17
+     },
+     "stats_scope": "the last <= 2000 round trips of this STATION SESSION when the meta was written, frame 1 excluded (first_frame_ms) \u2014 not this CSV's window alone",
+     "rig_sends": 1,
+     "timeouts_s": {
+      "first_infer": 10.0,
+      "infer": 5.0,
+      "load": 120.0,
+      "send_per_message": 5.0
+     }
+    },
+    "cuda_graph": true,
+    "ckpt_sha1_first_8mib": "d277c7ff7de5c627328cde9eaf775e181685276a"
+   }
+  }
+ ]
+}

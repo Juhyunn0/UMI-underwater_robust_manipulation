@@ -1,0 +1,56 @@
+# Deployment COLOUR camera — MarineSitu C3 (Luxonis OAK-D-W-POE) CAM_A, underwater,
+# on the 640x360 colour stream the station feeds an RGB policy (rov_gui --isp-scale 1/3
+# default: 1080p ISP output / 3, full 16:9 field of view).
+#
+# This is the ARRIVAL grid of the RGB warp (umi_handheld/build_dp_rgb_c3warp_zarr.py):
+# land-recorded OAK-D-W CAM_A frames are remapped into this camera's projection so an
+# RGB policy sees, at training time, the geometry the C3 colour frame has on the ROV.
+# The station's ColorObsBuilder takes the 640x360 frame -> centre 360x360 crop -> 224,
+# so the training store applies the same crop to this grid.
+#
+# No EEPROM dump file is left in the repo (c3_camera/datasets/*/calibration.json are
+# gone), so the numbers come from the live CalibrationHandler values a station run wrote
+# into its meta, converted with DepthAI's own resize rule (cover-then-crop, the rule
+# getCameraIntrinsics applies and demonstration_processing/gripper.py:rgb_intrinsics
+# re-implements). Nothing is typed by hand.
+
+schema: umi_camera_model/1
+name: marinesitu_c3_cam_a_640x360
+role: target
+medium: water
+verified: true
+
+provenance:
+  artifact: data/20260908/0908_180453_observe/mpc_180453.meta.json
+  field: fstereo.rig.color   # live CalibrationHandler, CAM_A at 400x250
+  conversion: >-
+    400x250 -> native 3840x2160 (scale = max(400/3840, 250/2160) = 0.115741, crop the
+    width overhang) -> 640x360 (scale 1/6, same 16:9 aspect, no crop):
+    fx 3080.348 / 6, cx 1905.155 / 6, cy 1078.613 / 6.
+  cross_check: >-
+    data/20260908/0908_180453_observe/diag/solve_frame.py:22 uses
+    K = [[513.3914, 0, 317.5259], [0, 513.4471, 179.7689]] for tag PnP on the run's
+    640x360 colour frames -- identical to 4 decimals.
+  source_string: "on-device factory calibration (OAK-D-W-POE EEPROM), underwater"
+  medium_determination: calib/FOV_AUDIT.md (CAM_A forward-projected HFOV 63.7 deg)
+
+image_size: [640, 360]
+
+# OpenCV 14-coefficient model [k1 k2 p1 p2 k3 k4 k5 k6 s1 s2 s3 s4 tx ty], verbatim from
+# the run meta (DepthAI distortion is resolution-independent). p1/p2 are non-zero, so
+# only cv2.undistortPoints / cv2.projectPoints may consume it (camera_model.py's radial
+# table refuses it, which WarpStage does not use).
+model: opencv_rational_14
+intrinsics:
+  fx: 513.3913330078125
+  fy: 513.4470556640624
+  cx: 317.5259008789062
+  cy: 179.7688586425781
+distortion: [2.628258228302002, 81.2908706665039, 0.0023482972756028175,
+             -0.000615767203271389, 188.5574951171875, 2.404470920562744,
+             83.12574005126953, 186.52230834960938, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+# Derived (pinhole, centre): the 360x360 centre crop spans 2*atan(180/513.39) = 38.6 deg.
+fov_deg:
+  hfov: 63.7
+  crop_360_deg: 38.6

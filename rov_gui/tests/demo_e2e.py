@@ -41,6 +41,14 @@ the run ends HONESTLY (STOP by this driver after a while, never "complete"),
 and that "STOP with a plan in flight installs nothing". What it cannot show
 is anything about the trained network — that is the dryrun tool's job.
 
+``policy auto`` (2026-10-03) is the policy.action_repr AUTO row: the SHIPPED
+config (action_repr auto) and the 7-dim ``stub_rp`` session on a 4-DoF LOW —
+the pick alone decides the representation (no YAML edit), the mission arms
+pinned to pos_rpy_width and flies roll/pitch DROPPED-AND-LOGGED (CSV rp_track
+0, plans rp_tracked false with rp_raw, meta trajectory.action_repr the pin,
+policy.config.action_repr "auto"). ``policy rp auto`` flies the variant row
+below with ``auto`` in its temp config instead of pos_rpy_width.
+
 ``policy rp`` (2026-09-26) is the 6-DoF VARIANT row: the same real
 PolicyWorker with the 7-dim ``stub_rp`` session (a 5 deg pitch ramp per
 chunk), a TEMPORARY copy of config/hw_mpc.yaml with policy.action_repr
@@ -54,7 +62,9 @@ compose -> PlanFilter -> stitcher -> NedPlan.rp_ned -> HwDobMpc xref[3:5]
 -> wrench_to_axes(attitude=True) -> PilotInput.roll/pitch -> plant, and the
 records (plans.jsonl rp_tracked/raw.rp, CSV rp_track/ax_pitch/rpitch_deg,
 MpcStatus.axes_rp, PolicyPlanViz.rp, meta run.attitude_axes). The follower
-is forced to plain ``mpc`` (dobmpc is refused by dobmpc_allowed: false).
+must be a *_7d LOW (2026-10-03: the LOW decides whether K/M go out —
+``pid_7d`` or ``mpc_tuned_7d``; ``rl_7d`` has no trained export yet); any
+other follower named with ``rp`` is a FAILURE, never a silent substitute.
 The stub's "+5 deg more pitch per chunk" is RELATIVE to the leashed anchor,
 so it integrates chunk by chunk up to the rp_max_deg (20 deg [예측]) T1 clip
 and the M axis sits at its cap for much of the run: the clip counter and the
@@ -168,7 +178,7 @@ def _fake_replay_session() -> str:
     return d
 
 
-def _variant_config() -> str:
+def _variant_config(action_repr: str = "pos_rpy_width") -> str:
     """config/hw_mpc.yaml with the 6-DoF variant switched ON, written to a
     tempdir: the shipped file stays the 4-DoF baseline (its resolved form is
     pinned byte-for-byte by rov_gui/tests/test_attitude_axes.py).
@@ -206,7 +216,7 @@ def _variant_config() -> str:
     with open(os.path.join(ROOT, "config/hw_mpc.yaml"), "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
     raw.setdefault("policy", {})
-    raw["policy"]["action_repr"] = "pos_rpy_width"
+    raw["policy"]["action_repr"] = action_repr      # "auto": the pick decides
     raw["policy"]["attitude_track"] = True
     aa = raw.setdefault("engage", {}).setdefault("attitude_axes", {})
     aa["enabled"] = True
@@ -215,6 +225,16 @@ def _variant_config() -> str:
     # RECORDED opt-out: no armed in-water sign probe exists in this cut, so
     # the demo row flies first_water_caps, as a first water session would.
     aa["require_sign_probe"] = False
+    # pid_7d's pulse-and-release gate (2026-10-03): a SYNTHETIC record whose
+    # free-decay periods are the DEMO PENDULUM's own 2 pi sqrt(I/k) [유도:
+    # backends/demo.py I 0.4491/0.7547, k 1.35 -> 3.62 / 4.70 s] — the gate's
+    # arithmetic on the plant this row actually flies, not a vehicle fact.
+    pp = os.path.join(d, "pulse_test_SYNTHETIC.json")
+    with open(pp, "w", encoding="utf-8") as f:
+        _json.dump({"tool": "demo_e2e SYNTHETIC pulse-and-release record",
+                    "free_decay_period_s": [3.62, 4.70],
+                    "note": "the demo pendulum's periods, derived — no vehicle was pulsed"}, f, indent=1)
+    raw.setdefault("pid_7d", {})["pulse_test"] = pp
     out = os.path.join(d, "hw_mpc_rp.yaml")
     with open(out, "w", encoding="utf-8") as f:
         f.write("# demo_e2e `policy rp`: config/hw_mpc.yaml + the 6-DoF variant ON "
@@ -251,6 +271,8 @@ SHAPES = {
 POLICY_FLY_S = 12.0
 SHAPE = "square"
 RP = False          # the `rp` argument: the 6-DoF variant row (policy only)
+AUTO = False        # the `auto` argument: policy.action_repr auto (policy only)
+RGB = False         # the `rgb` argument: the RGB-checkpoint row (policy only)
 # The real settle is 10 s (engage.settle_s); the driver has to outwait it or
 # it declares failure while the vehicle is doing exactly the right thing.
 SETTLE_S = 12.0
@@ -379,6 +401,13 @@ def _report_policy(backend, plans, states, statuses, state) -> int:
     if rp is None or rp.get("kind") != "policy":
         print("FAIL: the policy mission left no run record")
         return 1
+    if RGB:
+        srcs = sorted({str(getattr(p, "depth_src", "")) for p in plans})
+        print(f"[policy/stub] RGB row: plan obs sources {srcs}")
+        if srcs != ["c3_rgb"]:
+            print("FAIL: an RGB checkpoint's plans must all come from the C3 "
+                  "colour obs (depth_src c3_rgb)")
+            rc = 1
     print(f"[policy/stub] intake: received {rp['received']}, installed "
           f"{rp['installed']}, clipped {rp['clipped']}, rejected "
           f"{rp['rejected']}, late {rp['late']}, skip_bridge "
@@ -422,7 +451,7 @@ def _report_policy(backend, plans, states, statuses, state) -> int:
         if any("action_raw" not in l for l in inst):
             print("FAIL: an installed plan line lacks action_raw")
             rc = 1
-        want_w, want_repr = ((7, "pos_rpy_width") if RP
+        want_w, want_repr = ((7, "pos_rpy_width") if (RP or AUTO)
                              else (5, "pos_yaw_width"))
         if widths != [want_w]:
             print(f"FAIL: an installed plan's action_raw row is not {want_w} "
@@ -433,14 +462,120 @@ def _report_policy(backend, plans, states, statuses, state) -> int:
             rc = 1
         if RP:
             rc |= _report_policy_rp_lines(inst)
+        elif AUTO:
+            rc |= _report_policy_auto_lines(inst)
     # STOP with a plan in flight installs nothing: after the STOP the
     # counters are frozen and the inbox is empty.
-    if state.get("installed_after_stop", 0) != 0 or mpc._policy_inbox is not None:
-        print("FAIL: a plan was installed after STOP")
+    n_inst = state.get("installed_after_stop", 0)
+    inbox = mpc._policy_inbox
+    if n_inst != 0 or inbox is not None:
+        # which condition fired, and the inbox chunk's epoch / obs time — so
+        # the next reproduction separates "a pre-STOP epoch arriving late"
+        # from "a post-STOP install" (KNOWN_ISSUES 2026-09-07 flake)
+        print(f"FAIL: a plan was installed after STOP (installed_after_stop "
+              f"{n_inst}, inbox {'EMPTY' if inbox is None else 'HELD'}"
+              + ("" if inbox is None else
+                 f": epoch {getattr(inbox, 'epoch', '?')}, obs_t "
+                 f"{getattr(inbox, 'obs_t', '?')}, kind "
+                 f"{type(inbox).__name__}") + ")")
         rc = 1
     print(f"[policy/stub] after STOP: {state.get('plans_after_stop', 0)} plans "
-          f"emitted, 0 installed (inbox empty) — the in-flight chunk was "
-          f"dropped by the epoch/inactive rule")
+          f"emitted, {n_inst} installed (plans.jsonl lines - the worker's "
+          f"count at STOP; {state.get('installed_race_gui', 0)} more plan(s) "
+          f"installed between the driver's press and the worker's STOP), inbox "
+          f"{'empty' if inbox is None else 'HELD'}"
+          + (" — the in-flight chunk was dropped by the epoch/inactive rule"
+             if n_inst == 0 and inbox is None else ""))
+    return rc
+
+
+def _report_policy_auto_lines(inst) -> int:
+    """The plans.jsonl side of the AUTO row on a 4-DoF LOW: every installed
+    7-dim plan was DROPPED-AND-LOGGED — not tracked, no raw.rp flown, the
+    decoded rp_raw (2,K) and dropped_rp_deg on the record."""
+    rc = 0
+    if not inst or any(l.get("rp_tracked") is not False for l in inst):
+        print("FAIL: an installed 7-dim plan on a 4-DoF LOW was tracked (or none installed)")
+        rc = 1
+    if any("rp" in (l.get("raw") or {}) for l in inst):
+        print("FAIL: a dropped-and-logged plan carries raw.rp (a flown attitude)")
+        rc = 1
+    if any("rp_raw" not in l or "dropped_rp_deg" not in l for l in inst):
+        print("FAIL: a dropped-and-logged plan lacks rp_raw / dropped_rp_deg")
+        rc = 1
+    dropped = [float(l.get("dropped_rp_deg") or 0.0) for l in inst]
+    print(f"[policy/auto] plans.jsonl: {len(inst)} installed, rp_tracked 0, "
+          f"dropped_rp_deg max {max(dropped) if dropped else float('nan'):.2f} deg")
+    return rc
+
+
+def _find_meta(csv: str) -> dict | None:
+    import glob as _glob
+    import json as _json
+    for m in _glob.glob(os.path.join(os.path.dirname(csv), "*.json")):
+        try:
+            with open(m, encoding="utf-8") as f:
+                d = _json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(d, dict) and "schema_version" in d:
+            return d
+    return None
+
+
+def _report_policy_auto(state, logs) -> int:
+    """policy.action_repr AUTO (2026-10-03), both rows: the pin is the 7-dim
+    stub's contract and every representation record key carries it (never
+    "auto"; policy.config echoes it), the ARM line says where it came from;
+    on a 4-DoF LOW (no `rp`) the mission is levelled: CSV rp_track 0 on every
+    row, trajectory.attitude_track false, DROPPED-AND-LOGGED in the log."""
+    rc = 0
+    csv = state.get("csv")
+    if not csv or not os.path.exists(csv):
+        print("FAIL: no mission CSV")
+        return 1
+    meta = _find_meta(csv)
+    if meta is None:
+        print("FAIL: no run meta with schema_version beside the CSV")
+        return 1
+    pol, tr = meta.get("policy") or {}, meta.get("trajectory") or {}
+    run = pol.get("run") or {}
+    print(f"[policy/auto] meta policy.config.action_repr "
+          f"{(pol.get('config') or {}).get('action_repr')!r}, policy.action_repr "
+          f"{pol.get('action_repr')!r}, trajectory.action_repr {tr.get('action_repr')!r}, "
+          f"run.action_repr_pinned {run.get('action_repr_pinned')!r}, "
+          f"trajectory.attitude_track {tr.get('attitude_track')}")
+    if (pol.get("config") or {}).get("action_repr") != "auto":
+        print("FAIL: meta policy.config.action_repr is not 'auto' (the row's premise)")
+        rc = 1
+    if [pol.get("action_repr"), tr.get("action_repr"), run.get("action_repr_pinned")] \
+            != ["pos_rpy_width"] * 3:
+        print("FAIL: a representation record key is not the ARM pin pos_rpy_width")
+        rc = 1
+    arm = [m for _l, m in logs if "action pos_rpy_width" in m]
+    if not arm or "(auto: the checkpoint's contract)" not in arm[-1]:
+        print(f"FAIL: no ARM line naming the auto pin ({arm[-1:] or 'none'})")
+        rc = 1
+    if not RP:
+        if tr.get("attitude_track") is not False:
+            print("FAIL: trajectory.attitude_track is not false on a 4-DoF LOW")
+            rc = 1
+        if not arm or "DROPPED-AND-LOGGED" not in arm[-1]:
+            print("FAIL: the ARM line does not say DROPPED-AND-LOGGED")
+            rc = 1
+        with open(csv, encoding="utf-8") as f:
+            head = f.readline().strip().split(",")
+            rows = [ln.strip().split(",") for ln in f if ln.strip()]
+        if "rp_track" not in head:
+            print("FAIL: CSV lacks rp_track")
+            return 1
+        i = head.index("rp_track")
+        bad = [r[i] for r in rows if r[i] != "0"]
+        print(f"[policy/auto] CSV {os.path.basename(csv)}: {len(rows)} rows, "
+              f"rp_track != 0 on {len(bad)}")
+        if bad:
+            print("FAIL: a row of a dropped-and-logged mission says rp_track != 0")
+            rc = 1
     return rc
 
 
@@ -512,8 +647,11 @@ def _report_policy_rp(statuses, viz, state) -> int:
         head = f.readline().strip().split(",")
         rows = [ln.strip().split(",") for ln in f if ln.strip()]
     need = ("rroll_deg", "rpitch_deg", "ax_roll", "ax_pitch", "rp_track")
-    if head[-5:] != list(need):
-        print(f"FAIL: CSV does not end with {need}: {head[-5:]}")
+    # looked up BY NAME (2026-10-03): the DVL/EKF columns were appended after
+    # rp_track, and a positional pin failed this row for an unrelated reason
+    missing = [k for k in need if k not in head]
+    if missing:
+        print(f"FAIL: CSV lacks the attitude columns {missing}")
         return 1
     col = {k: head.index(k) for k in need}
     tracked = [r for r in rows if r[col["rp_track"]] == "1"]
@@ -561,8 +699,15 @@ def _report_policy_rp(statuses, viz, state) -> int:
           f"{pol.get('action_repr')!r}; controller.attitude_ref.tracked "
           f"{aref.get('tracked')} source {aref.get('source')!r}; "
           f"controller.allocation.attitude {(ctl.get('allocation') or {}).get('attitude')}")
-    if meta.get("schema_version") != 16:
-        print("FAIL: meta schema_version is not 16")
+    if not isinstance(meta.get("schema_version"), int) or meta["schema_version"] < 16:
+        print("FAIL: meta schema_version is not >= 16 (the variant's keys)")
+        rc = 1
+    if aa.get("low_attitude") is not True or aa.get("low") != Opts.mpc_mode:
+        print(f"FAIL: meta run.attitude_axes low {aa.get('low')!r} / low_attitude "
+              f"{aa.get('low_attitude')!r} — expected {Opts.mpc_mode!r} / True")
+        rc = 1
+    if ctl.get("type") != Opts.mpc_mode:
+        print(f"FAIL: meta controller.type {ctl.get('type')!r} is not the LOW {Opts.mpc_mode!r}")
         rc = 1
     if aa.get("enabled") is not True:
         print("FAIL: meta run.attitude_axes.enabled is not true")
@@ -596,9 +741,10 @@ def _report_policy_rp(statuses, viz, state) -> int:
 
 
 def main() -> int:
-    global SHAPE, RP
+    global SHAPE, RP, RGB, AUTO
     for a in sys.argv[1:]:
-        if a in ("mpc", "dobmpc", "mpc_tuned", "dobmpc_tuned", "pid", "rl"):
+        if a in ("mpc", "dobmpc", "mpc_tuned", "dobmpc_tuned", "pid", "rl",
+                 "pid_7d", "mpc_tuned_7d", "rl_7d"):
             # every follower the policy/replay stream accepts (the
             # contouring pair mpcc/dobmpcc is refused by design)
             Opts.mpc_mode = a
@@ -608,6 +754,10 @@ def main() -> int:
             Opts.demo_object = a
         elif a == "rp":
             RP = True
+        elif a == "auto":
+            AUTO = True
+        elif a == "rgb":
+            RGB = True
         elif a in ("dr", "dr-control"):
             Opts.imu_dr = "control" if a == "dr-control" else "shadow"
             Opts.imu_dr_control = a == "dr-control"
@@ -625,20 +775,46 @@ def main() -> int:
     if RP and SHAPE != "policy":
         print("FAIL: `rp` (the 6-DoF variant row) is a policy-only argument")
         return 2
+    if AUTO and (SHAPE != "policy" or RGB):
+        print("FAIL: `auto` (policy.action_repr auto) is a policy-only argument "
+              "and does not combine with `rgb`")
+        return 2
+    if RGB and (SHAPE != "policy" or RP):
+        print("FAIL: `rgb` (the RGB-checkpoint row) is a policy-only argument "
+              "and does not combine with `rp`")
+        return 2
     if SHAPE == "policy":
         Opts.policy = True
         Opts.policy_ckpt = "stub"
+        if RGB:
+            # THE RGB ROW (2026-10-03): the stub whose contract asks for
+            # camera0_rgb, fed from the demo's synthetic MAIN (colour) feed
+            # through PolicyColorMailbox — the path the RGB-only checkpoint
+            # (umi_rgb_5d) takes on the C3's colour frame.
+            Opts.policy_ckpt = "stub_rgb"
+        if AUTO and not RP:
+            # THE AUTO ROW (2026-10-03): the SHIPPED config says
+            # policy.action_repr auto, and the pick is the 7-dim stub — on a
+            # 4-DoF LOW the mission must arm pinned to pos_rpy_width and fly
+            # roll/pitch dropped-and-logged. A *_7d LOW belongs to `rp auto`.
+            Opts.policy_ckpt = "stub_rp"
+            if Opts.mpc_mode in ("pid_7d", "mpc_tuned_7d", "rl_7d"):
+                print(f"FAIL: `auto` without `rp` is the 4-DoF row; got "
+                      f"{Opts.mpc_mode} — use `{Opts.mpc_mode} policy rp auto`")
+                return 2
         if RP:
             # THE VARIANT ROW: 7-dim stub with a pitch ramp, a temp config
-            # with the variant ON, plain mpc (the attitude gate refuses the
-            # dobmpc family without dobmpc_allowed, and pid/rl/mpcc have no
-            # K/M path at all).
+            # with the capability ON, and a *_7d LOW (2026-10-03: the LOW
+            # decides). Anything else would fly 4-DoF and prove nothing —
+            # a FAILURE, never a silent substitute (it used to print a note
+            # and fly mpc, so `pid policy rp` was a green row about MPC).
             Opts.policy_ckpt = "stub_rp"
-            if Opts.mpc_mode not in ("mpc", "mpc_tuned"):
-                print(f"note: attitude axes are refused under {Opts.mpc_mode} "
-                      f"(engage.attitude_axes.dobmpc_allowed false) — flying mpc")
-                Opts.mpc_mode = "mpc"
-            Opts.mpc_config = _variant_config()
+            if Opts.mpc_mode not in ("pid_7d", "mpc_tuned_7d", "rl_7d"):
+                print(f"FAIL: `rp` needs a *_7d follower (pid_7d | mpc_tuned_7d | "
+                      f"rl_7d), got {Opts.mpc_mode} — a 4-DoF LOW sends no K/M")
+                return 2
+            Opts.mpc_config = _variant_config(
+                action_repr="auto" if AUTO else "pos_rpy_width")
             print(f"variant config (synthetic, temp): {Opts.mpc_config}")
         try:
             import rov_gui.backends.policy  # noqa: F401  (the REAL worker)
@@ -653,6 +829,8 @@ def main() -> int:
     statuses = []
     win.bus.mpc_status.connect(statuses.append)
     win.attach(backend)
+    logs: list = []
+    win.bus.log.connect(lambda lvl, msg: logs.append((lvl, msg)))
     objects = []
     win.bus.object_fix.connect(objects.append)
     plans, pstates, pstatuses, pviz = [], [], [], []
@@ -718,7 +896,29 @@ def main() -> int:
             if t > state["t_stop"] + 1.5:
                 mpc = backend.mpc
                 last = mpc._replay_last or {}
+                # RACE-FREE (2026-10-03). `_replay_last` is the worker's own
+                # copy taken WHEN IT PROCESSED the STOP, so every install it
+                # counts happened before STOP; a plan installed AFTER it would
+                # still be an accept/clip line in plans.jsonl (written and
+                # closed per line) that the copy does not count. The old
+                # GUI-thread snapshot (`n_installed_at_stop`, read BEFORE the
+                # queued STOP reached the worker) raced the last pre-STOP
+                # install — the 2026-09-07 / 2026-10-03 flake (snapshot 22,
+                # meta installed 23, plans.jsonl 23, end_reason stop).
+                import json as _json
+                pj = (os.path.join(os.path.dirname(str(mpc._csv_path)),
+                                   "plans.jsonl") if mpc._csv_path else "")
+                n_lines = None
+                if pj and os.path.exists(pj):
+                    with open(pj, encoding="utf-8") as f:
+                        n_lines = sum(1 for ln in f if ln.strip() and _json.loads(ln)
+                                      .get("status") in ("accept", "clip"))
                 state["installed_after_stop"] = (
+                    (n_lines - int(last.get("installed", 0)))
+                    if n_lines is not None else
+                    (last.get("installed", 0)
+                     - state.get("n_installed_at_stop", last.get("installed", 0))))
+                state["installed_race_gui"] = (
                     last.get("installed", 0)
                     - state.get("n_installed_at_stop", last.get("installed", 0)))
                 state["plans_after_stop"] = (len(plans)
@@ -787,6 +987,8 @@ def main() -> int:
         rc |= _report_policy(backend, plans, pstates, pstatuses, state)
         if RP:
             rc |= _report_policy_rp(statuses, pviz, state)
+        if AUTO:
+            rc |= _report_policy_auto(state, logs)
     if SHAPE == "replay":
         why = state.get("end_reason", "")
         print(f"[replay] mission ended: {why!r}")

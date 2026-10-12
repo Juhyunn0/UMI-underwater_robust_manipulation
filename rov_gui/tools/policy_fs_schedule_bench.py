@@ -6,6 +6,9 @@ the REAL workers.
     QT_QPA_PLATFORM=offscreen $P rov_gui/tools/policy_fs_schedule_bench.py
     QT_QPA_PLATFORM=offscreen $P rov_gui/tools/policy_fs_schedule_bench.py \\
         --arms free@0.75,yield@0.75,only@0.75,free@0.5 --seconds 40
+    # --fstereo-process (2026-10-12): "+proc" runs the network in a child
+    QT_QPA_PLATFORM=offscreen $P rov_gui/tools/policy_fs_schedule_bench.py \\
+        --arms free@0.5,free+proc@0.5,yield@0.5,free@0.75,free+proc@0.75
 
 WHAT RUNS. The station's own ``FStereoWorker`` and ``PolicyWorker``, each on
 its own QThread, joined by the same ``PolicyMailbox`` and (when the arm's
@@ -30,7 +33,9 @@ wait for the frame in flight, the depth frame rate, the pair spacing, the plan
 interval — under otherwise identical conditions. It says nothing about how the
 policy flies.
 
-One arm per subprocess (a fresh CUDA context each): ``<schedule>@<scale>``.
+One arm per subprocess (a fresh CUDA context each): ``<schedule>[+proc]@<scale>``
+(``+proc``: the FoundationStereo network in a child process of the arm's own,
+as ``--fstereo-process`` runs it — the round trip is real).
 Writes one JSON under ``--out-dir`` (default rov_gui/tools/fstereo_bench_out)
 and prints a table. Opens no camera, no vehicle link, no serial port.
 """
@@ -73,6 +78,7 @@ class Opts:
     fstereo_alpha = 0.5
     fstereo_graph = True
     fstereo_fill = 2
+    fstereo_process = False         # an arm "<schedule>+proc@<scale>" sets it
     fstereo_align_size = "400x250"
     fstereo_view = "native"
     depth_fps = CAMERA_FPS
@@ -102,9 +108,14 @@ def _q(vals, digits=1):
 
 
 def run_arm(arm: str, seconds: float, ckpt: str, warm_s: float) -> dict:
-    """One schedule@scale, in this process. Returns the result dict."""
+    """One ``schedule[+proc]@scale``, in this process. Returns the result
+    dict. ``+proc`` = --fstereo-process: the FoundationStereo network in a
+    child process of its own, with the REAL round trip (2026-10-12)."""
     schedule, _, scale = arm.partition("@")
     scale = float(scale or 0.75)
+    schedule, plus, layout = schedule.partition("+")
+    if plus and layout != "proc":
+        raise SystemExit(f"arm {arm!r}: unknown layout {layout!r} (only +proc)")
 
     from rov_gui.qt import QtWidgets
     from rov_gui.bus import DataBus, FrameMailbox, PolicyMailbox, StereoMailbox
@@ -120,6 +131,7 @@ def run_arm(arm: str, seconds: float, ckpt: str, warm_s: float) -> dict:
     opts = Opts()
     opts.fstereo_scale = scale
     opts.policy_fs_schedule = schedule
+    opts.fstereo_process = (layout == "proc")
     opts.policy_ckpt = str(ckpt)
 
     pairs = fb.load_pairs()
@@ -207,6 +219,7 @@ def run_arm(arm: str, seconds: float, ckpt: str, warm_s: float) -> dict:
              "builder_why": str(getattr(pw.builder, "why", "")),
              "load_s": round(now() - t_begin, 1)}
     result = {"arm": arm, "schedule": schedule, "fstereo_scale": scale,
+              "fstereo_process": bool(opts.fstereo_process),
               "ckpt": str(ckpt), "seconds": seconds, "ready": ready,
               "gpu_other_processes_at_start": busy,
               # CPU load is part of the conditions: the policy's observation
@@ -273,6 +286,8 @@ def run_arm(arm: str, seconds: float, ckpt: str, warm_s: float) -> dict:
         "fs_infer_size": fs_meta.get("infer_size_actual"),
         "plan_fs_schedule": sorted({p.fs_schedule for p in run}),
         "plan_fs_input": sorted({p.fs_input for p in run}),
+        "plan_fs_process": sorted({p.fs_process for p in run}),
+        "fstereo_process_meta": fs_meta.get("process"),
         "policy_counters": dict(pol_meta.get("counters") or {}),
         "policy_pairing": pol_meta.get("pairing"),
         "policy_fs_schedule_meta": pol_meta.get("fs_schedule"),
@@ -312,8 +327,9 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--arms", default=DEFAULT_ARMS,
-                    help="comma list of <schedule>@<fstereo scale> "
-                         "(default: %(default)s)")
+                    help="comma list of <schedule>[+proc]@<fstereo scale>; "
+                         "+proc = --fstereo-process, the network in a child "
+                         "process (default: %(default)s)")
     ap.add_argument("--seconds", type=float, default=30.0,
                     help="mission time per arm (default: %(default)s)")
     ap.add_argument("--warm", type=float, default=3.0)

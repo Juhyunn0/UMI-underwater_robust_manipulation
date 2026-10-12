@@ -1,0 +1,1885 @@
+{
+ "tool": "rov_gui/tools/policy_fs_schedule_bench.py",
+ "when": "20261012_121018",
+ "what": "real FStereoWorker + PolicyWorker threads, real networks; synthetic pairs at 15 fps, synthetic vehicle state, no camera latency, no GUI, no controller \u2014 see the module docstring",
+ "camera_fps": 15.0,
+ "state_hz": 20.0,
+ "arms": [
+  {
+   "arm": "yield@0.5",
+   "schedule": "yield",
+   "fstereo_scale": 0.5,
+   "fstereo_process": false,
+   "ckpt": "data/checkpoints/umi_depth_5d_peg5d_vitclip_9_27_9_28_20260929_012539.ckpt",
+   "seconds": 30.0,
+   "ready": {
+    "fs_ready": true,
+    "fs_error": "",
+    "policy_ready": true,
+    "policy_error": "",
+    "builder_usable": true,
+    "builder_why": "",
+    "load_s": 6.4
+   },
+   "gpu_other_processes_at_start": [],
+   "loadavg_at_start": [
+    1.68,
+    1.1,
+    1.04
+   ],
+   "cpu_count": 16,
+   "n_plans": 59,
+   "n_steady": 57,
+   "plan_interval_s": {
+    "p10": 0.496,
+    "p50": 0.515,
+    "p90": 0.523,
+    "max": 0.525,
+    "n": 56
+   },
+   "infer_ms": {
+    "p10": 19.3,
+    "p50": 19.5,
+    "p90": 20.1,
+    "max": 20.3,
+    "n": 57
+   },
+   "fs_wait_ms": {
+    "p10": 0.0,
+    "p50": 0.0,
+    "p90": 7.4,
+    "max": 13.8,
+    "n": 57
+   },
+   "fs_wait_timeouts": 0,
+   "pair_dt_ms": {
+    "p10": 66.6,
+    "p50": 66.7,
+    "p90": 66.8,
+    "max": 67.1,
+    "n": 57
+   },
+   "pair_consecutive_pct": 100.0,
+   "pair_dup": 0,
+   "depth_ready_age_ms": {
+    "p10": 50.7,
+    "p50": 54.2,
+    "p90": 68.8,
+    "max": 71.4,
+    "n": 57
+   },
+   "trigger_age_ms": {
+    "p10": 71.6,
+    "p50": 92.3,
+    "p90": 111.7,
+    "max": 113.3,
+    "n": 57
+   },
+   "emit_age_ms": {
+    "p10": 134.1,
+    "p50": 146.7,
+    "p90": 166.5,
+    "max": 170.8,
+    "n": 57
+   },
+   "attempt_ms": {
+    "p10": 52.0,
+    "p50": 56.0,
+    "p90": 62.9,
+    "max": 64.4,
+    "n": 57
+   },
+   "fs_frames_per_s_mission": 15.0,
+   "fs_frames_per_s_idle_before": 15.0,
+   "fs_frames_per_s_idle_after": 15.0,
+   "fs_measured_hz_meta": 15.5,
+   "fs_infer_size": [
+    320,
+    200
+   ],
+   "plan_fs_schedule": [
+    "yield"
+   ],
+   "plan_fs_input": [
+    "scale 0.5 it8"
+   ],
+   "plan_fs_process": [
+    "in-station"
+   ],
+   "fstereo_process_meta": {
+    "mode": "in-station"
+   },
+   "policy_counters": {
+    "plans": 59,
+    "skip_degenerate": 0,
+    "skip_pair": 0,
+    "skip_fresh": 0,
+    "skip_history": 0,
+    "skip_no_depth": 0,
+    "skip_stale_depth": 0,
+    "skip_no_start": 0,
+    "skip_grid": 0,
+    "skip_not_ready": 0,
+    "skip_fix_lag": 0,
+    "skip_same_obs": 0,
+    "color_refused": 0,
+    "pair_dup": 0,
+    "pair_fallback": 0,
+    "pair_near": 59,
+    "infer_errors": 0,
+    "epoch_changes": 0,
+    "depth_frames": 529,
+    "states": 821,
+    "history_rows": 821,
+    "ckpt_swaps": 0
+   },
+   "policy_pairing": {
+    "n": 59,
+    "dt_p50_s": 0.06668550700123888,
+    "dt_max_s": 0.0671313119964907,
+    "dup": 0,
+    "fallback": 0,
+    "near": 59,
+    "skip": 0,
+    "tol": 0.6,
+    "fallback_max": 3.0,
+    "skip_fix_lag": 0,
+    "fix_lag_tol": 0.5,
+    "trigger": "depth-frame arrival after period_s",
+    "trigger_detail": "first 20 ms tick after period_s, on the newest frame already in the ring; waits for an arrival only when none came since the last attempt"
+   },
+   "policy_fs_schedule_meta": {
+    "requested": "yield",
+    "effective": "yield",
+    "why": "",
+    "worker": {
+     "bursts": 0,
+     "burst_timeouts": 0,
+     "burst_refused": 0
+    },
+    "only_lead_s": null,
+    "gate": {
+     "mode": "yield",
+     "lease_s": 0.5,
+     "wait_s": 0.15,
+     "inflight_max_s": 2.5,
+     "heartbeat_s": 1.0,
+     "burst_timeout_s": 0.6,
+     "starve_s": 1.5,
+     "burst_frames_per_request": 2,
+     "counters": {
+      "frames": 529,
+      "delivered": 529,
+      "held_polls": 419,
+      "drained": 0,
+      "holds": 59,
+      "lease_expired": 0,
+      "waits": 59,
+      "wait_timeouts": 0,
+      "inflight_reset": 0,
+      "bursts": 0,
+      "burst_frames": 0,
+      "burst_void": 0,
+      "starve_free": 0,
+      "activations": 0
+     },
+     "held": false,
+     "in_flight": true,
+     "mission_active": false,
+     "burst_allowance": 0,
+     "wait_ms": {
+      "p50": 0.0,
+      "p90": 7.4,
+      "max": 13.79,
+      "n": 59
+     },
+     "hold_ms": {
+      "p50": 55.63,
+      "p90": 63.09,
+      "max": 64.39,
+      "n": 59
+     }
+    }
+   },
+   "fstereo_schedule_meta": {
+    "mode": "yield",
+    "lease_s": 0.5,
+    "wait_s": 0.15,
+    "inflight_max_s": 2.5,
+    "heartbeat_s": 1.0,
+    "burst_timeout_s": 0.6,
+    "starve_s": 1.5,
+    "burst_frames_per_request": 2,
+    "counters": {
+     "frames": 529,
+     "delivered": 529,
+     "held_polls": 419,
+     "drained": 0,
+     "holds": 59,
+     "lease_expired": 0,
+     "waits": 59,
+     "wait_timeouts": 0,
+     "inflight_reset": 0,
+     "bursts": 0,
+     "burst_frames": 0,
+     "burst_void": 0,
+     "starve_free": 0,
+     "activations": 0
+    },
+    "held": false,
+    "in_flight": true,
+    "mission_active": false,
+    "burst_allowance": 0,
+    "wait_ms": {
+     "p50": 0.0,
+     "p90": 7.4,
+     "max": 13.79,
+     "n": 59
+    },
+    "hold_ms": {
+     "p50": 55.63,
+     "p90": 63.09,
+     "max": 64.39,
+     "n": 59
+    }
+   },
+   "loadavg_at_end": [
+    5.28,
+    2.07,
+    1.37
+   ],
+   "stereo_mailbox": {
+    "put": 616,
+    "taken": 530,
+    "conflated": 86
+   },
+   "policy_mailbox": {
+    "put": 529,
+    "taken": 529,
+    "dropped_src": 0,
+    "dropped_unwanted": 0,
+    "grid_set": 1,
+    "grid_refused": 0
+   },
+   "warn_error_logs": [
+    "warn: policy: OBS VIEW SHIFT +0.050 m along body x (camera frame [0.0, -0.0341, 0.0366]) \u2014 the depth obs is re-rendered from a virtual viewpoint, NOT the training recipe (TEMPORARY, policy.obs_view_fo"
+   ]
+  },
+  {
+   "arm": "free+proc@0.5",
+   "schedule": "free",
+   "fstereo_scale": 0.5,
+   "fstereo_process": true,
+   "ckpt": "data/checkpoints/umi_depth_5d_peg5d_vitclip_9_27_9_28_20260929_012539.ckpt",
+   "seconds": 30.0,
+   "ready": {
+    "fs_ready": true,
+    "fs_error": "",
+    "policy_ready": true,
+    "policy_error": "",
+    "builder_usable": true,
+    "builder_why": "",
+    "load_s": 6.8
+   },
+   "gpu_other_processes_at_start": [],
+   "loadavg_at_start": [
+    4.71,
+    2.05,
+    1.37
+   ],
+   "cpu_count": 16,
+   "n_plans": 59,
+   "n_steady": 57,
+   "plan_interval_s": {
+    "p10": 0.491,
+    "p50": 0.511,
+    "p90": 0.531,
+    "max": 0.533,
+    "n": 56
+   },
+   "infer_ms": {
+    "p10": 19.8,
+    "p50": 32.6,
+    "p90": 40.3,
+    "max": 49.4,
+    "n": 57
+   },
+   "fs_wait_ms": {
+    "p10": null,
+    "p50": null,
+    "p90": null,
+    "max": null,
+    "n": 0
+   },
+   "fs_wait_timeouts": 0,
+   "pair_dt_ms": {
+    "p10": 66.6,
+    "p50": 66.7,
+    "p90": 66.8,
+    "max": 67.2,
+    "n": 57
+   },
+   "pair_consecutive_pct": 100.0,
+   "pair_dup": 0,
+   "depth_ready_age_ms": {
+    "p10": 51.9,
+    "p50": 57.2,
+    "p90": 60.2,
+    "max": 69.2,
+    "n": 57
+   },
+   "trigger_age_ms": {
+    "p10": 55.5,
+    "p50": 73.8,
+    "p90": 99.8,
+    "max": 101.9,
+    "n": 57
+   },
+   "emit_age_ms": {
+    "p10": 124.0,
+    "p50": 129.1,
+    "p90": 170.7,
+    "max": 187.0,
+    "n": 57
+   },
+   "attempt_ms": {
+    "p10": 54.6,
+    "p50": 65.2,
+    "p90": 73.3,
+    "max": 87.1,
+    "n": 57
+   },
+   "fs_frames_per_s_mission": 15.03,
+   "fs_frames_per_s_idle_before": 15.0,
+   "fs_frames_per_s_idle_after": 15.0,
+   "fs_measured_hz_meta": 15.1,
+   "fs_infer_size": [
+    320,
+    200
+   ],
+   "plan_fs_schedule": [
+    "free"
+   ],
+   "plan_fs_input": [
+    "scale 0.5 it8"
+   ],
+   "plan_fs_process": [
+    "child"
+   ],
+   "fstereo_process_meta": {
+    "mode": "child",
+    "pid": 189544,
+    "alive": true,
+    "exit_code": null,
+    "python": "/home/bdml/miniforge3/envs/rovgui-pose/bin/python",
+    "transport": "two AF_UNIX socketpairs, multiprocessing.connection framing (pickled numpy)",
+    "protocol": 2,
+    "load_s_child": 5.01,
+    "load_s_station": 5.1,
+    "frames_ok": 532,
+    "frames_error": 0,
+    "first_frame_ms": 1364.6,
+    "rpc_ms": {
+     "p50": 44.33,
+     "p90": 46.79,
+     "max": 67.6,
+     "n": 531
+    },
+    "ipc_ms": {
+     "p50": 0.4,
+     "p90": 0.56,
+     "max": 3.34,
+     "n": 531
+    },
+    "stats_scope": "the last <= 2000 round trips of this STATION SESSION when the meta was written, frame 1 excluded (first_frame_ms) \u2014 not this CSV's window alone",
+    "rig_sends": 1,
+    "timeouts_s": {
+     "first_infer": 10.0,
+     "infer": 5.0,
+     "load": 120.0,
+     "send_per_message": 5.0
+    }
+   },
+   "policy_counters": {
+    "plans": 59,
+    "skip_degenerate": 0,
+    "skip_pair": 0,
+    "skip_fresh": 0,
+    "skip_history": 0,
+    "skip_no_depth": 0,
+    "skip_stale_depth": 0,
+    "skip_no_start": 0,
+    "skip_grid": 0,
+    "skip_not_ready": 0,
+    "skip_fix_lag": 0,
+    "skip_same_obs": 0,
+    "color_refused": 0,
+    "pair_dup": 0,
+    "pair_fallback": 0,
+    "pair_near": 59,
+    "infer_errors": 0,
+    "epoch_changes": 0,
+    "depth_frames": 532,
+    "states": 835,
+    "history_rows": 835,
+    "ckpt_swaps": 0
+   },
+   "policy_pairing": {
+    "n": 59,
+    "dt_p50_s": 0.06665955700009363,
+    "dt_max_s": 0.06716024699562695,
+    "dup": 0,
+    "fallback": 0,
+    "near": 59,
+    "skip": 0,
+    "tol": 0.6,
+    "fallback_max": 3.0,
+    "skip_fix_lag": 0,
+    "fix_lag_tol": 0.5,
+    "trigger": "depth-frame arrival after period_s",
+    "trigger_detail": "first 20 ms tick after period_s, on the newest frame already in the ring; waits for an arrival only when none came since the last attempt"
+   },
+   "policy_fs_schedule_meta": {
+    "requested": "free",
+    "effective": "free",
+    "why": "",
+    "worker": {
+     "bursts": 0,
+     "burst_timeouts": 0,
+     "burst_refused": 0
+    },
+    "only_lead_s": null,
+    "gate": null
+   },
+   "fstereo_schedule_meta": null,
+   "loadavg_at_end": [
+    4.25,
+    2.22,
+    1.45
+   ],
+   "stereo_mailbox": {
+    "put": 626,
+    "taken": 532,
+    "conflated": 94
+   },
+   "policy_mailbox": {
+    "put": 532,
+    "taken": 532,
+    "dropped_src": 0,
+    "dropped_unwanted": 0,
+    "grid_set": 1,
+    "grid_refused": 0
+   },
+   "warn_error_logs": [
+    "warn: policy: OBS VIEW SHIFT +0.050 m along body x (camera frame [0.0, -0.0341, 0.0366]) \u2014 the depth obs is re-rendered from a virtual viewpoint, NOT the training recipe (TEMPORARY, policy.obs_view_fo"
+   ]
+  },
+  {
+   "arm": "yield+proc@0.5",
+   "schedule": "yield",
+   "fstereo_scale": 0.5,
+   "fstereo_process": true,
+   "ckpt": "data/checkpoints/umi_depth_5d_peg5d_vitclip_9_27_9_28_20260929_012539.ckpt",
+   "seconds": 30.0,
+   "ready": {
+    "fs_ready": true,
+    "fs_error": "",
+    "policy_ready": true,
+    "policy_error": "",
+    "builder_usable": true,
+    "builder_why": "",
+    "load_s": 6.8
+   },
+   "gpu_other_processes_at_start": [],
+   "loadavg_at_start": [
+    4.98,
+    2.45,
+    1.54
+   ],
+   "cpu_count": 16,
+   "n_plans": 59,
+   "n_steady": 57,
+   "plan_interval_s": {
+    "p10": 0.495,
+    "p50": 0.516,
+    "p90": 0.522,
+    "max": 0.527,
+    "n": 56
+   },
+   "infer_ms": {
+    "p10": 19.3,
+    "p50": 19.5,
+    "p90": 20.0,
+    "max": 20.5,
+    "n": 57
+   },
+   "fs_wait_ms": {
+    "p10": 0.0,
+    "p50": 0.0,
+    "p90": 8.5,
+    "max": 12.3,
+    "n": 57
+   },
+   "fs_wait_timeouts": 0,
+   "pair_dt_ms": {
+    "p10": 66.6,
+    "p50": 66.7,
+    "p90": 66.8,
+    "max": 67.2,
+    "n": 57
+   },
+   "pair_consecutive_pct": 100.0,
+   "pair_dup": 0,
+   "depth_ready_age_ms": {
+    "p10": 49.0,
+    "p50": 53.7,
+    "p90": 67.0,
+    "max": 70.2,
+    "n": 57
+   },
+   "trigger_age_ms": {
+    "p10": 69.0,
+    "p50": 90.3,
+    "p90": 109.8,
+    "max": 112.4,
+    "n": 57
+   },
+   "emit_age_ms": {
+    "p10": 128.6,
+    "p50": 145.0,
+    "p90": 164.3,
+    "max": 168.1,
+    "n": 57
+   },
+   "attempt_ms": {
+    "p10": 50.4,
+    "p50": 56.3,
+    "p90": 61.6,
+    "max": 66.1,
+    "n": 57
+   },
+   "fs_frames_per_s_mission": 15.0,
+   "fs_frames_per_s_idle_before": 15.0,
+   "fs_frames_per_s_idle_after": 15.0,
+   "fs_measured_hz_meta": 15.5,
+   "fs_infer_size": [
+    320,
+    200
+   ],
+   "plan_fs_schedule": [
+    "yield"
+   ],
+   "plan_fs_input": [
+    "scale 0.5 it8"
+   ],
+   "plan_fs_process": [
+    "child"
+   ],
+   "fstereo_process_meta": {
+    "mode": "child",
+    "pid": 190008,
+    "alive": true,
+    "exit_code": null,
+    "python": "/home/bdml/miniforge3/envs/rovgui-pose/bin/python",
+    "transport": "two AF_UNIX socketpairs, multiprocessing.connection framing (pickled numpy)",
+    "protocol": 2,
+    "load_s_child": 5.0,
+    "load_s_station": 5.09,
+    "frames_ok": 531,
+    "frames_error": 0,
+    "first_frame_ms": 1354.2,
+    "rpc_ms": {
+     "p50": 44.34,
+     "p90": 45.94,
+     "max": 48.77,
+     "n": 530
+    },
+    "ipc_ms": {
+     "p50": 0.43,
+     "p90": 0.56,
+     "max": 3.96,
+     "n": 531
+    },
+    "stats_scope": "the last <= 2000 round trips of this STATION SESSION when the meta was written, frame 1 excluded (first_frame_ms) \u2014 not this CSV's window alone",
+    "rig_sends": 1,
+    "timeouts_s": {
+     "first_infer": 10.0,
+     "infer": 5.0,
+     "load": 120.0,
+     "send_per_message": 5.0
+    }
+   },
+   "policy_counters": {
+    "plans": 59,
+    "skip_degenerate": 0,
+    "skip_pair": 0,
+    "skip_fresh": 0,
+    "skip_history": 0,
+    "skip_no_depth": 0,
+    "skip_stale_depth": 0,
+    "skip_no_start": 0,
+    "skip_grid": 0,
+    "skip_not_ready": 0,
+    "skip_fix_lag": 0,
+    "skip_same_obs": 0,
+    "color_refused": 0,
+    "pair_dup": 0,
+    "pair_fallback": 0,
+    "pair_near": 59,
+    "infer_errors": 0,
+    "epoch_changes": 0,
+    "depth_frames": 532,
+    "states": 835,
+    "history_rows": 835,
+    "ckpt_swaps": 0
+   },
+   "policy_pairing": {
+    "n": 59,
+    "dt_p50_s": 0.06668091699975776,
+    "dt_max_s": 0.06721008099702885,
+    "dup": 0,
+    "fallback": 0,
+    "near": 59,
+    "skip": 0,
+    "tol": 0.6,
+    "fallback_max": 3.0,
+    "skip_fix_lag": 0,
+    "fix_lag_tol": 0.5,
+    "trigger": "depth-frame arrival after period_s",
+    "trigger_detail": "first 20 ms tick after period_s, on the newest frame already in the ring; waits for an arrival only when none came since the last attempt"
+   },
+   "policy_fs_schedule_meta": {
+    "requested": "yield",
+    "effective": "yield",
+    "why": "",
+    "worker": {
+     "bursts": 0,
+     "burst_timeouts": 0,
+     "burst_refused": 0
+    },
+    "only_lead_s": null,
+    "gate": {
+     "mode": "yield",
+     "lease_s": 0.5,
+     "wait_s": 0.15,
+     "inflight_max_s": 2.5,
+     "heartbeat_s": 1.0,
+     "burst_timeout_s": 0.6,
+     "starve_s": 1.5,
+     "burst_frames_per_request": 2,
+     "counters": {
+      "frames": 532,
+      "delivered": 532,
+      "held_polls": 426,
+      "drained": 0,
+      "holds": 59,
+      "lease_expired": 0,
+      "waits": 59,
+      "wait_timeouts": 0,
+      "inflight_reset": 0,
+      "bursts": 0,
+      "burst_frames": 0,
+      "burst_void": 0,
+      "starve_free": 0,
+      "activations": 0
+     },
+     "held": false,
+     "in_flight": false,
+     "mission_active": false,
+     "burst_allowance": 0,
+     "wait_ms": {
+      "p50": 0.0,
+      "p90": 8.81,
+      "max": 12.27,
+      "n": 59
+     },
+     "hold_ms": {
+      "p50": 56.45,
+      "p90": 61.55,
+      "max": 66.04,
+      "n": 59
+     }
+    }
+   },
+   "fstereo_schedule_meta": {
+    "mode": "yield",
+    "lease_s": 0.5,
+    "wait_s": 0.15,
+    "inflight_max_s": 2.5,
+    "heartbeat_s": 1.0,
+    "burst_timeout_s": 0.6,
+    "starve_s": 1.5,
+    "burst_frames_per_request": 2,
+    "counters": {
+     "frames": 531,
+     "delivered": 531,
+     "held_polls": 426,
+     "drained": 0,
+     "holds": 59,
+     "lease_expired": 0,
+     "waits": 59,
+     "wait_timeouts": 0,
+     "inflight_reset": 0,
+     "bursts": 0,
+     "burst_frames": 0,
+     "burst_void": 0,
+     "starve_free": 0,
+     "activations": 0
+    },
+    "held": false,
+    "in_flight": true,
+    "mission_active": false,
+    "burst_allowance": 0,
+    "wait_ms": {
+     "p50": 0.0,
+     "p90": 8.81,
+     "max": 12.27,
+     "n": 59
+    },
+    "hold_ms": {
+     "p50": 56.45,
+     "p90": 61.55,
+     "max": 66.04,
+     "n": 59
+    }
+   },
+   "loadavg_at_end": [
+    4.01,
+    2.48,
+    1.58
+   ],
+   "stereo_mailbox": {
+    "put": 626,
+    "taken": 532,
+    "conflated": 94
+   },
+   "policy_mailbox": {
+    "put": 532,
+    "taken": 532,
+    "dropped_src": 0,
+    "dropped_unwanted": 0,
+    "grid_set": 1,
+    "grid_refused": 0
+   },
+   "warn_error_logs": [
+    "warn: policy: OBS VIEW SHIFT +0.050 m along body x (camera frame [0.0, -0.0341, 0.0366]) \u2014 the depth obs is re-rendered from a virtual viewpoint, NOT the training recipe (TEMPORARY, policy.obs_view_fo"
+   ]
+  },
+  {
+   "arm": "free@0.5",
+   "schedule": "free",
+   "fstereo_scale": 0.5,
+   "fstereo_process": false,
+   "ckpt": "data/checkpoints/umi_depth_5d_peg5d_vitclip_9_27_9_28_20260929_012539.ckpt",
+   "seconds": 30.0,
+   "ready": {
+    "fs_ready": true,
+    "fs_error": "",
+    "policy_ready": true,
+    "policy_error": "",
+    "builder_usable": true,
+    "builder_why": "",
+    "load_s": 6.8
+   },
+   "gpu_other_processes_at_start": [],
+   "loadavg_at_start": [
+    3.7,
+    2.46,
+    1.59
+   ],
+   "cpu_count": 16,
+   "n_plans": 59,
+   "n_steady": 57,
+   "plan_interval_s": {
+    "p10": 0.475,
+    "p50": 0.527,
+    "p90": 0.531,
+    "max": 0.534,
+    "n": 56
+   },
+   "infer_ms": {
+    "p10": 19.6,
+    "p50": 31.4,
+    "p90": 56.6,
+    "max": 59.0,
+    "n": 57
+   },
+   "fs_wait_ms": {
+    "p10": null,
+    "p50": null,
+    "p90": null,
+    "max": null,
+    "n": 0
+   },
+   "fs_wait_timeouts": 0,
+   "pair_dt_ms": {
+    "p10": 66.6,
+    "p50": 66.7,
+    "p90": 66.8,
+    "max": 67.2,
+    "n": 57
+   },
+   "pair_consecutive_pct": 100.0,
+   "pair_dup": 0,
+   "depth_ready_age_ms": {
+    "p10": 56.0,
+    "p50": 60.2,
+    "p90": 63.4,
+    "max": 64.2,
+    "n": 57
+   },
+   "trigger_age_ms": {
+    "p10": 59.6,
+    "p50": 77.9,
+    "p90": 102.8,
+    "max": 103.9,
+    "n": 57
+   },
+   "emit_age_ms": {
+    "p10": 126.5,
+    "p50": 133.4,
+    "p90": 192.4,
+    "max": 194.2,
+    "n": 57
+   },
+   "attempt_ms": {
+    "p10": 54.6,
+    "p50": 68.3,
+    "p90": 89.8,
+    "max": 93.3,
+    "n": 57
+   },
+   "fs_frames_per_s_mission": 15.0,
+   "fs_frames_per_s_idle_before": 15.0,
+   "fs_frames_per_s_idle_after": 15.0,
+   "fs_measured_hz_meta": 14.93,
+   "fs_infer_size": [
+    320,
+    200
+   ],
+   "plan_fs_schedule": [
+    "free"
+   ],
+   "plan_fs_input": [
+    "scale 0.5 it8"
+   ],
+   "plan_fs_process": [
+    "in-station"
+   ],
+   "fstereo_process_meta": {
+    "mode": "in-station"
+   },
+   "policy_counters": {
+    "plans": 59,
+    "skip_degenerate": 0,
+    "skip_pair": 0,
+    "skip_fresh": 0,
+    "skip_history": 0,
+    "skip_no_depth": 0,
+    "skip_stale_depth": 0,
+    "skip_no_start": 0,
+    "skip_grid": 0,
+    "skip_not_ready": 0,
+    "skip_fix_lag": 0,
+    "skip_same_obs": 0,
+    "color_refused": 0,
+    "pair_dup": 0,
+    "pair_fallback": 0,
+    "pair_near": 59,
+    "infer_errors": 0,
+    "epoch_changes": 0,
+    "depth_frames": 509,
+    "states": 831,
+    "history_rows": 831,
+    "ckpt_swaps": 0
+   },
+   "policy_pairing": {
+    "n": 59,
+    "dt_p50_s": 0.0666731820019777,
+    "dt_max_s": 0.06716482399497181,
+    "dup": 0,
+    "fallback": 0,
+    "near": 59,
+    "skip": 0,
+    "tol": 0.6,
+    "fallback_max": 3.0,
+    "skip_fix_lag": 0,
+    "fix_lag_tol": 0.5,
+    "trigger": "depth-frame arrival after period_s",
+    "trigger_detail": "first 20 ms tick after period_s, on the newest frame already in the ring; waits for an arrival only when none came since the last attempt"
+   },
+   "policy_fs_schedule_meta": {
+    "requested": "free",
+    "effective": "free",
+    "why": "",
+    "worker": {
+     "bursts": 0,
+     "burst_timeouts": 0,
+     "burst_refused": 0
+    },
+    "only_lead_s": null,
+    "gate": null
+   },
+   "fstereo_schedule_meta": null,
+   "loadavg_at_end": [
+    5.48,
+    3.04,
+    1.81
+   ],
+   "stereo_mailbox": {
+    "put": 624,
+    "taken": 530,
+    "conflated": 94
+   },
+   "policy_mailbox": {
+    "put": 529,
+    "taken": 509,
+    "dropped_src": 0,
+    "dropped_unwanted": 0,
+    "grid_set": 1,
+    "grid_refused": 0
+   },
+   "warn_error_logs": [
+    "warn: policy: OBS VIEW SHIFT +0.050 m along body x (camera frame [0.0, -0.0341, 0.0366]) \u2014 the depth obs is re-rendered from a virtual viewpoint, NOT the training recipe (TEMPORARY, policy.obs_view_fo"
+   ]
+  },
+  {
+   "arm": "yield@0.5",
+   "schedule": "yield",
+   "fstereo_scale": 0.5,
+   "fstereo_process": false,
+   "ckpt": "data/checkpoints/umi_depth_5d_peg5d_vitclip_9_27_9_28_20260929_012539.ckpt",
+   "seconds": 30.0,
+   "ready": {
+    "fs_ready": true,
+    "fs_error": "",
+    "policy_ready": true,
+    "policy_error": "",
+    "builder_usable": true,
+    "builder_why": "",
+    "load_s": 6.9
+   },
+   "gpu_other_processes_at_start": [],
+   "loadavg_at_start": [
+    5.02,
+    3.03,
+    1.82
+   ],
+   "cpu_count": 16,
+   "n_plans": 59,
+   "n_steady": 57,
+   "plan_interval_s": {
+    "p10": 0.494,
+    "p50": 0.514,
+    "p90": 0.525,
+    "max": 0.528,
+    "n": 56
+   },
+   "infer_ms": {
+    "p10": 19.3,
+    "p50": 19.5,
+    "p90": 20.1,
+    "max": 20.9,
+    "n": 57
+   },
+   "fs_wait_ms": {
+    "p10": 0.0,
+    "p50": 0.0,
+    "p90": 7.3,
+    "max": 9.5,
+    "n": 57
+   },
+   "fs_wait_timeouts": 0,
+   "pair_dt_ms": {
+    "p10": 66.6,
+    "p50": 66.7,
+    "p90": 66.8,
+    "max": 66.9,
+    "n": 57
+   },
+   "pair_consecutive_pct": 100.0,
+   "pair_dup": 0,
+   "depth_ready_age_ms": {
+    "p10": 48.9,
+    "p50": 52.0,
+    "p90": 67.8,
+    "max": 70.1,
+    "n": 57
+   },
+   "trigger_age_ms": {
+    "p10": 69.0,
+    "p50": 89.8,
+    "p90": 111.0,
+    "max": 113.0,
+    "n": 57
+   },
+   "emit_age_ms": {
+    "p10": 122.3,
+    "p50": 142.9,
+    "p90": 163.8,
+    "max": 169.0,
+    "n": 57
+   },
+   "attempt_ms": {
+    "p10": 51.0,
+    "p50": 54.2,
+    "p90": 64.4,
+    "max": 66.7,
+    "n": 57
+   },
+   "fs_frames_per_s_mission": 15.0,
+   "fs_frames_per_s_idle_before": 15.0,
+   "fs_frames_per_s_idle_after": 15.0,
+   "fs_measured_hz_meta": 15.5,
+   "fs_infer_size": [
+    320,
+    200
+   ],
+   "plan_fs_schedule": [
+    "yield"
+   ],
+   "plan_fs_input": [
+    "scale 0.5 it8"
+   ],
+   "plan_fs_process": [
+    "in-station"
+   ],
+   "fstereo_process_meta": {
+    "mode": "in-station"
+   },
+   "policy_counters": {
+    "plans": 59,
+    "skip_degenerate": 0,
+    "skip_pair": 0,
+    "skip_fresh": 0,
+    "skip_history": 0,
+    "skip_no_depth": 0,
+    "skip_stale_depth": 0,
+    "skip_no_start": 0,
+    "skip_grid": 0,
+    "skip_not_ready": 0,
+    "skip_fix_lag": 0,
+    "skip_same_obs": 0,
+    "color_refused": 0,
+    "pair_dup": 0,
+    "pair_fallback": 0,
+    "pair_near": 59,
+    "infer_errors": 0,
+    "epoch_changes": 0,
+    "depth_frames": 530,
+    "states": 832,
+    "history_rows": 832,
+    "ckpt_swaps": 0
+   },
+   "policy_pairing": {
+    "n": 59,
+    "dt_p50_s": 0.06667978400218999,
+    "dt_max_s": 0.06686689900379861,
+    "dup": 0,
+    "fallback": 0,
+    "near": 59,
+    "skip": 0,
+    "tol": 0.6,
+    "fallback_max": 3.0,
+    "skip_fix_lag": 0,
+    "fix_lag_tol": 0.5,
+    "trigger": "depth-frame arrival after period_s",
+    "trigger_detail": "first 20 ms tick after period_s, on the newest frame already in the ring; waits for an arrival only when none came since the last attempt"
+   },
+   "policy_fs_schedule_meta": {
+    "requested": "yield",
+    "effective": "yield",
+    "why": "",
+    "worker": {
+     "bursts": 0,
+     "burst_timeouts": 0,
+     "burst_refused": 0
+    },
+    "only_lead_s": null,
+    "gate": {
+     "mode": "yield",
+     "lease_s": 0.5,
+     "wait_s": 0.15,
+     "inflight_max_s": 2.5,
+     "heartbeat_s": 1.0,
+     "burst_timeout_s": 0.6,
+     "starve_s": 1.5,
+     "burst_frames_per_request": 2,
+     "counters": {
+      "frames": 530,
+      "delivered": 530,
+      "held_polls": 425,
+      "drained": 0,
+      "holds": 59,
+      "lease_expired": 0,
+      "waits": 59,
+      "wait_timeouts": 0,
+      "inflight_reset": 0,
+      "bursts": 0,
+      "burst_frames": 0,
+      "burst_void": 0,
+      "starve_free": 0,
+      "activations": 0
+     },
+     "held": false,
+     "in_flight": true,
+     "mission_active": false,
+     "burst_allowance": 0,
+     "wait_ms": {
+      "p50": 0.0,
+      "p90": 7.44,
+      "max": 9.52,
+      "n": 59
+     },
+     "hold_ms": {
+      "p50": 54.2,
+      "p90": 64.72,
+      "max": 66.66,
+      "n": 59
+     }
+    }
+   },
+   "fstereo_schedule_meta": {
+    "mode": "yield",
+    "lease_s": 0.5,
+    "wait_s": 0.15,
+    "inflight_max_s": 2.5,
+    "heartbeat_s": 1.0,
+    "burst_timeout_s": 0.6,
+    "starve_s": 1.5,
+    "burst_frames_per_request": 2,
+    "counters": {
+     "frames": 530,
+     "delivered": 530,
+     "held_polls": 425,
+     "drained": 0,
+     "holds": 59,
+     "lease_expired": 0,
+     "waits": 59,
+     "wait_timeouts": 0,
+     "inflight_reset": 0,
+     "bursts": 0,
+     "burst_frames": 0,
+     "burst_void": 0,
+     "starve_free": 0,
+     "activations": 0
+    },
+    "held": false,
+    "in_flight": true,
+    "mission_active": false,
+    "burst_allowance": 0,
+    "wait_ms": {
+     "p50": 0.0,
+     "p90": 7.44,
+     "max": 9.52,
+     "n": 59
+    },
+    "hold_ms": {
+     "p50": 54.2,
+     "p90": 64.72,
+     "max": 66.66,
+     "n": 59
+    }
+   },
+   "loadavg_at_end": [
+    6.55,
+    3.63,
+    2.07
+   ],
+   "stereo_mailbox": {
+    "put": 626,
+    "taken": 531,
+    "conflated": 95
+   },
+   "policy_mailbox": {
+    "put": 530,
+    "taken": 530,
+    "dropped_src": 0,
+    "dropped_unwanted": 0,
+    "grid_set": 1,
+    "grid_refused": 0
+   },
+   "warn_error_logs": [
+    "warn: policy: OBS VIEW SHIFT +0.050 m along body x (camera frame [0.0, -0.0341, 0.0366]) \u2014 the depth obs is re-rendered from a virtual viewpoint, NOT the training recipe (TEMPORARY, policy.obs_view_fo"
+   ]
+  },
+  {
+   "arm": "free+proc@0.5",
+   "schedule": "free",
+   "fstereo_scale": 0.5,
+   "fstereo_process": true,
+   "ckpt": "data/checkpoints/umi_depth_5d_peg5d_vitclip_9_27_9_28_20260929_012539.ckpt",
+   "seconds": 30.0,
+   "ready": {
+    "fs_ready": true,
+    "fs_error": "",
+    "policy_ready": true,
+    "policy_error": "",
+    "builder_usable": true,
+    "builder_why": "",
+    "load_s": 6.6
+   },
+   "gpu_other_processes_at_start": [],
+   "loadavg_at_start": [
+    5.92,
+    3.59,
+    2.07
+   ],
+   "cpu_count": 16,
+   "n_plans": 59,
+   "n_steady": 57,
+   "plan_interval_s": {
+    "p10": 0.485,
+    "p50": 0.517,
+    "p90": 0.53,
+    "max": 0.535,
+    "n": 56
+   },
+   "infer_ms": {
+    "p10": 19.6,
+    "p50": 29.5,
+    "p90": 42.9,
+    "max": 49.3,
+    "n": 57
+   },
+   "fs_wait_ms": {
+    "p10": null,
+    "p50": null,
+    "p90": null,
+    "max": null,
+    "n": 0
+   },
+   "fs_wait_timeouts": 0,
+   "pair_dt_ms": {
+    "p10": 66.6,
+    "p50": 66.7,
+    "p90": 66.8,
+    "max": 67.0,
+    "n": 57
+   },
+   "pair_consecutive_pct": 100.0,
+   "pair_dup": 0,
+   "depth_ready_age_ms": {
+    "p10": 52.7,
+    "p50": 58.2,
+    "p90": 62.7,
+    "max": 69.2,
+    "n": 57
+   },
+   "trigger_age_ms": {
+    "p10": 55.5,
+    "p50": 77.4,
+    "p90": 100.1,
+    "max": 101.4,
+    "n": 57
+   },
+   "emit_age_ms": {
+    "p10": 124.6,
+    "p50": 132.9,
+    "p90": 179.2,
+    "max": 186.4,
+    "n": 57
+   },
+   "attempt_ms": {
+    "p10": 55.6,
+    "p50": 65.0,
+    "p90": 79.4,
+    "max": 86.2,
+    "n": 57
+   },
+   "fs_frames_per_s_mission": 15.0,
+   "fs_frames_per_s_idle_before": 15.0,
+   "fs_frames_per_s_idle_after": 15.0,
+   "fs_measured_hz_meta": 15.04,
+   "fs_infer_size": [
+    320,
+    200
+   ],
+   "plan_fs_schedule": [
+    "free"
+   ],
+   "plan_fs_input": [
+    "scale 0.5 it8"
+   ],
+   "plan_fs_process": [
+    "child"
+   ],
+   "fstereo_process_meta": {
+    "mode": "child",
+    "pid": 191191,
+    "alive": true,
+    "exit_code": null,
+    "python": "/home/bdml/miniforge3/envs/rovgui-pose/bin/python",
+    "transport": "two AF_UNIX socketpairs, multiprocessing.connection framing (pickled numpy)",
+    "protocol": 2,
+    "load_s_child": 4.93,
+    "load_s_station": 5.0,
+    "frames_ok": 530,
+    "frames_error": 0,
+    "first_frame_ms": 1358.9,
+    "rpc_ms": {
+     "p50": 44.3,
+     "p90": 46.21,
+     "max": 68.28,
+     "n": 529
+    },
+    "ipc_ms": {
+     "p50": 0.44,
+     "p90": 0.58,
+     "max": 1.69,
+     "n": 529
+    },
+    "stats_scope": "the last <= 2000 round trips of this STATION SESSION when the meta was written, frame 1 excluded (first_frame_ms) \u2014 not this CSV's window alone",
+    "rig_sends": 1,
+    "timeouts_s": {
+     "first_infer": 10.0,
+     "infer": 5.0,
+     "load": 120.0,
+     "send_per_message": 5.0
+    }
+   },
+   "policy_counters": {
+    "plans": 59,
+    "skip_degenerate": 0,
+    "skip_pair": 0,
+    "skip_fresh": 0,
+    "skip_history": 0,
+    "skip_no_depth": 0,
+    "skip_stale_depth": 0,
+    "skip_no_start": 0,
+    "skip_grid": 0,
+    "skip_not_ready": 0,
+    "skip_fix_lag": 0,
+    "skip_same_obs": 0,
+    "color_refused": 0,
+    "pair_dup": 0,
+    "pair_fallback": 0,
+    "pair_near": 59,
+    "infer_errors": 0,
+    "epoch_changes": 0,
+    "depth_frames": 530,
+    "states": 830,
+    "history_rows": 830,
+    "ckpt_swaps": 0
+   },
+   "policy_pairing": {
+    "n": 59,
+    "dt_p50_s": 0.06665810200502165,
+    "dt_max_s": 0.06702888499421533,
+    "dup": 0,
+    "fallback": 0,
+    "near": 59,
+    "skip": 0,
+    "tol": 0.6,
+    "fallback_max": 3.0,
+    "skip_fix_lag": 0,
+    "fix_lag_tol": 0.5,
+    "trigger": "depth-frame arrival after period_s",
+    "trigger_detail": "first 20 ms tick after period_s, on the newest frame already in the ring; waits for an arrival only when none came since the last attempt"
+   },
+   "policy_fs_schedule_meta": {
+    "requested": "free",
+    "effective": "free",
+    "why": "",
+    "worker": {
+     "bursts": 0,
+     "burst_timeouts": 0,
+     "burst_refused": 0
+    },
+    "only_lead_s": null,
+    "gate": null
+   },
+   "fstereo_schedule_meta": null,
+   "loadavg_at_end": [
+    7.09,
+    4.14,
+    2.32
+   ],
+   "stereo_mailbox": {
+    "put": 622,
+    "taken": 530,
+    "conflated": 92
+   },
+   "policy_mailbox": {
+    "put": 530,
+    "taken": 530,
+    "dropped_src": 0,
+    "dropped_unwanted": 0,
+    "grid_set": 1,
+    "grid_refused": 0
+   },
+   "warn_error_logs": [
+    "warn: policy: OBS VIEW SHIFT +0.050 m along body x (camera frame [0.0, -0.0341, 0.0366]) \u2014 the depth obs is re-rendered from a virtual viewpoint, NOT the training recipe (TEMPORARY, policy.obs_view_fo"
+   ]
+  },
+  {
+   "arm": "yield+proc@0.5",
+   "schedule": "yield",
+   "fstereo_scale": 0.5,
+   "fstereo_process": true,
+   "ckpt": "data/checkpoints/umi_depth_5d_peg5d_vitclip_9_27_9_28_20260929_012539.ckpt",
+   "seconds": 30.0,
+   "ready": {
+    "fs_ready": true,
+    "fs_error": "",
+    "policy_ready": true,
+    "policy_error": "",
+    "builder_usable": true,
+    "builder_why": "",
+    "load_s": 6.6
+   },
+   "gpu_other_processes_at_start": [],
+   "loadavg_at_start": [
+    7.32,
+    4.24,
+    2.36
+   ],
+   "cpu_count": 16,
+   "n_plans": 59,
+   "n_steady": 57,
+   "plan_interval_s": {
+    "p10": 0.495,
+    "p50": 0.516,
+    "p90": 0.523,
+    "max": 0.526,
+    "n": 56
+   },
+   "infer_ms": {
+    "p10": 19.3,
+    "p50": 19.5,
+    "p90": 19.9,
+    "max": 20.4,
+    "n": 57
+   },
+   "fs_wait_ms": {
+    "p10": 0.0,
+    "p50": 0.0,
+    "p90": 6.5,
+    "max": 14.0,
+    "n": 57
+   },
+   "fs_wait_timeouts": 0,
+   "pair_dt_ms": {
+    "p10": 66.6,
+    "p50": 66.7,
+    "p90": 66.8,
+    "max": 67.2,
+    "n": 57
+   },
+   "pair_consecutive_pct": 100.0,
+   "pair_dup": 0,
+   "depth_ready_age_ms": {
+    "p10": 49.0,
+    "p50": 51.7,
+    "p90": 67.6,
+    "max": 69.8,
+    "n": 57
+   },
+   "trigger_age_ms": {
+    "p10": 67.8,
+    "p50": 89.8,
+    "p90": 108.9,
+    "max": 110.5,
+    "n": 57
+   },
+   "emit_age_ms": {
+    "p10": 123.9,
+    "p50": 143.8,
+    "p90": 163.5,
+    "max": 166.4,
+    "n": 57
+   },
+   "attempt_ms": {
+    "p10": 51.7,
+    "p50": 55.6,
+    "p90": 62.6,
+    "max": 64.9,
+    "n": 57
+   },
+   "fs_frames_per_s_mission": 15.0,
+   "fs_frames_per_s_idle_before": 15.0,
+   "fs_frames_per_s_idle_after": 15.0,
+   "fs_measured_hz_meta": 15.0,
+   "fs_infer_size": [
+    320,
+    200
+   ],
+   "plan_fs_schedule": [
+    "yield"
+   ],
+   "plan_fs_input": [
+    "scale 0.5 it8"
+   ],
+   "plan_fs_process": [
+    "child"
+   ],
+   "fstereo_process_meta": {
+    "mode": "child",
+    "pid": 191659,
+    "alive": true,
+    "exit_code": null,
+    "python": "/home/bdml/miniforge3/envs/rovgui-pose/bin/python",
+    "transport": "two AF_UNIX socketpairs, multiprocessing.connection framing (pickled numpy)",
+    "protocol": 2,
+    "load_s_child": 4.97,
+    "load_s_station": 5.05,
+    "frames_ok": 529,
+    "frames_error": 0,
+    "first_frame_ms": 1355.8,
+    "rpc_ms": {
+     "p50": 44.5,
+     "p90": 46.05,
+     "max": 50.02,
+     "n": 528
+    },
+    "ipc_ms": {
+     "p50": 0.47,
+     "p90": 0.58,
+     "max": 0.87,
+     "n": 528
+    },
+    "stats_scope": "the last <= 2000 round trips of this STATION SESSION when the meta was written, frame 1 excluded (first_frame_ms) \u2014 not this CSV's window alone",
+    "rig_sends": 1,
+    "timeouts_s": {
+     "first_infer": 10.0,
+     "infer": 5.0,
+     "load": 120.0,
+     "send_per_message": 5.0
+    }
+   },
+   "policy_counters": {
+    "plans": 59,
+    "skip_degenerate": 0,
+    "skip_pair": 0,
+    "skip_fresh": 0,
+    "skip_history": 0,
+    "skip_no_depth": 0,
+    "skip_stale_depth": 0,
+    "skip_no_start": 0,
+    "skip_grid": 0,
+    "skip_not_ready": 0,
+    "skip_fix_lag": 0,
+    "skip_same_obs": 0,
+    "color_refused": 0,
+    "pair_dup": 0,
+    "pair_fallback": 0,
+    "pair_near": 59,
+    "infer_errors": 0,
+    "epoch_changes": 0,
+    "depth_frames": 529,
+    "states": 829,
+    "history_rows": 829,
+    "ckpt_swaps": 0
+   },
+   "policy_pairing": {
+    "n": 59,
+    "dt_p50_s": 0.06665910299489042,
+    "dt_max_s": 0.06717714599653846,
+    "dup": 0,
+    "fallback": 0,
+    "near": 59,
+    "skip": 0,
+    "tol": 0.6,
+    "fallback_max": 3.0,
+    "skip_fix_lag": 0,
+    "fix_lag_tol": 0.5,
+    "trigger": "depth-frame arrival after period_s",
+    "trigger_detail": "first 20 ms tick after period_s, on the newest frame already in the ring; waits for an arrival only when none came since the last attempt"
+   },
+   "policy_fs_schedule_meta": {
+    "requested": "yield",
+    "effective": "yield",
+    "why": "",
+    "worker": {
+     "bursts": 0,
+     "burst_timeouts": 0,
+     "burst_refused": 0
+    },
+    "only_lead_s": null,
+    "gate": {
+     "mode": "yield",
+     "lease_s": 0.5,
+     "wait_s": 0.15,
+     "inflight_max_s": 2.5,
+     "heartbeat_s": 1.0,
+     "burst_timeout_s": 0.6,
+     "starve_s": 1.5,
+     "burst_frames_per_request": 2,
+     "counters": {
+      "frames": 530,
+      "delivered": 529,
+      "held_polls": 426,
+      "drained": 0,
+      "holds": 59,
+      "lease_expired": 0,
+      "waits": 59,
+      "wait_timeouts": 0,
+      "inflight_reset": 0,
+      "bursts": 0,
+      "burst_frames": 0,
+      "burst_void": 0,
+      "starve_free": 0,
+      "activations": 0
+     },
+     "held": false,
+     "in_flight": false,
+     "mission_active": false,
+     "burst_allowance": 0,
+     "wait_ms": {
+      "p50": 0.0,
+      "p90": 6.56,
+      "max": 13.99,
+      "n": 59
+     },
+     "hold_ms": {
+      "p50": 55.58,
+      "p90": 62.67,
+      "max": 64.88,
+      "n": 59
+     }
+    }
+   },
+   "fstereo_schedule_meta": {
+    "mode": "yield",
+    "lease_s": 0.5,
+    "wait_s": 0.15,
+    "inflight_max_s": 2.5,
+    "heartbeat_s": 1.0,
+    "burst_timeout_s": 0.6,
+    "starve_s": 1.5,
+    "burst_frames_per_request": 2,
+    "counters": {
+     "frames": 529,
+     "delivered": 529,
+     "held_polls": 426,
+     "drained": 0,
+     "holds": 59,
+     "lease_expired": 0,
+     "waits": 59,
+     "wait_timeouts": 0,
+     "inflight_reset": 0,
+     "bursts": 0,
+     "burst_frames": 0,
+     "burst_void": 0,
+     "starve_free": 0,
+     "activations": 0
+    },
+    "held": false,
+    "in_flight": true,
+    "mission_active": false,
+    "burst_allowance": 0,
+    "wait_ms": {
+     "p50": 0.0,
+     "p90": 6.56,
+     "max": 13.99,
+     "n": 59
+    },
+    "hold_ms": {
+     "p50": 55.58,
+     "p90": 62.67,
+     "max": 64.88,
+     "n": 59
+    }
+   },
+   "loadavg_at_end": [
+    6.82,
+    4.52,
+    2.53
+   ],
+   "stereo_mailbox": {
+    "put": 622,
+    "taken": 530,
+    "conflated": 92
+   },
+   "policy_mailbox": {
+    "put": 529,
+    "taken": 529,
+    "dropped_src": 0,
+    "dropped_unwanted": 0,
+    "grid_set": 1,
+    "grid_refused": 0
+   },
+   "warn_error_logs": [
+    "warn: policy: OBS VIEW SHIFT +0.050 m along body x (camera frame [0.0, -0.0341, 0.0366]) \u2014 the depth obs is re-rendered from a virtual viewpoint, NOT the training recipe (TEMPORARY, policy.obs_view_fo"
+   ]
+  },
+  {
+   "arm": "free@0.5",
+   "schedule": "free",
+   "fstereo_scale": 0.5,
+   "fstereo_process": false,
+   "ckpt": "data/checkpoints/umi_depth_5d_peg5d_vitclip_9_27_9_28_20260929_012539.ckpt",
+   "seconds": 30.0,
+   "ready": {
+    "fs_ready": true,
+    "fs_error": "",
+    "policy_ready": true,
+    "policy_error": "",
+    "builder_usable": true,
+    "builder_why": "",
+    "load_s": 6.8
+   },
+   "gpu_other_processes_at_start": [],
+   "loadavg_at_start": [
+    6.44,
+    4.48,
+    2.53
+   ],
+   "cpu_count": 16,
+   "n_plans": 59,
+   "n_steady": 57,
+   "plan_interval_s": {
+    "p10": 0.476,
+    "p50": 0.526,
+    "p90": 0.533,
+    "max": 0.537,
+    "n": 56
+   },
+   "infer_ms": {
+    "p10": 19.8,
+    "p50": 30.6,
+    "p90": 56.7,
+    "max": 59.1,
+    "n": 57
+   },
+   "fs_wait_ms": {
+    "p10": null,
+    "p50": null,
+    "p90": null,
+    "max": null,
+    "n": 0
+   },
+   "fs_wait_timeouts": 0,
+   "pair_dt_ms": {
+    "p10": 66.6,
+    "p50": 66.7,
+    "p90": 66.8,
+    "max": 67.1,
+    "n": 57
+   },
+   "pair_consecutive_pct": 100.0,
+   "pair_dup": 0,
+   "depth_ready_age_ms": {
+    "p10": 55.7,
+    "p50": 60.2,
+    "p90": 62.7,
+    "max": 65.2,
+    "n": 57
+   },
+   "trigger_age_ms": {
+    "p10": 59.5,
+    "p50": 78.7,
+    "p90": 101.5,
+    "max": 105.4,
+    "n": 57
+   },
+   "emit_age_ms": {
+    "p10": 125.6,
+    "p50": 133.0,
+    "p90": 191.6,
+    "max": 194.2,
+    "n": 57
+   },
+   "attempt_ms": {
+    "p10": 54.8,
+    "p50": 68.4,
+    "p90": 92.3,
+    "max": 95.2,
+    "n": 57
+   },
+   "fs_frames_per_s_mission": 15.0,
+   "fs_frames_per_s_idle_before": 15.0,
+   "fs_frames_per_s_idle_after": 15.0,
+   "fs_measured_hz_meta": 15.1,
+   "fs_infer_size": [
+    320,
+    200
+   ],
+   "plan_fs_schedule": [
+    "free"
+   ],
+   "plan_fs_input": [
+    "scale 0.5 it8"
+   ],
+   "plan_fs_process": [
+    "in-station"
+   ],
+   "fstereo_process_meta": {
+    "mode": "in-station"
+   },
+   "policy_counters": {
+    "plans": 59,
+    "skip_degenerate": 0,
+    "skip_pair": 0,
+    "skip_fresh": 0,
+    "skip_history": 0,
+    "skip_no_depth": 0,
+    "skip_stale_depth": 0,
+    "skip_no_start": 0,
+    "skip_grid": 0,
+    "skip_not_ready": 0,
+    "skip_fix_lag": 0,
+    "skip_same_obs": 0,
+    "color_refused": 0,
+    "pair_dup": 0,
+    "pair_fallback": 0,
+    "pair_near": 59,
+    "infer_errors": 0,
+    "epoch_changes": 0,
+    "depth_frames": 510,
+    "states": 831,
+    "history_rows": 831,
+    "ckpt_swaps": 0
+   },
+   "policy_pairing": {
+    "n": 59,
+    "dt_p50_s": 0.06666120699810563,
+    "dt_max_s": 0.06712992699613096,
+    "dup": 0,
+    "fallback": 0,
+    "near": 59,
+    "skip": 0,
+    "tol": 0.6,
+    "fallback_max": 3.0,
+    "skip_fix_lag": 0,
+    "fix_lag_tol": 0.5,
+    "trigger": "depth-frame arrival after period_s",
+    "trigger_detail": "first 20 ms tick after period_s, on the newest frame already in the ring; waits for an arrival only when none came since the last attempt"
+   },
+   "policy_fs_schedule_meta": {
+    "requested": "free",
+    "effective": "free",
+    "why": "",
+    "worker": {
+     "bursts": 0,
+     "burst_timeouts": 0,
+     "burst_refused": 0
+    },
+    "only_lead_s": null,
+    "gate": null
+   },
+   "fstereo_schedule_meta": null,
+   "loadavg_at_end": [
+    7.74,
+    5.02,
+    2.79
+   ],
+   "stereo_mailbox": {
+    "put": 624,
+    "taken": 531,
+    "conflated": 93
+   },
+   "policy_mailbox": {
+    "put": 530,
+    "taken": 510,
+    "dropped_src": 0,
+    "dropped_unwanted": 0,
+    "grid_set": 1,
+    "grid_refused": 0
+   },
+   "warn_error_logs": [
+    "warn: policy: OBS VIEW SHIFT +0.050 m along body x (camera frame [0.0, -0.0341, 0.0366]) \u2014 the depth obs is re-rendered from a virtual viewpoint, NOT the training recipe (TEMPORARY, policy.obs_view_fo"
+   ]
+  }
+ ]
+}

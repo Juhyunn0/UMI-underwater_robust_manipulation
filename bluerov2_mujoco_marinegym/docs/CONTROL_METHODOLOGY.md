@@ -1549,3 +1549,446 @@ Scope trims: `transport: rc_override`, the STABILIZE lean-angle cascade, the PID
 the run_compare attitude scenario and the armed in-water sign-probe mission are NOT in this cut.
 **Zero hardware runs**: firmware s/t consumption, the K/M sign and the torque gains are unconfirmed
 (KNOWN_ISSUES.md 2026-09-26).
+
+## 2026-10-01 — A DVL becomes the estimator's third sensor: AprilTag + IMU + DVL (OFF by default; no DVL mounted yet)
+
+An addition behind three switches, not a replacement. **Written before the hardware exists**: against the
+Water Linked DVL A50 protocol pages and a 12 s capture of the vendor's public demo unit
+(`rov_gui/tests/fixtures/dvl_a50_demo_capture_20261001.jsonl`); nothing below is a measurement on this vehicle.
+Revised 2026-10-02 after a three-reviewer pass (safety / correctness / estimation theory); the points it changed
+are marked ⟲. Revised again the same day after a timing simulation and three more independent passes, every
+finding re-checked by a skeptic before it was acted on (round 2: four reviewers, 28 confirmed; round 3, on the
+fixes: 9 confirmed; round 4, on those fixes: 8 — its skeptic did not run (session limit) and the main session re-ran
+the scripts instead; round 5: 3 from the worker reviewer, plus 3 more from the other reviewer's interim runs —
+neither round-5 skeptic finished, so the main session reproduced or derived each before acting; round 6, one
+reviewer on the round-5 fixes: PASS_WITH_FIXES, 1 medium fixed + 1 low documented, intent-A parity re-measured at
+0 differences incl. a fed IMU rung; none critical in any round); those points are marked ⟲⟲.
+
+* **What changes.** Only the SOURCE of the HORIZONTAL body velocity. `StateAssembler.step(..., vel_xy=None,
+  disp_xy=None)` (`rov_gui/control/state_assembler.py`): with a `vel_xy` the measured (surge, sway) replaces the
+  low-passed tag finite difference as `nu[0:2]` and in the `nudot` transport term. Position (x, y, yaw from tag PnP),
+  z, roll/pitch and the rates are untouched. `vel_xy=None` is the pre-DVL arithmetic, operation for operation
+  (`test_dvl.py::test_without_a_dvl_the_assembler_is_bit_identical_to_before`, float64 `==`). This is the operator's
+  choice of structure (2026-10-01): a velocity source in the existing assembler, not a new EKF. The EAOB's
+  measurement sigmas are NOT changed with the source.
+* ⟲ **The heave rate is not consumed.** `nu[2]` stays on the tag finite difference. The proof below sees surge and
+  sway only, so a tilted bracket (a pitch error e only scales one row by cos e — 20 deg passes), a wrong vz sign
+  convention or a wrong lever arm would otherwise put an unverified number into the heave loop with every gate
+  silent. The DVL's w is recorded (`dvl_w`) for the day a vertical check exists.
+* ⟲ **Fix-age bridging is an integral.** `p = p_tag(t_capture) + R · ∫ v_dvl dt` over the DVL history
+  (`DvlAid.displacement`, piecewise-linear), not "newest velocity × age" — which is not an integral once the
+  velocity keeps updating under an ageing fix (at a kick the estimate ran ahead, then back).
+* **Why not an EKF.** The paper that motivated it ("Learning to Swim", arXiv:2410.00120v2) fuses AprilTag + DVL +
+  IMU in an EKF and gives no state vector, noise or delay handling; its platform paper (CUREE, arXiv:2303.03943)
+  says a Waterlinked DVL and an IMU give dead reckoning that an EKF fuses with global fixes. The role split is what
+  transfers: tag = absolute position, DVL = direct velocity + the bridge when the tag is gone. An EKF tuned with no
+  data would be all [예측] and would change the DVL-off path that every recorded run was flown on.
+* **Three switches.** `dvl.enabled` / `--dvl` builds the TCP client (off = nothing constructed). `dvl.use` / the
+  trajectory panel's DVL button decides whether the estimator CONSUMES it; OUT = shadow (received, gated, compared,
+  recorded; commands bit-identical to no DVL). The button changes it only while disengaged and with no controller
+  CSV open (operator decision: one run = one estimator). Third, per tick and automatic: a sample that fails a data
+  gate makes THAT tick fall back to the tag finite difference.
+* ⟲ **Automation may only take the DVL OUT.** (1) Whether an ENGAGEMENT may use the DVL is decided once, at engage
+  (`_dvl_arm_run`: switch IN, proof satisfied, not tripped) — a proof that completes mid-run counts from the next
+  engagement. (2) Evidence that the DVL is WRONG is a TRIP, latched until the operator sets the switch OUT then IN
+  (which the proof gate must allow), and independent of `require_proven` (round 1 found the opt-out silently
+  disabled the in-flight monitor too). (3) A missing lock / stale link / single outlier is not a trip; the DVL
+  returns by itself after `reentry_s`. ⟲⟲ (4) Once this session's data has said the DVL is wrong — a trip, or a
+  refuting fit seen in shadow — IN needs a proof made AFTER that, also under `require_proven: false`: the opt-out
+  waives the proof a DVL with nothing against it would need, not the one evidence demands (the audit re-armed a
+  tripped DVL one second later on nothing, the trip having deleted its own evidence). A trip discards the proof and
+  its pairs; so does a change of the device's configuration in EVERY state (in shadow 59 old pairs + 1 new one
+  completed a proof of a stream that no longer existed), and a proof re-made under a latch falls to the next
+  evidence like any other (the first cut guarded every trip with "not already tripped"). (5) A trip needs the DVL
+  to be wrong in a way that LASTS, and there are two such ways: the MOUNT — the tag velocity SEES the motion the
+  DVL reports (at least 80 % of it, `COHERENT_MIN`) and puts it elsewhere (alignment monitor; a coherent refutation
+  by the fit) — and a FALSE LOCK — the DVL stands apart from the tag velocity by more than 8 cm/s for about a
+  second, whatever the tags saw (difference monitor; its message says "a false bottom lock rather than the mount").
+  NOT a trip: a glitch of a few reports (once or every few seconds), zero-mean DVL noise, a fit that refutes only
+  because the DVL "moves" and the tags do not. Those are HELD BACK without a latch, three ways, and the DVL returns
+  by itself: an INNOVATION HOLD (a rejected sample keeps the DVL out until a tag velocity from a NEWER camera frame
+  agrees — the same frame growing older does not rehabilitate it; keyed on "a fresh frame" instead, the hold never
+  released once the tags ran 0.25 s late, or was never set — round 5; and a rejected sample stays out of the
+  fix-age integral after the release, which otherwise put 9–11 cm into eta and the rung carried it — round 6), an
+  ALIGNMENT HOLD (the alignment monitor reads
+  the DVL's motion as going where the tags do not show it, however little of it the tags see), and a REFUTATION
+  HOLD (the fit refutes it, with the newest refuting evaluation within `REFUTE_HOLD_S` 3 s). Each threshold here
+  answers a reproduced failure: without "tags see it", two reports 12 cm/s off or 3 cm/s of DVL noise at rest
+  latched out a correct, proven mount (round 2); at one half, 2–2.5 cm/s of noise, 4-report glitches every
+  3–10 s (a "scale 1.3×" refutation) and one 4-report glitch at a square's corner still did (round 4); without the
+  refutation hold a wrong mount under noise was flown while the fit refuted it (round 3), and without its 3 s
+  staleness a DVL that went quiet stayed held for ~52 s (round 4); without the innovation hold a false lock the
+  gate was rejecting went back in as the fix aged (round 4, below).
+* **The "proven" gate.** A wrong mount is unobservable at rest and is wrong-signed velocity feedback in motion.
+  IN is refused until (1) `dvl.mount_rpy_deg` / `mount_t_flu` are filled in from a tape measure and (2) this
+  session's data proves the mount: least squares `v_tag_fd ≈ A v_dvl` over (surge, sway) pairs — raw two-point tag
+  differences at their midpoint against the DVL velocity interpolated there, DVL as the regressor (the cleaner
+  signal), pairs admitted only above 2 cm/s of DVL speed. ⟲ The verdict is THREE-WAY with a standard error
+  σ = residual scatter / (√n · rms speed along the weaker axis): proven iff max|A − I| + 3σ ≤ 0.25, refuted iff
+  max|A − I| − 3σ > 0.25, otherwise "not decided yet". One trimmed refit sets tag jumps aside; if fewer than 60
+  pairs survive the trim the verdict is withheld (round 1 reproduced a correct mount called "rotated 27 deg" when
+  the window shrank to the minimum with one tag jump in it); un-proving a proven mount takes 15 consecutive
+  refuting fits. It reports the yaw to add to the mount and the scale. Synthetic prototype only [예측: tag noise
+  0.8 mm at 15 Hz, DVL noise 3 mm/s assumed]: 8 s of 8–12 cm/s surge+sway gives A ± 0.01 and yaw ± 0.3 deg;
+  20/90/180 deg mounts, a mirrored axis and a 1.33 scale are each refused by name; surge-only and station-keeping
+  give no verdict. NOT seen by the proof: the vertical axis, mount tilt, the lever arm. ⟲⟲ The fit also reports
+  `lag_s` — how much later the tag velocity describes the motion than the DVL velocity carrying the same stamp
+  (the residual's slope on the DVL's acceleration) — as a commissioning number, logged with the proof: everything
+  here pairs the two sensors by their stamps. It is biased toward zero by the noisy acceleration (+33 / +49 /
+  +73 ms read for 50 / 100 / 150 ms in the simulation below [예측]) and reads zero on a single-frequency ellipse,
+  where the lag is absorbed into A as a rotation — so it is taken on straight passes and read as a floor.
+* ⟲⟲ **In flight: two trips, gates and holds.** Both trips (latched) are fed by the proof's own evidence — one
+  TIME-ALIGNED pair per new tag fix: the raw two-point tag difference against the DVL velocity interpolated to its
+  midpoint. Not by the tick's low-passed tag velocity against the newest DVL sample, which is what the first cut
+  did: whatever the two latencies differ by is then booked as disagreement, and in the timing simulation below a
+  CORRECT mount tripped once they differed by ~0.15 s and the vehicle oscillated at 0.5 Hz or faster [예측:
+  observed while designing, 2026-10-02]. (a) The low-passed (1 s) horizontal difference VECTOR above 8 cm/s — a
+  standing offset, a lasting false lock; a reversed mount is invisible to it below 4 cm/s [유도: the difference is
+  twice the speed] and so is any oscillation. Each pair's difference is clipped at a FIXED 15 cm/s (innov_max):
+  one jumped tag fix (metres per second in a raw difference) or one short burst cannot trip, a DVL grossly wrong
+  pair after pair trips in about 0.8 s. ⟲⟲ (The clip used to be 4σ of the proof's scatter; with 3 mm tags that
+  was 36 cm/s and ONE 3–4 report glitch tripped it in 0.4 s — round 4.) (b) ALIGNMENT, the proof in miniature
+  over the last second: along each principal direction e of the DVL velocity that moves faster than 2 cm/s rms,
+  `1 − |A e − e|` for the least-squares map A: tag ← DVL (1 the same motion, −1 reversed, −0.4 a quarter turn);
+  below 0.5 by three standard errors — from that regression's own residual, so slow or noisy motion is "no
+  evidence" — it holds the DVL back, and it trips when the tags also see ≥ 80 % of that motion for 0.4 s on end.
+  Principal directions rather than body axes because a mount a few degrees out leaks surge into the DVL's sway
+  and a per-axis slope reads the leak as "sway disagrees"; the hold because the first pair or two of a new motion
+  are that direction's whole evidence, and a few tens of ms of stamp error make them read zero. This is what
+  catches a station hold OSCILLATING on wrong-signed feedback, and a mount the proof accepts cannot trip it
+  [유도: 14.5 deg of yaw is a deviation of 0.25]. One pair's weight in its sums is capped at 1/7, so it keeps
+  working when tags come at 5 Hz or slower (uncapped, the effective pair count settled at 9 under a minimum of 10
+  and the monitor was silently off). Gates (that tick only): an innovation gate, |v_dvl − v_tag| > 15 cm/s against
+  the newest tag velocity (widened to 4σ of the proof's residual and by a_max × tag age beyond 0.25 s). That
+  reference survives a tick or two without a tag state (up to 0.25 s, its age widening the limit) — clearing it on
+  every such tick made the source flap once per fix cycle at slow tag rates — but a tick with NO tag velocity that
+  fresh does not use the DVL at all: the first tick after a real tag gap, when a false lock picked up during the
+  gap would otherwise go in unchecked; and a jump gate, |Δv| > a_max·Δt + 5 cm/s between
+  good samples with a_max 2.0 m/s² [유도: 30 N / 19 kg ≈ 1.6]. fom and altitude are fail-closed. All thresholds
+  [예측].
+* ⟲⟲ **What a synthetic timing simulation says — NOT a measurement.** `rov_gui/tests/sim_dvl_monitors.py` runs
+  the real `DvlAid` + `StateAssembler` on PRESCRIBED motion (open loop) with assumed sensor numbers (tags 15 Hz,
+  0.13 s late, 0.8 mm; DVL 12 Hz, 0.19 s late, 3 mm/s, 0.2 m arm; ticks 20 Hz). Output of the 2026-10-02 run:
+  `rov_gui/tests/fixtures/sim_dvl_monitors_20261002.txt`; every number here is [예측]. A correct mount never
+  tripped: 9 motions × 12 seeds, the same with tag jumps, across five latency pairs, 21 glitch / noise conditions
+  (one 4-report ±14 cm/s glitch incl. at a square's corner; 3–4 reports of 25–30 cm/s with 3 mm tags; 1–4 report
+  glitches every 3–10 s; DVL noise 1–5 cm/s; a glitch with the tags 0.28 / 0.35 s late) on four motions (incl.
+  0.3 m/s passes), and 300 s near the monitors' speed floor under the
+  opt-out. Those glitches and noise cost availability instead — held back, not latched: glitches every 3 s leave
+  39–60 % of the ticks on the DVL at rest, 2.5 cm/s of noise 48 %, 3 cm/s and more is hardly ever proven. A false
+  lock that LASTS does trip, as intended: +14 cm/s for 1 s or +10 cm/s for 2 s, once or repeated; +10 cm/s for 1 s
+  or +14 cm/s for 0.5 s does not. A reversed axis or
+  a 90-deg mount flown under the opt-out tripped 0.8–1.9 s after IN (8.6 s for a reversed sway on a 5+2 cm/s
+  diagonal). NOT caught under the opt-out: any wrong mount at station-keeping speeds (1–2 cm/s), a reversed axis
+  moving below ~2 cm/s rms; a reversed axis on a STRAIGHT
+  line within 14.5 deg of the other axis, at any speed (there a reversal is indistinguishable from a rotation by
+  twice that angle [유도]); a mount 30 deg out below ~15 cm/s; a 2× scale below ~8 cm/s. In those cells 98 % of
+  the ticks fly on the wrong DVL; where the fit can at least refute (a 2× scale on a 6 cm/s oscillation) the
+  hold-back brings that to 16 %. On the default path the proof catches all of them (the straight line cannot even
+  form a proof). A mount the proof ACCEPTS with 12 deg of
+  residual yaw or a 1.2× scale trips at 0.4 m/s and above (the proof's tolerance is relative, the difference
+  threshold absolute) — the proof's log line now says at what speed, and by how many degrees to correct the mount.
+  A noisy DVL (3 cm/s) is mostly never proven — the fit ignores the DVL's own noise and the map is pulled toward
+  zero — and stays OUT; at 1 cm/s nothing changes. Known sensitivity: a capture-stamp error on a sustained
+  0.5–1.5 Hz ELLIPTICAL motion trips a correct mount (2/36 and 3/36 at ±50 ms, 8/36 at 100 ms, 8/36 at 150 ms;
+  none on straight-line motions), because a time shift δ of a velocity that turns at ω is an apparent rotation
+  ω·δ. A wrong lever arm (3 or 10 cm) trips nothing: the false velocity it makes is motion only the DVL sees, and
+  3 cm/s of it [유도: 0.3 rad/s × 0.1 m] is under the difference threshold. The simulation has no controller in
+  it, so wrong-signed feedback growing the motion is not represented.
+* **Lever arm.** `v_origin = R_frd_dvl v_dvl − ω × r`. Device frame x forward (LED), y starboard, z down
+  [스펙: docs.waterlinked.com/dvl/axes], so an LED-forward mount is the identity. 0.3 rad/s × 0.2 m = 6 cm/s
+  [유도] — the size of the mission speed, hence not optional. ⟲ ω is interpolated from the ATTITUDE history at the
+  sample's own time of validity; with the newest rate a changing yaw leaves up to ~7 cm/s behind [유도, review].
+  ⟲⟲ With a lever arm and no rate for that moment the sample is not used (an uncorrected reading is not the
+  body-origin velocity).
+* **Tag dropout, STATION only.** `station_bridge.py` gains tier `dvl`: x/y integrate the DVL velocity from the
+  last fix (rotated by autopilot roll/pitch and gyro-carried yaw), every axis held up to `dvl_hold_s` 10 s
+  [예측], only while the DVL stays usable without a gap; then the existing IMU/COAST ladder on the same elapsed
+  time, never climbing back. ⟲ Nothing cross-checks the DVL while the tag is gone, so the rung is bounded by what a
+  station hold is: a DVL reading above `dvl_max_speed_m_s` 0.3 or integrating further than `dvl_max_disp_m` 0.5
+  from the last fix closes the rung for that dropout. ⟲⟲ When a cap closes it, the rungs below start from the last
+  FIX at rest, not from what that DVL integrated (the audit held 0.34 m of estimate error against the controller
+  until `imu_hold_s` ran out); when the DVL merely goes away, they carry on from its last position. A tick the rung
+  did not integrate — the bridge blind for a tick, a fault it does not carry — closes it until the next fresh fix.
+  And the rung opens only for a DVL that was actually FLOWN on the last tick that had a tag: one the innovation
+  gate was holding back while the tag contradicted it is not made trustworthy by the tag going away. ⟲⟲ Including
+  the way tags really go: the fix stops arriving and the assembler bridges it until `tag_stale_s`, the gate's limit
+  widening with its age — the innovation hold keeps such a DVL out through that phase (round 3 walked the estimate
+  0.5 m on a false 0.25 m/s by the first lost tick, round 4 0.6 m by the widened gate). "The last fix" a closed rung
+  returns to is the FIX's own position, not the last tagged tick's eta, which may already hold that DVL's integral
+  (round 4: 0.125 m off). The cost: a hard kick (~1 m/s²) while the tags are in view holds an honest DVL out too,
+  and if the tags then drop the pre-DVL ladder takes over — as without a DVL. ⟲⟲ The rung hands the IMU rung its
+  POSITION only: the IMU dead reckoner is re-anchored at rest on rung ticks, and on tagged ticks with the TAG
+  velocity even when the tick flew on the DVL (the pre-DVL value); seeded with a false lock's velocity that then
+  simply ended, it integrated 0.67–1.2 m on a vehicle at rest (round 5).
+  The ladder's own handling of such a blind tick is unchanged from the committed code (it restarts the hold clock;
+  KNOWN_ISSUES): an intermediate cut that kept the clock running changed the tiers of runs with no DVL at all and
+  was reverted. ⟲ The rung's `nudot` is built like the assembler's
+  (accelerometer + gravity − ω × v) instead of zeros, so the EAOB is not told "moving, not accelerating". ⟲ The
+  recovery log gives the dead-reckoning error only when the dropout ENDED on the DVL rung (otherwise the gap is
+  mostly post-DVL drift), plus the gyro-yaw error over the same span. Path / policy / replay missions still
+  disengage on a stale fix (operator decision).
+* **Timing.** ⟲ Device stamps are mapped to the station clock through the fastest report of the last 30 s
+  (`DeviceClock`: offset = min(t_arrival − time_of_transmission), `t_valid = time_of_validity + offset`), so the
+  device clock needs no sync and a backlog after a TCP stall keeps its true age instead of being stamped fresh.
+  The vendor's documented example report is 189 ms old at transmission [스펙 예시, one sample] — the same order
+  as the tag path's latency (the estimation reviewer's budget: DVL ≈ 0.22–0.24 s vs tag FD ≈ 0.21–0.27 s [유도]),
+  so the expected gain is noise, not lag, until measured.
+* **Records.** Meta schema 16 → 17: `dvl` block always written (use_at_engage, armed_at_engage, proof, tripped,
+  device config + changes, rows by `vel_src` and by fallback reason). CSV gains 15 trailing columns `vel_src,
+  nu_u/v/w, fd_u/v/w, dvl_u/v/w, dvl_ok, dvl_valid, dvl_fom, dvl_alt_m, dvl_age_s` (body FRD) — the first body
+  velocity this CSV has carried. `bridge_tier` gains `dvl`. Raw device lines go to `<stem>_dvl.jsonl`. NEVER pool
+  velocity-derived statistics across `vel_src`, nor runs across `dvl.armed_at_engage`.
+* **RL followers.** `rl` / `rl_pwm` were trained against a simulated tag-finite-difference estimator; a DVL
+  velocity is an observation distribution they never saw. Not blocked; warned at engage and recorded.
+* **Read-only.** The station sends `get_config` (a read) once per connection and every `config_poll_s` 10 s —
+  ⟲ a change in the device's `mounting_rotation_offset` / `speed_of_sound` after the first answer is a trip — and
+  nothing else: no config writes, no dead-reckoning reset, no ping trigger. The device's own `position_local`
+  dead reckoning is logged raw and never consumed.
+* ⟲ **Two pre-existing defects fixed on the way** (they apply without a DVL): `MpcStatus.bridge_tier` was filled
+  only inside the `--imu-dr` block, so the panel's "NO TAG — COASTING" chip could not fire on an ordinary run; and
+  `disengage` reset the ladder before the closing meta was written, so `station_bridge.dropouts` /
+  `reached_coast` / `last_recovery` closed as 0 / 0 / null on disk in every run so far.
+
+Verification: `rov_gui/tests/test_dvl.py` 96/96, `rov_gui/tests/demo_e2e_dvl.py` (correct and 90-deg-wrong
+mount, real window + demo backend) and the timing simulation above, no device; the other `rov_gui/tests` suites
+are where they were before this change. **Zero hardware runs**: the mount, every [예측] threshold, the latency,
+the noise and the behaviour over this pool's floor are unmeasured (KNOWN_ISSUES.md 2026-10-01).
+
+## 2026-10-02 — The paper's estimator beside ours: robot_localization's EKF, in shadow, with a switch to fly on it
+
+The operator asked for the Learning-to-Swim estimator "exactly as the paper did", to compare with the 2026-10-01
+velocity-source design. **Nothing below is a measurement on this vehicle** (no water run yet).
+
+* **Which EKF.** The paper (arXiv:2410.00120v2, Fig. 2: "IMU, DVL, April Tag → Fused state estimation (50Hz)",
+  an EKF "implemented in ROS") and its platform paper (CUREE, arXiv:2303.03943) give no state vector, noise or delay
+  handling, and the released code (warplab/isaac-auv-env) is the simulator only. The lab's state-estimation
+  repository (warplab/robot-state-estimation, empty) describes itself as "A state estimation codebase for marine
+  robots using the ROS localization package". So "the paper's way" is taken to be ROS `robot_localization`'s
+  `ekf_localization_node` — an inference, stated as one.
+* **What was ported** (`rov_gui/control/rl_ekf.py`, from cra-ros-pkg/robot_localization noetic-devel @ 9ef26a57):
+  the 15-state kinematic model and its Jacobian (`ekf.cpp::predict`; pinned against central differences of the
+  transfer function, max error 3e-10), Joseph-form `correct` with angle-wrapped innovation and the Mahalanobis gate,
+  `processMeasurement` (a measurement older than the filter is corrected in WITHOUT prediction), the measurement
+  queue and the timer (`integrateMeasurements`, sensor-timeout prediction, "corrected data" not published),
+  per-topic stamp ordering, the IMU's three-way split, `prepareTwist` (lever arm with the STATE's body rate, mask
+  and covariance rotation), `prepareAcceleration` (gravity removed with the IMU MESSAGE's orientation), and
+  `smooth_lagged_data` (`revertTo` / `clearExpiredHistory`). r_l defaults everywhere they exist (process noise,
+  initial covariance 1e-9, sensor_timeout = 1/frequency, no smoothing); frequency 50 Hz from the paper. Frames are
+  NED/FRD; the only sign that changes is gravity. The 50 Hz timer is replayed inside the 20 Hz tick
+  (`RlEkfNode.advance`): each input is delivered before the first cycle at or after its ARRIVAL, as a ROS callback
+  would have run.
+* **Choices (not in the paper; [예측] in hw_mpc.yaml `ekf:`).** The tag feeds x, y, yaw (+ z when the station's z
+  source is the tag), the vehicle IMU roll, pitch, rates and gravity-removed acceleration (compass yaw not fused),
+  the pressure depth z with the assembler's own offset, the DVL (vx, vy) in its measured mount — the SAME
+  information the assembler gets, so a difference is the fusion. IMU noise = mavros imu-plugin defaults. Tag/depth
+  noise and the DVL fallback are guesses.
+* **Shadow first, switch second.** On by default and recorded every tick (CSV schema 18: `est` + fifteen `ekf_*`
+  columns; meta `ekf`; `<stem>_ekf_inputs.jsonl`, which `rov_gui.tools.ekf_replay` re-runs offline with any other
+  configuration — with the live one it reproduces the live columns to < 1 mm once converged). The panel's EST button
+  hands the controller the EKF's state instead (`meas_ctrl`, the imu_dr precedent); `meas` — plot, px/py, every
+  interlock — stays the tag state. Disengaged-only, no CSV open; only `--ekf control` can start a session on it, and
+  switching in / engaging needs the EKF and the tag state within 5 cm / 3 deg (every "here" target is set from the
+  tag state). A run on the EKF ENDS, never falls back silently, when the EKF faults, when an input it fuses goes stale
+  (per input — r_l's timeout prediction keeps its own stamp at "now"), on the FIRST station-bridge tick (a tag dropout
+  is not carried: the bridge's ladder would leave it on uncorrected IMU integration and a coast retarget would write
+  its drift into the target), or when it leaves a fresh tag state by 15 cm (x/y, z), 10 deg (yaw, roll/pitch) or
+  15 cm/s (the difference low-passed, tau 0.5 s) for 0.25 s. The EKF fuses the DVL only while the DVL switch is IN and untripped (the DVL's own mount proof
+  applies; `ekf_replay --dvl-all` shows the ungated filter offline).
+* **Reviews (2026-10-02).** safety-code-reviewer: FAIL → the critical (station bridge carrying an EKF run) and three
+  highs (dead output-age gate, DVL gates bypassed, xy/yaw-only divergence) fixed as above, plus the stale
+  accelerometer and six lows. A port-fidelity check against an independent re-transcription of r_l: faithful with
+  low/info issues (state ≤ 5.5e-14 apart over smoothing on/off, dynamic noise, rejection); the cheap ones fixed
+  (angles::normalize_angle wrap, interleaved re-delivery dedupe, missing-compass handling, skip count). Safety
+  re-audit of those fixes: PASS_WITH_FIXES, two new mediums fixed — the stale/bridged EKF fault is now DEBOUNCED by
+  tag_stale_hold_s like the tag path (a frame landing just after the last 50 Hz cycle ended healthy runs), commanding
+  nothing meanwhile (never the bridge's state instead); and the EKF's DVL feed also asks the proof gate
+  (`DvlAid.refusal`), since a YAML `dvl.use: true` is IN without having passed it. The velocity gate judges the
+  low-passed (tau 0.5 s) EKF-minus-tag difference vector: the tag finite difference is noisy. Round 3: PASS_WITH_FIXES,
+  no command path from a held tick; one new medium fixed — a held tick no longer restarts the tag path's stale
+  debounce (one counter for both kinds of no-step tick, so an episode is bounded by tag_stale_hold_s; interleaved late
+  frames had stretched it to ~2.9 s [유도]); held rows carry est = hold and the observe sentinels.
+* **What the synthetic comparison says** [예측: `rov_gui/tests/sim_ekf_compare.py`, output
+  `rov_gui/tests/fixtures/sim_ekf_compare_20261002.txt`; open loop, every sensor number assumed]: with r_l's default
+  delay handling the EKF corrects the current state with a tag frame ~0.12 s old, so its position trails by speed ×
+  latency (0.3 m/s passes: 33 mm rms vs the assembler's 5 mm) and its yaw by yaw-rate × latency (1.7 deg vs 0.3 deg
+  while yawing). `smooth_lagged_data: true` removes that (6 mm) and gives the best velocity of all (0.72 cm/s vs
+  3.2–3.6), because the accelerometer is then fused at the right moment too. The mavros accelerometer noise trusts
+  the accelerometer almost completely: a 0.1 m/s² bias with no DVL gives 15 cm/s of velocity error. r_l's default
+  process noise makes the filter take each tag frame almost whole (cm-level 1-sigma even at rest).
+
+Verification: `rov_gui/tests/test_rl_ekf.py` 38/38, `demo_e2e_ekf.py` (real window); `test_dvl.py` 96/96 after the schema-18 header/number update;
+the other `rov_gui/tests` suites at their pre-change baselines. **Zero hardware runs.** KNOWN_ISSUES.md 2026-10-02.
+
+## 2026-10-03 — Roll/pitch become a LOW-level choice: PID_7D, MPC_Tuned_7D, RL_7D (station; zero water runs)
+
+Operator request: "pid_7d, mpc_tuned_7d, RL_7d 버전" — followers that also control pitch and roll, for the 7-dim
+(`pos_rpy_width`) Diffusion Policy. No 7-dim checkpoint exists on disk (only 5-dim; `run_ablations.sh peg_7d_vitclip`
+never ran), and the operator chose code only for RL (training deferred).
+
+* **The LOW decides, not a config switch.** `geometry.LOW_7D_BASE = {pid_7d: pid, mpc_tuned_7d: mpc_tuned, rl_7d: rl}`.
+  K/M leave the station (MANUAL_CONTROL s/t) iff the LOW is a `*_7d` follower AND `engage.attitude_axes.enabled`, which
+  is now a station CAPABILITY (the sink reads it once at launch). Without it a `*_7d` LOW is refused on a vehicle; with
+  it every other LOW engages 4-DoF (2026-09-26..10-02 plain mpc/mpc_tuned sent K/M under the switch and pid/rl/rl_pwm/mpcc
+  were refused — zero water runs in that window). Tracking a 7-dim plan = `*_7d` LOW + 7-dim checkpoint;
+  `policy.attitude_track` is now a VETO (shipped true); a 7-dim network on a 4-DoF LOW is dropped-and-logged.
+  Meta: `controller.type` = the LOW (mpc_tuned_7d carries `base_type: mpc_tuned`), `run.attitude_axes.low/low_attitude`,
+  `trajectory.attitude_track_low/_veto`.
+* **mpc_tuned_7d** = the 2026-09-26 NMPC attitude path on HwDobMpc mode `mpc_tuned` (the worker maps the key; the bridge's
+  `tuned` flag is `endswith("_tuned")`, so the key itself would fly the isotropic cost). No solver change.
+* **pid_7d** (`rov_gui/control/pid.py HwPid7d`): the pid set for x/y/z/yaw unchanged plus
+  `tau = k_ff [cos th_r sin ph_r, sin th_r] + Kp e + Kd (T^-1(ref) ref-rates - gyro p,q) + I`; Kp/Kd from the same
+  3rd-order pole placement (formula k = d = 0) at **wn 0.5 rad/s** (zeta 0.9, alpha 0.2, heavy_gripper I_eff
+  0.50/0.90 kg m^2 [유도]), Ki 0.15 set apart (the formula's I alpha wn^3 assumes k = 0), restoring FF 1.35 N m/rad on the
+  REFERENCE angles (the NMPC's ZG*W), I stored in N m and clamped to 0.8 x the wire torque, conditional integration on the
+  realized K/M (note_applied), heave trim rotated with the measured attitude, Euler yaw rate in the yaw D term, the D5
+  hold ramp and T3 validation shared with HwDobMpc (`control/attitude_ref.py`). wn is set by the DELAY (ATTITUDE ~52 ms
+  old at the tick [측정 data/20261001/1001_154825/mpc_154825.csv] + ZOH + sink phase + thruster lag), and `omega_derate`
+  is not applied. Margins [유도: control-theory-advisor consult, re-computed by `rov_gui/tests/sim_pid7d_attitude.py` ->
+  `rov_gui/tests/fixtures/sim_pid7d_attitude_20261003.txt`]: PM >= ~50 deg at 0.2 s total delay and actuator gain
+  x0.4..x2.5 only while the restoring stiffness k <= ~2.3 (roll) / 3.6 (pitch) N m/rad; at k ~20 (the RL repo's lumped
+  fit) 3-41 deg — hull resonance plus delay, not fixable by gain. Hence a pulse-and-release test (sign, delay, g/I,
+  k/I, damping) must precede closing this loop in water. Closed loop with the real class (same artefact, first-water
+  caps): k 1.35 -> 10 deg pitch hold error -0.03 deg, overshoot 2.7 deg; k 20 -> 4-9 deg steady error with the axis
+  below its cap. The safety audit (2026-10-03, WARN, one HIGH) showed the same mechanism hides an INVERTED wire sign
+  (the PID settles at a wrong tilt below the cap); fixed: HwPid7d reports "authority exhausted" (command clipped, or
+  integral at its limit with > 1 deg error, or error beyond the 20 deg gate) and interlock (iii) judges it like a
+  pinned axis (`test_low_7d.py::test_interlock_iii_trips_pid_7d_on_an_inverted_sign_below_the_cap`). Also from the
+  audit: a vehicle engage on pid_7d needs the pulse-and-release record (`pid_7d.pulse_test`, free-decay periods >=
+  3.2 s) or the recorded opt-out; non-finite attitude -> zero K/M + n_fail; rl_7d K/M clipped to its trained caps and
+  its recorded reference = the envelope-clipped one it flies.
+* **rl_7d** (`rov_gui/control/rl_policy.py HwRl7d`): an axes6 export whose `obs_spec.attitude_reference.trained` is true
+  (fail-closed — a level-trained export has the same layout); `q_des = quat_from_euler_xyz(roll_ref, -pitch_ref,
+  -yaw_ref)` clipped to the trained envelope; roll/pitch slewed even though the 4-axis slew is 0
+  (`allocation.slew_axes`); refused while the caps in force are below the trained caps (opt-out recorded) — the
+  2026-10-01 rl_pwm cap-0.25 run limit-cycled on a clipped policy. LOW `rl` no longer accepts axes6.
+  RL_controller (not a git repo; pre-change copies in `RL_controller/_pre_att7_backup_20261003/`): `goals.py` optional
+  roll/pitch reference (`att_*`, off = no RNG drawn: old vs new byte-identical over 12 seed/config cases,
+  `RL_controller/logs/smoke/att7_goals_byte_identity_20261003.txt`), env q_des from it, refusal of `ang_error_mode yaw`
+  / `rew_scale_tilt > 0` with att goals, `cob_trim_x_range_m`, preset `traj10att`, exporter `attitude_reference`,
+  `scripts/_pipeline_att7_seed.sh` (NOT run). Isaac smoke (3 iterations, code check) passed:
+  `RL_controller/logs/smoke/smoke_att7_20261003.log`. RL_PWM (pwm10_s1) was trained with a level q_des: it levels, it
+  does not track a 7-dim policy's roll/pitch.
+
+Verification: `rov_gui/tests/test_low_7d.py` 19/19; updated attitude tests; full station suite 1170 passed / 15 failed
+(the same 15 as the pre-change baseline) / 8 skipped; `demo_e2e.py pid_7d policy rp` and `mpc_tuned_7d policy rp` OK
+(`rov_gui/tests/fixtures/demo_e2e_*_policy_rp_20261003.log`, toy plant — wiring, not performance); RL_controller tests
+53/53. **Zero hardware runs; every gain [예측].**
+
+## 2026-10-03 (2) — RL_PWM learns to track roll/pitch (att7pwm, still water) + station LOW RL_PWM_7D (zero water runs)
+
+Operator request: train RL_PWM now, without the waves/current disturbance. The level-trained pwm10_s1 had only ever seen a
+LEVEL q_des, so a 7-dim policy's roll/pitch were out of its distribution.
+
+* **Training** (RL_controller, still water): `scripts/_pipeline_att7pwm_seed.sh` = dr preset `traj10att` (traj10 DR +
+  roll/pitch goal paths |roll| <= 10, |pitch| <= 20 deg, <= 0.35 rad/s, 30 % level + CB trim sampled per episode;
+  `sea:` absent -> SeaStateCfg p_mode NONE) in action_mode pwm, ang_error_mode full, no absolute-tilt term, tumble 60 deg,
+  tag dropout 35 deg, PPO std floor 0.05. Seeds 0..2, 2048 envs x 1200 it, 34:38-34:45 each [측정 `logs/train_att7pwm_s*.log`].
+* **Evaluation** (new `scripts/eval_attitude.py`, still water, nominal dynamics, 15 programs x worlds cob_x 0 / -0.029 /
+  -0.035; [측정 `RL_controller/logs/eval/ATT_COMPARE_20261003.md`]): retraining works — world 0 pitch RMS 1.46 deg (s0) vs
+  10.93 deg for the level-trained pwm10_s1 fed the same tilted goals; but quality is short of a promotion: steady pitch errors
+  up to 7-9 deg in the trim worlds, a +-3 deg roll wobble at level (e_roll RMS 2.8 vs 0.6 deg), vertical |throttle| ~0.7
+  vs 0.3 and 24-38 % (s0) / 57-83 % (s1) / ~100 % (s2) saturated ticks. All three fail the [예측] gate (|ss pitch| <= 2,
+  |ss roll| <= 1.5 deg). Best: s0 — shipped as a DISABLED candidate `rov_gui/control/rl_policies/att7pwm_s0/`.
+* **Station LOW `rl_pwm_7d`** (`HwRlPwm7d`): the rl_pwm transport unchanged (pulses, Lua, MANUAL, vehicle gate, the
+  transport's ONE cap `rl_pwm.pwm_cap` — HwRlPwm now reads it via PWM_CAP_KEY) + HwRl7d's q_des (plan roll/pitch clipped
+  to the trained envelope, fail-closed on attitude_reference.trained). Not in LOW_7D_BASE (no s/t gates); a worker pulse bit
+  `_attitude_pulses` arms the tilt CEILING for every pwm LOW (plain rl_pwm had none — behaviour change) and, for rl_pwm_7d,
+  roll/pitch tracking (`rp_track_live`: policy truth table, div_rp). CSV `rp_track` 2 = tracked via pulses; meta
+  `run.attitude_axes.rp_transport/ceiling_armed/rp_track_live`; pwm coast record corrected (eight 1500 us, nothing held).
+  test_rl_pwm.py repaired (11 tests pinned the old shipped cap 0.25): 26/26; new test_rl_pwm_7d.py 13/13; suite 1199 passed
+  / 4 pre-existing unrelated failures. **Zero water runs; the candidate is not enabled.**
+* **Review fixes (same day, workflow wf_b9f3f143-d12, 6 low findings confirmed):** the RL 7d followers (rl_7d, rl_pwm_7d) now
+  fly the TRAINED goal rate — the reference is envelope-clipped and then moved at most `attitude_reference.rate_max_rad_s`
+  (0.35 rad/s in the att7 exports) × dt per tick, starting level at engage, as the training goal did; an export without that
+  key is refused. The D5 hold-ramp decay moved to the START of step (pid_7d too), so the reference the CSV and interlock
+  (iii) read after a tick is the one that tick used. CSV `rp_track` 2 only on ticks whose policy pulses actually left (a coast
+  or gate-grace tick sends eight 1500 us and records 0). Suite 1212 passed / the same 4 pre-existing failures.
+* **Enabled (same day, operator request):** `rl_pwm_7d.policy_dir: rov_gui/control/rl_policies/att7pwm_s0` — the station
+  builds and selects RL_PWM_7D from the shipped config (transport cap 1.0 = trained 1.0, motor directions = the sink
+  export's). The sim-gate shortfall above still stands; zero water runs.
+
+## 2026-10-03 (3) — The policy can see in colour: an RGB-only checkpoint is fed the C3's colour frame (naive optics; zero water runs)
+
+* **Why:** the RGB-only diffusion policy (`umi_rgb_5d_peg5d_rgb_dinov3b_9_27_9_28_20261001_211106`, DINOv3-B, 5-dim) was
+  started three times in the pool and drew nothing: the station fed only `camera0_depth`, the session went READY on a warm-up
+  that used the contract's own key, and every predict raised KeyError — zero plans [측정: `data/20261003/1003_151227/events.log`,
+  `plans.jsonl`, meta `policy.worker.counters.infer_errors` 39→158].
+* **What changed (rov_gui):** the PolicyWorker now feeds whichever image the LOADED checkpoint's contract names. `camera0_depth`
+  takes the unchanged depth path (verified bit-identical: 173 plans over 8 random scenarios against the pre-change worker, review
+  2026-10-03). `camera0_rgb` takes the C3 COLOUR frame — the centre lens, the localizer's own frame — through `ColorObsBuilder`:
+  centre square crop, `INTER_AREA` to 224, BGR→RGB, /255, which reproduces the training store's `camera0_rgb` exactly (review:
+  4 training frames, max |diff| 0). Each attempt is anchored on the colour frame of the newest tag FIX (stamps identical — the
+  localizer's stamp is reused), so image and proprio rows are the same instant; the depth rule (newest frame) would have produced
+  zero plans at realistic localizer latency (review simulation). Unsupported keys, an undeclared/BGR training channel order, a
+  non-(3,R,R) image shape or a backend without a colour feed are an ERROR the controller refuses to arm on; the status says READY
+  only after the contract is adopted.
+* **What it is not:** the optics are NAIVE (operator decision): the training frames are the handheld colour camera in air,
+  unwarped; underwater the C3 colour sees the scene ~1.8× magnified at 224 [유도: focal 178 vs 319 px]. Records: meta
+  `policy.worker.obs_mode`/`obs.optics`, `depth_src = c3_rgb` per plan — do not pool with a warped-RGB retrain. The FS schedule
+  does not apply to an RGB checkpoint (effective `free`). Offline replay/held-out tools are still depth-only (KNOWN_ISSUES).
+* **Evidence:** test_policy_worker 9 new tests, test_policy_obs 2, demo e2e `mpc_tuned policy rgb` 24/24 plans from `c3_rgb`
+  installed [측정: `rov_gui/tests/fixtures/demo_e2e_mpc_tuned_policy_rgb_20261003.log`]; safety audit PASS_WITH_FIXES (no critical/
+  high), fixes applied. **Zero water runs** — first run in LOW None (observe), checking `obs_t − obs_fix_t[-1]` and the skip counters.
+
+## 2026-10-03 (4) — `policy.action_repr: auto`: the checkpoint picked in the panel decides 5-dim vs 7-dim, pinned at ARM; first RL_PWM_7D water run diagnosed (2026-10-04)
+
+* **What changed:** the operator asked that picking a 7-dim checkpoint should need no YAML edit. `policy.action_repr` gains the
+  CONFIG sentinel `auto` (shipped in hw_mpc.yaml and land_dp.yaml; code default when absent stays pos_yaw_width). Under auto
+  the mission's action representation is the contract of the checkpoint the policy worker holds at START, resolved by
+  `geometry.resolve_policy_action_repr` from the SAME PolicyStatus object the ARM refusal judged (`_arm_policy` refuses
+  if another status arrived in between), pinned in `rp["action_repr_pinned"]` / `scen["action_repr"]`; "" and pose10d are
+  refused, never defaulted; the intake compares with the pin only. Explicit values behave and record exactly as before.
+  The LOW still decides tracking (`geometry.policy_rp_tracked`); it is never switched automatically.
+* **Operator visibility:** ckpt row `READY · 5-dim | 7-dim` (FAIL with why when START would refuse it); a pre-START forecast
+  in the mission label (TRACKED in WARN colour / DROPPED-AND-LOGGED / holds level; respects the veto, the s/t capability, land
+  dry-run, contouring LOWs and LOWs without an export); after ARM the chip shows `· 7d rp TRACKED|DROPPED`.
+* **Records (schema stays 18):** trajectory.action_repr = the pin (pool on it); policy.action_repr = the live mission's pin,
+  else the last pin armed while this CSV was open, else null; policy.config.action_repr echoes "auto".
+* **Evidence:** test_policy auto tests, panel forecast test, 10/10 mutations killed, suite 1224 passed / 4 pre-existing
+  failures; demo rows [측정: `rov_gui/tests/fixtures/demo_e2e_mpc_tuned_policy_auto_20261004.log` (304 rows rp_track 0),
+  `demo_e2e_pid_7d_policy_rp_auto_20261004.log` (308/308 rows rp_track 1)] — synthetic plant, wiring only.
+* **First water run of RL_PWM_7D + the 7-dim peg checkpoint (2026-10-03 20:27, `data/20261003/1003_202721/`) FAILED:** three
+  engagements of 1.7 / 6.3 / 2.5 s, all released by the pilot. Diagnosis (records recomputed): att7pwm_s0 holds a learned
+  vertical co-contraction (T5/T8 up vs T6/T7 down at +230..+340 us even at a level reference, the same as its sim level program
+  — signs verified against the mixer flight in the same folder), drawing 22-42 A; the vehicle really sank (pressure depth
+  0.66 → 0.83 m in the UI video HUD) under a nominal +19 N upward command (peg −12 N outside the DR; the net is the difference of
+  two ~50 N numbers); and the policy's high gain on finite-difference velocity turned tag-fix z jumps (9 jumps >20 mm in
+  engagement 3, none in engagement 2) into ±90 N heave reversals. The DP is not the main cause (engagement 1 had no plan; the
+  engagement-3 excursion preceded the first plan); engagement 2's +14° nose-up plateau is most likely the stern on the floor.
+  Station timing was normal. KNOWN_ISSUES has the full entry; a retrain needs a co-contraction penalty, payload buoyancy in the
+  DR and tag-jump/fallback-camera noise in the observation model.
+
+## 2026-10-04 — MPC_Tuned profiles: the follower's tuning is a file, picked on the panel like a DP checkpoint (zero water runs)
+
+* **What changed:** operator request — save the mpc_tuned tuning that has been flown, and load/apply a tuning by picking it
+  like a Diffusion Policy checkpoint, with today's values as the default. A profile (`config/mpc_tuned_profiles/NAME.yaml`,
+  `rov_gui/control/mpc_tune.py`) holds three sections: `apply` (Q/QN/R, the along/cross split, policy q_scale/along_scale,
+  vehicle_net_buoyancy_n, axis_cap, axis_slew_per_s — every key required), `compare` (rov_model, ctrl_hz, N, dt, u_max, plant
+  damping, axis_gain — NOT applied: the damping is in the generated solver mpc/dobmpc share) and `record` (context). HwDobMpc
+  HOLDS the profile and APPLIES it only in mode `mpc_tuned` (LOW mpc_tuned_7d flies that mode): baseline W written with
+  cost_set, heave trim through the disturbance parameter, policy knobs via `policy_follow`, cap/slew via the controller hooks
+  MpcWorker already reads (the cap may only tighten). Any other mode writes the build W and the config trim back at the switch.
+  Operator decision: the heave trim is part of the applied set (so a profile carries its payload assumption).
+* **Default = today:** `20261004_default` is a snapshot of hw_mpc.yaml + params.py as of 2026-10-04 (split 0.25/4.0, q_scale
+  4.0, along_scale 3.0, trim −12 N peg-in-jaw, cap 0.5, slew 1.5/s, params Q/QN/R); hw_mpc.yaml `mpc_tuned_profile` names it,
+  so mpc_tuned flies exactly what it flew before. Under mpc_tuned, the hw_mpc.yaml `mpc_tuned:` block, `policy.q_scale /
+  along_scale` and `vehicle_net_buoyancy_n` are no longer read while a profile is held (`--mpc-tune none` restores that).
+* **Refusals:** a pick is refused while engaged, with a controller CSV open, before READY, or for a file that does not
+  load/fit (the previous profile stays held — the swap is transactional, a solver write that raises rolls it back). A launch
+  profile that fails to load makes mpc_tuned REFUSE to engage rather than fly hw_mpc.yaml under a launch that named a profile.
+* **Safety review (2026-10-04, WARN, no critical) → fixed:** axis_slew_per_s must be > 0 and is tighten-only like the cap (a
+  profile could have switched the anti-chatter slew off); Q/QN pose rows must be > 0 (a zero x/y weight divided by zero in
+  meta at CSV open); `path_cost` and `compare` must be complete (missing compare keys WARN); `name:` must equal the file name;
+  a profile trim ≠ hw_mpc.yaml trim is a WARN (the peg trap, KNOWN_ISSUES); `save` defaults to the HELD profile's apply
+  (`--from-config` / `--from`), because hw_mpc.yaml's blocks are not what mpc_tuned flies while one is held.
+* **Records (boundary):** meta `controller.mpc_tune` (profile, path, sha1, active, apply, warnings), `controller.weights_source`,
+  `controller.Q/QN/R` = the baseline THIS mode flew (was always params.py's), `trajectory.along_scale` +
+  `follow_knobs_source`. Runs before 2026-10-04 have no `mpc_tune` block and flew hw_mpc.yaml's values.
+* **Evidence:** `rov_gui/tests/test_mpc_tune.py` 16 passed (incl. a real acados bridge: a 4× position-weight profile changes
+  the mpc_tuned wrench and plain mpc afterwards is bit-identical), test_path_cost 27/28 (the 1 failure is the pre-existing
+  `|vehicle_net_buoyancy_n| ≤ 2` assertion vs the −12 N peg value), test_low_7d + test_control 161, policy/offline/replay/
+  attitude/station-bridge/policy-worker 361; demo e2e `mpc_tuned square` and `mpc_tuned policy` OK with the default profile
+  held (meta: profile 20261004_default, active, q_scale 4 / along 3 from the profile) — synthetic plant, wiring only.
+  **Zero water runs** — but the default profile reproduces the previous values, so behaviour is unchanged until a different
+  profile is picked.

@@ -19,9 +19,10 @@ RELATIVE to its own tool-centre-point (TCP) pose. Two action encodings exist
     BIT-IDENTICAL to ``pos_yaw_width``'s 0:4 and 4, and ``(droll, dpitch,
     dyaw)`` are the ZYX Euler angles of the SAME matrix ``R_bt @ R_rel @
     R_bt^T`` (``encode_pos_rpy``, transcribed from ``yaw_action.py``). Whether
-    the attitude columns are FLOWN is the caller's ``track_rp`` (config
-    policy.attitude_track, default off = "dropped-and-logged": 5-dim
-    arithmetic on cols 0:4, the requested attitude only recorded).
+    the attitude columns are FLOWN is the caller's ``track_rp`` (since
+    2026-10-03: a *_7d LOW + this representation + policy.attitude_track,
+    which is a veto; otherwise "dropped-and-logged": 5-dim arithmetic on
+    cols 0:4, the requested attitude only recorded).
   * ``pose10d`` (16, 10) -- legacy (the 2026-09-01 checkpoint), in the
     ``umi.common.pose_util`` encoding ``[pos(3), rot6d(6), width(1)]`` where
     rot6d is the first TWO ROWS of the rotation matrix (Gram-Schmidt back to a

@@ -1,0 +1,58 @@
+[info] backend demo started
+[info] ctrl[mpc_tuned]: writing runs under /tmp/rov_gui_rec_1ja6ocwu (hw_mpc.yaml log_dir data overridden — one root per run)
+[info] ekf: robot_localization EKF (cra-ros-pkg/robot_localization noetic-devel @ 9ef26a57 (2025-01-24)) at 50 Hz, smooth_lagged_data false; tag ['x', 'y', 'yaw', 'z'], imu ['roll', 'pitch', 'vroll', 'vpitch', 'vyaw', 'ax', 'ay', 'az'], z tag, no DVL; shadow (recorded and compared only). HARDWARE-UNVERIFIED; noise values are [예측]
+[info] pid: heave trim f_z -12.00 N (config vehicle_net_buoyancy_n; the integral carries the rest, i_max 5 N)
+[info] pid: sim GAINS_HEAVY_GRIPPER x omega_derate 0.9 -> kp [116.4, 116.4, 124.7] yaw_kp 8.04 [예측]
+[info] pid: heave trim f_z -12.00 N (config vehicle_net_buoyancy_n; the integral carries the rest, i_max 5 N)
+[info] pid: sim GAINS_HEAVY_GRIPPER x omega_derate 0.9 -> kp [116.4, 116.4, 124.7] yaw_kp 8.04 [예측]
+[info] pid_7d: roll/pitch PID wn 0.5 zeta 0.9 alpha 0.2 -> kp [0.171, 0.305] kd [0.502, 0.898] ki [0.15, 0.15], restoring FF 1.35 N m/rad [예측]; translation/yaw = the pid set. NOT FLOWN: measure k/I, d, gain and delay (pulse-and-release) first
+[info] rl: policy rov_gui/control/rl_policies/traj10_s1 (logs/rsl_rl/rov_posehold/2026-09-22_04-15-41_traj10_s1/model_1199.pt), obs 100 (K=4, feed-forward=on), act 4, probe 0.01 ms; assumes JS_GAIN_DEFAULT 0.5 and no axis slew [스펙 obs_spec.json]
+[info] ctrl[mpc_tuned]: RL_7D unavailable (ValueError: rl_7d: no policy_dir — no export trained with a roll/pitch reference exists yet (RL_controller scripts/_pipeline_att7_seed.sh, dr preset traj10att; not trained as of 2026-10-03). Name one under `rl_7d: policy_dir:`) — rl_7d mode will refuse
+[info] rl_pwm: policy rov_gui/control/rl_policies/pwm10_s1 (logs/rsl_rl/rov_posehold/2026-09-27_11-06-05_pwm10_s1/model_1199.pt), obs 116 (K=4), 8 thruster throttles, |throttle| <= 1.00 on the wire (trained 1.00), rc channels [9, 10, 11, 12, 13, 14, 15, 16], expects MOT_1..8_DIRECTION [-1, -1, 1, 1, -1, 1, 1, -1]; transport pwm_lua_override — UNTESTED on the vehicle [예측]
+[info] rl_pwm_7d: policy rov_gui/control/rl_policies/att7pwm_s0 (logs/rsl_rl/rov_posehold/2026-10-03_15-44-54_att7pwm_s0/model_1199.pt), pwm, trained roll/pitch envelope +-9.7 / +-20.1 deg, |throttle| <= 1.00 (transport rl_pwm.pwm_cap; trained 1.00) — roll/pitch as PULSES, never s/t; UNTESTED on the vehicle [예측]
+[warn] policy: OBS VIEW SHIFT +0.050 m along body x (camera frame [0.0, -0.0341, 0.0366]) — the depth obs is re-rendered from a virtual viewpoint, NOT the training recipe (TEMPORARY, policy.obs_view_forward_m; null turns it off). Do not pool these runs with unshifted ones.
+[info] policy: DP policy STUB ready (canned straight-ahead chunk, 0.05 m/s along TCP +z, dyaw 0 rad/s, width 0.069 m, pos_rpy_width (16, 7), roll/pitch ramp 0/5 deg at the last knot)
+[info] policy: READY after 0.3 s (obs_dt 66.7 ms, fps source: stub (policy.dataset_fps); action pos_rpy_width; mount ok; obs camera0_depth; sha1 -)
+[info] policy: STUB stub_rp (eval_transforms=center, steps=8, period 0.50 s); TCP = ROV jaw at body FRD [0.502, 0.0, 0.17] (|t| 0.530 m; handheld comparison [0.0355, 0.1293, 0.3186] in ITS camera frame). Inference runs only while a policy mission is ACTIVE.
+[info] policy: depth grid identity:39c71e96d1afb691 — obs coverage 100.00% (min 98.5%)
+[info] mpc: plant linear_damping OVERRIDDEN [4.03, 6.22, 5.18, 0.07, 0.07, 0.07] -> [86.7, 133.8, 5.18, 0.07, 0.07, 0.07] (x[21.514, 21.511, 1.0, 1.0, 1.0, 1.0]) — the solver's drag is the vehicle's, not marinegym's; runs are not comparable across this boundary
+[info] mpc: acados IPOPT fallback DISABLED — a failed solve holds the previous wrench; 3 in a row disengage
+[info] mpc: heave trim w_z +6.29 N (plant B-W -5.71 N, config vehicle_net_buoyancy_n -12.00 N) — constant, through the disturbance parameter
+[info] mpc: mpc_tuned — path-frame Q, q_along 75.0 / q_cross 1200.0 (x16.0) on a 300.0 isotropic baseline
+[info] mpc solver: acados, probe median 1.4 ms of 5 (first/cold 2.4, worst 1.4), build 1.4s, realtime_ok=True
+[info] mpcc: vehicle_net_buoyancy_n -12.00 N is IGNORED by this controller (heave trim wired for mpc/mpc_tuned/pid only)
+[warn] demo: flight mode MANUAL
+[info] mpcc: acados-mpcc, 60 stages / 7.2 s horizon, probe 7.1 ms, build 2.5s, realtime_ok=True
+[info] ctrl[mpc_tuned]: mpc_tuned ready, solver=acados, probe=1.4 ms
+[warn] demo: vehicle ARMED
+[warn] ARMED (MANUAL (sim))
+[debug] ctrl[mpc_tuned]: ENGAGED (mpc_tuned) — holding (+0.00, +0.00, +0.00) NED. START TRAJ begins the square.
+[info] mpc csv -> /tmp/rov_gui_rec_1ja6ocwu/20261004/1004_015405/mpc_015405.csv
+[info] ctrl[mpc_tuned]: plan position-weight scale 1 -> 4
+[info] ctrl[mpc_tuned]: plan along-track weight scale own -> 3
+[warn] ctrl[mpc_tuned]: POLICY stub_rp: action pos_rpy_width (auto: the checkpoint's contract), roll/pitch DROPPED-AND-LOGGED (LOW mpc_tuned is 4-DoF), max 500 s, anchor leash (leash 0.05 m), v_max 0.15 m/s, knots 0.2 s, hold tail extrapolate, box [[-1.0, -1.0, -0.5], [1.0, 1.0, 0.5]], gripper ON, lookahead 0.8 s; jaw width estimate 7 mm at START (open-loop; the policy's first open/close edge drives regardless)
+[warn] ctrl[mpc_tuned]: OBS VIEW SHIFT — the policy's depth obs is re-rendered +0.050 m forward along body x (policy.obs_view_forward_m). Meant for the PEG checkpoint only; this one is stub_rp. Temporary, 2026-09-30.
+[warn] ctrl[mpc_tuned]: YAW REF FILTER — plan yaw = flown reference + low-passed turn rate (tau 2.0 s, <= 3.0 deg/s, guard 15 deg from the measured yaw); the policy's dyaw is filtered, never re-anchored to the measurement (policy.yaw_ref_filter).
+[info] ctrl[mpc_tuned]: plan position-weight scale 4 -> 1 (baseline restored)
+[info] ctrl[mpc_tuned]: plan along-track weight scale 3 -> own (restored)
+[info] ctrl[mpc_tuned]: trajectory stopped — DP hold
+[debug] ctrl[mpc_tuned]: DISENGAGED — released
+[info] mpc csv closed: 304 rows (/tmp/rov_gui_rec_1ja6ocwu/20261004/1004_015405/mpc_015405.csv)
+[mpc_tuned/policy] samples 243: err_xy mean 1.9 cm, p95 3.6 cm (FABRICATED demo plant — a wiring check, not a performance figure)
+csv /tmp/rov_gui_rec_1ja6ocwu/20261004/1004_015405/mpc_015405.csv: 304 rows, last col ekf_n_dvl
+[policy/stub] 21 plans emitted, first 0.20 s after START; 361 PolicyState ticks (243 active)
+[policy/stub] intake: received 21, installed 21, clipped 0, rejected 0, late 0, skip_bridge 0, halted '', end_reason 'stop', hold_frac(last) 0.87
+[policy/stub] plans.jsonl: 21 lines, 21 installed, obs_age margin min 0.559 s, kinds ['policy'], action_raw width [7] action_repr ['pos_rpy_width']
+[policy/auto] plans.jsonl: 21 installed, rp_tracked 0, dropped_rp_deg max 5.00 deg
+[policy/stub] after STOP: 0 plans emitted, 0 installed (plans.jsonl lines - the worker's count at STOP; 0 more plan(s) installed between the driver's press and the worker's STOP), inbox empty — the in-flight chunk was dropped by the epoch/inactive rule
+[policy/auto] meta policy.config.action_repr 'auto', policy.action_repr 'pos_rpy_width', trajectory.action_repr 'pos_rpy_width', run.action_repr_pinned 'pos_rpy_width', trajectory.attitude_track False
+[policy/auto] CSV mpc_015405.csv: 304 rows, rp_track != 0 on 0
+OK: demo closed loop completed the policy with the real controller.
+QObject::killTimer: Timers cannot be stopped from another thread
+QObject::~QObject: Timers cannot be stopped from another thread
+QObject::killTimer: Timers cannot be stopped from another thread
+QObject::~QObject: Timers cannot be stopped from another thread
+QObject::killTimer: Timers cannot be stopped from another thread
+QObject::~QObject: Timers cannot be stopped from another thread
+QObject::killTimer: Timers cannot be stopped from another thread
+QObject::~QObject: Timers cannot be stopped from another thread

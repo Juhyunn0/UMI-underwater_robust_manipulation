@@ -444,8 +444,17 @@ def test_is_stub_ckpt_and_the_stub_variants():
     assert is_stub_ckpt("stub_rp") and is_stub_ckpt("Stub_RP")
     assert not is_stub_ckpt("") and not is_stub_ckpt(None)
     assert not is_stub_ckpt("/x/stub.ckpt") and not is_stub_ckpt("stub8")
-    assert set(dp_policy.STUB_CKPT_VARIANTS) == {"stub", "stub7", "stub_rp"}
+    assert set(dp_policy.STUB_CKPT_VARIANTS) == {"stub", "stub7", "stub_rp",
+                                                 "stub_rgb"}
     assert dp_policy.STUB_CKPT_VARIANTS["stub"] == {}
+    # stub_rgb (2026-10-03): the 5-dim chunk, the obs image is camera0_rgb
+    s = make_policy_session({"ckpt": "stub_rgb"}, None)
+    assert s.contract["image_key"] == "camera0_rgb"
+    assert s.contract["obs_keys"][0] == "camera0_rgb"
+    assert "camera0_depth" not in s.contract["obs_keys"]
+    assert s.contract["action_dim"] == 5
+    assert make_policy_session({"ckpt": "stub"}, None).contract["image_key"] \
+        == "camera0_depth"
     s = make_policy_session({"ckpt": "stub7"}, None)
     assert isinstance(s, StubPolicySession) and s.contract["action_dim"] == 7
     assert s.ckpt == "stub7" and s.pitch_ramp_deg == 0.0

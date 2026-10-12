@@ -1,0 +1,78 @@
+sim_ekf_compare.py — the state assembler vs the robot_localization EKF on
+one synthetic sensor stream.
+seeds [1, 2, 3], 60 s per run, scored from t = 5 s
+
+profile      estimator    pos rms  pos p95   uv rms  yaw rms   w rms  z rms   tag late (mean/max s)
+station      asm             3.2mm     5.4mm   1.31cm/s   0.30°  0.88cm/s   3.5mm   
+station      asm+dvl         1.4mm     2.5mm   0.64cm/s   0.30°  0.88cm/s   3.5mm   
+station      ekf             2.2mm     3.6mm   0.62cm/s   0.28°  0.55cm/s   3.5mm   0.117 / 0.140
+station      ekf-nodvl       2.3mm     3.8mm   0.87cm/s   0.28°  0.55cm/s   3.5mm   0.121 / 0.140
+station      ekf-smooth      1.5mm     2.5mm   0.63cm/s   0.28°  0.55cm/s   3.5mm   0.000 / 0.000
+
+profile      estimator    pos rms  pos p95   uv rms  yaw rms   w rms  z rms   tag late (mean/max s)
+square 0.1   asm             4.3mm     8.8mm   2.81cm/s   0.30°  0.88cm/s   3.5mm   
+square 0.1   asm+dvl         3.2mm     7.7mm   2.55cm/s   0.30°  0.88cm/s   3.5mm   
+square 0.1   ekf            13.8mm    17.4mm   2.20cm/s   0.28°  0.62cm/s   3.5mm   0.117 / 0.140
+square 0.1   ekf-nodvl      14.0mm    17.5mm   2.37cm/s   0.28°  0.62cm/s   3.5mm   0.121 / 0.140
+square 0.1   ekf-smooth      3.2mm     5.3mm   1.46cm/s   0.28°  0.63cm/s   3.5mm   0.000 / 0.000
+
+profile      estimator    pos rms  pos p95   uv rms  yaw rms   w rms  z rms   tag late (mean/max s)
+passes 0.3   asm             5.0mm     8.4mm   3.57cm/s   0.30°  0.88cm/s   3.5mm   
+passes 0.3   asm+dvl         3.7mm     5.9mm   3.18cm/s   0.30°  0.88cm/s   3.5mm   
+passes 0.3   ekf            33.1mm    51.0mm   2.62cm/s   0.28°  0.77cm/s   3.5mm   0.117 / 0.140
+passes 0.3   ekf-nodvl      33.6mm    51.8mm   1.65cm/s   0.28°  0.77cm/s   3.5mm   0.121 / 0.140
+passes 0.3   ekf-smooth      6.2mm    13.3mm   0.72cm/s   0.28°  0.79cm/s   3.5mm   0.000 / 0.000
+
+profile      estimator    pos rms  pos p95   uv rms  yaw rms   w rms  z rms   tag late (mean/max s)
+yawing       asm             3.1mm     5.3mm   1.23cm/s   0.32°  0.88cm/s   3.5mm   
+yawing       asm+dvl         1.4mm     2.4mm   0.48cm/s   0.32°  0.88cm/s   3.5mm   
+yawing       ekf             1.8mm     3.0mm   0.80cm/s   1.71°  0.55cm/s   3.5mm   0.117 / 0.140
+yawing       ekf-nodvl       1.9mm     3.1mm   0.90cm/s   1.73°  0.55cm/s   3.5mm   0.121 / 0.140
+yawing       ekf-smooth      1.8mm     3.0mm   0.88cm/s   0.43°  0.55cm/s   3.5mm   0.000 / 0.000
+
+profile      estimator    pos rms  pos p95   uv rms  yaw rms   w rms  z rms   tag late (mean/max s)
+kicks        asm             5.1mm     7.9mm   3.55cm/s   0.30°  0.89cm/s   3.5mm   
+kicks        asm+dvl         4.0mm     6.4mm   3.34cm/s   0.30°  0.89cm/s   3.5mm   
+kicks        ekf             8.3mm    21.3mm   2.59cm/s   0.28°  0.56cm/s   3.4mm   0.117 / 0.140
+kicks        ekf-nodvl       8.1mm    21.5mm   1.28cm/s   0.28°  0.56cm/s   3.5mm   0.121 / 0.140
+kicks        ekf-smooth      2.4mm     4.3mm   1.49cm/s   0.28°  0.57cm/s   3.4mm   0.000 / 0.000
+
+sensitivity on `passes 0.3` (one assumption changed per row)
+case              estimator    pos rms     uv rms  yaw rms
+nominal           asm             5.0mm    3.57cm/s   0.30°
+nominal           asm+dvl         3.7mm    3.18cm/s   0.30°
+nominal           ekf            33.1mm    2.62cm/s   0.28°
+nominal           ekf-nodvl      33.6mm    1.65cm/s   0.28°
+nominal           ekf-smooth      6.2mm    0.72cm/s   0.28°
+
+tag 0.25 s late   asm            10.1mm    5.12cm/s   0.30°
+tag 0.25 s late   asm+dvl         4.2mm    3.18cm/s   0.30°
+tag 0.25 s late   ekf            61.1mm    2.63cm/s   0.27°
+tag 0.25 s late   ekf-nodvl      61.5mm    2.65cm/s   0.27°
+tag 0.25 s late   ekf-smooth      6.8mm    0.74cm/s   0.28°
+
+tag 0.05 s late   asm             2.8mm    2.63cm/s   0.30°
+tag 0.05 s late   asm+dvl         2.7mm    3.18cm/s   0.30°
+tag 0.05 s late   ekf            14.5mm    2.63cm/s   0.27°
+tag 0.05 s late   ekf-nodvl      14.4mm    1.13cm/s   0.27°
+tag 0.05 s late   ekf-smooth      6.7mm    0.73cm/s   0.27°
+
+accel bias 0.1    asm             5.0mm    3.57cm/s   0.30°
+accel bias 0.1    asm+dvl         3.7mm    3.18cm/s   0.30°
+accel bias 0.1    ekf            33.1mm    2.73cm/s   0.28°
+accel bias 0.1    ekf-nodvl      35.2mm   14.84cm/s   0.28°
+accel bias 0.1    ekf-smooth      6.9mm    2.42cm/s   0.28°
+
+DVL 0.05 s late   asm             5.0mm    3.57cm/s   0.30°
+DVL 0.05 s late   asm+dvl         1.5mm    1.45cm/s   0.30°
+DVL 0.05 s late   ekf            32.9mm    0.87cm/s   0.28°
+DVL 0.05 s late   ekf-nodvl      33.6mm    1.65cm/s   0.28°
+DVL 0.05 s late   ekf-smooth      6.3mm    0.62cm/s   0.28°
+
+IMU 50 Hz         asm             5.0mm    3.57cm/s   0.30°
+IMU 50 Hz         asm+dvl         3.8mm    3.19cm/s   0.30°
+IMU 50 Hz         ekf            31.7mm    2.60cm/s   0.28°
+IMU 50 Hz         ekf-nodvl      31.8mm    1.48cm/s   0.28°
+IMU 50 Hz         ekf-smooth      5.3mm    0.63cm/s   0.28°
+
+(53 s)

@@ -43,7 +43,8 @@ from pathlib import Path
 
 import numpy as np
 
-from ..state import (POLICY_ACTION_REPR, POLICY_ACTION_REPRS_FLYABLE,  # noqa: F401
+from ..state import (ACTION_REPR_POS_RPY_WIDTH, POLICY_ACTION_REPR,  # noqa: F401
+                     POLICY_ACTION_REPR_AUTO, POLICY_ACTION_REPRS_FLYABLE,
                      POLICY_CKPT_DEFAULT, POLICY_UMI_REPO)
 
 S_FLU_FRD = np.diag([1.0, -1.0, -1.0])     # same involution as dobmpc.frames.S
@@ -189,10 +190,16 @@ POLICY_PROVENANCE = {
     # 6-DoF VARIANT (2026-09-26, design_final D3/D9/D12/D13). Every number is
     # [예측] until the sim S2-S7 artefacts and the offline gate stats exist.
     "action_repr": "[결정: the checkpoint contract this mission flies; pinned "
-                   "per mission at ARM (POLICY_ACTION_REPRS_FLYABLE)]",
-    "attitude_track": "[결정: False = dropped-and-logged (the mandatory first "
-                      "flight of any 7-dim network); True needs "
-                      "engage.attitude_axes.enabled + every arm gate]",
+                   "per mission at ARM (POLICY_ACTION_REPRS_FLYABLE); auto = "
+                   "the loaded checkpoint's contract, pinned per mission at "
+                   "ARM, never defaulted (2026-10-03)]",
+    "attitude_track": "[결정 2026-10-03: a VETO. Tracking is decided by the "
+                      "LOW (a *_7d follower) + a 7-dim checkpoint; false "
+                      "makes a *_7d LOW fly the 7-dim network dropped-and-"
+                      "logged (rp levelled & recorded, K/M levelling). On a "
+                      "4-DoF LOW a 7-dim network is always dropped-and-"
+                      "logged. Was (2026-09-26): the switch itself, needing "
+                      "engage.attitude_axes + LOW mpc|mpc_tuned]",
     "rp_max_deg": "[예측: T1 compose clip — heave-trim surge residual "
                   "5.81·sin 20° ≈ 2.0 N ≈ the T200 knee [유도: mpc_bridge.py "
                   "heave_trim_wrench + hw_mpc.yaml vehicle_net_buoyancy_n]; "
@@ -222,10 +229,12 @@ HANDHELD_TCP_OFFSET_CAM_M = (0.0355, 0.1293, 0.3186)
 #: down_sample_steps of the trained policy [스펙: ckpt cfg]; obs_dt =
 #: POLICY_DOWN_SAMPLE_STEPS / policy.dataset_fps.
 POLICY_DOWN_SAMPLE_STEPS = 2
-#: The action representation the station flies (state.POLICY_ACTION_REPR,
-#: re-exported here beside its sibling): the worker's checkpoint contract must
-#: match it to arm, every plan is checked at intake (workers._policy_refusal /
-#: _tick_policy_intake) -- a stale policy.ckpt is refused, not decoded.
+#: The CODE default of policy.action_repr (state.POLICY_ACTION_REPR,
+#: re-exported here beside its sibling): an explicit value must match the
+#: worker's checkpoint contract to arm; under ``auto`` the contract itself is
+#: pinned (resolve_policy_action_repr). Every plan is checked against the ARM
+#: pin at intake (workers._policy_refusal / _tick_policy_intake) -- a stale
+#: policy.ckpt is refused, not decoded.
 POLICY_ACTION_REPR = POLICY_ACTION_REPR
 
 
@@ -369,12 +378,13 @@ def default_policy_block() -> dict:
         # sway / heave / R untouched, unlike q_scale. Restored at STOP / mode
         # change like q_scale. Recorded in meta controller.plan_along_scale_flown.
         "along_scale": None,
-        # ---- 6-DoF VARIANT (2026-09-26). All OFF / [예측] by default; see
+        # ---- 6-DoF VARIANT (2026-09-26). [예측] by default; see
         # POLICY_PROVENANCE. action_repr is the checkpoint contract this
-        # mission flies (pinned at ARM); attitude_track True makes the NMPC
-        # follow the policy's roll/pitch (needs engage.attitude_axes).
+        # mission flies (pinned at ARM); attitude_track is a VETO since
+        # 2026-10-03 (True = a *_7d LOW tracks a 7-dim policy's roll/pitch;
+        # no effect on a 4-DoF LOW or a 5-dim checkpoint).
         "action_repr": POLICY_ACTION_REPR,
-        "attitude_track": False,
+        "attitude_track": True,
         "rp_max_deg": 20.0,
         "rp_reject_deg": 30.0,
         "pq_max_rad_s": 0.35,
@@ -596,11 +606,12 @@ def _validate_policy_attitude(pc: dict) -> None:
     take the defaults so a pre-variant hand-built block still resolves."""
     d = default_policy_block()
     ar = str(pc.get("action_repr", d["action_repr"]))
-    if ar not in POLICY_ACTION_REPRS_FLYABLE:
+    if ar not in POLICY_ACTION_REPRS_FLYABLE and ar != POLICY_ACTION_REPR_AUTO:
         raise ValueError(f"policy.action_repr must be one of "
-                         f"{list(POLICY_ACTION_REPRS_FLYABLE)}, got {ar!r}")
-    pc["action_repr"] = ar
-    pc["attitude_track"] = bool(pc.get("attitude_track", False))
+                         f"{[*POLICY_ACTION_REPRS_FLYABLE, POLICY_ACTION_REPR_AUTO]}, "
+                         f"got {ar!r}")
+    pc["action_repr"] = ar             # verbatim ('auto' stays 'auto': meta policy.config)
+    pc["attitude_track"] = bool(pc.get("attitude_track", True))
     pc["heave_trim_attitude_rotated"] = bool(
         pc.get("heave_trim_attitude_rotated", False))
     for k, hi in (("rp_max_deg", 60.0), ("rp_reject_deg", 60.0),
@@ -1131,6 +1142,35 @@ def default_attitude_axes_block() -> dict:
 ATTITUDE_AXES_KEYS = tuple(default_attitude_axes_block())
 
 
+# -----------------------------------------------------------------------------
+# engage.per_thruster — the pwm LOWs' runtime interlocks (2026-10-10 b)
+# -----------------------------------------------------------------------------
+def default_per_thruster_block() -> dict:
+    """``engage.per_thruster`` defaults (control/rl_pwm.PER_THRUSTER_DEFAULTS):
+    the per-thruster interlocks of the pwm LOWs — tilt 20 deg / 0.25 s, rate
+    40 deg/s / 0.15 s, pack 50 A / 1.0 s + 13.5 V, null 80 us / 0.5 s,
+    >= 3 thrusters pinned at the cap / 1.0 s. Armed ONLY under rl_pwm /
+    rl_pwm_7d (workers._runtime_fault, after the attitude ceiling); every
+    other LOW never reads the block, so its presence changes nothing for them
+    (their suites prove it)."""
+    from .rl_pwm import PER_THRUSTER_DEFAULTS
+    return dict(PER_THRUSTER_DEFAULTS)
+
+
+def validate_engage_per_thruster(engage: dict) -> dict:
+    """Merge + validate ``engage.per_thruster`` IN PLACE and return it
+    (unknown keys, types and ranges: control/rl_pwm.parse_per_thruster_block —
+    the ONE reader the worker and the replay tool use). Absent = defaults."""
+    raw = engage.get("per_thruster")
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"engage.per_thruster must be a mapping, got {raw!r}")
+    from .rl_pwm import parse_per_thruster_block
+    engage["per_thruster"] = parse_per_thruster_block(raw)
+    return engage["per_thruster"]
+
+
 def parse_firmware_version(s) -> tuple | None:
     """``"4.1.2"`` (with any trailing text) -> (4, 1, 2); None when unparsable.
     An EMPTY string is None too — a firmware nobody read must refuse."""
@@ -1308,15 +1348,104 @@ def check_vehicle_net_buoyancy(v) -> float:
     return v
 
 
+#: LOW modes that ALSO command roll/pitch (2026-10-03, operator request:
+#: "pid_7d, mpc_tuned_7d, RL_7d 버전"), each mapped to the 4-DoF LOW it
+#: extends. The suffix is a LOW-level decision, never a solver name:
+#: mpc_tuned_7d flies HwDobMpc in mode "mpc_tuned" (its `tuned` flag is
+#: endswith("_tuned") — "mpc_tuned_7d" would silently fly the ISOTROPIC cost),
+#: pid_7d / rl_7d are their own objects (control/pid.HwPid7d,
+#: control/rl_policy.HwRl7d). K/M reach the wire ONLY under these LOWs, and
+#: only with engage.attitude_axes.enabled (the station-launch capability).
+LOW_7D_BASE = {"pid_7d": "pid", "mpc_tuned_7d": "mpc_tuned", "rl_7d": "rl"}
+#: The roll/pitch-TRACKING LOW that actuates attitude with PER-THRUSTER PULSES
+#: (2026-10-03, operator request "RL_PWM 학습 … roll/pitch"): an rl_pwm policy
+#: trained with a roll/pitch reference in q_des (RL_controller att7pwm). It is
+#: deliberately NOT in LOW_7D_BASE: those LOWs put K/M on the MANUAL_CONTROL s/t
+#: extension axes and carry the s/t gates (engage.attitude_axes capability,
+#: firmware, probe, sign); this one never sends s/t — its gate is the pwm
+#: transport's (MANUAL + the vehicle-read PwmGate) — but it shares the attitude
+#: SAFETY interlocks and the tracking truth table (LOW_RP_TRACK_BASE).
+LOW_7D_PULSE_BASE = {"rl_pwm_7d": "rl_pwm"}
+#: Every LOW that tracks a plan's roll/pitch, whatever the transport.
+LOW_RP_TRACK_BASE = {**LOW_7D_BASE, **LOW_7D_PULSE_BASE}
+#: The inverse: the 4-DoF LOW -> its roll/pitch-tracking sibling (the panel
+#: names it when a 7-dim checkpoint would fly dropped-and-logged).
+LOW_RP_TRACK_SIBLING = {base: k for k, base in LOW_RP_TRACK_BASE.items()}
+
+
+def resolve_policy_action_repr(config_value, contract) -> tuple[str, str]:
+    """(pin, source) of a policy mission's action representation — ONE rule for
+    the worker's ARM refusal, its ARM pin and the panel's pre-START forecast
+    (2026-10-03, operator request: picking a 7-dim checkpoint must not need a
+    YAML edit).
+
+    An explicit ``policy.action_repr`` (pos_yaw_width | pos_rpy_width) is the
+    pin, exactly as before: ``(config_value, "config")``, and the caller still
+    refuses a checkpoint whose contract differs. ``auto`` pins the loaded
+    checkpoint's own contract: ``(contract, "checkpoint")``. An empty contract
+    stays "" — the caller REFUSES anything not in POLICY_ACTION_REPRS_FLYABLE
+    and never substitutes a default (the 2026-09-07 rule: a checkpoint is never
+    decoded by width alone)."""
+    cv = str(config_value or POLICY_ACTION_REPR)
+    if cv == POLICY_ACTION_REPR_AUTO:
+        return str(contract or ""), "checkpoint"
+    return cv, "config"
+
+
+def policy_rp_tracked(low, action_repr, attitude_track) -> bool:
+    """The 2026-10-03 truth table, unchanged: a policy mission TRACKS roll/pitch
+    iff the LOW is a *_7d follower (LOW_RP_TRACK_BASE) AND the pinned action is
+    7-dim (pos_rpy_width) AND policy.attitude_track (a veto) allows it — before
+    the ARM gates (K/M live, residual) that may still refuse it."""
+    return bool(str(low) in LOW_RP_TRACK_BASE
+                and str(action_repr) == ACTION_REPR_POS_RPY_WIDTH
+                and bool(attitude_track))
+#: The keys a `rl_pwm_7d:` block may carry. NO pwm_cap: the |throttle| ceiling
+#: belongs to the pwm TRANSPORT (the command sink reads `rl_pwm.pwm_cap` once at
+#: launch and clamps every pulse with it) — a second value would either be
+#: ignored on the wire or make every engage fail the follower-vs-sink check.
+RL_PWM_7D_KEYS = ("policy_dir", "leash_m", "yaw_rate_ff", "yaw_rate_max",
+                  "allow_caps_below_trained")
+
+
+def validate_rl_pwm_7d_block(b: dict) -> None:
+    """Strict check of a ``rl_pwm_7d:`` block (load() and HwRlPwm7d both call
+    it): raw thruster pulses — a misspelt key must not fall back silently."""
+    if "pwm_cap" in b:
+        raise ValueError("rl_pwm_7d: pwm_cap belongs to the pwm transport — set "
+                         "rl_pwm.pwm_cap (the command sink's single |throttle| "
+                         "ceiling for every pwm LOW)")
+    unknown = set(b) - set(RL_PWM_7D_KEYS)
+    if unknown:
+        raise ValueError(f"rl_pwm_7d: unknown key(s) {sorted(unknown)} "
+                         f"(allowed: {list(RL_PWM_7D_KEYS)})")
+    pd = b.get("policy_dir")
+    if pd is not None and (not isinstance(pd, str) or not pd.strip()):
+        raise ValueError(f"rl_pwm_7d.policy_dir must be null or a non-empty path, got {pd!r}")
+    for k in ("yaw_rate_ff", "allow_caps_below_trained"):
+        if k in b and not isinstance(b[k], bool):
+            raise ValueError(f"rl_pwm_7d.{k} must be true/false, got {b[k]!r}")
+    for k in ("leash_m", "yaw_rate_max"):
+        if k in b:
+            v = b[k]
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not (math.isfinite(float(v)) and float(v) > 0.0):
+                raise ValueError(f"rl_pwm_7d.{k} must be a finite number > 0, got {v!r}")
+
+
 @dataclass
 class MpcConfig:
     """config/hw_mpc.yaml, resolved. Axis gains and EAOB sigmas are [예측]
     until the P4 step-calibration / P3 residual fit replace them."""
 
     rov_model: str = "heavy_gripper"
-    # "none" | "mpc" | "dobmpc" | "mpc_tuned" | "dobmpc_tuned" | "pid" | "rl" | "rl_pwm" (the
-    # file / CLI vocabulary, validated in load()). "none" = LOW level None,
-    # TELEOP (2026-09-11): the station commands nothing.
+    # "none" | "mpc" | "dobmpc" | "mpc_tuned" | "dobmpc_tuned" | "pid" | "rl" | "rl_pwm"
+    # | "pid_7d" | "mpc_tuned_7d" | "rl_7d" | "rl_pwm_7d" (the file / CLI vocabulary,
+    # validated in load()). "none" = LOW level None, TELEOP (2026-09-11): the
+    # station commands nothing. The *_7d keys (2026-10-03) are the followers that
+    # ALSO command roll/pitch: pid_7d / mpc_tuned_7d / rl_7d as K/M on
+    # MANUAL_CONTROL s/t (LOW_7D_BASE), rl_pwm_7d through per-thruster pulses
+    # (LOW_7D_PULSE_BASE).
     mode: str = "dobmpc"
     ctrl_hz: float = 20.0
     # PID overrides (rov_gui/control/pid.py SIM_GAINS is the base) — most
@@ -1327,6 +1456,18 @@ class MpcConfig:
     # LOW mode rl_pwm (2026-09-30): the per-thruster RL policy (control/rl_policy.HwRlPwm) — policy_dir, pwm_cap.
     # Empty = the shipped default (rl_policies/pwm10_s1, cap 0.25).
     rl_pwm: dict = field(default_factory=dict)
+    # LOW mode pid_7d (2026-10-03): the roll/pitch loop of control/pid.HwPid7d
+    # (PID7D_DEFAULTS is the base; translation/yaw come from `pid:`). Unknown
+    # keys RAISE (a misspelt gain would otherwise fly the default).
+    pid_7d: dict = field(default_factory=dict)
+    # LOW mode rl_7d (2026-10-03): control/rl_policy.HwRl7d — policy_dir of an
+    # axes6 export trained WITH a roll/pitch reference (none exists yet), leash,
+    # allow_caps_below_trained. Unknown keys RAISE.
+    rl_7d: dict = field(default_factory=dict)
+    # LOW mode rl_pwm_7d (2026-10-03): control/rl_policy.HwRlPwm7d — the pwm
+    # policy trained WITH a roll/pitch reference. Keys RL_PWM_7D_KEYS (strict);
+    # its |throttle| cap is rl_pwm.pwm_cap (one per transport).
+    rl_pwm_7d: dict = field(default_factory=dict)
     # Bridge tag fixes with the velocity estimate + gyro between camera
     # frames (state_assembler): the position the EAOB/PID sees (and the plot
     # draws) moves at the control rate instead of holding the last fix.
@@ -1399,6 +1540,12 @@ class MpcConfig:
     # ``dobmpc`` fly the isotropic Q whatever is written here, so the block
     # can sit in the file while a baseline run is flown.
     mpc_tuned: dict = field(default_factory=dict)
+    # MPC_Tuned PROFILE (2026-10-04, control/mpc_tune.py): the NAME (or path)
+    # of a config/mpc_tuned_profiles/*.yaml the station holds at launch —
+    # applied while LOW is mpc_tuned / mpc_tuned_7d, re-pickable on the panel.
+    # None = no profile: mpc_tuned flies the blocks of this file (the
+    # pre-2026-10-04 behaviour). --mpc-tune overrides it.
+    mpc_tuned_profile: str | None = None
     # STATION BRIDGE — carry a station hold across a tag dropout instead of
     # disengaging. Empty = station_bridge.DEFAULTS. STATION MODE ONLY.
     station_bridge: dict = field(default_factory=dict)
@@ -1469,7 +1616,11 @@ class MpcConfig:
         # MANUAL_CONTROL v2 extension axes. OFF here and in the shipped
         # YAML; with it off every control output, xref and wire frame is
         # byte-identical to the 4-DoF station (test_attitude_axes.py).
-        "attitude_axes": default_attitude_axes_block()})
+        "attitude_axes": default_attitude_axes_block(),
+        # THE PWM LOWs' RUNTIME INTERLOCKS (2026-10-10 b): read only under
+        # rl_pwm / rl_pwm_7d (workers._arm_pwm_interlocks); every other LOW
+        # is byte-identical with or without the block.
+        "per_thruster": default_per_thruster_block()})
     # DEMO REPLAY (shape: replay) — re-fly one recorded handheld demonstration.
     # The session dir must hold poses.npy/poses.json (umi_handheld.extract_pose
     # output). The track is re-expressed relative to its own first pose and
@@ -1554,6 +1705,16 @@ class MpcConfig:
         "abort_max_s": None,
         "axis_cap_dr": None,           # None = use axis_cap
     })
+    # DVL — the estimator's third sensor (control/dvl.py, 2026-10-01,
+    # HARDWARE-UNVERIFIED). Empty = dvl.DEFAULTS, i.e. OFF: no client is
+    # built and the tick is byte-identical to a build without it. Unknown
+    # keys RAISE (the station_bridge rule); `--dvl` forces `enabled`.
+    dvl: dict = field(default_factory=dict)
+    # The robot_localization EKF (control/rl_ekf.py, 2026-10-02) run beside
+    # the state assembler. Empty = rl_ekf.DEFAULTS (enabled, SHADOW). Unknown
+    # keys RAISE (the dvl rule); `--ekf off|shadow|control` overrides
+    # `enabled`, and only the command line can start a session in control.
+    ekf: dict = field(default_factory=dict)
     # ROOT of the dated run tree (rov_gui/runstore.py), not the folder
     # written to: the CSV, its .meta.json and events.log land in
     # <log_dir>/YYYYMMDD/MMDD_HHMMSS/ beside the recordings of the same run.
@@ -1637,6 +1798,10 @@ class MpcConfig:
 
             resolve_tune(raw["mpc_tuned"])
             cfg.mpc_tuned = dict(raw["mpc_tuned"])
+        if raw.get("mpc_tuned_profile") is not None:
+            # A NAME only here — the file is loaded (and may fail, loudly) by
+            # the MpcWorker, which owns the refusal and the panel's ERROR.
+            cfg.mpc_tuned_profile = str(raw["mpc_tuned_profile"]).strip() or None
         if "square" in raw and raw["square"]:
             cfg.square.update(raw["square"])
         # WHICH SHAPE, validated — AFTER the merge, so the name checked is the
@@ -1681,23 +1846,46 @@ class MpcConfig:
                 cfg.engage.get("require_mode", "MANUAL"))
             check_engage_stabilize(cfg.engage)
             validate_engage_attitude_axes(cfg.engage)
+            validate_engage_per_thruster(cfg.engage)
         if "pid" in raw and raw["pid"]:
             cfg.pid = dict(raw["pid"])
         if "rl" in raw and raw["rl"]:
             cfg.rl = dict(raw["rl"])
+        if "pid_7d" in raw and raw["pid_7d"]:
+            cfg.pid_7d = dict(raw["pid_7d"])
+            from .pid import PID7D_DEFAULTS
+            unknown = set(cfg.pid_7d) - set(PID7D_DEFAULTS)
+            if unknown:
+                raise ValueError(f"pid_7d: unknown key(s) {sorted(unknown)}")
+        if "rl_pwm_7d" in raw and raw["rl_pwm_7d"]:
+            cfg.rl_pwm_7d = dict(raw["rl_pwm_7d"])
+            validate_rl_pwm_7d_block(cfg.rl_pwm_7d)
+        if "rl_7d" in raw and raw["rl_7d"]:
+            cfg.rl_7d = dict(raw["rl_7d"])
+            unknown = set(cfg.rl_7d) - {"policy_dir", "axis_cap", "leash_m", "yaw_rate_ff",
+                                        "yaw_rate_max", "allow_caps_below_trained"}
+            if unknown:
+                raise ValueError(f"rl_7d: unknown key(s) {sorted(unknown)}")
         if "rl_pwm" in raw and raw["rl_pwm"]:
             cfg.rl_pwm = dict(raw["rl_pwm"])
             # NO pwm_channels key: the vehicle's script maps RC channel 8+m to motor m and nothing else, so a
             # configurable order could only ever swap thrusters silently (safety review 2026-09-30).
-            unknown = set(cfg.rl_pwm) - {"policy_dir", "pwm_cap", "leash_m", "yaw_rate_ff", "yaw_rate_max"}
+            from .rl_pwm import RL_PWM_KEYS, parse_rl_pwm_block
+            unknown = set(cfg.rl_pwm) - set(RL_PWM_KEYS)
             if unknown:
                 # raw thruster pulses: a misspelt pwm_cap silently falling back to a default is not acceptable here
-                raise ValueError(f"rl_pwm: unknown key(s) {sorted(unknown)}")
-            cap = cfg.rl_pwm.get("pwm_cap")
-            if cap is not None and (isinstance(cap, bool) or not isinstance(cap, (int, float))
-                                    or not (math.isfinite(float(cap)) and 0.0 < float(cap) <= 1.0)):
-                # `pwm_cap: true` is YAML for 1.0 = full throttle; a number or nothing
-                raise ValueError(f"rl_pwm.pwm_cap must be a number in (0, 1], got {cap!r}")
+                raise ValueError(f"rl_pwm: unknown key(s) {sorted(unknown)} (allowed: {list(RL_PWM_KEYS)})")
+            # `pwm_cap: true` is YAML for 1.0 = full throttle; a number or nothing. The 2026-10-10 keys
+            # (pwm_cap_mode, allow_caps_below_trained, require_thruster_probe, thruster_probe_path,
+            # thruster_probe_max_age_days) are validated by the ONE reader the follower and the command sink use.
+            parse_rl_pwm_block(cfg.rl_pwm)
+            # ...and the 2026-10-10 (b) observation-guard block (rl_pwm.obs_guard: velocity slew, fix-jump reject,
+            # tag gate -> hold), by its own reader — unknown keys raise, like the transport keys above.
+            from .rl_pwm import parse_obs_guard_block
+            og = cfg.rl_pwm.get("obs_guard")
+            if og is not None and not isinstance(og, dict):
+                raise ValueError(f"rl_pwm.obs_guard must be a mapping, got {og!r}")
+            parse_obs_guard_block(og)
         if "vel_propagation" in raw:
             cfg.vel_propagation = bool(raw["vel_propagation"])
         if "imu_dr" in raw and raw["imu_dr"]:
@@ -1713,6 +1901,21 @@ class MpcConfig:
                     f"unknown imu_dr keys {sorted(unknown)}; "
                     f"known: {sorted(cfg.imu_dr)}")
             cfg.imu_dr.update(raw["imu_dr"])
+        if "dvl" in raw and raw["dvl"]:
+            # Unknown keys and bad shapes RAISE, the station_bridge rule: a
+            # silently ignored `mount_rpy:` would fly an unrotated DVL while
+            # the file and the run meta say it was rotated.
+            from .dvl import resolve as _resolve_dvl
+
+            _resolve_dvl(raw["dvl"])
+            cfg.dvl = dict(raw["dvl"])
+        if "ekf" in raw and raw["ekf"]:
+            # The dvl rule: typos and bad shapes RAISE at load, so a run
+            # cannot fly an EKF the file does not describe.
+            from .rl_ekf import resolve as _resolve_ekf
+
+            _resolve_ekf(raw["ekf"])
+            cfg.ekf = dict(raw["ekf"])
         if "replay" in raw and raw["replay"]:
             # Unknown keys RAISE, the imu_dr rule: `griper:` for `gripper:` or
             # `vmax:` for `v_max_m_s:` silently ignored means a replay flown
@@ -1797,11 +2000,13 @@ class MpcConfig:
         # request: LOW level None = TELEOP; `--policy-observe` is its launch
         # alias) — it is NOT a member of HwDobMpc.MODES and must not become
         # one (that setter raises for non-members).
+        # 2026-10-03: + pid_7d | mpc_tuned_7d | rl_7d (LOW_7D_BASE) | rl_pwm_7d
+        # (LOW_7D_PULSE_BASE).
         if cfg.mode not in ("none", "mpc", "dobmpc", "mpc_tuned",
-                            "dobmpc_tuned", "pid", "rl", "rl_pwm"):
+                            "dobmpc_tuned", "pid", "rl", "rl_pwm") + tuple(LOW_RP_TRACK_BASE):
             raise ValueError(
                 f"mode must be none|mpc|dobmpc|mpc_tuned|dobmpc_tuned|pid|rl|"
-                f"rl_pwm, got {cfg.mode!r}")
+                f"rl_pwm|pid_7d|mpc_tuned_7d|rl_7d|rl_pwm_7d, got {cfg.mode!r}")
         return cfg
 
 

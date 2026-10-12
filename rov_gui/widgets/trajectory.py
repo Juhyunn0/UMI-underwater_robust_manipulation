@@ -31,8 +31,12 @@ from collections import deque
 from .. import theme
 from ..qt import (QColor, QPainter, QRectF, Qt, QtCore, QtGui, QtWidgets,
                   Signal)
-from ..control.geometry import SHAPES
-from ..state import MpcStatus, NavFix, ObjectFix, PolicyStatus
+from ..control.geometry import (LOW_7D_BASE, LOW_RP_TRACK_BASE,
+                                LOW_RP_TRACK_SIBLING, SHAPES,
+                                policy_rp_tracked, resolve_policy_action_repr)
+from ..state import (ACTION_DIM_BY_REPR, ACTION_REPR_POS_RPY_WIDTH,
+                     ACTION_REPR_POS_YAW_WIDTH, POLICY_ACTION_REPRS_FLYABLE,
+                     MpcStatus, NavFix, ObjectFix, PolicyStatus)
 from .indicators import HoldToConfirmButton
 
 #: HIGH level = the mission SHAPE: what generates the reference. The KEYS are
@@ -53,13 +57,21 @@ assert set(SHAPE_LABELS) == set(SHAPES), "a shape without a label, or a label wi
 #: draws its plans — exactly the audited --policy-observe path, now a runtime
 #: choice (the flag survives as a launch alias). First in the list because it
 #: is the one LOW level that cannot move the vehicle by itself.
-MODE_LABELS = {"none": "None", "pid": "PID", "mpc": "MPC",
-               "mpc_tuned": "MPC_Tuned", "dobmpc": "DOBMPC",
+MODE_LABELS = {"none": "None", "pid": "PID",
+               # 2026-10-03: each *_7D right after its base — the same
+               # follower that ALSO commands roll/pitch (K/M on MANUAL_CONTROL
+               # s/t; needs engage.attitude_axes.enabled at launch).
+               "pid_7d": "PID_7D", "mpc": "MPC",
+               "mpc_tuned": "MPC_Tuned", "mpc_tuned_7d": "MPC_Tuned_7D",
+               "dobmpc": "DOBMPC",
                "dobmpc_tuned": "DOBMPC_Tuned", "mpcc": "MPCC",
-               "dobmpcc": "DOBMPCC", "rl": "RL",
+               "dobmpcc": "DOBMPCC", "rl": "RL", "rl_7d": "RL_7D",
                # 2026-09-30: the per-thruster RL policy (8 raw pulses through
                # the vehicle's Lua override, mixer bypassed). Last, after RL.
-               "rl_pwm": "RL_PWM"}
+               "rl_pwm": "RL_PWM",
+               # 2026-10-03: the same transport, a policy trained to TRACK
+               # roll/pitch (q_des) — no s/t, no engage.attitude_axes needed.
+               "rl_pwm_7d": "RL_PWM_7D"}
 #: The ckpt row shows a BASENAME, elided past this many characters (the full
 #: path is the tooltip). Character-based, not pixel-based, so the row's width
 #: never depends on the font — the panel is a fixed grid cell.
@@ -80,6 +92,9 @@ def elide_ckpt_name(name: str, limit: int = CKPT_NAME_CHARS) -> str:
     return name[:head] + "…" + name[-tail:]
 
 TRAIL_MAX = 4800          # hard cap on stored points (memory bound)
+#: The robot_localization EKF overlay (2026-10-02): teal, a colour no other
+#: series here uses (blue reference, viridis truth, amber DR, accent object).
+EKF_COLOR = "#2bb5a8"
 #: How far back the trails go. 3 s, not the 90 s this shipped with
 #: (operator, 2026-09-03): at 90 s the vehicle's own history filled the plot
 #: and buried the thing the panel is currently FOR — the policy's proposal,
@@ -203,6 +218,11 @@ class TrajectoryView(QtWidgets.QWidget):
         # the other two so the gap between it and trail_act is read straight
         # off the picture. That gap is the experiment's whole output.
         self.trail_dr: deque = deque(maxlen=TRAIL_MAX)
+        # The robot_localization EKF's position (2026-10-02, MpcStatus
+        # p_ekf_flu): a dotted teal trail and a ring, subordinate to the
+        # tag truth like the DR ghost.
+        self.trail_ekf: deque = deque(maxlen=TRAIL_MAX)
+        self.p_ekf = None
         # ON whenever a dead reckoner is reporting. Running with --imu-dr IS
         # the request to see the estimate — the experiment is the two markers
         # side by side, and an overlay the operator has to discover and switch
@@ -380,7 +400,7 @@ class TrajectoryView(QtWidgets.QWidget):
     def _prune_trails(self) -> None:
         cut = time.monotonic() - TRAIL_AGE_S
         for trail in (self.trail_act, self.trail_ref, self.trail_dr,
-                      self.trail_obj):
+                      self.trail_obj, self.trail_ekf):
             while trail and trail[0][0] < cut:
                 trail.popleft()
 
@@ -596,6 +616,17 @@ class TrajectoryView(QtWidgets.QWidget):
             # most misleading thing this plot could draw — a dead reckoner
             # that has died looks like one that is tracking perfectly.
             self.p_dr = None
+        # The EKF, through the same mirror and datum, while engaged only (the
+        # datum frame exists only then — p_flu's rule) and only while it has
+        # an output: no estimate, no marker.
+        pe = getattr(s, "p_ekf_flu", None)
+        if pe is not None and s.engaged:
+            ex, ey = self._to_map(pe[0], -pe[1])
+            ez = self._to_map_z(-float(pe[2]))
+            self._trail_push(self.trail_ekf, ex, ey, 1e-3, ez)
+            self.p_ekf = (ex, ey, ez)
+        else:
+            self.p_ekf = None
         self.observe = bool(getattr(s, "observe", False))
         if s.ref_flu is not None:
             # FLU -> NED mirror for display (the map frame the pool is
@@ -695,6 +726,7 @@ class TrajectoryView(QtWidgets.QWidget):
         self.trail_act.clear()
         self.trail_ref.clear()
         self.trail_dr.clear()
+        self.trail_ekf.clear()
         self.trail_obj.clear()
         self.policy_plans.clear()
         # The gauge's window is a per-run latch, so a cleared plot gets a
@@ -1586,6 +1618,11 @@ class TrajectoryView(QtWidgets.QWidget):
             for run in self._clip_runs(self.trail_dr, xw0, xw1, yw0, yw1):
                 poly(run, QtGui.QPen(_c(theme.WARN, 170), 1,
                                      Qt.PenStyle.DashLine))
+        # The EKF trail: dotted teal, under the truth like the DR trail.
+        if len(self.trail_ekf) >= 2:
+            for run in self._clip_runs(self.trail_ekf, xw0, xw1, yw0, yw1):
+                poly(run, QtGui.QPen(_c(EKF_COLOR, 170), 1,
+                                     Qt.PenStyle.DotLine))
         # The object's own track: a plain 1 px solid line. Deliberately NOT a
         # second viridis ramp — one age ramp per plot is enough, and a second
         # would make the two impossible to tell apart at a glance.
@@ -1703,6 +1740,13 @@ class TrajectoryView(QtWidgets.QWidget):
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(_c(theme.WARN, 200))
             p.drawEllipse(self._px(self.p_dr[0], self.p_dr[1], zd), 3, 3)
+        if self.p_ekf is not None:
+            # A RING, not a hull: the EKF is a comparison overlay, and a
+            # second ghost vehicle beside the DR's would be one too many.
+            p.setPen(QtGui.QPen(_c(EKF_COLOR, 220), 1.5))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(self._px(self.p_ekf[0], self.p_ekf[1],
+                                   float(self.p_ekf[2])), 4, 4)
 
         # THE OBJECT: a DIAMOND, and the shape is the point. Tags are squares,
         # the hull is a rectangle, the reference is a cross — a fourth marker
@@ -2113,11 +2157,29 @@ class ElidingLabel(QtWidgets.QLabel):
 
     Also the checkpoint NAME and STATE on the HIGH row (2026-09-11, review
     M1): each prefers its text and yields under a deficit, so neither a long
-    checkpoint name nor a 48-char refusal can drive the panel's minimum."""
+    checkpoint name nor a 48-char refusal can drive the panel's minimum.
+
+    And the status CHIP under the plot (2026-10-03): as a plain QLabel its
+    sentence was the panel's minimum width, so a long START refusal (the
+    facing-tag one in control/workers.py `_refuse` is ~230 chars) or a
+    localizer note widened columns 2-3, squeezed the main video, and could
+    push the window's minimum past the screen — the operator's "the
+    trajectory panel suddenly grows and the cameras get squeezed". Pinned by
+    test_offline.py test_status_text_never_moves_the_station_grid. A label
+    whose tooltip already EXPLAINS it (the chip's sign legend) keeps that
+    text under the full message: see :meth:`set_tip_legend`."""
+
+    _tip_legend = ""
 
     def setText(self, text: str) -> None:          # noqa: N802 - Qt naming
         super().setText(text)
-        self.setToolTip(text)
+        self.setToolTip(f"{text}\n\n{self._tip_legend}" if self._tip_legend
+                        else text)
+
+    def set_tip_legend(self, legend: str) -> None:
+        """A fixed explanation shown in the tooltip BELOW the full text."""
+        self._tip_legend = str(legend)
+        self.setText(self.text())
 
     def minimumSizeHint(self):                      # noqa: N802 - Qt naming
         h = super().minimumSizeHint()
@@ -2181,6 +2243,24 @@ class TrajectoryWindow(QtWidgets.QWidget):
     # (which loads it on the GPU, or refuses and says why in
     # PolicyStatus.ckpt_note). Replaces --policy-ckpt (2026-09-11).
     policy_ckpt_requested = Signal(str)
+    # The MPC_Tuned PROFILE row (2026-10-04, control/mpc_tune.py), the ckpt
+    # row's twin on the LOW row: `…` asks the WINDOW to open the picker
+    # (MainWindow._pick_mpc_tune — it owns the keyboard hand-back and Esc =
+    # E-STOP), and the chosen file's PATH goes -> bus.cmd_mpc_tune ->
+    # MpcWorker.set_mpc_tune, which holds it or refuses; the CONFIRMED name
+    # comes back only through MpcStatus.mpc_tune.
+    mpc_tune_pick_requested = Signal()
+    mpc_tune_requested = Signal(str)
+    # The DVL button -> bus.cmd_dvl_use -> MpcWorker.set_dvl_use: True = IN
+    # (the estimator consumes the DVL's velocity), False = OUT (shadow). The
+    # worker may refuse (engaged, CSV open, mount not measured / not proven)
+    # and the button shows only what MpcStatus.dvl_use reports (2026-10-01).
+    dvl_use_requested = Signal(bool)
+    # The EST button -> bus.cmd_estimator -> MpcWorker.set_estimator: "ekf" =
+    # the controller is handed the robot_localization EKF's state, "tag" =
+    # the state assembler's. Same request/re-sync rule as the DVL button
+    # (2026-10-02).
+    estimator_requested = Signal(str)
 
     _BTN_CSS = "QPushButton{font-size:11px; padding:3px 8px;}"
     # The ckpt row's button: same face, one line tall — the row sits between
@@ -2230,7 +2310,15 @@ class TrajectoryWindow(QtWidgets.QWidget):
             "*_Tuned: the same tracking NMPC with Q split into along-track "
             "(cheap) and cross-track (expensive) — suppresses corner "
             "cutting; weights in hw_mpc.yaml mpc_tuned:\n"
-            "PID: the pole-placed baseline")
+            "PID: the pole-placed baseline\n"
+            "*_7D: the same follower that ALSO commands roll/pitch — tracks a "
+            "7-dim Diffusion Policy's roll/pitch, levels otherwise (K/M on "
+            "MANUAL_CONTROL s/t, MANUAL only; refused unless the station was "
+            "launched with engage.attitude_axes.enabled + its probe gates). "
+            "RL_7D needs a policy trained with a roll/pitch goal (none yet)\n"
+            "RL_PWM_7D: the per-thruster RL policy trained to track roll/pitch — "
+            "roll/pitch go out as PULSES (no s/t, no engage.attitude_axes); "
+            "MANUAL + the RL_PWM vehicle gate; tilt ceiling armed")
         self.mode_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.mode_box.currentIndexChanged.connect(self._mode_changed)
 
@@ -2397,6 +2485,31 @@ class TrajectoryWindow(QtWidgets.QWidget):
         self.btn_dr.setVisible(False)          # only when a DR is reporting
         self.btn_dr.setChecked(True)           # ...and checked when it appears
         self.btn_dr.toggled.connect(self._dr_toggled)
+        # THE DVL SWITCH (2026-10-01, control/dvl.py). Hidden until a DVL is
+        # reporting through MpcStatus (the DR button's rule), so a station
+        # without one looks exactly as it did. `clicked`, not `toggled`: the
+        # click is a REQUEST, and `_dvl_clicked` puts the face straight back
+        # to what the worker last said until the next status confirms it.
+        self.btn_dvl = QtWidgets.QPushButton("DVL OUT")
+        self.btn_dvl.setCheckable(True)
+        self.btn_dvl.setStyleSheet(self._BTN_CSS)
+        self.btn_dvl.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_dvl.setVisible(False)
+        self.btn_dvl.clicked.connect(self._dvl_clicked)
+        self._dvl_use = False           # what the WORKER holds
+        self._dvl_css = ""
+        # THE ESTIMATOR SWITCH (2026-10-02, control/rl_ekf.py): TAG = the
+        # state assembler (every run before), EKF = the robot_localization
+        # EKF. Hidden until an EKF reports through MpcStatus; the DVL
+        # button's request / re-sync rule.
+        self.btn_est = QtWidgets.QPushButton("EST TAG")
+        self.btn_est.setCheckable(True)
+        self.btn_est.setStyleSheet(self._BTN_CSS)
+        self.btn_est.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_est.setVisible(False)
+        self.btn_est.clicked.connect(self._est_clicked)
+        self._ekf_control = False       # what the WORKER holds
+        self._est_css = ""
         self.btn_3d = QtWidgets.QPushButton("3D")
         self.btn_3d.setCheckable(True)
         self.btn_3d.setStyleSheet(self._BTN_CSS)
@@ -2466,11 +2579,53 @@ class TrajectoryWindow(QtWidgets.QWidget):
         self._ckpt_note_t = 0.0
         self._ckpt_note_seen = ""       # last ckpt_note VALUE seen (incl. "")
 
+        # ---- the MPC_Tuned profile widgets (LOW = MPC_Tuned / _7D only) -----
+        # 2026-10-04, operator request: "mpc_tuned를 선택하면 diffusion policy
+        # 처럼 튜닝 파라미터를 불러와서 적용". Same pattern as the ckpt row and
+        # on the LOW row for the same height reason (no new row): name = the
+        # profile the WORKER holds (MpcStatus.mpc_tune; "→ name" while a pick
+        # is in flight), state = OK / WARN (flies with differences — tooltip
+        # lists them) / ERROR, or the worker's refusal for a few seconds.
+        self.lbl_tune = QtWidgets.QLabel("tune")
+        self.lbl_tune.setStyleSheet(f"color:{theme.TEXT_DIM}; font-size:11px;")
+        self.tune_name = ElidingLabel("")
+        self.tune_name.setStyleSheet(f"color:{theme.TEXT_DIM}; font-size:11px;")
+        self.tune_state = ElidingLabel("")
+        self.tune_state.setStyleSheet(f"color:{theme.TEXT_DIM}; font-size:11px;")
+        self.btn_tune = QtWidgets.QPushButton("…")
+        self.btn_tune.setStyleSheet(self._CKPT_BTN_CSS)
+        self.btn_tune.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_tune.setToolTip(
+            "choose the MPC_Tuned profile (config/mpc_tuned_profiles/*.yaml): "
+            "Q/QN/R, the along/cross split, policy q_scale/along_scale, the "
+            "heave trim (vehicle_net_buoyancy_n) and axis cap/slew — applied "
+            "while LOW is MPC_Tuned / MPC_Tuned_7D only; every other LOW keeps "
+            "hw_mpc.yaml. Refused while engaged or while a REC controller CSV "
+            "is open.\nWhile the dialog is up the KEYBOARD is not flying the "
+            "vehicle (Esc closes it AND is E-STOP); the joystick still flies.\n"
+            "Save a new one: python -m rov_gui.tools.mpc_tune save NAME")
+        self.btn_tune.clicked.connect(self.mpc_tune_pick_requested)
+        self.tune_widgets = (self.lbl_tune, self.tune_name, self.tune_state,
+                             self.btn_tune)
+        self._tune_path = ""            # the profile the worker holds ("" = none)
+        self._tune_requested = ""       # a pick in flight, until status answers
+        self._tune_requested_t = 0.0
+        self._tune_css = ""
+
         # The last START refusal and when it arrived — see add_status.
         self._ref_msg = ""
         self._ref_t = 0.0
-        self.chip = QtWidgets.QLabel("not engaged")
-        self.chip.setToolTip(
+        # ELIDING with an IGNORED width, like mission_lbl: the chip carries
+        # whole sentences (START refusals up to ~230 chars, localizer notes
+        # joined with "; ") and as a plain QLabel its text WAS the panel's
+        # minimum width — through the grid it squeezed the video columns and
+        # pushed the window past the screen (ElidingLabel docstring). The full
+        # sentence stays in text() (tests read it) and heads the tooltip; the
+        # refusal itself is also in the mission log (`_refuse` logs it).
+        self.chip = ElidingLabel("not engaged")
+        self.chip.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                                QtWidgets.QSizePolicy.Policy.Preferred)
+        self.chip.set_tip_legend(
             "off = cross-track (+ left of travel) · lag = along-track "
             "(+ behind)\n"
             "z = the DEPTH being held, MAP frame, NED down-positive — a "
@@ -2524,6 +2679,10 @@ class TrajectoryWindow(QtWidgets.QWidget):
         row1.setSpacing(4)
         row1.addWidget(self.lbl_low)
         row1.addWidget(self.mode_box)
+        # the MPC_Tuned profile, right after the LOW combo (shown only for
+        # mpc_tuned / mpc_tuned_7d — `_refresh_tune_row`)
+        for w in self.tune_widgets:
+            row1.addWidget(w)
         row1.addWidget(self.btn_start, 1)
         row1.addWidget(self.btn_hold)
         row2 = QtWidgets.QHBoxLayout()
@@ -2534,11 +2693,14 @@ class TrajectoryWindow(QtWidgets.QWidget):
         row2.addWidget(clear)
         row2.addWidget(self.btn_3d)
         row2.addWidget(self.btn_dr)
+        row2.addWidget(self.btn_dvl)
+        row2.addWidget(self.btn_est)
         row2.addWidget(self.btn_rec)
         row2.addStretch(1)
         bottom = QtWidgets.QHBoxLayout()
-        bottom.addWidget(self.chip)
-        bottom.addStretch(1)
+        # stretch 1: an Ignored-width label gets only what the layout hands
+        # it, so it must be the item that takes the row's leftover.
+        bottom.addWidget(self.chip, 1)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(6, 4, 6, 6)
         lay.setSpacing(4)
@@ -2552,8 +2714,23 @@ class TrajectoryWindow(QtWidgets.QWidget):
         self._nav_note = ""            # the localizer's last refusal, and
         self._nav_note_t = 0.0         # when — see add_fix
         self._mission_base = ""        # mission_lbl before the LOW suffix
+        # THE PRE-START FORECAST (2026-10-03, policy.action_repr auto): what the
+        # held checkpoint is and what the current LOW will do with its
+        # roll/pitch. From the PolicyStatus (contract, mount, ready) and the
+        # config the window seeds (set_policy_config_default). Display only;
+        # no seed = no forecast (never a "will be refused" the worker may not
+        # share). The worker's own rule (geometry) decides — the panel says.
+        self._pol_repr = ""            # the held checkpoint's contract, "" = none
+        self._pol_mount_ok = True
+        self._pol_ready = False        # ready, no error, not loading
+        self._pol_cfg = None           # (action_repr, attitude_track, axes capability)
+        self._pol_land = False         # --land-dry-run: nothing is actuated
+        self._pol_unavailable = ()     # *_7d LOWs with no export to fly
+        self._pol_status_last = None   # re-rendered when the seed arrives
+        self._mission_colour = theme.TEXT_FAINT
         self.shape_box.currentIndexChanged.connect(self._shape_index_changed)
         self._shape_changed(self.current_shape())
+        self._refresh_tune_row()
 
     # ------------------------------------------------------------- keyboard
     _EDIT_KEYS = frozenset((
@@ -2615,6 +2792,7 @@ class TrajectoryWindow(QtWidgets.QWidget):
         self.mode_box.blockSignals(True)
         self.mode_box.setCurrentIndex(i)
         self.mode_box.blockSignals(False)
+        self._refresh_tune_row()
         # The mission label depends on the LOW level (LOW None changes what
         # START does), and the blocked combo fires nothing — so re-word it
         # here. Without this the window's seeding order (set_mission_defaults
@@ -2632,6 +2810,7 @@ class TrajectoryWindow(QtWidgets.QWidget):
         depends on it too (LOW None changes what START will do), so it is
         re-worded here WITHOUT re-sending the scenario."""
         self._refresh_mission_lbl()
+        self._refresh_tune_row()
         key = self.current_mode()
         if key:
             self.mode_requested.emit(key)
@@ -2811,7 +2990,7 @@ class TrajectoryWindow(QtWidgets.QWidget):
                     + (f", tag {tag} at its bottom" if tag
                        else ", bottom of it here"))
         self._mission_base = text
-        self.mission_lbl.setText(self._mission_text(shape, text))
+        self._show_mission_text(shape, text)
         self.scenario_requested.emit(d)
 
     def _mission_text(self, shape: str, base: str) -> str:
@@ -2824,11 +3003,16 @@ class TrajectoryWindow(QtWidgets.QWidget):
         Policy / Replay). Wording per the 2026-09-11 design."""
         low_none = (self.current_mode() == "none")
         if shape == "policy":
+            # 2026-10-03: the roll/pitch forecast LEADS (it survives the
+            # right-elision of a squeezed label); under LOW None it follows
+            # the teleop sentence, which must keep saying what START does.
+            fc = self._policy_forecast()[0]
             if low_none:
                 return ("LOW None (teleop): press START — the DP infers + "
                         "draws, YOU fly; STOP TRAJ / DISENG to change LOW or "
-                        "the ckpt")
-            return ("run the diffusion policy from HERE (ckpt from the "
+                        "the ckpt" + (f" · {fc}" if fc else ""))
+            return ((f"{fc} · " if fc else "")
+                    + "run the diffusion policy from HERE (ckpt from the "
                     "picker; limits in hw_mpc.yaml policy:)")
         if low_none and shape != "replay":
             return base + (" · LOW None: START will be refused (teleop runs "
@@ -2838,8 +3022,115 @@ class TrajectoryWindow(QtWidgets.QWidget):
     def _refresh_mission_lbl(self) -> None:
         """Re-word the mission label for the current LOW level, without
         re-sending the scenario (nothing about the mission changed)."""
-        self.mission_lbl.setText(
-            self._mission_text(self.current_shape(), self._mission_base))
+        self._show_mission_text(self.current_shape(), self._mission_base)
+
+    def _show_mission_text(self, shape: str, base: str) -> None:
+        """Set the mission label AND its colour: FAINT as always, unless the
+        Diffusion Policy forecast has something to say (WARN when roll/pitch
+        would be TRACKED or the LOW cannot engage, DIM when dropped/level)."""
+        self.mission_lbl.setText(self._mission_text(shape, base))
+        colour = (self._policy_forecast()[1] if shape == "policy"
+                  else theme.TEXT_FAINT)
+        if colour != self._mission_colour:
+            self._mission_colour = colour
+            self.mission_lbl.setStyleSheet(f"color:{colour}; font-size:11px;")
+
+    def set_policy_config_default(self, action_repr: str, attitude_track: bool,
+                                  attitude_axes: bool, *,
+                                  land_dry_run: bool = False,
+                                  unavailable: tuple = ()) -> None:
+        """Seed the forecast from the YAML the worker loads (window.py, beside
+        set_policy_ckpt_default): policy.action_repr, the policy.attitude_track
+        veto and the engage.attitude_axes capability; plus what the launch
+        fixes — a land dry-run (nothing is actuated: a tracked mission is
+        refused at ARM) and the *_7d LOWs that have no export to fly
+        (`unavailable`, e.g. rl_7d with policy_dir null). Display only."""
+        self._pol_cfg = (str(action_repr or ""), bool(attitude_track),
+                         bool(attitude_axes))
+        self._pol_land = bool(land_dry_run)
+        self._pol_unavailable = tuple(str(k) for k in (unavailable or ()))
+        if self._pol_status_last is not None:     # the row judges with it too
+            self.set_policy_status(self._pol_status_last)
+        self._refresh_mission_lbl()
+
+    def _policy_ckpt_problem(self) -> str:
+        """Why START will be REFUSED because of the held CHECKPOINT itself
+        (whatever the LOW): the worker's order and rule — contract not
+        flyable, contract != an explicit policy.action_repr (only once the
+        config is seeded), mount mismatch. "" = none known."""
+        r = self._pol_repr
+        if not r:
+            return ""
+        if r not in POLICY_ACTION_REPRS_FLYABLE:
+            return "not flyable"
+        if self._pol_cfg is not None:
+            pin, _src = resolve_policy_action_repr(self._pol_cfg[0], r)
+            if pin != r:
+                return f"≠ config {pin}"
+        if not self._pol_mount_ok:
+            return "MOUNT MISMATCH"
+        return ""
+
+    def _policy_forecast(self) -> tuple[str, str]:
+        """(sentence, colour) — what the CURRENT LOW will do with the held
+        checkpoint's roll/pitch at START (geometry.policy_rp_tracked, the
+        worker's own rule), or ("", FAINT) when there is nothing to add: no
+        seed, no READY contract, a checkpoint the row already marks as
+        refused, or a 5-dim checkpoint on a 4-DoF LOW (byte-identical to the
+        pre-2026-10-03 label), or a contouring LOW (mpcc: every policy START
+        is refused). The ARM gates the panel cannot see (pwm gate / K/M live
+        on this engagement, attitude residual) stay "if the ARM gates pass"."""
+        none = ("", theme.TEXT_FAINT)
+        if self._pol_cfg is None or not self._pol_ready or not self._pol_repr:
+            return none
+        if self._policy_ckpt_problem():
+            return none
+        _cfg_repr, veto_ok, axes_cap = self._pol_cfg
+        low = self.current_mode()
+        label = MODE_LABELS.get(low, low)
+        if low in ("mpcc", "dobmpcc"):
+            # the contouring pair refuses every streamed plan (worker:
+            # "contours its own path") — nothing to forecast about rp
+            return none
+        if low in LOW_7D_BASE and not axes_cap and not self._pol_land:
+            # an s/t *_7d LOW cannot ENGAGE on a vehicle without the launch
+            # capability, whatever the checkpoint (review 2026-10-03)
+            return (f"{label} needs engage.attitude_axes (off in the YAML) — "
+                    f"ENGAGE will be refused", theme.WARN)
+        if self._pol_repr == ACTION_REPR_POS_YAW_WIDTH:
+            if low in LOW_RP_TRACK_SIBLING.values() and not self._pol_land:
+                return (f"5-dim ckpt: {label} holds roll/pitch level",
+                        theme.TEXT_DIM)
+            return none
+        if low == "none":
+            return ("7-dim ckpt: roll/pitch DROPPED-AND-LOGGED (LOW None)",
+                    theme.TEXT_DIM)
+        if policy_rp_tracked(low, ACTION_REPR_POS_RPY_WIDTH, veto_ok):
+            if self._pol_land:
+                # nothing is actuated in a land dry-run, so the worker
+                # refuses a TRACKED mission at ARM ("K/M path is not live")
+                base = LOW_RP_TRACK_BASE.get(low, "")
+                return (f"7-dim ckpt: {label} cannot track in a land dry-run — "
+                        f"START will be refused (use "
+                        f"{MODE_LABELS.get(base, base) or 'a 4-DoF LOW'})",
+                        theme.WARN)
+            return (f"7-dim ckpt: roll/pitch TRACKED on {label} (if the ARM "
+                    f"gates pass)", theme.WARN)
+        if low in LOW_RP_TRACK_SIBLING.values():
+            return ("7-dim ckpt: roll/pitch DROPPED-AND-LOGGED "
+                    "(policy.attitude_track false)", theme.TEXT_DIM)
+        # a 4-DoF LOW: name the sibling that WOULD track — only when the
+        # worker's own rule says so (veto), the launch allows it (capability,
+        # not a land dry-run) and it has an export to fly
+        sib = LOW_RP_TRACK_SIBLING.get(low)
+        hint = ""
+        if (sib is not None and not self._pol_land
+                and sib not in self._pol_unavailable
+                and policy_rp_tracked(sib, ACTION_REPR_POS_RPY_WIDTH, veto_ok)
+                and (sib not in LOW_7D_BASE or axes_cap)):
+            hint = f"; {MODE_LABELS.get(sib, sib)} tracks"
+        return (f"7-dim ckpt: roll/pitch DROPPED-AND-LOGGED ({label} is "
+                f"4-DoF{hint})", theme.TEXT_DIM)
 
     # ------------------------------------------------------- the checkpoint
     def current_ckpt(self) -> str:
@@ -2860,13 +3151,13 @@ class TrajectoryWindow(QtWidgets.QWidget):
             self.ckpt_name.setText(name)
             self.ckpt_name.setToolTip(str(path))
 
-    def _set_ckpt_state(self, text: str, colour: str) -> None:
+    def _set_ckpt_state(self, text: str, colour: str, tip: str = "") -> None:
         # One line, always: a long error / refusal is elided here and kept
         # whole in the tooltip (and it is in the mission log in full).
         full = str(text)
         shown = full if len(full) <= 48 else full[:47] + "…"
         self.ckpt_state.setText(shown)
-        self.ckpt_state.setToolTip(full)
+        self.ckpt_state.setToolTip(str(tip) or full)
         self.ckpt_state.setStyleSheet(f"color:{colour}; font-size:11px;")
 
     def set_policy_ckpt_default(self, path: str) -> None:
@@ -2911,9 +3202,21 @@ class TrajectoryWindow(QtWidgets.QWidget):
         `_ref_msg/_ref_t` pattern — then the row falls back to
         loading…/READY/ERROR. A refusal that only reached the log was
         invisible next to a name that silently snapped back."""
+        self._pol_status_last = st
         ckpt = str(getattr(st, "ckpt", "") or "")
         if ckpt:
             self._show_ckpt_name(ckpt, requested=False)
+        # The forecast's inputs (2026-10-03): the checkpoint's OWN contract
+        # ("" until READY), its mount verdict, and whether START could pass
+        # the worker's first gates at all (ready, no error, not loading).
+        pol = (str(getattr(st, "action_repr", "") or ""),
+               bool(getattr(st, "mount_ok", True)),
+               bool(getattr(st, "ready", False)
+                    and not getattr(st, "error", "")
+                    and not getattr(st, "loading", False)))
+        if pol != (self._pol_repr, self._pol_mount_ok, self._pol_ready):
+            self._pol_repr, self._pol_mount_ok, self._pol_ready = pol
+            self._refresh_mission_lbl()
         note = str(getattr(st, "ckpt_note", "") or "")
         if note != self._ckpt_note_seen:
             # New VALUE — or the first note after a new request, since
@@ -2939,7 +3242,20 @@ class TrajectoryWindow(QtWidgets.QWidget):
         elif getattr(st, "error", ""):
             self._set_ckpt_state(f"ERROR: {st.error}", theme.FAIL)
         elif getattr(st, "ready", False):
-            self._set_ckpt_state("READY", theme.OK)
+            # "READY · 7-dim" (2026-10-03): under policy.action_repr auto the
+            # pick decides the representation, so the row says which one it
+            # is; a checkpoint START will refuse says why, in FAIL. A status
+            # with no contract keeps the plain "READY".
+            r = self._pol_repr
+            d = ACTION_DIM_BY_REPR.get(r)
+            why = self._policy_ckpt_problem()
+            text = "READY" + (f" · {d}-dim" if d else (f" · {r}" if r else ""))
+            text += f" · {why}" if why else ""
+            tip = (f"{text} — checkpoint contract {r}"
+                   + ("" if self._pol_cfg is None else
+                      f"; policy.action_repr {self._pol_cfg[0]}")
+                   + ("" if not why else " — START will be refused")) if r else ""
+            self._set_ckpt_state(text, theme.FAIL if why else theme.OK, tip)
         else:
             self._set_ckpt_state("", theme.TEXT_DIM)
 
@@ -2977,12 +3293,195 @@ class TrajectoryWindow(QtWidgets.QWidget):
               else f" ({(v.p_act[2] - v.p_ref[2]) * 100:+.0f} cm)")
         return f" · {tag} {z_map:+.2f} m{dz}"
 
+    # ------------------------------------------------- MPC_Tuned profile row
+    #: LOW keys the profile applies to (MpcWorker.TUNE_LOWS)
+    TUNE_LOWS = ("mpc_tuned", "mpc_tuned_7d")
+
+    def _refresh_tune_row(self) -> None:
+        on = self.current_mode() in self.TUNE_LOWS
+        for w in self.tune_widgets:
+            w.setVisible(on)
+
+    def current_tune(self) -> str:
+        """The profile PATH the worker holds ("" = none / not reported yet)."""
+        return self._tune_path
+
+    def _apply_tune_choice(self, path: str) -> None:
+        """A pick from the window's dialog: show it as a REQUEST ("→ name")
+        and send it; only MpcStatus.mpc_tune makes it the held profile."""
+        path = str(path).strip()
+        if not path:
+            return
+        stem = os.path.splitext(os.path.basename(path))[0]
+        self.tune_name.setText(f"→ {elide_ckpt_name(stem)}")
+        self.tune_name.setToolTip(f"requested: {path}")
+        self._tune_requested, self._tune_requested_t = path, time.monotonic()
+        self.mpc_tune_requested.emit(path)
+
+    def _set_tune(self, s: MpcStatus) -> None:
+        """Reflect the worker's profile truth on the tune row."""
+        name = str(getattr(s, "mpc_tune", "") or "")
+        path = str(getattr(s, "mpc_tune_path", "") or "")
+        st = str(getattr(s, "mpc_tune_state", "") or "")
+        note = str(getattr(s, "mpc_tune_note", "") or "")
+        self._tune_path = path
+        # "→ name" stands until the worker answers: accepted (the held path
+        # is the requested one), refused, or 1.5 s of silence
+        pending = (self._tune_requested and st != "refused"
+                   and time.monotonic() - self._tune_requested_t < 1.5
+                   and os.path.abspath(self._tune_requested) != os.path.abspath(path or "-"))
+        if not pending:
+            self._tune_requested = ""
+            shown = elide_ckpt_name(name) if name else "hw_mpc.yaml"
+            if self.tune_name.text() != shown:
+                self.tune_name.setText(shown)
+            self.tune_name.setToolTip(
+                path or "no profile held — mpc_tuned flies hw_mpc.yaml's "
+                        "mpc_tuned: / policy: / vehicle_net_buoyancy_n blocks")
+        if st == "error":
+            text, colour = f"ERROR: {note}", theme.FAIL
+        elif st == "refused":
+            text, colour = note, theme.FAIL
+        elif st == "warn":
+            text, colour = "WARN", theme.WARN
+        elif st == "ok":
+            text, colour = "OK", theme.OK
+        else:
+            text, colour = "", theme.TEXT_DIM
+        short = text if len(text) <= 48 else text[:47] + "…"
+        if self.tune_state.text() != short:
+            self.tune_state.setText(short)
+        self.tune_state.setToolTip(
+            (note + "\n\nWARN = the profile flies, but the station differs "
+             "from the one it was saved on (compare: block) or clamps one of "
+             "its values; controller.mpc_tune.warnings in the run meta.")
+            if st == "warn" else text)
+        css = f"color:{colour}; font-size:11px;"
+        if css != self._tune_css:
+            self._tune_css = css
+            self.tune_state.setStyleSheet(css)
+        self.btn_tune.setEnabled(not s.engaged
+                                 and not getattr(s, "csv_open", False))
+
     def _three_d_toggled(self, on: bool) -> None:
         self.view.set_three_d(on)
 
     def _dr_toggled(self, on: bool) -> None:
         self.view.show_dr = bool(on)
         self.view.update()
+
+    def _dvl_clicked(self, checked: bool) -> None:
+        """Ask for the other position; show the CURRENT one until the worker
+        answers (honesty rule — it may refuse, and says why in the chip)."""
+        self.btn_dvl.setChecked(self._dvl_use)
+        self.dvl_use_requested.emit(bool(checked))
+
+    def _est_clicked(self, checked: bool) -> None:
+        """Ask for the other estimator; show the CURRENT one until the
+        worker answers (it may refuse, and says why in the chip)."""
+        self.btn_est.setChecked(self._ekf_control)
+        self.estimator_requested.emit("ekf" if checked else "tag")
+
+    def _set_est(self, s: MpcStatus) -> None:
+        """Reflect the worker's estimator truth on the EST button."""
+        st = str(getattr(s, "ekf_state", "") or "")
+        self.btn_est.setVisible(bool(st))
+        if not st:
+            return
+        on = bool(s.ekf_control)
+        self._ekf_control = on
+        if self.btn_est.isChecked() != on:
+            self.btn_est.setChecked(on)
+        self.btn_est.setText("EST EKF" if on else "EST TAG")
+        self.btn_est.setEnabled(not s.engaged
+                                and not getattr(s, "csv_open", False))
+        colour = (theme.FAIL if st == "fault" else
+                  theme.TEXT_DIM if not on else
+                  theme.OK if st == "ready" else theme.WARN)
+        css = (self._BTN_CSS[:-1] + f" color:{colour};}}")
+        if css != self._est_css:
+            self._est_css = css
+            self.btn_est.setStyleSheet(css)
+
+        def f(v, fmt, unit, k=1.0):
+            return "--" if v is None else f"{v * k:{fmt}}{unit}"
+        self.btn_est.setToolTip(
+            "ESTIMATOR — which state the controller is handed. "
+            "HARDWARE-UNVERIFIED.\n"
+            "TAG: the state assembler (AprilTag pose + vehicle IMU, DVL "
+            "velocity when the DVL button is IN) — every run before "
+            "2026-10-02.\n"
+            "EKF: robot_localization's EKF (AprilTag + IMU + depth + DVL, the "
+            "Learning-to-Swim estimator), which always runs in shadow and is "
+            "recorded either way (CSV ekf_*).\n"
+            "Changes only while disengaged and with no controller CSV open. "
+            "The plot, px/py and every interlock stay on the tag state; a "
+            "run on the EKF ends if it stops publishing or walks away from "
+            "the tag state.\n\n"
+            f"EKF: {st}" + (f" — {s.ekf_note}" if s.ekf_note else "") + "\n"
+            f"EKF - tag {f(s.ekf_err_m, '.1f', ' cm', 100.0)}, yaw "
+            f"{f(s.ekf_err_yaw_deg, '.1f', ' deg')} · 1-sigma xy "
+            f"{f(s.ekf_sig_m, '.1f', ' cm', 100.0)} · last tag fused "
+            f"{f(s.ekf_tag_late_s, '.0f', ' ms late', 1000.0)}")
+
+    _DVL_WORDS = {"no_link": "NO LINK", "no_lock": "NO LOCK",
+                  "shadow": "shadow", "unproven": "NOT PROVEN",
+                  "tripped": "TRIPPED", "fallback": "held back",
+                  "in_use": "in use"}
+
+    def _set_dvl(self, s: MpcStatus) -> None:
+        """Reflect the worker's DVL truth on the button. IN/OUT is the
+        operator's switch as the WORKER holds it; the colour says whether
+        the estimator is actually flying on it right now."""
+        st = str(getattr(s, "dvl_state", "") or "")
+        self.btn_dvl.setVisible(bool(st))
+        if not st:
+            return
+        use = bool(s.dvl_use)
+        self._dvl_use = use
+        if self.btn_dvl.isChecked() != use:
+            self.btn_dvl.setChecked(use)
+        # A TRIP is shown on the face itself: the switch still says IN, the
+        # DVL is not in the loop, and only the operator can put it back.
+        self.btn_dvl.setText("DVL TRIPPED" if st == "tripped" else
+                             "DVL IN" if use else "DVL OUT")
+        # Frozen while engaged or while a controller CSV is open — the
+        # worker refuses there too (one run = one estimator); the button
+        # says so by being dead, like the LOW combo beside it.
+        self.btn_dvl.setEnabled(not s.engaged
+                                and not getattr(s, "csv_open", False))
+        colour = (theme.FAIL if st == "tripped" else
+                  theme.TEXT_DIM if not use else
+                  theme.OK if st == "in_use" else theme.WARN)
+        css = (self._BTN_CSS[:-1] + f" color:{colour};}}")
+        if css != self._dvl_css:
+            self._dvl_css = css
+            self.btn_dvl.setStyleSheet(css)
+
+        def f(v, fmt, unit):
+            return "--" if v is None else f"{v:{fmt}}{unit}"
+        self.btn_dvl.setToolTip(
+            "DVL — the estimator's third sensor (AprilTag + IMU + DVL). "
+            "HARDWARE-UNVERIFIED.\n"
+            "IN: surge/sway velocity comes from the DVL whenever it is usable "
+            "(tag finite difference otherwise). OUT: recorded and compared "
+            "only.\n"
+            "Changes only while disengaged and with no controller CSV open; "
+            "IN needs the mount measured (hw_mpc.yaml dvl:) and PROVEN "
+            "against the tag velocity — fly a short pass in surge AND sway "
+            "with tags in view. Whether a run may use it is decided at "
+            "engage.\n"
+            "TRIPPED = evidence the DVL is wrong; it stays out until you "
+            "press OUT, then IN.\n\n"
+            f"state: {self._DVL_WORDS.get(st, st)}"
+            + (f" — {s.dvl_note}" if s.dvl_note else "") + "\n"
+            f"mount proven: {'yes' if s.dvl_proven else 'no'} · "
+            f"velocity source now: {s.vel_src or '--'}\n"
+            f"altitude {f(s.dvl_alt_m, '.2f', ' m')} · "
+            f"fom {f(s.dvl_fom, '.3f', ' m/s')} · "
+            f"{f(s.dvl_hz, '.0f', ' Hz')} · age {f(s.dvl_age_s, '.2f', ' s')}"
+            f" · |v_dvl - v_tag| "
+            f"{f(None if s.dvl_res_m_s is None else s.dvl_res_m_s * 100, '.1f', ' cm/s')}")
 
     def set_recording(self, on: bool) -> None:
         """Reflect what the window's recorder ACTUALLY did (honesty rule: the
@@ -3035,6 +3534,9 @@ class TrajectoryWindow(QtWidgets.QWidget):
         if live and s.dr_mode == "control" and not self.btn_dr.isChecked():
             self.btn_dr.setChecked(True)
         self.btn_dr.setEnabled(live and s.dr_mode != "control")
+        self._set_dvl(s)
+        self._set_est(s)
+        self._set_tune(s)
         self._engaged = s.engaged
         self._traj_on = s.traj_on
         kind_now = (s.scenario or {}).get("kind")
@@ -3094,6 +3596,15 @@ class TrajectoryWindow(QtWidgets.QWidget):
                     "follow": "FOLLOWING",
                     "warmup": "WARMING UP"}.get(
                         s.phase, kind.upper() if s.traj_on else "DP HOLD")
+            # WHAT A 7-DIM NETWORK'S ROLL/PITCH ARE DOING (2026-10-03): with
+            # policy.action_repr auto the pick decides the representation,
+            # so the chip says it after ARM — from the ARM-pinned scenario,
+            # never from the panel. Nothing for a 5-dim mission.
+            scn = s.scenario or {}
+            if (s.traj_on and kind == "policy"
+                    and scn.get("action_repr") == ACTION_REPR_POS_RPY_WIDTH):
+                what += (" · 7d rp TRACKED" if scn.get("attitude_track")
+                         else " · 7d rp DROPPED")
             det = f" {s.phase_detail}" if s.phase_detail else ""
             if s.err_cross is not None and s.err_along is not None:
                 err = (f" · off {s.err_cross * 100:+.0f} cm"
@@ -3109,6 +3620,16 @@ class TrajectoryWindow(QtWidgets.QWidget):
                     err += f"/{s.ref_speed_m_s:.2f}"
                 err += " m/s"
             err += self._hold_z_text()
+            # WHICH velocity instrument, only when a DVL is switched IN: the
+            # run was started to fly on it, so a tick that fell back to the
+            # tag finite difference is worth one word on the chip.
+            if getattr(s, "dvl_use", False):
+                err += (" · v:DVL" if s.vel_src == "dvl" else
+                        " · v:TAG (DVL " + self._DVL_WORDS.get(
+                            s.dvl_state, s.dvl_state) + ")")
+            # ...and which ESTIMATE, only when it is not the default.
+            if getattr(s, "ekf_control", False):
+                err += " · est:EKF"
             # THE BRIDGE HAS TO BE LOUD. "still engaged" and "engaged but no
             # longer holding position" look identical otherwise, and the coast
             # tier is indefinite — the operator is the thing deciding when it
@@ -3118,6 +3639,8 @@ class TrajectoryWindow(QtWidgets.QWidget):
                 what = "NO TAG — COASTING"
             elif tier == "imu":
                 what = f"{what} · NO TAG (IMU)"
+            elif tier == "dvl":
+                what = f"{what} · NO TAG (DVL)"
             # THE FOLLOW LADDER HAS TO BE LOUD, for the bridge's reason:
             # "still following" and "holding the last setpoint because the
             # object went away" look identical otherwise, and only one of them

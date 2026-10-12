@@ -97,6 +97,12 @@ class DataBus(QObject):
     # wants the whole array anyway — decimating to the 20 Hz control tick
     # would throw away the only thing this IMU has over the autopilot's.
     camera_imu = Signal(object)       # state.ImuBatch
+    # The DVL (2026-10-01, control/dvl.py): one state.DvlSample per velocity
+    # report, 2-15 Hz — the snapshot traffic shape, like nav_fix. `dvl_info`
+    # is the device's own get_config answer (a dict), sent once per connect
+    # so the run meta can say what the device itself was set to.
+    dvl = Signal(object)              # state.DvlSample
+    dvl_info = Signal(object)         # dict
     tag_overlay = Signal(object)      # state.TagOverlay (per video feed)
     # One SHORT line per mission event ("going to tag 79", "hold done ->
     # LINE"), for the on-screen log. Separate from `log` on purpose: `log` is
@@ -189,9 +195,16 @@ class DataBus(QObject):
     cmd_mpc_start = Signal()
     # The LOW level: "none" (teleop — the station commands nothing; a policy
     # mission still infers and draws) | "pid" | "mpc" | "dobmpc" | "mpc_tuned"
-    # | "dobmpc_tuned" | "mpcc" | "dobmpcc". Refused by the worker while
-    # engaged or while a controller CSV is open.
+    # | "dobmpc_tuned" | "mpcc" | "dobmpcc" | "rl" | "rl_pwm" | "pid_7d" |
+    # "mpc_tuned_7d" | "rl_7d" | "rl_pwm_7d" (2026-10-03: roll/pitch too). Refused by the
+    # worker while engaged or while a controller CSV is open.
     cmd_mpc_mode = Signal(str)
+    # The MPC_Tuned PROFILE (2026-10-04, control/mpc_tune.py): a profile NAME
+    # or path from the LOW row's tune picker, or "none" (= hw_mpc.yaml's own
+    # blocks). MpcWorker.set_mpc_tune holds it — applied only while LOW is
+    # mpc_tuned / mpc_tuned_7d — or refuses (engaged, CSV open, bad file) and
+    # says why in MpcStatus.mpc_tune_note. The row shows MpcStatus.mpc_tune.
+    cmd_mpc_tune = Signal(str)
     # Payload keys are PER SHAPE: station {} | line {length} |
     # square {size, size_y} | circle {radius}, all beside {shape, origin_tag,
     # speed}. Merged over hw_mpc.yaml's `square:` block by the worker.
@@ -207,6 +220,24 @@ class DataBus(QObject):
     # C3 feed off mid-engagement starves the localizer and the MPC disengages
     # on the stale-fix gate — that is the intended, safe consequence.
     cmd_tag_enable = Signal(str, bool)
+    # The DVL switch: True = IN (the estimator consumes the DVL's velocity),
+    # False = OUT (shadow: recorded and compared only). Refused by MpcWorker
+    # while engaged or while a controller CSV is open — one run is one
+    # estimator — and IN is refused until the mount is proven against the
+    # tag velocity. The panel button reflects MpcStatus.dvl_use, never its
+    # own click.
+    cmd_dvl_use = Signal(bool)
+    # The ESTIMATOR switch (2026-10-02): "tag" = the controller is handed the
+    # state assembler's state, "ekf" = the robot_localization EKF's
+    # (control/rl_ekf.py). Refused by MpcWorker while engaged or while a
+    # controller CSV is open, and "ekf" until the EKF is ready. The panel
+    # button reflects MpcStatus.ekf_control, never its own click.
+    cmd_estimator = Signal(str)
+    # MpcWorker -> the DVL worker: keep the verbatim reports beside this
+    # controller CSV. (enabled, path stem), the cmd_log_raw_sensors shape —
+    # its own signal so a DVL-only run does not also switch on 40 kB/s of
+    # IMU logging that nobody asked for.
+    cmd_log_dvl = Signal(bool, str)
     # What the learned-depth worker is doing (state.FStereoState). Its own
     # signal because two consumers need it for reasons that must not drift:
     # the window attributes the depth-vs-MAP ratio to the right INSTRUMENT with
@@ -678,6 +709,78 @@ class PolicyMailbox:
                 return False
             self._item = {"depth": depth_mm, "t_capture": float(t_capture),
                           "src": str(src)}
+            self._counters["put"] += 1
+            return True
+        finally:
+            self._lock.unlock()
+
+    def take(self) -> dict | None:
+        self._lock.lock()
+        try:
+            item, self._item = self._item, None
+            if item is not None:
+                self._counters["taken"] += 1
+            return item
+        finally:
+            self._lock.unlock()
+
+    def counters(self) -> dict[str, int]:
+        self._lock.lock()
+        try:
+            return dict(self._counters)
+        finally:
+            self._lock.unlock()
+
+
+class PolicyColorMailbox:
+    """Latest C3 COLOUR frame for the policy worker — the obs of an RGB
+    checkpoint (shape_meta key ``camera0_rgb``, 2026-10-03).
+
+    The :class:`PolicyMailbox` contract without the grid: one producer (the
+    C3 camera worker, or the demo's synthetic colour), one consumer
+    (``PolicyWorker``), latest-wins, ``wanted()`` gates the producer's copy.
+    The worker wants it ONLY while the loaded checkpoint asks for RGB, so a
+    depth checkpoint costs not one copied frame.
+
+    ``t_capture`` must be the frame's own capture stamp — the SAME number the
+    tag localizer stamps its fix with — because the worker pairs each image
+    with the proprio row of that exact fix (PolicyWorker._anchor).
+    """
+
+    def __init__(self):
+        self._lock = QMutex()
+        self._item = None
+        self._wanted = False
+        self._counters = {"put": 0, "taken": 0, "overwritten": 0,
+                          "dropped_unwanted": 0}
+
+    def set_wanted(self, on: bool) -> None:
+        self._lock.lock()
+        try:
+            self._wanted = bool(on)
+            if not on:
+                self._item = None
+        finally:
+            self._lock.unlock()
+
+    def wanted(self) -> bool:
+        self._lock.lock()
+        try:
+            return self._wanted
+        finally:
+            self._lock.unlock()
+
+    def put(self, bgr, t_capture: float) -> bool:
+        """``bgr`` must be a private (h, w, 3) uint8 array the caller will not
+        touch again."""
+        self._lock.lock()
+        try:
+            if not self._wanted:
+                self._counters["dropped_unwanted"] += 1
+                return False
+            if self._item is not None:
+                self._counters["overwritten"] += 1
+            self._item = {"image": bgr, "t_capture": float(t_capture)}
             self._counters["put"] += 1
             return True
         finally:

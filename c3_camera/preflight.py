@@ -905,6 +905,38 @@ def vehicle_checks(*, transport: str, connection: str, rest_url: str,
     return checks
 
 
+def check_dvl(host: str, port: int, timeout_s: float) -> Check:
+    """Is the DVL's TCP server accepting connections?
+
+    A plain connect-and-close: nothing is sent, nothing is configured, and
+    the device accepts several clients at once, so this takes nothing from
+    whoever else is reading it (the BlueOS DVL extension). A WARNING, never
+    a failure — the station flies without a DVL exactly as it did before one
+    existed; only the DVL switch stays unavailable.
+    """
+    import socket
+
+    t = time.monotonic()
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout_s):
+            pass
+    except OSError as e:
+        return _warn(
+            f"DVL TCP {host}:{port} not reachable ({type(e).__name__}: {e}) — "
+            f"the station runs WITHOUT it",
+            f"is the DVL powered and SUBMERGED? (it overheats in air and "
+            f"takes 20-90 s to boot)",
+            f"is its address {host}?  its web GUI answers on http://{host} "
+            f"(factory fallback 192.168.194.95)",
+            reachable=False)
+    return _ok(f"DVL TCP {host}:{port} open in "
+               f"{(time.monotonic() - t) * 1000:.0f} ms", reachable=True)
+
+
+def dvl_checks(*, host: str, port: int, timeout_s: float) -> list:
+    return [("DVL link", lambda: check_dvl(host, port, timeout_s))]
+
+
 def storage_checks(*, out_dir, min_free_gb: float) -> list:
     return [("disk", lambda: check_storage(out_dir, min_free_gb))]
 
@@ -945,6 +977,12 @@ def standard_checks(a: argparse.Namespace, *, camera: bool = True,
             rest_url=getattr(a, "mavlink_rest_url",
                              f"http://{BLUEOS_HOST}:{MAVLINK_REST_PORT}"),
             timeout_s=timeout)
+    # Only for a tool that resolved a DVL (rov_gui sets both from --dvl /
+    # hw_mpc.yaml dvl:); every other tool's namespace has neither.
+    if getattr(a, "dvl_check_host", None):
+        specs += dvl_checks(host=str(a.dvl_check_host),
+                            port=int(getattr(a, "dvl_check_port", 16171)),
+                            timeout_s=timeout)
     if out_dir is not None:
         specs += storage_checks(out_dir=out_dir, min_free_gb=min_free_gb)
     if display is not None:

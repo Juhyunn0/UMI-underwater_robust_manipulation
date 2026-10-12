@@ -12,11 +12,37 @@
 `enabled_extensions = 0b11`)으로 보낸다. **기본값은 전부 OFF**이고 OFF면 4-DoF 경로(제어 출력·xref·MAVLink 프레임·
 resolved config)는 이전과 **바이트 동일**(테스트가 고정). 기록 파일만 schema 15 → 16으로 항상 붙는 꼬리 열/키를 얻는다.
 
+## 0.5 2026-10-03 갱신 — **LOW가 결정한다** (`PID_7D` / `MPC_Tuned_7D` / `RL_7D`)
+
+운용자 요청("pid_7d, mpc_tuned_7d, RL_7d 버전")으로 아래 §1의 스위치 의미가 바뀌었다. **§1–§2의 표와 진리표보다 이 절이 우선한다.**
+
+* K/M은 **LOW가 `pid_7d` | `mpc_tuned_7d` | `rl_7d`일 때만** 나간다. `engage.attitude_axes.enabled`는 이제 "스테이션 능력"
+  (sink가 기동 때 읽는 s/t 경로 + §4 게이트)이다: 꺼져 있으면 `*_7d`는 engage 거부, 켜져 있으면 나머지 LOW(pid, mpc,
+  mpc_tuned, dobmpc*, rl, rl_pwm, mpcc)는 **4-DoF로 engage**한다(이전: plain mpc/mpc_tuned가 K/M 송신, pid/rl/rl_pwm/mpcc는 거부).
+* 추종: 7-dim ckpt를 `*_7d`에서 날리면 추종, 4-DoF LOW에서 날리면 dropped-and-logged. `policy.attitude_track`은 **거부권**(기본
+  `true`; `false`면 `*_7d`에서도 dropped-and-logged + 능동 레벨링). 5-dim ckpt·도형 미션에서 `*_7d`는 능동 수평 유지.
+* §2 ④ "LOW `MPC` 또는 `MPC_Tuned`" → 추종·레벨링 단계는 **LOW `MPC_Tuned_7D`(또는 `PID_7D`)**. §3 ④ dropped-and-logged는 4-DoF LOW
+  (`MPC_Tuned`)로 날면 된다(스위치를 끌 필요 없음). §3 ③ "plain mpc 자세 STEP" → 스테이션에 자세 스텝 미션은 여전히 **없다**;
+  현재 자극은 `MPC_Tuned_7D`/`PID_7D` 위의 `stub_rp`(정책 스텁) 또는 `replay.track_attitude`(가드가 정책보다 약함, KNOWN_ISSUES)뿐이다.
+* **PID_7D는 루프를 닫기 전에 pulse-and-release(개루프) 1회가 먼저다**: 복원강성 k가 ~2–4 N·m/rad를 넘으면(자유감쇠 주기 < 3.2 s)
+  지연 0.2 s에서 위상여유가 무너진다 [유도: `rov_gui/tests/fixtures/sim_pid7d_attitude_20261003.txt`]. 절차와 판정은
+  KNOWN_ISSUES 2026-10-03 항목.
+* `RL_7D`: roll/pitch 기준으로 학습된 axes6 export가 필요하다(없음; RL_controller `scripts/_pipeline_att7_seed.sh`, 학습 보류).
+* 코드 경계: `rov_gui/README.md` "7d LOW 추종자" 절, 방법론 로그 2026-10-03.
+* **`policy.action_repr: auto` (같은 날, 운용자 요청 "checkpoint를 7d로 하면 알아서 7d 세팅을")**: 배포값(hw_mpc.yaml·land_dp.yaml).
+  START 때 쥐고 있는 체크포인트의 계약(5-dim `pos_yaw_width` | 7-dim `pos_rpy_width`)을 ARM 때 그 미션에 고정한다 — 아래 §2의
+  2단계("`policy.action_repr: pos_rpy_width`")는 **필요 없다**. 계약 없음·`pose10d`는 거부(기본값 대체 없음), 7-dim은 마운트 키 필수,
+  명시값은 예전처럼 세션 고정. 그러므로 §3 ④(dropped-and-logged)는 7-dim을 고르고 **4-DoF LOW**(`MPC_Tuned`, `RL_PWM` …)로
+  START하면 된다. 반대로 **auto + `attitude_track: true`(배포)에서 7-dim + `RL_PWM_7D`(펄스, 능력 스위치 불필요)는 START 한 번에
+  추종**이다 — ④ 기록이 있기 전에는 LOW를 4-DoF로 고를 것(패널 미션 줄이 START 전에 `TRACKED on …`(경고색) / `DROPPED-AND-LOGGED`를
+  말하고, ARM 뒤 칩이 `· 7d rp TRACKED|DROPPED`를 보인다). 기록: meta `trajectory.action_repr`(핀, 풀링 키)·`policy.action_repr`
+  (핀 또는 null)·`policy.config.action_repr`(`auto`).
+
 ## 1. 변형이 무엇인가 — 세 스위치와 그 조합
 
 | 스위치 | 위치 | 기본 | 의미 |
 |---|---|---|---|
-| `policy.action_repr` | `config/hw_mpc.yaml` | `pos_yaw_width` | 이 미션이 나는 체크포인트 계약. ARM 때 ckpt의 `shape_meta.action.action_repr`와 **같아야** 하고 `POLICY_ACTION_REPRS_FLYABLE = (pos_yaw_width, pos_rpy_width)` 안이어야 한다. 5-dim ckpt에 `pos_rpy_width`, 7-dim ckpt에 `pos_yaw_width` → 둘 다 arm 거부("action_repr mismatch"). |
+| `policy.action_repr` | `config/hw_mpc.yaml` | `auto`(2026-10-03 배포값; 코드 기본 `pos_yaw_width`) | 이 미션이 나는 체크포인트 계약. `auto` = START 때 쥔 ckpt의 계약을 ARM 때 고정(§0.5). 명시값이면 ARM 때 ckpt의 `shape_meta.action.action_repr`와 **같아야** 하고 `POLICY_ACTION_REPRS_FLYABLE = (pos_yaw_width, pos_rpy_width)` 안이어야 한다. 5-dim ckpt에 `pos_rpy_width`, 7-dim ckpt에 `pos_yaw_width` → 둘 다 arm 거부("action_repr mismatch"). |
 | `policy.attitude_track` | 〃 | `false` | `false` = **dropped-and-logged**: 7-dim ckpt여도 roll/pitch 열은 버리고(앵커 자세로 레벨링) `plans.jsonl rp_raw`(최상위, 디코드된 절대 roll/pitch (2,K))·`dropped_rp_deg`로 기록만 (`raw.rp`는 tracked 때만). `true` = compose가 클립한 절대 roll/pitch를 `PlanMsg.rp`로 실어 NMPC가 추종. |
 | `engage.attitude_axes.enabled` | 〃 | `false` | NMPC의 K/M을 선으로 보낼지. `false`면 allocation에서 예전처럼 버린다(`roll = pitch = 0`). `true`면 `wrench_to_axes(..., attitude=True)` → `s/t` 송신. 이것만 켜고 정책을 안 날리면 "능동 레벨링" 런. |
 
@@ -36,7 +62,8 @@ resolved config)는 이전과 **바이트 동일**(테스트가 고정). 기록 
    고른다(sha1은 ARM에 핀). ckpt는 `shape_meta.action {shape [7], action_repr pos_rpy_width, yaw_axis_cam_tilt_deg 43.3,
    yaw_axis_R_frd_cam, rpy_convention {order: zyx, frame: body_frd_via_R_bt, columns: [dx,dy,dz,dyaw,droll,dpitch,width]}}`를
    선언해야 한다. torch 없이 배선만 볼 땐 ckpt 칸에 `stub7`(7-dim 수평) 또는 `stub_rp`(pitch 5° 램프 [예측]).
-2. `config/hw_mpc.yaml`: `policy.action_repr: pos_rpy_width`. 첫 비행은 `attitude_track: false` 그대로.
+2. ~~`config/hw_mpc.yaml`: `policy.action_repr: pos_rpy_width`.~~ 2026-10-03부터 배포값 `auto`라 필요 없다(§0.5). 첫 비행은
+   4-DoF LOW로(dropped-and-logged).
 3. K/M을 보낼 단계에서만 `engage.attitude_axes.enabled: true` + `probe`/`sign_probe` 산출물 경로 기입(§4). engage 게이트는
    경로 존재가 아니라 **내용을 파싱**한다: `probe`는 `tool == rov_gui.tools.attitude_axes_probe`, `pass: true`,
    `mavlink_wire_version "2.0"`, `firmware_version`이 기체의 AUTOPILOT_VERSION과 같아야 하고, `sign_probe`는 `sign_proven: true`를
@@ -54,7 +81,7 @@ resolved config)는 이전과 **바이트 동일**(테스트가 고정). 기록 
 | ① 벤치 프로브 | `python -m rov_gui.tools.attitude_axes_probe` — **DISARMED**, s=+300 1 s → t=+300 1 s @10 Hz, RC_CHANNELS chan1/chan2 전후 비교; preflight 먼저, armed면 거부 | 없음 | 확장 프레임만 | `data/<YYYYMMDD>/<run>_probe/attitude_axes_probe.json` (pass/fail, firmware_version, wire version) → `engage.attitude_axes.probe`; engage가 내용을 파싱해 `tool`·`pass: true`·`mavlink_wire_version "2.0"`·`firmware_version` 일치를 요구 |
 | ② 수중 부호 프로브 | armed, 추종자 disengaged, roll +0.10 1 s → pitch +0.10 1 s, ATTITUDE + SERVO_OUTPUT_RAW 기록, abort \|rp\| > 10° 또는 2 s | 없음 | 캡 0.1/0.15 | `engage.attitude_axes.sign_probe` 경로 + `sign {roll, pitch}` 확정; JSON에 `sign_proven: true`가 있어야 게이트 통과(`require_sign_probe: true` 기본). **미션 종류는 이번 컷에 없다**(§8 (c)) — 수동으로 만든다. 아직 없으면 `require_sign_probe: false`로 허용되지만 `first_water_caps` 강제 + meta `sign_proven: false`·`caps_in_force` |
 | ③ plain mpc 자세 STEP | 정책 없이 station에서 roll/pitch 참조 스텝(0 → 10~15°)·램프(0.35 rad/s) — 0914 yaw 스텝 시험의 자세판 | 없음 | ON (첫 물 캡) | 정상 M_cmd vs θ·k로 `roll_nm/pitch_nm` 보정, 오버슈트·정착·감쇠 → `attitude_q_scale`/`rp_ref_filter` 결정 |
-| ④ dropped-and-logged 7-dim 비행 | `action_repr: pos_rpy_width`, `attitude_track: false`, `attitude_axes.enabled: false` | 7-dim | **없음** | `plans.jsonl rp_raw`, `dropped_rp_deg` 분포; tagnav 수용률 vs 측정 pitch → `rp_max_deg` 선택 근거 |
+| ④ dropped-and-logged 7-dim 비행 | (2026-10-03~) `action_repr: auto` 그대로, 패널에서 7-dim 선택 + **4-DoF LOW**(`MPC_Tuned`/`RL_PWM` …); 예전 설정은 `action_repr: pos_rpy_width`, `attitude_track: false`, `attitude_axes.enabled: false` | 7-dim | **없음** | `plans.jsonl rp_raw`, `dropped_rp_deg` 분포; tagnav 수용률 vs 측정 pitch → `rp_max_deg` 선택 근거 |
 | ⑤ 능동 레벨링 | `attitude_axes.enabled: true`, 정책 없음 또는 5-dim | 선택 | ON | `rroll_deg/rpitch_deg = 0` 추종 품질, meta `run.attitude_axes.sat_ticks`, 데드밴드 리밋사이클 유무 |
 | ⑥ 추종 비행 | `attitude_track: true` | 7-dim | ON | 첫 런은 스모크(§1 진리표 전부 통과) |
 
@@ -153,7 +180,7 @@ disengage. 조종자에게 roll/pitch 입력은 없다 — 자세 명령을 거�
 
 (a) `transport: rc_override`(FALLBACK-A) — config 검증이 "not implemented"로 거부; (b) STABILIZE lean-angle 캐스케이드 —
 `attitude_axes.enabled`면 STABILIZE 거부; (c) armed 수중 부호 프로브 **미션 종류** — arm 게이트는 `sign_probe` JSON의
-`sign_proven: true`만 요구하므로(`require_sign_probe: false`면 첫 물 캡 강제로 우회) §3 ②는 수동 절차; (d) PID roll/pitch 루프(S11), `run_compare` 자세 시나리오, `plot_policy_map` rp 패널,
+`sign_proven: true`만 요구하므로(`require_sign_probe: false`면 첫 물 캡 강제로 우회) §3 ②는 수동 절차; (d) ~~PID roll/pitch 루프(S11)~~ — 2026-10-03 `pid_7d`로 구현(§0.5), `run_compare` 자세 시나리오, `plot_policy_map` rp 패널,
 teleop 패널 자세 바; (e) 시뮬 검증은 S2 홀드 그리드(heavy, mpc/dobmpc, NONE)까지가 필수; S3–S7은 heavy·NONE 실행
 (`bluerov2_mujoco_marinegym/recordings/20260926/attitude_hold_174607` 전 시나리오 — 단 step/ramp/rate/dropped의 정상상태 값은 창이
 과도를 포함해 인용 불가 → step `attitude_hold_211813`, ramp/rate `attitude_hold_211921`, dropped `attitude_hold_211917`로 인용);

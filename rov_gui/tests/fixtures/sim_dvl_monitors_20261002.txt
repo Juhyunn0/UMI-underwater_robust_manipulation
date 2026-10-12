@@ -1,0 +1,102 @@
+sim_dvl_monitors.py — SYNTHETIC, prescribed motion, assumed sensor numbers {'tag_hz': 15.0, 'tag_lat': 0.13, 'tag_sig': 0.0008, 'dvl_hz': 12.0, 'dvl_lat': 0.19, 'dvl_sig': 0.003}; 12 seeds
+
+A1. correct mount, proven by a 15 s pass, then 60 s of:
+  station keeping (1-2 cm/s)             false trips 0/12   proven 12/12   flew on DVL 100.0 %   gross pairs 0
+  5 cm/s square                          false trips 0/12   proven 12/12   flew on DVL 100.0 %   gross pairs 0
+  10 cm/s square                         false trips 0/12   proven 12/12   flew on DVL  99.9 %   gross pairs 0   held back {'DVL innovation': 15}
+  0.3 m/s passes, 0.15 m/s^2             false trips 0/12   proven 12/12   flew on DVL 100.0 %   gross pairs 0
+  yaw sweeps 0.3 rad/s                   false trips 0/12   proven 12/12   flew on DVL 100.0 %   gross pairs 0
+  oscillation 0.5 Hz 6 cm/s              false trips 0/12   proven 12/12   flew on DVL 100.0 %   gross pairs 0
+  oscillation 1 Hz 6 cm/s                false trips 0/12   proven 12/12   flew on DVL 100.0 %   gross pairs 0
+  oscillation 1.5 Hz 4 cm/s              false trips 0/12   proven 12/12   flew on DVL 100.0 %   gross pairs 0
+  reversals 8 cm/s                       false trips 0/12   proven 12/12   flew on DVL  99.0 %   gross pairs 0   held back {'DVL innovation': 161}
+
+A2. the same with TAG JUMPS (4 cm steps every 7 s, +10 cm at 40 s, a 1 ms double fix every 11 s):
+  station keeping (1-2 cm/s)             false trips 0/12   proven 12/12   flew on DVL  97.4 %   gross pairs 144   held back {'DVL innovation': 406}
+  5 cm/s square                          false trips 0/12   proven 12/12   flew on DVL  97.4 %   gross pairs 144   held back {'DVL innovation': 406}
+  10 cm/s square                         false trips 0/12   proven 12/12   flew on DVL  97.3 %   gross pairs 144   held back {'DVL innovation': 421}
+  0.3 m/s passes, 0.15 m/s^2             false trips 0/12   proven 12/12   flew on DVL  97.5 %   gross pairs 144   held back {'DVL innovation': 403}
+
+A3. the same across latencies (tag s, DVL s) — false trips summed over the nine motions above:
+  tag 0.05 s, DVL 0.35 s:  false trips 0/36
+  tag 0.25 s, DVL 0.05 s:  false trips 0/36
+  tag 0.13 s, DVL 0.05 s:  false trips 0/36
+  tag 0.05 s, DVL 0.19 s:  false trips 0/36
+  tag 0.30 s, DVL 0.30 s:  false trips 0/36
+
+A4. harder conditions (false trips / runs):
+  tag noise 2 mm               0/36   proof's lag_s   -1 ms
+  tag noise 3 mm, tags 10 Hz   0/36   proof's lag_s  +19 ms
+  tags 5 Hz                    0/36   proof's lag_s   +4 ms
+  DVL 5 Hz, noise 1 cm/s       0/36   proof's lag_s  -15 ms
+  capture stamps 50 ms late    2/36   proof's lag_s  +33 ms   tripped in: ['oscillation 1 Hz 6 cm/s']
+  capture stamps 50 ms early   3/36   proof's lag_s  -23 ms   tripped in: ['oscillation 1 Hz 6 cm/s']
+  capture stamps 100 ms late   8/36   proof's lag_s  +49 ms   tripped in: ['oscillation 0.5 Hz 6 cm/s', 'oscillation 1 Hz 6 cm/s']
+  capture stamps 150 ms late   8/36   proof's lag_s  +73 ms   tripped in: ['oscillation 0.5 Hz 6 cm/s', 'oscillation 1 Hz 6 cm/s']
+  lever arm 3 cm wrong         0/36   proof's lag_s   -2 ms
+  lever arm 10 cm wrong        0/36   proof's lag_s   -2 ms
+
+A5. a DVL that glitches or is noisy (inside fom_max), correct mount, 15 s proving pass, then 60 s — trips / runs, and the share of ticks flown on the DVL (the rest are held back, no latch):
+  once: 4 reports -14 cm/s surge at 30 s       station: 0/6 98% | 5 cm/s square: 0/6 99% | 10 cm/s square: 0/6 99% | 0.3 m/s passes: 0/6 100%
+  once: 4 reports +14 cm/s surge at 30 s       station: 0/6 98% | 5 cm/s square: 0/6 99% | 10 cm/s square: 0/6 99% | 0.3 m/s passes: 0/6 100%
+  once: 4 reports -14 cm/s surge at 22 s       station: 0/6 98% | 5 cm/s square: 0/6 99% | 10 cm/s square: 0/6 100% | 0.3 m/s passes: 0/6 100%
+  once: 4 reports +30 cm/s surge, tags 3 mm    station: 0/6 (proven 1) 16% | 5 cm/s square: 0/6 98% | 10 cm/s square: 0/6 98% | 0.3 m/s passes: 0/6 98%
+  once: 3 reports +30 cm/s surge, tags 3 mm    station: 0/6 (proven 1) 16% | 5 cm/s square: 0/6 98% | 10 cm/s square: 0/6 98% | 0.3 m/s passes: 0/6 98%
+  once: 4 reports +25 cm/s sway, tags 3 mm     station: 0/6 (proven 1) 16% | 5 cm/s square: 0/6 98% | 10 cm/s square: 0/6 98% | 0.3 m/s passes: 0/6 98%
+  every 10 s: 1 report +15 cm/s sway           station: 0/6 97% | 5 cm/s square: 0/6 99% | 10 cm/s square: 0/6 100% | 0.3 m/s passes: 0/6 100%
+  every 10 s: 2 reports +12 cm/s sway          station: 0/6 94% | 5 cm/s square: 0/6 100% | 10 cm/s square: 0/6 100% | 0.3 m/s passes: 0/6 100%
+  every 10 s: 4 reports +14 cm/s sway          station: 0/6 85% | 5 cm/s square: 0/6 99% | 10 cm/s square: 0/6 99% | 0.3 m/s passes: 0/6 99%
+  every 10 s: 4 reports -14 cm/s surge         station: 0/6 88% | 5 cm/s square: 0/6 97% | 10 cm/s square: 0/6 98% | 0.3 m/s passes: 0/6 99%
+  every 5 s: 4 reports +14 cm/s surge          station: 0/6 60% | 5 cm/s square: 0/6 84% | 10 cm/s square: 0/6 98% | 0.3 m/s passes: 0/6 99%
+  every 3 s: 4 reports +12 cm/s surge          station: 0/6 39% | 5 cm/s square: 0/6 76% | 10 cm/s square: 0/6 97% | 0.3 m/s passes: 0/6 100%
+  every 3 s: 2 reports +20 cm/s sway           station: 0/6 60% | 5 cm/s square: 0/6 87% | 10 cm/s square: 0/6 94% | 0.3 m/s passes: 0/6 95%
+  DVL noise 1 cm/s (fom 0.01)                  station: 0/6 100% | 5 cm/s square: 0/6 100% | 10 cm/s square: 0/6 100% | 0.3 m/s passes: 0/6 100%
+  DVL noise 2 cm/s (fom 0.02)                  station: 0/6 98% | 5 cm/s square: 0/6 100% | 10 cm/s square: 0/6 100% | 0.3 m/s passes: 0/6 100%
+  DVL noise 2.5 cm/s (fom 0.025)               station: 0/6 (proven 5) 48% | 5 cm/s square: 0/6 (proven 5) 83% | 10 cm/s square: 0/6 99% | 0.3 m/s passes: 0/6 100%
+  DVL noise 2.5 cm/s from 20 s                 station: 0/6 85% | 5 cm/s square: 0/6 100% | 10 cm/s square: 0/6 100% | 0.3 m/s passes: 0/6 100%
+  DVL noise 3 cm/s (fom 0.03)                  station: 0/6 (proven 1) 4% | 5 cm/s square: 0/6 (proven 1) 14% | 10 cm/s square: 0/6 99% | 0.3 m/s passes: 0/6 100%
+  DVL noise 5 cm/s (fom 0.05)                  station: 0/6 (proven 0) 0% | 5 cm/s square: 0/6 (proven 0) 0% | 10 cm/s square: 0/6 (proven 0) 0% | 0.3 m/s passes: 0/6 (proven 5) 71%
+  once: 3 reports +18 cm/s sway, tags 0.28 s late station: 0/6 100% | 5 cm/s square: 0/6 100% | 10 cm/s square: 0/6 100% | 0.3 m/s passes: 0/6 100%
+  once: 3 reports +18 cm/s sway, tags 0.35 s late station: 0/6 100% | 5 cm/s square: 0/6 100% | 10 cm/s square: 0/6 100% | 0.3 m/s passes: 0/6 100%
+
+A5b. a false lock that LASTS (reports reading sway that is not there, once at 20 s / every 10 s), correct mount — these ARE meant to trip from about half a second (moving) to a second (at rest); the rows show where the line falls (trips / runs):
+   4 reports (0.33 s) +10 cm/s   once, station: 0/6 | once, 5 cm/s square: 0/6 | every 10 s, station: 0/6 | every 10 s, 5 cm/s square: 0/6
+   6 reports (0.50 s) +10 cm/s   once, station: 0/6 | once, 5 cm/s square: 0/6 | every 10 s, station: 0/6 | every 10 s, 5 cm/s square: 0/6
+   6 reports (0.50 s) +14 cm/s   once, station: 0/6 | once, 5 cm/s square: 0/6 | every 10 s, station: 0/6 | every 10 s, 5 cm/s square: 0/6
+   8 reports (0.67 s) +10 cm/s   once, station: 0/6 | once, 5 cm/s square: 0/6 | every 10 s, station: 0/6 | every 10 s, 5 cm/s square: 0/6
+  12 reports (1.00 s) +10 cm/s   once, station: 0/6 | once, 5 cm/s square: 0/6 | every 10 s, station: 0/6 | every 10 s, 5 cm/s square: 0/6
+  12 reports (1.00 s) +14 cm/s   once, station: 6/6 | once, 5 cm/s square: 6/6 | every 10 s, station: 6/6 | every 10 s, 5 cm/s square: 6/6
+  24 reports (2.00 s) +10 cm/s   once, station: 6/6 | once, 5 cm/s square: 6/6 | every 10 s, station: 6/6 | every 10 s, 5 cm/s square: 6/6
+
+A6. a mount the proof ACCEPTS at the edge of its tolerance, then straight passes (trips / runs):
+  12 deg yaw   0.2 m/s: 0/4 (proven 3) | 0.3 m/s: 0/4 (proven 3) | 0.4 m/s: 3/4 (proven 3) | 0.5 m/s: 3/4 (proven 3)
+  reads 1.2x   0.2 m/s: 0/4 | 0.3 m/s: 0/4 | 0.4 m/s: 4/4 | 0.5 m/s: 4/4
+  5 deg yaw    0.2 m/s: 0/4 | 0.3 m/s: 0/4 | 0.4 m/s: 0/4 | 0.5 m/s: 0/4
+
+B. WRONG mount under the opt-out — median seconds from IN to the trip (6 seeds; NEVER = not within 30 s, with the share of ticks flown on the wrong DVL):
+                        station |      5+2 cm/s |     10+4 cm/s |     20+8 cm/s |    osc 3 cm/s |    osc 6 cm/s |   osc 10 cm/s |   20+3.5 line |  30+7.5 0.5Hz
+  surge reversed      NEVER 98% |         1.2 s |         0.8 s |         0.8 s |         1.4 s |         1.2 s |         1.9 s |         0.8 s |         0.8 s
+  sway reversed       NEVER 98% |         8.6 s |         1.2 s |         0.8 s |     NEVER 98% |     NEVER 98% |         1.9 s |     NEVER 98% |     NEVER 90%
+  90 deg              NEVER 98% |         1.2 s |         0.8 s |         0.8 s |         1.6 s |         1.2 s |         1.2 s |         0.8 s |         0.8 s
+  30 deg              NEVER 98% |     NEVER 98% |     NEVER 98% |         1.2 s |     NEVER 98% |     NEVER 98% |     NEVER 98% |         1.4 s |     NEVER 79%
+  reads 2x            NEVER 98% |     NEVER 98% |         1.4 s |         0.8 s |     NEVER 98% |     NEVER 16% |     NEVER 15% |         0.8 s |         0.8 s
+
+B2. the same with a DVL noise of 2 cm/s (fom 0.02): the percentage is the share of ticks flown on the wrong DVL — the fit, once it refutes, holds the DVL back even where nothing trips:
+                        station |      5+2 cm/s |     10+4 cm/s |     20+8 cm/s |    osc 3 cm/s |    osc 6 cm/s |   osc 10 cm/s |   20+3.5 line |  30+7.5 0.5Hz
+  surge reversed      NEVER 68% |         1.2 s |         0.8 s |         0.8 s |        4/6 2% |         1.2 s |         2.1 s |         0.8 s |         0.8 s
+  sway reversed       NEVER 86% |        17.1 s |         1.2 s |         0.8 s |     NEVER 97% |     NEVER 62% |         3.4 s |       3/6 81% |     NEVER 83%
+  90 deg              NEVER 83% |         1.2 s |         0.9 s |         0.8 s |       3/6 24% |         1.2 s |         1.2 s |         0.8 s |         0.8 s
+  30 deg              NEVER 98% |     NEVER 98% |     NEVER 98% |         1.2 s |     NEVER 98% |     NEVER 98% |     NEVER 39% |         1.3 s |     NEVER 76%
+  reads 2x            NEVER 66% |     NEVER 98% |         1.5 s |         0.8 s |     NEVER 98% |     NEVER 16% |     NEVER 15% |         0.8 s |       3/6 12%
+
+C. correct mount under the opt-out, 300 s near the speed floor (false trips / runs):
+  station keeping (1-2 cm/s)             0.8 mm tags  0/4
+  station keeping (1-2 cm/s)             3 mm tags    0/4
+  creep 0.3 Hz, 3.5 cm/s peak            0.8 mm tags  0/4
+  creep 0.3 Hz, 3.5 cm/s peak            3 mm tags    0/4
+  creep 0.3 Hz, 5 cm/s peak, both axes   0.8 mm tags  0/4
+  creep 0.3 Hz, 5 cm/s peak, both axes   3 mm tags    0/4
+  3 cm/s square                          0.8 mm tags  0/4
+  3 cm/s square                          3 mm tags    0/4
+
+false trips of a correct mount in A1-A3, A5 and C: 0   (559 s)

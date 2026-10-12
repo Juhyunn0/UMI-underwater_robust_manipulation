@@ -1,0 +1,64 @@
+# MPC_Tuned profile — rov_gui/control/mpc_tune.py (schema 1).
+# Picked on the trajectory panel (LOW = MPC_Tuned, `…` on the tune row), or
+# at launch: `--mpc-tune NAME` / hw_mpc.yaml `mpc_tuned_profile: NAME`.
+#   apply:   APPLIED while LOW is mpc_tuned / mpc_tuned_7d (runtime, no rebuild).
+#            Every key required. Edit these to make a new tune — and save it
+#            under a NEW name: run metas pin the file's sha1.
+#   compare: NOT applied; the solver/vehicle this tune was made on. A
+#            difference from the running station is a warning (panel + meta).
+#   record:  context only, never read back.
+schema: 1
+name: 20261004_default
+created: '2026-10-04T02:11:35'
+description: 'Snapshot of the mpc_tuned follower as flown up to 2026-10-04 (peg-in-hole sessions): hw_mpc.yaml
+  mpc_tuned split 0.25/4.0, policy q_scale 4.0 / along_scale 3.0, heave trim -12 N (peg in jaw), axis
+  cap 0.5 / slew 1.5/s; params.py Q/QN/R. The station default (hw_mpc.yaml mpc_tuned_profile).'
+source: {config: config/hw_mpc.yaml, config_sha1: bfcd6916fd0963576aa0258303184025cea81386, params: bluerov2_mujoco_marinegym/dobmpc/params.py,
+  params_sha1: 826256e649b98363a6ce7c881d400013e4e326b1, git_commit: 5c50f99257cb9bd801b26517f0b29bb8518c15c7,
+  git_dirty: true}
+apply:
+  Q: [300.0, 300.0, 150.0, 80.0, 80.0, 150.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
+  QN: [300.0, 300.0, 150.0, 80.0, 80.0, 150.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
+  R: [0.05, 0.05, 0.05, 0.01, 0.01, 0.005]
+  path_cost: {along_scale: 0.25, cross_scale: 4.0, q_along: null, q_cross: null, apply_terminal: true,
+    split_velocity: false, v_along_scale: 1.0, v_cross_scale: 1.0}
+  policy: {q_scale: 4.0, along_scale: 3.0}
+  vehicle_net_buoyancy_n: -12.0
+  axis_cap: 0.5
+  axis_slew_per_s: 1.5
+compare:
+  rov_model: heavy_gripper
+  ctrl_hz: 20.0
+  N: 60
+  dt_s: 0.05
+  u_max: [30.0, 30.0, 30.0, 8.0, 8.0, 10.0]
+  linear_damping: [86.7, 133.8, 5.18, 0.07, 0.07, 0.07]
+  quadratic_damping: [18.18, 21.66, 36.99, 1.55, 1.55, 1.55]
+  axis_gain: {surge_n: 60.0, sway_n: 60.0, heave_n: 60.0, yaw_nm: 20.0, roll_nm: 13.2, pitch_nm: 7.2}
+record:
+  note: context only — never read back by the station
+  model:
+    mass_kg: 13.724
+    inertia: [0.38154, 0.7778, 0.70954]
+    added_mass: [5.5, 12.7, 14.57, 0.12, 0.12, 0.12]
+    volume_m3: 0.0131815
+    rho: 997.0
+    zg_m: 0.01
+    net_buoyancy_model_n: -5.709856545000008
+    v_max_m_s: 1.5
+    horizon_s: 3.0
+  path: {path_following: true, path_lead_m: 0.1, path_fillet_m: 0.0, path_turn_radius_m: 0.0, path_lat_accel_m_s2: 0.05,
+    path_long_accel_m_s2: 0.05, path_creep_m_s: 0.02}
+  hw_mpc_yaml:
+    mpc_tuned: {along_scale: 0.25, cross_scale: 4.0, apply_terminal: true, split_velocity: false, v_along_scale: 1.0,
+      v_cross_scale: 1.0}
+    plant:
+      linear_damping: [86.7, 133.8, 5.18, 0.07, 0.07, 0.07]
+    axis_gain: {surge_n: 60.0, sway_n: 60.0, heave_n: 60.0, yaw_nm: 20.0, roll_nm: 13.2, pitch_nm: 7.2}
+    axis_cap: 0.5
+    axis_slew_per_s: 1.5
+    vehicle_net_buoyancy_n: -12.0
+    w_hat_clip: [15, 45, 45, 5, 5, 8]
+    policy.q_scale: 4.0
+    policy.along_scale: 3.0
+    policy.heave_trim_attitude_rotated: false

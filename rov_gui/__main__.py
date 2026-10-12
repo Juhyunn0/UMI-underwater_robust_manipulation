@@ -234,6 +234,35 @@ def build_parser() -> argparse.ArgumentParser:
                         "means: the controller drives the vehicle toward "
                         "where the IMU thinks it is, and this station has no "
                         "geofence, so the pilot's E-STOP is the stop.")
+    g.add_argument("--dvl", action="store_true",
+                   help="read a Water Linked DVL (A50) over its TCP JSON API "
+                        "and offer it to the state estimate as a THIRD sensor "
+                        "(AprilTag + IMU + DVL). Same as hw_mpc.yaml "
+                        "dvl.enabled. The station only READS the device. "
+                        "Whether the estimator CONSUMES it is the DVL button "
+                        "on the trajectory panel (OUT = shadow: recorded and "
+                        "compared only); it changes only while disengaged, "
+                        "and IN is refused until the mount is measured in "
+                        "hw_mpc.yaml and proven against the tag velocity. "
+                        "With --source demo a SYNTHETIC DVL is simulated. "
+                        "HARDWARE-UNVERIFIED (2026-10-01).")
+    g.add_argument("--ekf", choices=("off", "shadow", "control"),
+                   default=None,
+                   help="the robot_localization EKF (AprilTag + IMU + DVL, "
+                        "the Learning-to-Swim estimator; control/rl_ekf.py). "
+                        "Default = hw_mpc.yaml ekf.enabled (true): it runs in "
+                        "SHADOW beside the state assembler on every tick and "
+                        "is recorded (CSV ekf_*, <stem>_ekf_inputs.jsonl). "
+                        "`control` STARTS the session with the controller "
+                        "flying on it; otherwise the EST button on the "
+                        "trajectory panel switches it, only while disengaged "
+                        "with no CSV open. HARDWARE-UNVERIFIED (2026-10-02).")
+    g.add_argument("--dvl-host", default=None, metavar="IP",
+                   help="the DVL's address (default: hw_mpc.yaml dvl.host, "
+                        "192.168.2.95)")
+    g.add_argument("--dvl-port", type=int, default=None,
+                   help="the DVL's TCP port (default: hw_mpc.yaml dvl.port, "
+                        "16171)")
     g.add_argument("--battery-capacity-mah", type=float, default=0.0,
                    help="pack capacity in mAh, e.g. 18000 for the BlueROV2 "
                         "stock Li-ion (default: %(default)s = unknown). Given "
@@ -447,7 +476,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "recordings all take the learned map. One instrument "
                         "per run, so a run is never a mixture. OFF by default "
                         "— it loads 3 GiB onto the GPU (~6 s) in the process "
-                        "that commands the vehicle, and it re-plans the link "
+                        "that commands the vehicle (in a child process of its "
+                        "own with --fstereo-process), and it re-plans the link "
                         "(--depth-fps becomes 15 for the mono pair). Without "
                         "the flag nothing is imported and no frame is copied. "
                         "Needs the rovgui-pose env; './c3 env' shows which "
@@ -521,6 +551,30 @@ def build_parser() -> argparse.ArgumentParser:
                         "on a new torch/driver falls back to eager by itself "
                         "and says so in the log; this flag is for skipping "
                         "the attempt.")
+    g.add_argument("--fstereo-process", action="store_true",
+                   help="run the FoundationStereo NETWORK in a child process "
+                        "of its own instead of inside the station (2026-10-12; "
+                        "rov_gui/perception/fstereo_proc.py). Same network and "
+                        "settings; the camera, the mono pair and its capture "
+                        "stamp, the depth panel, --record-stereo, "
+                        "FoundationPose and the policy tap stay in the "
+                        "station, and --policy-fs-schedule keeps its meaning "
+                        "(one pair in flight, synchronous round trip). On the "
+                        "station's real workers, FS scale 0.75 back to back: "
+                        "policy forward p50 121.6 ms in-station, 40.8 ms in a "
+                        "child, 19.4 ms with --policy-fs-schedule yield; plan "
+                        "age (emit) p50 321.2 / 222.3 / 233.3 ms; round trip "
+                        "minus FS solve 0.4-0.5 ms p50 [측정: rov_gui/tools/"
+                        "fstereo_bench_out/policy_fs_schedule_20261012_"
+                        "100908.json, synthetic pairs, no camera/GUI] — for "
+                        "flying the two remedies against each other, not a "
+                        "known win. A child that exits, or stops answering "
+                        "(5 s per frame; 10 s for the first, which captures "
+                        "the CUDA graph; 120 s to load), is a FAULT for the "
+                        "rest of the run: no fallback to the in-station "
+                        "network or the camera's depth. UNVERIFIED in water. "
+                        "RECORD BOUNDARY: run meta fstereo.process.mode and "
+                        "plans.jsonl fs_process.")
     g.add_argument("--fstereo-fill", type=int, default=2, metavar="N",
                    help="passes of scatter-gap fill on the projected depth "
                         "(default: %(default)s; 0 = off). Projecting the "
@@ -807,7 +861,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "DOWN (needs a re-measured extrinsic in hw_nav.yaml)")
     g.add_argument("--mpc-mode", default=None,
                    choices=("none", "mpc", "dobmpc", "mpc_tuned", "dobmpc_tuned",
-                            "pid", "rl", "rl_pwm"),
+                            "pid", "rl", "rl_pwm", "pid_7d", "mpc_tuned_7d", "rl_7d",
+                            "rl_pwm_7d"),
                    help="override hw_mpc.yaml mode — the LOW level (the "
                         "follower) the trajectory panel starts on; the panel "
                         "can change it between engagements. One solver serves "
@@ -818,7 +873,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "(hw_mpc.yaml mpc_tuned:). 'none' = TELEOP: the "
                         "station commands nothing, you fly on the joystick; "
                         "a Diffusion Policy mission still infers and draws "
-                        "(2026-09-11; --policy-observe is the launch alias).")
+                        "(2026-09-11; --policy-observe is the launch alias). "
+                        "'*_7d' (2026-10-03) = the same follower that ALSO "
+                        "commands roll/pitch (needs engage.attitude_axes.enabled; "
+                        "rl_pwm_7d drives them with per-thruster pulses instead).")
+    g.add_argument("--mpc-tune", default=None, metavar="NAME|PATH|none",
+                   help="override hw_mpc.yaml mpc_tuned_profile: the MPC_Tuned "
+                        "profile (config/mpc_tuned_profiles/NAME.yaml) the "
+                        "station holds at launch — Q/QN/R, the along/cross "
+                        "split, policy q_scale/along_scale, the heave trim and "
+                        "axis cap/slew, applied while LOW is mpc_tuned / "
+                        "mpc_tuned_7d only. 'none' = hw_mpc.yaml's own blocks. "
+                        "Re-pickable on the trajectory panel's tune row "
+                        "(2026-10-04; save one with "
+                        "`python -m rov_gui.tools.mpc_tune save NAME`).")
     g.add_argument("--rov-model", default=None,
                    choices=("heavy", "heavy_c3", "heavy_gripper"),
                    help="override hw_mpc.yaml rov_model (which dobmpc plant "
@@ -1006,7 +1074,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--policy-fs-schedule", default="free",
                    choices=FS_SCHEDULES,
                    help="how FoundationStereo and the policy share the GPU "
-                        "(default: %(default)s). Both run in this process, and "
+                        "(default: %(default)s). Both run in this process "
+                        "unless --fstereo-process, and "
                         "with the stereo network running back to back the "
                         "policy's forward takes 152.8 ms p50 instead of the "
                         "19.3 ms it takes alone [측정: data/20260930/"
@@ -1562,6 +1631,35 @@ def check_policy(a):
     return None
 
 
+def check_fstereo_process(a):
+    """--fstereo-process at launch: ``("refuse"|"warn", text)`` or None.
+
+    A REFUSAL without --fstereo — there is no network to move, and a flag that
+    silently does nothing is the failure mode --fstereo itself was fixed for.
+    A warning off the hardware source (only HardwareBackend builds the worker),
+    and on hw the record boundary, said once, like --policy-fs-schedule's.
+    Silent when the flag is not given.
+    """
+    if not bool(getattr(a, "fstereo_process", False)):
+        return None
+    if not bool(getattr(a, "fstereo", False)):
+        return ("refuse", "--fstereo-process needs --fstereo: it moves the "
+                          "FoundationStereo network into a child process, and "
+                          "without --fstereo there is no network. Add "
+                          "--fstereo, or drop --fstereo-process.")
+    src = getattr(a, "source", "demo")
+    if src != "hw":
+        return ("warn", f"--fstereo-process does nothing with --source {src}: "
+                        f"only the hardware backend builds the learned-depth "
+                        f"worker.")
+    return ("warn", "--fstereo-process: the FoundationStereo network runs in "
+                    "its OWN process (same network and settings; the camera, "
+                    "the depth panel, --record-stereo and the policy tap stay "
+                    "here). UNVERIFIED in water. RECORD BOUNDARY: run meta "
+                    "fstereo.process.mode and plans.jsonl fs_process — do not "
+                    "pool plan age, infer_ms or FS rate across it.")
+
+
 def check_fstereo(a) -> str | None:
     """--fstereo only does anything on the hardware source. Say so at launch.
 
@@ -1595,7 +1693,7 @@ def main(argv: list[str] | None = None) -> int:
     bad = check_fstereo(a)
     if bad:
         print(f"rov_gui: {bad}", file=sys.stderr)
-    for check in (check_slam, check_policy):
+    for check in (check_slam, check_fstereo_process, check_policy):
         got = check(a)
         if not got:
             continue
@@ -1687,6 +1785,17 @@ def _preflight(a) -> int | None:
               "  or pass --no-preflight if you know the rig is ready.",
               file=sys.stderr)
         return None if a.no_preflight else 2
+    # A DVL, if this run has one (--dvl or hw_mpc.yaml dvl.enabled): one
+    # reachability line. A broken dvl: block is the worker's to report.
+    try:
+        from rov_gui.control.dvl import resolve_with_opts
+        from rov_gui.control.geometry import MpcConfig
+
+        dv = resolve_with_opts(MpcConfig.load(a.mpc_config).dvl, a)
+        if dv["enabled"]:
+            a.dvl_check_host, a.dvl_check_port = dv["host"], dv["port"]
+    except Exception:                                            # noqa: BLE001
+        pass
     return PF.gate(a, title="rov_gui", out_dir=Path(a.rec_dir),
                    display=True, vehicle=a.mavlink_transport != "none")
 

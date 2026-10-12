@@ -276,7 +276,12 @@ THEMES = {
 #: it is named as a variant of its base rather than as a separate controller.
 CTRL_LABEL = {"pid": "PID", "mpc": "MPC", "dobmpc": "DOB-MPC",
               "mpc_tuned": "MPC path-frame",
-              "dobmpc_tuned": "DOB-MPC path-frame"}
+              "dobmpc_tuned": "DOB-MPC path-frame",
+              # 2026-10-03: the roll/pitch-commanding LOWs. The worker stamps
+              # controller.type with the LOW key, so a 7d run never pools with
+              # its 4-DoF base.
+              "pid_7d": "PID 7D", "mpc_tuned_7d": "MPC path-frame 7D",
+              "rl_7d": "RL 7D", "rl_pwm_7d": "RL PWM 7D"}
 
 
 # ============================================================== config
@@ -843,12 +848,14 @@ def load_run(date: str, run_dir: Path, meta_path: Path, cfg: dict):
         "lead_cm": lead * 100.0, "err_src": err_src,
     }
     # ATTITUDE TRACKING (schema 16): roll/pitch RMS against the reference,
-    # ONLY over rows flown with the attitude axes SENT (rp_track == 1) and
-    # only when the columns exist. A 4-DoF run gets no key at all — the
+    # ONLY over rows that flew an attitude reference (rp_track 1 = K/M sent on
+    # s/t, 2 = policy pulses sent by rl_pwm_7d) and only when the columns exist. A 4-DoF run gets no key at all — the
     # figures and every existing statistic above are untouched.
     if "rroll_deg" in col and "rp_track" in col and "roll_deg" in col \
             and "rpitch_deg" in col and "pitch_deg" in col:
-        tr = m & (col["rp_track"] == 1) & np.isfinite(col["rroll_deg"])
+        # 1 = K/M on s/t, 2 = tracked through per-thruster pulses (rl_pwm_7d,
+        # 2026-10-03) — both flew an attitude reference
+        tr = m & np.isin(col["rp_track"], (1, 2)) & np.isfinite(col["rroll_deg"])
         if int(tr.sum()) >= 3:
             run.stats["roll_rms_deg"] = _rms(col["roll_deg"][tr] - col["rroll_deg"][tr])
             run.stats["pitch_rms_deg"] = _rms(col["pitch_deg"][tr] - col["rpitch_deg"][tr])

@@ -359,6 +359,18 @@ class C3VideoWorker(LoopWorker):
         #: --record-depth's colour tap (bus.LatestFrame), injected by the
         #: backend. None, or `wanted()` False, means not one byte is copied.
         self.color_rec_mb = None
+        #: The policy's COLOUR obs (bus.PolicyColorMailbox), injected by the
+        #: backend under --policy (2026-10-03). Wanted only while the loaded
+        #: checkpoint is an RGB one (PolicyWorker._adopt_obs_contract), so a
+        #: depth checkpoint costs not one copied frame.
+        self.policy_color_mb = None
+        self._policy_color_fault = ""
+        #: (colour frame object, t_capture) of the frame _tap_pose stamped
+        #: for the localizer — reused by _tap_policy_color for the SAME frame,
+        #: so the image and its fix carry one identical stamp (review
+        #: 2026-10-03, N1: two separate now() - age_ms() reads can straddle a
+        #: GIL switch).
+        self._nav_stamp = None
         self._fs_last_seq = None
         self._fs_tap_fault = ""
         self._color_rec_fault = ""
@@ -666,6 +678,18 @@ class C3VideoWorker(LoopWorker):
                         "warn", f"record-depth: colour tap failed "
                                 f"({type(e).__name__}: {e}) — the recording "
                                 f"keeps its depth; the camera is unaffected")
+            # Same guard, same reason: an RGB checkpoint's colour obs is an
+            # optional feature and must never cost the pilot the camera.
+            try:
+                self._tap_policy_color(bundle)
+            except Exception as e:                               # noqa: BLE001
+                if self._policy_color_fault != str(e):
+                    self._policy_color_fault = str(e)
+                    self.bus.log.emit(
+                        "warn", f"policy: colour tap failed "
+                                f"({type(e).__name__}: {e}) — an RGB "
+                                f"checkpoint gets no frames; the camera is "
+                                f"unaffected")
             # Same guard, same reason: the policy's device-depth tap is an
             # optional feature and must never cost the pilot the camera.
             try:
@@ -865,6 +889,7 @@ class C3VideoWorker(LoopWorker):
         # The stamp is when the frame was TRUE, not when we got here
         # (state.py:13-15). age_ms() covers sensor->host.
         t_capture = now() - (color.age_ms() / 1000.0)
+        self._nav_stamp = (color, t_capture)
         intr = bundle.intrinsics.get("color") if bundle.intrinsics else None
         # .copy() is not optional: DepthAI recycles its frame pool, so an array
         # handed to another thread is a race the moment the next frame lands.
@@ -930,6 +955,31 @@ class C3VideoWorker(LoopWorker):
         # .copy(): DepthAI recycles its pool and the writer thread reads this
         # later — the same hazard every tap above copies against.
         slot.put(color.image.copy(), now() - (color.age_ms() / 1000.0))
+
+    def _tap_policy_color(self, bundle) -> None:
+        """The C3 COLOUR frame -> an RGB checkpoint's obs (2026-10-03).
+
+        The same frame the tag localizer runs on (``_tap_pose`` -> nav_mb),
+        with the SAME stamp: the number _tap_pose computed for this frame
+        object (``_nav_stamp``), else ``now() - age_ms`` read here (the
+        frame's device time on the host's monotonic clock — microseconds
+        from the localizer's). That equality is what lets the policy worker
+        pair each image with the proprio row of that frame's own fix
+        (PolicyWorker._anchor, COLOR_FIX_MATCH_S). Gated on ``wanted()``
+        before the copy, like every optional tap here.
+        """
+        mb = self.policy_color_mb
+        if mb is None or not mb.wanted() or "color" not in bundle.fresh:
+            return
+        color = bundle.frames.get("color")
+        if color is None or color.image is None:
+            return
+        held = self._nav_stamp
+        t_capture = (held[1] if held is not None and held[0] is color
+                     else now() - (color.age_ms() / 1000.0))
+        # .copy(): DepthAI recycles its frame pool; the policy thread reads
+        # this array later (the hazard every tap above copies against).
+        mb.put(color.image.copy(), t_capture)
 
     def _tap_policy_depth(self, bundle) -> None:
         """Device depth -> the policy mailbox, on the `color_aligned` grid.
@@ -2515,6 +2565,7 @@ class MavlinkCommandSink(TimerWorker):
         self._pwm_latch = ""
         self._pwm_late_run = 0               # consecutive policy frames that arrived old
         self._pwm_cap = 0.0                  # |throttle| ceiling THIS sink enforces (setup)
+        self._pwm_cap_mode = ""              # rl_pwm.pwm_cap_mode as configured (snapshot / meta only; setup)
         self._pwm_tick_failed = ""
 
     def setup(self) -> None:
@@ -2582,13 +2633,19 @@ class MavlinkCommandSink(TimerWorker):
         policy's own export (its motor_direction is what MOT_n_DIRECTION is
         checked against) and read the |throttle| ceiling this sink enforces
         by itself. A missing/malformed export costs only that mode: the gate
-        stays None, ``pwm_gate_state`` says why, the worker refuses."""
+        stays None, ``pwm_gate_state`` says why, the worker refuses.
+
+        2026-10-10: the gate also carries the sign-probe artefact check
+        (rl_pwm.ThrusterProbeCheck, built for the export's sigma) unless the
+        RECORDED opt-out rl_pwm.require_thruster_probe: false — the sink's
+        own copy of the follower's engage gate, judged every frame."""
         try:
             import json as _json
 
             from ..control.geometry import MpcConfig
             from ..control.rl_policy import HwRlPwm, REPO_ROOT
-            from ..control.rl_pwm import PWM_CAP_FIRST_WATER, PwmGate, PwmModel
+            from ..control.rl_pwm import (PwmGate, PwmModel, ThrusterProbeCheck,
+                                          parse_rl_pwm_block)
 
             cfg = MpcConfig.load(getattr(self.opts, "mpc_config",
                                          "config/hw_mpc.yaml"))
@@ -2600,15 +2657,22 @@ class MavlinkCommandSink(TimerWorker):
                       encoding="utf-8") as fh:
                 spec = _json.load(fh)
             model = PwmModel((spec.get("output") or {})["pwm_model"])
-            cap = float(raw.get("pwm_cap", PWM_CAP_FIRST_WATER))
-            if isinstance(raw.get("pwm_cap"), bool) or not (0.0 < cap <= 1.0):
-                raise ValueError(f"rl_pwm.pwm_cap {raw.get('pwm_cap')!r}")
-            self._pwm_cap = min(cap, float(model.cap_trained))
-            self._pwm_gate = PwmGate(model.motor_direction, self.sysid)
+            blk = parse_rl_pwm_block(raw)
+            self._pwm_cap = min(blk["pwm_cap"], float(model.cap_trained))
+            self._pwm_cap_mode = str(blk["pwm_cap_mode"])
+            probe = None
+            if blk["require_thruster_probe"]:
+                probe = ThrusterProbeCheck(
+                    model.sigma, blk["thruster_probe_path"],
+                    blk["thruster_probe_max_age_days"],
+                    data_root=HwRlPwm._probe_data_root(cfg))
+            self._pwm_gate = PwmGate(model.motor_direction, self.sysid,
+                                     thruster_probe=probe)
             self._pwm_gate_error = ""
         except Exception as e:                                   # noqa: BLE001
             self._pwm_gate = None
             self._pwm_cap = 0.0
+            self._pwm_cap_mode = ""
             self._pwm_gate_error = f"{type(e).__name__}: {e}"
             self.bus.log.emit("warn", f"rl_pwm transport unavailable "
                                       f"({self._pwm_gate_error}) — LOW mode "
@@ -2632,19 +2696,26 @@ class MavlinkCommandSink(TimerWorker):
     def _send_pwm(self, pulses) -> bool:
         """ONE rc_channels_override_send call site. Channels 9..16 carry the
         eight pulses, every other channel 65535 (= leave). Each pulse is
-        clamped HERE to 1500 +- 400 * pwm_cap as well — the controller caps
-        too, but a raw thruster command does not rest on one line of another
-        module. A v1 dialect has no channels 9..18: TypeError, said once."""
-        from ..control.rl_pwm import (PWM_NEUTRAL_US, PWM_SPAN_US,
-                                      pack_rc_override)
+        ASSERTED inside 1500 +- 400 * pwm_cap here as well — the follower
+        applies the cap as a thrust-space scale (2026-10-10), and a raw
+        thruster command does not rest on one line of another module; but
+        nothing here CLAMPS: a pulse outside the window is refused (said
+        once) and not sent — the per-thruster clamp that stood here until
+        2026-10-09 was a second copy of the clip that collapsed the
+        allocation on 2026-10-01. A v1 dialect has no channels 9..18:
+        TypeError, said once."""
+        from ..control.rl_pwm import (cap_span_us, pack_rc_override,
+                                      pulses_within_cap)
 
         g = self._pwm_gate
         if g is None or self.master is None:
             return False
-        span = int(round(PWM_SPAN_US * self._pwm_cap))
         try:
-            pw = [min(PWM_NEUTRAL_US + span, max(PWM_NEUTRAL_US - span, int(p)))
-                  for p in pulses]
+            pw = [int(p) for p in pulses]
+            if not pulses_within_cap(pw, self._pwm_cap):
+                raise ValueError(f"pulse outside 1500 +- {cap_span_us(self._pwm_cap)} "
+                                 f"us (|throttle| <= {self._pwm_cap:.2f}): {pw} — "
+                                 f"refused, not clamped")
             ch = pack_rc_override(pw, g.channels)
             self.master.mav.rc_channels_override_send(
                 self.target_sys, self.target_comp, *ch)
@@ -2746,6 +2817,21 @@ class MavlinkCommandSink(TimerWorker):
             if self._pwm_late_run >= self.PWM_LATE_FRAMES:
                 self._pwm_halt("policy frames keep arriving late", latch=True)
             return
+        from ..control.rl_pwm import cap_span_us, pulses_within_cap
+
+        if not pulses_within_cap(pulses, self._pwm_cap):
+            # 2026-10-10: the cap is a thrust-space SCALE upstream
+            # (rl_pwm.scale_throttles); a frame outside 1500 +- 400 * cap is
+            # a follower that did not scale. REFUSED and neutralised, never
+            # clamped (the clamp was the 2026-10-01 allocation collapse's
+            # second copy), and LATCHED: the worker disengages on the
+            # snapshot, exactly as for a gate lost mid-flow.
+            why = (f"a pulse is outside the cap window 1500 +- "
+                   f"{cap_span_us(self._pwm_cap)} us (|throttle| <= "
+                   f"{self._pwm_cap:.2f}): {pulses} — refused, not clamped")
+            self._pwm_refuse(why)
+            self._pwm_halt(why, latch=True)
+            return
         ok, why = self._pwm_ready(t)
         if not ok:
             self._pwm_refuse(why)
@@ -2808,7 +2894,8 @@ class MavlinkCommandSink(TimerWorker):
                 d["ok"], d["why"] = False, self._pwm_latch
             d.update(active=bool(self._pwm_active), n_sent=int(self._pwm_sent),
                      enabled=bool(self.enabled), latched=bool(self._pwm_latch),
-                     pwm_cap=float(self._pwm_cap), stamp=now())
+                     pwm_cap=float(self._pwm_cap), pwm_cap_mode=self._pwm_cap_mode,
+                     stamp=now())
             self._pwm_state = d
 
     def pwm_gate_state(self) -> dict | None:
@@ -3747,7 +3834,15 @@ class FStereoWorker(TimerWorker):
     def setup(self) -> None:
         # Imported here, not at module scope: this pulls torch and 3 GiB of
         # weights, which must not be a requirement for starting the station.
-        from ..perception.fstereo import FStereoSession
+        # --fstereo-process (2026-10-12): the same session surface with the
+        # network in a child process (perception/fstereo_proc.py); everything
+        # below — the gate, the panel, the recorder, the policy tap — is the
+        # same code in both layouts.
+        if self._process_mode() == "child":
+            from ..perception.fstereo_proc import \
+                RemoteFStereoSession as FStereoSession
+        else:
+            from ..perception.fstereo import FStereoSession
         raw_size = getattr(self.opts, "fstereo_size", None)
         size = _parse_size(raw_size)
         if raw_size and size is None:
@@ -3813,9 +3908,30 @@ class FStereoWorker(TimerWorker):
                if self.session.infer_size else f"scale={self.session.scale:g}")
             + f", cuda graph {'on' if self.session.graph else 'off'}, "
             f"projected onto "
-            f"{getattr(self.opts, 'fstereo_align_size', '400x250')}. The "
-            f"camera's own depth stream is not requested.")
+            f"{getattr(self.opts, 'fstereo_align_size', '400x250')}, network "
+            + (f"in its own process (pid {getattr(self.session, 'pid', None)})"
+               if self._process_mode() == "child" else "in this process")
+            + ". The camera's own depth stream is not requested.")
         self._publish_state()
+
+    def _process_mode(self) -> str:
+        """Where the network runs: "child" (--fstereo-process) or
+        "in-station". getattr: hand-built opts (tools, tests) lack the flag."""
+        return ("child" if bool(getattr(self.opts, "fstereo_process", False))
+                else "in-station")
+
+    def _process_meta(self) -> dict:
+        """``fstereo.process`` — ALWAYS written (off included): an absent key
+        cannot say which layout a run flew. The child's round-trip numbers
+        come from the session; the in-station layout has none."""
+        fn = getattr(self.session, "process_meta", None)
+        if callable(fn):
+            try:
+                return dict(fn())
+            except Exception as e:                               # noqa: BLE001
+                return {"mode": self._process_mode(),
+                        "error": f"{type(e).__name__}: {e}"}
+        return {"mode": self._process_mode()}
 
     def _say(self, level: str, text: str) -> None:
         """on_log for the session. ``_say``, never ``_log`` — see PoseWorker."""
@@ -3856,6 +3972,9 @@ class FStereoWorker(TimerWorker):
             eager=bool(s is not None and getattr(s, "graph_requested", False)
                        and not s.graph),
             schedule=str(getattr(getattr(self, "fs_gate", None), "mode", "") or ""),
+            # from the SESSION, not the flag: the chip says what is running
+            process=("proc" if getattr(s, "process_mode", "") == "child"
+                     else ""),
             stamp=now()))
 
     def _publish_state_throttled(self, note: str = "") -> None:
@@ -3887,7 +4006,9 @@ class FStereoWorker(TimerWorker):
         self.bus.log.emit(
             "error", f"fstereo: STOPPED — {why}. This run has no other depth "
                      f"source (--fstereo does not stream the camera's own); "
-                     f"restart without --fstereo to fly on the C3's stereo.")
+                     f"restart the station to get learned depth back (keep "
+                     f"--fstereo: a --policy run refuses the C3's own depth "
+                     f"without --policy-allow-device-depth).")
         self._publish_state()
 
     # ------------------------------------------------------------------ tick
@@ -3900,7 +4021,13 @@ class FStereoWorker(TimerWorker):
             return
         if s.error:
             self._disarm(s.error[:70])
-            self._status(Conn.FAULT, s.error[:60])
+            # Throttled like the starvation branch: since --fstereo-process an
+            # error can arrive MID-run (a child that died), and this branch
+            # then runs every 5 ms tick for the rest of the run.
+            t = now()
+            if t - self._last_stat > 0.5:
+                self._last_stat = t
+                self._status(Conn.FAULT, s.error[:60])
             return
         if not self.enabled:
             self._publish_state_throttled()
@@ -4308,7 +4435,8 @@ class FStereoWorker(TimerWorker):
         if self.session is None:
             return {"enabled": False, "why": self._fault or "not built",
                     "schedule": (self.fs_gate.snapshot()
-                                 if self.fs_gate is not None else None)}
+                                 if self.fs_gate is not None else None),
+                    "process": self._process_meta()}
         d = self.session.describe()
         d.update(enabled=bool(self.enabled), ready=bool(self.session.ready),
                  frames=self._frames, measured_hz=round(self._hz, 2),
@@ -4355,7 +4483,11 @@ class FStereoWorker(TimerWorker):
                  # which). RECORD BOUNDARY: do not pool frame rate, plan age
                  # or infer_ms across schedules.
                  schedule=(self.fs_gate.snapshot()
-                           if self.fs_gate is not None else None))
+                           if self.fs_gate is not None else None),
+                 # --fstereo-process: where the network ran, and (child) the
+                 # round trip the worker waited for. RECORD BOUNDARY: do not
+                 # pool plan age, infer_ms or FS rate across process.mode.
+                 process=self._process_meta())
         return d
 
     def teardown(self) -> None:
@@ -5158,6 +5290,15 @@ class HardwareBackend(Backend):
             # ...and the colour slot the camera worker fills, so the recorder
             # can file the frame that was current when each obs was built.
             self.policy.color_mb = getattr(self, "_color_rec_slot", None)
+            # ...and the C3 COLOUR frames an RGB checkpoint consumes
+            # (2026-10-03). Always wired — which image a run feeds is the
+            # loaded checkpoint's choice, made in the panel at runtime — and
+            # free until then: the worker wants it only for an RGB contract.
+            if self.video is not None:
+                from ..bus import PolicyColorMailbox
+                pcm = PolicyColorMailbox()
+                self.video.policy_color_mb = pcm
+                self.policy.policy_color_mb = pcm
             if self.fstereo is not None:
                 self.fstereo.policy_mb = pmb
                 self.policy.fstereo_meta_fn = self.fstereo.meta
@@ -5222,6 +5363,21 @@ class HardwareBackend(Backend):
                 # is not needed and must not fire.
                 self.tagnav.suppress_land_fix = True
 
+        # THE DVL (2026-10-01, HARDWARE-UNVERIFIED): opt-in like everything
+        # above — `--dvl` or hw_mpc.yaml dvl.enabled. Off = nothing built,
+        # nothing imported. Built without --mpc too: the SENSORS row is how
+        # the link is checked on the bench before anything consumes it.
+        self.dvl = None
+        from .dvl import dvl_config
+
+        if dvl_config(opts) is not None:
+            from .dvl import DvlWorker
+
+            self.dvl = DvlWorker(bus, opts)
+            self.workers.append(self.dvl)
+            # TimerWorker receiver: the queued slot IS delivered.
+            bus.cmd_log_dvl.connect(self.dvl.set_raw_log)
+
         bus.cmd_pilot.connect(self.sink.set_pilot)
         # LOW mode rl_pwm (2026-09-30): both sinks have the slot (the wiring
         # test reads these connections by name); only MavlinkCommandSink
@@ -5283,6 +5439,13 @@ class HardwareBackend(Backend):
             # IS delivered — the mirror image of the cmd_log_sensors case
             # above, where the LoopWorker was the receiver.
             bus.camera_imu.connect(self.mpc.on_camera_imu)
+            # The DVL. Wired unconditionally (the bus.pose rule): with no
+            # --dvl nothing emits, and MpcWorker builds no aid, so each slot
+            # is a no-op twice over.
+            bus.dvl.connect(self.mpc.on_dvl)
+            bus.dvl_info.connect(self.mpc.on_dvl_info)
+            bus.cmd_dvl_use.connect(self.mpc.set_dvl_use)
+            bus.cmd_estimator.connect(self.mpc.set_estimator)
             bus.telemetry.connect(self.mpc.on_telemetry)
             bus.cmd_mode.connect(self.mpc.on_mode_request)
             bus.thrusters.connect(self.mpc.on_thrusters)
@@ -5297,6 +5460,7 @@ class HardwareBackend(Backend):
             bus.cmd_mpc_traj.connect(self.mpc.set_traj)
             bus.cmd_mpc_start.connect(self.mpc.start_mission)
             bus.cmd_mpc_mode.connect(self.mpc.set_mode)
+            bus.cmd_mpc_tune.connect(self.mpc.set_mpc_tune)
             bus.cmd_mpc_scenario.connect(self.mpc.set_scenario)
             bus.cmd_mpc_dump_meta.connect(self.mpc.dump_run_meta)
             bus.cmd_enable.connect(self.mpc.on_enable)

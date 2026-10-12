@@ -458,6 +458,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 # choose the model in the GUI; see _pick_policy_ckpt).
                 self._traj_panel.set_policy_ckpt_default(
                     str(_mcfg.policy["ckpt"]))
+                # ...and what the worker decides a pick's roll/pitch with
+                # (2026-10-03, policy.action_repr auto): the panel forecasts
+                # TRACKED / DROPPED before START from the SAME file. Unseeded
+                # (this block failed) = no forecast at all.
+                _att = (_mcfg.engage or {}).get("attitude_axes") or {}
+                self._traj_panel.set_policy_config_default(
+                    str(_mcfg.policy["action_repr"]),
+                    bool(_mcfg.policy["attitude_track"]),
+                    bool(_att.get("enabled", False)
+                         if isinstance(_att, dict) else False),
+                    land_dry_run=bool(getattr(self.opts, "land_dry_run",
+                                              False)),
+                    # the RL *_7d LOWs fly an export; none named = the worker
+                    # refuses the mode, so the panel must not point at it
+                    unavailable=tuple(
+                        k for k in ("rl_7d", "rl_pwm_7d")
+                        if not (getattr(_mcfg, k, None) or {}).get("policy_dir")))
             except Exception as e:                           # noqa: BLE001
                 print(f"[warn] mpc panel: mission defaults ({e})", flush=True)
             if cfg is not None:
@@ -761,6 +778,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._traj_panel.policy_ckpt_pick_requested.connect(
                 self._pick_policy_ckpt)
             self._traj_panel.policy_ckpt_requested.connect(b.cmd_policy_ckpt)
+            # The MPC_Tuned profile picker (2026-10-04): the same split — the
+            # panel asks, the window owns the dialog, the worker answers.
+            self._traj_panel.mpc_tune_pick_requested.connect(
+                self._pick_mpc_tune)
+            self._traj_panel.mpc_tune_requested.connect(b.cmd_mpc_tune)
+            self._traj_panel.dvl_use_requested.connect(b.cmd_dvl_use)
+            self._traj_panel.estimator_requested.connect(b.cmd_estimator)
 
         # Explicit .connect rather than the `activated=` constructor keyword:
         # that keyword form is a PyQt convenience and is not portable to PySide.
@@ -1156,6 +1180,37 @@ class MainWindow(QtWidgets.QMainWindow):
         # `fileSelected` fires on accept only, with the one chosen file — no
         # dialog-code comparison across Qt bindings needed.
         dlg.fileSelected.connect(lambda p: panel._apply_ckpt_choice(str(p)))
+        try:
+            (dlg.exec_ if hasattr(dlg, "exec_") else dlg.exec)()
+        finally:
+            dlg.deleteLater()
+
+    def _pick_mpc_tune(self) -> None:
+        """The tune row's `…` button (LOW = MPC_Tuned). 2026-10-04, operator
+        request: the follower's tuning is picked like a DP checkpoint. The
+        SAME dialog and keyboard contract as `_pick_policy_ckpt` (keys handed
+        back first, Esc closes AND is E-STOP, the joystick keeps flying), on
+        config/mpc_tuned_profiles/. Whether it is held is the MpcWorker's
+        answer (MpcStatus.mpc_tune), never assumed here."""
+        panel = self._traj_panel
+        if panel is None:
+            return
+        from pathlib import Path
+
+        from .control.mpc_tune import PROFILE_DIR
+        from .widgets.trajectory import CkptDialog
+
+        self.teleop.all_stop()
+        self.bus.log.emit("warn", "choosing an MPC_Tuned profile — the "
+                                  "keyboard is NOT flying the vehicle; Esc "
+                                  "closes the dialog AND is E-STOP")
+        cur = panel.current_tune()
+        start = (str(Path(cur).parent) if cur and Path(cur).is_file()
+                 else str(PROFILE_DIR))
+        dlg = CkptDialog(self, "MPC_Tuned profile", start,
+                         "MPC_Tuned profiles (*.yaml);;All files (*)")
+        dlg.estop_requested.connect(self.estop)
+        dlg.fileSelected.connect(lambda p: panel._apply_tune_choice(str(p)))
         try:
             (dlg.exec_ if hasattr(dlg, "exec_") else dlg.exec)()
         finally:

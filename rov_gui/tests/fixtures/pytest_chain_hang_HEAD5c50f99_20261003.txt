@@ -1,0 +1,40 @@
+........................................................................ [ 14%]
+........................................................................ [ 29%]
+.....................s..............F................sssssssF.F...F..... [ 44%]
+...................F.................................................... [ 59%]
+........................................................................ [ 74%]
+...........Timeout (0:00:45)!
+Thread 0x000071fc04973740 (most recent call first):
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/pupil_apriltags/bindings.py", line 450 in __del__
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/_pytest/python.py", line 167 in pytest_pyfunc_call
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/pluggy/_callers.py", line 121 in _multicall
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/pluggy/_manager.py", line 120 in _hookexec
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/pluggy/_hooks.py", line 512 in __call__
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/_pytest/python.py", line 1707 in runtest
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/_pytest/runner.py", line 184 in pytest_runtest_call
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/pluggy/_callers.py", line 121 in _multicall
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/pluggy/_manager.py", line 120 in _hookexec
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/pluggy/_hooks.py", line 512 in __call__
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/_pytest/runner.py", line 250 in <lambda>
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/_pytest/runner.py", line 361 in from_call
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/_pytest/runner.py", line 249 in call_and_report
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/_pytest/runner.py", line 139 in runtestprotocol
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/_pytest/runner.py", line 118 in pytest_runtest_protocol
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/pluggy/_callers.py", line 121 in _multicall
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/pluggy/_manager.py", line 120 in _hookexec
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/pluggy/_hooks.py", line 512 in __call__
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/_pytest/main.py", line 408 in pytest_runtestloop
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/pluggy/_callers.py", line 121 in _multicall
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/pluggy/_manager.py", line 120 in _hookexec
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/pluggy/_hooks.py", line 512 in __call__
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/_pytest/main.py", line 384 in _main
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/_pytest/main.py", line 330 in wrap_session
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/_pytest/main.py", line 377 in pytest_cmdline_main
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/pluggy/_callers.py", line 121 in _multicall
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/pluggy/_manager.py", line 120 in _hookexec
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/pluggy/_hooks.py", line 512 in __call__
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/_pytest/config/__init__.py", line 229 in _main
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/_pytest/config/__init__.py", line 253 in _console_main
+  File "/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/pytest/__main__.py", line 9 in <module>
+  File "<frozen runpy>", line 88 in _run_code
+  File "<frozen runpy>", line 198 in _run_module_as_main

@@ -117,9 +117,24 @@ def slew_axes(cmd: PilotInput, prev, max_rate: float, dt: float, *,
     with a 4-tuple they pass through unchanged — never zeroed, so a caller
     that has not opted in cannot silently lose them, and a 4-DoF caller
     (roll = pitch = 0.0) gets today's object back. Returns a new PilotInput;
-    the caller keeps the tuple for next tick."""
-    if prev is None or not (max_rate > 0.0) or not (dt > 0.0):
+    the caller keeps the tuple for next tick.
+
+    ``max_rate <= 0`` (a follower trained without a slew — HwRl / HwRl7d)
+    passes the four translation/yaw axes through; with a 6-tuple ``prev`` and
+    ``rate_rp > 0`` the roll/pitch are STILL slewed (2026-10-03, LOW rl_7d:
+    the neutral-seeded first frame must not put +-cap on s/t — the
+    2026-09-26 audit fix, which a zero 4-axis rate used to bypass)."""
+    if prev is None or not (dt > 0.0):
         return cmd
+    if not (max_rate > 0.0):
+        if len(prev) < 6 or rate_rp is None or not (float(rate_rp) > 0.0):
+            return cmd
+        st = float(rate_rp) * float(dt)
+        return PilotInput(
+            surge=cmd.surge, sway=cmd.sway, heave=cmd.heave, yaw=cmd.yaw,
+            active=cmd.active, source=cmd.source, stamp=cmd.stamp,
+            roll=float(prev[4]) + max(-st, min(st, float(cmd.roll) - float(prev[4]))),
+            pitch=float(prev[5]) + max(-st, min(st, float(cmd.pitch) - float(prev[5])))).clamped()
     step = float(max_rate) * float(dt)
 
     def lim(new: float, old: float, st: float = step) -> float:
