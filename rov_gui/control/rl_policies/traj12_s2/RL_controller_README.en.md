@@ -366,7 +366,7 @@ Background: even when starting on the path, the error grows during the episode. 
 
 ## 10. Direct-thruster action mode `pwm` (2026-09-27) — a second version kept alongside the 4-axis policy
 
-User request (2026-09-27): "Instead of the policy whose outputs are x,y,z,yaw, also make a policy that outputs PWM directly, keep both, and train it too." There is one environment, and
+User request (2026-09-27): "Also make a policy that outputs PWM directly instead of one whose outputs are x,y,z,yaw, keep both, and train it too." There is one environment, and
 `ROVEnvCfg.action_mode` changes only the output (`rov_rl/obs_spec.py`). The 4-axis policy, checkpoints and export do not change by a single byte
 (`tests/test_pwm_mode.py::test_layout_two_modes`, the existing 33 tests still pass unchanged; no key in `params/env.yaml`/`obs_spec.json` = `axes`).
 
@@ -588,7 +588,7 @@ The axes6/pwm policies can **actuate** roll/pitch, but that is a "level out in t
   `deploy/obs_builder.py set_goal(roll_ned=, pitch_ned=)` refuse rather than give a tilted goal to such an export (the layouts are the same, so
   this key is the only discriminator). Mapping roll_up = roll_ned, pitch_up = −pitch_ned, yaw_up = −yaw_ned.
 * **Verification**: `tests/` 53/53 (new `test_att7_goals.py` 5), Isaac smoke 3 iterations (a code check, not training) — att7 axes6 training, the level recipe,
-  the `ang_error_mode=yaw` refusal and export all pass (`logs/smoke/smoke_att7_20261003.log`; with ref tilt 3.7°, q_des actually tilts).
+  the `ang_error_mode=yaw` refusal and export all passed (`logs/smoke/smoke_att7_20261003.log`; q_des actually tilted — ref tilt 3.7°).
 * **Remaining**: the evaluation scripts (eval_sweep/eval_trajectory/summarize_results) have no roll/pitch reference steps or metrics; the training caps (0.5/0.75) and
   the station first-water caps (0.25/0.375 in policy units) differ — the station refuses `rl_7d` engage until the signs are proven; there is no pwm-mode att recipe and
   no q_des attitude feed for station `rl_pwm`. This repository is not git — pre-modification copy `_pre_att7_backup_20261003/`.

@@ -142,7 +142,7 @@ Steps:
 1. LOW combo `None` (already selected if you launched with the alias) → ENGAGE → HIGH combo
    `Diffusion Policy` → START TRAJ. When the chip shows `OBSERVE · DP NOT COMMANDING`, it is open
    loop. Under None, the only HIGH options that START are Diffusion Policy and Replay (Station/Line/…
-   are refused with a reason), and under None even a bare HOLD·replay lands in `data/*/*_observe/`.
+   are refused with a reason), and under None even a bare HOLD or a replay lands in `data/*/*_observe/`.
 2. Direct flight by joystick. Moving the sticks does not cut off the mission (in a control run it is read as a
    takeover and disengages). Losing the tags for a moment does not end the run; only that tick is skipped.
 3. The DP plan appears on the main plot as a **thick red dashed line** — the thick one is the current one, the
@@ -167,7 +167,7 @@ on by default so it follows the vehicle, and the starting zoom is 6× because a 
 
 What draws it is **the same `TrajectoryView` widget as live** — it only reconstructs `MpcStatus` and
 `PolicyPlanViz` from the CSV and feeds them in; it does no coordinate transforms of its own. So if the replay
-picture is wrong, **the picture actually seen that day was wrong in the same way**.
+picture is wrong, **the picture actually seen that day was also wrong in the same way**.
 
 Files read (all of them already written by an ordinary run): `mpc_*.csv` (20 Hz vehicle pose),
 `hardware.datum_tag_frame` in `mpc_*.meta.json` (it only sits in the map frame if this is present),
@@ -190,7 +190,7 @@ dragging the anchor around by hand, so **never pool with control runs**.
 ```
 
 `--allow-command` is **absent**. If it is present, execution is refused (`__main__.check_slam`) — because
-that combination sends thruster commands to a vehicle a person is holding. So in this run the path to the
+that combination would send thruster commands to a vehicle a person is holding. So in this run the path to the
 thrusters is not even built (`NullCommandSink`).
 
 Three windows appear: the rov_gui station, `ORB-SLAM3: Map Viewer` (Pangolin — map points +
@@ -198,7 +198,7 @@ DP trajectory), `ORB-SLAM3: Current Frame`.
 
 Steps:
 
-1. Keep the can in the C3's view and hold it facing the room. ORB-SLAM3 only starts building a map once a
+1. Keep the can in the C3's view and hold the ROV facing the room. ORB-SLAM3 only starts building a map once a
    single frame has more than 500 ORB keypoints, and if it does not get past that it **says nothing at all** — you only see an
    empty map. Point it at a textured 1–5 m scene and turn the lights on. When the station log prints
    `slam: tracking — first pose after …`, it has started.

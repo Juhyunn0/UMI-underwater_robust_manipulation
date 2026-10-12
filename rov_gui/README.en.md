@@ -688,7 +688,7 @@ was invisible; with `3D` on, the robot was stuck to the floor. Now `_to_map_z` c
 the error line) keep working unchanged because the offset is common to all.
 `test_the_engaged_marker_keeps_its_map_depth_instead_of_the_tag_plane`.
 
-**The hull marker is only ever written from one place** — `engaged` is the switch (fixed
+**The hull marker is always written from only one place** — `engaged` is the switch (fixed
 2026-08-23).
 
 | Status | Who writes the marker and trajectory | Source of z |
@@ -832,14 +832,14 @@ Verification: 18 tests in `rov_gui/tests/test_rov_shape.py` — the two sign fli
 whether the normals point outward, whether the heading line passes through the COM, extends both
 ways farther than the old optical-axis end and the tail, and turns with yaw, and whether every
 constant has a provenance tag (`test_offline.py` pins the widget side — top-down only the heading
-line, 3-D both, it survives at a zoomed-out level and is absent when yaw is None). To see it by eye:
+line, 3-D both, it survives even at a zoomed-out level and is absent when yaw is None). To see it by eye:
 `rov_gui/tools/policy_observe_smoke.py --shots DIR`.
 
 ### The overlay goes into the recorded video
 
 With `TRACK` on, **the mask, 3-D axes and stage lines are burned as is into the C3 RGB feed
-recording (`REC`).** If you recorded a tracking session and the tracking is not visible, then what
-you recorded was the floor.
+recording (`REC`).** A recording of a tracking session in which the tracking is not visible is a
+recording of the floor.
 
 ```
 POSE TRACKING  13 Hz    solve 210 ms    reg 1
@@ -1272,7 +1272,7 @@ How it was fixed (`perception/upstream.py`, `fstereo._import_upstream`, `session
 stereo import owns the bare name inside a shared lock **only for the duration of the import**, gives
 it back, and then sends its own checkout to the **end** of `sys.path` (`core` has no deferred
 imports, so after that it needs neither the name nor the path — checked with grep). FoundationPose
-is imported first inside the same lock, so that the worker uses the cached module. The tests cover
+is imported up front inside the same lock, so that the worker uses the cached module. The tests cover
 both orders with two fake checkouts
 (`test_the_stereo_import_does_not_keep_foundationposes_utils_name`). **On hardware it has not yet
 been taken as far as registration.**
@@ -1784,8 +1784,8 @@ a 1080p operating screen):
   NED/FRD ↔ z-up/FLU mirror `diag(1,−1,−1)` (the same convention as the reference sampler in pid.py). Verification: 4 tests in
   `test_control.py` (harness surface·pseudo-wrench round trip·observation frame·mode switch·axis cap), `demo_e2e.py rl square`.
   The first hardware test (2026-09-21, `data/20260921/0921_182926`) completed Square 1 m @0.10 m/s for 5 laps with
-  `axis_cap 0.5` (xy error RMS 0.042 m, p95 0.057 m [측정]); the approach segment's maximum of 0.45 m/s was too fast, so it
-  was lowered to `rl.axis_cap 0.3`.
+  `axis_cap 0.5` (xy error RMS 0.042 m, p95 0.057 m [측정]); the approach segment's maximum of 0.45 m/s was too fast, so the
+  cap was lowered to `rl.axis_cap 0.3`.
   **2026-09-27**: a direct-thruster output policy (`action_mode: pwm`, 8 throttles, mixer bypassed) was added to
   RL_controller. The station's transport is only the 4 MANUAL_CONTROL axes, so `HwRl` **refuses such a policy at
   construction** and leaves the reason (it does not force 8 outputs onto 4 axes;
@@ -1810,7 +1810,7 @@ a 1080p operating screen):
   lights·camera·gripper do not follow the thruster pulses), `MOT_1..8_DIRECTION` = the export's `motor_direction`,
   `SCR_ENABLE` 1, `SCR_USER1` 1, `RC_OPTIONS` bit1 0, `RC_OVERRIDE_TIME` > 0, `RC9..16_OPTION` 0, `SYSID_MYGCS` = station
   sysid, script heartbeat `RLPWM` within 2 s, `RLPWM` = 1 within 1 s after the pulses start, MAVLink 2 link, flight mode
-  MANUAL (STABILIZE not allowed). Parameters count **only as values the vehicle reported within 30 s** — while RL_PWM is
+  MANUAL (STABILIZE not allowed). For parameters, **only values the vehicle reported within 30 s** are accepted — while RL_PWM is
   selected, the worker notifies the sink every 1 s (a neutral `PwmCommand`; nothing goes out on the wire) and the sink
   re-reads them every 10 s; a session that has not selected it sends not a single parameter request. If the gate breaks
   mid-stream, the sink **latches** (refuses until the worker's stop command arrives, with the reason in the snapshot) —
@@ -1918,7 +1918,7 @@ block goes into `meta.json`, and **pressing REC also drops `controller.json` int
   `dobmpc/params.py`+`fossen.py` that the controller actually imports.
   * **C and D are state-dependent**, so the matrices are *samples*, and the state they were taken at is
     written alongside in `evaluated_at`. They do not pretend to be constants.
-  * Right before writing, the recorded generating matrices are checked against `fossen`'s product, and the residual
+  * Right before writing, the recorded generated matrices are checked against `fossen`'s product, and the residual
     is kept as `check_max_abs_err` (currently 0.0). The record cannot silently drift away from the model.
 * `controller` — for PID, kp/kd/ki **plus** `omega_derate`, i_max, e_gate,
   yaw_gate, f_max, mz_max, and slew too. For MPC/DOB-MPC, N·horizon·**Q/QN/R**·u_max·
@@ -1931,7 +1931,7 @@ block goes into `meta.json`, and **pressing REC also drops `controller.json` int
 
 Verification status (2026-08-12): `rov_gui/control/smoke.py` — acados in rovgui-pose (numpy 2): SQP-RTI
 build 1.3 s, EAOB+solve p50 3.1 ms/p99 6.4 ms (not in `data/`, console output); 1 lap of square completed
-in the demo closed loop (0 solver failures). **Hardware and underwater are still unverified** — see
+in the demo closed loop (0 solver failures). **Still unverified on hardware and in water** — see
 KNOWN_ISSUES.md. The pool procedure must keep the order P3 (record localization only) → P4 (DP + axis-gain
 step calibration) → P5 (square, mpc) → P6 (dobmpc A/B). **circle after P5** — a crab circle demands sway
 for the whole lap, so it shakes the not-yet-calibrated axis gains harder than square does [예측].
@@ -2078,7 +2078,7 @@ pwm_age_s    age of that report. bus.thrusters is 10 Hz but the CSV is 20 Hz, so
              repeats over two rows, and if the feed dies the last value repeats forever
              (a trap fixed in the panel on 2026-08-07). If the age keeps growing, it is a repeat.
 batt_v/a     pack voltage·current. T200 thrust is a function of voltage even at the same PWM, so a
-             newton value produced without voltage is an estimate. The station keeps the **measured value (µs)** and leaves the curve to the reader.
+             newton value computed without voltage is an estimate. The station keeps the **measured value (µs)** and leaves the curve to the reader.
 ```
 
 `pwm_dev_us` stays as it is (there is code that reads it). Not a single existing column was moved, and runs
@@ -2091,7 +2091,7 @@ as the control tick.
 
 ### The prediction model's drag set to the hardware value — `plant:` (2026-09-08)
 
-After the weights were attached, the vehicle held depth but got only **0.006 m in 54 s** horizontally
+After the ballast weights were attached, the vehicle held depth but got only **0.006 m in 54 s** horizontally
 [측정: `data/20260908/0908_133049/mpc_133049.csv`].
 The cause was not a lack of force but a **threshold**: the solver's plant reckoned that moving at 0.05 m/s
 takes 0.25 N, so it requested only |uX| p50 2.16 N, which is inside the ESC deadband, so the thrust is 0.
@@ -2202,7 +2202,7 @@ and this vehicle is not neutral (the model sinks at −5.7 N; on 2026-09-07 the 
 `vehicle_net_buoyancy_n`), so it starts drifting off according to the day's trim. With attitude and view
 changing, the odds of reacquisition actually **drop**. And the pilot has to ARM again.
 
-**Turning on `imu_dr` does not fix it**, and that is the crux. What `MpcWorker._runtime_fault` consumes is
+**Even turning on `imu_dr` does not fix it**, and that is the crux. What `MpcWorker._runtime_fault` consumes is
 `meas` (the tag solution, deliberately kept as ground truth), not the `meas_ctrl` that the controller
 actually consumes. So whatever the estimator does, the interlock fires all the same. What has to be
 separated is not "tag vs IMU" but **"the estimate dropped out" and "give up on control"**.
@@ -2363,8 +2363,8 @@ hardware), and a vehicle that drifts off changes its view, so the odds of reacqu
 point", whereas follow is structurally a moving mission; (2) **when the tags are lost, the object cannot be seen either**
 — `T_map_obj` is composed from `NavFix`, so without a fix there is nothing to follow in the first place, and
 carrying the vehicle on the IMU while leaving the target unobservable means subtracting two drifting
-quantities; (3) the argument that not switching off is still right is the same. Only the wording in
-`station_bridge.py` changed.
+quantities; (3) the argument that not switching off is still right is the same. In
+`station_bridge.py`, only the wording changed.
 
 `STOP TRAJ` can be pressed during follow too (follow, like station, does not turn on `traj_on`).
 `set_traj(False)` already retargets to `self._eta`, so "stop following, hold right here" comes for free.
@@ -3054,7 +3054,7 @@ estimate runs only outside that range (a regression test guards 12.0 V → 0%).
 ## Two IMUs — and two lines in SENSORS too
 
 `IMU (ROV)` and `IMU (C3)` are **different devices, different clocks, different rates**. Merged into one
-line, you cannot tell which one went quiet, and worse, you cannot tell which one downstream is fusing.
+line, you cannot tell which one went quiet, and worse, you cannot tell which one the downstream is fusing.
 
 | | `IMU (ROV)` | `IMU (C3)` |
 |---|---|---|
@@ -3081,7 +3081,7 @@ line, you cannot tell which one went quiet, and worse, you cannot tell which one
   says **there is no penalty when requested at the same rate** (accel+gyro @200 +
   ROTATION_VECTOR @200 → 194 Hz). What drags it down is the magnetometer, and a rotation vector requested **slower**
   than accel/gyro.
-* The `IMU (C3)` line keeps updating even when the C3 is alive and the ROV is absent. For checking the camera IMU
+* The `IMU (C3)` line keeps updating when the C3 is alive, even if the ROV is absent. For checking the camera IMU
   before a dive, a panel that has to wait until the vehicle answers is useless.
 * The rate cell shows the **rate**. Before, the detail string won, so where `486 Hz` should have been,
   `BNO086` was showing. The only exception is when the detail already contains a rate
@@ -3194,7 +3194,7 @@ time as QGC makes the vehicle shake between the two inputs).
   means losing depth hold and the vehicle drifting, so it is not always safer either. If the motors really
   have to be killed, use the DISARM button next to it (or QGC).
 * While enabled, it sends a 1 Hz HEARTBEAT (because the ArduSub GCS failsafe is the mechanism that stops the
-  vehicle when this station dies). On disable it stops immediately.
+  vehicle when this station dies). On disable, the heartbeat stops immediately.
 * Deadman: if the input is older than `--deadman-ms` (default 500), it **sends neutral**.
   "Not sending" is not a stop command.
 * The MANUAL_CONTROL `z`-axis convention is **stated explicitly** with `--z-convention`. Depending on the ArduSub
@@ -3512,7 +3512,7 @@ Behaviour and decisions (spec v2 A1–A24, outcome of the 5-lens review):
 
 * **Clock (A1)**: `PolicyPlan.obs_t` is on the same monotonic `now()` clock as every `t_capture`.
   The **only** place that converts it to the mission clock is `MpcWorker._tick_policy_intake`, and
-  a live source rejects a plan without `obs_t` before the filter (`require_obs_t`) — this closed
+  for a live source, a plan without `obs_t` is rejected before the filter (`require_obs_t`) — this closed
   the replay-era trap of "if obs_t=None, skip the freshness gate".
 * **TCP-space composition (A2)**: the action is composed in the TCP frame and only the body yaw is
   taken; roll/pitch are discarded (the NMPC levels). The magnitude of the discarded attitude is
@@ -3533,7 +3533,7 @@ Behaviour and decisions (spec v2 A1–A24, outcome of the 5-lens review):
   meta `policy.anchor_mode` and do not pool. **2026-09-14: back to leash** (measured wrote off the
   error every 0.5 s, so the hull could not get past the ESC deadband, `0914_172420`).
 * **Yaw reference filter (2026-09-14, `policy.yaw_ref_filter`)**: why the yaw wobble did not go
-  away however the anchor was chosen came to light from giving yaw steps of 10~26° at the station
+  away however the anchor was chosen came to light from giving yaw steps of 10~26° in station
   without the policy (`data/20260914/0914_190226/mpc_190335`·`mpc_190532`): the NMPC yaw loop is
   **stable but underdamped** (overshoot 45/18 %, ringing period ~1.4–2 s, settling after one or two
   cycles, quiet tail) [측정]. In policy runs, the plans arriving every 0.5 s injected components
@@ -3564,7 +3564,7 @@ Behaviour and decisions (spec v2 A1–A24, outcome of the 5-lens review):
   `_shift_view`: back-project with the training rays → translate → reproject; each sample writes
   2×2 pixels with the nearer point winning, and holes are filled with the farther of the nearest
   measured values above/below/left/right). **Only the observation** changes; the action transform
-  (`tcp_body_flu_m`) stays as it is. A workaround for the peg checkpoint reading the peg held in the
+  (`tcp_body_flu_m`) stays as it is. A temporary workaround for the peg checkpoint reading the peg held in the
   jaw as "after release" and retreating, because the ROV jaw sits about 5 cm further forward along
   the axis than the handheld in the peg demos (peg root 0.254 vs 0.208 m [측정:
   `data/20260930/0930_183320_observe/diag/rig_geometry.json`]). At 0.05 m the dz<0 fraction goes
@@ -3620,12 +3620,12 @@ Behaviour and decisions (spec v2 A1–A24, outcome of the 5-lens review):
   since 2026-09-30 the comparison is **by content, not by path** (`same_fstereo_ckpt`: if both
   exist, the sha1 of the first 8 MiB of each; if the store-side file has been deleted, the
   remaining file against the upstream public release's sha1 `fstereo.UPSTREAM_CKPT_SHA1`) — the
-  stores record copy paths under the deleted `~/Desktop/FoundationStereo/…` or `data collection`,
+  stores record the deleted `~/Desktop/FoundationStereo/…` path or a `data collection` copy path,
   so with a path comparison the same weights read as a different model once the checkout has
   moved. And **in the 2026-09-14~09-30 runs this check did not run at all**:
   `data/checkpoints/*.ckpt` are symlinks into run folders, and `hydra_config_for` did not follow
   the link, so meta `policy.worker.fstereo.training.status` is `no_hydra_config` in all 178
-  non-stub records after 09-14 (245 `ok` before that) [측정: `data/2026*/*/*.meta.json`,
+  non-stub records since 09-14 (245 `ok` before that) [측정: `data/2026*/*/*.meta.json`,
   2026-09-30 tally]. Since 09-30 the link target is resolved first — the iters/scale mismatch
   **warning** reappearing on a default launch is due to this fix and is an intended trade-off
   (`FS_RATE_NOTE`). With the parity setting (16 / 1.0), FoundationStereo runs at 7.26 Hz, solve
@@ -3711,7 +3711,7 @@ cite as measurements**. **Never pool** policy runs with replay or geometric-miss
 **Why the MPC follower did not follow the policy plans — the hold-tail mask (2026-09-07)**: flying policy
 with mpc/mpc_tuned left the vehicle in place (net displacement 0.05–0.4 m/50–90 s; PID 0.2–0.9 m). The
 reference sat consistently 7.5–10 cm ahead of the body, with yaw error ~1° and sign flips 0–0.4/s, so it
-was **not wobble but not pushing**. The 1st-order cause is `hold_tail: mask`: a plan (1 s) is
+was **not wobble but not pushing**. The #1 cause is `hold_tail: mask`: a plan (1 s) is
 already ~0.5 s old when it arrives, so only 0.25–0.4 s of the 3 s NMPC horizon keeps any position weight
 (`hold_frac` p50 0.87–0.92), and under that cost the NMPC's optimal surge is 0.05–0.2 N on a fresh plan
 and 0.6–1.9 N during a blend — below the T200 deadband (axis ≈0.096 ≈ 5.8 N; the knee in this record is
@@ -3758,7 +3758,7 @@ The stitcher itself, `_replay_ref_now`, the divergence guard and the jaw sample 
 the path-frame follower's along weight to the baseline (300) only while a policy plan is installed
 (`HwDobMpc.set_plan_along_scale`, same lifecycle as q_scale: applied at START, restored on STOP·mode
 switch·disengage·reset; meta `controller.plan_along_scale`/`plan_along_scale_flown`, run `extrap_ticks`).
-`q_scale 4` gives the same surge too, but it multiplies x·y·z together by 4×, so sway 1200→4800·heave
+`q_scale 4` gives the same surge too, but it scales x·y·z all by 4×, so sway 1200→4800·heave
 150→600 fight the STAB attitude loop; hence this knob, which touches only surge, was chosen. The evidence
 is an offline closed-loop A/B that ran the actual acados solver, a plant with the measured deadband law
 and the 88 plans of that run [측정: `diag/fwd_C_out.txt`, `fwd_C_harness.py`; reproduction: the flown
@@ -3777,8 +3777,8 @@ Limits: on a 0.04 m/s plan the feedforward is only 2.5 N, so the same setting on
 the effective knee is 0.13 rather than 0.096 (25 µs per thruster, ~190 µs/axis), the 0.085 plan still
 holds 0.042 m/s but the 0.04 plan drops to ~0. The next lever in that case is **`anchor: leash` +
 `anchor_leash_m 0.10`** (allows the error up to 10 cm; harness 0.076 / 0.036 m/s, and 0.075 / 0.035 even
-at knee 0.13) — but it reverses the 2026-09-07 `measured` decision (the knot0 point left the hull; plans
-were composed 10 cm ahead of the pose the policy saw), so it is an operator decision [측정: `diag/fwd_R_leash_knee_out.txt`].
+at knee 0.13) — but it reverses the 2026-09-07 `measured` decision (the knot0 point leaves the hull; plans
+are composed 10 cm ahead of the pose the policy saw), so it is a matter for operator decision [측정: `diag/fwd_R_leash_knee_out.txt`].
 In STAB, heading hold pre-loads T1/T3 at +25/+36 µs and T2/T4 have the opposite sign, so below surge axis
 ~0.16 only one diagonal pair pushes and heading hold has to absorb that yaw torque (not in the 1-D
 harness; the effective threshold in this run appears to be ≥36 µs, as T3 sat at 32–36 µs for 39 s
@@ -4066,8 +4066,8 @@ sampler noise" was an artifact created by the EMA weights. One trap: the 32-wind
 family — that curve's minimum is at epoch 10, but measured with the deployed weights epoch 10 is the
 **worst** of those measured (26.7 mm [측정: `heldout_pos_yaw_width_ep0010_model_stride4.log`]) and
 position is flat from ep100 on (17.2–17.6 mm [측정: same directory `..._ep{0100,0150,0175,0190}_model_stride4.log`],
-within the 219-window noise). The first choice, picked with this curve, turned the whole run upside down.
-Runs with different weights must **never be pooled** with each other (meta `policy.weights` is the
+within the 219-window noise). The first choice, picked with this curve, stood the whole run on its head.
+Runs with different weights must **not be pooled** with each other (meta `policy.weights` is the
 boundary).
 
 Verification: `rov_gui/tests/test_policy_frames.py` (frame algebra + the 5-dim encoder's upstream bit
@@ -4789,7 +4789,7 @@ lossless mono pairs → `replay_foundation_stereo.py`).
 
 **Not there yet**: an **offline tool** that reads `<run>/stereo/` and rebuilds the depth with different
 settings. The format is self-describing (see `regenerate_with` in the meta) and `infer()` in
-`perception/fstereo.py` chains on as is, but the script has not been written yet.
+`perception/fstereo.py` is the chain as is, but the script has not been written yet.
 
 ## Flight modes — arm goes into MANUAL
 
@@ -4920,7 +4920,7 @@ pitch RMS, heave deadband). [Source: a reading of the ArduSub source Sub-4.1/4.5
 
 ## Camera tilt
 
-Tilts the mount of the ROV's default RGB camera up and down. It is **shaped like the gripper**, not like
+Tilts the mount of the ROV's default RGB camera up and down. It follows **the same pattern as the gripper**, not
 the lights: ArduSub handles `mount_tilt_up/down` in the button **repeat** path, so the mount keeps moving
 for as long as the bit is set (unlike the lights' "one step per press"). Hence press-and-hold buttons and
 the `,` / `/` keys, plus `LEVEL` (`.`, `mount_center`), which returns to level with a single press.
@@ -5107,7 +5107,7 @@ data/20260814/0814_184148/
   shared run id would take a handshake, and a handshake has a failure mode where "one writer misses it
   and its file silently lands somewhere else".
 * **What changed when seconds were added**: with minute buckets the three writers each *computed*
-  `1841`, and the join window existed only for the one run that straddled a minute boundary. At second
+  `1841`, and the join window existed only for the case of a run that straddled a minute boundary. At second
   resolution :48, :49 and :51 make different names, so `run_dir()` no longer computes; it **looks for the
   run in progress in today's folder and joins it**, and creates a new one only when there is none. The
   filesystem is still the only state and there is still no handshake, but **`JOIN_WINDOW_S` (90 s) now
@@ -5326,7 +5326,7 @@ On screen:
 
 * A **red `LEAK DETECTED` banner** appears in the header and blinks. Why blinking rather than steady:
   the header already has an orange banner and four coloured pills, so a steady red is just one more
-  colour, and what grabs an eye that is watching video is **motion** (the only cue that also survives
+  colour, and what grabs an eye that is watching video is **motion** (the only cue that survives even
   colour-vision deficiency).
 * The **`Leak` row** in SENSORS (moved to the top — if a row that means "abort the dive" can only be
   seen by scrolling, nobody looks at it), and below it the **`Enclosure` row** (internal pressure, hPa).
@@ -5503,7 +5503,7 @@ Live policy (`--policy`) has five files + tools (the policy section above):
 P=~/miniforge3/envs/rovgui-pose/bin/python
 QT_QPA_PLATFORM=offscreen $P rov_gui/tests/test_policy_frames.py    # 22 tests, also runs under robust
 QT_QPA_PLATFORM=offscreen $P rov_gui/tests/test_policy_obs.py       # 9 tests
-QT_QPA_PLATFORM=offscreen $P rov_gui/tests/test_dp_policy.py        # 17 tests, half of them on the stub if there is no GPU
+QT_QPA_PLATFORM=offscreen $P rov_gui/tests/test_dp_policy.py        # 17 tests, only the stub half if there is no GPU
 QT_QPA_PLATFORM=offscreen $P rov_gui/tests/test_policy.py           # 79 tests, the MpcWorker side (real acados; includes LOW None · ckpt pin)
 QT_QPA_PLATFORM=offscreen $P rov_gui/tests/test_policy_worker.py    # 28 tests, no torch (includes set_ckpt · parser)
 $P rov_gui/tests/test_policy_ckpt_paths.py                           # 4 tests, ckpt paths + max_run_s single source
@@ -5544,7 +5544,7 @@ qt.qpa.plugin: Could not load the Qt platform plugin "xcb" in "..." even though 
 ```
 
 1. **cv2 hijacks `QT_QPA_PLATFORM_PLUGIN_PATH`.** `cv2/config-3.py` overwrites this variable at
-   import time with cv2's own Qt5 plugin directory, **unconditionally**. That folder has exactly one
+   import time with cv2's own Qt5 plugin directory, **unconditionally**. That folder holds only one file,
    `platforms/libqxcb.so`, built for cv2's Qt, so it does not load into PyQt5's Qt. On the hw path this
    happens *before* the QApplication is created, because **preflight's `check_python_env` imports cv2 to
    read its version**.

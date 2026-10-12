@@ -422,7 +422,7 @@
   1010_interlock_replay_offline/report.txt` (first draft 60/120/1.0 s, null 80·100·120 compared), `report_sensitivity_rate40_null05s.txt`,
   **`report_shipped_v2.txt` (shipped v2)**). **First-draft results [측정: report.txt]**: mixer mode, 91 files, 0 trips; of the 14 pwm
   engagements, 12 trip with null 120 — 10-01 cap-0.25 pwm10_s1, all 5 engagements on **pinned** (+0.96..+2.89 s; at rate 24–38 deg/s rate does
-  not fire, and at a squeeze of 95–100 µs null is **not caught** at 100 or at 120), 10-03 cap-1.0 pwm10_s1, 3 engagements: tilt at
+  not fire, and at a squeeze of 95–100 µs null does **not catch** them at 100 or at 120), 10-03 cap-1.0 pwm10_s1, 3 engagements: tilt at
   +1.00/+1.25 s and **1 with no trip** (180854, a 1.3 s run: rate 62 deg/s does not last the 0.15 s, null 139 µs does not last the 1 s),
   att7pwm, 6 engagements: null +0.95 s ×5 and **1 with no trip** (212239, a 1.6 s run: null 297 µs drops out for one tick after 0.95 s) — the
   expectation "within ~0.5 s via rate or null" [예측] does not hold with the first draft (the 1.0 s debounce dominates). **Shipped v2 results
@@ -527,7 +527,7 @@
 - **In passing**: in the same records, plans whose observation frame-pair interval is 66.7 ms and plans where it is 133 ms are half and half (rl run 234 : 182) — the same problem as the 2026-09-02 "depth pair" entry below.
   `--policy-fs-schedule only` and `--fstereo-scale 0.5` gave 100 % consecutive frame pairs in the offline worker bench (free 82.5 %) [측정: `rov_gui/tools/fstereo_bench_out/policy_fs_schedule_20261001_115008.json`].
 - **How to fix**: reduce the age — the switch in the entry right above (implemented, OFF by default, unverified in water; bench plan age p50 328.8 → 134.5–224.6 ms). Other options: reduce `period_s` to
-  about 0.35 s [예측: the GPU is shared with FS, so the age may grow, untested], continue the extrapolation after expiry (code), or retrain with a longer action horizon (not applied).
+  about 0.35 s [예측: the GPU is shared with FS, so the age may grow, untested], continue the extrapolation even after expiry (code), or retrain with a longer action horizon (not applied).
 
 ### Even when the policy outputs "open gripper", the station does not open it — turning it on also carries a misfire risk (2026-09-30)
 - **Fact**: on 2026-09-30 `policy.gripper: false`, so the width channel was discarded (true from 10-01, lookahead 0.8 — first policy OPEN executed in the 10-01 15:19 rl run,
@@ -585,7 +585,7 @@
   (whether it was moved by hand or dropped off on its own at stream start is unknown).
 - **Cause (partial)**: the module that crashed is not the stock kernel driver but the patched uvcvideo of `librealsense2-dkms` 1.3.28
   (`/lib/modules/6.8.0-138-generic/updates/dkms/uvcvideo.ko`, version `1.1.1-realsense-1.3.28`). In the race between the disconnect and STREAMON,
-  the thread that died appears to have vanished while holding the controller's bandwidth lock [유도: D-state wchan]. Whether the stock uvcvideo has the same race
+  the thread that died appears to have vanished while holding the controller's bandwidth lock [유도: D-state wchan]. Whether the stock uvcvideo also has the same race
   is unconfirmed. This repo's code does not use RealSense, but librealsense2·pyrealsense2 are installed on the system (possibly for another project).
 - **Impact on the station**: none — the cameras are a child process, so only that process hung, and the window shut down normally after the `stop()`
   timeout. Had it been the same process, the station itself would have become unkillable.
@@ -691,7 +691,7 @@
   The rise was not "against thrust" but a drift with thrust 0 + B−W ≈ +0.1 N, and the same day's MANUAL runs, with the same sub-deadband commands, floated at
   scattered rates of −0.006~+0.029 m/s (cannot be attributed to buoyancy, trim or the policy).
 - **Cause**: with anchor measured + 1 s plans (0.5 s stale on arrival) the reference is re-anchored to the measured pose every 0.5 s → the tracking error stays bound to the plan displacement (xy p50 3 cm, z ≤10 cm),
-  and with follower stiffness uX ≈ 35.6 N/m·e, uZ ≈ 64.9 N/m·e, reaching the 5.8~7.5 N threshold needs an xy error of 0.15~0.2 m, so it is never crossed. hold_tail track
+  and with follower stiffness uX ≈ 35.6 N/m·e, uZ ≈ 64.9 N/m·e, reaching the 5.8~7.5 N threshold needs an xy error of 0.15~0.2 m, so it can never be crossed. hold_tail track
   only raised |uX| in the plan segment from 0.05→1.21 N (1/4 of the deadband). In STAB the attitude loop wakes only the vertical thrusters, to 34~37 µs, so the rise is smaller (horizontally it still drifts).
 - **2026-09-08 action taken (half)**: raised the prediction model's horizontal drag to the hardware value — `hw_mpc.yaml`
   `plant.linear_damping [86.7, 133.8, ...]` (= `axis_gain/0.692`, 21.5× the model). At a 0.05 m/s reference with error 0,
@@ -784,12 +784,12 @@
   [유도], and the marker's hull is drawn ~9 cm behind where it actually is (the jaw is right). The sim GRIP_POS/JAW_POS are roughly right under (a') and,
   under (a), 8.5 cm behind the lens-anchored jaw — the plant composition was not touched.
 - **Why it was not changed / Workaround**: this value is the records boundary for every recorded position (hw_nav.yaml comment), and the circumstantial evidence above is all
-  indirect. Only the jaw/TCP was anchored to the lens (that is all). When citing absolute positions at the cm level, cite this entry alongside.
+  indirect. Only the jaw/TCP was anchored to the lens (done). When citing absolute positions at the cm level, cite this entry alongside.
 - **Proper fix**: two tape-measure readings on the vehicle — (1) frame front end (dome apex) → C3 lens: under the current value the lens is ~7.5 cm **ahead** of the dome
   apex, under (a') at the dome apex ±2 cm; (2) C3 lens → gripper palm. If it is changed, in the same commit
   re-derive `policy.tcp_body_flu_m = cam_t_flu + [0.196, 0, −0.275]` (or set `tcp_offset_cam_m` so that the lens position
   cancels out), and meta `hardware.cam_t_flu` records the boundary.
-- **2026-09-09 CAD re-export evidence (on the (a') side)**: the user's Onshape document "BlueROV2", tab "mujoco" (with the camera, upper mount and Newton
+- **2026-09-09 CAD re-export circumstantial evidence (on the (a') side)**: the user's Onshape document "BlueROV2", tab "mujoco" (with the camera, upper mount and Newton
   gripper), was re-exported with onshape-to-robot and placed in base_link with the July (07) registration (R0, C_ASM; the hull part poses are byte-identical to July (07))
   [유도: assets/CAD files/onshape_export_20260909/payload_frames_20260909.json; the script uses
   the same registration constants (tools/process_c3_mesh.py)]. What the CAD says: **lens-face centre [0.194, 0.006, +0.133]**, optical axis 40.0° down,
@@ -811,7 +811,7 @@
 ### The policy's yaw response is **one-sided** — an error to the right can never be corrected (2026-09-08)
 - **Symptom**: the knot-15 dyaw measured while moving the can left and right responds at **+0.15~0.25°/° on the left** of the aim point
   but dies to **+0.02~0.05°/° on the right**. A flat region with |dyaw| ≤ 1° runs from +8° to at least +20°.
-  Running the same sweep on **training images** gives the same shape (left +0.146, right +0.020), so it is not the hardware images' fault but
+  Even running the same sweep on **training images** gives the same shape (left +0.146, right +0.020), so it is not the hardware images' fault but
   **a property of the policy** [측정: `.../diag/q1_sweep1_out.txt`, `q1_sweep_train_out.txt`].
 - **An added constant**: at bearing 0° (nose aligned) the demonstration labels themselves are −1.85~−2.17°/plan left (because the demonstrator's fingertip being 3.55 cm right
   of the lens = +4.1° is the labels' zero), the policy on training images gives −2.32°, and **on hardware images −3.7~−4.97°**
@@ -1191,7 +1191,7 @@
   margin, but there is no near junk, 0.016 vs 0.015). As a secondary option, consider alpha 0.2~0.3 [유도: coverage 99.1~99.6 %, margin 0.31~0.74 %],
   but the network d≤0 of 3.06 % from the alpha 0 days (`fstereo_bench_out/hardware_20260902_fill.txt`) may come back (not modelled).
   Precondition: **record K_right/D_right/R2** in the run meta `fstereo.rig` (`hardware.py:708-715` writes only the left side) — without them, all
-  offline verification is [유도]. A range-limit cut (E) is not the answer (precedent: it erased the 15 cm gripper, `fstereo.py:107-119`). Without
+  offline verification is [유도]. A range-limit cut (E) is not the answer (precedent: it erased the gripper at 15 cm, `fstereo.py:107-119`). Without
   `--record-stereo`, no BORDER_REPLICATE / pre-network crop A/B is possible.
 
 
@@ -1367,7 +1367,7 @@
   - `follow_ff_max_m_s 0.30` actually saturates at about 0.15 m/s.
   - The `predict()` extrapolation is off.
   - The threshold 'demote to STATION if the object speed exceeds 3×cap for 1 s' is off.
-  The FF noise grows even on a stationary object. The FF published during the 0824 stationary segment was p90 0.062–0.110 m/s
+  The FF noise grows even on a stationary object. The FF published during the 0824 stationary segments was p90 0.062–0.110 m/s
   [computed in review, not saved: `data/20260824/0824_105751/mpc_*.csv`].
 - **Workaround**: follow has had 0 water runs since 08-24 and `--pose` does not load either, so there is no harm right now. Fix it after the
   restore, before flying follow.
@@ -1430,7 +1430,7 @@
   the map itself is not contaminated.)
 - **Proper fix**: after fixing the anchor at 25 (the entry below), refit on a trajectory that moves **≥3 m on all 3 axes**,
   and trust a uniform scale only when the per-axis stretches converge to isotropic. Before that,
-  separate the two suspects for the anisotropy one at a time — `SCALE_MM_PER_UNIT` X=8.25 mm/unit
+  test each of the two suspects for the anisotropy separately — `SCALE_MM_PER_UNIT` X=8.25 mm/unit
   (`src/gantry_runner.py` confesses it was "copied verbatim from whisker_dragging.py") with
   a 1 m commanded move + a tape measure, and `fx/fy = 1.0411` (with square pixels it should be 1.000) with
   a recalibration using more frames. The translation comes out by reading the card and the encoders at the same instant and
@@ -1487,15 +1487,15 @@
   disengage on leaving the box mid-run. `geofence_ned`·`geofence_frame` in `hw_nav.yaml` are no longer
   read, and the `geofence_ok` column of the MPC CSV is gone too.
 - **What was lost**: now **nothing at all stops the vehicle because of its position.** A line that goes
-  9 m outside the pool still arms as is, and if the vehicle is pushed toward a wall mid-run, the controller keeps
+  9 m outside the pool still arms as is, and even if the vehicle is pushed toward a wall mid-run, the controller keeps
   going. **The circle (2026-08-17) is the shape that goes farthest from the entered tag** —
   the centre is R from the tag and the opposite rim 2R (1.0 m at the deployed radius of 0.5 m), so if you set the vehicle next to the tag
   and press START, it travels to a point 1 m away. Other than a person checking the placement,
   there is still no means of preventing this. The remaining protections are E-STOP (Esc · header · MPC panel) · DISENG · sink deadman (500 ms) ·
   the engage gate (ARMED / MANUAL / fresh tag fix · telemetry) · disarm mid-run ·
   telemetry stopping · leaving the mode · automatic release on tag dropout · axis authority cap.
-- **Workaround**: in pool runs, **a person checks the path when placing it**, and the pilot
-  keeps a hand on E-STOP. The solid `POOL` line on the plot still draws the walls, but
+- **Workaround**: in pool runs, **a person must check the path when placing it**, and the pilot
+  must keep a hand on E-STOP. The solid `POOL` line on the plot still draws the walls, but
   **it is only a drawing and enforces nothing**.
 - **Proper fix**: if it is needed again, rather than reviving the fence, it is better to **clamp the reference**
   instead of refusing (`geofence_clamp` existed for that purpose) — that keeps the setpoint from crossing the wall
@@ -1556,7 +1556,7 @@
 
 ### **Relaunching the station within 90 s** joins the same run folder, and `--record-stereo`/`--record-depth` recordings **overwrite the previous run's** (2026-10-12)
 - **Symptom**: `runstore.run_dir` joins a folder of the same kind if that folder started within `JOIN_WINDOW_S` 90 s
-  (`rov_gui/runstore.py:144`). But after opening the folder, the recorder opens `index.csv` **with `"w"`** and rewrites frame numbers from 0
+  (`rov_gui/runstore.py:144`). But after opening the folder, the recorder opens `index.csv` **with `"w"`** and starts frame numbering from 0 again
   (`rov_gui/perception/frame_record.py:320`, shared by StereoRecorder · the depth recorder). So if you change a flag and relaunch right away
   (exactly what a `--policy-fs-schedule`/`--fstereo-process` A/B does), the new run's recording overwrites the previous run's `index.csv`·`000000.png…`·`meta.json`.
   `mission_log.txt` is also replaced by the new session's log (`window.py` session log). The 2026-10-12 review critic reproduced it in scratch by running StereoRecorder twice
@@ -1653,7 +1653,7 @@
   (2) wall-clock dependence — `engage refused: imu stale (0.44s)`. The latter depends on the wall-clock time the previous file
   consumed, so if unrelated code shifts by just a few ms, fail/pass flips.
 - **Confirmed it is not caused by my change**: on 2026-09-06, with all 4 `--record-depth`-related files reverted,
-  running the same command still **fails the same 23** (23 in the reverted state, 24 before reverting — the extra
+  running the same command, **23 still fail** (23 in the reverted state, 24 before reverting — the extra
   1 is the imu-stale timing case of (2) above).
 - **Workaround**: judge the policy tests by running the file on its own. Do not use the full suite's failure count as a regression
   signal.
@@ -1776,7 +1776,7 @@
   `[측정: c3_camera/datasets/*/depth/, recordings/*/depth/ — exhaustive, 47,270 frames,
   floor exactly 300/150 mm, 0 pixels below it]`. The in-air physical distance of ≈225 mm is still
   `[유도: substitute fx_air = fx_water/1.333. 미실측 — depth_accuracy/rungs.csv absent,
-  a tape-measure check has never been run]`.
+  tape-measure verification has never been run]`.
 - **Proper fix**: (a) correct the wording in the 5 places above to the facts and, in `calibration.json`, state
   `medium: "water"` + the evidence; (b) when the camera is back on the network, read the EEPROM metadata
   (`batchTime`/`boardCustom`/`productName` from `getEepromData()`) to nail down the provenance;
@@ -1886,8 +1886,8 @@
   the estimate itself is not contaminated).
 - **2026-07-23 update**: EAOB innovation gating was **implemented, but after measurement it was decided to be OFF by default**
   (`params.EAOB_GATE_ON=False`; the mechanism · `n_gated` counter · meta records are kept) — in a square
-  seed-0 A/B (at tau_dist=0.5), the χ²(0.999,18) gate — of the frames that constantly violate w_dot=0 in waves/corners —
-  rejected 25–76%, blocking wave tracking itself (CDW radRMS 4.5→15.5 cm, CD 1.35→1.43 cm);  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
+  seed-0 A/B (at tau_dist=0.5), the χ²(0.999,18) gate rejected 25–76% of the frames carrying the ever-present w_dot=0
+  violation of waves/corners, blocking wave tracking itself (CDW radRMS 4.5→15.5 cm, CD 1.35→1.43 cm);  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
   the vicious cycle of rejection in turn growing the innovation contaminated the NIS statistics too (137 vs gate-off 25). At the final default  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
   tau_dist=0.2, the gate does not fire at all in the same scenario (0/1067). The consistency gate is  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
   structurally incompatible with the wave-band model violation → spike defence still has to be handled by a single per-axis
@@ -1932,7 +1932,7 @@
 - **Symptom**: all remaining variants are rank-6 (NU=6), so the NU=4 branch in `dobmpc/params.py` and
   the option-(b) surge→pitch coupling path in `mpc.py`/`mpc_acados.py` have become dead code.
 - **Workaround**: harmless (never reached) — no functional impact.
-- **To fix properly**: per the user's instruction, simplify everything in one batch **later** (NU=6 fixed). Together with the test_dobmpc
+- **To fix properly**: per the user's instruction, simplify everything in one batch **later** (fixed at NU=6). Together with the test_dobmpc
   rewrite.
 - **2026-07-22 update**: **mpc.py cleanup done** — tau if/else removed (`tau = u`), the pitch bound's
   PITCH_AWARE ternary → fixed at 1.2 (behaviour identical, since PITCH_AWARE=False), stale comments/docstring corrected
@@ -2023,7 +2023,7 @@
   89–99% in CW/CDW (run failure rate **mpc 14.0% vs dobmpc 7.7%** — the EAOB FF, if anything,
   stabilizes the OCP). In failed runs, coupled extreme depth/pitch excursions — mpc up to 181.8 cm (pitch up to
   79.5°), dobmpc up to 134.7 cm (|pz| 97 cm). **dobmpc radial_max>40 cm: 23/23 are fail runs**
-  (clean-run upper bound 37.8 cm) → this class dominates the worst-case statistics. The trigger is the seed-0 shared
+  (clean-run maximum 37.8 cm) → this class dominates the worst-case statistics. The trigger is the seed-0 shared
   wave group's lap-7/8 V3 turn event, and the failure is an amplifier (not the cause; only a run-level association can be confirmed).
 - **Workaround**: in analysis, treat the radial_max of `n_fail>0` runs separately (the RMS tally is robust:
   excluding them shifts the mean by only −3~−8%).
@@ -2371,7 +2371,7 @@ and verified **only with saved data and the demo**. The C3 was not on the networ
   rotation+delay recovery), demo-backend closed loop (injected bias comes back as predicted,
   both shadow/control), offline re-estimation round trip.
 - **Not tried**: real BNO086 samples, the real mounting rotation (calibration not run →
-  shows up as `calibration_sha1: null`), underwater, and **actually driving the vehicle in closed loop**.
+  shows up as `calibration_sha1: null`), in water, and **actually driving the vehicle in closed loop**.
 - **Most dangerous item**: with `--imu-dr control` the controller **actively drives** the vehicle toward a
   drifting estimate. There is no geofence (entry above), so the only means of stopping it for position reasons
   is the pilot's E-STOP — by operator decision, the automatic abort is off
@@ -2491,7 +2491,7 @@ and verified **only with saved data and the demo**. The C3 was not on the networ
 - **Resolution path**: Read them by resolving through `moves[]` (from→to) in `data/MIGRATION_20260914.json`. The reason the records are not
   rewritten is the same as the measurement-citation rule — records must stay as they were at the time.
 - For the same reason, citations of folders that were already gone at migration time, such as `sessions/demonstration_0015/0019`,
-  `sessions/grippercalibration_0004`, `sessions/session_syn` (`configs/pipeline*.yaml`, `umi_handheld/extract_gripper_width.py`, journal),
+  `sessions/grippercalibration_0004`, `sessions/session_syn` (in `configs/pipeline*.yaml`, `umi_handheld/extract_gripper_width.py`, journal),
   were left as they are — they were dead references from the start, and where they went has not been confirmed.
 
 ### The z ruler in `replay-html` has diverged from the live panel (2026-09-07)
@@ -2535,7 +2535,7 @@ and verified **only with saved data and the demo**. The C3 was not on the networ
   `rov_gui/tools/calibrate_second_cam.py --yaml` → paste into `second_cam` →
   restore the gate. **Done 2026-09-08**: from `nav_111010` (RGB 3,463 frames), fx 713.8 + 5 distortion
   terms, lens position·tilt 15.9° measured → entered into `second_cam`; in the reproduction, RGB acceptance 43.5% → 100%,
-  offset between the two solvers 2 mm. The gate is 4.0 (2× the RGB pixel pitch [유도]). Remaining: 1 and 3 below.
+  offset between the two solvers 2 mm. The gate is 4.0 (the RGB pixel pitch is 2× the C3's [유도]). Remaining: 1 and 3 below.
 - **What needs checking on hardware**:
   1. `second_cam.tilt_rate_deg_s: 30` **[예측]** — never measured even once. Press and hold the mount from
      LEVEL to DOWN for 2 s and read PAYLOAD's `measured:tags` value; that by itself is a
@@ -2567,7 +2567,7 @@ and verified **only with saved data and the demo**. The C3 was not on the networ
   release. Properly: a jaw-specific arbitration in the sink (pilot priority + a window that ignores worker emissions)
   — before using `replay.gripper: true` / `policy.gripper: true` routinely.
   (Since 2026-09-02 every drive is also integrated into the open-loop width estimator in `MpcWorker.on_gripper_drive`,
-  so once arbitration exists, the estimator must be fed from the same place.)
+  so once arbitration exists, the estimator must also be fed from the same place.)
 
 ### Live diffusion policy (shape `policy`): TCP/jaw geometry — **only x measured**, y·z not measured (2026-09-02, updated 2026-09-08)
 - **Status**: The `--policy` stack has been running in the pool since 2026-09-07 (data/20260907/0907_145206
@@ -2596,7 +2596,7 @@ and verified **only with saved data and the demo**. The C3 was not on the networ
 ### policy: device depth is **refused**, FoundationStereo is the only parity path (2026-09-02)
 - Without `--fstereo`, `--source hw --policy` **refuses** to start (a missing `--mpc` is
   only a warning, and the refusal is decided before the warning). The C3's own depth is CAM_A-aligned (63.7°
-  FOV), so it covers only the part that falls inside the policy FOV (CAM_B 85.6°) [유도: FOV comparison, area ratio
+  FOV), so it covers only part of the policy FOV (CAM_B 85.6°) [유도: FOV comparison, area ratio
   not computed], and it is an on-device matcher with the ×0.64 stopgap applied. `--policy-allow-device-depth` is
   for bench experiments; along with a warning, `depth_scale_applied: 0.64` and the coverage are left in meta.
 - `--fstereo` also warns if it differs from the training store's settings (iters 16 / scale 1.0 [측정: `~/Desktop/data
@@ -2640,7 +2640,7 @@ and verified **only with saved data and the demo**. The C3 was not on the networ
 
 ### policy: validation error is ~36 mm RMS — not enough for precise grasping (2026-09-02)
 - Position RMS ~36 mm, [유도] from the val action pos MSE in selected.json. Relative to the 62 mm jaw [스펙],
-  the margin is thin. The expectation for the first pool run extends to "the policy pushes the vehicle in a mostly
+  the margin is thin. The expectation for the first pool run goes only as far as "the policy pushes the vehicle in a mostly
   right direction"; grasp success rate is a matter for after more demonstrations and retraining.
 
 ### policy/fstereo: **2 native crashes** when three model loads overlap — cause unattributed, mitigated by serialization (2026-09-02)
@@ -2730,7 +2730,7 @@ was also disconnected. The code has been verified only with the demo backend and
    (`test_arm_puts_the_vehicle_in_manual_first`).
    - **How to check**: After ARM, whether the teleop `MANUAL` button lights up (= the vehicle reports MANUAL
      via HEARTBEAT), and whether the thrusters sit still at 1500 µs when armed + input 0. Only when `STAB` is
-     pressed should it start moving. If ArduSub refuses a switch while armed, it shows up as the button
+     pressed should they start moving. If ArduSub refuses a switch while armed, it shows up as the button
      highlight not changing (because it draws the vehicle's report, not the request).
 3. **The video-default combination is [유도].** `컬러 640×360 q80 @30 + depth 640×360 @20` ("colour 640×360 q80 @30 + depth 640×360 @20") =
    83.1 Mb/s (92%). The components are all measured (depth formula + re-encoding the C3's own frames), but
@@ -2879,7 +2879,7 @@ was also disconnected. The code has been verified only with the demo backend and
   station's lens-anchored jaw became 0.502 ahead of the COM (`rov_shape.JAW_CENTRE_M`, `policy.tcp_body_flu_m`; the tube moved by the same
   +0.0855). The sim's GRIP_POS 0.25 / JAW_POS 0.4165 is **8.5 cm behind** that if `cam_t_flu` is right, and
   **roughly right** if `cam_t_flu` is wrong by ~9 cm toward the front (entry "The x/z of the C3 extrinsic cam_t_flu are suspected"). The
-  plant composition (composite COM/inertia) was not touched — an 8.5 cm shift moves the composite COM on the order of a few mm [예측,
+  plant composition (composite COM/inertia) was not touched — an 8.5 cm shift would move the composite COM on the order of a few mm [예측,
   not computed]. Once a tape-measure measurement settles the attribution, update GRIP_POS/JAW_POS at that point.
 
 ### The direction sweep shares one seed-0 wave realization — the worst-vertex statistics are a single-realization artifact
@@ -2898,7 +2898,7 @@ was also disconnected. The code has been verified only with the demo backend and
   (|hilbert| corr ≈ 0.995), and the observation above (the same wave-group hits the same vertex) remains
   valid. When citing, do not write "the waves repeat".
 - Found 2026-07-19 (during C3 position registration): skin bbox = vendor dimensions × 1.0233 (uniform on all three axes).
-- The C3/payload placement is based on **measured metric** (COM anchor), so the dynamics·camera are exact, but
+- The C3/payload placement is based on **measured metric** (COM anchor), so the dynamics·camera are accurate, but
   in the render the payload may look ~3–5 mm off relative to the skin (cosmetic).
 
 ### 4 stale/wrong citations from the DP frame audit ((2)(5)(6)(7)) + a 43.4 mm COM gap (2026-09-03; (1) resolved 2026-09-08)

@@ -282,8 +282,8 @@ v_ref    = (1-w)·v_old + w·v_new + w_dot·(p_new − p_old)   ← cross term r
   Exception: while |r−x_meas| is saturated beyond the leash (0.10 m), anchor at the leash edge
   (in the 0818 run, leash saturation = 83.6 % of engaged ticks — path_cost.py header,
   data/20260818/0818_143802/mpc_143938.csv).
-  - **2026-09-07 trial switch [decision: operator]**: `policy.anchor: measured` (both hw_mpc/land_dp). Over 4,048
-    hardware plans on 0907 the leash was 94 % saturated (always 5 cm ahead), and the operator decided to accept the reset
+  - **2026-09-07 trial switch [decision: operator]**: `policy.anchor: measured` (both hw_mpc/land_dp). Of the 4,048
+    hardware plans on 0907, 94 % had the leash saturated (always 5 cm ahead), and the operator decided to accept the reset
     cost above and observe the "actual-position anchor" first. If it does not work after observing, revert to leash.
     Records boundary = meta `policy.anchor_mode`.
 - ACT-style temporal ensembling rejected — with diffusion's multimodal outputs it averages across modes
@@ -354,7 +354,7 @@ v_ref    = (1-w)·v_old + w·v_new + w_dot·(p_new − p_old)   ← cross term r
 1. **Handheld↔ROV domain gap** — obs: in-air OAK depth (warp correction) vs underwater C3 depth
    (×0.64 stopgap, distance-dependent residual); viewpoint distribution (hand vs mount); dynamics: handheld trajectories
    do not know the ROV authority (actually delivered ~1/11, memory: sim-vs-hw-square-corner) → the filter's speed
-   clamp/reprofile + M0 as the 1st verification.
+   clamp/reprofile + M0 are the 1st-pass verification.
 2. **Open-loop gripper in the grasp phase** — no feedback at all + interaction between tracking error and the g threshold
    (the kind where the vehicle is 5 cm short but g flips to close) → verify timing in M0, hysteresis on the
    threshold, an option to disable the gripper in early hardware runs.

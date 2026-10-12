@@ -648,7 +648,7 @@ $V c3_camera/c3_encode_quality.py \
   not the codec's. Move to a wall with more texture and recapture.
 * **`SCENE WAS NOT STATIC (or the sensor is very noisy)`** → the rig moved, or
   the gain is too high. The 0.7 threshold is uncalibrated, so even on a static rig, 12 DN of sensor noise  [UNVERIFIED: 예시/유도값 — docs/MEASUREMENT_AUDIT.md]
-  drops it as low as 0.682 and a false alarm fires. Check the mount, then look at gain/exposure.
+  drops the value as low as 0.682 and a false alarm fires. Check the mount, then look at gain/exposure.
 * **`extraction_ok = 0`** → the h26x stream cannot be read back. However good the quality numbers are,
   it is disqualified.
 * **Rows at the top bitrates (8000-16000 kbps) bunch together and cannot be told apart** → you are reading the

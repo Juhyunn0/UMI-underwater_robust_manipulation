@@ -237,7 +237,7 @@ cd ~/IsaacLab
 |---|---|---|
 | `observation_space` / `action_space` / `state_space` declared explicitly | ✅ Applied | `warpauv_env.py:70-72` — Box(17), Box(6, ±1), Box(17) |
 | `articulation_enabled=False` (assets) | ✅ Applied | `assets/warpauv.py:17-19` (inside RigidObjectCfg) |
-| Synthesis | **fully-applied** | No further work needed |
+| Overall | **fully-applied** | No further work needed |
 
 > However, on 5.0 (Route A) an additional 4.5→5.0 migration may be needed → use the step-7 1-iter smoke test
 > to check for import/API errors first. On errors, see the IsaacLab 5.0 migration notes.

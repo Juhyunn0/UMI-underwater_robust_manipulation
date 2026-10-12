@@ -68,7 +68,7 @@ The last line of `./c3 env`, `numpy elide`, is that diagnostic, and the old envi
 The venv was not deleted. It can be used any time with `C3_PY=~/.venvs/c3-depthai/bin/python ./c3 ...`.
 
 `viz.py` automatically fixes the preview window (`cv2.imshow`) not appearing in the conda environment —
-cv2 overwrites its own Qt plugin path at import time, and in `robust` that directory has been switched
+cv2 overwrites the Qt plugin path with its own at import time, and in `robust` that directory has been switched
 off as `plugins.disabled`, which is what causes it.
 
 ### ⚠ Why it must not just be run in conda base (important)
@@ -451,7 +451,7 @@ and this network**. If the cable, switch or optical link changes, just measure a
 - **depth latency > colour latency** (82 vs 38 ms) is normal. Stereo computation is involved,
   and the frame is also 3.5× larger.
 - **Colour/depth skew about 66 ms** (≈ 1 frame). Colour and the mono pair are not hardware-synchronized,
-  so they can drift apart by up to one frame interval. If registration matters,
+  so the gap between them reaches up to one frame interval. If registration matters,
   use `--pair-mode timestamp` (at the cost of waiting up to one frame).
 - **In an in-air indoor test, depth valid was ≈ 21%.** That was due to textureless walls/backlighting,  [UNVERIFIED: 산출물 없음 — docs/MEASUREMENT_AUDIT.md]
   and in water it is different again. The HUD's `depth valid %` keeps showing this.
@@ -589,7 +589,7 @@ for r in rows:
 depth value is off by 257×.
 
 `t_device` is a monotonic clock, so it loses its absolute-time meaning once the process ends. That is
-why the offset is stored alongside it under `clock` in `meta.json`:
+why the offset is also stored, under `clock` in `meta.json`:
 `절대시각 = t_device - dai_now_s + time_time_s` ("absolute time = t_device - dai_now_s + time_time_s").
 
 ## Using RGB-D in code
@@ -682,7 +682,7 @@ tree holds up when the link stalls once is decided right here.
 <!-- MEASUREMENT AUDIT (2026-08-04): the following numbers appear inside code
      blocks above and could not be annotated inline without corrupting them. -->
 
-> **[UNVERIFIED]** The figures on the line below were classified as unverified by the provenance audit — details in [docs/MEASUREMENT_AUDIT.md](docs/MEASUREMENT_AUDIT.md).
+> **[UNVERIFIED]** The figures on the lines below were classified as unverified by the provenance audit — details in [docs/MEASUREMENT_AUDIT.md](docs/MEASUREMENT_AUDIT.md).
 >
 > - `c3_camera/README.md:306` — 예시/유도값 — `컬러 지연 ≈ 30 ms          (고정: 센서 readout + ISP + 인코딩)` ("colour latency ≈ 30 ms (fixed: sensor readout + ISP + encoding)")
 > - `c3_camera/README.md:405` — 산출물 없음 — `--color-encode mjpeg | none        기본 mjpeg (실측 약 1/6). none은 무손실 대신 약 9 fps` ("--color-encode mjpeg | none — default mjpeg (measured about 1/6); none is lossless but about 9 fps")

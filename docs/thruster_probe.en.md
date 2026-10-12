@@ -6,7 +6,7 @@
 
 > For operators. The purpose, order, safety checklist, how to read the artifacts, and what to do when a motor FAILs, for the
 > five sequences (A–E) run in the pool **before any rl_pwm flight**. Evidence: `RL_controller/logs/eval/pwm_cocontraction_analysis_20261010/REPORT.md` §0–3
-> (re-analysis of the 2026-10-10 pool failure) and `RL_controller/README.md` §10.3 item 4 (per-thruster sign measurement — **never performed, not even once**).
+> (the 2026-10-10 pool-failure re-analysis) and `RL_controller/README.md` §10.3 item 4 (per-thruster sign measurement — **never performed, not even once**).
 > **0 water runs**: every threshold below is [예측] until an artifact path exists. The same tag also sits next to the constants in the code.
 
 ## 0. One-line summary
@@ -132,7 +132,7 @@ servo1..8 reported, roll/pitch/yaw deg NED, p/q/r deg/s, depth m, batt V/A). `pr
   → 20–40 °/s after 0.4 s without damping. The synthetic vehicle gave 8–12 °/s. **The horizontal thrusters' −100 µs is borderline**: yaw moment 3.4 N × 0.14–0.20 m
   = 0.49–0.68 N·m, I_yaw ≈ 0.73 kg·m² → window mean ~5 °/s [유도], the same as the threshold. SERVO_OUTPUT_RAW reports come at 20 Hz, so if the window jitters by 50 ms,
   PASS/WEAK can go either way (on the synthetic vehicle, T2 −4.8 vs −5.1 °/s). A WEAK on the negative pulse of T1..T4 is likely a threshold problem, not a sign problem —
-  confirm the sign with the three-axis means in `detail` and retry; the four verticals (0.9 N·m, roll) have margin.
+  check the sign with the three-axis means in `detail` and retry; the four verticals (0.9 N·m, roll) have margin.
 
 ### `nv_leak.json`
 
@@ -183,7 +183,7 @@ the link latency removed. The synthetic vehicle (0.12 s injected) gave 0.19 s.
 
 ## 6. Verification status
 
-* Offline: `rov_gui/tests/test_thruster_probe.py` 18 tests + `test_rl_pwm.py` 26 tests passed (2026-10-10). All sequences run in a dry run;
-  5↔8 swap and reverse-rotation detection, abort conditions, neutral burst, refusal codes and the `load_and_check` refusal items are all pinned.
+* Offline: `rov_gui/tests/test_thruster_probe.py` 18 tests + `test_rl_pwm.py` 26 tests passed (2026-10-10). All sequences run in a dry run,
+  the 5↔8 swap and reverse rotation detected, and the abort conditions, neutral burst, refusal codes and `load_and_check` refusal items all pinned.
 * **Hardware: 0 runs [예측]** — the thresholds (5 °/s, window 0.15–0.55 s, 25°, 0.2–0.9 m, 30 A), whether the message-rate request takes effect over the BlueOS path, the Lua script
   heartbeat timing, the SERVO_OUTPUT_RAW report latency, and whether the tilting during free decay does not trip the 25° abort — the first artifact will tell.

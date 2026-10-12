@@ -1217,7 +1217,7 @@ dashboard after `--write` to see the gantry GT and camera curves overlap.
 <!-- MEASUREMENT AUDIT (2026-08-04): the following numbers appear inside code
      blocks above and could not be annotated inline without corrupting them. -->
 
-> **[UNVERIFIED]** The figures on the line below were classified as unverified by the provenance audit — details in [docs/MEASUREMENT_AUDIT.md](docs/MEASUREMENT_AUDIT.en.md).
+> **[UNVERIFIED]** The figures on the lines below were classified as unverified by the provenance audit — details in [docs/MEASUREMENT_AUDIT.md](docs/MEASUREMENT_AUDIT.en.md).
 >
 > - `README_fisheye_gantry.md:412` — 산출물 없음 — `MIN_SHARPNESS       = 50.0   # Laplacian-variance floor; lower in dim environmen`
 > - `README_fisheye_gantry.md:567` — 산출물 없음 — `run_metadata.json         # CLI args, K/D/T_gantry_camera, soft limits, t0/t1`

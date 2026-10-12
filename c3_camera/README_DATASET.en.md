@@ -395,7 +395,7 @@ For the full list, `--help`. Camera options override the `--mode` defaults.
 | `dropped > 0` (writer) | Disk can't keep up (rare on this machine) | Raise `--writer-threads`, `--png-compression 0` |
 | depth mostly 0 | Too little texture / too close | `--extended`, lighting. Check the valid % in the HUD |
 | `Qt xcb` error | conda library conflict | After `conda deactivate`, run with the venv's absolute path, or `env -u LD_LIBRARY_PATH ...`, or `--no-display` |
-| Run from conda base | base has depthai **3.5.0** (v3), so v2 code breaks about halfway and it may grab the camera | Refused automatically at import. Run via the venv path |
+| Run from conda base | base has depthai **3.5.0** (v3), so v2 code half-breaks and may grab the camera | Refused automatically at import. Run via the venv path |
 
 ## 10. Files
 

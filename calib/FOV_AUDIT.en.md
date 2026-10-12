@@ -105,7 +105,7 @@ C1  pinhole, zero distortion — does the bisection recover an exact FOV?
   [PASS] pinhole 95d: got 94.96d, want 94.96+-0.01d
   [PASS] pinhole 127d: got 126.96d, want 126.96+-0.01d
 
-C2  CRITICAL — can a *genuinely 127 deg* wide camera read back as 127 deg?
+C2  CRITICAL — does a *genuinely 127 deg* wide-angle camera read back as 127 deg?
   [PASS] synthetic 127d fisheye: got 127.00d, want 127.00+-2.0d (fitted fx=576.6, valid<=85d)
 
 C3  closed loop on the real C3 distortion: apply Snell -> refit -> remeasure
