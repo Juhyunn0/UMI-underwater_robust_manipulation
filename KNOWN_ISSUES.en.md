@@ -64,13 +64,18 @@
   1.0 s — a value chosen so that the gate does not flicker when SCALED_IMU2 runs at 2–3 Hz). Meanwhile the acceleration
   state is held at its last value and integrated into velocity, and the only thing that catches it is the velocity gate
   (LP 0.5 s) (a 0.3 m/s error in ~0.6 s [유도]). Look at the measured SCALED_IMU2 rate and adjust `acc_s`.
-- **The DVL's per-sample verdicts are not applied to the EKF**: the EKF looks only at the per-run eligibility
-  (`_dvl_run_ok` / `refusal`) and the trip, not at the innovation hold·stale·lock verdicts the assembler makes every tick
-  (only `valid`, like r_l). A false lock under 0.15 m/s gets in until the trip (~1 s sustained). Latent, since the DVL is
-  not mounted. The real device's covariance diagonal at rest is ≈ 8e-7 m²/s² (σ ≈ 0.9 mm/s) [측정:
-  data/20261011/1011_155235_dvl_probe/station_client_live.json first_sample] and the `dvl_rejection_threshold` default is
-  None, so in opt-out (mount values set + `require_proven: false`) the ~0 velocity of a DVL that is not attached to the
-  vehicle, or is in false lock, is fused with **a very high weight**.
+- **The DVL's per-sample verdicts and the EKF** (updated 2026-10-16): under `dvl.selection: primary` (the default) the EKF
+  is given a DVL sample only while the blend may use it (`DvlAid.usable`) — not on a quality flag, a disagreement hold, a
+  data gate or a latch (`on_dvl` runs the aid first, then feeds the EKF). So the EKF loses the DVL at the first hold (p50
+  1.7–4.3 s), not at the latch (p50 6.6–9.0 s) [측정: RL_controller logs/eval/dvl_trip_fix_20261015/design/out/
+  faults_summary.json]. The EKF control-velocity interlock (`_ekf_vs_tag` dv) compares with the tag finite difference —
+  primary's `nu[0:2]` is the DVL blend, so otherwise an EKF that fused a wrong DVL would be compared with that same DVL.
+  Under `legacy` it is as before: the EKF looks only at the per-run eligibility (`_dvl_run_ok` / `refusal`) and the trip,
+  not at the innovation hold·stale·lock verdicts the assembler makes every tick (only `valid`, like r_l); a false lock under
+  0.15 m/s gets in until the trip (~1 s sustained). Both modes: the real device's covariance diagonal at rest is ≈ 8e-7
+  m²/s² (σ ≈ 0.9 mm/s) [측정: data/20261011/1011_155235_dvl_probe/station_client_live.json first_sample] and the
+  `dvl_rejection_threshold` default is None, so a DVL that is being used is fused with **a very high weight** (in opt-out,
+  also the ~0 velocity of a DVL that is not attached to the vehicle).
 - **Transient right after engage**: `asm.reset()` in `set_engaged` restarts the assembler velocity from 0 for ~2 frames,
   so the velocity channel reads |nu_ekf| (it trips only at an engage velocity of ~0.37 m/s or more [유도]); with z_source
   pressure, the z offset recalibration puts the EKF z off for 1–2 samples.
@@ -79,6 +84,98 @@
 - **Proper fix**: fly the first water session in shadow and check the `ekf_*` columns and `est` → measure the SCALED_IMU2
   at-rest bias → compare smoothing on/off·IMU noise variants with `ekf_replay` → after that, a short station hold on the
   EST EKF.
+
+### DVL `selection: primary` (2026-10-16): a disagreement is a HOLD; only escalation and a device-config change latch — remaining costs, blind spots, rollback
+- **What changed**: a disagreement with the tag velocity (slow difference, alignment, a refuting fit) is no longer a trip
+  but a **HOLD** — the DVL is not used for a moment through the same hold/fade path as a dropout, and it comes back **by
+  itself** once the disagreement and its evidence (escalation bucket < 0.5 s) are gone. **No button to press**; the proof is
+  kept. The only latches are (a) the device's configuration changing and (b) escalation (4 s of accumulated evidence, or 3
+  episodes within 60 s that carried difference, fit or scale evidence); both discard the proof (proving pass → OUT → IN).
+  Design and evidence: RL_controller `logs/eval/dvl_trip_fix_20261015/SPEC.md`, implementation record
+  `IMPLEMENTATION.md` (with its "Fix round 1"). On replay of the 10-13/10-15 recordings: 0 latches (old 16), 0 hard
+  switches (old 31.9/min), error RMS 6.33 → 4.72 cm/s [측정: same folder, design/out, impl/out and fix1/out — the
+  implementation reproduces the prototype CSV by CSV and fault run by fault run].
+- **Fix round 1 (2026-10-16, after the verification)** [측정: RL_controller logs/eval/dvl_trip_fix_20261015/fix1/out]:
+  - **One short glitch no longer latches.** Before, ONE large DVL glitch while moving (+0.5–0.8 m/s for 0.5–1 s — the
+    blend's gross check never flew it, and even with every glitch report fom-flagged) latched the DVL about 4 s later
+    "persistently … the DVL reads 2× the motion the tags see. It lasted, so it is not a glitch": the scale ratio's 4-s power
+    average took the glitch unclipped (59/120 worker runs, 12/30 real-session replays, verify/). Now the slow powers take the
+    pair clipped like the residual and leave out a glitch pair (gross AND further from the tags than a ≤ 3× scale error
+    could be at that speed): 0/128 worker runs, 0/30 real-session replays, 0/850 glitches injected on the armed recordings
+    (OLD: 202/490), glitch bucket max 1.29 s. 2×/3× scale faults still latch (X2 31/35 within 20 s, max 15.3 s).
+  - **The repeated latch counts only episodes that carried difference, fit or scale evidence.** All 4 counted episodes
+    on the recordings were alignment-only (two 55 s apart on mpc_192708 → "one more latches it", the second while the DVL
+    was the better sensor). Now 0 counted, 0 warnings; alignment still holds the DVL and fills the persistent bucket.
+  - The log's `dvl: HELD` and `hold released` lines pair up (18/18 on the 58 recordings; before 17/22) and "released" is
+    written only when the DVL fades back in (never on a gross tick). A hold that starts within 2 s of the previous HELD line
+    is announced once those 2 s are up, or not at all if it ends sooner (the panel shows it).
+  - The panel says "— returns by itself" for a lost lock only when the DVL would be used again (IN and proven): in shadow
+    it shows the plain words, and in a run not armed for the DVL "not used this run". The held note's episode count drops
+    "of 0" and onsets older than the window. The fade catch-up after a tag gap is bounded (bit-identical).
+- **Remaining costs (the price of R1/R2)**:
+  - A false lock that neither a flag nor the stage-1 hold catches is flown meanwhile: longer than training (≤ 1.1 s), 1.6–2.8 s
+    to the hold for a 15–10 cm/s lock [유도]. During a 3-s zero lock the error RMS is 7.07 cm/s (clean run 3.60, the old
+    innovation gate 5.30) [측정: faults_summary.json] — that gate threw away the closer sensor 80 % of the time on real data.
+  - Repeated glitch bursts make the fit refute incoherently, which holds the DVL for as long as they last (+0.30 m/s 4-report
+    bursts every 3 s on the 17:45 CSV: the whole run on the tag FD, RMS 16.1 vs 6.5 cm/s clean).
+  - The hold's tail: after a ≥ 2 s lock the DVL stays out until the slow residual < 2.5 cm/s AND the bucket < 0.5 s — 7.15 s
+    after a 3-s lock at 0.3 m/s [측정: test_dvl N4]. The fit's 60-s memory can prolong a hold after a transient (24 of 786
+    runs, mostly `dis_fit` on mpc_201923 / 201355).
+  - **(fix round 1) A long glitch is held by the fit for up to ~60 s.** One glitch long enough to dominate the fit's 60-s
+    window (≥ ~1.5 s of a ≥ 0.4 m/s offset with a full window; ≥ 0.5 s when it holds few moving pairs) makes the fit refute
+    incoherently, and the `dis_fit` hold keeps the DVL on the tag FD until those pairs leave the window — no latch, it
+    returns by itself (+0.8 m/s × 1.5 s: weight back after 59.8 s; × 1.0 s: after 0.9 s) [측정: fix1/out/
+    glitch_recovery_aid_final.json]. On the injected glitches the weight was back to the clean run's within 12 s in 79 %
+    of runs (+0.8 m/s × 1.5 s: 29–31 %) [측정: fix1/out/f_compare_final.json].
+  - **(fix round 1, measured) A glitch below the blend's 0.5 m/s gross limit is flown.** The jump gate rejects only its
+    first reports (a_max·dt + 5 cm/s passes a +0.3 m/s step within ~0.13 s [유도]), and a 1–1.5 s spell is over before the
+    slow hold acts: the velocity error over the fault + 2 s is 14.8–16.7 cm/s RMS for +0.3 m/s × 1–1.5 s and 14.0–17.1 for
+    +0.5 m/s (OLD innovation gate 4.2, clean 3.5); +0.8 m/s is refused by the gross check (3.6–3.9) [측정: same]. The gross
+    limit is the trained blend's (changing it refuses the pwm11att13 exports); SPEC §12.1.
+  - After a tag gap the blend judges its hold against the sample from BEFORE the gap: when the DVL goes bad late in a
+    ≥ 1.4-s gap, the first tagged tick can switch from the DVL to the FD in one tick (7.1 cm/s in the synthetic case; 0
+    engaged ticks on the recordings; the RL_PWM tag gate is already on HOLD pulses by then) [측정: verify/parity.md §5].
+- **Blind spots (the latch)**: a +5 cm/s bias latches in only 19/35 windows within 30 s (stage-1 holds in 30/35); a 3-s zero
+  lock repeating every 12 s at the recorded speeds (7–12 cm/s) latches 3/23 (5/23 before fix round 1; DVL weight 0.72,
+  error 5.1 vs 3.1 cm/s; `EPISODE_MIN_S` 0.25 latched 10/23 under the round-0 rule [측정 design/out/
+  episode_choose.json]); 2-of-3 flicker 28/38 (not caught by the re-acquired flag; the monitors latch
+  it); with tags in bursts (0.3 s on / 0.7 s off) detection is slower (B10 31/35, RY 29/35, X2 23/35 within 30 s); a
+  low-amplitude 2× scale only while the tags see ≥ 5 cm/s rms; on the two recordings with no lock about half the time
+  (mpc_190606, mpc_191140) 1/35 B10 and 4/35 X2 windows did not latch (window DVL weight 0.08–0.43) [측정: fix1/out/
+  f_compare_final.json]. **(fix round 1)** a fault that shows only ALIGNMENT evidence in separate short spells (three
+  1.5-s spells a minute) is held each time but latches only through the 4-s bucket, no longer "repeatedly" [측정:
+  test_dvl `test_alignment_only_episodes_do_not_count_toward_the_repeated_latch`]. **Operator note**: on a session where
+  the DVL has no lock about half the time, a persistent scale or bias fault is held but may not latch within 30 s — if the
+  panel keeps showing `held` / `no lock` while flying with tags in view, treat the DVL as suspect (mount, lever arm, bottom
+  lock) and set it OUT between runs.
+- **Train/test consistency (pwm11att13)**: the blend law and constants are the trained ones (the 5 traces reproduced tick for
+  tick, test_dvl N1). But the station's w-process is outside the trained distribution — mean w 0.823 vs the twin's 0.970
+  (per-episode p1 0.905), w = 0 share 0.114 vs p99 0.049, fades 13.0/min vs 7.6 [측정 selection.json / 예측 sim-only
+  twin_chain_out.json]. 47 % of the gap is the R3 flags (the twin's flag model has no false positives), the rest the real
+  DVL's clustered no-lock spells. **Before att13 flies on primary**: feed the clustered no-lock spells and the flags'
+  false-positive rate into the twin's DR, and run an Isaac closed-loop check with the station's measured w-process (SPEC
+  §12.3 items 6–7).
+- **Rollback (`dvl.selection: legacy`)**: the old ladder, bit for bit (58/58 CSV hashes equal [측정 impl/out/
+  legacy_new.json; again after fix round 1, fix1/out/legacy_compare.log]; pinned in the repo by
+  `rov_gui/tests/test_dvl_legacy_replay.py`, a recorded segment replayed against the shipped station's digests). (a) legacy **refuses** every export trained on the blend (velocity_source.trained true, pwm11att13*) —
+  RL_PWM / RL_PWM_7D become unavailable (warn). (b) `dvl.stale_s` is also the blend's stale clock: a value other than 0.6
+  refuses those exports in primary too. (c) `selection` is read at startup and the proof is per process — switching = a
+  restart + a new proving pass. (d) After the yaml patch (`RL_controller logs/eval/dvl_trip_fix_20261015/
+  hw_mpc_dvl_patch.diff`, applied by the operator), undo it first (`patch -p1 -R`) before reverting the code, or
+  `MpcWorker.setup` dies on the unknown dvl keys.
+- **Not covered yet**: the height-mismatch flag (|altitude − tag height| > 0.15 m — needs the tags, so outside R3; needs the
+  session-offset calibration replay), per-beam flags (`DvlSample` keeps only `n_beams`), a pool A/B and the Isaac closed
+  loop, and the merge with the RL_PWM export picker (SPEC §13: picker-first was the recommended order, but this change
+  landed while the picker was unmerged — the picker needs `git merge-file`; its test N41, a picker swap to a
+  blend-trained export under legacy being refused, comes with that merge). **(fix round 1, open) The altitude-jump flag
+  fires during steady heave**: it compares with the median of the last 1 s of unflagged reports, which lags ~0.5 s, so a
+  steady altitude rate v_z over a flat floor reads a jump of ~0.5·v_z — past 0.10 m from ~0.2 m/s [유도]. With an otherwise
+  perfect DVL over a 6-s ramp: 0.10–0.15 m/s → 0 flagged; 0.20 m/s → 24/60 (10 Hz) and 30/78 (13 Hz) flagged, mean DVL
+  weight 0.81–0.85; 0.30 m/s → 30/60 and 40/78, 0.75–0.81 [측정: verify review probe p_heave.py]. Never a latch, but the
+  DVL is intermittently withheld on fast dives and ascents (another train/test shift); the recordings hold little such
+  heave (flag_alt 6.6 % of rows at |w_fd| < 0.05 m/s, 12.1 % at 0.20–0.30 m/s [측정: verify/REPLAY.md §8 item 6]).
+  Candidate fix, not made: compare with a de-trended reference (a 1-s linear fit, or the barometer depth + altitude as the
+  floor depth), then re-measure the recall with `design/flag_recall.py`.
 
 ### The entire DVL path (`--dvl`) is **unverified on hardware** — mount values null, all thresholds [예측], latency and noise not measured (2026-10-01)
 - **Status**: `rov_gui/control/dvl.py` · `backends/dvl.py` · the station bridge's `dvl` rung were written **before** the
@@ -122,18 +219,24 @@
   Turning the extension off may make prearm refuse with "VisOdom: not healthy" etc. [예측: SYS_STATUS VISION_POSITION bit —
   AP_Arming unconfirmed].
 - **Design limitations (confirmed over 6 reviews, 2026-10-02; unresolved)**:
-  - **A long false lock trips, and that trip, too, requires a fresh proof.** +14 cm/s × 1 s or +10 cm/s × 2 s trips
-    (whether once or every 10 s); +10 cm/s × 1 s, +14 cm/s × 0.5 s, and 4 reports or fewer do not trip [예측: `rov_gui/tests/fixtures/
-    sim_dvl_monitors_20261002.txt` A5b]. This is intended behaviour (you cannot fly on a DVL that reports nonexistent
-    motion for 1 s). However, such a trip discards the proof and demands a new proof pass even though it has nothing to
-    do with the mount — if false locks are frequent near the pool walls, you have to prove the mount again every time. To
-    close this, split the trip in two so that a "DVL-only motion" difference trip only sets the latch and keeps the proof
-    (not implemented). The boundary values are all [예측].
+  - **(resolved 2026-10-16, `selection: primary`) A false lock is a HOLD — the latch that discards the proof only comes when
+    it lasts or keeps coming back.** A disagreement takes the DVL out through hold/fade and it returns **by itself** (nothing
+    to press, the proof kept): a 3-s zero lock at 0.3 m/s is held after 1.65 s and back 7.15 s after it ends, no latch
+    [측정: test_dvl N4]. The latch (proof discarded) comes at 4 s of evidence (a constant lock longer than ~3.4 s [유도]; a
+    6-s zero lock latches at 5.65 s) or at 3 episodes within 60 s (a 3-s lock every 12 s at 0.12 m/s: warning at 14.5 s,
+    latch at 26.5 s) [측정: test_dvl N8, N30]. On the 786 transient-fault replays (zero locks ≤ 3 s, offsets ≤ 1.1 s,
+    silences, flicker): 0 latches, bucket max 3.11 s; on 850 single glitches (+0.3–0.8 m/s × 0.3–1.5 s, steps, ramps,
+    fom-flagged; fix round 1): 0 latches, bucket max 1.29 s [측정: fix1/out/f_compare_final.json]. Remaining costs and
+    blind spots: the "DVL `selection: primary`" entry above. **Under `legacy` it is as before**: +14 cm/s × 1 s or
+    +10 cm/s × 2 s trips, and that trip discards the proof [예측: `rov_gui/tests/fixtures/sim_dvl_monitors_20261002.txt`
+    A5b].
   - **Glitches and noise take the DVL out with a hold instead of a trip — if they are frequent, it flies without the DVL
     for that much of the time.** With a 4-report glitch every 3 s, the ticks flown on the DVL at rest are 39–60 %; with
     2.5 cm/s DVL noise, 48 % at rest; at 3 cm/s or more it is almost never proven and stays OUT [예측:
     same output file A5]. Each time a hold is set and released, the velocity source switches (the difference between the
-    two values is at the noise level). There is no latch.
+    two values is at the noise level). There is no latch. (This is the 2026-10-02 legacy analysis. Under `primary` a
+    single glitch is a hold too — until fix round 1 one large glitch of 0.5–1 s could still latch through the scale
+    evidence, see "Fix round 1" above — and the velocity source fades instead of switching.)
   - **Vertical axis unproven → heave velocity does not use the DVL.** Because the proof looks only at surge·sway. To
     close this, add a 1-D regression of baro depth rate (or tag z differencing) ↔ DVL vz, and replace `nu[2]` only after
     confirming sign·scale with an up-down pass.

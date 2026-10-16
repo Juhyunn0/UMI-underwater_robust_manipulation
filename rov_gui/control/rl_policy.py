@@ -182,6 +182,146 @@ def check_frame_layout(spec: dict, who: str, where: str, goal_velocity: bool | N
     return gf
 
 
+# ----------------------------------------------------------------------------- what velocity the export was trained on
+#: 2026-10-16 (dvl.selection; RL_controller logs/eval/dvl_trip_fix_20261015 SPEC.md §8): an export's
+#: obs_spec.velocity_source constants (RL_controller scripts/export_policy.py, pwm11att13 and later) and the station's
+#: dvl: key that implements each. The layout gate cannot tell such an export apart — its slot is v_b_est(3) like every
+#: other's — so these keys are the only thing that can.
+VELOCITY_SOURCE_KEYS = (("hold_s", "blend_hold_s"), ("xfade_s", "blend_xfade_s"), ("gross_m_s", "blend_gross_m_s"),
+                        ("gross_tau_s", "blend_gross_tau_s"), ("stale_s", "stale_s"))
+#: the export's obs_guard.thin_proxy ("the env's low-tag spell stands for n_tags < min_tags") was calibrated at 2 [스펙]
+THIN_PROXY_MIN_TAGS = 2
+
+
+class ExportRefused(ValueError):
+    """An export that says what it was trained on (obs_spec velocity_source / obs_guard) and this station does not
+    implement it the same way: refused at build, and logged at warn (a refusal, not a missing file)."""
+
+    export_refused = True
+
+
+def _num(who: str, where: str, what: str, v) -> float:
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)):
+        raise ExportRefused(f"{who}: policy {where} {what} is {v!r}, not a number — refused")
+    return float(v)
+
+
+def station_velocity_source(dvl_raw, vel_lp_alpha) -> dict:
+    """What THIS station implements, in the export's terms. ``dvl_raw`` = cfg.dvl (the resolved block when a DVL was
+    built, else the yaml's: resolved again here, same values either way)."""
+    from . import dvl as DV
+    c = DV.resolve(dict(dvl_raw or {}))
+    return {"selection": c["selection"], "hold_s": c["blend_hold_s"], "xfade_s": c["blend_xfade_s"],
+            "gross_m_s": c["blend_gross_m_s"], "gross_tau_s": c["blend_gross_tau_s"], "stale_s": c["stale_s"],
+            "dvl_w": False, "vel_lp_alpha": None if vel_lp_alpha is None else float(vel_lp_alpha)}
+
+
+def check_velocity_source(spec: dict, who: str, where: str, dvl_raw, vel_lp_alpha) -> dict | None:
+    """R7 (2026-10-16): an export whose obs_spec says ``velocity_source.trained: true`` was trained on the DVL-primary
+    blend (RL_controller deploy/obs_builder.DvlBlendNp) and is accepted ONLY by a station that implements the same blend:
+    ``dvl.selection: primary`` with equal hold / fade / gross / gross time constant / stale clock (1e-9), no DVL heave,
+    and — when the export records it — the same tag-velocity low-pass (estimator.vel_lp_alpha). Anything else raises
+    ExportRefused naming the difference. No block -> None (accepted exactly as before); ``trained: false`` -> the block
+    (accepted; the engage note reads it)."""
+    if "velocity_source" not in spec:
+        return None
+    vs = spec["velocity_source"]
+    if not isinstance(vs, dict) or not isinstance(vs.get("trained"), bool):
+        raise ExportRefused(f"{who}: policy {where} has a velocity_source block that is not {{trained: true|false, ...}} "
+                            f"({vs!r:.80}) — refused, the velocity it was trained on is unknown")
+    if not vs["trained"]:
+        return vs
+    try:
+        st = station_velocity_source(dvl_raw, vel_lp_alpha)
+    except ValueError as e:
+        raise ExportRefused(f"{who}: policy {where} was trained on the DVL-primary blend, and this station's dvl: block "
+                            f"does not resolve ({e}) — refused") from e
+    if st["selection"] != "primary":
+        raise ExportRefused(f"{who}: policy {where} was trained on the DVL-primary velocity blend (velocity_source.trained "
+                            f"true: hold {vs.get('hold_s')} s, fade {vs.get('xfade_s')} s, gross {vs.get('gross_m_s')} "
+                            f"m/s) but this station runs dvl.selection: {st['selection']} (hard switches) — refused; set "
+                            f"dvl.selection: primary (and restart), or fly an export without velocity_source")
+    for k, key in VELOCITY_SOURCE_KEYS:
+        v = _num(who, where, f"velocity_source.{k}", vs.get(k))
+        s = float(st[k])
+        if abs(v - s) > 1e-9:
+            raise ExportRefused(f"{who}: policy {where} was trained with velocity_source.{k} {v:g}; this station "
+                                f"implements {s:g} (dvl.{key}) — refused: the policy would be fed a blend it never saw")
+    if vs.get("dvl_w") is not False:
+        raise ExportRefused(f"{who}: policy {where} was trained with the DVL's heave (velocity_source.dvl_w "
+                            f"{vs.get('dvl_w')!r}); this station never feeds the DVL's w (heave stays on the tag finite "
+                            f"difference) — refused")
+    est = spec.get("estimator")
+    if isinstance(est, dict) and "vel_lp_alpha" in est:
+        v = _num(who, where, "estimator.vel_lp_alpha", est["vel_lp_alpha"])
+        if vel_lp_alpha is None:
+            raise ExportRefused(f"{who}: policy {where} was trained on a tag finite difference low-passed with "
+                                f"estimator.vel_lp_alpha {v:g}; this station's vel_lp_alpha is unknown — refused")
+        s = float(vel_lp_alpha)
+        if abs(v - s) > 1e-9:
+            raise ExportRefused(f"{who}: policy {where} was trained on a tag finite difference low-passed with "
+                                f"estimator.vel_lp_alpha {v:g}; this station's vel_lp_alpha is {s:g} — refused: both "
+                                f"the fallback velocity and the gross check's reference would differ")
+    return vs
+
+
+def check_obs_guard(spec: dict, who: str, where: str, guard_cfg) -> dict | None:
+    """R7 (2026-10-16): an export whose obs_spec says ``obs_guard.trained: true`` was trained behind the pwm LOWs'
+    observation guard (rl_pwm.PwmObsGuard rules 1-2) and is accepted ONLY by a LOW that applies it (``guard_cfg`` =
+    its validated rl_pwm.obs_guard block; None = an axes LOW, which has none) with the same velocity slew and fix-jump
+    limits and a thin fix = n_tags < the trained min_tags (the export's, else THIN_PROXY_MIN_TAGS). No block -> None;
+    ``trained: false`` -> the block."""
+    if "obs_guard" not in spec:
+        return None
+    og = spec["obs_guard"]
+    if not isinstance(og, dict) or not isinstance(og.get("trained"), bool):
+        raise ExportRefused(f"{who}: policy {where} has an obs_guard block that is not {{trained: true|false, ...}} "
+                            f"({og!r:.80}) — refused, the observation guard it was trained behind is unknown")
+    if not og["trained"]:
+        return og
+    if guard_cfg is None:
+        raise ExportRefused(f"{who}: policy {where} was trained behind the station's observation guard (obs_guard.trained "
+                            f"true: velocity slew {og.get('vel_slew_mps2')} m/s^2, fix jump {og.get('jump_m')} m) — LOW "
+                            f"{who} does not apply it (only rl_pwm / rl_pwm_7d do) — refused")
+    for k in ("vel_slew_mps2", "jump_m"):
+        v = _num(who, where, f"obs_guard.{k}", og.get(k))
+        s = float(guard_cfg[k])
+        if abs(v - s) > 1e-9:
+            raise ExportRefused(f"{who}: policy {where} obs_guard.{k} {v:g} != the station's rl_pwm.obs_guard.{k} "
+                                f"{s:g} — refused")
+    m = og.get("min_tags", THIN_PROXY_MIN_TAGS)
+    if isinstance(m, bool) or not isinstance(m, int) or guard_cfg.get("min_tags") != m:
+        raise ExportRefused(f"{who}: policy {where} its fix-jump rule was trained on a thin fix = n_tags < {m}; "
+                            f"rl_pwm.obs_guard.min_tags is {guard_cfg.get('min_tags')} — refused")
+    return og
+
+
+def rl_velocity_note(mode: str, vs, armed: bool, run_why: str, estimator: str) -> tuple | None:
+    """The engage-time line about the velocity an RL LOW is fed this run -> (level, text) or None. ``vs`` = the
+    follower's ``velocity_source`` (the export's block, None without one), ``armed`` = the DVL is IN and this run is
+    armed for it, ``run_why`` = why not, ``estimator`` = "tag" | "ekf" | "imu_dr". An export without the block gets the
+    shipped warning (armed) or nothing — exactly as before 2026-10-16."""
+    trained = isinstance(vs, dict) and vs.get("trained") is True
+    if not trained:
+        if armed:
+            return ("warn", f"ctrl: {mode} was trained on a simulated tag-finite-difference velocity, not a DVL's — "
+                            f"this run feeds it a different observation distribution (meta dvl.use_at_engage)")
+        return None
+    if str(estimator) != "tag":
+        return None                 # refused at engage (_engage_refusal): never flies
+    if armed:
+        return ("info", f"ctrl: {mode} flies the DVL-primary blend it was trained on (hold {float(vs['hold_s']):g} s, "
+                        f"fade {float(vs['xfade_s']):g} s, gross {float(vs['gross_m_s']):g} m/s)")
+    p = vs.get("p")
+    pct = isinstance(p, (list, tuple)) and len(p) >= 2 and all(
+        isinstance(x, (int, float)) and not isinstance(x, bool) for x in p[:2])
+    return ("warn", f"ctrl: {mode} was trained mostly on the DVL-primary blend"
+                    + (f" ({float(p[1]) * 100:.0f} % of its episodes)" if pct else "")
+                    + f"; this run is NOT armed for the DVL ({run_why}) and flies on the tag finite difference — inside "
+                      f"its training" + (f" ({float(p[0]) * 100:.0f} % tag-FD episodes)" if pct else "")
+                    + " but at tag-FD accuracy")
+
+
 # ----------------------------------------------------------------------------- the controller
 class HwRl(HwPid):
     """RL follower with HwPid's harness surface (reference API inherited)."""
@@ -195,6 +335,9 @@ class HwRl(HwPid):
     #: outputs silently dropped — refused below with the reason.
     ACCEPTED_MODES = ("axes",)
     DEFAULT_DIR = DEFAULT_POLICY_DIR
+    #: 2026-10-16 (R7): does this LOW apply the pwm observation guard (rl_pwm.PwmObsGuard)? An export trained behind it
+    #: (obs_spec obs_guard.trained) is refused by a LOW that does not. HwRlPwm (and HwRlPwm7d) set it.
+    APPLIES_OBS_GUARD = False
 
     def __init__(self, cfg, log=print):
         raw = dict(getattr(cfg, self.CFG_KEY, None) or {})
@@ -242,6 +385,17 @@ class HwRl(HwPid):
         #: an export whose frame_layout and obs_goal_frame disagree, whatever the LOW (rl / rl_pwm compared no layout
         #: before this — a goal-frame export would have flown there on world-frame quaternions).
         self.goal_frame = check_frame_layout(self.spec, self.CFG_KEY, os.path.relpath(pdir, REPO_ROOT))
+        #: 2026-10-16 (R7, RL_controller logs/eval/dvl_trip_fix_20261015 SPEC.md §8): the velocity the export was
+        #: trained on (obs_spec velocity_source; None = no block, exactly as before) — refused at build unless this
+        #: station implements the same blend — and, for a LOW without the pwm observation guard, an export trained
+        #: behind that guard is refused here too (HwRlPwm checks its own guard against the export).
+        rel = os.path.relpath(pdir, REPO_ROOT)
+        _alpha = getattr(cfg, "vel_lp_alpha", None)
+        self.velocity_source = check_velocity_source(self.spec, self.CFG_KEY, rel, getattr(cfg, "dvl", None), _alpha)
+        self._vs_station = (station_velocity_source(getattr(cfg, "dvl", None), _alpha)
+                            if isinstance(self.velocity_source, dict) and self.velocity_source.get("trained") else None)
+        if not self.APPLIES_OBS_GUARD:
+            check_obs_guard(self.spec, self.CFG_KEY, rel, None)
         if self.policy.obs_dim != self.frame_dim * self.K or self.policy.act_dim != self.n_act:
             raise ValueError(f"rl: policy dims {self.policy.obs_dim}->{self.policy.act_dim} do not match obs_spec "
                              f"({self.frame_dim}x{self.K} -> {self.n_act})")
@@ -390,6 +544,9 @@ class HwRl(HwPid):
                           + ("; q_des / q_est rotated by -goal yaw (ZYX yaw of q_des) before the w>=0 canonicalization "
                              "(obs_goal_frame)" if self.goal_frame else ""),
                 "ref_preview": False, "path_reference": "shared spatial plan, stage 0 (+ its velocity as feed-forward)",
+                # 2026-10-16 (R7): what velocity the export says it was trained on, and what this station implements
+                # (only for an export trained on the blend; checked equal at build)
+                "velocity_source": {"export": self.velocity_source, "station": self._vs_station},
                 "provenance": "RL_controller (Isaac Lab, PPO), see rl_policies/<name>/RL_controller_README.md"}
 
 
@@ -430,6 +587,8 @@ class HwRlPwm(HwRl):
     DEFAULT_DIR = os.path.join("rov_gui", "control", "rl_policies", "pwm10_s1")
     #: The worker reads this to pick the transport: "pwm" = pulses on bus.cmd_pwm, anything else = axes on cmd_pilot.
     transport = "pwm"
+    #: 2026-10-16 (R7): this LOW applies rl_pwm.PwmObsGuard, so an export trained behind it is checked against its config
+    APPLIES_OBS_GUARD = True
 
     def __init__(self, cfg, log=print):
         from .rl_pwm import (PWM_CHANNELS_DEFAULT, PwmModel, PwmObsGuard, ThrusterProbeCheck, hold_throttles,
@@ -480,6 +639,10 @@ class HwRlPwm(HwRl):
         #: like any frame (scale / clip) so the strict conversion and the sink's window always admit them. Applied
         #: INSIDE step to the state the network sees; the worker's state, the CSV and every other LOW are untouched.
         self.obs_guard = PwmObsGuard(raw.get("obs_guard"), dt=self.dt)
+        #: 2026-10-16 (R7): an export trained behind the guard (obs_spec obs_guard.trained) flies only with THIS guard
+        #: configured as it was trained (slew, fix jump, thin = n_tags < min_tags); None = no block, as before.
+        self.obs_guard_trained = check_obs_guard(self.spec, self.CFG_KEY, os.path.relpath(self.policy_dir, REPO_ROOT),
+                                                 self.obs_guard.cfg)
         hold_thr = hold_throttles(self.model, self.obs_guard.cfg["hold_wrench_z_n"])
         if self.pwm_cap_mode == "scale":
             hold_thr = scale_throttles(hold_thr, self.pwm_cap, self.model)
@@ -630,6 +793,8 @@ class HwRlPwm(HwRl):
                   # 2026-10-10 (b): the observation guards and the hold they switch to (RECORD BOUNDARY: never
                   # pool across obs_guard.config; the CSV pwm_guard column says which guard acted per row)
                   "obs_guard": self.obs_guard.meta(),
+                  # 2026-10-16 (R7): the export's obs_guard block (None = it has none)
+                  "obs_guard_trained": self.obs_guard_trained,
                   "hold_pwm_us": [int(v) for v in self.hold_pwm_us],
                   "hold_throttles": [float(v) for v in self.hold_throttles],
                   "hold_wrench_ned_est": [float(v) for v in self.model.wrench_ned_from_throttles(self.hold_throttles)],

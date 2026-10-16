@@ -162,12 +162,18 @@ def _json_default(o):
     return repr(o)
 
 
-def _ekf_vs_tag(m, meas) -> dict:
+def _ekf_vs_tag(m, meas, nu_ref=None) -> dict:
     """EKF state minus the tag state, both datum frame: horizontal and
     vertical distance (m), yaw and the larger of roll/pitch (deg, signed for
     yaw), and the body linear-velocity difference VECTOR (m/s; the caller
-    low-passes it — the tag finite difference is noisy)."""
+    low-passes it — the tag finite difference is noisy).
+
+    ``nu_ref`` (2026-10-16, dvl.selection primary): the velocity reference
+    when given — the tag finite difference (health["nu_fd"]). Under primary
+    meas["nu"][0:2] IS the DVL blend, and an EKF that fused a wrong DVL would
+    otherwise be compared with that same DVL."""
     a, b = m["eta"], meas["eta"]
+    ref = meas["nu"][:3] if nu_ref is None else np.asarray(nu_ref, float)[:3]
     return {
         "xy": math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1])),
         "z": abs(float(a[2]) - float(b[2])),
@@ -175,7 +181,7 @@ def _ekf_vs_tag(m, meas) -> dict:
         "rp": math.degrees(max(abs(_wrap_pi(float(a[3]) - float(b[3]))),
                                abs(_wrap_pi(float(a[4]) - float(b[4]))))),
         "dv": (np.asarray(m["nu"][:3], float)
-               - np.asarray(meas["nu"][:3], float)),
+               - np.asarray(ref, float)),
     }
 
 
@@ -725,7 +731,9 @@ CSV_HEADER = ("t,px,py,pz,rx,ry,yaw_deg,pitch_deg,lap,"
               "ekf_yaw_deg,ekf_u,ekf_v,ekf_w,ekf_sig_xy_m,ekf_age_s,"
               "ekf_tag_late_s,ekf_n_tag,ekf_n_dvl,"
               "i_pred_a,null_v_us,null_h_us,pwm_guard,"
-              "att_age_v_s,att_tb_ms,banner_age_s\n")
+              "att_age_v_s,att_tb_ms,banner_age_s,"
+              "w_dvl,dvl_code,dvl_res_fast_m_s,dvl_res_slow_m_s,dvl_esc_s,"
+              "dvl_align,dvl_scale\n")
 # 2026-09-08: the eleven trailing columns. `pwm1..pwm8` are the vehicle's OWN
 # SERVO_OUTPUT_RAW microseconds per thruster (1500 = neutral; EMPTY when that
 # output is unconfigured or the vehicle has not reported yet), `pwm_age_s` is
@@ -1033,6 +1041,33 @@ CSV_HEADER = ("t,px,py,pz,rx,ry,yaw_deg,pitch_deg,lap,"
 #     STATUSTEXT (another client pulled the parameter list, or a reboot); `nan`
 #     = none this session. A row with banner_age_s < ~2 s sits inside the
 #     downlink queue that followed every 10-13 banner.
+# 2026-10-16: seven trailing columns arrived with schema 22, with
+# `dvl.selection` (control/dvl.py; RL_controller logs/eval/
+# dvl_trip_fix_20261015/SPEC.md §6). Under `primary` (the default) the DVL is
+# the horizontal velocity and nu_u / nu_v = w_dvl x DVL + (1 - w_dvl) x the
+# tag finite difference (fd_u / fd_v), the blend the pwm11att13 policy was
+# trained on; `vel_src` then also reads `hold` (the last usable sample, w 1)
+# and `blend` (0 < w < 1) besides `dvl` / `tag_fd` / `bridge`. Every LOW; all
+# `nan` / empty without a DVL except w_dvl 0.000:
+#   * `w_dvl` = the DVL's weight in this row's (u, v): the blend's w; 1.000 on
+#     the station bridge's DVL rung, 0.000 on its other tiers, `nan` on a row
+#     with no tag state that nothing bridged. LEGACY writes 1.000 / 0.000 from
+#     vel_src (its switches are hard).
+#   * `dvl_code` = why (dvl.reason_code: ok, out, latched, unproven, the data
+#     gates no_lock / stale / jump ..., the quality flags flag_fom / flag_alt /
+#     flag_beams / flag_reacq, the disagreement holds dis_diff / dis_align /
+#     dis_fit, gross, not_armed, fault, no_tag, rung, bridge; legacy also
+#     reentry, innovation, innov_hold, unchecked, refute_hold, align_hold).
+#   * `dvl_res_fast_m_s` = the 1-s low-passed |v_dvl - v_tag| of the aligned
+#     pairs (legacy's difference-trip signal; MpcStatus.dvl_res_m_s);
+#     `dvl_res_slow_m_s` = its slow twin (primary's hold / escalation signal,
+#     agree_slow_s); `dvl_esc_s` = the escalation bucket (s; `nan` in legacy);
+#     `dvl_align` = the lowest alignment judged on the newest pair (`nan` =
+#     none judged); `dvl_scale` = sqrt(slow |v_dvl|^2 / slow |v_tag|^2)
+#     (`nan` while the tags see < dvl.esc_scale_v_min_m_s).
+#   RECORD BOUNDARY: never pool velocity statistics (vel_src shares, nu error,
+#   fallback rates) across meta `dvl.selection` — the two modes switch
+#   differently by design.
 
 
 class MpcWorker(TimerWorker):
@@ -1245,6 +1280,18 @@ class MpcWorker(TimerWorker):
         self._dvl_logged = None            # the velocity source last LOGGED
         self._dvl_log_t = 0.0              # rate limit for source changes
         self._dvl_rows: dict = {}          # per-CSV: rows by vel_src / reason
+        # 2026-10-16, dvl.selection primary (control/dvl.py): what the blend
+        # did on THIS tick (why, code, w, src, target — the CSV, the panel
+        # and the logs read it, never the aid again), the ticks without a tag
+        # state since its last step (replayed as fade steps on the next one),
+        # the HELD log line's own memory, and the station bridge's DVL rung
+        # bookkeeping for the run meta (station_bridge_dvl).
+        self._dvl_tick: dict = {}
+        self._blend_skip = 0
+        self._dvl_dis_logged = ""          # the dis_* code last logged as HELD
+        self._dvl_dis_log_t = -1e9
+        self._sb_dvl = self._sb_dvl_new()
+        self._sb_rung_on = False           # the rung carried this dropout
         # LATCHED if any DVL code on the TICK path ever raises: from then on
         # the tick asks the DVL for nothing and flies the tag finite
         # difference. A new sensor's bookkeeping must never be able to abort
@@ -1506,7 +1553,9 @@ class MpcWorker(TimerWorker):
             self._rl7d = HwRl7d(self.cfg, log=lambda m: self._log("info", m))
         except Exception as e:                                   # noqa: BLE001
             self._rl7d_error = f"{type(e).__name__}: {e}"
-            self._log("info", f"ctrl: RL_7D unavailable ({self._rl7d_error}) — rl_7d mode will refuse")
+            # (2026-10-16: an export refused for what it was trained on — rl_policy.ExportRefused — is a warning)
+            self._log("warn" if getattr(e, "export_refused", False) else "info",
+                      f"ctrl: RL_7D unavailable ({self._rl7d_error}) — rl_7d mode will refuse")
         # LOW mode rl_pwm (2026-09-30): the per-thruster RL policy. Built up front like the axes one; a missing or
         # non-pwm export only costs that mode. It moves nothing by being built — its pulses leave on bus.cmd_pwm only
         # while engaged, and only through a sink whose vehicle gate holds (control/rl_pwm.py).
@@ -1518,7 +1567,8 @@ class MpcWorker(TimerWorker):
             self._rl_pwm = HwRlPwm(self.cfg, log=lambda m: self._log("info", m))
         except Exception as e:                                   # noqa: BLE001
             self._rl_pwm_error = f"{type(e).__name__}: {e}"
-            self._log("info", f"ctrl: RL_PWM controller unavailable ({self._rl_pwm_error}) — rl_pwm mode will refuse")
+            self._log("warn" if getattr(e, "export_refused", False) else "info",
+                      f"ctrl: RL_PWM controller unavailable ({self._rl_pwm_error}) — rl_pwm mode will refuse")
         # LOW mode rl_pwm_7d (2026-10-03): the pwm policy trained WITH a roll/pitch reference. Same transport, gate and cap
         # (rl_pwm.pwm_cap) as rl_pwm; a missing or level-trained export only costs this mode.
         self._rl_pwm7d = None
@@ -1528,7 +1578,8 @@ class MpcWorker(TimerWorker):
             self._rl_pwm7d = HwRlPwm7d(self.cfg, log=lambda m: self._log("info", m))
         except Exception as e:                                   # noqa: BLE001
             self._rl_pwm7d_error = f"{type(e).__name__}: {e}"
-            self._log("info", f"ctrl: RL_PWM_7D unavailable ({self._rl_pwm7d_error}) — rl_pwm_7d mode will refuse")
+            self._log("warn" if getattr(e, "export_refused", False) else "info",
+                      f"ctrl: RL_PWM_7D unavailable ({self._rl_pwm7d_error}) — rl_pwm_7d mode will refuse")
         self._mpc_ctrl = None
         self._mpcc_ctrl = None
         try:
@@ -1888,10 +1939,30 @@ class MpcWorker(TimerWorker):
         # position noise, for which the gain is alpha / sqrt(2 - alpha)
         # (0.507 at 0.6) — not the white-input sqrt(alpha / (2 - alpha)).
         al = min(1.0, max(1e-3, float(self.cfg.vel_lp_alpha)))
-        self.dvl = DV.DvlAid(cfg, fd_lp_gain=al / math.sqrt(2.0 - al))
+        # dt: the period the DVL-primary blend steps at (the trained export's
+        # control_dt; rl_policy refuses an export whose control_dt differs)
+        self.dvl = DV.DvlAid(cfg, fd_lp_gain=al / math.sqrt(2.0 - al),
+                             dt=1.0 / float(self.cfg.ctrl_hz))
+        primary = self.dvl.selection == "primary"
         m = ("mount NOT MEASURED — it can only run in shadow"
              if not self.dvl.mount_measured else
              f"mount rpy {cfg['mount_rpy_deg']} deg, t_flu {cfg['mount_t_flu']} m")
+        if primary:
+            sel = (f". selection primary: the DVL is the horizontal velocity; "
+                   f"a disagreement holds it back and it returns by itself; "
+                   f"only a lasting one (escalation {cfg['esc_latch_s']:g} s, "
+                   f"or {cfg['esc_repeat_n']} episodes in "
+                   f"{cfg['esc_repeat_window_s']:g} s) or a "
+                   f"device-configuration change latches. Legacy-only keys, "
+                   f"not used here: reentry_s {cfg['reentry_s']:g} "
+                   f"(blend_xfade_s instead), agree_trip_m_s "
+                   f"{cfg['agree_trip_m_s']:g} (agree_hold_m_s / "
+                   f"agree_release_m_s / esc_latch_s instead); innov_max_m_s "
+                   f"{cfg['innov_max_m_s']:g} admits the station-bridge DVL "
+                   f"rung")
+        else:
+            sel = (". selection LEGACY (the 2026-10-01..15 ladder: re-entry, "
+                   "innovation gate, latching trips)")
         self._log(
             "warn", f"dvl: built ({cfg['host']}:{cfg['port']}), switch "
                     f"{'IN' if self.dvl.use else 'OUT (shadow)'}; {m}. "
@@ -1899,8 +1970,20 @@ class MpcWorker(TimerWorker):
                     f"changes only while disengaged; IN needs the mount "
                     f"proven against the tag velocity"
                     + ("" if cfg["require_proven"] else
+                       " — require_proven is FALSE (recorded opt-out of the "
+                       "first proof; the escalation and device-configuration "
+                       "latches stay armed)" if primary else
                        " — require_proven is FALSE (recorded opt-out; the "
-                       "runtime trips stay armed)"))
+                       "runtime trips stay armed)") + sel)
+        if primary:
+            # A legacy-only key tuned at the pool would change NOTHING under
+            # primary: say so, once, where the operator reads.
+            for k, gov in DV.INACTIVE_IN_PRIMARY.items():
+                if cfg[k] != DV.DEFAULTS[k]:
+                    self._log("warn", f"dvl: dvl.{k} is {cfg[k]!r} in "
+                                      f"hw_mpc.yaml, but selection primary "
+                                      f"does not use it — edit "
+                                      f"{' / '.join(gov)} instead")
 
     def _omega_at(self, t: float):
         """Body rates (p, q, r) at station time ``t``, interpolated from the
@@ -1938,17 +2021,40 @@ class MpcWorker(TimerWorker):
         """One state.DvlSample (bus.dvl). The lever-arm correction needs the
         body rate of the sample's own moment; with a lever arm and no rate
         history reaching that moment the aid marks the sample unusable
-        (an uncorrected reading is not the body-origin velocity)."""
-        self._ekf_feed("dvl", sample)
-        if self.dvl is None or sample is None or self._dvl_fault:
+        (an uncorrected reading is not the body-origin velocity).
+
+        2026-10-16, selection primary: the aid FIRST, then the EKF (in a
+        ``finally``, so a DVL code fault still feeds it its log line) — the
+        EKF's gate (_ekf_dvl_may) asks the aid whether THIS sample may be
+        used, and that needs its own gates and flags."""
+        if not self._dvl_primary():
+            self._ekf_feed("dvl", sample)
+            if self.dvl is None or sample is None or self._dvl_fault:
+                return
+            try:
+                omega = self._omega_at(float(sample.t_valid))
+                was, trips = self.dvl.proven, self.dvl.n_trips
+                self.dvl.note_sample(sample, omega)
+                self._dvl_note_proof(was, trips)
+            except Exception as e:                               # noqa: BLE001
+                self._dvl_trip_fault("sample", e)
             return
         try:
-            omega = self._omega_at(float(sample.t_valid))
-            was, trips = self.dvl.proven, self.dvl.n_trips
-            self.dvl.note_sample(sample, omega)
-            self._dvl_note_proof(was, trips)
-        except Exception as e:                                   # noqa: BLE001
-            self._dvl_trip_fault("sample", e)
+            if sample is not None and not self._dvl_fault:
+                try:
+                    omega = self._omega_at(float(sample.t_valid))
+                    was, trips = self.dvl.proven, self.dvl.n_trips
+                    self.dvl.note_sample(sample, omega)
+                    self._dvl_note_proof(was, trips)
+                except Exception as e:                           # noqa: BLE001
+                    self._dvl_trip_fault("sample", e)
+        finally:
+            self._ekf_feed("dvl", sample)
+
+    def _dvl_primary(self) -> bool:
+        """Is a DVL built, running ``dvl.selection: primary``?"""
+        return bool(self.dvl is not None
+                    and getattr(self.dvl, "selection", "") == "primary")
 
     @Slot(object)
     def on_dvl_info(self, info) -> None:
@@ -1991,9 +2097,32 @@ class MpcWorker(TimerWorker):
                                f"one of them to 0.")
 
     def _dvl_note_proof(self, was: bool, trips: int) -> None:
-        """Say it ONCE when the mount becomes proven, and once per trip."""
+        """Say it ONCE when the mount becomes proven, and once per trip.
+        (primary: a trip is one of the two LATCHES — an escalation or the
+        device's own configuration — and the line says what to do.)"""
         d = self.dvl
-        if d.n_trips != trips:
+        primary = self._dvl_primary()
+        if d.n_trips != trips and primary:
+            lt = str(d.last_trip)
+            if lt.startswith("the device's configuration changed"):
+                msg = (f"dvl: TRIPPED (latched) — {lt}. The proof was made on "
+                       f"a different output stream: check the device's "
+                       f"setting, fly a proving pass (surge AND sway, tags in "
+                       f"view), then set the switch OUT and IN.")
+            else:
+                how = ("It kept coming back, so it is not a glitch"
+                       if "repeatedly" in lt else
+                       "It lasted, so it is not a glitch")
+                msg = (f"dvl: TRIPPED (latched) — {lt}. {how}: the DVL is "
+                       f"OUT of the estimator (tag finite difference) until "
+                       f"you fly a proving pass (surge AND sway, tags in view) "
+                       f"and then set the switch OUT and IN. Check the mount "
+                       f"(dvl.mount_rpy_deg, the device's mounting rotation "
+                       f"offset), the lever arm and the bottom lock first.")
+            self._log("error", msg)
+            if self.engaged:
+                self._event(msg)
+        elif d.n_trips != trips:
             msg = (f"dvl: TRIPPED — {d.last_trip}. The DVL is OUT of the "
                    f"estimator (tag finite difference) until the switch is "
                    f"set OUT then IN again, which needs a proof made after "
@@ -2022,7 +2151,20 @@ class MpcWorker(TimerWorker):
             # of standing difference. Say at what speed that alone trips.
             dev = float(f.get("dev") or 0.0)
             trip = float(d.cfg["agree_trip_m_s"])
-            if dev > 1e-6 and trip / dev < 0.6:
+            hold = float(d.cfg["agree_hold_m_s"])
+            if primary and dev > 1e-6 and hold / dev < 0.6:
+                # (primary: the slow residual's hold level, and the
+                # escalation that a lasting one becomes)
+                self._log("warn", f"dvl: the proven mount still differs "
+                                  f"from the tags by {dev:.2f} of the speed; "
+                                  f"above {hold / dev:.2f} m/s that alone "
+                                  f"holds the DVL back (slow residual > "
+                                  f"{hold * 100:.0f} cm/s) and, lasting "
+                                  f"{float(d.cfg['esc_latch_s']):g} s, "
+                                  f"latches it. Correct dvl.mount_rpy_deg yaw "
+                                  f"by {f.get('mount_yaw_fix_deg', 0.0):+.1f} "
+                                  f"deg (and restart) to remove it.")
+            elif not primary and dev > 1e-6 and trip / dev < 0.6:
                 self._log("warn", f"dvl: the proven mount still differs "
                                   f"from the tags by {dev:.2f} of the speed; "
                                   f"above {trip / dev:.2f} m/s that alone "
@@ -2107,7 +2249,11 @@ class MpcWorker(TimerWorker):
         here — the switch IN, not tripped, the proof gate satisfied — and a
         run that was not eligible at engage stays on the tag finite
         difference to its end. Within an eligible run a tick may still fall
-        back (no lock, stale, innovation), and a trip ends its DVL use."""
+        back (no lock, stale, innovation), and a trip ends its DVL use.
+
+        (primary, 2026-10-16: the question is DvlAid.arm_refusal — a fit
+        refutation current at engage no longer unarms the whole run; the
+        per-tick dis_fit hold holds the DVL until it ends.)"""
         d = self.dvl
         self._dvl_run_ok, self._dvl_run_why = False, ""
         if d is None:
@@ -2120,7 +2266,8 @@ class MpcWorker(TimerWorker):
             self._dvl_run_why = "DVL tripped before engage"
         else:
             try:
-                why = d.refusal(True)
+                why = (d.arm_refusal() if self._dvl_primary()
+                       else d.refusal(True))
             except Exception as e:                               # noqa: BLE001
                 # set_engaged must not die on the DVL's bookkeeping.
                 self._dvl_trip_fault("arm", e)
@@ -2135,7 +2282,9 @@ class MpcWorker(TimerWorker):
         """-> (vel_body (3,) | None, why): may this tick fly on the DVL?
         ``running`` = judge as an engaged tick (default: ``self.engaged``).
         ``need_ref`` False = the station bridge's rung, which has no tag
-        velocity to check the sample against (DvlAid.velocity)."""
+        velocity to check the sample against (DvlAid.velocity).
+        (primary: only the rung asks, and the answer is
+        DvlAid.rung_velocity — the tick itself goes through _dvl_vel_fn.)"""
         if self.dvl is None:
             return None, ""
         if self._dvl_fault:
@@ -2144,7 +2293,10 @@ class MpcWorker(TimerWorker):
                 and not self._dvl_run_ok:
             return None, self._dvl_run_why
         try:
-            v, why = self.dvl.velocity(t, need_ref=need_ref)
+            if self._dvl_primary():
+                v, why = self.dvl.rung_velocity(t)
+            else:
+                v, why = self.dvl.velocity(t, need_ref=need_ref)
             if v is not None and not np.all(np.isfinite(v)):
                 # Belt and braces: nothing non-finite may reach meas["nu"].
                 return None, "DVL velocity not finite"
@@ -2152,6 +2304,46 @@ class MpcWorker(TimerWorker):
         except Exception as e:                                   # noqa: BLE001
             self._dvl_trip_fault("velocity", e)
             return None, "DVL code fault"
+
+    def _dvl_vel_fn(self, t: float, fd_b, running: bool | None = None):
+        """(primary) The StateAssembler's ``vel_fn``: one tick of the
+        DVL-primary blend on THIS tick's tag finite difference ``fd_b`` ->
+        (v_xy | None, src, w). The run's arming and a code fault are asked
+        first (not armed: the blend still steps, toward the tag velocity);
+        then DvlAid.usable and DvlAid.blend_step. What it did is kept in
+        ``_dvl_tick`` for the CSV, the panel and the logs. NEVER raises: a
+        fault latches _dvl_fault and this tick flies the tag finite
+        difference (w 0 — a hard switch, accepted for a code fault)."""
+        self._dvl_tick = {"why": "", "code": "", "w": 0.0, "src": "tag_fd",
+                          "target": 0.0}
+        try:
+            d = self.dvl
+            if self._dvl_fault:
+                self._dvl_tick.update(why="DVL code fault", code="fault")
+                return None, DV.VEL_TAG_FD, 0.0
+            if (self.engaged if running is None else running) \
+                    and not self._dvl_run_ok:
+                ok, why, code = False, self._dvl_run_why, "not_armed"
+            else:
+                ok, why, code = d.usable(t)
+            n_skip, self._blend_skip = self._blend_skip, 0
+            v_b, w, src, code, why2 = d.blend_step(t, fd_b, ok, code,
+                                                   n_skip=n_skip)
+            v_b = np.asarray(v_b, float)
+            if w > 0.0 and not np.all(np.isfinite(v_b[:2])):
+                # Belt and braces: nothing non-finite may reach meas["nu"].
+                self._dvl_tick.update(why="DVL velocity not finite",
+                                      code="implausible")
+                return None, DV.VEL_TAG_FD, 0.0
+            self._dvl_tick = {"why": why2 or why, "code": code,
+                              "w": float(w), "src": str(src),
+                              "target": float(d.blend.target)}
+            return (v_b[:2].copy() if w > 0.0 else None), str(src), float(w)
+        except Exception as e:                                   # noqa: BLE001
+            self._dvl_trip_fault("blend", e)
+            self._dvl_tick = {"why": "DVL code fault", "code": "fault",
+                              "w": 0.0, "src": DV.VEL_TAG_FD, "target": 0.0}
+            return None, DV.VEL_TAG_FD, 0.0
 
     def _dvl_inputs(self, t: float, running: bool | None = None):
         """-> (vel_xy | None, disp_xy | None, why) for ``asm.step``: the
@@ -2174,16 +2366,91 @@ class MpcWorker(TimerWorker):
     def _dvl_after_step(self, meas, health, vel_xy, why: str,
                         t: float) -> None:
         """Hand the innovation gate this tick's tag velocity and report a
-        change of velocity source. Guarded: see ``_dvl_fault``."""
+        change of velocity source. Guarded: see ``_dvl_fault``. (primary:
+        no innovation gate; the tick's own usage code goes into ``health``
+        and the hold / release / "again" lines are said here.)"""
         if self.dvl is None:
             return
         health["dvl_why"] = why
+        primary = self._dvl_primary()
+        if primary:
+            if meas is None:
+                health["dvl_code"] = "no_tag"
+                health["dvl_why"] = ("no tag state this tick (the blend waits "
+                                     "for it)")
+            else:
+                health["dvl_code"] = str(self._dvl_tick.get("code", "") or "")
         if self._dvl_fault:
             return
         try:
-            self._dvl_after_step_inner(meas, health, vel_xy, why, t)
+            if primary:
+                self._dvl_after_step_primary(meas, health, t)
+            else:
+                self._dvl_after_step_inner(meas, health, vel_xy, why, t)
         except Exception as e:                                   # noqa: BLE001
             self._dvl_trip_fault("monitor", e)
+
+    def _dvl_after_step_primary(self, meas, health, t: float) -> None:
+        d = self.dvl
+        was, trips = d.proven, d.n_trips
+        self._dvl_note_proof(was, trips)
+        # The escalation's warning: the second counted episode in the window
+        # — one more latches it. Any switch state (a shadow DVL can be
+        # latched too, and the operator should hear it before switching IN).
+        for _t, text in d.take_warnings():
+            msg = (f"dvl: {text} — one more latches it. Check the mount, the "
+                   f"lever arm and the bottom lock.")
+            self._log("warn", msg)
+            if self.engaged:
+                self._event(msg)
+        if not d.use or meas is None:
+            return
+        tk = self._dvl_tick
+        code = str(health.get("dvl_code", "") or "")
+        why = str(health.get("dvl_why", "") or "")
+        # A disagreement HOLD, from the tick's own code. Its end is judged
+        # only on a tick whose code says the hold was looked at and found
+        # clear AND the DVL fades back in (ok): a flag or a data gate masks
+        # it (they come first in usable()), and the gross check keeps it out
+        # ("released ... fades back in" on either would be a lie). The two
+        # lines PAIR (fix round 1): the hold is remembered only once its
+        # HELD line is written — a hold starting within 2 s of the last one
+        # is announced on its first tick after that, or, if it ends sooner,
+        # neither line is written (the panel shows it). Before, the memory
+        # was set with the line suppressed: 19 "released" for 14 HELD on the
+        # armed recordings [측정 DTF verify/REPLAY.md §8 item 2].
+        if code.startswith("dis_"):
+            if not self._dvl_dis_logged and t - self._dvl_dis_log_t > 2.0:
+                self._dvl_dis_log_t = t
+                self._dvl_dis_logged = code
+                self._log("warn", f"dvl: HELD (not latched) — {why}. The "
+                                  f"DVL comes back by itself when it "
+                                  f"agrees again; nothing to press")
+        elif self._dvl_dis_logged and code == "ok":
+            self._dvl_dis_logged = ""
+            r = d.residual_slow_m_s
+            self._log("info", f"dvl: hold released — the DVL agrees with the "
+                              f"tag velocity again (slow residual "
+                              f"{(r or 0.0) * 100:.1f} cm/s); it fades back in "
+                              f"over {float(d.cfg['blend_xfade_s']):g} s")
+        elif code in ("latched", "out", "not_armed", "fault"):
+            self._dvl_dis_logged = ""         # its own line says enough
+        used = float(tk.get("target", 0.0) or 0.0) >= 1.0
+        if self._dvl_logged is None:
+            self._dvl_logged = used           # the engage line already said
+        elif used != self._dvl_logged and t - self._dvl_log_t > 2.0:
+            # Against the last source LOGGED, not last tick's (shipped rule).
+            self._dvl_log_t = t
+            self._dvl_logged = used
+            if used:
+                self._log("info", "ctrl: velocity source -> DVL")
+            elif code in ("latched", "out", "not_armed", "fault"):
+                self._log("warn", f"ctrl: velocity source -> tag finite "
+                                  f"difference ({why})")
+            else:
+                self._log("warn", f"ctrl: velocity fading to the tag finite "
+                                  f"difference ({why}) — the DVL returns by "
+                                  f"itself")
 
     def _dvl_after_step_inner(self, meas, health, vel_xy, why: str,
                               t: float) -> None:
@@ -2235,12 +2502,44 @@ class MpcWorker(TimerWorker):
         out["not_armed_why"] = e.get("why") or None
         out["rows"] = dict(self._dvl_rows)
         out["code_fault"] = self._dvl_fault or None
-        out["switch_rule"] = ("the IN/OUT switch changes only while "
-                              "disengaged and with no controller CSV open; "
-                              "eligibility is frozen at engage; a trip is "
-                              "latched until the operator re-arms; per-row "
-                              "truth is CSV vel_src")
+        if self._dvl_primary():
+            out["switch_rule"] = (
+                "the IN/OUT switch changes only while disengaged and with no "
+                "controller CSV open; eligibility is frozen at engage; a "
+                "disagreement is a hold that releases by itself; only a "
+                "lasting or repeated disagreement (escalation) or a "
+                "device-configuration change is latched until the operator "
+                "re-proves and re-arms; per-row truth is CSV vel_src / w_dvl "
+                "/ dvl_code (a `fallback: ...` row may still carry DVL weight "
+                "while it holds or fades: vel_src hold / blend)")
+            out["station_bridge_dvl"] = self._sb_dvl_meta()
+        else:
+            out["switch_rule"] = ("the IN/OUT switch changes only while "
+                                  "disengaged and with no controller CSV "
+                                  "open; eligibility is frozen at engage; a "
+                                  "trip is latched until the operator "
+                                  "re-arms; per-row truth is CSV vel_src")
         return out
+
+    @staticmethod
+    def _sb_dvl_new() -> dict:
+        """(primary) The station bridge's DVL rung over one CSV: tagged ticks
+        that opened it (admits) or did not although they flew the DVL
+        (refusals, by phrase), lost ticks carried on it, how many of those on
+        a held sample, and what broke the chain (by usage code)."""
+        return {"rung_admits": 0, "rung_refusals": {}, "dropouts_on_dvl": 0,
+                "rung_ticks": 0, "held_ticks": 0, "chain_breaks": {}}
+
+    def _sb_dvl_meta(self) -> dict:
+        m = {k: (dict(v) if isinstance(v, dict) else v)
+             for k, v in self._sb_dvl.items()}
+        m["rule"] = ("a tagged tick that flew the DVL opens the rung only "
+                     "with its sample within the innovation limit "
+                     "(dvl.innov_max_m_s, widened as shipped) of the tag "
+                     "velocity and no disagreement pending; a lost tick "
+                     "carries the last usable sample <= blend_hold_s across a "
+                     "data gate or a quality flag")
+        return m
 
     # -------------------------------------------------------------------- ekf
     def _setup_ekf(self) -> None:
@@ -2360,10 +2659,23 @@ class MpcWorker(TimerWorker):
         2026-10-02). Engaged, the run's own arm decision (`_dvl_run_ok`,
         which went through the same gate at engage) is the answer;
         disengaged, refusal() is asked at most every 0.5 s (it runs the
-        agreement fit). Any exception here = not given, never an EKF trip."""
+        agreement fit). Any exception here = not given, never an EKF trip.
+
+        (primary, 2026-10-16: AND DvlAid.usable — a sample that is flagged,
+        held for a disagreement, gated or latched does not reach the EKF
+        either; the device's covariance (sigma ~0.9 mm/s at rest [측정
+        KNOWN_ISSUES, 1011_155235_dvl_probe]) would let a fused wrong DVL
+        dominate it. on_dvl runs the aid before this, so the answer is
+        about THIS sample.)"""
         d = self.dvl
         if d is None or not d.use or d.tripped or self._dvl_fault:
             return False
+        if self._dvl_primary():
+            try:
+                if not d.usable(t)[0]:
+                    return False
+            except Exception:                                    # noqa: BLE001
+                return False
         if self.engaged:
             return bool(self._dvl_run_ok)
         c = self._ekf_dvl_ref
@@ -2455,7 +2767,10 @@ class MpcWorker(TimerWorker):
                     imu_s=float(e["imu_stale_s"]),
                     acc_s=max(1.0, float(e["imu_stale_s"])))
                 if meas is not None and health.get("ok"):
-                    err = _ekf_vs_tag(m, meas)
+                    # (primary: against the tag finite difference itself,
+                    # as the comment below says — nu[0:2] is the DVL blend)
+                    err = _ekf_vs_tag(m, meas, nu_ref=(
+                        health.get("nu_fd") if self._dvl_primary() else None))
                     # The velocity reference is the tag FINITE DIFFERENCE,
                     # whose noise scales with the tag noise (the demo's 1 cm
                     # gave 30 cm/s spikes and ended a healthy run). The
@@ -2727,7 +3042,14 @@ class MpcWorker(TimerWorker):
             # going away (review 2026-10-02, reproduced: a false 0.25 m/s
             # rejected on the last tagged ticks was taken by the rung on the
             # first lost one, and walked the estimate 0.5 m).
-            if health.get("vel_src") == DV.VEL_DVL:
+            # (primary, 2026-10-16: the blend flies a sample the tags
+            # contradict for a moment before its hold starts, so "flown" is
+            # not enough — DvlAid.rung_admit asks the shipped innovation
+            # limit against THIS tick's tag velocity, and no disagreement
+            # pending.)
+            self._sb_rung_on = False
+            if health.get("vel_src") == DV.VEL_DVL \
+                    and self._dvl_rung_admit(t, health):
                 self._dvl_xy = np.asarray(meas["eta"], float)[:2].copy()
             else:
                 self._dvl_xy = None
@@ -2834,9 +3156,18 @@ class MpcWorker(TimerWorker):
             # The chain broke (or the hold ran out): the rung stays closed
             # until the next fresh fix, whatever the DVL says afterwards.
             self._dvl_xy = None
+        elif self.engaged:
+            sb = self._sb_dvl
+            sb["rung_ticks"] += 1
+            if not self._sb_rung_on:
+                sb["dropouts_on_dvl"] += 1
+                self._sb_rung_on = True
         # What this row's velocity was (CSV vel_src): the DVL's on its own
         # rung, nothing measured on the IMU / freeze rungs.
         health["vel_src"] = (DV.VEL_DVL if tier == SB.TIER_DVL else "bridge")
+        # ...and its DVL weight and usage code (CSV w_dvl / dvl_code, 2026-10-16)
+        health["w_dvl"] = 1.0 if tier == SB.TIER_DVL else 0.0
+        health["dvl_code"] = "rung" if tier == SB.TIER_DVL else "bridge"
         self.phase_detail = br.detail()
         if tier == SB.TIER_COAST and br.n_coast and int(
                 br.elapsed * self.cfg.ctrl_hz) % int(
@@ -2889,6 +3220,29 @@ class MpcWorker(TimerWorker):
                                        float(imu.r)])])
         return {"eta": eta, "nu": nu, "nudot": np.zeros(6)}
 
+    def _dvl_rung_admit(self, t: float, health) -> bool:
+        """May this tagged tick, which flew the DVL, open the bridge's DVL
+        rung? Legacy: yes (flying it was the whole test). Primary:
+        DvlAid.rung_admit. Guarded like every DVL call on the tick."""
+        if not self._dvl_primary():
+            return True                       # legacy: exactly as shipped
+        if self._dvl_fault:
+            return False
+        try:
+            ok, why = self.dvl.rung_admit(t, health.get("nu_fd"),
+                                          health.get("tag_age"))
+        except Exception as e:                                   # noqa: BLE001
+            self._dvl_trip_fault("rung", e)
+            return False
+        if self.engaged:
+            sb = self._sb_dvl
+            if ok:
+                sb["rung_admits"] += 1
+            else:
+                k = str(why).split(" (")[0]
+                sb["rung_refusals"][k] = sb["rung_refusals"].get(k, 0) + 1
+        return bool(ok)
+
     def _bridge_meas_dvl(self, base, t, dt):
         """The DVL rung's state, or None if the DVL may not carry this tick.
 
@@ -2918,12 +3272,24 @@ class MpcWorker(TimerWorker):
         if base is None:
             return None
         # the guarded entry point; no tag velocity exists to check against
+        # (primary: DvlAid.rung_velocity — its hold carries a gated or
+        # flagged newest sample on the last usable one for blend_hold_s)
         v, _why = self._dvl_velocity(t, need_ref=False)
+        primary = self._dvl_primary()
         if v is None:
+            if primary and self.engaged:
+                cb = self._sb_dvl["chain_breaks"]
+                k = DV.reason_code(_why)
+                cb[k] = cb.get(k, 0) + 1
             return None
+        if primary and self.engaged and str(_why).startswith("held: "):
+            self._sb_dvl["held_ticks"] += 1
         cfg = self._bridge.cfg
         speed = float(math.hypot(v[0], v[1]))
         if speed > cfg["dvl_max_speed_m_s"]:
+            if primary and self.engaged:
+                cb = self._sb_dvl["chain_breaks"]
+                cb["speed_cap"] = cb.get("speed_cap", 0) + 1
             self._dvl_rung_closed(
                 f"it reads {speed:.2f} m/s during a station hold "
                 f"(> {cfg['dvl_max_speed_m_s']:.2f})", base, t)
@@ -2935,6 +3301,9 @@ class MpcWorker(TimerWorker):
         disp = float(math.hypot(xy[0] - self._dvl_xy0[0],
                                 xy[1] - self._dvl_xy0[1]))
         if disp > cfg["dvl_max_disp_m"]:
+            if primary and self.engaged:
+                cb = self._sb_dvl["chain_breaks"]
+                cb["disp_cap"] = cb.get("disp_cap", 0) + 1
             self._dvl_rung_closed(
                 f"its integral is {disp:.2f} m from the last fix "
                 f"(> {cfg['dvl_max_disp_m']:.2f})", base, t)
@@ -4362,10 +4731,24 @@ class MpcWorker(TimerWorker):
         # (set_dvl_use refuses while engaged) and so is the run's
         # ELIGIBILITY to use it (_dvl_arm_run).
         self._dvl_arm_run()
-        vel_xy, disp_xy, _dvl_why = self._dvl_inputs(t_e, running=True)
-        meas, h = self.asm.step(self.fix, self.imu, t_e,
-                                1.0 / self.cfg.ctrl_hz, vel_xy=vel_xy,
-                                disp_xy=disp_xy)
+        if self._dvl_primary():
+            # 2026-10-16: the blend restarts with the assembler and SNAPS to
+            # its first target on this tick (DvlBlend.reset), as trained.
+            try:
+                self.dvl.blend_reset()
+            except Exception as e:                               # noqa: BLE001
+                self._dvl_trip_fault("blend reset", e)
+            self._blend_skip = 0
+            self._dvl_dis_logged = ""
+            self._sb_rung_on = False
+            meas, h = self.asm.step(
+                self.fix, self.imu, t_e, 1.0 / self.cfg.ctrl_hz,
+                vel_fn=lambda tt, fd: self._dvl_vel_fn(tt, fd, running=True))
+        else:
+            vel_xy, disp_xy, _dvl_why = self._dvl_inputs(t_e, running=True)
+            meas, h = self.asm.step(self.fix, self.imu, t_e,
+                                    1.0 / self.cfg.ctrl_hz, vel_xy=vel_xy,
+                                    disp_xy=disp_xy)
         if meas is None:
             self.reason = f"engage refused: {h['why']}"
             self._log("warn", f"ctrl: {self.reason}")
@@ -4603,15 +4986,30 @@ class MpcWorker(TimerWorker):
                 self._log("warn", f"ctrl: the DVL switch is IN but this run "
                                   f"flies on the tag finite difference — "
                                   f"{self._dvl_run_why}")
-            if self._dvl_run_ok and str(self.cfg.mode) in ("rl", "rl_pwm", "rl_7d", "rl_pwm_7d"):
-                # rl_policies/*/RL_controller_README.md: these followers were
-                # trained against a SIMULATED tag-finite-difference estimator
-                # ("DVL 없음"), so a direct velocity is an input they never saw.
-                self._log("warn", f"ctrl: {self.cfg.mode} was trained on a "
-                                  f"simulated tag-finite-difference velocity, "
-                                  f"not a DVL's — this run feeds it a "
-                                  f"different observation distribution (meta "
-                                  f"dvl.use_at_engage)")
+        if str(self.cfg.mode) in ("rl", "rl_pwm", "rl_7d", "rl_pwm_7d"):
+            # rl_policies/*/RL_controller_README.md: the followers before
+            # pwm11att13 were trained against a SIMULATED tag-finite-
+            # difference estimator ("DVL 없음"), so a direct velocity is an
+            # input they never saw; an export whose obs_spec says
+            # velocity_source.trained (2026-10-16) was trained on the
+            # DVL-primary blend instead, and its off-distribution case is
+            # the DVL NOT armed (rl_policy.rl_velocity_note).
+            try:
+                from .rl_policy import rl_velocity_note
+                note = rl_velocity_note(
+                    str(self.cfg.mode),
+                    getattr(self.ctrl, "velocity_source", None),
+                    armed=bool(self.dvl is not None and self.dvl.use
+                               and self._dvl_run_ok),
+                    run_why=(self._dvl_run_why if self.dvl is not None else
+                             "no DVL built (dvl.enabled false / no --dvl)"),
+                    estimator=("ekf" if self.ekf_control else
+                               "imu_dr" if self.dr_control else "tag"))
+            except Exception as e:                               # noqa: BLE001
+                note = ("warn", f"ctrl: {self.cfg.mode}: the export's "
+                                f"velocity-source note failed ({e})")
+            if note is not None:
+                self._log(note[0], note[1])
         self._log_event(f"ENGAGED ({self.cfg.mode}) datum p0="
                         f"{[round(float(v), 3) for v in self._datum['p0']]} "
                         f"yaw0 {math.degrees(self._datum['yaw0']):.1f} deg; "
@@ -5287,6 +5685,21 @@ class MpcWorker(TimerWorker):
             return "tag fix stale"
         if self.imu is None or self.imu.roll is None:
             return "no vehicle attitude"
+        # 2026-10-16: an RL export trained on the DVL-primary blend
+        # (obs_spec velocity_source.trained) saw ONLY the assembler's blend
+        # as its velocity in training (RL_controller rov_rl/env/rov_env.py:
+        # VelocitySelector is the sole source of v_b) — the EKF's or
+        # imu_dr's state is a velocity it never saw. Asked before the EKF's
+        # own readiness: such a run can never fly on it. Exports without the
+        # block are unchanged.
+        vs = getattr(self.ctrl, "velocity_source", None)
+        if isinstance(vs, dict) and vs.get("trained") is True \
+                and not self.observe and (self.ekf_control or self.dr_control):
+            est = "EKF" if self.ekf_control else "imu_dr"
+            return (f"policy {getattr(self.ctrl, 'policy_dir', '?')} was "
+                    f"trained on the state assembler's DVL-primary blend; "
+                    f"ESTIMATOR {est} CONTROL would hand it a different "
+                    f"velocity — refused; set the estimator to TAG")
         if self.ekf_control and not self.observe:
             why = self._ekf_control_refusal()
             if why:
@@ -9329,9 +9742,23 @@ class MpcWorker(TimerWorker):
         self._pwm_sent_us = None      # set by whatever this tick puts on cmd_pwm
         self._pwm_guard = 0           # the follower's obs-guard code (CSV pwm_guard)
         self._pwm_keepalive(t)
-        vel_xy, disp_xy, dvl_why = self._dvl_inputs(t)
-        meas, health = self.asm.step(self.fix, self.imu, t, dt,
-                                     vel_xy=vel_xy, disp_xy=disp_xy)
+        if self._dvl_primary():
+            # 2026-10-16, dvl.selection primary: the blend needs THIS tick's
+            # tag finite difference, so it runs INSIDE the step (vel_fn); a
+            # tick without a tag state does not step it, and the next one
+            # replays its fade step (_blend_skip).
+            self._dvl_tick = {"why": "no tag state this tick (the blend "
+                                     "waits for it)", "code": "no_tag",
+                              "w": None, "src": ""}
+            meas, health = self.asm.step(self.fix, self.imu, t, dt,
+                                         vel_fn=self._dvl_vel_fn)
+            if meas is None:
+                self._blend_skip += 1
+            vel_xy, dvl_why = None, str(self._dvl_tick.get("why", ""))
+        else:
+            vel_xy, disp_xy, dvl_why = self._dvl_inputs(t)
+            meas, health = self.asm.step(self.fix, self.imu, t, dt,
+                                         vel_xy=vel_xy, disp_xy=disp_xy)
         # 2026-10-15: every tick's vehicle-clock attitude age into the engage
         # refusal's window, and the banner's once-a-minute mission line.
         self._note_att_age(t, health)
@@ -10055,6 +10482,9 @@ class MpcWorker(TimerWorker):
             else ""
         s.dvl_use = bool(d.use)
         s.dvl_proven = bool(d.proven)
+        if self._dvl_primary():
+            self._publish_dvl_primary(s, meas, health, t)
+            return
         # The tick's own reason, not a second question to the aid: the
         # gate's reference has moved on since, and asking again could answer
         # differently (review 2026-10-02: the panel said "fallback" with no
@@ -10075,6 +10505,56 @@ class MpcWorker(TimerWorker):
             # The aid knows nothing of the engage-time decision; without
             # this the chip read "DVL held back" with no reason at all.
             s.dvl_note = self._dvl_run_why
+        sm = d.sample
+        if sm is not None:
+            s.dvl_age_s = max(0.0, t - float(sm.t_valid))
+            s.dvl_alt_m = sm.altitude
+            s.dvl_fom = sm.fom
+            s.dvl_hz = sm.hz
+        s.dvl_res_m_s = d.residual_m_s
+
+    def _publish_dvl_primary(self, s: MpcStatus, meas, health, t) -> None:
+        """(primary) The panel row from the tick's OWN blend step
+        (_dvl_tick / health), never a second question to the aid."""
+        d = self.dvl
+        tk = self._dvl_tick
+        target = tk.get("target")
+        if meas is None:
+            code, why, w = ("no_tag", "no tag state this tick (the blend "
+                                      "waits for it)", None)
+        elif s.vel_src == "bridge":
+            tier = self._bridge.tier if self._bridge is not None else "?"
+            code, w = "bridge", 0.0
+            why = (f"station bridge on tier {tier} (the DVL rung is not "
+                   f"carrying this dropout)")
+            target = 0.0
+        elif health.get("dvl_code") == "rung":
+            code, why, w, target = "rung", "", 1.0, 1.0
+        else:
+            code = str(health.get("dvl_code", "") or tk.get("code", "") or "")
+            why = str(health.get("dvl_why", "") or "")
+            w = health.get("w_dvl", tk.get("w"))
+        used = bool(code in ("ok", "rung") and w is not None and w > 0.0)
+        s.dvl_state, s.dvl_note = d.state(t, used=used, why=(why or None),
+                                          code=code, w=w)
+        if self.engaged and not self._dvl_run_ok and (
+                s.dvl_state == DV.ST_NOT_ARMED
+                or (d.use and s.dvl_state == DV.ST_NO_LOCK)):
+            # The aid knows nothing of the engage-time decision: with the
+            # switch IN, a lost lock in a run not armed for the DVL is "not
+            # used this run", never "returns by itself" — it cannot return
+            # within this run (fix round 1, review F2). OUT keeps the aid's
+            # plain no-lock words.
+            s.dvl_state, s.dvl_note = DV.ST_NOT_ARMED, self._dvl_run_why
+        s.dvl_w = None if w is None else float(w)
+        s.dvl_code = code
+        s.dvl_target = None if target is None else float(target)
+        s.dvl_res_slow_m_s = d.residual_slow_m_s
+        s.dvl_esc_s = d.escalation_s
+        s.dvl_scale = d.scale_ratio
+        s.dvl_episodes = int(d.episodes_recent)
+        s.dvl_esc_limits = (float(d.cfg["esc_latch_s"]), int(d.cfg["esc_repeat_n"]),
+                            float(d.cfg["esc_repeat_window_s"]))
         sm = d.sample
         if sm is not None:
             s.dvl_age_s = max(0.0, t - float(sm.t_valid))
@@ -10108,6 +10588,17 @@ class MpcWorker(TimerWorker):
                 tier = self._bridge.tier if self._bridge is not None else "?"
                 k2 = f"bridge: tier {tier}"
                 self._dvl_rows[k2] = self._dvl_rows.get(k2, 0) + 1
+            elif self._dvl_primary():
+                # (primary: by the tick's usage code — a `fallback:` row may
+                # still carry DVL weight while it holds or fades, vel_src
+                # hold / blend; the meta's switch_rule says so)
+                code = str(health.get("dvl_code", "") or "")
+                if meas is None:
+                    code = "no_tag"
+                if d.use and code not in ("ok", "rung"):
+                    why = str(health.get("dvl_why", "") or "other")
+                    k2 = "fallback: " + why.split(" (")[0]
+                    self._dvl_rows[k2] = self._dvl_rows.get(k2, 0) + 1
             elif d.use and src != DV.VEL_DVL:
                 why = str(health.get("dvl_why", "") or "other")
                 k2 = "fallback: " + why.split(" (")[0]   # drop per-tick numbers
@@ -10242,6 +10733,46 @@ class MpcWorker(TimerWorker):
             except OSError:
                 pass
 
+    def _dvl_sel_row(self, meas, health) -> list:
+        """The seven schema-22 columns (2026-10-16; CSV_HEADER's note): the
+        DVL's weight in this row's (u, v), the usage code, the 1-s and slow
+        residuals, the escalation bucket, the lowest alignment judged and the
+        scale ratio. Width kept whatever happens (the _dvl_row rule)."""
+        d = self.dvl
+        if d is None:
+            return ["0.000", ""] + ["nan"] * 5
+
+        def fmt(v, f):
+            try:
+                return "nan" if v is None or not math.isfinite(float(v)) \
+                    else format(float(v), f)
+            except (TypeError, ValueError):
+                return "nan"
+        try:
+            primary = self._dvl_primary()
+            src = (str(health.get("vel_src", "") or "")
+                   if meas is not None else "")
+            if not primary:
+                w = 1.0 if src == DV.VEL_DVL else 0.0
+                code = str(health.get("dvl_code", "") or "") \
+                    or DV.reason_code(health.get("dvl_why"))
+                if meas is None:
+                    code = "no_tag"
+            elif meas is None:
+                w, code = None, "no_tag"
+            else:
+                w = health.get("w_dvl")
+                code = str(health.get("dvl_code", "") or "")
+            code = code.replace(",", ";").replace(" ", "_")
+            return [fmt(w, ".3f"), code, fmt(d.residual_m_s, ".4f"),
+                    fmt(d.residual_slow_m_s, ".4f"),
+                    fmt(d.escalation_s if primary else None, ".2f"),
+                    fmt(getattr(d, "_al_min", None), "+.3f"),
+                    fmt(d.scale_ratio, ".2f")]
+        except Exception as e:                                   # noqa: BLE001
+            self._dvl_trip_fault("csv", e)
+            return ["nan", "fault"] + ["nan"] * 5
+
     def _dvl_cols(self, d, src: str, health, t) -> list:
         """The eight device columns of ``_dvl_row``."""
         def v3(v):
@@ -10361,6 +10892,7 @@ class MpcWorker(TimerWorker):
             # opens (REC pressed mid-mission) belongs to this record too
             self._policy_pin_csv = self._policy_live_pin()
             self._dvl_rows = {}              # per CSV (_dvl_row)
+            self._sb_dvl = self._sb_dvl_new()   # per CSV (the DVL rung)
             self._ekf_rows = {}              # per CSV (_ekf_row)
             self._ekf_open_log(stem)
             self._write_meta()
@@ -10462,7 +10994,7 @@ class MpcWorker(TimerWorker):
             except OSError:
                 pass
         return {
-            "schema_version": 21,         # 2: + plant, mission, meta_trigger
+            "schema_version": 22,         # 2: + plant, mission, meta_trigger
                                           # 3: + imu_dr, hardware.cam_tilt_deg
                                           # 4: + circle; `trajectory` is now
                                           #    PER-SHAPE (a circle carries
@@ -10887,6 +11419,28 @@ class MpcWorker(TimerWorker):
                                           #    (+<=20 ms at 50 Hz) — never
                                           #    pool them across
                                           #    mavlink_streams.requested_hz.
+                                          # 22 (2026-10-16): + CSV columns
+                                          #    w_dvl, dvl_code,
+                                          #    dvl_res_fast_m_s,
+                                          #    dvl_res_slow_m_s, dvl_esc_s,
+                                          #    dvl_align, dvl_scale on
+                                          #    EVERY LOW (CSV_HEADER's
+                                          #    2026-10-16 note); vel_src
+                                          #    gains `hold` / `blend`; meta
+                                          #    `dvl` gains selection, blend,
+                                          #    flags, disagreement,
+                                          #    escalation, inactive_keys /
+                                          #    governed_by, reentry_s_used,
+                                          #    station_bridge_dvl (primary)
+                                          #    and monitor_now's slow
+                                          #    numbers; the RL followers'
+                                          #    meta gains velocity_source /
+                                          #    obs_guard_trained. RECORD
+                                          #    BOUNDARY: never pool velocity
+                                          #    statistics across
+                                          #    dvl.selection (primary
+                                          #    blends, legacy switches hard
+                                          #    and latches on disagreement).
             # `source` answers "was the plant real". A LAND DRY-RUN is the
             # third answer and needs saying out loud: the vehicle IS the real
             # one, but it could not move and could not be commanded, and the
@@ -11812,6 +12366,9 @@ class MpcWorker(TimerWorker):
         # THE ATTITUDE'S TRUE AGE (schema 21), every LOW. See CSV_HEADER's
         # 2026-10-15 note.
         row += self._att_age_row(health, t)
+        # THE DVL SELECTION (schema 22): w_dvl, the usage code, the residuals,
+        # the escalation. See CSV_HEADER's 2026-10-16 note.
+        row += self._dvl_sel_row(meas, health)
         try:
             self._csv.write(",".join(row) + "\n")
             self._rows += 1

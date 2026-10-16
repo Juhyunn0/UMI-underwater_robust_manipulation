@@ -504,7 +504,7 @@ def test_the_run_meta_records_the_request():
         snap = {"policy": "per_message", "requested_hz": dict(MS.DEFAULT_HZ), "sent": True}
         w.mavlink_streams_fn = lambda: snap
         m = w._run_meta()
-        assert m["mavlink_streams"] == snap and m["schema_version"] == 21
+        assert m["mavlink_streams"] == snap and m["schema_version"] == 22
         json.dumps(m["mavlink_streams"])
 
         def broken():

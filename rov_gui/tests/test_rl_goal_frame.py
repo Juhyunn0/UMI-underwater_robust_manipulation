@@ -602,4 +602,8 @@ def test_world_frame_exports_are_byte_identical_to_the_pre_change_module(low, pd
     # meta: one key more, nothing else changed (policy_dir is relative to each module's REPO_ROOT: compared absolute)
     mn, mo = new_c.meta(), old_c.meta()
     assert new_c.policy_dir == old_c.policy_dir and mn.pop("policy_dir") and mo.pop("policy_dir")
+    # (2026-10-16, R7: what velocity / observation guard the export says it was trained on — none of these exports
+    # carries either block, so both read "none")
+    assert mn.pop("velocity_source") == {"export": None, "station": None}
+    assert mn.pop("obs_guard_trained", None) is None
     assert mn.pop("obs_goal_frame") is False and mn == mo

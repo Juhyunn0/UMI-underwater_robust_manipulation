@@ -190,9 +190,11 @@ def run(profile, T, seed, which=ESTIMATORS, tilt=True, **over):
     c.update(over)
     tr = truth(profile, T, tilt=tilt)
     ev = events(tr, T, seed, c)
+    # selection legacy (2026-10-16): "asm+dvl" below drives the SHIPPED
+    # ladder (aid.velocity), which its quoted numbers describe.
     dvl_cfg = {"mount_rpy_deg": [0.0, 0.0, 0.0],
                "mount_t_flu": [float(ARM[0]), 0.0, 0.0],
-               "require_proven": False}
+               "require_proven": False, "selection": "legacy"}
     mount = DV.mount_from_cfg(DV.resolve(dvl_cfg))
     est = {}
     for name in which:

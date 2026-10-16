@@ -1076,7 +1076,7 @@ def test_run_meta_carries_action_repr():
         _arm(w)
         _ticks(w)
         meta = w._run_meta()
-        assert meta["schema_version"] == 21     # 21: + att_age_v_s/att_tb_ms/banner_age_s (2026-10-15); 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
+        assert meta["schema_version"] == 22     # 22: + w_dvl/dvl_code/dvl_res_fast_m_s/dvl_res_slow_m_s/dvl_esc_s/dvl_align/dvl_scale (2026-10-16); 21: + att_age_v_s/att_tb_ms/banner_age_s (2026-10-15); 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
         pm = meta["policy"]
         assert pm["action_repr"] == POLICY_ACTION_REPR == "pos_yaw_width"
         assert pm["status"]["action_repr"] == "pos_yaw_width"
@@ -1475,7 +1475,7 @@ def test_gripper_lookahead_closes_on_intent():
         assert min(g_now for _, g_now in seen) > 0.30
         assert min(g for g, _ in seen) < 0.30
         meta = w._run_meta()
-        assert meta["schema_version"] == 21     # 21: + att_age_v_s/att_tb_ms/banner_age_s (2026-10-15); 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
+        assert meta["schema_version"] == 22     # 22: + w_dvl/dvl_code/dvl_res_fast_m_s/dvl_res_slow_m_s/dvl_esc_s/dvl_align/dvl_scale (2026-10-16); 21: + att_age_v_s/att_tb_ms/banner_age_s (2026-10-15); 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
         assert meta["policy"]["config"]["gripper_lookahead_s"] == 0.8
         assert meta["policy"]["estimator"]["lookahead_s"] == 0.8
         assert meta["policy"]["run"]["grip_lookahead_s"] == 0.8
@@ -1686,7 +1686,7 @@ def test_policy_meta_csv_and_plans_jsonl_carry_the_record():
         w.on_policy_plan(_mk_plan(w, infer_ms=42.0))
         _ticks(w, 2)
         meta = w._run_meta()
-        assert meta["schema_version"] == 21     # 21: + att_age_v_s/att_tb_ms/banner_age_s (2026-10-15); 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
+        assert meta["schema_version"] == 22     # 22: + w_dvl/dvl_code/dvl_res_fast_m_s/dvl_res_slow_m_s/dvl_esc_s/dvl_align/dvl_scale (2026-10-16); 21: + att_age_v_s/att_tb_ms/banner_age_s (2026-10-15); 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
         assert meta["trajectory"]["kind"] == "policy"
         assert meta["reference_clock"]["strategy"] == "plan_stream_policy"
         assert meta["plan_stream"]["enabled"] is True
@@ -2511,7 +2511,7 @@ def test_plans_jsonl_carries_the_fs_schedule_and_the_plan_timing():
 
         # the run record: same schema, the schedule as of ARM, plain JSON
         meta = w._run_meta()
-        assert meta["schema_version"] == 21
+        assert meta["schema_version"] == 22
         assert meta["policy"]["run"]["fs_schedule"] == "free"
         json.dumps(meta)                           # serialisable WITHOUT a default
         w.teardown()
@@ -2596,7 +2596,7 @@ def test_the_fs_schedule_is_pinned_at_arm_and_announced_once_per_arm():
             assert w._policy_status.fs_schedule == "free"
             meta = w._run_meta()
             assert meta["policy"]["run"]["fs_schedule"] == sched
-            assert meta["schema_version"] == 21
+            assert meta["schema_version"] == 22
             json.dumps(meta)
             w.teardown()
     # a status from a worker that PREDATES the field arms as `free`
@@ -3309,7 +3309,7 @@ def test_run_meta_under_none_marks_the_holder_and_the_solver_none():
         assert w.engaged, w.reason
         _ticks(w, 6)
         m = w._run_meta()
-        assert m["schema_version"] == 21     # 21: + att_age_v_s/att_tb_ms/banner_age_s (2026-10-15); 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26)
+        assert m["schema_version"] == 22     # 22: + w_dvl/dvl_code/dvl_res_fast_m_s/dvl_res_slow_m_s/dvl_esc_s/dvl_align/dvl_scale (2026-10-16); 21: + att_age_v_s/att_tb_ms/banner_age_s (2026-10-15); 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26)
         assert m["mode"] == "none" and m["policy_observe"] is True
         c = m["controller"]
         assert c["type"] == "none" == w.cfg.mode

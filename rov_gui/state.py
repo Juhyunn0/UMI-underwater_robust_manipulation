@@ -882,6 +882,23 @@ class MpcStatus:
     dvl_fom: float | None = None
     dvl_hz: float | None = None
     dvl_res_m_s: float | None = None     # |v_dvl - v_tag_fd| horizontal, low-passed
+    # 2026-10-16, dvl.selection primary (None / "" / 0 under legacy): the
+    # blend's DVL weight in this tick's (u, v) and where it is heading (1 / 0
+    # — the chip's arrow), the tick's usage code (dvl.reason_code vocabulary),
+    # the slow residual that holds the DVL back, the scale ratio, and the
+    # escalation bucket with its counted episodes in the window. vel_src then
+    # also reads "hold" (the last good sample) and "blend" (0 < w < 1), and
+    # dvl_state "held" (returns by itself), "not_armed", "no_tag".
+    dvl_w: float | None = None
+    dvl_code: str = ""
+    dvl_target: float | None = None
+    dvl_res_slow_m_s: float | None = None
+    dvl_esc_s: float | None = None
+    dvl_scale: float | None = None
+    dvl_episodes: int = 0
+    # (dvl.esc_latch_s, dvl.esc_repeat_n, dvl.esc_repeat_window_s): what the
+    # tooltip measures dvl_esc_s / dvl_episodes against (None = legacy)
+    dvl_esc_limits: tuple | None = None
     # ---- EKF (control/rl_ekf.py, 2026-10-02; HARDWARE-UNVERIFIED) -----------
     # The robot_localization EKF run beside the assembler. `ekf_state` is ""
     # when none was built, else "ready" | "not_ready" | "fault".

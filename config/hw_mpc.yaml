@@ -210,7 +210,7 @@ rl_pwm_7d:
   leash_m: 0.8
   yaw_rate_ff: true
   yaw_rate_max: 0.6
-  allow_caps_below_trained: false
+  allow_caps_below_trained: true
 
 # LOW mode rl_7d (panel RL_7D, 2026-10-03): a 6-axis RL policy (axes6: x/y/z/r
 # + s/t) TRAINED WITH A ROLL/PITCH REFERENCE in its goal quaternion

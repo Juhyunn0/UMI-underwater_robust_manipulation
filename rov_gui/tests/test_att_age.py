@@ -782,7 +782,11 @@ def test_the_csv_columns_and_the_meta(monkeypatch):
     from rov_gui.tests.test_control import _last_csv_row
 
     cols = CSV_HEADER.strip().split(",")
-    assert cols[-3:] == ["att_age_v_s", "att_tb_ms", "banner_age_s"] and len(cols) == len(set(cols))
+    i = cols.index("att_age_v_s")
+    assert cols[i:i + 3] == ["att_age_v_s", "att_tb_ms", "banner_age_s"] and len(cols) == len(set(cols))
+    # schema 22 (2026-10-16): the DVL selection's seven follow them (test_dvl pins their meaning)
+    assert cols[-7:] == ["w_dvl", "dvl_code", "dvl_res_fast_m_s", "dvl_res_slow_m_s", "dvl_esc_s",
+                         "dvl_align", "dvl_scale"]
     with tempfile.TemporaryDirectory() as tmp:
         w, bus, pwms, logs, events = _pwm(tmp, "rl_pwm", monkeypatch)
         _engage_healthy(w)
@@ -792,7 +796,7 @@ def test_the_csv_columns_and_the_meta(monkeypatch):
         assert len(row) == len(cols) and float(row["att_age_v_s"]) == pytest.approx(0.05, abs=0.03)
         assert row["att_tb_ms"] == "4242000" and float(row["banner_age_s"]) == pytest.approx(40.0, abs=0.5)
         m = w._run_meta()
-        assert m["schema_version"] == 21
+        assert m["schema_version"] == 22
         a = m["att_age"]
         assert a["estimator"]["drift_ppm"] == 300.0 and a["estimator"]["reboot_gap_s"] == 2.0
         assert a["pwm_gate"]["thresholds"]["age_engage_p99_s"] == 0.12 and a["pwm_gate"]["lows"] == ["rl_pwm",

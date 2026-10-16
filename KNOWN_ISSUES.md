@@ -47,16 +47,103 @@
 - **가속도계가 죽어도 최대 1 s는 EKF가 ok다**(첨부 규칙 0.3 s와 freshness 1.0 s 사이 — SCALED_IMU2가 2–3 Hz일 때
   게이트가 깜빡이지 않게 한 값). 그동안 가속도 상태는 마지막 값으로 고정돼 속도로 적분되고, 잡는 건 속도 게이트(LP 0.5 s)뿐이다
   (0.3 m/s 오차를 ~0.6 s에 [유도]). SCALED_IMU2 실측 rate를 보고 `acc_s`를 조정할 것.
-- **DVL의 샘플별 판정은 EKF에 적용되지 않는다**: EKF는 run 단위 자격(`_dvl_run_ok` / `refusal`)과 trip만 보고, assembler가
-  tick마다 하는 innovation hold·stale·lock 판정은 안 본다(r_l처럼 `valid`만). 0.15 m/s 미만의 false lock은 trip(~1 s 지속)
-  전까지 들어간다. DVL 미장착이라 잠복. 실장치 covariance 대각은 정지에서 ≈ 8e-7 m²/s²(σ ≈ 0.9 mm/s) [측정:
-  data/20261011/1011_155235_dvl_probe/station_client_live.json first_sample]이고 `dvl_rejection_threshold` 기본은 None이라,
-  opt-out(장착값 설정 + `require_proven: false`)에서는 기체에 안 붙은·false lock DVL의 ~0 속도가 **매우 높은 가중치**로 융합된다.
+- **DVL의 샘플별 판정과 EKF** (2026-10-16 갱신): `dvl.selection: primary`(기본)에서는 EKF가 blend가 그 DVL 샘플을
+  쓸 수 있을 때만(`DvlAid.usable`) 받는다 — 품질 플래그·불일치 hold·데이터 게이트·래치 중의 샘플은 안 받는다(`on_dvl`이
+  aid를 먼저 돌리고 EKF에 준다). 그래서 EKF는 래치(p50 6.6–9.0 s)가 아니라 첫 hold(p50 1.7–4.3 s)에서 DVL을 잃는다
+  [측정: RL_controller logs/eval/dvl_trip_fix_20261015/design/out/faults_summary.json]. EKF 제어의 속도 인터록
+  (`_ekf_vs_tag` dv)은 태그 유한차분과 비교한다 — primary의 `nu[0:2]`는 DVL blend라, 그렇지 않으면 틀린 DVL을 융합한 EKF를
+  그 DVL 자신과 비교하게 된다. `legacy`에서는 옛 동작 그대로다: EKF는 run 단위 자격(`_dvl_run_ok` / `refusal`)과 trip만
+  보고, assembler가 tick마다 하는 innovation hold·stale·lock 판정은 안 본다(r_l처럼 `valid`만). 0.15 m/s 미만의 false
+  lock은 trip(~1 s 지속) 전까지 들어간다. 두 모드 모두: 실장치 covariance 대각은 정지에서 ≈ 8e-7 m²/s²(σ ≈ 0.9 mm/s)
+  [측정: data/20261011/1011_155235_dvl_probe/station_client_live.json first_sample]이고 `dvl_rejection_threshold` 기본은
+  None이라, 쓰는 동안의 DVL은 **매우 높은 가중치**로 융합된다(opt-out에서 기체에 안 붙은 DVL의 ~0 속도도).
 - **engage 직후 과도**: `set_engaged`의 `asm.reset()`으로 assembler 속도가 ~2 프레임 0에서 다시 시작해 속도 채널이 |nu_ekf|를
   읽는다(trip은 engage 속도 ~0.37 m/s 이상에서만 [유도]); z_source pressure면 z offset 재보정으로 EKF z가 1–2 샘플 어긋난다.
 - **replay는 콜드 스타트**(CSV 첫 행부터)이고 CSV `t`의 0.1 ms 반올림 때문에 가끔 한 행이 다르다 — 변형은 "replay(라이브 설정)"과 비교할 것.
 - **제대로 고치는 법**: 첫 수중 세션은 shadow로 날며 `ekf_*` 열과 `est` 확인 → SCALED_IMU2 정지 바이어스 측정 →
   `ekf_replay`로 smoothing on/off·IMU 잡음 변형 비교 → 그다음에 EST EKF로 짧은 station hold.
+
+### DVL `selection: primary` (2026-10-16): 불일치는 HOLD, 래치는 에스컬레이션·장치 설정 변경뿐 — 남은 비용·사각지대·되돌리기
+- **무엇이 바뀌었나**: 태그 속도와의 불일치(느린 차이, 정렬, 적합 반박)는 더 이상 trip이 아니라 **HOLD**다 — 데이터가
+  끊길 때와 같은 hold/fade 경로로 DVL을 잠시 안 쓰고, 불일치와 그 증거(에스컬레이션 버킷 < 0.5 s)가 사라지면 **스스로**
+  돌아온다. **누를 버튼이 없다**, 검증도 유지된다. 래치는 (a) 장치 설정 변경, (b) 에스컬레이션(증거 누적 4 s 또는 60 s 안에
+  차이·적합·스케일 증거가 있었던 에피소드 3번)뿐이고 둘 다 검증을 버린다(증명 pass → OUT → IN). 설계·근거: RL_controller
+  `logs/eval/dvl_trip_fix_20261015/SPEC.md`, 구현 기록 `IMPLEMENTATION.md`("Fix round 1" 포함). 10-13/10-15 기록
+  replay에서 래치 0회(옛 16회), hard switch 0(옛 31.9/min), 오차 RMS 6.33 → 4.72 cm/s [측정: 같은 폴더 design/out,
+  impl/out, fix1/out — 구현이 프로토타입을 CSV·고장 run 단위로 그대로 재현].
+- **Fix round 1 (2026-10-16, 검증 뒤)** [측정: RL_controller logs/eval/dvl_trip_fix_20261015/fix1/out]:
+  - **짧은 글리치 하나로는 더 이상 래치되지 않는다.** 전에는 움직이는 중 큰 DVL 글리치 하나(+0.5–0.8 m/s, 0.5–1 s —
+    blend의 gross 검사가 한 번도 날리지 않았고, 글리치 리포트가 전부 fom 플래그여도)가 약 4 s 뒤 "persistently … the DVL
+    reads 2× the motion the tags see. It lasted, so it is not a glitch"로 래치시켰다: 스케일 비율의 4-s 파워 평균이 글리치를
+    클립 없이 받았다(워커 120회 중 59, 실제 세션 30회 중 12, verify/). 이제 느린 파워는 잔차처럼 클립한 쌍을 받고, 글리치
+    쌍(gross이면서 그 속도에서 ≤ 3× 스케일 오류로 설명되는 것보다 태그와 더 먼 쌍)은 뺀다: 워커 128회 0, 실제 세션 30회 0,
+    armed 기록에 넣은 글리치 850회 0(OLD 490 중 202), 글리치 버킷 최대 1.29 s. 2×/3× 스케일 고장은 여전히 래치된다(X2
+    35 중 31이 20 s 안, 최대 15.3 s).
+  - **반복 래치는 차이·적합·스케일 증거가 있었던 에피소드만 센다.** 기록에서 센 에피소드 4개가 전부 정렬 증거뿐이었다
+    (mpc_192708에서 55 s 간격 둘 → "one more latches it", 둘째는 DVL이 더 나은 센서였다). 이제 0개, 경고 0. 정렬 증거는
+    여전히 DVL을 hold하고 지속 버킷을 채운다.
+  - 로그의 `dvl: HELD`와 `hold released` 줄이 짝을 이룬다(58개 기록에서 18/18; 전에는 17/22). "released"는 DVL이 다시
+    섞여 들어갈 때만 쓴다(gross tick엔 안 쓴다). 직전 HELD 줄 2 s 안에 시작한 hold는 2 s가 지나면 알리고, 그 전에 끝나면
+    아예 쓰지 않는다(패널엔 보인다).
+  - 패널은 lock을 잃었을 때 DVL이 다시 쓰일 수 있을 때만(IN이고 검증됨) "— returns by itself"라고 한다: shadow에서는
+    그냥 말, DVL로 armed되지 않은 런에서는 "not used this run". held 메모의 에피소드 수는 "of 0"과 창보다 오래된 시작을
+    빼고 센다. 태그 공백 뒤 페이드 따라잡기는 상한이 있다(비트 단위 동일).
+- **남은 비용 (R1/R2의 값)**:
+  - 플래그도 1단계 hold도 못 잡은 false lock은 그동안 날아간다: 학습(≤ 1.1 s)보다 길게, 15–10 cm/s 잠금이면 hold까지
+    1.6–2.8 s [유도]. 3-s zero lock 동안 오차 RMS 7.07 cm/s(깨끗한 런 3.60, 옛 innovation 게이트 5.30) [측정:
+    faults_summary.json] — 그 게이트는 실데이터에서 더 가까운 센서를 80 % 버렸다.
+  - 반복 글리치 버스트는 적합을 비일관 반박시켜 버스트가 계속되는 동안 DVL을 hold한다(17:45 CSV에 +0.30 m/s 4-리포트
+    버스트를 3 s마다 넣으면 런 전체 태그 FD: RMS 16.1 vs 깨끗한 6.5 cm/s).
+  - hold 꼬리: ≥ 2 s 잠금 뒤에는 느린 잔차 < 2.5 cm/s AND 버킷 < 0.5 s가 될 때까지 빠져 있다 — 0.3 m/s에서 3-s 잠금이면
+    끝난 뒤 7.15 s [측정: test_dvl N4]. 적합의 60 s 기억이 일시 고장 뒤 hold를 늘린다(786런 중 24런, 대부분 mpc_201923·
+    201355의 `dis_fit`).
+  - **(fix round 1) 긴 글리치는 적합이 최대 ~60 s hold한다.** 적합의 60-s 창을 지배할 만큼 긴 글리치 하나(창이 차 있으면
+    ≥ 0.4 m/s로 ~1.5 s 이상, 움직이는 쌍이 적으면 0.5 s 이상)는 적합을 비일관 반박시키고, `dis_fit` hold가 그 쌍들이 창을
+    빠져나갈 때까지 DVL을 태그 FD에 둔다 — 래치는 없고 스스로 돌아온다(+0.8 m/s × 1.5 s: 가중치가 59.8 s 뒤, × 1.0 s: 0.9 s 뒤 복귀)
+    [측정: fix1/out/glitch_recovery_aid_final.json]. 넣은 글리치에서 가중치가 12 s 안에 깨끗한 런과 같아진 비율 79 %
+    (+0.8 m/s × 1.5 s는 29–31 %) [측정: fix1/out/f_compare_final.json].
+  - **(fix round 1, 측정) blend의 gross 한계 0.5 m/s보다 작은 글리치는 날아간다.** 점프 게이트는 처음 리포트만 거르고
+    (a_max·dt + 5 cm/s가 +0.3 m/s 계단을 ~0.13 s 안에 넘는다 [유도]), 1–1.5 s 구간은 느린 hold가 걸리기 전에 끝난다: 고장 +
+    2 s 동안 속도 오차 RMS가 +0.3 m/s × 1–1.5 s에서 14.8–16.7 cm/s, +0.5 m/s에서 14.0–17.1(OLD innovation 게이트 4.2,
+    깨끗한 런 3.5); +0.8 m/s는 gross 검사가 거른다(3.6–3.9) [측정: 같음]. gross 한계는 학습된 blend의 값이다(바꾸면
+    pwm11att13 export가 거부된다); SPEC §12.1.
+  - 태그 공백 뒤 blend는 hold를 공백 **이전** 샘플 기준으로 판단한다: ≥ 1.4-s 공백의 끝 무렵에 DVL이 나빠지면 첫 태그 tick에서
+    DVL에서 FD로 한 tick에 바뀔 수 있다(합성 사례 7.1 cm/s; 기록의 engaged tick 0개; 그때는 이미 RL_PWM 태그 게이트가
+    HOLD 펄스다) [측정: verify/parity.md §5].
+- **사각지대 (래치)**: +5 cm/s 편향은 30 s 안에 19/35만 래치(1단계 hold는 30/35); 기록된 속도(7–12 cm/s)에서 12 s마다
+  되풀이되는 3-s zero lock은 3/23만 래치(fix round 1 전 5/23; DVL 가중치 0.72, 오차 5.1 vs 3.1 cm/s; round 0 규칙에서
+  `EPISODE_MIN_S` 0.25면 10/23 [측정 design/out/episode_choose.json]); 2-of-3 깜빡임 28/38(재획득 플래그로는 안 잡히고
+  모니터가 래치); 태그가 띄엄띄엄(0.3 s on / 0.7 s off)이면 탐지가 느려진다(B10 31/35, RY 29/35, X2 23/35, 30 s 안);
+  저진폭 2× 스케일은 태그가 ≥ 5 cm/s rms를 볼 때만; lock이 절반쯤 없던 두 기록(mpc_190606, mpc_191140)에서 B10 1/35,
+  X2 4/35 미래치(창 DVL 가중치 0.08–0.43) [측정: fix1/out/f_compare_final.json]. **(fix round 1)** 정렬 증거만 짧은
+  구간들로 나오는 고장(1분에 1.5-s 구간 셋)은 매번 hold되지만 4-s 버킷으로만 래치되고 더 이상 "repeatedly"로는 안 된다
+  [측정: test_dvl `test_alignment_only_episodes_do_not_count_toward_the_repeated_latch`]. **운영자 메모**: DVL이 절반쯤
+  lock이 없는 세션에서는 지속 스케일·편향 고장이 hold되지만 30 s 안에 래치되지 않을 수 있다 — 태그가 보이는데 비행 중
+  패널이 계속 `held` / `no lock`이면 DVL을 의심하고(장착, 레버 암, bottom lock) 런 사이에 OUT으로 둔다.
+- **학습/배포 일치 (pwm11att13)**: blend 법칙·상수는 학습과 같다(5개 trace tick 단위 재현, test_dvl N1). 그러나 스테이션의
+  w-과정은 학습 분포 밖이다 — 평균 w 0.823 vs twin 0.970(에피소드 p1 0.905), w = 0 비율 0.114 vs p99 0.049, 페이드
+  13.0/min vs 7.6 [측정 selection.json / 예측 sim-only twin_chain_out.json]. 차이의 47 %가 R3 플래그(twin의 플래그 모델엔
+  오탐이 없다), 나머지는 실제 DVL의 뭉친 no-lock 구간. **att13을 primary로 날리기 전에**: twin의 DR에 뭉친 no-lock과
+  플래그 오탐률을 넣고, 스테이션의 실측 w-과정으로 Isaac 폐루프 확인(SPEC §12.3 6–7).
+- **되돌리기 (`dvl.selection: legacy`)**: 옛 사다리 비트 단위 재현(58/58 CSV 해시 동일 [측정 impl/out/legacy_new.json;
+  fix round 1 뒤에도 같음, fix1/out/legacy_compare.log]; 저장소 안에서는 `rov_gui/tests/test_dvl_legacy_replay.py`가 기록 구간을
+  배포된 스테이션의 digest와 비교해 고정한다).
+  (a) legacy는 blend로 학습한 export(velocity_source.trained true, pwm11att13*)를 **거부**한다 — RL_PWM / RL_PWM_7D가
+  unavailable(warn). (b) `dvl.stale_s`는 blend의 stale 시계이기도 하다: 0.6이 아니면 그 export는 primary에서도 거부.
+  (c) `selection`은 시작 때 읽고 검증은 프로세스 단위 — 바꾸려면 재시작 + 새 증명 pass. (d) yaml 패치
+  (`RL_controller logs/eval/dvl_trip_fix_20261015/hw_mpc_dvl_patch.diff`, 운영자가 적용)를 적용한 뒤 코드를 되돌리려면
+  먼저 `patch -p1 -R`로 패치를 되돌린다 — 안 그러면 모르는 dvl 키로 `MpcWorker.setup`이 죽는다.
+- **아직 없는 것**: 높이 불일치 플래그(|고도 − 태그 높이| > 0.15 m — 태그가 필요해 R3 밖, 세션 오프셋 보정 replay 필요),
+  빔별 플래그(`DvlSample`은 `n_beams`만), 풀 A/B와 Isaac 폐루프, 그리고 RL_PWM export picker와의 병합(SPEC §13; picker가
+  먼저 들어가는 게 권장 순서였으나 미병합 상태에서 이 변경이 먼저 들어갔다 — picker 쪽에 `git merge-file` 필요; legacy에서
+  blend로 학습한 export로 바꾸는 picker 선택이 거부되는지 보는 테스트 N41도 그 병합과 함께). **(fix round 1, 미해결) 고도
+  점프 플래그가 꾸준한 heave에서 울린다**: 직전 1 s의 플래그 안 된 리포트 중앙값과 비교하는데 그 중앙값이 ~0.5 s 늦어서,
+  평평한 바닥 위 일정한 고도 변화율 v_z는 ~0.5·v_z의 점프로 읽힌다 — ~0.2 m/s부터 0.10 m를 넘는다 [유도]. 그 밖엔 완벽한
+  DVL로 6-s 경사: 0.10–0.15 m/s → 플래그 0; 0.20 m/s → 24/60(10 Hz), 30/78(13 Hz), 평균 DVL 가중치 0.81–0.85; 0.30 m/s →
+  30/60, 40/78, 0.75–0.81 [측정: verify review 프로브 p_heave.py]. 래치는 아니지만 빠른 하강·상승에서 DVL이 간간이 빠진다
+  (또 하나의 학습/배포 차이); 기록엔 그런 heave가 적다(|w_fd| < 0.05 m/s에서 flag_alt 6.6 %, 0.20–0.30 m/s에서 12.1 %
+  [측정: verify/REPLAY.md §8 6번]). 후보 수정(안 함): 추세를 뺀 기준(1-s 선형 적합, 또는 기압 깊이 + 고도 = 바닥 깊이)과
+  비교한 뒤 `design/flag_recall.py`로 재현율을 다시 잰다.
 
 ### DVL 경로(`--dvl`) 전체가 **실기 미검증** — 장착값 null, 임계값 전부 [예측], 지연·잡음 미실측 (2026-10-01)
 - **상태**: `rov_gui/control/dvl.py` · `backends/dvl.py` · station bridge의 `dvl` 단은 DVL A50이 장착되기 **전에**
@@ -92,15 +179,20 @@
   (POSHOLD, 패널 DEPTH = ALT_HOLD)가 기체와 무관한 속도를 쓴다. 확장을 끄면 prearm이 "VisOdom: not healthy" 등으로
   거부할 수 있다 [예측: SYS_STATUS VISION_POSITION 비트 — AP_Arming 미확인].
 - **설계상 한계 (리뷰 6회, 2026-10-02에서 확인, 미해결)**:
-  - **false lock이 길면 trip이고, 그 trip도 재검증을 요구한다.** +14 cm/s × 1 s 또는 +10 cm/s × 2 s면 trip(한 번이든
-    10 s마다든); +10 cm/s × 1 s, +14 cm/s × 0.5 s, 리포트 4개 이하는 trip하지 않는다 [예측: `rov_gui/tests/fixtures/
-    sim_dvl_monitors_20261002.txt` A5b]. 의도한 동작이다(없는 운동을 1초 보고하는 DVL로는 날 수 없다). 다만 그런
-    trip은 장착과 무관한데도 검증을 버리고 새 검증 pass를 요구한다 — 풀 벽 근처에서 false lock이 잦으면 매번 재검증
-    해야 한다. 닫으려면 "DVL만 움직인" 차이 trip은 래치만 걸고 검증은 남기도록 trip을 둘로 나눈다(미구현). 경계값은
-    전부 [예측].
+  - **(2026-10-16 해결, `selection: primary`) false lock은 HOLD다 — 검증을 버리는 래치는 오래 가거나 되풀이될 때뿐.**
+    불일치는 hold/fade로 DVL을 잠시 빼고 **스스로** 돌아온다(누를 것 없음, 검증 유지): 0.3 m/s에서 3-s zero lock은
+    1.65 s 만에 hold, 끝난 뒤 7.15 s에 복귀, 래치 0 [측정: test_dvl N4]. 래치(검증 버림)는 증거가 4 s 쌓일 때(constant
+    잠금이면 ~3.4 s 이상 [유도]; 6-s zero lock은 5.65 s에 래치) 또는 60 s 안에 3번일 때(12 s마다 3-s 잠금, 0.12 m/s:
+    14.5 s에 경고, 26.5 s에 래치) [측정: test_dvl N8, N30]. 786개 일시 고장 replay(≤ 3 s zero lock, ≤ 1.1 s offset,
+    무응답, 깜빡임)에서 래치 0, 버킷 최대 3.11 s; 단발 글리치 850회(+0.3–0.8 m/s × 0.3–1.5 s, 계단·경사·fom 플래그;
+    fix round 1)에서 래치 0, 버킷 최대 1.29 s [측정: fix1/out/f_compare_final.json]. 남은 비용과 사각지대는 위
+    "DVL `selection: primary`" 항목. **`legacy`에서는 옛 동작 그대로**: +14 cm/s × 1 s 또는 +10 cm/s × 2 s면 trip이고
+    그 trip이 검증을 버린다 [예측: `rov_gui/tests/fixtures/sim_dvl_monitors_20261002.txt` A5b].
   - **글리치와 잡음은 trip 대신 hold로 DVL을 뺀다 — 잦으면 그만큼 DVL 없이 난다.** 3 s마다 4-리포트 글리치면 정지 중
     DVL로 난 tick이 39–60 %, DVL 잡음 2.5 cm/s면 정지 중 48 %, 3 cm/s 이상이면 거의 검증되지 않아 OUT에 머문다 [예측:
-    같은 출력 파일 A5]. hold가 걸리고 풀릴 때마다 속도원이 바뀐다(두 값의 차는 잡음 수준). 래치는 없다.
+    같은 출력 파일 A5]. hold가 걸리고 풀릴 때마다 속도원이 바뀐다(두 값의 차는 잡음 수준). 래치는 없다. (2026-10-02
+    legacy 분석이다. `primary`에서도 단발 글리치는 hold다 — fix round 1 전에는 0.5–1 s짜리 큰 글리치 하나가 스케일 증거로
+    래치될 수 있었다, 위 "Fix round 1" — 그리고 속도원은 바뀌는 대신 섞인다.)
   - **수직축 미검증 → heave 속도는 DVL을 쓰지 않는다.** 검증이 surge·sway만 보기 때문. 닫으려면 baro depth rate
     (또는 태그 z 차분) ↔ DVL vz의 1-D 회귀를 추가하고 상하 pass로 부호·스케일을 확인한 뒤에만 `nu[2]`를 교체.
   - **장착 기울기(roll/pitch)와 lever arm은 검증도 감시도 보지 못한다.** pitch 오차 e는 한 행을 cos e배 할 뿐이라
@@ -1612,6 +1704,31 @@
 
 ## 🐛 테스트 / 스크립트 함정
 
+### `plot_runs.py`가 engage가 여러 번 든 CSV를 **마지막 engage의 datum 하나로** 지도에 올린다 — 앞 engage의 행은 돌아가고 옮겨진 자리에 그려진다 (2026-10-15)
+- **증상**: 피드 녹화와 함께 열린 컨트롤러 로그(`c3_*_<hhmmss>_mpc.csv`)는 녹화 동안의 engage를 모두 담는다. 행의 px/py/yaw는
+  engage마다 0으로 다시 잡힌다(workers.py `_datumize`). 그런데 `load_run`은 `meta.hardware.datum_tag_frame` 하나(= 마지막
+  engage의 datum)로 모든 행을 지도에 올린다. 2026-10-15 `figures/trajectories/20261015/20261015_1015_174503_rl_pwm_7d_174509.png`는
+  SQUARE 행(17:45:16 engage, yaw0 93.8°)을 17:45:57 engage의 datum(yaw0 64.9°)으로 올려, 28.9° 돌고 경로를 따라 0.33–0.65 m
+  옮겨진 자리에 그렸다 [측정: `data/20261015/1015_174503/c3_fs_depth_20261015_174509_mpc.csv` + 같은 폴더 `events.log`의 datum 줄.
+  `nav_174505/fixes.csv`의 지도 fix와 대조하면 첫 engage datum으로 올린 경로는 중앙값 0.9 cm, 그려진 경로는 0.53 m 어긋남 —
+  검증 workflow wf_7f3afa5a]. RMS는 강체 변환이라 영향이 없다. standalone `mpc_<hhmmss>.csv`는 engage마다 따로 열리므로 해당 없다.
+- **임시 대응**: `c3_*_mpc.csv`로 그린 그림의 **위치**는 믿지 않는다(engage 수 = `engaged` 열의 0→1 전이 수).
+- **제대로 고치는 법**: CSV의 datum 리셋 행이나 events.log `ENGAGED (...) datum p0=[…] yaw0 …` 줄로 engage 구간을 나누고, 구간마다
+  그 datum으로 올린다(또는 구간마다 따로 그린다). 구간의 datum을 알 수 없으면 그리지 말고 `[none]`으로 보고한다.
+
+### `plot_runs.py`: 궤적이 시작되지 않은 조각에 **패널 모양(SQUARE/CIRCLE)과 재구성한 cross-track RMS**가 찍힌다 (2026-10-15)
+- **증상**: traj_on 행이 20개 미만이면 `segment: auto`가 engaged 행(접근·대기)을 그린다. 부제는 `_traj_line`이
+  `mission.panel_override.shape`로 만든 'SQUARE · 0.10 m/s'이고, 헤드라인도 `_shape`가 패널 요청값을 돌려주므로 path_following이면
+  cross-track이다. 스테이션은 traj_on 동안만 `e_cross`를 써서 이 열이 전부 NaN이고, `load_run`은 원래 옛 런용인 `_along_cross`
+  폴백으로 접근 setpoint의 접선에서 cross를 재구성한다 — setpoint가 움직인 행에서만 값이 나온다(대기 행은 NaN으로 빠짐).
+  2026-10-15에는 이런 조각이 14장이고 그중 10장이 재구성 cross-track을 찍었다. 예: `20261015_1015_183959_rl_pwm_184105.png`
+  'cross-track RMS 0.5 cm'는 35행 중 7행 값이고 같은 행의 radial RMS는 5.7 cm [측정: `data/20261015/1015_183959/mpc_184105.csv`];
+  `20261015_1015_202421_rl_pwm_202421.png` 1.2 cm는 radial 12.8 cm [측정: `data/20261015/1015_202421/mpc_202421.csv`]로, 같은 폴더에서
+  5랩을 다 돈 202432(1.7 cm)보다 좋아 보인다. CIRCLE도 같다(`…_202041.png` 0.3 cm).
+- **임시 대응**: 부제에 크기·랩 수가 없는 그림(`meta.trajectory` null)은 궤적을 돌지 않은 조각이다 — 슬라이드에서 뺀다.
+- **제대로 고치는 법**: traj_on이 0이면 부제를 'approach / hold — trajectory not started'로, 헤드라인은 radial로 한다.
+  `_along_cross` 폴백은 `e_cross` 열 자체가 없는 런에만 쓴다. 또는 기본값에서 이런 CSV를 `[none]`으로 건너뛴다.
+
 ### `test_dvl.py::test_the_shipped_config_has_the_dvl_off_and_the_mount_unmeasured`가 2026-10-13 장착값 입력 뒤로 **red** (2026-10-13)
 - **증상**: 이 테스트는 배포 `config/hw_mpc.yaml`의 `dvl.mount_rpy_deg` / `mount_t_flu`가 **null**이고 모든 값이
   `DV.DEFAULTS`와 같다고 단정한다. 2026-10-13 운영자 줄자 장착값(`[0,0,0]` / `[-0.192, 0, -0.104]`, 아직 미커밋)이 들어가면서
@@ -1620,6 +1737,9 @@
 - **임시 대응**: 실패 원인이 이 테스트 하나뿐인지 출력으로 확인한다. 장착값은 의도된 변경이다.
 - **제대로 고치는 법**: 장착값을 커밋할 때 테스트를 "배포 config는 장착이 실측돼 있고 DEFAULTS(null)와 다르다"로 바꾸거나,
   장착 두 키를 DEFAULTS 일치 단정에서 빼고 값의 형식만 단정한다.
+- **해결 (2026-10-16)**: `test_the_shipped_config_spells_known_dvl_keys_with_the_code_defaults`로 바꿨다 — yaml이 아는 키만
+  쓰고, 안 쓴 키는 2026-10-16 selection 키(`DV.KEYS_20261016`)뿐이며(운영자가 `hw_mpc_dvl_patch.diff`를 적용하면 0개),
+  장착 두 키를 뺀 모든 값이 DEFAULTS와 같고, 장착은 둘 다 null이거나 둘 다 유한 3-벡터라고 단정한다.
 
 ### SENSORS 줄의 긴 `no link (<예외 문구>)`가 `--mpc` 배치에서 PROPULSION을 밀어낸다 (2026-10-13, 이전부터 있던 것)
 - **증상**: `SensorRow.value`는 생략(elide)하지 않는 일반 QLabel이다. DVL 행의 `no link (ConnectionRefusedError: [Errno 111]
@@ -3026,7 +3146,7 @@ AprilTag PnP → EAOB+acados NMPC → MANUAL_CONTROL 폐루프(`rov_gui/control/
   VFOV ±19.3° 밖으로 빠지고 ROV 턱(약 11.5°)은 보이는 비대칭이 생긴다 [유도].
 
 ---
-*마지막 갱신: 2026-10-14*
+*마지막 갱신: 2026-10-15*
 
 ### 정책+GUI 테스트를 한 pytest 프로세스로 길게 이어 돌리면 `pupil_apriltags`에서 멈춘다(힙 손상) — HEAD에서도 재현 (2026-10-03)
 - **증상**: `test_policy_*`·`test_plan_stream`·`test_replay` 묶음 뒤에 `test_control.py`를 같은 프로세스로 돌리면 `test_control` 초반

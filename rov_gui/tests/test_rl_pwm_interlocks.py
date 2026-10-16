@@ -619,8 +619,9 @@ def test_the_csv_pwm_guard_column_and_the_4dof_lows_are_untouched():
     from rov_gui.tests.test_control import _last_csv_row, _worker
 
     cols = CSV_HEADER.strip().split(",")
-    # schema 21 (2026-10-15) appended att_age_v_s, att_tb_ms, banner_age_s after these four (test_att_age.py)
-    assert cols[-7:-3] == ["i_pred_a", "null_v_us", "null_h_us", "pwm_guard"] and len(cols) == len(set(cols))
+    # schema 21 (2026-10-15) appended att_age_v_s, att_tb_ms, banner_age_s after these four (test_att_age.py),
+    # schema 22 (2026-10-16) seven more (the DVL selection, test_dvl.py)
+    assert cols[-14:-10] == ["i_pred_a", "null_v_us", "null_h_us", "pwm_guard"] and len(cols) == len(set(cols))
     with tempfile.TemporaryDirectory() as tmp:
         w, bus, pwms, logs, events = _pwm_worker(tmp)
         _engage(w)

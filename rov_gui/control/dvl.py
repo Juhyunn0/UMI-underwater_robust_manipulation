@@ -104,6 +104,44 @@ rest, and — with the condition at one half — by repeated short glitches
 that dilute the fit's slope to 0.6-0.75; without the innovation hold, a
 false lock the gate was rejecting went in as soon as the fix grew old.)
 
+SELECTION (2026-10-16, ``dvl.selection``). DTF below = RL_controller
+logs/eval/dvl_trip_fix_20261015 (SPEC.md, DESIGN_DECISIONS.md and the
+replays of the 10-13 / 10-15 pool recordings behind every [측정] number of
+the 2026-10-16 keys). Operator, 2026-10-15: the DVL is the station's MAIN
+horizontal velocity sensor, and disagreeing with the tag velocity must not
+latch it out — the tag finite difference is the WORSE of the two (DVL
+2.3-2.9 vs tag 5.5-7.0 cm/s RMS against a non-causal tag fit [측정
+RL_controller logs/eval/vel_source_20261015]); the shipped difference trip
+fired ~18 times an hour on replay, and the innovation gate threw away the
+closer of the two velocities on 80 % of its rejections [측정 same].
+
+    primary  (the default) the DVL IS nu[0:2]. Each tick blends it with the
+             tag finite difference exactly as the pwm11att13 policy was
+             trained (DvlBlend = RL_controller deploy/obs_builder.py
+             DvlBlendNp): a newest sample that is not usable is replaced by
+             the last usable one for blend_hold_s, then the weight fades to
+             the tag velocity over blend_xfade_s, and back — no hard
+             switch, nothing to press. Not usable = a data gate above; an
+             R3 quality flag (fom, altitude jump, beams, lock re-acquired:
+             the report's own word that it may be a false lock); or a
+             DISAGREEMENT with the tag velocity — the slow difference, the
+             alignment monitor, a refuting fit — which is a HOLD through
+             that same fade, released by itself once it has cleared and its
+             evidence has drained (disagree_hold). The re-entry wait, the
+             innovation gate and "unchecked" are not on this path. Two
+             things still LATCH: the device's own configuration changing
+             (unchanged) and ESCALATION — a disagreement that LASTS
+             (esc_latch_s of evidence in a leaky count) or keeps COMING
+             BACK (esc_repeat_n episodes within esc_repeat_window_s, each
+             with difference, fit or scale evidence: EPISODE_KINDS). Like
+             every trip, a latch throws the proof away: re-prove, then OUT
+             and IN.
+    legacy   the 2026-10-01..15 ladder described above, bit for bit — the
+             rollback. An RL export trained on the blend refuses to load
+             under it (rl_policy.check_velocity_source).
+
+Above, under primary, read "trip" as "hold" except for those two latches.
+
 No Qt, no sockets, no dobmpc: plain numpy, so it is tested bare
 (rov_gui/tests/test_dvl.py). The TCP client lives in backends/dvl.py.
 """
@@ -112,7 +150,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections import deque
+from collections import Counter, deque
 
 import numpy as np
 
@@ -126,13 +164,23 @@ ST_NO_LOCK = "no_lock"      # reports arrive; this one fails a data gate
 ST_SHADOW = "shadow"        # good data, operator has it OUT: recorded only
 ST_UNPROVEN = "unproven"    # operator has it IN, the mount is not proven yet
 ST_TRIPPED = "tripped"      # evidence it is wrong; latched until re-armed
-ST_FALLBACK = "fallback"    # IN, good data, held back this tick
+ST_FALLBACK = "fallback"    # IN, good data, held back this tick (legacy)
 ST_IN_USE = "in_use"        # nu[0:2] is the DVL's
+# 2026-10-16, selection primary (which never answers ST_FALLBACK, so "held"
+# always means self-releasing):
+ST_HELD = "held"            # IN, a quality flag / disagreement / gross:
+#                             held back, returns by ITSELF
+ST_NOT_ARMED = "not_armed"  # IN, but not used this run (not armed at
+#                             engage, a code fault)
+ST_NO_TAG = "no_tag"        # this tick had no tag state (the blend waits)
 STATES = (ST_NO_LINK, ST_NO_LOCK, ST_SHADOW, ST_UNPROVEN, ST_TRIPPED,
-          ST_FALLBACK, ST_IN_USE)
+          ST_FALLBACK, ST_IN_USE, ST_HELD, ST_NOT_ARMED, ST_NO_TAG)
 
 VEL_TAG_FD = "tag_fd"
 VEL_DVL = "dvl"
+#: ``dvl.selection`` values (2026-10-16): the DVL-primary blend, or the
+#: 2026-10-01..15 ladder kept for a rollback.
+SELECTIONS = ("primary", "legacy")
 
 DEFAULTS = {
     "enabled": False,
@@ -184,7 +232,9 @@ DEFAULTS = {
     "v_max_m_s": 1.5,
     # Seconds of uninterrupted good samples before the DVL is used (again).
     # Stops a marginal bottom lock from flipping the velocity source every
-    # tick. [예측]
+    # tick. [예측] LEGACY ONLY: primary has no re-entry wait — the fade
+    # (blend_xfade_s) does that job without a hard switch, and a lock that
+    # flickers is flagged (flag_reacquired). The setup log names it.
     "reentry_s": 0.5,
     # The fastest this vehicle can change its velocity: 30 N (axis_cap 0.5 x
     # 60 N) over ~19 kg with added mass is 1.6 m/s^2 [유도], rounded up. A
@@ -198,6 +248,13 @@ DEFAULTS = {
     # beyond 0.25 s). Once rejected, the DVL stays out until a tag velocity
     # from a NEWER camera frame agrees ("innovation hold"). The slow, small
     # disagreements are the trips' business below. [예측]
+    # That gate is LEGACY: replayed on 10-15 it threw away the closer of the
+    # two velocities 80 % of the time [측정 RL_controller logs/eval/
+    # vel_source_20261015 accuracy/out/trips_replay.json]. PRIMARY uses the
+    # number for the station bridge's DVL rung: a tagged tick opens it only
+    # with its sample within this (widened the same way) of the tag velocity
+    # (rung_admit). BOTH modes: the monitors' gross-pair floor and the
+    # per-pair clip of the 1-s residual.
     "innov_max_m_s": 0.15,
     # ---- the agreement with the tag finite difference -----------------------
     "require_proven": True,
@@ -213,8 +270,16 @@ DEFAULTS = {
     # A PROVEN mount is un-proven by the fit only after this many consecutive
     # refuting evaluations (one per new tag fix): one evaluation on a window
     # that happens to hold a tag jump must not undo a proof. [예측]
+    # PRIMARY: that many in a row make the refutation CURRENT, which holds
+    # the DVL back (self-releasing, any coherence); a coherent one is also
+    # escalation evidence, and only an escalation latch un-proves.
     "agree_refute_n": 15,
-    # Runtime monitors, each latching a trip. All three are fed by the SAME
+    # LEGACY: the runtime monitors below each latch a trip. PRIMARY: neither
+    # trips — the alignment verdict holds the DVL back and, when coherent,
+    # feeds the escalation; the difference's role passes to the slow
+    # residual (agree_slow_s, 2026-10-16 keys); agree_trip_m_s is LEGACY ONLY
+    # and agree_trip_s stays the alignment window and the 1-s residual's
+    # (recorded) time constant. All three are fed by the SAME
     # evidence as the proof — one TIME-ALIGNED pair per new tag fix (the raw
     # tag difference against the DVL velocity interpolated to its midpoint) —
     # so none of them depends on how late either sensor's data arrives
@@ -251,9 +316,97 @@ DEFAULTS = {
     "agree_trip_s": 1.0,
     "agree_ratio_min": 0.5,
     "agree_ratio_v_min_m_s": 0.02,
+    # ==== 2026-10-16: SELECTION (module doc; DTF SPEC.md §2). Twenty NEW
+    # keys — none of the 27 above is re-purposed, and the shipped hw_mpc.yaml
+    # names none of these, so it runs on exactly these values. ============
+    # "primary" | "legacy". [가정: operator decision 2026-10-15, the DVL is
+    # the main horizontal velocity sensor; legacy = the rollback]
+    "selection": "primary",
+    # THE BLEND (primary): the pwm11att13 export's velocity_source.hold_s /
+    # xfade_s / gross_m_s / gross_tau_s [스펙: RL_controller
+    # rov_rl/velocity_source.py HOLD_S, XFADE_S, GROSS_M_S, GROSS_TAU_S] —
+    # stale_s above is its stale clock (export stale_s 0.6 [스펙]). An RL
+    # export trained on the blend refuses to load if any of the five differ
+    # (rl_policy.check_velocity_source). blend_gross_m_s 0 = no gross check.
+    "blend_hold_s": 0.45,
+    "blend_xfade_s": 0.5,
+    "blend_gross_m_s": 0.5,
+    "blend_gross_tau_s": 1.0,
+    # R3 QUALITY FLAGS (primary): the report itself says it may be a false
+    # lock. A flagged sample is not FLOWN (hold, then fade) — it stays in
+    # the pairs, the monitors and the fit (as data gates they cut the 17:45
+    # pairs from 1258 to 561 and an injected +10 cm/s bias never latched
+    # [측정 DTF map/out/package_replay2.log]) and does not become the jump
+    # gate's reference. Never a trip. 0 / false = off. Share of the > 8 cm/s
+    # wrong 10-15 reports flagged / of the good ones flagged [측정 DTF
+    # design/out/flag_recall.json]: fom 20.3 / 1.9 %, altitude 20.4 / 5.4 %,
+    # beams 9.1 / 0.8 %, re-acquired 20.4 / 4.3 %, all four 51.3 / 11.1 %.
+    # A firmware without `transducers` reports 0 beams: then EVERY sample is
+    # flagged and the panel names the flag (fail-safe).
+    "flag_fom_m_s": 0.003,       # valid fom p95 2.6 mm/s [측정 RL_controller
+    #                              logs/eval/vel_source_20261015 accuracy/out/
+    #                              dvl_detectors.json]
+    "flag_alt_jump_m": 0.10,     # |altitude - median of the unflagged reports
+    "flag_alt_window_s": 1.0,    # of the last 1.0 s (>= 3 of them)| [측정 DTF]
+    "flag_min_beams": 4,         # 3-beam error p50/p90 6.9/16.0 vs 1.4/6.1
+    #                              cm/s with 4 [측정 vel_source_20261015
+    #                              pipeline/out/a16_beams_fom.json]
+    "flag_reacquired": True,     # the report before it failed a data gate:
+    #                              a lock that flickers never flies (1:1
+    #                              flicker, DVL weight 10.0 -> 0.58 s of 10 s
+    #                              [측정 DTF design/out/synth_v2.json])
+    # DISAGREEMENT (primary) — a HOLD, never a trip by itself: the time-
+    # aligned difference (the monitors' pairs), each pair clipped to
+    # agree_slow_clip_m_s (its own key: tied to innov_max_m_s, a clip of 0.30
+    # gave 5.5 false trips/h [측정 vel_source_20261015 pipeline/out/
+    # a12b_clip_coupling.json]), low-passed over agree_slow_s; above
+    # agree_hold_m_s it holds the DVL back until it is below
+    # agree_release_m_s AND the escalation below has drained. Largest on the
+    # 58 recorded CSVs (0.735 h): 4.06 cm/s, 0 holds [측정 DTF design/out/
+    # clean_ev.json]; the 2:1 hysteresis is [가정].
+    "agree_slow_s": 4.0,
+    "agree_slow_clip_m_s": 0.15,
+    "agree_hold_m_s": 0.05,
+    "agree_release_m_s": 0.025,
+    # ESCALATION (primary) — the one latch on disagreement: a bucket of
+    # seconds of evidence (the slow difference above agree_hold_m_s, the
+    # alignment monitor's coherent verdict, a coherent refutation by the fit,
+    # or the DVL reading > esc_scale_ratio x the rms motion the tags see
+    # while they see >= esc_scale_v_min_m_s of it), drained at esc_leak x the
+    # time without any, moving only while armed and not latched, capped at
+    # esc_latch_s. Latched at esc_latch_s ("persistently") or on
+    # esc_repeat_n counted episodes within esc_repeat_window_s
+    # ("repeatedly"; an episode counts only with difference, fit or scale
+    # evidence — EPISODE_KINDS). Recorded CSVs: bucket max 1.43 s, no counted
+    # episode (4 of alignment alone), scale evidence 0 s; 786 transient
+    # faults (zero locks <= 3 s, offsets <= 1.1 s, silences, flicker): 0
+    # latches, bucket max 3.11 s; 850 single glitches (+0.3-0.8 m/s for
+    # 0.3-1.5 s, steps / ramps / fom-flagged): 0 latches, bucket max 1.29 s;
+    # +10 cm/s bias / reversed sway / 180 deg / 2x scale held 30 s: 34 / 35
+    # / 35 / 31 of 35 latched [측정 DTF fix1/out/clean_ev_impl.json,
+    # f_compare_final.json]. Leak 0.25-1.0 changes none of those [측정 DTF
+    # design/v1/out_v1/esc_choose.json]; the leak itself is [가정].
+    "esc_latch_s": 4.0,
+    "esc_leak": 0.5,
+    "esc_scale_ratio": 1.5,      # 0 = off; 1.4 gives 1.1 s of evidence on the
+    "esc_scale_v_min_m_s": 0.05,  # recordings [측정 DTF design/out/scale_rules.json]
+    "esc_repeat_n": 3,           # 0 = off
+    "esc_repeat_window_s": 60.0,  # = agree_window_s, the fit's own [가정]
 }
 
 KEYS = tuple(DEFAULTS)
+#: The keys that arrived on 2026-10-16 (selection primary): the shipped
+#: hw_mpc.yaml spells out the 27 before them and none of these until the
+#: operator applies DTF hw_mpc_dvl_patch.diff (test_dvl's config test).
+KEYS_20261016 = KEYS[KEYS.index("selection"):]
+#: The shipped keys `primary` does not use, and what governs instead — named
+#: in the setup log (with a warning when one is not its default: tuning it at
+#: the pool would change nothing) and in the meta. innov_max_m_s is NOT here:
+#: primary uses it (DEFAULTS).
+INACTIVE_IN_PRIMARY = {
+    "reentry_s": ("blend_xfade_s",),
+    "agree_trip_m_s": ("agree_hold_m_s", "agree_release_m_s", "esc_latch_s"),
+}
 
 #: Margin of the jump gate on top of a_max*dt (m/s): two samples' worth of
 #: noise at the [예측] 3 mm/s plus room for the lever-arm term.
@@ -321,6 +474,138 @@ ALIGN_MIN_SHARE = 0.07
 #: 2026-10-02: 50 ms of stamp error tripped a right mount at the corners of
 #: a 10 cm/s square without this).
 ALIGN_HOLD_S = 0.4
+#: 2026-10-16 (primary). Pairs further apart than this restart the SLOW
+#: monitors (the slow residual, the slow powers, the escalation bucket); the
+#: 1-s residual and the alignment sums keep MONITOR_GAP_S. With the tags in
+#: bursts (0.3 s on, 0.7 s off) the 0.5-s restart froze them: a 20-s zero
+#: lock at 0.12 m/s was first held after 11.25 s and never latched; with
+#: this, 4.25 s and 10.15 s [측정 DTF design/out/synth_v2.json]. 2.0 [가정]
+SLOW_GAP_S = 2.0
+#: ...the interval one pair gives the slow EMAs is capped at this: 0.5
+#: raised the clean slow-residual maximum from 4.06 to 4.78 cm/s (tag noise
+#: right after gaps at high tilt) [측정 DTF design/out/cap_choose.json] —
+SLOW_DT_CAP_S = 0.25
+#: ...and the interval one pair gives the escalation bucket at this, which
+#: only counts time that already has evidence (clean bucket max 1.21 ->
+#: 1.43 s, still 0 latches [측정 same]).
+ESC_DT_CAP_S = MONITOR_GAP_S
+#: (fix round 1) The slow POWERS behind scale_ratio leave out a GLITCH pair:
+#: one that is gross AND further from the tag velocity than a DVL reading up
+#: to this many times the motion could be at that speed ((this - 1) x |v_tag|
+#: + JUMP_MARGIN_M_S). A scale error is then seen whole up to 3x at any speed,
+#: and a glitch larger than twice the speed never feeds the scale evidence
+#: [가정 3x; 측정 effect DTF fix1/out/scale_faults_aid_m2.json,
+#: glitch_slowmotion_aid_m2.json].
+SCALE_PAIR_MAX = 3.0
+#: An escalation EPISODE (the bucket rising from 0) counts toward
+#: esc_repeat_n once its bucket has reached this: 4 counted on the 0.735 h
+#: of recordings, never more than 2 within 60 s [측정 DTF design/out/
+#: clean_ev.json, episode_choose.json] (0.25 would also latch 10 of 23
+#: recorded repeated 3-s zero locks instead of 5 — a module constant a
+#: later session may lower).
+EPISODE_MIN_S = 0.5
+#: ...and only once it has carried one of these kinds of evidence (fix
+#: round 1): an episode of ALIGNMENT evidence alone is still held (dis_align)
+#: and still fills the bucket toward the persistent latch, but it does not
+#: count toward the repeated one. All 4 counted episodes on the recordings
+#: were alignment-only, two of them 55 s apart on mpc_192708 ("one more
+#: latches it"), and in the second the DVL was the better sensor (1.8 vs
+#: 8.8 cm/s RMS against the reference) [측정 DTF verify/out/
+#: episodes_real.json, verify/REPLAY.md §3.1]: tag-side disagreement about
+#: direction, the operator's 19:29:18 complaint.
+EPISODE_KINDS = frozenset(("difference", "fit", "scale"))
+#: A disagreement HOLD, once its own condition has cleared, releases only
+#: when the bucket is below this: a reversed axis or a scale error stops
+#: showing whenever the vehicle slows or leaves that axis, and a hold that
+#: released then flew the wrong velocity at full weight again (reversed
+#: sway, 5 cm/s oscillation: DVL weight 5.58 -> 1.03 s [측정 DTF
+#: design/out/synth_v2.json]). = EPISODE_MIN_S, so "a hold sticks" and "an
+#: episode counts" are one level; release at 0 put a station on a 73 cm/s
+#: tag-FD spike for 0.5 s [측정 DTF design/out/selection.json NEW-Dz].
+HOLD_DRAIN_S = EPISODE_MIN_S
+
+#: The usage-reason CODE vocabulary (CSV dvl_code; DTF SPEC.md §6.3): the
+#: data gates by the phrase before " (" ...
+GATE_CODES = (("no DVL data", "no_data"), ("DVL has no bottom lock", "no_lock"),
+              ("DVL is in water-tracking mode", "water_track"),
+              ("DVL report lacks fom or altitude", "no_fom_alt"),
+              ("DVL fom too high", "fom_max"),
+              ("DVL altitude too low", "low_alt"),
+              ("DVL velocity implausible", "implausible"),
+              ("DVL velocity jump", "jump"),
+              ("no body rate for the DVL lever arm", "no_rate"),
+              ("DVL stale", "stale"))
+#: ...the R3 quality flags, the disagreement holds...
+FLAG_CODES = ("flag_fom", "flag_alt", "flag_beams", "flag_reacq")
+DIS_CODES = ("dis_diff", "dis_align", "dis_fit")
+#: ...and the codes the station bridge's DVL rung carries on its last usable
+#: sample for blend_hold_s (the blend's own hold, on the rung): a data gate
+#: or a flag. A latch, a disagreement, OUT or not armed refuse at once.
+RUNG_BRIDGE_CODES = frozenset([c for _p, c in GATE_CODES] + list(FLAG_CODES))
+#: Phrase -> code for everything else a tick can be told, the legacy
+#: ladder's words included (the meta counts rows by the phrase).
+_REASON_PHRASES = (
+    ("DVL is OUT (shadow)", "out"),
+    ("DVL latched OUT (", "latched"),
+    ("DVL tripped before engage", "not_armed"),
+    ("DVL not armed at engage", "not_armed"),
+    ("DVL tripped (", "latched"),
+    ("DVL mount not measured", "no_mount"),
+    ("DVL not proven against the tag velocity", "unproven"),
+    ("DVL velocity not finite", "implausible"),
+    ("DVL code fault", "fault"),
+    ("DVL quality flag: fom", "flag_fom"),
+    ("DVL quality flag: altitude", "flag_alt"),
+    ("DVL quality flag: beams", "flag_beams"),
+    ("DVL quality flag: lock re-acquired", "flag_reacq"),
+    ("DVL disagrees with the tag velocity: alignment", "dis_align"),
+    ("DVL disagrees with the tag velocity: the fit", "dis_fit"),
+    ("DVL disagrees with the tag velocity", "dis_diff"),
+    ("DVL disagreement releasing", "dis_diff"),
+    ("DVL gross", "gross"),
+    ("no tag state", "no_tag"),
+    ("station bridge on tier", "bridge"),
+    ("DVL re-entry", "reentry"),
+    ("DVL innovation hold", "innov_hold"),
+    ("DVL innovation (", "innovation"),
+    ("DVL unchecked", "unchecked"),
+    ("DVL held back", "refute_hold"),
+    ("DVL alignment hold", "align_hold"),
+)
+
+
+def reason_code(why) -> str:
+    """A tick's reason (the phrase before " (" + numbers) -> its CSV
+    ``dvl_code``: "ok" for none, "other" for a phrase nobody mapped (a test
+    pins that every reason the ladders and the worker give has a code)."""
+    w = str(why or "")
+    if not w:
+        return "ok"
+    if w.startswith("held: "):                   # the rung's hold (rung_velocity)
+        return reason_code(w[len("held: "):])
+    for phrase, code in _REASON_PHRASES:
+        if w.startswith(phrase):
+            return code
+    for phrase, code in GATE_CODES:
+        if w.startswith(phrase):
+            return code
+    return "other"
+
+
+def reason_class(code) -> str:
+    """A usage code -> the panel chip's short word ("" = nothing to say)."""
+    c = str(code or "")
+    if c in ("", "ok", "rung"):
+        return ""
+    if c.startswith("dis_"):
+        return "disagrees"
+    return {"flag_fom": "flag fom", "flag_alt": "flag altitude",
+            "flag_beams": "flag beams", "flag_reacq": "flag re-lock",
+            "gross": "gross", "no_lock": "no lock", "stale": "stale",
+            "latched": "latched", "not_armed": "not this run",
+            "fault": "code fault", "no_tag": "no tag state",
+            "unproven": "not proven", "no_mount": "no mount",
+            "out": "OUT"}.get(c, c.replace("_", " "))
 
 
 def resolve(raw: dict | None) -> dict:
@@ -335,9 +620,13 @@ def resolve(raw: dict | None) -> dict:
             raise ValueError(f"unknown dvl keys {sorted(unknown)}; "
                              f"known: {sorted(KEYS)}")
         cfg.update(raw)
-    for k in ("enabled", "use", "require_proven"):
+    for k in ("enabled", "use", "require_proven", "flag_reacquired"):
         if not isinstance(cfg[k], bool):
             raise ValueError(f"dvl.{k} must be true or false, got {cfg[k]!r}")
+    sel = cfg["selection"]
+    if not isinstance(sel, str) or sel not in SELECTIONS:
+        raise ValueError(f"dvl.selection must be 'primary' or 'legacy', "
+                         f"got {sel!r}")
     cfg["host"] = str(cfg["host"])
     port = cfg["port"]
     if isinstance(port, bool) or not isinstance(port, int) \
@@ -359,6 +648,32 @@ def resolve(raw: dict | None) -> dict:
         n = cfg[k]
         if isinstance(n, bool) or not isinstance(n, int) or n < lo:
             raise ValueError(f"dvl.{k} must be an integer >= {lo}, got {n!r}")
+    # ---- the 2026-10-16 keys (selection primary)
+    for k in ("blend_hold_s", "blend_xfade_s", "blend_gross_tau_s",
+              "flag_alt_window_s", "agree_slow_s", "agree_slow_clip_m_s",
+              "agree_hold_m_s", "agree_release_m_s", "esc_latch_s",
+              "esc_scale_v_min_m_s", "esc_repeat_window_s"):
+        cfg[k] = _pos(k, cfg[k])
+    for k in ("blend_gross_m_s", "flag_fom_m_s", "flag_alt_jump_m",
+              "esc_leak", "esc_scale_ratio"):          # 0 = off / no leak
+        cfg[k] = _pos(k, cfg[k], allow_zero=True)
+    nb = cfg["flag_min_beams"]
+    if isinstance(nb, bool) or not isinstance(nb, int) or not 0 <= nb <= 4:
+        raise ValueError(f"dvl.flag_min_beams must be an integer 0..4 (0 = "
+                         f"off; the A50 has 4 beams), got {nb!r}")
+    n = cfg["esc_repeat_n"]
+    if isinstance(n, bool) or not isinstance(n, int) or (n != 0 and n < 2):
+        raise ValueError(f"dvl.esc_repeat_n must be 0 (off) or an integer "
+                         f">= 2, got {n!r}")
+    if cfg["agree_release_m_s"] >= cfg["agree_hold_m_s"]:
+        raise ValueError(f"dvl.agree_release_m_s {cfg['agree_release_m_s']!r} "
+                         f"must be below dvl.agree_hold_m_s "
+                         f"{cfg['agree_hold_m_s']!r} (a hold must be able to "
+                         f"end)")
+    if 0.0 < cfg["esc_scale_ratio"] <= 1.0:
+        raise ValueError(f"dvl.esc_scale_ratio must be 0 (off) or above 1 (the "
+                         f"DVL reading MORE motion than the tags), got "
+                         f"{cfg['esc_scale_ratio']!r}")
     for k, what in (("mount_rpy_deg", "[roll, pitch, yaw] degrees"),
                     ("mount_t_flu", "[x, y, z] metres, body FLU")):
         v = cfg[k]
@@ -837,6 +1152,112 @@ class Agreement:
 
 
 # =============================================================================
+# the DVL-primary blend (2026-10-16, selection primary)
+# =============================================================================
+class DvlBlend:
+    """The velocity blend the pwm11att13 policy was trained on — RL_controller
+    deploy/obs_builder.py ``DvlBlendNp`` (= rov_rl/velocity_source.py
+    VelocitySelector, mode dvl_primary), transcribed line for line [스펙];
+    plus two additions that are no-ops on the twin's own traces (DTF
+    design/out/check_proto.json, test_dvl N1):
+
+        expire_hold()   a disagreement / latch makes the held sample
+                        ineligible, so the fade starts on that tick (the
+                        twin's own law for a held sample older than hold_s)
+                        instead of re-flying the faulty sample for 0.45 s
+        step(n_skip=)   the ticks that had no tag state (the station does not
+                        step the blend without one) are replayed as fade
+                        steps toward the current target; tag_lp does not
+                        move across them
+
+    Per tick: the gross check's reference tag_lp is a 1-s EMA of THIS tick's
+    tag finite difference (a = dt / gross_tau_s); ``ok`` = the newest sample
+    is usable, fresh (stale_s on its capture time) and within gross_m_s of
+    tag_lp. Then the last ok sample is flown for hold_s of its capture time
+    (src "hold"), and the weight w moves dt / xfade_s per tick toward its
+    target (1 or 0; it snaps to the first target after reset(), at engage).
+    u, v = w * v_dvl + (1 - w) * fd; heave stays the tag's (dvl_w false).
+    Frames: the station feeds FRD; the step is linear and its only norm is of
+    a (u, v) difference, so FRD in gives the FRD image of the FLU result
+    [유도]. Sources: "dvl", "hold", "blend" (0 < w < 1), "tag_fd" (w = 0)."""
+
+    def __init__(self, dt=0.05, hold_s=0.45, xfade_s=0.5, gross_m_s=0.5,
+                 gross_tau_s=1.0, stale_s=0.6, dvl_w=False, snap_tol=1e-6):
+        self.dt, self.hold_s, self.xfade_s = float(dt), float(hold_s), float(xfade_s)
+        self.gross, self.gross_tau = float(gross_m_s), float(gross_tau_s)
+        self.stale_s = float(stale_s)
+        self.dvl_w, self.snap_tol = bool(dvl_w), float(snap_tol)
+        self.reset()
+
+    def reset(self) -> None:
+        """At engage, together with the assembler's reset."""
+        self.w = 0.0
+        self.v_hold = None
+        self.t_hold = None
+        self.tag_lp = None
+        self.snap = True
+        self.src = "tag_fd"
+        self.target = 0.0                   # (logging only)
+        self.gross_rejected = False         # (logging only)
+
+    def expire_hold(self) -> None:
+        """The held sample is no longer eligible: the next not-ok step starts
+        the fade at once."""
+        if self.t_hold is not None:
+            self.t_hold = -math.inf
+
+    def step(self, t_now, fd_b, dvl_v=None, dvl_t_valid=None, dvl_ok=False,
+             n_skip=0):
+        """-> (v_b (3,), w). ``fd_b`` = this tick's tag finite difference
+        (body); ``dvl_v`` / ``dvl_t_valid`` = the NEWEST sample (passed every
+        tick until a newer one replaces it); ``dvl_ok`` = the station allows
+        it; ``n_skip`` = ticks without a tag state since the last step."""
+        fd = np.asarray(fd_b, float).reshape(3)
+        a = min(1.0, self.dt / self.gross_tau)
+        self.tag_lp = (fd[:2].copy() if self.tag_lp is None
+                       else self.tag_lp + a * (fd[:2] - self.tag_lp))
+        ok = (bool(dvl_ok) and dvl_v is not None and dvl_t_valid is not None
+              and (t_now - float(dvl_t_valid) <= self.stale_s))
+        v = None if dvl_v is None else np.asarray(dvl_v, float).reshape(3)
+        self.gross_rejected = False
+        if ok and self.gross > 0.0 and float(
+                np.hypot(*(v[:2] - self.tag_lp))) > self.gross:
+            ok = False
+            self.gross_rejected = True
+        if ok:
+            self.v_hold, self.t_hold = v.copy(), float(dvl_t_valid)
+            target, self.src = 1.0, "dvl"
+        elif self.v_hold is not None and t_now - self.t_hold <= self.hold_s:
+            target, self.src = 1.0, "hold"
+        else:
+            target, self.src = 0.0, "tag_fd"
+        self.target = target
+        v_src = self.v_hold if self.v_hold is not None else fd
+        if self.snap:
+            self.w, self.snap = target, False
+        stp = self.dt / self.xfade_s
+        # The skipped ticks replay only until w can have reached the target:
+        # the target is fixed here, so every step after that changes nothing
+        # (bit-identical) — unbounded, an hour without tags while disengaged
+        # (72 000 ticks) cost one 2-3 ms tick [측정 DTF fix1, review F1].
+        n_rep = 1 + min(max(0, int(n_skip)), int(math.ceil(1.0 / stp)) + 1)
+        for _ in range(n_rep):
+            # the trained per-tick law, once per tick — the skipped ones too
+            if abs(target - self.w) <= stp + self.snap_tol:
+                self.w = target
+            else:
+                self.w = self.w + stp if target > self.w else self.w - stp
+        if self.w <= 0.0:
+            return fd.copy(), self.w
+        out = self.w * v_src + (1.0 - self.w) * fd
+        if not self.dvl_w:
+            out[2] = fd[2]
+        if 0.0 < self.w < 1.0:
+            self.src = "blend"
+        return out, self.w
+
+
+# =============================================================================
 # the estimator-side object
 # =============================================================================
 class DvlAid:
@@ -853,9 +1274,17 @@ class DvlAid:
     alpha 0.6 — not the white-input sqrt(alpha / (2 - alpha)) = 0.655,
     review 2026-10-02). It turns the proof's residual scatter into the
     noise of the velocity the innovation gate compares against.
+
+    ``dt`` (2026-10-16) = the control period the blend steps at (the worker
+    passes 1 / ctrl_hz; the trained export is 0.05 s [스펙]). Under
+    ``selection: primary`` the tick asks :meth:`usable` and
+    :meth:`blend_step`, the bridge rung :meth:`rung_admit` /
+    :meth:`rung_velocity`; :meth:`velocity`, :meth:`displacement` and
+    :meth:`note_tag_velocity` serve ``legacy`` only (unchanged).
     """
 
-    def __init__(self, cfg: dict | None = None, fd_lp_gain: float = 0.507):
+    def __init__(self, cfg: dict | None = None, fd_lp_gain: float = 0.507,
+                 dt: float = 0.05):
         self.cfg = resolve(cfg)
         self.R, self.r, self.mount_measured = mount_from_cfg(self.cfg)
         self.fd_lp_gain = float(fd_lp_gain)
@@ -905,6 +1334,43 @@ class DvlAid:
         self._refuted_t: float | None = None    # newest refuting evaluation
         self.n_gross = 0                    # pairs kept out of the monitors
         self.n_monitor = 0                  # aligned pairs the monitors saw
+        # ---- 2026-10-16: selection (module doc). The slow monitors are
+        # computed in BOTH modes (recorded); everything else below acts in
+        # primary only, and its counters stay 0 under legacy.
+        self.selection = str(self.cfg["selection"])
+        self.dt = float(dt)
+        c = self.cfg
+        self.blend = DvlBlend(self.dt, hold_s=c["blend_hold_s"],
+                              xfade_s=c["blend_xfade_s"],
+                              gross_m_s=c["blend_gross_m_s"],
+                              gross_tau_s=c["blend_gross_tau_s"],
+                              stale_s=c["stale_s"], dvl_w=False)
+        #: R3: the newest sample's quality flag (text, code; "" = none) and
+        #: the (t_valid, altitude) of the recent UNflagged good reports
+        self._s_flag, self._s_flag_code = "", ""
+        self._alt_ref: deque = deque(maxlen=64)
+        self._refuted_coh = False           # the newest refutation's coherence
+        self._esc_onsets: deque = deque()   # counted episodes in the window
+        self.n_hold = Counter()             # stage-1 hold onsets by kind
+        self.n_flag = Counter()             # flagged samples by flag
+        self.n_esc = Counter()              # latches: persistent / repeated
+        self.esc_max = 0.0                  # largest escalation bucket (s)
+        self.r_slow_max = 0.0               # largest slow residual (m/s)
+        self.ep_log: list = []              # onset times of counted episodes
+        #: onset times of episodes that reached EPISODE_MIN_S on alignment
+        #: evidence alone (not counted toward esc_repeat_n; EPISODE_KINDS)
+        self.ep_log_align: list = []
+        self.warn_log: list = []            # (t, text) "disagreed again"
+        self._warn_new: list = []           # ...not yet taken (take_warnings)
+        self.esc_log: list = []             # (t, latch text)
+        #: the station bridge's DVL rung: (t_valid, v_body) of its last
+        #: usable sample, and the lost ticks it carried on it
+        self._rung_hold = None
+        self.n_rung_held = 0
+        #: per-pair evidence for offline replays (DTF design/ harness: a
+        #: list = record (t, dt_bucket, vd, vf, r_slow, alignment bad, fit
+        #: coherent, alignment off, slow gap, scale, bucket)); None = off
+        self.ev_log = None
         self._monitor_reset()
         self.n_samples = 0
         self.n_valid = 0
@@ -943,18 +1409,107 @@ class DvlAid:
 
     def set_use(self, on: bool) -> str:
         """The operator's switch. Setting it IN is also the one thing that
-        clears a trip — and only if ``refusal`` lets it through."""
+        clears a trip — and only if ``refusal`` lets it through. (primary:
+        an IN that clears a latch also starts a new escalation bucket.)"""
+        was = bool(self.tripped)
         why = self.refusal(bool(on))
         if not why:
             self.use = bool(on)
             if on:
                 self.tripped = ""
+                if was and self.selection == "primary":
+                    self._esc_reset()
         return why
+
+    def arm_refusal(self) -> str:
+        """(primary) May THIS engagement fly on the DVL? ``refusal(True)``
+        without its refuted-fit branch: a refutation current at engage is
+        the per-tick ``dis_fit`` hold's business, which releases by itself —
+        it no longer unarms the whole run (the shipped verdicts lasted up to
+        ~52 s after an episode; REFUTE_HOLD_S). The switch IN, no code fault
+        and not latched are the worker's questions, as before."""
+        if not self.mount_measured:
+            return ("DVL mount not measured — set dvl.mount_rpy_deg and "
+                    "dvl.mount_t_flu in hw_mpc.yaml")
+        if self._s is None:
+            return "no DVL data yet"
+        f = self.agree.fit()
+        if not self.proven and self.against:
+            return (f"this session's data has shown the DVL wrong "
+                    f"({self.against}) — it has to be PROVEN against the "
+                    f"tag velocity before it goes IN again"
+                    + (f": {f['why']}" if f["why"] else ""))
+        if self.cfg["require_proven"] and not self.proven:
+            return ("DVL not proven against the tag velocity yet — "
+                    + (f["why"] or "fly a short pass with tags in view"))
+        return ""
 
     # --------------------------------------------------------------- inputs
     def note_sample(self, s, omega=None) -> None:
         """One ``state.DvlSample``. ``omega`` = the body rates (p, q, r) at
-        the sample's ``t_valid``, for the lever arm."""
+        the sample's ``t_valid``, for the lever arm. (primary: then the R3
+        quality flags, :meth:`_flag_sample`.)"""
+        lg_before = self._last_good
+        self._note_sample(s, omega)
+        if self.selection == "primary" and self._s is s:
+            self._flag_sample(s, lg_before)
+
+    def _flag_sample(self, s, lg_before) -> None:
+        """R3 (primary): the report's OWN word that it may be a false lock,
+        on every sample that became the newest and passed the data gates. A
+        flag is usage only: the sample stays data-good in ``_hist`` (the
+        pairs, the monitors, the fit) but is not flown, and it does not
+        become the jump gate's reference (``_last_good``) — the twin's
+        detected report never moves its own [스펙 RL_controller
+        rov_rl/velocity_source.py]. An out-of-order sample never gets here,
+        so the newest sample's flag stands."""
+        if not self._s_ok:
+            self._s_flag, self._s_flag_code = "", ""
+            return
+        c = self.cfg
+        t = float(s.t_valid)
+        hits = []
+        fom = getattr(s, "fom", None)
+        if c["flag_fom_m_s"] > 0.0 and fom is not None \
+                and float(fom) > c["flag_fom_m_s"]:
+            hits.append(("flag_fom", f"DVL quality flag: fom "
+                                     f"({float(fom) * 1e3:.1f} > "
+                                     f"{c['flag_fom_m_s'] * 1e3:.1f} mm/s)"))
+        alt = getattr(s, "altitude", None)
+        if c["flag_alt_jump_m"] > 0.0 and alt is not None:
+            ref = [a for (tt, a) in self._alt_ref
+                   if t - c["flag_alt_window_s"] <= tt < t]
+            if len(ref) >= 3:
+                med = float(np.median(ref))
+                if abs(float(alt) - med) > c["flag_alt_jump_m"]:
+                    hits.append(("flag_alt", (
+                        f"DVL quality flag: altitude jump ({float(alt):.2f} m "
+                        f"against {med:.2f} m over the last "
+                        f"{c['flag_alt_window_s']:g} s)")))
+        nb = getattr(s, "n_beams", None)
+        if c["flag_min_beams"] > 0 and nb is not None \
+                and int(nb) < c["flag_min_beams"]:
+            hits.append(("flag_beams", f"DVL quality flag: beams ({int(nb)} "
+                                       f"< {c['flag_min_beams']})"))
+        if c["flag_reacquired"] and len(self._hist) >= 2:
+            h = self._hist[-2]                  # the entry before its own
+            dtg = t - float(h[0])
+            if not h[2] and 0.0 <= dtg <= c["stale_s"]:
+                hits.append(("flag_reacq", (
+                    f"DVL quality flag: lock re-acquired (the report "
+                    f"{dtg:.2f} s before it failed a data gate)")))
+        for code, _w in hits:
+            self.n_flag[code] += 1
+        if hits:
+            self.n_flag["flagged"] += 1
+            self._s_flag_code, self._s_flag = hits[0]
+            self._last_good = lg_before
+        else:
+            self._s_flag, self._s_flag_code = "", ""
+            self._alt_ref.append((t, float(alt)))
+
+    def _note_sample(self, s, omega=None) -> None:
+        """The shipped note_sample body (both modes)."""
         self.n_samples += 1
         self.source = str(getattr(s, "source", "") or self.source)
         if self.t_first is None:
@@ -1067,6 +1622,9 @@ class DvlAid:
         time ``t``). Proving is immediate (the verdict already carries its
         3-sigma margin); UN-proving takes ``agree_refute_n`` refuting
         evaluations in a row."""
+        if self.selection == "primary":
+            self._judge_primary(t)
+            return
         f = self.agree.fit()
         if f["verdict"] == "proven":
             self._refuted_run = 0
@@ -1092,6 +1650,41 @@ class DvlAid:
                 self.against = f["why"]
         else:
             self._refuted_run = 0
+
+    def _judge_primary(self, t: float | None = None) -> None:
+        """(primary) The same counting, with NO trip: ``agree_refute_n``
+        refutations in a row make the refutation current — a ``dis_fit``
+        hold through the blend while it lasts, any coherence; a coherent one
+        is also escalation evidence (_monitor), and only an escalation latch
+        un-proves. A proof starts a new escalation bucket. In shadow with
+        nothing armed, a coherent refutation is still remembered (shipped)."""
+        f = self.agree.fit()
+        if f["verdict"] == "proven":
+            self._refuted_run = 0
+            if not self.proven:
+                self.proven, self.proof = True, dict(f)
+                self.against = ""
+                self._esc_reset()
+        elif f["verdict"] == "refuted":
+            self._refuted_run += 1
+            if t is not None:
+                self._refuted_t = float(t)
+            self._refuted_coh = bool(f["coherent"])
+            if self._refuted_run < self.cfg["agree_refute_n"]:
+                return
+            if not self._armed() and f["coherent"] and not self.against:
+                self.against = f["why"]
+        else:
+            self._refuted_run = 0
+
+    def _fit_current(self, t: float) -> bool:
+        """The shipped refutation-hold condition (any coherence): enough
+        refutations in a row, the newest within REFUTE_HOLD_S, and the
+        verdict still refuted."""
+        return bool(self._refuted_run >= self.cfg["agree_refute_n"]
+                    and self._refuted_t is not None
+                    and float(t) - self._refuted_t <= REFUTE_HOLD_S
+                    and self.agree.fit()["verdict"] == "refuted")
 
     def _trip(self, why: str) -> None:
         """Evidence that the DVL is wrong. Latched (see the module doc)."""
@@ -1139,6 +1732,32 @@ class DvlAid:
         self._mon_t: float | None = None    # the newest pair's time
         self._pw_d = 0.0                    # low-passed |v_dvl|^2, every pair
         self._pw_f = 0.0                    # low-passed |v_tag|^2, every pair
+        # 2026-10-16: the slow monitors (both modes, recorded; primary acts)
+        self._slow_vec = None               # slow LP of (v_dvl - v_tag)_xy
+        self._r_slow: float | None = None   # ...its magnitude
+        self._pd_s = 0.0                    # slow LP of |v_dvl|^2
+        self._pf_s = 0.0                    # slow LP of |v_tag|^2
+        self._slow_t: float | None = None   # the newest pair's time (slow)
+        self._al_min: float | None = None   # lowest align judged, newest pair
+        self._hold_diff = False             # the difference hold (hysteresis)
+        self._fit_was = False               # rising edges, for the counters
+        self._fit_inc_was = False
+        self._dis_code = ""                 # the sticky disagreement code
+        self._esc_reset()
+
+    def _esc_reset(self) -> None:
+        """(primary) The escalation bucket and its episode history start
+        again: at a latch or a config change (through _monitor_reset), at a
+        proof (_judge_primary) and at the IN that clears a latch (set_use).
+        A latch is therefore never re-fired on evidence from before it."""
+        self._esc_s = 0.0
+        self._esc_ev = ""
+        self._ep_active = False
+        self._ep_t0: float | None = None
+        self._ep_peak = 0.0
+        self._ep_counted = False
+        self._ep_kinds: set = set()         # evidence kinds of this episode
+        self._esc_onsets.clear()
 
     def note_device_config(self, info: dict) -> str:
         """The device's own ``get_config`` answer. A change in what rotates
@@ -1414,6 +2033,204 @@ class DvlAid:
         self._fd_ref = ((t_now, v_fd, tag_age, fix_t)
                         if np.all(np.isfinite(v_fd)) else None)
 
+    # ------------------------------------------------- usage (primary only)
+    def usable(self, t_now: float) -> tuple:
+        """-> (ok, why, code): may the blend use the NEWEST sample this tick
+        (its ``dvl_ok``)? The first hit answers: the switch, a latch, the
+        mount, the data gates (fresh within stale_s), the proof, an R3 flag,
+        a disagreement hold. ``why`` keeps the shipped style (a digit-free
+        phrase, then the numbers in parentheses); ``code`` is the CSV's
+        dvl_code. No side effect but disagree_hold's sticky code, which is a
+        function of the aid's state: asking twice in one tick answers the
+        same."""
+        if not self.use:
+            return False, "DVL is OUT (shadow)", "out"
+        if self.tripped:
+            return False, f"DVL latched OUT ({self.tripped})", "latched"
+        if not self.mount_measured:
+            return False, "DVL mount not measured", "no_mount"
+        ok, why = self.data_ok(t_now)
+        if not ok:
+            return False, why, reason_code(why)
+        if (self.cfg["require_proven"] or self.against) and not self.proven:
+            return False, "DVL not proven against the tag velocity", "unproven"
+        if self._s_flag:
+            return False, self._s_flag, self._s_flag_code
+        why, code = self.disagree_hold(t_now)
+        if why:
+            return False, why, code
+        return True, "", "ok"
+
+    def disagree_hold(self, t_now: float) -> tuple:
+        """-> (why, code) of the stage-1 hold, or ("", ""): the first of its
+        own conditions that holds — the slow difference (with hysteresis),
+        the alignment verdict (the shipped alignment hold, 2 x agree_trip_s
+        of life), a CURRENT fit refutation of any coherence. Once set, a hold
+        releases only when its own condition has cleared AND the escalation
+        bucket is below HOLD_DRAIN_S: a reversed axis or a scale error stops
+        showing whenever the vehicle slows, and at rest nothing can be judged
+        at all — so not "until it agrees again" (that would keep the DVL out
+        through a whole station hold), but at most 2 x (bucket - 0.5) s
+        after its evidence ends at esc_leak 0.5 [유도]."""
+        c = self.cfg
+        t_now = float(t_now)
+        own = None
+        if self._hold_diff:
+            r = float(self._r_slow or 0.0)
+            if r > c["agree_hold_m_s"]:
+                own = (f"DVL disagrees with the tag velocity (slow residual "
+                       f"{r * 100:.1f} > {c['agree_hold_m_s'] * 100:.1f} "
+                       f"cm/s)", "dis_diff")
+            else:
+                own = (f"DVL disagreement releasing (slow residual "
+                       f"{r * 100:.1f} cm/s; it returns below "
+                       f"{c['agree_release_m_s'] * 100:.1f})", "dis_diff")
+        elif self._al_hold is not None and self._al_hold_t is not None \
+                and t_now - self._al_hold_t <= 2.0 * c["agree_trip_s"]:
+            al = self._al_hold
+            own = (f"DVL disagrees with the tag velocity: alignment (bearing "
+                   f"{al['along_deg']:+.0f} deg: alignment "
+                   f"{al['align']:+.2f}, the tags see {al['gain']:.2f} of "
+                   f"it)", "dis_align")
+        elif self._fit_current(t_now):
+            if self._refuted_coh:
+                own = ("DVL disagrees with the tag velocity: the fit refutes "
+                       "the mount (the tags see the motion elsewhere)",
+                       "dis_fit")
+            else:
+                g = self.agree.fit().get("gain_min") or 0.0
+                own = (f"DVL disagrees with the tag velocity: the fit refutes "
+                       f"it (the tags see only {g:.2f} of the motion it "
+                       f"reports)", "dis_fit")
+        if own:
+            self._dis_code = own[1]
+            return own
+        if self._dis_code and self._esc_s >= HOLD_DRAIN_S:
+            return (f"DVL disagreement releasing (waiting for "
+                    f"{self._esc_s:.1f} s of disagreement evidence to "
+                    f"drain)", self._dis_code)
+        self._dis_code = ""
+        return "", ""
+
+    def blend_reset(self) -> None:
+        """At engage, with the assembler's reset: the weight snaps to its
+        first target on the next step."""
+        self.blend.reset()
+
+    def blend_step(self, t_now: float, fd_b, ok: bool, code: str,
+                   n_skip: int = 0) -> tuple:
+        """One tick of the blend on the NEWEST sample -> (v_b (3,), w, src,
+        code, why). ``ok`` / ``code`` = this tick's :meth:`usable` (or the
+        worker's not-armed / fault). A disagreement or a latch expires the
+        held sample first, so the fade starts on this tick instead of
+        re-flying the sample the disagreement is about; a data gate or a flag
+        keeps it (its last good sample IS good). When the ladder said ok but
+        the gross check refused, code / why become "gross"."""
+        code = str(code or "")
+        if code.startswith("dis_") or code == "latched":
+            self.blend.expire_hold()
+        s = self._s
+        tv = None if s is None else float(s.t_valid)
+        v_b, w = self.blend.step(float(t_now), fd_b, self.v_body, tv,
+                                 bool(ok), n_skip=n_skip)
+        why = ""
+        if ok and self.blend.gross_rejected:
+            dd = float(np.hypot(*(np.asarray(self._v_body, float)[:2]
+                                  - self.blend.tag_lp)))
+            code = "gross"
+            why = (f"DVL gross (|v_dvl - LP(v_tag)| {dd:.2f} > "
+                   f"{self.blend.gross:.2f} m/s)")
+        return v_b, w, self.blend.src, code, why
+
+    def rung_admit(self, t_now: float, fd_b, tag_age=None) -> tuple:
+        """-> (ok, why): may a tagged tick that FLEW the DVL (vel_src "dvl")
+        open the station bridge's DVL rung? Its sample within the shipped
+        innovation limit of THIS tick's tag velocity, and no disagreement
+        evidence pending. The shipped station never let the rung take a DVL
+        the tags were contradicting on the last tagged ticks (review
+        2026-10-02: a false 0.25 m/s walked the estimate 0.5 m); the blend
+        flies such a sample for a moment, the rung must not carry it. On
+        admission the sample becomes the rung's hold reference."""
+        if self._v_body is None or fd_b is None or self._s is None:
+            return False, "no sample / no tag velocity"
+        d = float(np.hypot(*(np.asarray(self._v_body, float)[:2]
+                             - np.asarray(fd_b, float).reshape(-1)[:2])))
+        g = self._innov_limit(tag_age)
+        if d > g:
+            return False, f"DVL innovation ({d:.2f} > {g:.2f} m/s)"
+        if self._r_slow is not None \
+                and self._r_slow >= self.cfg["agree_release_m_s"]:
+            return False, (f"DVL slow residual pending "
+                           f"({self._r_slow * 100:.1f} cm/s)")
+        if self._esc_s > 0.0:
+            return False, (f"DVL escalation evidence pending "
+                           f"({self._esc_s:.1f} s)")
+        self._rung_hold = (float(self._s.t_valid),
+                           np.asarray(self._v_body, float).copy())
+        return True, ""
+
+    def rung_velocity(self, t_now: float) -> tuple:
+        """-> (v_body (3,) | None, why) for a LOST tick (no tag state) on the
+        station bridge's DVL rung: the newest sample if usable and within the
+        gross limit of the last tag low-pass; across a data gate or an R3
+        flag, the last rung-usable sample while it was captured <=
+        blend_hold_s ago (the blend's own hold, on the rung); else None at
+        once (a latch, a disagreement, OUT). The blend is NOT stepped."""
+        ok, why, code = self.usable(t_now)
+        if ok:
+            v = np.asarray(self._v_body, float)
+            lp = self.blend.tag_lp
+            if lp is not None and self.blend.gross > 0.0:
+                dd = float(np.hypot(*(v[:2] - lp)))
+                if dd > self.blend.gross:
+                    return None, (f"DVL gross (|v_dvl - LP(v_tag)| {dd:.2f} "
+                                  f"> {self.blend.gross:.2f} m/s, the last "
+                                  f"tag low-pass)")
+            self._rung_hold = (float(self._s.t_valid), v.copy())
+            return v.copy(), ""
+        hold = self._rung_hold
+        if code in RUNG_BRIDGE_CODES and hold is not None \
+                and float(t_now) - hold[0] <= self.cfg["blend_hold_s"]:
+            self.n_rung_held += 1
+            return hold[1].copy(), "held: " + why
+        return None, why
+
+    def take_warnings(self) -> list:
+        """The "disagreed again" warnings since the last call [(t, text)],
+        for the worker's log."""
+        out, self._warn_new = list(self._warn_new), []
+        return out
+
+    @property
+    def residual_slow_m_s(self) -> float | None:
+        return self._r_slow
+
+    @property
+    def escalation_s(self) -> float:
+        return float(self._esc_s)
+
+    @property
+    def scale_ratio(self) -> float | None:
+        """sqrt(slow |v_dvl|^2 / slow |v_tag|^2) while the tags see at least
+        esc_scale_v_min_m_s of rms motion, else None (the DVL's side from
+        the clipped pair, _slow_monitors)."""
+        pf = self._pf_s
+        if pf <= 0.0 or math.sqrt(pf) < self.cfg["esc_scale_v_min_m_s"]:
+            return None
+        return math.sqrt(max(self._pd_s, 0.0) / pf)
+
+    @property
+    def episodes_recent(self) -> int:
+        """Counted episodes within esc_repeat_window_s of the newest pair.
+        The bucket prunes its own list only while it is live; frozen (not
+        armed, latched) the window still moves for the panel (fix round 1:
+        it showed onsets older than the window)."""
+        t = self._mon_t
+        if t is None:
+            return len(self._esc_onsets)
+        win = float(self.cfg["esc_repeat_window_s"])
+        return sum(1 for t0 in self._esc_onsets if t - t0 <= win)
+
     # ------------------------------------------------------------- monitors
     def _gross_limit(self) -> float:
         """How far apart one aligned pair may be before it is GROSS: the
@@ -1430,7 +2247,13 @@ class DvlAid:
 
         The monitors always run — the residual is shown and recorded in
         shadow too — but they only TRIP while there is something to take
-        out: a proof, or the switch IN."""
+        out: a proof, or the switch IN.
+
+        2026-10-16: under ``selection: primary`` neither of the two trips
+        below exists; the same verdicts feed the self-releasing holds and the
+        escalation instead (:meth:`_monitor_primary`). The slow residual and
+        the slow powers are computed in BOTH modes (CSV dvl_res_slow_m_s /
+        dvl_scale); legacy decides nothing on them."""
         cfg = self.cfg
         t = float(t)
         last, self._mon_t = self._mon_t, t
@@ -1448,6 +2271,7 @@ class DvlAid:
         gross = dn > self._gross_limit()
         if gross:
             self.n_gross += 1
+        d_raw = d                       # (the slow residual clips it itself)
         clip = float(cfg["innov_max_m_s"])
         if dn > clip:
             d = d * (clip / dn)
@@ -1457,6 +2281,9 @@ class DvlAid:
         self._res_lp = float(np.hypot(self._res_vec[0], self._res_vec[1]))
         self._pw_d += a * (float(vd @ vd) - self._pw_d)
         self._pw_f += a * (float(vf @ vf) - self._pw_f)
+        dtb, gap_s = self._slow_monitors(t, d_raw, dn, vd, vf, gross and dn > (
+            (SCALE_PAIR_MAX - 1.0) * float(np.hypot(vf[0], vf[1]))
+            + JUMP_MARGIN_M_S))
         if not gross:
             aa = min(a, ALIGN_MAX_GAIN)
             self._al_S += aa * (np.outer(vd, vd) - self._al_S)
@@ -1467,8 +2294,12 @@ class DvlAid:
         # The DVL's motion along a direction goes somewhere the tags do not
         # show it (beyond three standard errors): hold the DVL back...
         als = self.alignment()
+        self._al_min = min(al["align"] for al in als) if als else None
         off = [al for al in als
                if al["align"] + 3.0 * al["sigma"] < cfg["agree_ratio_min"]]
+        primary = self.selection == "primary"
+        if primary and off and self._al_hold is None:
+            self.n_hold["alignment"] += 1
         self._al_hold = off[0] if off else None
         self._al_hold_t = t if off else None
         # ...and if the tags SEE that motion (gain), it is evidence about the
@@ -1478,6 +2309,9 @@ class DvlAid:
             self._al_bad_t0 = None
         elif self._al_bad_t0 is None or gap:
             self._al_bad_t0 = t
+        if primary:
+            self._monitor_primary(t, vd, vf, bad, bool(off), gap_s, dtb)
+            return
         if not self._armed():
             return
         if self._res_lp > cfg["agree_trip_m_s"]:
@@ -1499,6 +2333,177 @@ class DvlAid:
                        f"{bad['along_deg']:+.0f} deg (alignment "
                        f"{bad['align']:+.2f} +- {3.0 * bad['sigma']:.2f} < "
                        f"{cfg['agree_ratio_min']:.2f})")
+
+    def _slow_monitors(self, t: float, d, dn: float, vd, vf,
+                       glitch: bool = False) -> tuple:
+        """2026-10-16, both modes: the SLOW residual — the pair difference
+        ``d`` (|d| = ``dn``, unclipped) clipped to agree_slow_clip_m_s and
+        low-passed over agree_slow_s — and the slow powers |v_dvl|^2,
+        |v_tag|^2 behind ``scale_ratio`` (fix round 1: a ``glitch`` pair —
+        gross AND beyond any scale error up to SCALE_PAIR_MAX at its speed —
+        is left out of both; the DVL's power takes the pair clipped like the
+        residual). A pair gap up to SLOW_GAP_S keeps them running, the
+        interval counted at most SLOW_DT_CAP_S (the bucket's, returned, at
+        most ESC_DT_CAP_S). -> (bucket dt, gap)."""
+        c = self.cfg
+        last, self._slow_t = self._slow_t, t
+        gap_s = last is None or not 0.0 < t - last <= SLOW_GAP_S
+        dts = 0.0 if gap_s else min(t - last, SLOW_DT_CAP_S)
+        dtb = 0.0 if gap_s else min(t - last, ESC_DT_CAP_S)
+        a_s = min(1.0, dts / c["agree_slow_s"])
+        c2 = float(c["agree_slow_clip_m_s"])
+        d2 = d * (c2 / dn) if dn > c2 else d
+        if self._slow_vec is None:
+            self._slow_vec = np.zeros(2)
+        self._slow_vec = self._slow_vec + a_s * (d2 - self._slow_vec)
+        self._r_slow = float(np.hypot(self._slow_vec[0], self._slow_vec[1]))
+        self.r_slow_max = max(self.r_slow_max, self._r_slow)
+        # The slow POWERS (the scale evidence) leave a GLITCH pair out and
+        # take the DVL's velocity clipped like the residual (vf + d2) on the
+        # rest. Fed every pair unclipped, ONE short large glitch (+0.5-0.8
+        # m/s for 0.5-1 s, which the blend's gross check never flew) held
+        # scale_ratio above esc_scale_ratio for ~4 s (the 4-s memory) and
+        # latched a right DVL "persistently": 20 of 32 aid-level glitch runs,
+        # 12 of 30 real-session worker replays [측정 DTF fix1/out/
+        # repro_glitch_aid_before.json, verify/primary_replay/
+        # glitch_spot.txt]. The clip alone still left a 3.15-s bucket (0.79 of
+        # the latch) for a 1.5-s glitch where the tags see just over 5 cm/s
+        # rms; leaving out every gross pair made a 3x scale in a 24/16 cm/s
+        # oscillation never latch; this rule: bucket 0.0 on all 240 slow-
+        # motion glitch runs, scale latches as with the clip [측정 DTF fix1/
+        # out/glitch_slowmotion_aid*.json, scale_faults_aid_*.json].
+        if not glitch:
+            vdc = vd if dn <= c2 else np.asarray(vf, float).reshape(2) + d2
+            self._pd_s += a_s * (float(vdc @ vdc) - self._pd_s)
+            self._pf_s += a_s * (float(vf @ vf) - self._pf_s)
+        return dtb, gap_s
+
+    def _monitor_primary(self, t: float, vd, vf, bad, off: bool,
+                         gap_s: bool, dtb: float) -> None:
+        """(primary) What the pair means, without a trip on disagreement:
+
+            stage 1  the HOLDS' own conditions — the slow residual above
+                     agree_hold_m_s (released below agree_release_m_s), the
+                     alignment verdict (``_al_hold``, set above) and a CURRENT
+                     fit refutation — which :meth:`disagree_hold` turns into
+                     a self-releasing hold through the blend;
+            stage 2  the ESCALATION bucket: + the pair interval while there is
+                     lasting-disagreement evidence (the slow residual above
+                     the hold level, the alignment's COHERENT verdict, a
+                     coherent current refutation, the DVL reading more than
+                     esc_scale_ratio x the motion the tags see), - esc_leak x
+                     it otherwise; live only while armed and not latched
+                     (frozen otherwise), capped at esc_latch_s. It LATCHES
+                     (the shipped _trip: the proof is thrown away) at
+                     esc_latch_s, or on esc_repeat_n counted episodes within
+                     esc_repeat_window_s — the second one queues a warning.
+                     An episode counts once its bucket has reached
+                     EPISODE_MIN_S AND it has carried difference, fit or
+                     scale evidence (EPISODE_KINDS; alignment alone is
+                     recorded in ep_log_align, fix round 1).
+
+        Only an over-reading DVL is scale evidence: an under-reading one
+        refutes coherently (A = 2 I has gain 2) and reads alignment-bad, and
+        an under-read ratio is what a zero lock looks like, which must stay
+        transient."""
+        c = self.cfg
+        r = float(self._r_slow or 0.0)
+        if not self._hold_diff and r > c["agree_hold_m_s"]:
+            self._hold_diff = True
+            self.n_hold["difference"] += 1
+        elif self._hold_diff and r < c["agree_release_m_s"]:
+            self._hold_diff = False
+        fit_any = self._fit_current(t)
+        fit_coh = bool(fit_any and self._refuted_coh)
+        if fit_coh and not self._fit_was:
+            self.n_hold["fit"] += 1
+        if fit_any and not fit_coh and not self._fit_inc_was:
+            self.n_hold["fit_incoherent"] += 1
+        self._fit_was, self._fit_inc_was = fit_coh, bool(fit_any and not fit_coh)
+        ev = []
+        if r > c["agree_hold_m_s"]:
+            ev.append("difference")
+        if bad is not None:
+            ev.append("alignment")
+        if fit_coh:
+            ev.append("fit")
+        k = self.scale_ratio
+        if c["esc_scale_ratio"] > 0.0 and k is not None \
+                and k > c["esc_scale_ratio"]:
+            ev.append("scale")
+        live = bool(self._armed() and not self.tripped)
+        n_rep, win = int(c["esc_repeat_n"]), float(c["esc_repeat_window_s"])
+        if live:
+            if ev:
+                if self._esc_s <= 0.0:          # an episode starts
+                    self._ep_active, self._ep_t0 = True, t
+                    self._ep_peak, self._ep_counted = 0.0, False
+                    self._ep_kinds = set()
+                self._esc_s = min(float(c["esc_latch_s"]), self._esc_s + dtb)
+                self._esc_ev = "+".join(ev)
+                self._ep_kinds.update(ev)
+            else:
+                self._esc_s = max(0.0, self._esc_s - c["esc_leak"] * dtb)
+            newly = False
+            if self._ep_active:
+                self._ep_peak = max(self._ep_peak, self._esc_s)
+                if not self._ep_counted and self._ep_peak >= EPISODE_MIN_S \
+                        and self._ep_kinds & EPISODE_KINDS:
+                    self._ep_counted = True
+                    self._esc_onsets.append(self._ep_t0)
+                    self.ep_log.append(self._ep_t0)
+                    newly = True
+                if self._esc_s <= 0.0:
+                    self._ep_active = False
+                    if not self._ep_counted \
+                            and self._ep_peak >= EPISODE_MIN_S:
+                        self.ep_log_align.append(self._ep_t0)
+            while self._esc_onsets and t - self._esc_onsets[0] > win:
+                self._esc_onsets.popleft()
+            if newly and n_rep > 1 and len(self._esc_onsets) == n_rep - 1:
+                w_ = (t, f"the DVL disagreed with the tag velocity again "
+                         f"({len(self._esc_onsets)} times in the last "
+                         f"{win:g} s)")
+                self.warn_log.append(w_)
+                self._warn_new.append(w_)
+        self.esc_max = max(self.esc_max, self._esc_s)
+        if self.ev_log is not None:
+            self.ev_log.append((t, dtb, float(vd[0]), float(vd[1]),
+                                float(vf[0]), float(vf[1]), r,
+                                float(bad is not None), float(fit_coh),
+                                float(off), float(gap_s),
+                                float("scale" in ev), self._esc_s))
+        if not live:
+            return
+        if self._esc_s >= c["esc_latch_s"]:
+            why = (f"DVL disagreed with the tag velocity persistently "
+                   f"({self._esc_s:.1f} s of evidence; now: "
+                   + self._evidence_text(ev, r, bad, k) + ")")
+            self.n_esc["persistent"] += 1
+            self.esc_log.append((t, why))
+            self._trip(why)
+        elif n_rep > 0 and len(self._esc_onsets) >= n_rep and ev:
+            why = (f"DVL disagreed with the tag velocity repeatedly "
+                   f"({len(self._esc_onsets)} times in the last {win:g} s; "
+                   f"now: " + self._evidence_text(ev, r, bad, k) + ")")
+            self.n_esc["repeated"] += 1
+            self.esc_log.append((t, why))
+            self._trip(why)
+
+    @staticmethod
+    def _evidence_text(ev, r, bad, scale) -> str:
+        """The latch text names only the evidence on the latching pair."""
+        what = []
+        if "difference" in ev:
+            what.append(f"residual {r * 100:.1f} cm/s")
+        if "alignment" in ev and bad is not None:
+            what.append(f"alignment {bad['align']:+.2f} along "
+                        f"{bad['along_deg']:+.0f} deg")
+        if "fit" in ev:
+            what.append("the fit refutes the mount")
+        if "scale" in ev and scale is not None:
+            what.append(f"the DVL reads {scale:.1f}x the motion the tags see")
+        return ", ".join(what)
 
     def alignment(self) -> list:
         """The fast agreement test's numbers, strongest direction first.
@@ -1584,12 +2589,16 @@ class DvlAid:
     def residual_m_s(self) -> float | None:
         return self._res_lp
 
-    def state(self, t_now: float, used: bool, why: str | None = None
-              ) -> tuple:
+    def state(self, t_now: float, used: bool, why: str | None = None,
+              code: str | None = None, w: float | None = None) -> tuple:
         """-> (dvl.STATES member, note) for the panel. ``why`` = the reason
         the tick itself was given for not flying on the DVL, if the caller
         has it; asking :meth:`velocity` again here could answer differently
-        (the reference has moved on since — review 2026-10-02)."""
+        (the reference has moved on since — review 2026-10-02).
+        (primary: ``code`` / ``w`` = the tick's usage code and blend weight;
+        see :meth:`_state_primary`.)"""
+        if self.selection == "primary":
+            return self._state_primary(t_now, used, why, code, w)
         s = self._s
         if s is None or float(t_now) - float(s.t_rx) > max(
                 2.0, self.cfg["stale_s"]):
@@ -1619,7 +2628,127 @@ class DvlAid:
             _v, why = self.velocity(t_now, count=False)
         return ST_FALLBACK, why
 
+    def _state_primary(self, t_now: float, used: bool, why, code, w) -> tuple:
+        """(primary) The panel's words. Never ST_FALLBACK: "held" is only
+        ever a hold that RETURNS BY ITSELF (a flag, a disagreement, gross),
+        and the button face says TRIPPED only for a latch. A lost lock says
+        "returns by itself" only when the DVL would be used again with the
+        lock back (IN, mount measured, proven or not required): not in
+        shadow, not unproven (fix round 1). A run the worker did not arm is
+        the worker's to say (_publish_dvl_primary: not_armed)."""
+        s = self._s
+        if s is None or float(t_now) - float(s.t_rx) > max(
+                2.0, self.cfg["stale_s"]):
+            return ST_NO_LINK, "no reports"
+        if self.tripped:
+            f = self.agree.fit()
+            return ST_TRIPPED, (
+                self.tripped
+                + (f"; now: {f['why']}" if f["verdict"] == "refuted" else "")
+                + " — latched: fly a proving pass in surge AND sway with tags "
+                  "in view, then set the switch OUT then IN")
+        ok, data_why = self.data_ok(t_now)
+        if not ok:
+            back = bool(self.use and self.mount_measured and not (
+                (self.cfg["require_proven"] or self.against)
+                and not self.proven))
+            return ST_NO_LOCK, (f"{data_why} — returns by itself" if back
+                                else data_why)
+        if used:
+            return ST_IN_USE, ("" if w is None or w >= 1.0 else
+                               f"fading in ({w * 100:.0f} % DVL)")
+        if not self.use:
+            f = self.agree.fit()
+            return ST_SHADOW, (
+                "proven" if self.proven else
+                (f["why"] or "not proven yet")
+                + (f" — shown wrong earlier: {self.against}"
+                   if self.against and f["verdict"] != "refuted" else ""))
+        if (self.cfg["require_proven"] or self.against) and not self.proven:
+            return ST_UNPROVEN, (self.agree.fit()["why"] or "not proven yet")
+        if code is None:
+            _ok, why2, code = self.usable(t_now)
+            why = why or why2
+        code = str(code or "")
+        if code.startswith("flag_") or code.startswith("dis_") \
+                or code == "gross":
+            note = f"{why or code} — returns by itself"
+            if w is not None and 0.0 < w < 1.0:
+                note += f" ({w * 100:.0f} % DVL still)"
+            n = self.episodes_recent
+            if n >= 1 and int(self.cfg["esc_repeat_n"]) > 0:
+                note += (f"; {n} of {self.cfg['esc_repeat_n']} in the last "
+                         f"{self.cfg['esc_repeat_window_s']:g} s")
+            return ST_HELD, note
+        if code in ("no_tag", "bridge"):
+            return ST_NO_TAG, (why or "no tag state this tick (the blend "
+                                      "waits for it)")
+        # not armed this run, a code fault — and anything else that does not
+        # return by itself within the run (an unmeasured mount)
+        return ST_NOT_ARMED, str(why or code)
+
     def meta(self) -> dict:
+        m = self._meta_shipped()
+        c = self.cfg
+        primary = self.selection == "primary"
+        m["monitor_now"].update({
+            "residual_slow_m_s": self._r_slow,
+            "escalation_s": float(self._esc_s) if primary else None,
+            "align_min": self._al_min, "scale_ratio": self.scale_ratio,
+            "episodes_recent": self.episodes_recent})
+        m.update({
+            # 2026-10-16 (DTF SPEC.md §6.2). RECORD BOUNDARY: never pool
+            # velocity statistics across `selection`.
+            "selection": self.selection,
+            # not inside `gates`: a replay rebuilds a dvl: block from gates +
+            # agreement_cfg, and resolve() refuses an unknown key
+            "reentry_s_used": not primary,
+            "blend": {"hold_s": c["blend_hold_s"], "xfade_s": c["blend_xfade_s"],
+                      "gross_m_s": c["blend_gross_m_s"],
+                      "gross_tau_s": c["blend_gross_tau_s"],
+                      "stale_s": c["stale_s"], "dvl_w": False, "dt_s": self.dt},
+            "flags": {"fom_m_s": c["flag_fom_m_s"],
+                      "alt_jump_m": c["flag_alt_jump_m"],
+                      "alt_window_s": c["flag_alt_window_s"],
+                      "min_beams": c["flag_min_beams"],
+                      "reacquired": bool(c["flag_reacquired"]),
+                      "counts": {k: int(self.n_flag.get(k, 0)) for k in (
+                          "flag_fom", "flag_alt", "flag_beams", "flag_reacq",
+                          "flagged")}},
+            "disagreement": {
+                "slow_s": c["agree_slow_s"], "clip_m_s": c["agree_slow_clip_m_s"],
+                "hold_m_s": c["agree_hold_m_s"],
+                "release_m_s": c["agree_release_m_s"],
+                "slow_gap_s": SLOW_GAP_S, "slow_dt_cap_s": SLOW_DT_CAP_S,
+                "hold_drain_s": HOLD_DRAIN_S,
+                "hold_onsets": {k: int(self.n_hold.get(k, 0)) for k in (
+                    "difference", "alignment", "fit", "fit_incoherent")},
+                "slow_residual_max_m_s": float(self.r_slow_max)},
+            "escalation": {
+                "latch_s": c["esc_latch_s"], "leak": c["esc_leak"],
+                "scale_ratio": c["esc_scale_ratio"],
+                "scale_v_min_m_s": c["esc_scale_v_min_m_s"],
+                "repeat_n": c["esc_repeat_n"],
+                "repeat_window_s": c["esc_repeat_window_s"],
+                "episode_min_s": EPISODE_MIN_S, "dt_cap_s": ESC_DT_CAP_S,
+                # fix round 1: what makes an episode count toward repeat_n,
+                # and the episodes alignment evidence alone made (not counted)
+                "episode_kinds": sorted(EPISODE_KINDS),
+                "max_s": float(self.esc_max),
+                "latches": {k: int(self.n_esc.get(k, 0))
+                            for k in ("persistent", "repeated")},
+                "episodes": len(self.ep_log),
+                "episodes_alignment_only": len(self.ep_log_align),
+                "warnings": len(self.warn_log)},
+            "rung_held_ticks": int(self.n_rung_held),
+            "inactive_keys": ({k: c[k] for k in INACTIVE_IN_PRIMARY}
+                              if primary else {}),
+            "governed_by": ({k: list(v) for k, v in
+                             INACTIVE_IN_PRIMARY.items()} if primary else {}),
+        })
+        return m
+
+    def _meta_shipped(self) -> dict:
         f = self.agree.fit()
         c = self.cfg
         return {

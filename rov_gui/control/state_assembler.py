@@ -114,7 +114,7 @@ class StateAssembler:
 
     # --------------------------------------------------------------- step
     def step(self, fix, imu, t_now: float, dt: float, vel_xy=None,
-             disp_xy=None):
+             disp_xy=None, vel_fn=None):
         """-> (meas dict for EAOB.update | None, health dict).
 
         ``meas`` is None whenever either sensor is missing or stale — the
@@ -143,7 +143,20 @@ class StateAssembler:
         same order, so ``meas`` is bit-identical to a build without these
         arguments (pinned by test_dvl). Position source, yaw, z, roll/pitch
         and the rates are NOT touched either way: a DVL is a velocity sensor.
+
+        ``vel_fn`` (2026-10-16, dvl.selection primary; never together with
+        ``vel_xy``) is asked ``vel_fn(t_now, nu_fd) -> (v_xy | None, src,
+        w)`` once THIS tick's tag finite difference exists — the DVL-primary
+        blend needs it, which a velocity decided before the step cannot
+        have. ``v_xy`` (w > 0) = the blended (u, v), flown through the
+        ``vel_xy`` branch below with velocity x age bridging (as the trained
+        twin bridges); None (w = 0) = the finite-difference path, bit-
+        identical to ``vel_fn=None``. ``h["vel_src"]`` / ``h["w_dvl"]`` = its
+        src / w. Not called on a tick without a tag state.
         """
+        if vel_fn is not None and vel_xy is not None:
+            raise ValueError("StateAssembler.step: vel_xy and vel_fn are "
+                             "exclusive (vel_fn decides the velocity itself)")
         h = {"tag_age": None, "imu_age": None, "ok": False, "why": ""}
         # The attitude's TRUE age (2026-10-15, see att_age_v below), set
         # BEFORE every early return: a tick with no tag fix still has an
@@ -235,6 +248,14 @@ class StateAssembler:
         nu_lin = R.T @ self._v_ned
         h["nu_fd"] = nu_lin              # the tag finite difference, always
         h["vel_src"] = "tag_fd"
+        src = None
+        if vel_fn is not None:
+            v_xy, src, w = vel_fn(t_now, nu_lin.copy())
+            h["vel_src"], h["w_dvl"] = str(src), float(w)
+            if v_xy is not None:         # w > 0: the blend, velocity x age
+                vel_xy, disp_xy = v_xy, None
+            else:
+                src = None
         if vel_xy is None:
             if age > 0.0:
                 p[0] += self._v_ned[0] * age
@@ -245,7 +266,7 @@ class StateAssembler:
             vel_xy = np.asarray(vel_xy, float).reshape(2)
             # (u, v) measured, w still the finite difference's
             nu_lin = np.array([vel_xy[0], vel_xy[1], nu_lin[2]])
-            h["vel_src"] = "dvl"
+            h["vel_src"] = "dvl" if src is None else str(src)
             if age > 0.0:
                 if disp_xy is not None:
                     d = np.asarray(disp_xy, float).reshape(2)

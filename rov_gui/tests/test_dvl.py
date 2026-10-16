@@ -97,20 +97,37 @@ MOUNT = {"mount_rpy_deg": [0.0, 0.0, 0.0], "mount_t_flu": [0.0, 0.0, 0.0]}
 
 
 # ===================================================================== config
-def test_the_shipped_config_has_the_dvl_off_and_the_mount_unmeasured():
+def test_the_shipped_config_spells_known_dvl_keys_with_the_code_defaults():
+    """(2026-10-16: was ..._has_the_dvl_off_and_the_mount_unmeasured, which
+    failed since the operator measured the mount.) The DVL is off and needs
+    the proof; the file names only keys the code knows, and every key it does
+    not name is one of the 2026-10-16 selection keys (none once the operator
+    applies RL_controller logs/eval/dvl_trip_fix_20261015/
+    hw_mpc_dvl_patch.diff); every spelled key but the measured mount says
+    what the code would have assumed."""
     from rov_gui.control.geometry import MpcConfig
 
     mc = MpcConfig.load(ROOT / "config" / "hw_mpc.yaml")
     cfg = DV.resolve(mc.dvl)
     assert cfg["enabled"] is False and cfg["use"] is False
-    assert cfg["mount_rpy_deg"] is None and cfg["mount_t_flu"] is None
     assert cfg["require_proven"] is True
     assert cfg["port"] == 16171
     # The file SPELLS OUT every key, and says what the code would have
     # assumed: a number changed in one place and not the other is a run
     # flown on a gate nobody chose.
-    assert set(mc.dvl) == set(DV.KEYS), set(DV.KEYS) ^ set(mc.dvl)
-    assert all(cfg[k] == DV.DEFAULTS[k] for k in DV.KEYS)
+    assert set(mc.dvl) <= set(DV.KEYS), set(mc.dvl) - set(DV.KEYS)
+    assert set(DV.KEYS) - set(mc.dvl) <= set(DV.KEYS_20261016), \
+        set(DV.KEYS) - set(mc.dvl)
+    mount = ("mount_rpy_deg", "mount_t_flu")
+    assert all(cfg[k] == DV.DEFAULTS[k] for k in mc.dvl if k not in mount), \
+        {k: cfg[k] for k in mc.dvl if k not in mount and cfg[k] != DV.DEFAULTS[k]}
+    # the mount: both unmeasured, or both measured (3 finite numbers each)
+    if cfg["mount_rpy_deg"] is None or cfg["mount_t_flu"] is None:
+        assert cfg["mount_rpy_deg"] is None and cfg["mount_t_flu"] is None
+    else:
+        for k in mount:
+            assert len(cfg[k]) == 3 and all(math.isfinite(x) for x in cfg[k])
+    assert cfg["selection"] == "primary"
     sb = SB.resolve(mc.station_bridge)
     assert set(mc.station_bridge) == set(SB.KEYS)
     assert all(sb[k] == SB.DEFAULTS[k] for k in SB.KEYS)
@@ -120,7 +137,16 @@ def test_a_typo_in_the_dvl_block_is_refused_not_ignored():
     for bad in ({"mount_rpy": [0, 0, 0]}, {"enabled": "yes"},
                 {"mount_rpy_deg": [0, 0]}, {"stale_s": 0},
                 {"fom_max": float("nan")}, {"port": 0},
-                {"agree_min_pairs": 2}, {"mount_t_flu": [0, "x", 0]}):
+                {"agree_min_pairs": 2}, {"mount_t_flu": [0, "x", 0]},
+                # the 2026-10-16 keys
+                {"selection": "Primary"}, {"selection": None},
+                {"selection": True}, {"blend_xfade_s": 0},
+                {"blend_hold_s": -1}, {"flag_min_beams": 5},
+                {"flag_min_beams": 3.5}, {"flag_min_beams": True},
+                {"flag_reacquired": 1}, {"agree_release_m_s": 0.06},
+                {"esc_latch_s": 0}, {"esc_leak": -0.1}, {"flag_fom_m_s": -1},
+                {"esc_scale_ratio": 0.9}, {"esc_repeat_n": 1},
+                {"esc_repeat_n": 2.0}):
         try:
             DV.resolve(bad)
         except ValueError:
@@ -128,6 +154,11 @@ def test_a_typo_in_the_dvl_block_is_refused_not_ignored():
         raise AssertionError(f"accepted {bad!r}")
     assert DV.resolve({"mount_rpy_deg": [0, 0, 90]})["mount_rpy_deg"] == [
         0.0, 0.0, 90.0]
+    for good in ({"selection": "legacy"}, {"flag_min_beams": 0},
+                 {"blend_gross_m_s": 0.0}, {"esc_scale_ratio": 0.0},
+                 {"esc_repeat_n": 0}, {"flag_reacquired": False}):
+        c = DV.resolve(good)
+        assert all(c[k] == v for k, v in good.items()), (good, c)
 
 
 def test_the_command_line_overrides_the_file_for_both_readers():
@@ -647,8 +678,9 @@ def test_out_means_shadow_and_in_needs_the_mount_and_the_proof():
     assert "REFUTES" in why and not d.use, why
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_reentry_hysteresis_keeps_a_flickering_lock_out():
-    d = _proven_aid(reentry_s=0.5)
+    d = _proven_aid(selection="legacy", reentry_s=0.5)
     d.use = True
     t = 20.0
     d.note_sample(_sample(valid=False, t=t))
@@ -665,10 +697,11 @@ def test_reentry_hysteresis_keeps_a_flickering_lock_out():
     assert v is None and why.startswith("DVL re-entry (")
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_a_silence_restarts_the_hysteresis_like_a_bad_sample_does():
     """review 2026-10-02: only an INVALID sample used to reset the clock, so
     after a link stall the first report back was used at once."""
-    d = _proven_aid(reentry_s=0.5)
+    d = _proven_aid(selection="legacy", reentry_s=0.5)
     d.use = True
     t = 40.0
     for k in range(10):
@@ -832,8 +865,9 @@ class _Pairs:
         self._late = []
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_a_sustained_disagreement_trips_and_the_trip_is_latched():
-    d = _proven_aid(reentry_s=0.0)
+    d = _proven_aid(selection="legacy", reentry_s=0.0)
     d.use = True
     f = _Pairs(d)
     t = f.run(200, (0.10, 0, 0), (0.10, 0, 0), noise_mm=1.0)
@@ -860,10 +894,11 @@ def test_a_sustained_disagreement_trips_and_the_trip_is_latched():
     assert _vel(d, t2)[0] is not None
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_a_standing_offset_trips_on_the_low_passed_difference():
     """Below the gross gate, above trip_m_s: a mount 60 degrees out at
     10 cm/s is 10 cm/s of difference that never goes away."""
-    d = _proven_aid(reentry_s=0.0, agree_ratio_v_min_m_s=50.0)   # alignment off
+    d = _proven_aid(selection="legacy", reentry_s=0.0, agree_ratio_v_min_m_s=50.0)   # alignment off
     d.use = True
     f = _Pairs(d)
     c, s = math.cos(math.radians(60)), math.sin(math.radians(60))
@@ -873,11 +908,12 @@ def test_a_standing_offset_trips_on_the_low_passed_difference():
     assert 1.0 < t - t0 < 3.0, t - t0
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_the_opt_out_waives_the_proof_not_the_trips():
     """review 2026-10-02, both reviewers: with require_proven false the
     runtime monitor used to be gated on `proven` and so never fired — a
     mirrored mount flew on wrong-signed feedback until E-STOP."""
-    d = DV.DvlAid(dict(MOUNT, require_proven=False, reentry_s=0.0))
+    d = DV.DvlAid(dict(MOUNT, selection="legacy", require_proven=False, reentry_s=0.0))
     d.note_sample(_sample(t=29.9))
     assert d.set_use(True) == "" and not d.proven
     f = _Pairs(d)
@@ -887,6 +923,7 @@ def test_the_opt_out_waives_the_proof_not_the_trips():
     assert _vel(d, t)[0] is None
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_an_oscillating_wrong_sign_trips_on_alignment_not_on_the_average():
     """A station hold on wrong-signed velocity feedback does not drift, it
     OSCILLATES — and the low-passed difference of an oscillation averages
@@ -900,7 +937,7 @@ def test_an_oscillating_wrong_sign_trips_on_alignment_not_on_the_average():
     def flipped(t):
         return (-amp * math.sin(w * t), 0.0, 0.0)
 
-    d = _proven_aid(reentry_s=0.0, agree_trip_m_s=10.0)   # vector monitor off
+    d = _proven_aid(selection="legacy", reentry_s=0.0, agree_trip_m_s=10.0)   # vector monitor off
     d.use = True
     f = _Pairs(d)
     t = f.run(200, flipped, tag, noise_mm=0.5)
@@ -910,18 +947,19 @@ def test_an_oscillating_wrong_sign_trips_on_alignment_not_on_the_average():
     assert t - 30.0 < 1.5, t
     # with the alignment test disabled the same data sails through the
     # vector monitor at its shipped threshold
-    d = _proven_aid(reentry_s=0.0, agree_ratio_v_min_m_s=50.0)
+    d = _proven_aid(selection="legacy", reentry_s=0.0, agree_ratio_v_min_m_s=50.0)
     d.use = True
     _Pairs(d).run(200, flipped, tag, noise_mm=0.5)
     assert not d.tripped, d.tripped
     # ...and a RIGHT mount oscillating the same way trips neither
-    d = _proven_aid(reentry_s=0.0)
+    d = _proven_aid(selection="legacy", reentry_s=0.0)
     d.use = True
     _Pairs(d).run(200, tag, tag, noise_mm=1.0)
     assert not d.tripped, d.tripped
 
 
-def test_the_alignment_numbers_name_the_direction_and_the_error():
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a), with a twin under primary below.
+def test_the_alignment_numbers_name_the_direction_and_the_error(selection="legacy"):
     """alignment() is 1 - |A e - e| along each direction the vehicle moves
     in: +1 the same motion, -1 reversed, 1 - sqrt(2) a quarter turn. In
     shadow with no proof there is nothing to trip, so the numbers can be
@@ -930,7 +968,7 @@ def test_the_alignment_numbers_name_the_direction_and_the_error():
         #                        the ellipse fits the test's 1 s memory
         return (0.08 * math.sin(7.0 * t), 0.05 * math.cos(7.0 * t), 0.0)
 
-    d = DV.DvlAid(dict(MOUNT))
+    d = DV.DvlAid(dict(MOUNT, selection=selection))
     assert d.alignment() == []                # no pairs yet
     _Pairs(d).run(200, tag, tag, noise_mm=0.5)
     al = d.alignment()
@@ -940,20 +978,20 @@ def test_the_alignment_numbers_name_the_direction_and_the_error():
     assert all(a["align"] > 0.85 and a["sigma"] < 0.15 for a in al), al
     assert al[0]["speed_m_s"] > al[1]["speed_m_s"] > 0.02 and al[0]["n_eff"] > 20
 
-    d = DV.DvlAid(dict(MOUNT))                # sway mirrored
+    d = DV.DvlAid(dict(MOUNT, selection=selection))                # sway mirrored
     _Pairs(d).run(200, lambda t: (tag(t)[0], -tag(t)[1], 0.0), tag,
                   noise_mm=0.5)
     al = d.alignment()
     assert al[0]["align"] > 0.85 and al[1]["align"] < -0.85, al
     assert d.n_trips == 0                     # shadow, unproven: nothing to trip
 
-    d = DV.DvlAid(dict(MOUNT))                # a quarter turn
+    d = DV.DvlAid(dict(MOUNT, selection=selection))                # a quarter turn
     _Pairs(d).run(200, lambda t: (tag(t)[1], -tag(t)[0], 0.0), tag,
                   noise_mm=0.5)
     al = d.alignment()
     assert all(abs(a["align"] - (1 - math.sqrt(2))) < 0.15 for a in al), al
 
-    d = DV.DvlAid(dict(MOUNT))                # a station hold: no evidence
+    d = DV.DvlAid(dict(MOUNT, selection=selection))                # a station hold: no evidence
     _Pairs(d).run(200, lambda t: (0.008 * math.sin(t), 0.0, 0.0),
                   lambda t: (0.008 * math.sin(t), 0.0, 0.0), noise_mm=0.5)
     assert d.alignment() == [] and d.n_monitor > 150
@@ -962,7 +1000,13 @@ def test_the_alignment_numbers_name_the_direction_and_the_error():
     json.dumps(d.meta())
 
 
-def test_a_mount_inside_the_tolerance_cannot_trip_whichever_way_it_moves():
+def test_the_alignment_numbers_name_the_direction_and_the_error_under_primary():
+    """The same, under dvl.selection primary (2026-10-16): mode-independent in substance."""
+    test_the_alignment_numbers_name_the_direction_and_the_error(selection="primary")
+
+
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a), with a twin under primary below.
+def test_a_mount_inside_the_tolerance_cannot_trip_whichever_way_it_moves(selection="legacy"):
     """A mount the proof accepts (12 degrees out is inside agree_tol) leaks
     surge into the DVL's sway. A per-AXIS slope reads that leak as "sway
     disagrees" on a diagonal pass (design note 2026-10-02); along the
@@ -978,7 +1022,7 @@ def test_a_mount_inside_the_tolerance_cannot_trip_whichever_way_it_moves():
             v = tag(t)
             return (c * v[0] + s * v[1], -s * v[0] + c * v[1], 0.0)
 
-        d = _proven_aid(reentry_s=0.0)
+        d = _proven_aid(selection=selection, reentry_s=0.0)
         d.use = True
         _Pairs(d).run(600, dvl, tag, noise_mm=0.8)
         assert not d.tripped, (deg, d.tripped)
@@ -986,6 +1030,12 @@ def test_a_mount_inside_the_tolerance_cannot_trip_whichever_way_it_moves():
         assert al and abs((1 - al[0]["align"]) - 0.21) < 0.12, al
 
 
+def test_a_mount_inside_the_tolerance_cannot_trip_whichever_way_it_moves_under_primary():
+    """The same, under dvl.selection primary (2026-10-16): mode-independent in substance."""
+    test_a_mount_inside_the_tolerance_cannot_trip_whichever_way_it_moves(selection="primary")
+
+
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_the_first_pairs_of_a_new_motion_are_not_a_verdict():
     """When the vehicle starts moving, the first pair or two are that
     direction's whole evidence. With stamps 100 ms apart the DVL has stepped
@@ -1001,7 +1051,7 @@ def test_the_first_pairs_of_a_new_motion_are_not_a_verdict():
                  (0.10, 0, 0), (0, 0, 0)][k]
             f.run(40, v, v, noise_mm=0.2, stamp_late=0.10)
 
-    d = _proven_aid(reentry_s=0.0)
+    d = _proven_aid(selection="legacy", reentry_s=0.0)
     d.use = True
     fly(d)
     assert not d.tripped, d.tripped
@@ -1010,7 +1060,7 @@ def test_the_first_pairs_of_a_new_motion_are_not_a_verdict():
     hold, share = DV.ALIGN_HOLD_S, DV.ALIGN_MIN_SHARE
     DV.ALIGN_HOLD_S, DV.ALIGN_MIN_SHARE = 0.0, 0.0
     try:
-        d = _proven_aid(reentry_s=0.0)
+        d = _proven_aid(selection="legacy", reentry_s=0.0)
         d.use = True
         fly(d)
         assert d.tripped and "alignment" in d.tripped, d.tripped
@@ -1018,12 +1068,13 @@ def test_the_first_pairs_of_a_new_motion_are_not_a_verdict():
         DV.ALIGN_HOLD_S, DV.ALIGN_MIN_SHARE = hold, share
 
 
-def test_a_tag_jump_is_set_aside_not_booked_against_the_dvl():
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a), with a twin under primary below.
+def test_a_tag_jump_is_set_aside_not_booked_against_the_dvl(selection="legacy"):
     """One mis-solved fix is one pair of metres per second in the raw tag
     difference. It counts as innov_max apart in the difference monitor and
     is left out of the alignment sums — it is the tag's error — so it takes
     most of a second of such pairs on end to trip."""
-    d = _proven_aid(reentry_s=0.0)
+    d = _proven_aid(selection=selection, reentry_s=0.0)
     d.use = True
     f = _Pairs(d)
     f.run(100, (0.05, 0, 0), (0.05, 0, 0), noise_mm=0.5)
@@ -1036,7 +1087,13 @@ def test_a_tag_jump_is_set_aside_not_booked_against_the_dvl():
     assert abs(d.residual_m_s - res) < 0.02, (res, d.residual_m_s)
 
 
-def test_how_late_either_stream_arrives_changes_nothing():
+def test_a_tag_jump_is_set_aside_not_booked_against_the_dvl_under_primary():
+    """The same, under dvl.selection primary (2026-10-16): mode-independent in substance."""
+    test_a_tag_jump_is_set_aside_not_booked_against_the_dvl(selection="primary")
+
+
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a), with a twin under primary below.
+def test_how_late_either_stream_arrives_changes_nothing(selection="legacy"):
     """The monitors compare what the two sensors say about the SAME moment
     (a pair is the tag difference against the DVL interpolated to its
     midpoint). Fed by the tick's own tag velocity instead, a right mount
@@ -1049,7 +1106,7 @@ def test_how_late_either_stream_arrives_changes_nothing():
     ref = None
     for late in ({}, {"dvl_late": 0.30}, {"tag_late": 0.25},
                  {"dvl_late": 0.05, "tag_late": 0.30}):
-        d = _proven_aid(reentry_s=0.0)
+        d = _proven_aid(selection=selection, reentry_s=0.0)
         d.use = True
         f = _Pairs(d)
         f.run(400, v, v, noise_mm=0.8, **late)
@@ -1063,13 +1120,19 @@ def test_how_late_either_stream_arrives_changes_nothing():
         assert got == ref, (late, got, ref)
 
 
-def test_without_new_fixes_there_is_no_evidence_to_trip_on():
+def test_how_late_either_stream_arrives_changes_nothing_under_primary():
+    """The same, under dvl.selection primary (2026-10-16): mode-independent in substance."""
+    test_how_late_either_stream_arrives_changes_nothing(selection="primary")
+
+
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a), with a twin under primary below.
+def test_without_new_fixes_there_is_no_evidence_to_trip_on(selection="legacy"):
     """After the LAST fix the tag side says nothing. Comparing the DVL
     against a tag velocity frozen at its last value books the vehicle's own
     acceleration as disagreement (review 2026-10-02: a kick that took the
     tags out of view un-proved the mount right before the dropout the DVL
     rung exists for)."""
-    d = _proven_aid(reentry_s=0.0)
+    d = _proven_aid(selection=selection, reentry_s=0.0)
     d.use = True
     f = _Pairs(d)
     t = f.run(40, (0.0, 0, 0), (0.0, 0, 0))
@@ -1083,10 +1146,16 @@ def test_without_new_fixes_there_is_no_evidence_to_trip_on():
     assert _vel(d, f.t)[0] is not None
 
 
+def test_without_new_fixes_there_is_no_evidence_to_trip_on_under_primary():
+    """The same, under dvl.selection primary (2026-10-16): mode-independent in substance."""
+    test_without_new_fixes_there_is_no_evidence_to_trip_on(selection="primary")
+
+
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_an_outlier_tick_is_held_back_without_a_trip():
     """The innovation gate: with a current tag velocity to compare against,
     one sample far from it is simply not used that tick."""
-    d = _proven_aid(reentry_s=0.0, a_max_m_s2=50.0)       # jump gate aside
+    d = _proven_aid(selection="legacy", reentry_s=0.0, a_max_m_s2=50.0)       # jump gate aside
     d.use = True
     t = 30.0
     for _ in range(20):
@@ -1161,12 +1230,13 @@ def test_the_device_changing_its_own_rotation_is_a_trip():
     assert d.meta()["device_config_changes"] == [what]
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_a_latched_trip_does_not_shield_a_proof_made_under_it():
     """review 2026-10-02 (reproduced): every trip was guarded by "not
     already tripped". So a proof RE-MADE while the latch was still set could
     never be undone — it survived a change of the device's own rotation,
     and the operator could re-arm on it."""
-    d = DV.DvlAid(dict(MOUNT, reentry_s=0.0))
+    d = DV.DvlAid(dict(MOUNT, selection="legacy", reentry_s=0.0))
     _fly(d)
     assert d.proven and d.set_use(True) == ""
     assert d.note_device_config({"mounting_rotation_offset": 0,
@@ -1194,6 +1264,7 @@ def test_a_latched_trip_does_not_shield_a_proof_made_under_it():
     assert d.n_trips == 3
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_evidence_against_the_dvl_outlives_its_window_and_its_trip():
     """require_proven false waives the proof a DVL with nothing against it
     would need — not the one evidence demands (review 2026-10-02: under the
@@ -1201,7 +1272,7 @@ def test_evidence_against_the_dvl_outlives_its_window_and_its_trip():
     tripped DVL could be re-armed a second later, the trip having deleted
     the very pairs that caused it)."""
     # (a) refuted in shadow: remembered after the window has forgotten it
-    d = DV.DvlAid(dict(MOUNT, require_proven=False, agree_window_s=8.0))
+    d = DV.DvlAid(dict(MOUNT, selection="legacy", require_proven=False, agree_window_s=8.0))
     _fly(d, theta_deg=180.0)                  # switch OUT, mount reversed
     assert d.agree.fit()["verdict"] == "refuted"
     assert not d.tripped and d.n_trips == 0   # nothing to take out...
@@ -1216,7 +1287,7 @@ def test_evidence_against_the_dvl_outlives_its_window_and_its_trip():
     _fly(d, t0=60.0)                          # a proof made AFTERWARDS
     assert d.proven and d.against == "" and d.set_use(True) == ""
     # (b) a trip: the re-arm needs a proof made after it, opt-out or not
-    d = DV.DvlAid(dict(MOUNT, require_proven=False, reentry_s=0.0))
+    d = DV.DvlAid(dict(MOUNT, selection="legacy", require_proven=False, reentry_s=0.0))
     d.note_sample(_sample(t=29.9))
     assert d.set_use(True) == ""              # the opt-out, nothing against
     f = _Pairs(d)
@@ -1252,6 +1323,7 @@ def test_a_device_config_change_discards_the_evidence_in_every_state():
     assert min(q[0] for q in d.agree._pairs) > t_change + 0.05
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_dvl_noise_or_a_glitch_is_not_evidence_about_the_mount():
     """A trip is about the MOUNT: both sensors see the motion and disagree
     about it. When only the DVL "moves" — its own noise, two reports off a
@@ -1270,7 +1342,7 @@ def test_dvl_noise_or_a_glitch_is_not_evidence_about_the_mount():
                       (0.0, 0, 0), noise_mm=0.5, dt=0.1)
 
     for feed in (glitch, noisy):
-        d = _proven_aid(reentry_s=0.0)
+        d = _proven_aid(selection="legacy", reentry_s=0.0)
         d.use = True
         feed(d)
         assert not d.tripped and d.proven, (feed.__name__, d.tripped)
@@ -1283,7 +1355,7 @@ def test_dvl_noise_or_a_glitch_is_not_evidence_about_the_mount():
     # ...which still keeps a switch from going IN on that data — but is
     # not REMEMBERED against the DVL once it has passed (shadow and IN must
     # agree on what counts as evidence)
-    d2 = DV.DvlAid(dict(MOUNT, require_proven=False, agree_window_s=8.0))
+    d2 = DV.DvlAid(dict(MOUNT, selection="legacy", require_proven=False, agree_window_s=8.0))
     noisy(d2)
     assert "nothing about the mount" in d2.set_use(True)
     assert d2.against == "" and not d2.tripped
@@ -1295,7 +1367,7 @@ def test_dvl_noise_or_a_glitch_is_not_evidence_about_the_mount():
     hold, DV.COHERENT_MIN = DV.COHERENT_MIN, 0.0
     try:
         for feed in (glitch, noisy):
-            d = _proven_aid(reentry_s=0.0)
+            d = _proven_aid(selection="legacy", reentry_s=0.0)
             d.use = True
             feed(d)
             assert d.tripped, feed.__name__
@@ -1303,12 +1375,13 @@ def test_dvl_noise_or_a_glitch_is_not_evidence_about_the_mount():
         DV.COHERENT_MIN = hold
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_a_dvl_the_fit_currently_refutes_is_held_back_without_a_latch():
     """A refutation that is not about the mount (the DVL "moves", the tags
     do not) does not trip — but the DVL is not flown on while it stands
     (review 2026-10-02: it was, for the rest of the engagement, on data
     refusal() would have refused IN for). It comes back by itself."""
-    d = _proven_aid(reentry_s=0.0, agree_window_s=20.0)
+    d = _proven_aid(selection="legacy", reentry_s=0.0, agree_window_s=20.0)
     d.use = True
     rng = np.random.default_rng(3)
     f = _Pairs(d)
@@ -1326,12 +1399,13 @@ def test_a_dvl_the_fit_currently_refutes_is_held_back_without_a_latch():
     assert d.n_trips == 0
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_a_dvl_that_stands_apart_for_a_second_is_a_trip_whatever_the_tags_saw():
     """The other half of the rule: a two-report glitch is not a trip, a
     false lock that lasts IS — a DVL that reports for a second a motion
     that is not there is not fit to fly on. The message says which of the
     two it looks like, because the operator's remedy differs."""
-    d = _proven_aid(reentry_s=0.0)
+    d = _proven_aid(selection="legacy", reentry_s=0.0)
     d.use = True
     f = _Pairs(d)
     f.run(60, (0.0, 0, 0), (0.0, 0, 0), noise_mm=0.5)
@@ -1341,7 +1415,7 @@ def test_a_dvl_that_stands_apart_for_a_second_is_a_trip_whatever_the_tags_saw():
     assert "false bottom lock rather than the mount" in d.tripped
     assert 0.8 < f.t - t0 < 2.0, f.t - t0
     # shorter than that it is not (the fixture's table A5 has the boundary)
-    d = _proven_aid(reentry_s=0.0)
+    d = _proven_aid(selection="legacy", reentry_s=0.0)
     d.use = True
     f = _Pairs(d)
     f.run(60, (0.0, 0, 0), (0.0, 0, 0), noise_mm=0.5)
@@ -1350,6 +1424,7 @@ def test_a_dvl_that_stands_apart_for_a_second_is_a_trip_whatever_the_tags_saw():
     assert not d.tripped, d.tripped
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_a_rejected_dvl_stays_out_until_a_newer_frame_agrees():
     """The innovation gate's limit widens with the age of the fix — the
     vehicle may have accelerated since. But the same camera frame growing
@@ -1359,7 +1434,7 @@ def test_a_rejected_dvl_stays_out_until_a_newer_frame_agrees():
     carried it 0.6 m). Rejected, the DVL stays out — for the bridge's rung
     too — until a tag velocity from a NEWER frame agrees."""
     def run(lat):
-        d = _proven_aid(reentry_s=0.0)
+        d = _proven_aid(selection="legacy", reentry_s=0.0)
         d.use = True
         t = 30.0
         for _ in range(10):                   # agreeing tags, `lat` late
@@ -1417,12 +1492,13 @@ def test_a_rejected_dvl_stays_out_until_a_newer_frame_agrees():
         run(lat)
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_the_fix_age_integral_never_contains_a_rejected_sample():
     """The gate judges the NEWEST sample. Once it releases, the integral
     over the fix's age (displacement) must not still hold the samples it
     rejected a few ticks earlier (round 6, reproduced: 9-11 cm into eta with
     the tags in view, then carried through a dropout by the DVL rung)."""
-    d = _proven_aid(reentry_s=0.0, a_max_m_s2=50.0)       # jump gate aside
+    d = _proven_aid(selection="legacy", reentry_s=0.0, a_max_m_s2=50.0)       # jump gate aside
     d.use = True
     t = 30.0
     for _ in range(10):
@@ -1455,13 +1531,14 @@ def test_the_fix_age_integral_never_contains_a_rejected_sample():
     d._innov_reject_t = rej
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_a_released_dvl_does_not_carry_what_it_was_rejected_for():
     """Worker level, round 6's scenario: tags 0.30 s late, a false lock
     ramps up and down (each step passes the jump gate), the gate rejects
     the large part, then releases; the tags drop right after. The estimate
     must not keep the rejected motion — in view or through the dropout."""
     with tempfile.TemporaryDirectory() as tmp:
-        TC, w, bus, _pilots, _logs, sim = _station(tmp)
+        TC, w, bus, _pilots, _logs, sim = _station(tmp, selection="legacy")
         try:
             w._bridge.cfg["dvl_hold_s"] = 3.0
             st = []
@@ -1492,6 +1569,7 @@ def test_a_released_dvl_does_not_carry_what_it_was_rejected_for():
             sim.close()
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_a_shrunken_map_is_held_back_not_called_a_mount():
     """What only part of the time is DVL-only motion — repeated short
     glitches, noise on slow motion — does not drive the fit's slope to zero
@@ -1515,7 +1593,7 @@ def test_a_shrunken_map_is_held_back_not_called_a_mount():
         return f
 
     shrink = np.diag([0.7, 0.7])              # tags see 0.7 of the DVL
-    d = _proven_aid(reentry_s=0.0)
+    d = _proven_aid(selection="legacy", reentry_s=0.0)
     d.use = True
     f = feed(d, shrink)
     ft = d.agree.fit()
@@ -1525,7 +1603,7 @@ def test_a_shrunken_map_is_held_back_not_called_a_mount():
     # the same with the old threshold: a latched "scale" trip
     hold, DV.COHERENT_MIN = DV.COHERENT_MIN, 0.5
     try:
-        d = _proven_aid(reentry_s=0.0)
+        d = _proven_aid(selection="legacy", reentry_s=0.0)
         d.use = True
         feed(d, shrink)
         assert d.tripped and "scale" in d.tripped, d.tripped
@@ -1534,12 +1612,13 @@ def test_a_shrunken_map_is_held_back_not_called_a_mount():
     # a mount 40 degrees out and a mirrored axis are still trips
     c, s_ = math.cos(math.radians(40)), math.sin(math.radians(40))
     for mapping in (np.array([[c, -s_], [s_, c]]), np.diag([1.0, -1.0])):
-        d = _proven_aid(reentry_s=0.0)
+        d = _proven_aid(selection="legacy", reentry_s=0.0)
         d.use = True
         feed(d, mapping)
         assert d.tripped, mapping
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_an_alignment_the_tags_only_partly_see_holds_the_dvl_back():
     """The alignment monitor: the DVL's motion along a direction goes
     somewhere the tags do not show. If the tags see most of it (a mount),
@@ -1553,7 +1632,7 @@ def test_an_alignment_the_tags_only_partly_see_holds_the_dvl_back():
         return (0.06 * math.sin(w * t), 0.0, 0.0)
 
     def run(mapping, n=200):
-        d = _proven_aid(reentry_s=0.0, agree_trip_m_s=10.0)   # vector off
+        d = _proven_aid(selection="legacy", reentry_s=0.0, agree_trip_m_s=10.0)   # vector off
         d.use = True
         f = _Pairs(d)
         held = 0
@@ -1579,6 +1658,7 @@ def test_an_alignment_the_tags_only_partly_see_holds_the_dvl_back():
     assert d.tripped and "alignment" in d.tripped, d.tripped
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_a_burst_cannot_trip_the_difference_monitor_whatever_the_tag_noise():
     """Every pair counts as at most innov_max_m_s apart — a FIXED clip.
     Clipped at 4 sigma of the proof's scatter instead, noisy tags (3 mm:
@@ -1586,7 +1666,7 @@ def test_a_burst_cannot_trip_the_difference_monitor_whatever_the_tag_noise():
     reports trip it in 0.4 s (review 2026-10-02, reproduced). A false lock
     that LASTS still trips."""
     def make():
-        d = _proven_aid(reentry_s=0.0, a_max_m_s2=50.0)     # jump gate aside
+        d = _proven_aid(selection="legacy", reentry_s=0.0, a_max_m_s2=50.0)     # jump gate aside
         d.use = True
         d.proof = {"rms_m_s": 0.09}           # what 3 mm tags give a proof
         return d
@@ -1607,12 +1687,13 @@ def test_a_burst_cannot_trip_the_difference_monitor_whatever_the_tag_noise():
     assert 0.6 < f.t - t0 < 1.6, f.t - t0
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_the_refutation_hold_ends_when_its_evidence_does():
     """The fit's window keeps refuting pairs for agree_window_s, and with
     the vehicle at rest no new pair replaces them: a DVL that went quiet
     again stayed held back for ~52 s (review 2026-10-02). The hold lasts
     REFUTE_HOLD_S past the newest refuting evaluation."""
-    d = _proven_aid(reentry_s=0.0)
+    d = _proven_aid(selection="legacy", reentry_s=0.0)
     d.use = True
     rng = np.random.default_rng(3)
     f = _Pairs(d)
@@ -1632,6 +1713,7 @@ def test_the_refutation_hold_ends_when_its_evidence_does():
     assert not d.tripped
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_the_alignment_test_still_works_when_the_tags_come_slowly():
     """review 2026-10-02 (reproduced): with one pair every 0.2 s the
     effective pair count settled at 9, under the minimum of 10 — the
@@ -1639,7 +1721,7 @@ def test_the_alignment_test_still_works_when_the_tags_come_slowly():
     w = 2 * math.pi * 0.25                    # a slow, wrong-signed sway
 
     for dt in (0.2, 0.3):
-        d = _proven_aid(reentry_s=0.0, agree_trip_m_s=10.0)
+        d = _proven_aid(selection="legacy", reentry_s=0.0, agree_trip_m_s=10.0)
         d.use = True
         f = _Pairs(d)
         f.run(int(30 / dt), lambda t: (-0.06 * math.sin(w * t), 0.0, 0.0),
@@ -1874,11 +1956,14 @@ def test_with_no_dvl_the_worker_is_what_it_was_and_says_so():
             w.set_dvl_use(True)               # nothing to switch
             assert "no DVL" in w.reason
             m = w._run_meta()
-            assert m["dvl"]["enabled"] is False and m["schema_version"] == 21
+            assert m["dvl"]["enabled"] is False and m["schema_version"] == 22
             rows = _rows(w)
             assert rows and all(r["vel_src"] == "tag_fd" for r in rows)
             assert all(r["dvl_u"] == "nan" and r["dvl_ok"] == "0"
                        for r in rows)
+            # schema 22: no DVL, no weight and no usage code
+            assert all(r["w_dvl"] == "0.000" and r["dvl_code"] == ""
+                       and r["dvl_esc_s"] == "nan" for r in rows)
             # the body velocity is on disk for the first time, and without a
             # DVL it IS the tag finite difference
             assert all(r["nu_u"] == r["fd_u"] and r["nu_v"] == r["fd_v"]
@@ -1910,9 +1995,10 @@ def test_the_switch_needs_the_proof_and_is_frozen_while_engaged():
             sim.close()
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_in_flies_on_the_dvl_and_falls_back_row_by_row():
     with tempfile.TemporaryDirectory() as tmp:
-        TC, w, bus, _pilots, _logs = _dvl_worker(tmp, reentry_s=0.0)
+        TC, w, bus, _pilots, _logs = _dvl_worker(tmp, selection="legacy", reentry_s=0.0)
         sim = _Sim(w, TC)
         try:
             sim.prove()
@@ -1999,9 +2085,10 @@ def _station(tmp, **over):
     return TC, w, bus, pilots, logs, sim
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_the_bridge_carries_a_station_hold_on_the_dvl_then_coasts():
     with tempfile.TemporaryDirectory() as tmp:
-        TC, w, bus, pilots, logs, sim = _station(tmp)
+        TC, w, bus, pilots, logs, sim = _station(tmp, selection="legacy")
         try:
             st = []
             bus.mpc_status.connect(st.append)
@@ -2060,11 +2147,12 @@ def test_the_bridge_carries_a_station_hold_on_the_dvl_then_coasts():
             sim.close()
 
 
-def test_a_dropout_carried_to_its_end_on_the_dvl_measures_the_dead_reckoning():
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a), with a twin under primary below.
+def test_a_dropout_carried_to_its_end_on_the_dvl_measures_the_dead_reckoning(selection="legacy"):
     """Only THEN is the gap to the returning fix the DVL's own error — the
     number that will replace the [예측] dvl_hold_s."""
     with tempfile.TemporaryDirectory() as tmp:
-        TC, w, _bus, _pilots, logs, sim = _station(tmp)
+        TC, w, _bus, _pilots, logs, sim = _station(tmp, selection=selection)
         try:
             w.fix.t_capture -= 5.0
             for _ in range(8):
@@ -2092,14 +2180,20 @@ def test_a_dropout_carried_to_its_end_on_the_dvl_measures_the_dead_reckoning():
             sim.close()
 
 
-def test_the_dvl_rung_is_bounded_by_what_a_station_hold_is():
+def test_a_dropout_carried_to_its_end_on_the_dvl_measures_the_dead_reckoning_under_primary():
+    """The same, under dvl.selection primary (2026-10-16): mode-independent in substance."""
+    test_a_dropout_carried_to_its_end_on_the_dvl_measures_the_dead_reckoning(selection="primary")
+
+
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a), with a twin under primary below.
+def test_the_dvl_rung_is_bounded_by_what_a_station_hold_is(selection="legacy"):
     """Nothing cross-checks the DVL while the tag is gone, so the rung
     refuses a DVL that describes anything but a vehicle nominally at rest
     (review 2026-10-02: 10 s of a false 0.2 m/s was 2 m of full-authority
     push the wrong way)."""
     for kind in ("speed", "displacement"):
         with tempfile.TemporaryDirectory() as tmp:
-            TC, w, _bus, _pilots, logs, sim = _station(tmp)
+            TC, w, _bus, _pilots, logs, sim = _station(tmp, selection=selection)
             try:
                 if kind == "displacement":
                     w._bridge.cfg["dvl_max_disp_m"] = 0.032
@@ -2141,12 +2235,18 @@ def test_the_dvl_rung_is_bounded_by_what_a_station_hold_is():
                 sim.close()
 
 
-def test_the_dvl_rung_tells_the_observer_about_the_acceleration():
+def test_the_dvl_rung_is_bounded_by_what_a_station_hold_is_under_primary():
+    """The same, under dvl.selection primary (2026-10-16): mode-independent in substance."""
+    test_the_dvl_rung_is_bounded_by_what_a_station_hold_is(selection="primary")
+
+
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a), with a twin under primary below.
+def test_the_dvl_rung_tells_the_observer_about_the_acceleration(selection="legacy"):
     """A bridge state that says "moving at 0.1 m/s, accelerating at zero"
     for ten seconds pulls the EAOB's disturbance estimate by M x the real
     acceleration. The rung builds nudot the way the assembler does."""
     with tempfile.TemporaryDirectory() as tmp:
-        TC, w, _bus, _pilots, _logs, sim = _station(tmp)
+        TC, w, _bus, _pilots, _logs, sim = _station(tmp, selection=selection)
         try:
             seen = []
             real = w.ctrl.step
@@ -2165,13 +2265,19 @@ def test_the_dvl_rung_tells_the_observer_about_the_acceleration():
             sim.close()
 
 
+def test_the_dvl_rung_tells_the_observer_about_the_acceleration_under_primary():
+    """The same, under dvl.selection primary (2026-10-16): mode-independent in substance."""
+    test_the_dvl_rung_tells_the_observer_about_the_acceleration(selection="primary")
+
+
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_a_tick_the_rung_did_not_integrate_closes_it_for_the_dropout():
     """The rung's position is the last fix plus the integral of EVERY tick
     since. A tick it did not integrate — the bridge blind for one tick, or
     a fault the bridge does not carry at all — leaves a hole, and only a
     fresh fix may open the rung again."""
     with tempfile.TemporaryDirectory() as tmp:
-        TC, w, _bus, _pilots, _logs, sim = _station(tmp)
+        TC, w, _bus, _pilots, _logs, sim = _station(tmp, selection="legacy")
         try:
             w.fix.t_capture -= 5.0
             for _ in range(4):
@@ -2203,6 +2309,7 @@ def test_a_tick_the_rung_did_not_integrate_closes_it_for_the_dropout():
             sim.close()
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_the_rung_does_not_take_a_dvl_the_gate_was_rejecting():
     """The rung has no tag to check the DVL against — so it only opens for
     a DVL that was actually FLOWN on the last tagged tick. One the
@@ -2212,7 +2319,7 @@ def test_the_rung_does_not_take_a_dvl_the_gate_was_rejecting():
     taken by the rung on the first lost one and walked the estimate 0.5 m
     with the controller pushing against it)."""
     with tempfile.TemporaryDirectory() as tmp:
-        TC, w, bus, _pilots, _logs, sim = _station(tmp)
+        TC, w, bus, _pilots, _logs, sim = _station(tmp, selection="legacy")
         try:
             st = []
             bus.mpc_status.connect(st.append)
@@ -2235,6 +2342,7 @@ def test_the_rung_does_not_take_a_dvl_the_gate_was_rejecting():
             sim.close()
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_the_tags_fading_out_do_not_let_a_rejected_dvl_back_in():
     """How tags REALLY disappear: the fix simply stops arriving, and the
     assembler bridges the last one until tag_stale_s — a tag state with an
@@ -2244,7 +2352,7 @@ def test_the_tags_fading_out_do_not_let_a_rejected_dvl_back_in():
     the opposite: the DVL went back in 0.35 s after the last fix, the rung
     carried it 0.6 m, and the closure went "back" to a point 0.125 m off)."""
     with tempfile.TemporaryDirectory() as tmp:
-        TC, w, bus, pilots, logs, sim = _station(tmp)
+        TC, w, bus, pilots, logs, sim = _station(tmp, selection="legacy")
         try:
             w._bridge.cfg["imu_hold_s"] = 3.0
             w._bridge.cfg["dvl_hold_s"] = 10.0
@@ -2269,12 +2377,13 @@ def test_the_tags_fading_out_do_not_let_a_rejected_dvl_back_in():
             sim.close()
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_late_tags_fading_out_do_not_let_a_rejected_dvl_back_in_either():
     """The same with tags 0.28 s late — no frame is ever "fresh" there.
     Keyed on freshness, the hold was then never set, and the station bridge
     carried the rejected false lock 0.5 m (round 5, reproduced)."""
     with tempfile.TemporaryDirectory() as tmp:
-        TC, w, bus, pilots, logs, sim = _station(tmp)
+        TC, w, bus, pilots, logs, sim = _station(tmp, selection="legacy")
         try:
             w._bridge.cfg["imu_hold_s"] = 3.0
             w._bridge.cfg["dvl_hold_s"] = 10.0
@@ -2300,7 +2409,8 @@ def test_late_tags_fading_out_do_not_let_a_rejected_dvl_back_in_either():
             sim.close()
 
 
-def test_the_imu_rung_never_inherits_a_dvl_velocity():
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a), with a twin under primary below.
+def test_the_imu_rung_never_inherits_a_dvl_velocity(selection="legacy"):
     """The IMU rung's dead reckoner is anchored on every tagged tick and,
     while the DVL rung carries a dropout, on every rung tick. Neither may
     seed it with the DVL's velocity: a false lock that ENDS (lock lost,
@@ -2309,7 +2419,7 @@ def test_the_imu_rung_never_inherits_a_dvl_velocity():
     imu_hold_s — 0.67-1.2 m on a vehicle at rest (round 5). Tagged ticks
     seed it with the TAG velocity, as before the DVL; rung ticks at rest."""
     with tempfile.TemporaryDirectory() as tmp:
-        TC, w, _bus, _pilots, _logs, sim = _station(tmp)
+        TC, w, _bus, _pilots, _logs, sim = _station(tmp, selection=selection)
         try:
             assert w._bridge_dr is not None
             seen = []
@@ -2341,11 +2451,17 @@ def test_the_imu_rung_never_inherits_a_dvl_velocity():
             sim.close()
 
 
+def test_the_imu_rung_never_inherits_a_dvl_velocity_under_primary():
+    """The same, under dvl.selection primary (2026-10-16): mode-independent in substance."""
+    test_the_imu_rung_never_inherits_a_dvl_velocity(selection="primary")
+
+
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_the_panel_gives_a_reason_on_bridged_and_tagless_ticks():
     """A fallback with no reason on the panel (round 5: about five ticks
     per dropout on the IMU rung, and on tagless ticks without a station)."""
     with tempfile.TemporaryDirectory() as tmp:
-        TC, w, bus, _pilots, _logs, sim = _station(tmp)
+        TC, w, bus, _pilots, _logs, sim = _station(tmp, selection="legacy")
         try:
             w._bridge.cfg["use_dvl"] = False          # the IMU rung carries it
             st = []
@@ -2360,12 +2476,13 @@ def test_the_panel_gives_a_reason_on_bridged_and_tagless_ticks():
             sim.close()
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_the_panel_says_what_the_tick_was_told():
     """The panel's reason is the one the tick itself got, not a second
     question to the aid — which can answer differently, the gate's
     reference having moved on since (review 2026-10-02)."""
     with tempfile.TemporaryDirectory() as tmp:
-        TC, w, bus, _pilots, _logs = _dvl_worker(tmp, reentry_s=0.0)
+        TC, w, bus, _pilots, _logs = _dvl_worker(tmp, selection="legacy", reentry_s=0.0)
         sim = _Sim(w, TC)
         try:
             sim.prove()
@@ -2386,12 +2503,13 @@ def test_the_panel_says_what_the_tick_was_told():
             sim.close()
 
 
-def test_a_healthy_dvl_carries_the_real_tag_dropout():
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a), with a twin under primary below.
+def test_a_healthy_dvl_carries_the_real_tag_dropout(selection="legacy"):
     """...and the same real sequence with an honest DVL: it flies through
     the ageing phase and the rung carries it, tracking a drift the frozen
     ladder would not see."""
     with tempfile.TemporaryDirectory() as tmp:
-        TC, w, bus, _pilots, _logs, sim = _station(tmp)
+        TC, w, bus, _pilots, _logs, sim = _station(tmp, selection=selection)
         try:
             w._bridge.cfg["dvl_hold_s"] = 10.0
             st = []
@@ -2409,14 +2527,20 @@ def test_a_healthy_dvl_carries_the_real_tag_dropout():
             sim.close()
 
 
-def test_a_refused_rung_goes_back_to_the_fix_not_to_an_eta():
+def test_a_healthy_dvl_carries_the_real_tag_dropout_under_primary():
+    """The same, under dvl.selection primary (2026-10-16): mode-independent in substance."""
+    test_a_healthy_dvl_carries_the_real_tag_dropout(selection="primary")
+
+
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a), with a twin under primary below.
+def test_a_refused_rung_goes_back_to_the_fix_not_to_an_eta(selection="legacy"):
     """A false lock that starts only once the fix is old (the gate can no
     longer tell it from a real acceleration) is flown, and the rung carries
     it until a cap closes it. "Back to the last fix" then means the FIX —
     not the last tagged tick's eta, which by then holds the DVL's integral
     over the fix's age."""
     with tempfile.TemporaryDirectory() as tmp:
-        TC, w, bus, _pilots, logs, sim = _station(tmp)
+        TC, w, bus, _pilots, logs, sim = _station(tmp, selection=selection)
         try:
             w._bridge.cfg["imu_hold_s"] = 3.0
             w._bridge.cfg["dvl_hold_s"] = 10.0
@@ -2440,6 +2564,11 @@ def test_a_refused_rung_goes_back_to_the_fix_not_to_an_eta():
             sim.close()
 
 
+def test_a_refused_rung_goes_back_to_the_fix_not_to_an_eta_under_primary():
+    """The same, under dvl.selection primary (2026-10-16): mode-independent in substance."""
+    test_a_refused_rung_goes_back_to_the_fix_not_to_an_eta(selection="primary")
+
+
 def test_the_dvl_bookkeeping_cannot_abort_engage_the_switch_or_the_meta():
     """Intent E off the tick path: set_engaged asks the aid whether to arm,
     the switch asks it too, and the run meta — written from set_engaged and
@@ -2457,6 +2586,7 @@ def test_the_dvl_bookkeeping_cannot_abort_engage_the_switch_or_the_meta():
             sim.prove()
             w.set_dvl_use(True)
             w.dvl.refusal = boom
+            w.dvl.arm_refusal = boom          # (primary arms on this, 2026-10-16)
             sim.engage()
             assert w.engaged and "arm: RuntimeError" in w._dvl_fault
             assert w._dvl_run_ok is False
@@ -2466,6 +2596,31 @@ def test_the_dvl_bookkeeping_cannot_abort_engage_the_switch_or_the_meta():
             assert len(pilots) == n0 + 3
         finally:
             sim.close()
+    # 2026-10-16, selection primary: the blend's own entry points — at engage
+    # (blend_reset), and on the tick (usable / blend_step) — latch the fault,
+    # and the engagement and the tick go on, on the tag velocity (w 0)
+    for name in ("blend_reset", "usable", "blend_step"):
+        with tempfile.TemporaryDirectory() as tmp:
+            TC, w, _bus, pilots, _logs = _dvl_worker(tmp, reentry_s=0.0)
+            sim = _Sim(w, TC)
+            try:
+                assert w.dvl.selection == "primary"
+                sim.prove()
+                w.set_dvl_use(True)
+                setattr(w.dvl, name, boom)
+                sim.engage()
+                n0 = len(pilots)
+                for _ in range(3):
+                    sim.step(v=(0.05, 0.0, 0.0))
+                assert w.engaged and len(pilots) == n0 + 3, name
+                assert "RuntimeError" in w._dvl_fault, (name, w._dvl_fault)
+                rows = _rows(w)
+                assert rows and all(r["w_dvl"] == "0.000" and
+                                    r["vel_src"] == "tag_fd" for r in rows), \
+                    (name, [(r["w_dvl"], r["vel_src"]) for r in rows])
+                assert all(r["nu_u"] == r["fd_u"] for r in rows), name
+            finally:
+                sim.close()
     with tempfile.TemporaryDirectory() as tmp:                  # the switch
         TC, w, _bus, _pilots, _logs = _dvl_worker(tmp, reentry_s=0.0)
         sim = _Sim(w, TC)
@@ -2501,13 +2656,14 @@ def test_the_dvl_bookkeeping_cannot_abort_engage_the_switch_or_the_meta():
             sim.close()
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_a_proof_at_the_edge_of_the_tolerance_says_at_what_speed_it_trips():
     """The proof's tolerance is relative (0.25 of the speed) and the
     difference monitor's threshold absolute (8 cm/s): a mount proven 10
     degrees out trips above ~0.4 m/s on that residual alone. The operator
     is told when the proof is made, with the yaw to correct by."""
     with tempfile.TemporaryDirectory() as tmp:
-        TC, w, _bus, _pilots, logs = _dvl_worker(tmp)
+        TC, w, _bus, _pilots, logs = _dvl_worker(tmp, selection="legacy")
         sim = _Sim(w, TC)
         try:
             c, s = math.cos(math.radians(10)), math.sin(math.radians(10))
@@ -2533,7 +2689,7 @@ def test_a_proof_at_the_edge_of_the_tolerance_says_at_what_speed_it_trips():
             sim.close()
     with tempfile.TemporaryDirectory() as tmp:
         # a mount that is right says nothing of the kind
-        TC, w, _bus, _pilots, logs = _dvl_worker(tmp)
+        TC, w, _bus, _pilots, logs = _dvl_worker(tmp, selection="legacy")
         sim = _Sim(w, TC)
         try:
             sim.prove()
@@ -2596,13 +2752,14 @@ def test_the_dvl_rung_is_station_only_like_the_rest_of_the_ladder():
             sim.close()
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_a_run_is_armed_for_the_dvl_at_engage_or_not_at_all():
     """One run = one estimator binds the automation too. A proof that
     completes in the middle of a mission — the switch left IN by the YAML,
     or a re-proof after a trip — must not move the velocity source under
     it (review 2026-10-02)."""
     with tempfile.TemporaryDirectory() as tmp:
-        TC, w, bus, _pilots, logs, _ = (*_dvl_worker(tmp, use=True,
+        TC, w, bus, _pilots, logs, _ = (*_dvl_worker(tmp, selection="legacy", use=True,
                                                     reentry_s=0.0), None)
         sim = _Sim(w, TC)
         try:
@@ -2653,13 +2810,14 @@ def test_a_run_is_armed_for_the_dvl_at_engage_or_not_at_all():
             sim.close()
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_a_trip_in_flight_takes_the_dvl_out_until_the_operator_rearms():
     with tempfile.TemporaryDirectory() as tmp:
         # An 8 s agreement window, so the two seconds of wrong data below
         # have left it by the end of the 12 s that follow. (With the shipped
         # 60 s the mount stays un-provable for a minute after a DVL has
         # disagreed with the tags — which is the behaviour one wants.)
-        TC, w, bus, _pilots, logs = _dvl_worker(tmp, reentry_s=0.0,
+        TC, w, bus, _pilots, logs = _dvl_worker(tmp, selection="legacy", reentry_s=0.0,
                                                 agree_window_s=8.0)
         sim = _Sim(w, TC)
         try:
@@ -2754,12 +2912,13 @@ def test_the_lever_arm_uses_the_body_rate_of_the_samples_own_moment():
         w.teardown()
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_the_log_never_ends_on_the_wrong_velocity_source():
     """The source-change line is rate-limited to one per 2 s; a change the
     limit swallowed is reported when the limit lifts, so the last line is
     never the opposite of what is flying."""
     with tempfile.TemporaryDirectory() as tmp:
-        TC, w, _bus, _pilots, logs = _dvl_worker(tmp, reentry_s=0.0)
+        TC, w, _bus, _pilots, logs = _dvl_worker(tmp, selection="legacy", reentry_s=0.0)
         sim = _Sim(w, TC)
         try:
             sim.prove()
@@ -2779,12 +2938,13 @@ def test_the_log_never_ends_on_the_wrong_velocity_source():
             sim.close()
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2a): the shipped ladder = the rollback's test.
 def test_a_bug_in_the_dvl_code_cannot_starve_the_control_tick():
     """If the DVL's own code ever raises on the tick path, the DVL is
     latched out and the loop flies on the tag finite difference — it must
     not abort tick() at 20 Hz with the vehicle engaged."""
     with tempfile.TemporaryDirectory() as tmp:
-        TC, w, bus, pilots, logs = _dvl_worker(tmp, reentry_s=0.0)
+        TC, w, bus, pilots, logs = _dvl_worker(tmp, selection="legacy", reentry_s=0.0)
         sim = _Sim(w, TC)
         try:
             sim.prove()
@@ -2817,6 +2977,78 @@ def test_a_bug_in_the_dvl_code_cannot_starve_the_control_tick():
                 widths = {len(r) for r in csv.reader(fh)}
             assert widths == {len(W.CSV_HEADER.strip().split(","))}, widths
             assert [r["vel_src"] for r in rows[-5:]] == ["tag_fd"] * 5
+        finally:
+            sim.close()
+
+
+def test_a_bug_in_the_dvl_code_cannot_starve_the_control_tick_under_primary():
+    """N40 (2026-10-16), the primary half of the test above: the blend's
+    entry points on the tick (usable, blend_step) and the bridge rung's
+    (rung_velocity) raise — the DVL is latched out once, the loop flies on
+    the tag finite difference with w 0, and no row is short."""
+    import csv
+    import rov_gui.control.workers as W
+
+    def boom(*_a, **_k):
+        raise RuntimeError("synthetic DVL bug")
+
+    width = len(W.CSV_HEADER.strip().split(","))
+    for name in ("usable", "blend_step"):
+        with tempfile.TemporaryDirectory() as tmp:
+            TC, w, bus, pilots, logs = _dvl_worker(tmp, reentry_s=0.0)
+            sim = _Sim(w, TC)
+            try:
+                assert w.dvl.selection == "primary"
+                sim.prove()
+                w.set_dvl_use(True)
+                sim.engage()
+                for _ in range(3):
+                    sim.step(v=(0.05, 0.0, 0.0))
+                assert w._last_nu is not None and w._dvl_tick["w"] == 1.0
+                n0 = len(pilots)
+                setattr(w.dvl, name, boom)
+                st = []
+                bus.mpc_status.connect(st.append)
+                for _ in range(5):
+                    sim.step(v=(0.05, 0.0, 0.0))
+                assert w.engaged and len(pilots) == n0 + 5, (name, w.reason)
+                assert "synthetic DVL bug" in w._dvl_fault, name
+                assert all(s.vel_src == "tag_fd" and s.dvl_w == 0.0
+                           for s in st), name
+                assert "CODE FAULT" in st[-1].dvl_note
+                errs = [m for lvl, m in logs
+                        if lvl == "error" and "CODE FAULT" in m]
+                assert len(errs) == 1, errs
+                path = w._csv_path
+                rows = _rows(w)
+                with open(path, newline="") as fh:
+                    widths = {len(r) for r in csv.reader(fh)}
+                assert widths == {width}, widths
+                assert [(r["vel_src"], r["w_dvl"], r["dvl_code"])
+                        for r in rows[-5:]] == [("tag_fd", "0.000", "fault")] * 5
+                assert all(r["nu_u"] == r["fd_u"] for r in rows[-5:])
+            finally:
+                sim.close()
+    with tempfile.TemporaryDirectory() as tmp:           # the rung's entry
+        TC, w, bus, pilots, logs, sim = _station(tmp)
+        try:
+            assert w._dvl_xy is not None, "the rung should be open"
+            w.dvl.rung_velocity = boom
+            n0 = len(pilots)
+            w.fix.t_capture -= 5.0            # the tags are gone
+            for _ in range(5):
+                sim.step(fix=False)
+            assert w.engaged and len(pilots) == n0 + 5, w.reason
+            assert "synthetic DVL bug" in w._dvl_fault
+            assert w._bridge.tier != SB.TIER_DVL
+            path = w._csv_path
+            rows = _rows(w)
+            with open(path, newline="") as fh:
+                widths = {len(r) for r in csv.reader(fh)}
+            assert widths == {width}, widths
+            assert all(r["w_dvl"] == "0.000" and r["dvl_code"] == "bridge"
+                       for r in rows[-5:]), [(r["w_dvl"], r["dvl_code"])
+                                             for r in rows[-5:]]
         finally:
             sim.close()
 
@@ -3700,10 +3932,25 @@ def test_an_in_switch_is_readable_in_every_state():
                 (dict(dvl_state="in_use", dvl_use=True, vel_src="dvl",
                       engaged=True, mode="pid"), None, theme.OK, False),
                 (dict(dvl_state="fallback", dvl_use=True, csv_open=True),
+                 None, theme.WARN, False),
+                # 2026-10-16 (selection primary): the self-releasing hold,
+                # a run not armed, a tick without a tag state — all "DVL IN"
+                # on the WARN face, never TRIPPED
+                (dict(dvl_state="held", dvl_use=True, dvl_code="dis_diff",
+                      dvl_w=0.0, dvl_target=0.0), theme.WARN, None, False),
+                (dict(dvl_state="not_armed", dvl_use=True,
+                      dvl_code="not_armed", dvl_w=0.0, dvl_target=0.0),
+                 theme.WARN, None, False),
+                (dict(dvl_state="no_tag", dvl_use=True, dvl_code="no_tag"),
+                 theme.WARN, None, False),
+                (dict(dvl_state="held", dvl_use=True, dvl_code="flag_fom",
+                      dvl_w=0.6, dvl_target=0.0, csv_open=True),
                  None, theme.WARN, False)):
             p.add_status(MpcStatus(**kw))
             app.processEvents()
             check(p.btn_dvl, kw, fill, frozen, down)
+            if kw["dvl_state"] in ("held", "not_armed", "no_tag"):
+                assert p.btn_dvl.text() == "DVL IN", (kw, p.btn_dvl.text())
         for kw, fill in ((dict(ekf_state="ready", ekf_control=True), theme.OK),
                          (dict(ekf_state="warming", ekf_control=True),
                           theme.WARN),
@@ -3762,11 +4009,1694 @@ def test_the_csv_header_carries_the_velocity_and_dvl_columns_at_the_end():
                               "dvl_ok", "dvl_valid", "dvl_fom", "dvl_alt_m",
                               "dvl_age_s"]
     # ...then schema 19's three pwm-LOW columns (2026-10-10, test_rl_pwm_scale pins them) and schema 20's
-    # pwm_guard (2026-10-10 b, test_rl_pwm_interlocks pins it), and schema 21's three attitude-age columns
-    # (2026-10-15, test_att_age pins them): still append-at-end
-    assert cols[i + 15] == "est" and len(cols) == i + 15 + 16 + 3 + 1 + 3
+    # pwm_guard (2026-10-10 b, test_rl_pwm_interlocks pins it), schema 21's three attitude-age columns
+    # (2026-10-15, test_att_age pins them) and schema 22's seven DVL-selection columns (2026-10-16): still
+    # append-at-end
+    assert cols[i + 15] == "est" and len(cols) == i + 15 + 16 + 3 + 1 + 3 + 7
+    assert cols[-7:] == ["w_dvl", "dvl_code", "dvl_res_fast_m_s", "dvl_res_slow_m_s", "dvl_esc_s",
+                         "dvl_align", "dvl_scale"]
     assert cols.index("vel_src") == cols.index("rp_track") + 1
     assert len(cols) == len(set(cols))
+
+
+# ===================================================== selection primary (2026-10-16)
+# DTF = RL_controller logs/eval/dvl_trip_fix_20261015. N-numbers are SPEC.md
+# §10.3's; [bracketed] numbers are the prototype's on the same scenario
+# (DTF design/out/spec_scenarios.json [측정]), which this implementation
+# reproduces exactly (DTF impl/out/spec_scenarios_impl.json). The bounds leave
+# room for the tag-noise seed, not for a different design.
+BLEND_TRACE = (Path(__file__).parent / "fixtures"
+               / "dvl_blend_trace_20261015.json")
+
+
+def _smp(v, t, valid=True, fom=0.002, alt=0.5, n_beams=4):
+    """A DvlSample with every field the R3 flags read (_sample has no beams)."""
+    return DvlSample(t_valid=t, t_rx=t, valid=valid, fom=fom, altitude=alt,
+                     v_dvl=(None if v is None else tuple(float(x) for x in v)),
+                     n_beams=n_beams, kind="velocity", hz=10.0, source="test",
+                     conn=Conn.ONLINE, stamp=t)
+
+
+def _paid(**over):
+    """SPEC §10.3's _aid(): proven, IN, the default selection (primary)."""
+    d = _proven_aid(**over)
+    d.proof = {"rms_m_s": 0.02}
+    d.use = True
+    return d
+
+
+def _osc(t):
+    """Surge-and-sway, 12 / 8 cm/s, 8-s periods (the _fly / prove motion)."""
+    return (0.12 * math.sin(2 * math.pi * t / 8.0),
+            0.08 * math.sin(2 * math.pi * (t - 3.0) / 8.0), 0.0)
+
+
+class _Feed:
+    """DTF design/spec_scenarios.py `Feed`: a DVL sample and a tag fix every
+    0.05 s (heading 0: body = world), the usage question every step and —
+    with ``blend`` — the blend stepped on the tag velocity (+1 cm/s noise) as
+    the worker's tick would. ``v_dvl`` None = an invalid (no-lock) report,
+    False = no report. ``log`` rows: (t, code, tripped, escalation_s,
+    residual_slow, w, why)."""
+
+    def __init__(self, d, t=30.0, seed=2, blend=False):
+        self.d, self.t = d, float(t)
+        self.p = np.array([0.0, 0.0, 0.5])
+        self.rng = np.random.default_rng(seed)
+        self.imu = _imu(t=t)
+        self.log = []
+        self.blend = blend
+        if blend:
+            d.blend_reset()
+
+    def run(self, n, v_dvl, v_tag, noise_mm=1.0, dt=0.05, s_kw=None,
+            tag=True):
+        for _ in range(n):
+            t0, self.t = self.t, self.t + dt
+            tm = 0.5 * (t0 + self.t)
+            vd = v_dvl(self.t) if callable(v_dvl) else v_dvl
+            vt = v_tag(tm) if callable(v_tag) else v_tag
+            self.p = self.p + np.asarray(vt, float) * dt
+            kw = s_kw(self.t) if callable(s_kw) else (s_kw or {})
+            if vd is not False:
+                self.d.note_sample(_smp(vd, self.t, valid=vd is not None,
+                                        **kw))
+            if tag:
+                pn = self.p + self.rng.normal(0, noise_mm * 1e-3, 3)
+                self.d.note_fix(_fix(list(pn), 0.0, self.t), self.imu)
+            ok, why, code = self.d.usable(self.t)
+            w = None
+            if self.blend:
+                fd = (np.asarray(v_tag(self.t) if callable(v_tag) else v_tag,
+                                 float) + self.rng.normal(0, 0.01, 3))
+                _vb, w, _src, code, _why = self.d.blend_step(self.t, fd, ok,
+                                                             code)
+            self.log.append((round(self.t, 3), code, bool(self.d.tripped),
+                             self.d.escalation_s, self.d.residual_slow_m_s, w,
+                             why))
+        return self.t
+
+    def first(self, pred, after=None):
+        return next((r[0] for r in self.log
+                     if (after is None or r[0] > after) and pred(r)), None)
+
+    def last(self, pred, after=None):
+        return max((r[0] for r in self.log
+                    if (after is None or r[0] > after) and pred(r)),
+                   default=None)
+
+
+def _is_dis(r):
+    return str(r[1]).startswith("dis_")
+
+
+def test_the_blend_is_the_trained_twin_tick_for_tick():
+    """N1. DvlBlend = RL_controller deploy/obs_builder.py DvlBlendNp, the
+    blend pwm11att13 trains on: five scripted streams (dropout, silence,
+    gross, a good report mid-fade, engage on a bad sample), 500 ticks,
+    reproduced tick for tick (fixture = DTF map/dvl_blend_trace.json, made by
+    running BOTH the torch selector and the numpy twin) [측정: 1.7e-16]."""
+    tr = json.loads(BLEND_TRACE.read_text())
+    inp = tr["inputs"]
+    fd = np.asarray(inp["fd_b_flu"], float)
+    n = 0
+    for name, sc in tr["scenarios"].items():
+        b = DV.DvlBlend(dt=inp["dt"], **inp["blend"])
+        for r in sc["rows"]:
+            v, w = b.step(r["t"], fd, r["sample_v"], r["sample_t_valid"],
+                          r["sample_ok"])
+            assert abs(w - r["w"]) <= 1e-6, (name, r["k"], w, r["w"])
+            assert float(np.max(np.abs(v - np.asarray(r["v_b"])))) <= 2e-6, \
+                (name, r["k"], v, r["v_b"])
+            assert b.src == r["src"], (name, r["k"], b.src, r["src"])
+            n += 1
+    assert len(tr["scenarios"]) == 5 and n == 500
+
+
+def test_the_blend_constants_are_the_pwm11att13_values():
+    """N2. The export's velocity_source (hold 0.45 s, fade 0.5 s, gross
+    0.5 m/s against a 1-s low-pass, stale 0.6 s) [스펙], primary by default,
+    and the aid's blend steps at the control period it is given."""
+    D_ = DV.DEFAULTS
+    assert (D_["blend_hold_s"], D_["blend_xfade_s"], D_["blend_gross_m_s"],
+            D_["blend_gross_tau_s"], D_["stale_s"]) == (0.45, 0.5, 0.5, 1.0,
+                                                         0.6)
+    assert D_["selection"] == "primary"
+    b = DV.DvlAid(dict(MOUNT), dt=0.05).blend
+    assert (b.dt, b.hold_s, b.xfade_s, b.gross, b.gross_tau, b.stale_s,
+            b.dvl_w) == (0.05, 0.45, 0.5, 0.5, 1.0, 0.6, False)
+    assert len(DV.KEYS_20261016) == 20 and DV.KEYS_20261016[0] == "selection"
+    assert set(DV.KEYS_20261016) <= set(DV.KEYS)
+
+
+def test_the_assembler_blend_path_is_the_fd_path_at_w0():
+    """N3. vel_fn answering w = 0 is the finite-difference path, bit for bit
+    (the inputs of test_without_a_dvl_the_assembler_is_bit_identical_to_
+    before); w > 0 flies the blended (u, v) with the heave and the bridge's
+    velocity x age as trained; vel_xy and vel_fn are exclusive."""
+    rng = np.random.default_rng(5)
+    a0 = StateAssembler(z_source="tag", vel_lp_alpha=0.6, nudot_source="imu")
+    a1 = StateAssembler(z_source="tag", vel_lp_alpha=0.6, nudot_source="imu")
+    t = 100.0
+    p = np.array([0.3, -0.2, -0.9])
+    fix = None
+    for k in range(200):
+        t_cap = t - 0.13
+        if k % 2 == 0:
+            p = p + rng.normal(0, 0.004, 3) + np.array([0.004, 0.002, 0.0])
+            fix = _fix(list(p), 0.4 + 0.01 * k, t_cap)
+        imu = _imu(roll=0.02 * math.sin(k), pitch=0.03 * math.cos(k),
+                   r=0.1 * math.sin(0.3 * k), t=t - 0.01,
+                   f=(0.1 * rng.normal(), 0.1 * rng.normal(), -9.8))
+        m0, h0 = a0.step(fix, imu, t, 0.05)
+        m1, h1 = a1.step(fix, imu, t, 0.05,
+                         vel_fn=lambda tt, fd: (None, "tag_fd", 0.0))
+        for key in ("eta", "nu", "nudot"):
+            assert np.array_equal(m0[key], m1[key]), (k, key)
+        assert np.array_equal(h0["nu_fd"], h1["nu_fd"])
+        assert h1["vel_src"] == "tag_fd" and h1["w_dvl"] == 0.0
+        assert "w_dvl" not in h0
+        t += 0.05
+    seen = {}
+
+    def fn(tt, fd):
+        seen["fd"] = np.array(fd)
+        return np.array([0.2, -0.1]), "blend", 0.4
+
+    fix = _fix([1.0, 2.0, 0.5], 0.3, t - 0.1)
+    imu = _imu(t=t)
+    m, h = a1.step(fix, imu, t, 0.05, vel_fn=fn)
+    assert np.array_equal(m["nu"][:2], [0.2, -0.1]), m["nu"]
+    assert m["nu"][2] == h["nu_fd"][2] and np.array_equal(seen["fd"],
+                                                          h["nu_fd"])
+    assert h["vel_src"] == "blend" and h["w_dvl"] == 0.4
+    step = rot_zyx(0.0, 0.0, 0.3) @ np.array([0.2, -0.1, h["nu_fd"][2]]) * 0.1
+    assert abs(m["eta"][0] - (1.0 + step[0])) < 1e-12, m["eta"]
+    assert abs(m["eta"][1] - (2.0 + step[1])) < 1e-12, m["eta"]
+    try:
+        a1.step(fix, imu, t, 0.05, vel_xy=(0.1, 0.0), vel_fn=fn)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("vel_xy and vel_fn together were accepted")
+
+
+def test_a_three_second_false_lock_holds_and_returns_without_a_latch():
+    """N4. THE OPERATOR'S CASE (the 10-15 20:25-20:27 trips were real false
+    locks, DVL ~0 while the vehicle moved): a 3-s zero lock is HELD — the
+    blend fades to the tag velocity — and comes back BY ITSELF; no latch, the
+    proof kept, nothing for the operator to press."""
+    for spd, hold_max, back_max in ((0.30, 2.0, 9.0), (0.10, 3.5, 4.0)):
+        d = _paid()
+        f = _Feed(d, blend=True)
+        t0 = f.run(200, (spd, 0, 0), (spd, 0, 0))
+        t1 = f.run(60, (0.0, 0, 0), (spd, 0, 0))
+        first = f.first(_is_dis, t0)
+        # held from <= hold_max s into the lock [1.65 s at 0.3, 2.8 s at 0.1]
+        assert first is not None and first - t0 <= hold_max, (spd, first)
+        ok, why, code = d.usable(t1)
+        assert not ok and code == "dis_diff", (spd, code, why)
+        st, note = d.state(t1, used=False, why=why, code=code, w=0.0)
+        assert st == DV.ST_HELD and "returns by itself" in note, (st, note)
+        t2 = f.run(400, (spd, 0, 0), (spd, 0, 0))
+        back = f.last(_is_dis, t0)
+        # back within back_max s of the lock's end [7.15 s at 0.3, 2.9 at 0.1]
+        assert back - t1 <= back_max, (spd, back - t1)
+        assert d.usable(t2) == (True, "", "ok")
+        assert max(r[3] for r in f.log) < 4.0     # [3.2 s at 0.3]
+        assert d.proven and d.n_trips == 0 and not d.tripped
+        assert f.log[-1][5] == 1.0                # flown at full weight again
+
+
+def test_a_lasting_disagreement_latches_and_says_what_to_do():
+    """N5. A reversed reading held 15 s at 10 cm/s is not a glitch: the
+    escalation latches it (the proof is thrown away), the text says so, the
+    panel says how to re-arm, and nothing re-latches under the latch."""
+    d = _paid()
+    f = _Feed(d)
+    t0 = f.run(200, (0.10, 0, 0), (0.10, 0, 0))
+    f.run(300, (-0.10, 0, 0), (0.10, 0, 0))
+    t_trip = f.first(lambda r: r[2], t0)
+    assert t_trip is not None and 4.5 <= t_trip - t0 <= 7.5, t_trip  # [5.65]
+    assert d.tripped.startswith("DVL disagreed with the tag velocity "
+                                "persistently (") and "now: residual" in \
+        d.tripped, d.tripped
+    assert not d.proven and d.against
+    assert "has to be PROVEN" in d.refusal(True)
+    st, note = d.state(f.t, used=False)
+    assert st == DV.ST_TRIPPED and "proving pass" in note \
+        and "OUT then IN" in note, note
+    assert d.usable(f.t)[2] == "latched"
+    assert d.n_trips == 1 and d.n_esc["persistent"] == 1
+    f.run(200, (-0.10, 0, 0), (0.10, 0, 0))   # the fault goes on
+    assert d.n_trips == 1 and d.escalation_s == 0.0
+    assert all(r[3] == 0.0 for r in f.log if r[2])   # frozen while latched
+
+
+def test_a_three_cm_s_bias_is_neither_held_nor_latched():
+    """N6. 3 cm/s is inside what the recordings' tag velocity disagrees by:
+    no hold, no latch [slow residual max 3.08 cm/s]."""
+    d = _paid()
+    f = _Feed(d)
+    f.run(200, (0.10, 0, 0), (0.10, 0, 0))
+    f.run(1200, (0.13, 0, 0), (0.10, 0, 0))
+    assert not any(_is_dis(r) for r in f.log) and not d.tripped
+    assert d.r_slow_max < DV.DEFAULTS["agree_hold_m_s"], d.r_slow_max
+
+
+def test_a_ten_cm_s_bias_is_held_then_latched():
+    """N7. +10 cm/s held 30 s: a hold first [2.8 s], then the latch [6.8 s]."""
+    d = _paid()
+    f = _Feed(d)
+    t0 = f.run(200, (0.10, 0, 0), (0.10, 0, 0))
+    f.run(600, (0.20, 0, 0), (0.10, 0, 0))
+    hold = f.first(_is_dis, t0)
+    trip = f.first(lambda r: r[2], t0)
+    assert hold is not None and 2.0 <= hold - t0 <= 4.0, hold
+    assert trip is not None and 5.5 <= trip - t0 <= 8.5, trip
+    assert "persistently" in d.tripped, d.tripped
+
+
+def test_a_false_lock_that_lasts_six_seconds_latches():
+    """N8. A zero lock that LASTS (6 s at 0.3 m/s) is latched [5.65 s]: past
+    ~3.4 s no single constant lock stays under the 4-s bucket [유도]."""
+    d = _paid()
+    f = _Feed(d)
+    t0 = f.run(200, (0.30, 0, 0), (0.30, 0, 0))
+    f.run(120, (0.0, 0, 0), (0.30, 0, 0))
+    trip = f.first(lambda r: r[2], t0)
+    assert trip is not None and 4.5 <= trip - t0 <= 7.0, trip
+
+
+def test_an_oscillating_wrong_sign_is_held_at_once_and_latched_only_if_it_lasts():
+    """N9. The counterpart of the legacy alignment trip: a station hold on
+    wrong-signed feedback (4 rad/s, 6 cm/s) is HELD at once by the alignment
+    verdict; for one second that is all [no latch], for fifteen it latches
+    [6.2 s] — the alignment's coherent verdict is escalation evidence."""
+    w, amp = 4.0, 0.06
+
+    def tag(t):
+        return (amp * math.sin(w * t), 0.0, 0.0)
+
+    def flipped(t):
+        return (-amp * math.sin(w * t), 0.0, 0.0)
+
+    for n, latches in ((20, False), (300, True)):
+        d = _paid()
+        f = _Feed(d)
+        t0 = f.run(200, tag, tag, noise_mm=0.5)
+        f.run(n, flipped, tag, noise_mm=0.5)
+        t2 = f.run(400, tag, tag, noise_mm=0.5)
+        assert any(r[1] == "dis_align" for r in f.log if r[0] > t0), n
+        trip = f.first(lambda r: r[2], t0)
+        if latches:
+            assert trip is not None and 5.0 <= trip - t0 <= 8.0, trip
+            assert "alignment" in d.tripped, d.tripped
+        else:
+            assert trip is None and d.usable(t2)[0], (trip, d.usable(t2))
+
+
+def test_a_device_configuration_change_still_latches():
+    """N10. R4a, unchanged: the device rotating its own output is a latch at
+    once, and the proof made on the old stream is gone."""
+    d = _paid()
+    f = _Feed(d)
+    f.run(100, (0.10, 0, 0), (0.10, 0, 0))
+    d.note_device_config({"mounting_rotation_offset": 180.0,
+                          "speed_of_sound": 1475.0})
+    d.note_device_config({"mounting_rotation_offset": 0.0,
+                          "speed_of_sound": 1475.0})
+    assert d.tripped.startswith("the device's configuration changed ("), \
+        d.tripped
+    assert not d.proven
+    ok, why, code = d.usable(f.t)
+    assert not ok and why.startswith("DVL latched OUT (") \
+        and code == "latched", (ok, why, code)
+
+
+def test_quality_flags_hold_the_sample_not_the_evidence():
+    """N11. R3: the report's own word that it may be a false lock — fom,
+    an altitude jump, beams, a lock re-acquired — keeps the sample from being
+    FLOWN, never trips, never moves the jump gate's reference, and leaves
+    the monitors their pairs; an altitude that stays is believed after
+    ~0.85 s; with the flags off the same reports fly."""
+    d = _paid()
+    f = _Feed(d)
+    f.run(40, (0.10, 0, 0), (0.10, 0, 0))
+    t = f.t
+    d.note_sample(_smp((0.10, 0, 0), t + 0.05, fom=0.004))
+    assert d.usable(t + 0.05) == (
+        False, "DVL quality flag: fom (4.0 > 3.0 mm/s)", "flag_fom")
+    assert abs(d._last_good[0] - t) < 1e-9     # not the jump reference
+    d.note_sample(_smp((0.10, 0, 0), t + 0.10, alt=0.75))
+    ok, why, code = d.usable(t + 0.10)
+    assert code == "flag_alt" and "altitude jump" in why, why
+    t = t + 0.10
+    codes = []
+    for k in range(1, 30):
+        d.note_sample(_smp((0.10, 0, 0), t + 0.05 * k, alt=0.75))
+        codes.append((round(0.05 * k, 2), d.usable(t + 0.05 * k)[2]))
+    first_ok = next(a for a, c in codes if c == "ok")
+    assert first_ok <= 1.0, codes             # [0.85 s]
+    assert all(c == "ok" for a, c in codes if a >= first_ok), codes
+    d.note_sample(_smp((0.10, 0, 0), t + 1.6, n_beams=3, alt=0.75))
+    assert d.usable(t + 1.6) == (False, "DVL quality flag: beams (3 < 4)",
+                                 "flag_beams")
+    d.note_sample(_smp(None, t + 1.65, valid=False, alt=0.75))
+    d.note_sample(_smp((0.10, 0, 0), t + 1.70, alt=0.75))
+    ok, why, code = d.usable(t + 1.70)
+    assert code == "flag_reacq" and "lock re-acquired" in why, why
+    d.note_sample(_smp((0.10, 0, 0), t + 1.75, alt=0.75))
+    assert d.usable(t + 1.75) == (True, "", "ok")
+    # no flag is a phrase with a digit before " (" (the meta counts by it)
+    assert not any(ch.isdigit() for ch in why.split(" (")[0])
+    d2 = _paid(flag_fom_m_s=0.0, flag_alt_jump_m=0.0, flag_min_beams=0,
+               flag_reacquired=False)
+    _Feed(d2).run(40, (0.10, 0, 0), (0.10, 0, 0))
+    d2.note_sample(_smp(None, 32.02, valid=False))
+    d2.note_sample(_smp((0.10, 0, 0), 32.05, fom=0.004, n_beams=3))
+    assert d2.usable(32.05) == (True, "", "ok")
+    n0 = d.n_monitor
+    f.t = t + 1.75
+    f.run(40, (0.10, 0, 0), (0.10, 0, 0),
+          s_kw=lambda tt: {"fom": 0.004, "alt": 0.75})
+    assert d.n_monitor - n0 >= 35, d.n_monitor - n0      # [39 of 40]
+    assert all(r[1] == "flag_fom" for r in f.log[-40:])
+    m = d.meta()["flags"]["counts"]
+    assert m["flag_fom"] >= 41 and m["flag_beams"] == 1 \
+        and m["flag_reacq"] == 1 and m["flag_alt"] >= 1, m
+
+
+def test_a_coherent_refutation_holds_and_escalates():
+    """N12. A DVL mounted 180 deg out, in a surge-and-sway oscillation: held
+    within ~1 s [0.9 s], latched once it has lasted [15.8 s]."""
+    d = _paid()
+    f = _Feed(d)
+    f.run(100, (0.10, 0, 0), (0.10, 0, 0))
+    t0 = f.t
+    f.run(400, lambda t: (-_osc(t)[0], -_osc(t)[1], 0.0), _osc)
+    hold = f.first(_is_dis, t0)
+    trip = f.first(lambda r: r[2], t0)
+    assert hold is not None and hold - t0 <= 2.0, hold
+    assert trip is not None and trip - t0 <= 25.0, trip
+    assert d.n_trips == 1
+
+
+def test_a_2x_scale_in_oscillation_is_held_and_latched():
+    """N13. A DVL reading twice the motion refutes INCOHERENTLY (the fit sees
+    ~half of it) and never reaches the alignment threshold — the scale
+    evidence latches it [held 3.7 s, latched 6.75 s, gain 0.55, DVL weight
+    3.9 s of the fault]."""
+    d = _paid()
+    f = _Feed(d, blend=True)
+    f.run(100, _osc, _osc)
+    t0 = f.t
+    fits = []
+    for _ in range(1200):
+        f.run(1, lambda t: (2.0 * _osc(t)[0], 2.0 * _osc(t)[1], 0.0), _osc)
+        if not d.tripped:
+            fits.append(d.agree.fit())
+    hold = f.first(_is_dis, t0)
+    trip = f.first(lambda r: r[2], t0)
+    assert hold is not None and hold - t0 <= 10.0, hold
+    assert trip is not None and trip - t0 <= 20.0, trip
+    assert "the DVL reads" in d.tripped, d.tripped
+    refuted = [x for x in fits if x["verdict"] == "refuted"]
+    assert refuted and refuted[-1]["coherent"] is False, refuted[-1:]
+    flown = sum(r[5] for r in f.log if r[0] > t0 and r[5] is not None) * 0.05
+    assert flown <= 8.0, flown
+
+
+def test_a_false_lock_at_rest_is_flown_not_tripped():
+    """N14. The counterpart of the legacy "stands apart for a second is a
+    trip" test: 12 cm/s for 1 s at rest is held by the alignment verdict at
+    most, nothing latches [slow residual 2.6 cm/s]."""
+    d = _paid()
+    f = _Feed(d)
+    t0 = f.run(100, (0.0, 0, 0), (0.0, 0, 0))
+    f.run(20, (0.12, 0, 0), (0.0, 0, 0))
+    f.run(100, (0.0, 0, 0), (0.0, 0, 0))
+    assert not d.tripped and d.n_trips == 0
+    assert d.r_slow_max < 0.05, d.r_slow_max
+    assert {r[1] for r in f.log if r[0] > t0} <= {"dis_align", "ok"}, \
+        {r[1] for r in f.log if r[0] > t0}
+
+
+def test_a_flickering_false_lock_is_never_flown():
+    """N27. A zero lock that alternates with no-lock reports: every valid
+    report follows a gap marker, so every one is flag_reacq and the blend
+    never takes it [w 0.078 over the window]."""
+    d = _paid()
+    f = _Feed(d, blend=True)
+    f.run(200, (0.12, 0, 0), (0.12, 0, 0))
+    t0 = f.t
+    k = {"n": 0}
+
+    def flick(t):
+        k["n"] += 1
+        return None if k["n"] % 2 == 0 else (0.0, 0.0, 0.0)
+    t1 = f.run(200, flick, (0.12, 0, 0))
+    rows = [r for r in f.log if t0 < r[0] <= t1]
+    assert {r[1] for r in rows} <= {"flag_reacq", "no_lock", "ok"}, \
+        {r[1] for r in rows}
+    assert sum(1 for r in rows if r[1] == "ok") <= 2           # [2]
+    assert float(np.mean([r[5] for r in rows])) <= 0.15
+    assert not d.tripped
+
+
+def test_a_disagreement_onset_expires_the_held_sample():
+    """N28. A disagreement ends the hold on the sample it is about: the fade
+    starts on the onset tick [w 1.0 -> 0.9], instead of flying it 0.45 s."""
+    d = _paid()
+    f = _Feed(d, blend=True)
+    f.run(200, (0.30, 0, 0), (0.30, 0, 0))
+    first = None
+    for _ in range(80):
+        f.run(1, (0.0, 0, 0), (0.30, 0, 0))
+        if first is None and _is_dis(f.log[-1]):
+            first = (f.log[-2][5], f.log[-1][5], d.blend.t_hold, d.blend.src)
+    assert first is not None
+    w0, w1, t_hold, src = first
+    assert t_hold == -math.inf and src == "blend", first
+    assert abs(w1 - (w0 - 0.1)) < 1e-9, first
+
+
+def test_the_escalation_is_frozen_while_latched_and_reset_by_a_rearm():
+    """N29. Under the latch nothing in the escalation moves; the proof made
+    afterwards and the IN that clears the latch start it afresh — the
+    shipped re-trip loop (4 trips in 2.2 min on mpc_202432) cannot happen —
+    and evidence from before a proof does not count after it."""
+    d = _paid()
+    f = _Feed(d)
+    f.run(200, _osc, _osc)
+    n = 0
+    while not d.tripped and n < 2000:
+        f.run(1, lambda t: (_osc(t)[0], -_osc(t)[1], 0.0), _osc)
+        n += 1
+    assert d.tripped, "the reversed sway never latched"
+    esc = []
+    for _ in range(1800):                      # 90 s more of the fault
+        f.run(1, lambda t: (_osc(t)[0], -_osc(t)[1], 0.0), _osc)
+        esc.append(d.escalation_s)
+    assert max(esc) == 0.0 and d.n_trips == 1
+    k = 0
+    while not d.proven and k < 6000:           # honest data: a new proof
+        f.run(1, _osc, _osc)
+        k += 1
+    assert d.proven
+    assert d.set_use(True) == "" and not d.tripped
+    assert d.escalation_s == 0.0
+    f.run(400, _osc, _osc)
+    assert d.n_trips == 1 and not d.tripped    # no re-latch in the 20 s
+    # ...and 60 s of +10 cm/s in SHADOW before the first proof
+    d = _paid()
+    d.proven, d.proof, d.use = False, None, False
+    f = _Feed(d)
+    f.run(1200, (0.20, 0.0, 0), (0.10, 0, 0))
+    assert d.escalation_s == 0.0
+    k = 0
+    while not d.proven and k < 6000:
+        f.run(1, _osc, _osc)
+        k += 1
+    assert d.proven and d.set_use(True) == ""
+    f.run(400, _osc, _osc)
+    assert not d.tripped and d.n_trips == 0
+
+
+def test_a_false_lock_that_keeps_coming_back_latches_repeatedly():
+    """N30. 3 s of zero lock every 12 s at 0.12 m/s: each one alone drains
+    away, together they are a DVL that keeps disagreeing — a warning at the
+    second [14.47 s], the latch at the third [26.55 s]."""
+    d = _paid()
+    f = _Feed(d, blend=True)
+    t0 = f.run(200, (0.12, 0, 0), (0.12, 0, 0))
+
+    def rec(t):
+        return (0.0, 0.0, 0.0) if ((t - t0) % 12.0) < 3.0 else (0.12, 0.0, 0.0)
+    f.run(1200, rec, (0.12, 0, 0))
+    assert len(d.warn_log) == 1, d.warn_log
+    tw, text = d.warn_log[0]
+    assert 10.0 <= tw - t0 <= 20.0 and "again (2 times in the last 60 s)" \
+        in text, (tw - t0, text)
+    trip = f.first(lambda r: r[2], t0)
+    assert trip is not None and 20.0 <= trip - t0 <= 32.0, trip
+    assert "repeatedly (3 times in the last 60 s" in d.tripped, d.tripped
+    assert d.take_warnings() == d.warn_log and d.take_warnings() == []
+
+
+def test_a_reversed_axis_does_not_flap_back_in():
+    """N31. A reversed sway at 5 cm/s keeps disappearing from view as the
+    oscillation turns; the hold releases only once its evidence has DRAINED,
+    so the DVL never flies again between the first hold [0.7 s] and the
+    latch [9.8 s] [DVL weight 0.93 s]."""
+    k = 0.05 / 0.12
+    d = _paid()
+    f = _Feed(d, blend=True)
+    f.run(200, lambda t: tuple(k * x for x in _osc(t)),
+          lambda t: tuple(k * x for x in _osc(t)))
+    t0 = f.t
+    f.run(600, lambda t: (k * _osc(t)[0], -k * _osc(t)[1], 0.0),
+          lambda t: tuple(k * x for x in _osc(t)))
+    rows = [r for r in f.log if r[0] > t0]
+    i_hold = next(i for i, r in enumerate(rows) if _is_dis(r))
+    i_trip = next(i for i, r in enumerate(rows) if r[2])
+    assert rows[i_hold][0] - t0 <= 2.0 and rows[i_trip][0] - t0 <= 15.0
+    assert not any(r[1] == "ok" for r in rows[i_hold:i_trip]), \
+        [r[:2] for r in rows[i_hold:i_trip] if r[1] == "ok"]
+    assert sum(r[5] for r in rows if r[5] is not None) * 0.05 <= 2.0
+
+
+def test_sparse_tags_do_not_stall_the_escalation():
+    """N32. Tags in bursts (0.3 s on, 0.7 s off — the high-tilt case where
+    the 10-15 false locks sat): the 0.5-s pair gap restarted the old
+    monitors on every burst; the slow monitors run across gaps up to
+    SLOW_GAP_S. A 20-s zero lock at 0.12 m/s: held [4.25 s], latched
+    [10.15 s] (DTF design/out/synth_v2.json sparse_tags)."""
+    rng = np.random.default_rng(5)
+    d = _paid()
+    imu = _imu(t=30.0)
+    t = 30.0
+    p = np.array([0.0, 0.0, 0.5])
+    nd = nt = tl = t
+    last_fix = None
+    first_hold = trip = None
+    while t < 80.0:
+        tn = t + 0.05
+        while True:
+            te = min(nd, nt)
+            if te > tn:
+                break
+            p = p + np.array([0.12, 0.0, 0.0]) * (te - tl)
+            tl = te
+            if te == nd:
+                v = (0.0, 0.0, 0.0) if 40.0 <= te <= 60.0 else (0.12, 0, 0)
+                d.note_sample(_smp(v, te))
+                nd += 0.1
+            else:
+                if ((te - 30.0) % 1.0) < 0.3:
+                    d.note_fix(_fix(list(p + rng.normal(0, 1e-3, 3)), 0.0, te),
+                               imu)
+                    last_fix = te
+                nt += 1 / 15
+        t = tn
+        fd = np.array([0.12, 0.0, 0.0]) + rng.normal(0, 0.01, 3)
+        if last_fix is None or t - last_fix > 0.5:
+            continue                           # no tag state: no blend step
+        ok, _why, code = d.usable(t)
+        _vb, _w, _src, code, _ = d.blend_step(t, fd, ok, code)
+        if first_hold is None and t >= 40.0 and str(code).startswith("dis_"):
+            first_hold = t - 40.0
+        if trip is None and t >= 40.0 and d.tripped:
+            trip = t - 40.0
+    assert first_hold is not None and first_hold <= 6.0, first_hold
+    assert trip is not None and trip <= 14.0, trip
+
+
+def test_the_rung_admission_refuses_a_false_lock_the_blend_still_flies():
+    """N33. A +0.25 m/s false lock at hover is still `ok` for the blend for
+    the moment before a disagreement shows — and the station bridge's rung,
+    which nothing would correct, does not take it: the shipped innovation
+    limit (review 2026-10-02: such a lock walked a station hold 0.5 m)."""
+    d = _paid()
+    f = _Feed(d, blend=True)
+    f.run(200, (0.0, 0, 0), (0.0, 0, 0))
+    f.run(10, (0.25, 0, 0), (0.0, 0, 0))
+    assert d.usable(f.t)[2] == "ok"
+    assert d.rung_admit(f.t, np.zeros(3), 0.1) == (
+        False, "DVL innovation (0.25 > 0.15 m/s)")
+
+
+def test_the_blend_replays_ticks_without_a_tag_state():
+    """N34. Ticks with no tag state do not step the blend; the next one
+    replays their fade steps toward the current target [w 1.0 -> 0.4]."""
+    b = DV.DvlBlend()
+    b.reset()
+    b.step(0.0, np.zeros(3), np.array([0.1, 0, 0]), 0.0, True)
+    assert b.w == 1.0
+    _v, w = b.step(1.0, np.zeros(3), np.array([0.1, 0, 0]), 0.0, False,
+                   n_skip=5)
+    assert abs(w - 0.4) < 1e-9 and b.src == "blend", (w, b.src)
+
+
+def test_the_rung_holds_across_a_flag_then_refuses():
+    """N18a. The rung carries the blend's own hold: a flagged newest sample on
+    a lost tick is bridged on the last usable one while it was captured
+    <= blend_hold_s ago, then refused (ages kept off 0.45 itself)."""
+    d = _paid()
+    f = _Feed(d, blend=True)
+    t_last = f.run(100, (0.10, 0, 0), (0.10, 0, 0))
+    assert d.rung_admit(t_last, np.array([0.10, 0.0, 0.0]), 0.05) == (True, "")
+    for k in range(1, 12):
+        tk = t_last + 0.05 * k
+        d.note_sample(_smp((0.10, 0, 0), tk, fom=0.004))
+        v, why = d.rung_velocity(tk)
+        if 0.05 * k <= 0.40 + 1e-9:
+            assert v is not None and abs(v[0] - 0.10) < 1e-12, (k, why)
+            assert why.startswith("held: DVL quality flag: fom"), why
+        elif 0.05 * k >= 0.5 - 1e-9:
+            assert v is None and why.startswith("DVL quality flag: fom"), \
+                (k, why)
+    assert d.n_rung_held == 8
+    # a usable sample is carried (and becomes the hold); a DISAGREEMENT then
+    # refuses at once, however fresh the held sample is
+    t2 = t_last + 0.6
+    d.note_sample(_smp((0.10, 0, 0), t2))
+    assert d.rung_velocity(t2)[1] == ""
+    d._hold_diff, d._r_slow = True, 0.08       # the slow residual's hold
+    d.note_sample(_smp((0.10, 0, 0), t2 + 0.05))
+    v, why = d.rung_velocity(t2 + 0.05)
+    assert v is None and why.startswith("DVL disagrees with the tag "
+                                        "velocity (slow residual"), why
+
+
+def test_arming_ignores_a_refutation_the_switch_does_not():
+    """N35a. A refutation current at engage refuses the switch IN
+    (refusal, unchanged) but no longer the RUN (arm_refusal): the per-tick
+    dis_fit hold holds the DVL while it lasts and releases by itself. The
+    latches are off here to build the state."""
+    for name, fn, n in (("incoherent_2x",
+                         lambda t: (2.0 * _osc(t)[0], 2.0 * _osc(t)[1], 0.0),
+                         300),
+                        ("coherent_180",
+                         lambda t: (-_osc(t)[0], -_osc(t)[1], 0.0), None)):
+        d = _paid(esc_scale_ratio=0.0, esc_latch_s=1e9, esc_repeat_n=0)
+        f = _Feed(d)
+        f.run(200, _osc, _osc)
+        k = 0
+        while k < 1600 and not d.tripped and not (
+                n is None and d._fit_current(f.t) and d._refuted_coh):
+            f.run(1, fn, _osc)
+            k += 1
+            if n is not None and k >= n:
+                break
+        assert d.agree.fit()["verdict"] == "refuted" and \
+            d._fit_current(f.t), name
+        assert "REFUTES" in d.refusal(True), name
+        assert d.arm_refusal() == "", (name, d.arm_refusal())
+        assert d.usable(f.t)[2] in ("dis_fit", "dis_diff"), \
+            (name, d.usable(f.t))
+        assert not d.tripped
+
+
+def test_every_reason_the_ladder_or_the_worker_gives_has_a_code():
+    """N38. The CSV's dvl_code is a closed vocabulary: every reason the
+    legacy ladder, the data gates, usable(), the blend and the worker give
+    maps to a code, never "other"."""
+    phrases = [
+        "", "DVL is OUT (shadow)", "DVL latched OUT (x)", "DVL tripped (x)",
+        "DVL tripped before engage", "DVL not armed at engage (x)",
+        "DVL mount not measured", "DVL not proven against the tag velocity",
+        "no DVL data", "DVL has no bottom lock", "DVL is in water-tracking mode",
+        "DVL report lacks fom or altitude", "DVL fom too high (0.1 > 0.05 m/s)",
+        "DVL altitude too low (0.02 < 0.05 m)", "DVL velocity implausible",
+        "DVL velocity jump (0.30 > 0.15 m/s)",
+        "no body rate for the DVL lever arm", "DVL stale (0.70s)",
+        "DVL velocity not finite", "DVL code fault",
+        "DVL quality flag: fom (4.0 > 3.0 mm/s)",
+        "DVL quality flag: altitude jump (0.75 m against 0.50 m over the "
+        "last 1 s)", "DVL quality flag: beams (3 < 4)",
+        "DVL quality flag: lock re-acquired (the report 0.05 s before it "
+        "failed a data gate)",
+        "DVL disagrees with the tag velocity (slow residual 6.0 > 5.0 cm/s)",
+        "DVL disagreement releasing (slow residual 3.0 cm/s; it returns "
+        "below 2.5)",
+        "DVL disagreement releasing (waiting for 1.2 s of disagreement "
+        "evidence to drain)",
+        "DVL disagrees with the tag velocity: alignment (bearing +0 deg: "
+        "alignment -0.90, the tags see 0.95 of it)",
+        "DVL disagrees with the tag velocity: the fit refutes the mount (the "
+        "tags see the motion elsewhere)",
+        "DVL disagrees with the tag velocity: the fit refutes it (the tags "
+        "see only 0.55 of the motion it reports)",
+        "DVL gross (|v_dvl - LP(v_tag)| 0.80 > 0.50 m/s)",
+        "no tag state this tick (the blend waits for it)",
+        "no tag state this tick (the DVL needs one to be checked)",
+        "station bridge on tier imu (the DVL rung is not carrying this "
+        "dropout)", "held: DVL has no bottom lock",
+        "DVL re-entry (0.10/0.50s)", "DVL innovation (0.25 > 0.15 m/s)",
+        "DVL innovation hold (until a fresh tag velocity agrees; it was x)",
+        "DVL unchecked (no current tag velocity)",
+        "DVL held back (the fit refutes it)",
+        "DVL alignment hold (bearing +0 deg: alignment -0.90, the tags see "
+        "0.95 of it)"]
+    bad = [p for p in phrases if DV.reason_code(p) == "other"]
+    assert not bad, bad
+    assert DV.reason_code("DVL tripped (x)") == "latched"
+    assert DV.reason_code("DVL tripped before engage") == "not_armed"
+    assert DV.reason_code("DVL held back (the fit refutes it)") == "refute_hold"
+    assert DV.reason_code("") == "ok" and DV.reason_code("what?") == "other"
+    # ...and the chip's words
+    assert DV.reason_class("dis_fit") == "disagrees"
+    assert DV.reason_class("flag_reacq") == "flag re-lock"
+    assert DV.reason_class("ok") == "" and DV.reason_class("rung") == ""
+    # a live aid's own reasons, every code it can answer
+    d = _paid()
+    f = _Feed(d)
+    f.run(40, (0.10, 0, 0), (0.10, 0, 0))
+    for why in [r[6] for r in f.log] + [d.usable(f.t + 9.0)[1]]:
+        assert DV.reason_code(why) != "other", why
+
+
+# ------------------------------------------------- selection primary: worker
+def _fly_n15(tmp, **over):
+    """N15's flight through the real worker: proven, IN, engaged; 6 ticks
+    good at (0.07, -0.02); 20 with no bottom lock; 14 good again. -> (w,
+    rows, meta dvl, logs, statuses). Sample ages are exact multiples of
+    0.05 s (the _Sim clock)."""
+    TC, w, bus, _pilots, logs = _dvl_worker(tmp, reentry_s=0.0, **over)
+    sim = _Sim(w, TC)
+    st = []
+    try:
+        assert w.dvl.selection == "primary"
+        sim.prove()
+        w.set_dvl_use(True)
+        sim.engage()
+        bus.mpc_status.connect(st.append)
+        v = (0.07, -0.02, 0.0)
+        for _ in range(6):
+            sim.step(v=v)
+        for _ in range(20):
+            sim.step(v=v, valid=False)
+        for _ in range(14):
+            sim.step(v=v)
+        assert w.engaged, w.reason
+        meta = w._run_meta()["dvl"]
+        rows = _rows(w)
+    finally:
+        sim.close()
+    return w, rows, meta, logs, st
+
+
+def test_primary_fades_row_by_row_and_never_hard_switches():
+    """N15. A lost bottom lock is a tick without a DVL — under primary the
+    last good sample is held 0.45 s and the weight fades 0.1 per tick to the
+    tag velocity, and back: no row changes w by more than one fade step. The
+    first report after the lock comes back is a re-acquired lock and is not
+    flown; the next ones fade in."""
+    with tempfile.TemporaryDirectory() as tmp:
+        w, rows, meta, _logs, _st = _fly_n15(tmp)
+    src = [r["vel_src"] for r in rows]
+    wd = [float(r["w_dvl"]) for r in rows]
+    code = [r["dvl_code"] for r in rows]
+    assert len(rows) == 40, len(rows)
+    assert src[:6] == ["dvl"] * 6 and wd[:6] == [1.0] * 6 and \
+        code[:6] == ["ok"] * 6
+    n_hold = 0
+    while src[6 + n_hold] == "hold":
+        n_hold += 1
+    assert n_hold in (8, 9), src[6:20]            # 0.45 s of capture time
+    assert wd[6:6 + n_hold] == [1.0] * n_hold
+    i = 6 + n_hold
+    assert src[i:i + 9] == ["blend"] * 9, src[i:i + 9]
+    assert np.allclose(wd[i:i + 9], [0.9 - 0.1 * k for k in range(9)],
+                       atol=1e-3), wd[i:i + 9]
+    assert all(s == "tag_fd" and x == 0.0 for s, x in zip(src[i + 9:26],
+                                                         wd[i + 9:26]))
+    assert code[6:26] == ["no_lock"] * 20, code[6:26]
+    # the lock is back: the first report is a RE-ACQUIRED lock, not flown...
+    assert (src[26], wd[26], code[26]) == ("tag_fd", 0.0, "flag_reacq")
+    # ...then the weight fades in, 0.1 per tick, to the DVL
+    assert src[27:36] == ["blend"] * 9 and code[27:] == ["ok"] * 13
+    assert np.allclose(wd[27:36], [0.1 * (k + 1) for k in range(9)],
+                       atol=1e-3), wd[27:36]
+    assert src[36:] == ["dvl"] * 4 and wd[36:] == [1.0] * 4
+    # never a hard switch; the row's (u, v) IS the blend of the two it shows
+    assert all(abs(b - a) <= 0.1 + 1e-6 for a, b in zip(wd, wd[1:])), wd
+    for r, x in zip(rows, wd):
+        exp = x * 0.07 + (1.0 - x) * float(r["fd_u"])
+        assert abs(float(r["nu_u"]) - exp) < 2e-5, (r["vel_src"], x,
+                                                     r["nu_u"], exp)
+    m = meta["rows"]
+    # tag_fd: what is left of the 20 after hold and fade, + the re-lock row
+    assert m.get("dvl") == 10 and m.get("hold") == n_hold \
+        and m.get("blend") == 18 and m.get("tag_fd") == 12 - n_hold, m
+    assert m.get("fallback: DVL has no bottom lock") == 20, m
+    assert m.get("fallback: DVL quality flag: lock re-acquired") == 1, m
+    assert not any(any(c.isdigit() for c in k) for k in m), m
+
+
+def test_the_csv_and_meta_record_the_selection():
+    """N20. Schema 22: the seven columns on every row, parseable, the code a
+    single token; the meta says which selection flew and with what."""
+    with tempfile.TemporaryDirectory() as tmp:
+        w, rows, meta, _logs, _st = _fly_n15(tmp)
+        m_all = w._run_meta()
+    assert m_all["schema_version"] == 22
+    for r in rows:
+        for k in ("w_dvl", "dvl_res_fast_m_s", "dvl_res_slow_m_s",
+                  "dvl_esc_s", "dvl_align", "dvl_scale"):
+            float(r[k])                           # parses ("nan" included)
+        assert r["dvl_code"] and "," not in r["dvl_code"] \
+            and " " not in r["dvl_code"], r["dvl_code"]
+        assert math.isfinite(float(r["dvl_esc_s"]))       # primary: known
+    assert meta["selection"] == "primary" and meta["reentry_s_used"] is False
+    assert meta["blend"] == {"hold_s": 0.45, "xfade_s": 0.5, "gross_m_s": 0.5,
+                             "gross_tau_s": 1.0, "stale_s": 0.6,
+                             "dvl_w": False, "dt_s": 0.05}, meta["blend"]
+    assert meta["flags"]["reacquired"] is True \
+        and meta["flags"]["counts"]["flag_reacq"] >= 1
+    for k in ("disagreement", "escalation", "inactive_keys", "governed_by",
+              "station_bridge_dvl"):
+        assert k in meta, k
+    assert meta["inactive_keys"] == {"reentry_s": 0.0, "agree_trip_m_s": 0.08}
+    assert meta["escalation"]["latches"] == {"persistent": 0, "repeated": 0}
+    assert "residual_slow_m_s" in meta["monitor_now"]
+    assert "a disagreement is a hold that releases by itself" in \
+        meta["switch_rule"]
+    assert "gates" in meta and "reentry_s_used" not in meta["gates"]
+    DV.resolve(dict(meta["gates"], **meta["agreement_cfg"]))   # replayable
+    json.dumps(m_all, default=str)
+
+
+def test_primary_never_asks_the_legacy_ladder():
+    """N21. Under primary the tick, the rung and the after-step never ask
+    velocity(), displacement() or note_tag_velocity() — the legacy ladder
+    raising changes nothing."""
+    def boom(*_a, **_k):
+        raise RuntimeError("the legacy ladder was asked")
+
+    orig = (DV.DvlAid.velocity, DV.DvlAid.displacement,
+            DV.DvlAid.note_tag_velocity)
+    DV.DvlAid.velocity = DV.DvlAid.displacement = boom
+    DV.DvlAid.note_tag_velocity = boom
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            w, rows, _meta, _logs, _st = _fly_n15(tmp)
+            assert not w._dvl_fault, w._dvl_fault
+    finally:
+        (DV.DvlAid.velocity, DV.DvlAid.displacement,
+         DV.DvlAid.note_tag_velocity) = orig
+    assert [r["vel_src"] for r in rows][:6] == ["dvl"] * 6
+    assert [r["dvl_code"] for r in rows][26] == "flag_reacq"
+
+
+def test_legacy_keeps_the_shipped_tick():
+    """N22. selection: legacy is the shipped tick: hard switches, w 1 / 0,
+    no escalation; the seven new columns only describe it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        TC, w, bus, _pilots, _logs = _dvl_worker(tmp, reentry_s=0.0,
+                                                 selection="legacy")
+        sim = _Sim(w, TC)
+        try:
+            assert w.dvl.selection == "legacy"
+            sim.prove()
+            w.set_dvl_use(True)
+            sim.engage()
+            for _ in range(6):
+                sim.step(v=(0.07, -0.02, 0.0))
+            for _ in range(4):
+                sim.step(v=(0.07, -0.02, 0.0), valid=False)
+            m = w._run_meta()["dvl"]
+            rows = _rows(w)
+        finally:
+            sim.close()
+    assert [r["vel_src"] for r in rows] == ["dvl"] * 6 + ["tag_fd"] * 4
+    assert [r["w_dvl"] for r in rows] == ["1.000"] * 6 + ["0.000"] * 4
+    assert [r["dvl_code"] for r in rows] == ["ok"] * 6 + ["no_lock"] * 4
+    assert all(r["dvl_esc_s"] == "nan" for r in rows)
+    assert m["rows"]["dvl"] == 6 and m["rows"]["tag_fd"] == 4
+    assert m["rows"]["fallback: DVL has no bottom lock"] == 4
+    assert m["selection"] == "legacy" and m["reentry_s_used"] is True
+    assert m["inactive_keys"] == {} and "station_bridge_dvl" not in m
+    assert m["flags"]["counts"]["flagged"] == 0
+
+
+def test_a_disagreement_in_flight_holds_and_returns_by_itself():
+    """N16. THE OPERATOR'S REQUEST: the DVL reading the reverse of the tags
+    for two seconds is a HOLD — it fades to the tag velocity at once, comes
+    back by itself when it agrees again, keeps its proof and its arming;
+    no TRIPPED anywhere, nothing to press."""
+    with tempfile.TemporaryDirectory() as tmp:
+        TC, w, bus, _pilots, logs = _dvl_worker(tmp, reentry_s=0.0)
+        sim = _Sim(w, TC)
+        try:
+            sim.prove()
+            w.set_dvl_use(True)
+            sim.engage()
+            st = []
+            bus.mpc_status.connect(st.append)
+            for _ in range(20):
+                sim.step(v=(0.10, 0.0, 0.0))
+            assert st[-1].vel_src == "dvl" and st[-1].dvl_w == 1.0
+            for _ in range(40):
+                sim.step(v=(0.10, 0.0, 0.0), dvl_v=(-0.10, 0.0, 0.0))
+            for _ in range(240):
+                sim.step(v=(0.10, 0.0, 0.0))
+            assert w.engaged and w._dvl_run_ok and not w.dvl.tripped
+            assert w.dvl.proven
+            assert not any("TRIPPED" in m for _l, m in logs), \
+                [m for _l, m in logs if "TRIPPED" in m]
+            held = [m for lvl, m in logs if lvl == "warn"
+                    and m.startswith("dvl: HELD (not latched) — ")]
+            assert len(held) == 1 and "nothing to press" in held[0], held
+            rel = [m for lvl, m in logs if lvl == "info"
+                   and m.startswith("dvl: hold released")]
+            assert len(rel) == 1, rel
+            assert all(s.dvl_state != "tripped" for s in st)
+            assert any(s.dvl_state == "held" for s in st)
+            i = next(k for k, s in enumerate(st)
+                     if s.dvl_code.startswith("dis_"))
+            assert st[i - 1].dvl_w == 1.0 and abs(st[i].dvl_w - 0.9) < 1e-9, \
+                (st[i - 1].dvl_w, st[i].dvl_w)        # N28: no 0.45 s hold
+            assert st[-1].dvl_w == 1.0 and st[-1].vel_src == "dvl"
+            m = w._run_meta()["dvl"]
+            assert m["trips"] == 0 and m["escalation"]["latches"] == {
+                "persistent": 0, "repeated": 0}
+            assert sum(m["disagreement"]["hold_onsets"].values()) >= 1
+        finally:
+            sim.close()
+
+
+def test_a_lasting_disagreement_in_flight_latches_and_rearming_is_unchanged():
+    """N17. The same reversed reading for 15 s is not a glitch: ONE latch
+    line that says what to do, an event, the TRIPPED face, a fade (not a
+    step) to the tag velocity, a frozen escalation — and the shipped
+    re-arming: a new proof, then OUT and IN."""
+    TC = _harness()
+    TC._app()
+    from rov_gui import theme
+    from rov_gui.widgets.trajectory import TrajectoryWindow
+
+    with tempfile.TemporaryDirectory() as tmp:
+        TC, w, bus, _pilots, logs = _dvl_worker(tmp, reentry_s=0.0,
+                                                agree_window_s=8.0)
+        sim = _Sim(w, TC)
+        p = None
+        try:
+            sim.prove()
+            w.set_dvl_use(True)
+            sim.engage()
+            st, ev = [], []
+            bus.mpc_status.connect(st.append)
+            bus.mpc_event.connect(ev.append)
+            for _ in range(10):
+                sim.step(v=(0.10, 0.0, 0.0))
+            for _ in range(300):
+                sim.step(v=(0.10, 0.0, 0.0), dvl_v=(-0.10, 0.0, 0.0))
+            assert w.dvl.tripped and w.engaged
+            errs = [m for lvl, m in logs if lvl == "error" and "TRIPPED" in m]
+            assert len(errs) == 1, errs
+            assert errs[0].startswith(
+                "dvl: TRIPPED (latched) — DVL disagreed with the tag velocity "
+                "persistently"), errs[0]
+            assert "proving pass" in errs[0] and "OUT and IN" in errs[0]
+            assert any(e.startswith("dvl: TRIPPED (latched)") for e in ev)
+            assert st[-1].dvl_state == "tripped" and st[-1].dvl_w == 0.0
+            assert st[-1].dvl_esc_s == 0.0 and w.dvl.escalation_s == 0.0
+            ws = [s.dvl_w for s in st if s.dvl_w is not None]
+            assert all(abs(b - a) <= 0.1 + 1e-6 for a, b in zip(ws, ws[1:]))
+            p = TrajectoryWindow()
+            p.add_status(st[-1])
+            assert p.btn_dvl.text() == "DVL TRIPPED"
+            assert p._dvl_css == p._state_btn_css(theme.FAIL)
+            assert "TRIPPED = it disagreed" in p.btn_dvl.toolTip()
+            # the shipped re-arming, unchanged
+            w.set_engaged(False)
+            w.set_dvl_use(True)
+            assert w.dvl.tripped and "PROVEN" in w.reason, w.reason
+            sim.prove()                       # a proof made after the latch
+            w.set_dvl_use(False)
+            w.set_dvl_use(True)
+            assert not w.dvl.tripped and w.dvl.use, w.reason
+            assert w.dvl.escalation_s == 0.0
+            sim.engage()
+            assert w._dvl_run_ok is True
+        finally:
+            if p is not None:
+                p.close()
+            sim.close()
+
+
+def test_the_rung_takes_only_a_usable_agreeing_dvl():
+    """N18. The station bridge's DVL rung under primary: opened only by a
+    tagged tick that flew the DVL AND agrees with that tick's tag velocity
+    (rung_admit); a flagged sample on a lost tick is carried on the last
+    usable one for blend_hold_s; a disagreement closes it at once."""
+    TC = _harness()
+    TC._app()
+    from rov_gui import theme
+    from rov_gui.widgets.trajectory import TrajectoryWindow
+
+    def lost(sim, w, v=(0.0, 0.0, 0.0), **kw):
+        sim.step(fix=False, dvl=False, tick=False)
+        w.on_dvl(_smp(v, sim.t, **kw))
+        w.tick()
+
+    # (a) + (b): opened by an agreeing DVL; a flag is bridged, then closes
+    with tempfile.TemporaryDirectory() as tmp:
+        TC, w, bus, _pilots, _logs, sim = _station(tmp)
+        p = None
+        try:
+            st = []
+            bus.mpc_status.connect(st.append)
+            assert w._dvl_xy is not None, "an agreeing DVL opens the rung"
+            w.fix.t_capture -= 5.0            # the tags are gone
+            tiers = []
+            for _ in range(14):
+                lost(sim, w, fom=0.004)       # every report flagged
+                tiers.append(w._bridge.tier)
+            assert tiers[:8] == [SB.TIER_DVL] * 8, tiers
+            assert SB.TIER_DVL not in tiers[10:], tiers
+            assert w._dvl_xy is None
+            assert st[0].dvl_state == "in_use" and st[0].dvl_code == "rung"
+            assert st[0].dvl_w == 1.0
+            p = TrajectoryWindow()
+            p.add_status(st[0])
+            assert p._dvl_css == p._state_btn_css(theme.OK)
+            sb = w._run_meta()["dvl"]["station_bridge_dvl"]
+            assert sb["dropouts_on_dvl"] == 1 and sb["held_ticks"] >= 7, sb
+            assert sb["chain_breaks"].get("flag_fom", 0) >= 1, sb
+            rows = _rows(w)
+            rung = [r for r in rows if r["bridge_tier"] == "dvl"]
+            assert rung and all(r["w_dvl"] == "1.000" and
+                                r["dvl_code"] == "rung" for r in rung)
+        finally:
+            if p is not None:
+                p.close()
+            sim.close()
+    # (c) the counterpart of the legacy rejected-DVL test: a false lock the
+    # tags contradict on the last tagged ticks never opens the rung
+    with tempfile.TemporaryDirectory() as tmp:
+        TC, w, bus, _pilots, _logs, sim = _station(tmp)
+        try:
+            x0 = float(w._eta[0])
+            for v in (0.1, 0.2, 0.25, 0.25, 0.25, 0.25):
+                sim.step(dvl_v=(v, 0.0, 0.0))
+            assert w._dvl_xy is None and not w.dvl.tripped
+            w.fix.t_capture -= 5.0
+            tiers = []
+            for _ in range(8):
+                sim.step(dvl_v=(0.25, 0.0, 0.0), fix=False)
+                tiers.append(w._bridge.tier)
+            assert SB.TIER_DVL not in tiers, tiers
+            assert abs(float(w._eta[0]) - x0) < 1e-6
+            assert w._bridge.meta()["dropouts_on_dvl"] == 0
+            refused = w._run_meta()["dvl"]["station_bridge_dvl"][
+                "rung_refusals"]
+            assert refused.get("DVL innovation", 0) >= 1, refused
+        finally:
+            sim.close()
+    # (d) a +0.25 m/s false lock starting 0.5 s before the tags go
+    with tempfile.TemporaryDirectory() as tmp:
+        TC, w, bus, _pilots, _logs, sim = _station(tmp)
+        try:
+            for _ in range(10):
+                sim.step(dvl_v=(0.25, 0.0, 0.0))
+            assert w._dvl_xy is None
+            w.fix.t_capture -= 5.0
+            for _ in range(6):
+                sim.step(dvl_v=(0.25, 0.0, 0.0), fix=False)
+                assert w._bridge.tier != SB.TIER_DVL
+        finally:
+            sim.close()
+    # (e) a tier below the rung: the panel names it, never "held back"
+    with tempfile.TemporaryDirectory() as tmp:
+        TC, w, bus, _pilots, _logs, sim = _station(tmp)
+        try:
+            w._bridge.cfg["use_dvl"] = False
+            st = []
+            bus.mpc_status.connect(st.append)
+            w.fix.t_capture -= 5.0
+            for _ in range(3):
+                sim.step(fix=False)
+            assert st[-1].vel_src == "bridge" and st[-1].dvl_code == "bridge"
+            assert st[-1].dvl_state == "no_tag" and st[-1].dvl_w == 0.0
+            assert "station bridge on tier" in st[-1].dvl_note, st[-1].dvl_note
+        finally:
+            sim.close()
+    # (f) a disagreement on a lost tick closes the rung at once
+    with tempfile.TemporaryDirectory() as tmp:
+        TC, w, bus, _pilots, _logs, sim = _station(tmp)
+        try:
+            w.fix.t_capture -= 5.0
+            lost(sim, w)
+            assert w._bridge.tier == SB.TIER_DVL
+            w.dvl._hold_diff, w.dvl._r_slow = True, 0.08   # stage 1 holds
+            lost(sim, w)
+            assert w._bridge.tier != SB.TIER_DVL and w._dvl_xy is None
+            cb = w._run_meta()["dvl"]["station_bridge_dvl"]["chain_breaks"]
+            assert cb.get("dis_diff") == 1, cb
+        finally:
+            sim.close()
+
+
+def test_the_panel_never_says_tripped_for_a_hold():
+    """N19 (R9). A hold reads "held — returns by itself" on a DVL IN face,
+    with the reason and the fade on the chip; a run not armed reads "not
+    used this run", a tick without a tag state "no tag state"; a shadow aid
+    logs no HELD line."""
+    TC = _harness()
+    TC._app()
+    from rov_gui.widgets.trajectory import TrajectoryWindow
+
+    with tempfile.TemporaryDirectory() as tmp:
+        TC, w, bus, _pilots, logs = _dvl_worker(tmp, reentry_s=0.0)
+        sim = _Sim(w, TC)
+        p = TrajectoryWindow()
+        try:
+            sim.prove()
+            w.set_dvl_use(True)
+            sim.engage()
+            st = []
+            bus.mpc_status.connect(st.append)
+            for _ in range(20):
+                sim.step(v=(0.10, 0.0, 0.0))
+            for _ in range(40):
+                sim.step(v=(0.10, 0.0, 0.0), dvl_v=(-0.10, 0.0, 0.0))
+            held = [s for s in st if s.dvl_state == "held"]
+            assert held, {s.dvl_state for s in st}
+            assert all("returns by itself" in s.dvl_note for s in held)
+            # (the first may be the re-acquired lock after the jump, still
+            # flown on the held sample at w 1: "v:DVL"); the disagreement:
+            dis = [s for s in held if s.dvl_code.startswith("dis_")]
+            assert dis, [(s.dvl_code, s.dvl_w) for s in held]
+            for s in (dis[0], dis[-1]):
+                s.engaged, s.mode = True, "pid"
+                p.add_status(s)
+                assert p.btn_dvl.text() == "DVL IN"
+                assert "HELD =" in p.btn_dvl.toolTip()
+                chip = p.chip.text()
+                assert ("v:TAG (DVL held: disagrees)" in chip
+                        or "%↓ (disagrees)" in chip), (s.dvl_w, chip)
+            for _ in range(60):               # agreeing again: the tail
+                sim.step(v=(0.10, 0.0, 0.0))
+            tail = [s for s in st if s.dvl_code == "dis_diff"
+                    and "releasing" in s.dvl_note]
+            assert tail, [s.dvl_note for s in st if s.dvl_code == "dis_diff"]
+            out = [s for s in st if s.dvl_code.startswith("dis_")
+                   and s.dvl_w == 0.0]
+            assert out, [(s.dvl_code, s.dvl_w) for s in st[-60:]]
+            out[0].engaged, out[0].mode = True, "pid"
+            p.add_status(out[0])
+            assert "v:TAG (DVL held: disagrees)" in p.chip.text(), \
+                p.chip.text()
+            # a tick with no tag state, engaged
+            w.fix.t_capture -= 5.0
+            w._bridge.cfg["enabled"] = False
+            n0 = len(st)
+            sim.step(fix=False)
+            nt = [s for s in st[n0:] if s.dvl_code == "no_tag"]
+            assert nt and nt[-1].dvl_state == "no_tag" and \
+                "no tag state" in nt[-1].dvl_note, [(s.dvl_state, s.dvl_code)
+                                                     for s in st[n0:]]
+        finally:
+            p.close()
+            sim.close()
+    # a run that is not armed
+    with tempfile.TemporaryDirectory() as tmp:
+        TC, w, bus, _pilots, logs = _dvl_worker(tmp, use=True, reentry_s=0.0)
+        sim = _Sim(w, TC)
+        p = TrajectoryWindow()
+        try:
+            sim.engage()                      # IN from the file, unproven
+            assert w._dvl_run_ok is False
+            st = []
+            bus.mpc_status.connect(st.append)
+            for k in range(240):              # the proof completes mid-run
+                sim.step(v=_osc(k * 0.05))
+            assert w.dvl.proven and st[-1].dvl_state == "not_armed"
+            assert "not armed at engage" in st[-1].dvl_note, st[-1].dvl_note
+            s = st[-1]
+            s.engaged, s.mode = True, "pid"
+            p.add_status(s)
+            assert "v:TAG (DVL not used this run)" in p.chip.text(), \
+                p.chip.text()
+        finally:
+            p.close()
+            sim.close()
+    # a SHADOW aid that disagrees logs nothing about holding
+    with tempfile.TemporaryDirectory() as tmp:
+        TC, w, bus, _pilots, logs = _dvl_worker(tmp, reentry_s=0.0)
+        sim = _Sim(w, TC)
+        try:
+            sim.prove()
+            sim.engage()                      # OUT: shadow
+            for _ in range(60):
+                sim.step(v=(0.10, 0.0, 0.0), dvl_v=(-0.10, 0.0, 0.0))
+            assert w.dvl.residual_slow_m_s > 0.05
+            assert not any("HELD" in m for _l, m in logs)
+        finally:
+            sim.close()
+
+
+def test_a_refutation_at_engage_does_not_unarm_the_run():
+    """N35. A fit refutation current at engage refuses the switch IN but no
+    longer the run: the run is armed (the events.log engage line says
+    ARMED), the tick holds the DVL while the refutation is current — the
+    difference hold answers first (disagree_hold's order: difference,
+    alignment, fit), then dis_fit while the fit alone refutes — and fades it
+    in when it ends [first ok 6.8 s, coherent case]. The latches are OFF here
+    to build the state: the test is about ARMING only. With them on, a 2x
+    DVL latches through the scale evidence (N13) and a 180 deg one through
+    the coherent evidence (N12) — that is the escalation's job, not a
+    contradiction (fix round 1: the old "does not latch" line was vacuous)."""
+    for name, fn, coh in (
+            ("incoherent", lambda t: (2.0 * _osc(t)[0], 2.0 * _osc(t)[1],
+                                      0.0), False),
+            ("coherent", lambda t: (-_osc(t)[0], -_osc(t)[1], 0.0), True)):
+        with tempfile.TemporaryDirectory() as tmp:
+            TC, w, bus, _pilots, logs = _dvl_worker(
+                tmp, reentry_s=0.0, agree_window_s=8.0, esc_scale_ratio=0.0,
+                esc_latch_s=1e9, esc_repeat_n=0)
+            sim = _Sim(w, TC)
+            try:
+                sim.prove()
+                w.set_dvl_use(True)
+                k = 0
+                while k < 2000 and not (
+                        w.dvl._fit_current(sim.t)
+                        and w.dvl.agree.fit()["coherent"] is coh):
+                    sim.step(v=_osc(k * 0.05), dvl_v=fn(k * 0.05))
+                    k += 1
+                f = w.dvl.agree.fit()
+                assert w.dvl._fit_current(sim.t) and f["coherent"] is coh, \
+                    (name, f)
+                assert "REFUTES" in w.dvl.refusal(True)
+                assert w.dvl.arm_refusal() == ""
+                w.on_enable(True)
+                w.set_engaged(True)
+                w._warmup_left = 0
+                assert w.engaged and w._dvl_run_ok is True, (name,
+                                                             w._dvl_run_why)
+                ev = "\n".join(p.read_text(encoding="utf-8")
+                               for p in Path(tmp).rglob("events.log"))
+                assert "DVL IN at engage — ARMED for this run" in ev, ev
+                st = []
+                bus.mpc_status.connect(st.append)
+                sim.step(v=_osc(k * 0.05), dvl_v=fn(k * 0.05))
+                assert st[-1].dvl_code == "dis_diff", (name, st[-1].dvl_code)
+                assert w.dvl._fit_current(sim.t), name
+                assert st[-1].dvl_w == 0.0, st[-1].dvl_w
+                codes = []
+                for j in range(400):          # honest again
+                    sim.step(v=_osc((k + j) * 0.05))
+                    codes.append(st[-1].dvl_code)
+                assert "dis_fit" in codes, (name, sorted(set(codes)))
+                assert st[-1].dvl_w == 1.0 and st[-1].vel_src == "dvl", \
+                    (name, st[-1].dvl_code, st[-1].dvl_note)
+                assert not w.dvl.tripped and w.dvl.n_trips == 0
+                assert w._dvl_run_ok is True
+            finally:
+                sim.close()
+
+
+def test_primary_names_the_keys_it_does_not_use():
+    """N37. A legacy-only key tuned in the yaml would change nothing under
+    primary: the setup line names it and what governs instead, a warning
+    says so for a non-default value, and the meta records it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        TC, w, _bus, _pilots, logs = _dvl_worker(tmp, reentry_s=0.3)
+        setup = [m for lvl, m in logs if m.startswith("dvl: built")]
+        assert setup and "selection primary" in setup[-1]
+        assert "reentry_s 0.3 (blend_xfade_s instead)" in setup[-1], setup[-1]
+        assert "agree_trip_m_s 0.08" in setup[-1]
+        warn = [m for lvl, m in logs if lvl == "warn" and
+                "selection primary does not use it" in m]
+        assert len(warn) == 1 and "dvl.reentry_s is 0.3" in warn[0], warn
+        assert w.dvl.meta()["inactive_keys"]["reentry_s"] == 0.3
+        TC, w, _bus, _pilots, logs = _dvl_worker(tmp, selection="legacy",
+                                                 reentry_s=0.3)
+        setup = [m for lvl, m in logs if m.startswith("dvl: built")]
+        assert "selection LEGACY" in setup[-1]
+        assert not any("does not use it" in m for _l, m in logs)
+
+
+def test_a_proof_at_the_edge_of_the_tolerance_says_at_what_speed_it_holds():
+    """N39. Primary's counterpart of the legacy edge-of-proof warning: the
+    hold level (5 cm/s) and the escalation, not agree_trip_m_s."""
+    with tempfile.TemporaryDirectory() as tmp:
+        TC, w, _bus, _pilots, logs = _dvl_worker(tmp)
+        sim = _Sim(w, TC)
+        try:
+            c, s = math.cos(math.radians(10)), math.sin(math.radians(10))
+            for k in range(240):
+                v = _osc(k * 0.05)
+                sim.step(v=v, tick=False,
+                         dvl_v=(c * v[0] + s * v[1], -s * v[0] + c * v[1], 0))
+            assert w.dvl.proven
+            warn = [m for _l, m in logs if "holds the DVL back" in m]
+            assert len(warn) == 1, warn
+            assert "slow residual > 5 cm/s" in warn[0] and \
+                "lasting 4 s, latches it" in warn[0], warn[0]
+            assert "trips the difference monitor" not in warn[0]
+            import re
+            mm = re.search(r"above ([0-9.]+) m/s .* yaw by \+([0-9.]+) deg",
+                           warn[0])
+            assert mm and 0.20 < float(mm.group(1)) < 0.32, warn[0]
+            assert 9.0 < float(mm.group(2)) < 13.0, warn[0]
+        finally:
+            sim.close()
+
+
+def test_a_run_is_armed_for_the_dvl_at_engage_or_not_at_all_under_primary():
+    """The primary twin of the (legacy-pinned) arming test: one run = one
+    estimator binds the automation too — a proof completing mid-run does not
+    move the velocity source; the panel says "not used this run" (never
+    "held back") with the reason."""
+    with tempfile.TemporaryDirectory() as tmp:
+        TC, w, bus, _pilots, logs = _dvl_worker(tmp, use=True, reentry_s=0.0)
+        sim = _Sim(w, TC)
+        try:
+            assert w.dvl.use and not w.dvl.proven
+            sim.engage()
+            assert w._dvl_run_ok is False
+            assert "not armed" in w._dvl_run_why.lower()
+            st = []
+            bus.mpc_status.connect(st.append)
+            for k in range(240):
+                sim.step(v=_osc(k * 0.05))
+            assert w.dvl.proven
+            assert all(s.vel_src == "tag_fd" and s.dvl_w == 0.0 for s in st)
+            assert st[-1].dvl_state == "not_armed"
+            assert "not armed at engage" in st[-1].dvl_note, st[-1].dvl_note
+            assert any("used from the next engagement" in m
+                       for _l, m in logs)
+            m = w._run_meta()["dvl"]
+            assert m["armed_at_engage"] is False and m["rows"].get("dvl", 0) == 0
+            w.set_engaged(False)
+            sim.engage()
+            assert w._dvl_run_ok is True
+            st.clear()
+            for _ in range(5):
+                sim.step(v=(0.05, 0.0, 0.0))
+            assert all(s.vel_src == "dvl" and s.dvl_w == 1.0 for s in st)
+        finally:
+            sim.close()
+
+
+# ================================================ fix round 1 (2026-10-16)
+# DTF fix1/ (IMPLEMENTATION.md "Fix round 1"): the verifiers' findings.
+# [bracketed] numbers are measured on THIS implementation by the same
+# scenario (DTF fix1/out [측정]).
+def _glitch_run(m, dur, warm_s=60.0, after_s=10.0, flagged=False, seed=2,
+                k=1.0):
+    """k x `_osc` motion with a full 60-s fit window of honest pairs (as in
+    flight), then ONE glitch: +m m/s on the DVL's u for dur s (its reports
+    carrying fom 6 mm/s when ``flagged``), then honest for after_s."""
+    d = _paid()
+    f = _Feed(d, seed=seed, blend=True)
+
+    def mot(t):
+        return tuple(k * x for x in _osc(t))
+    f.run(int(round(warm_s / 0.05)), mot, mot)
+    t0 = f.t
+
+    def dv(t):
+        v = mot(t)
+        return (v[0] + m, v[1], v[2]) if t0 < t <= t0 + dur + 1e-9 else v
+    kw = ((lambda t: {"fom": 0.006} if t0 < t <= t0 + dur + 1e-9 else {})
+          if flagged else None)
+    f.run(int(round((dur + after_s) / 0.05)), dv, mot, s_kw=kw)
+    return d, f, t0, t0 + dur
+
+
+def test_a_short_glitch_while_moving_is_held_not_latched():
+    """Fix round 1 (DTF verify/tests.md §6.1, parity.md §4): ONE large short
+    DVL glitch while moving is a transient — the blend keeps it out (jump
+    gate, gross check, or the fom flag), nothing latches, the proof stays,
+    and the DVL is used again within a second [ok 0.05-0.45 s, w 1 by
+    0.5-0.9 s]. The slow DVL power used to take the glitch UNclipped: its
+    4-s memory held scale_ratio over 1.5 and latched "persistently ... the
+    DVL reads 2.1x the motion the tags see" 4.05 s after the onset."""
+    for m, dur, flagged in ((0.6, 1.0, False), (0.8, 0.5, False),
+                            (0.8, 1.0, False), (0.5, 0.5, False),
+                            (0.6, 1.0, True)):
+        d, f, t0, te = _glitch_run(m, dur, flagged=flagged)
+        case = (m, dur, flagged)
+        assert d.n_trips == 0 and not d.tripped and d.proven, \
+            (case, d.last_trip)
+        assert d.esc_max < 0.5 and not d.ep_log, (case, d.esc_max)
+        post = [r for r in f.log if r[0] > te]
+        ok = next(r[0] - te for r in post if r[1] == "ok")
+        assert ok <= 1.0, (case, ok)
+        assert all(r[1] == "ok" and r[5] == 1.0 for r in post
+                   if r[0] - te >= 1.5), \
+            (case, sorted({r[1] for r in post if r[0] - te >= 1.5}))
+        assert {r[1] for r in f.log if r[0] > t0} <= {
+            "ok", "jump", "gross", "flag_reacq", "flag_fom"}, \
+            (case, {r[1] for r in f.log if r[0] > t0})
+    # Where the tags see just over 5 cm/s rms (6 / 4 cm/s), a 1.5-s glitch:
+    # a glitch pair feeds no scale evidence at all [bucket 0.0; clipped but
+    # kept, it left 2.9 s — 0.73 of the latch — DTF fix1/out/
+    # glitch_slowmotion_aid.json]. (Its fit-memory hold is the next test's.)
+    d, f, t0, te = _glitch_run(0.5, 1.5, k=0.5)
+    assert d.n_trips == 0 and not d.tripped and d.proven, d.last_trip
+    assert d.esc_max < 0.5 and not d.ep_log, d.esc_max
+
+
+def test_a_long_glitch_is_held_by_the_fit_and_returns_without_a_latch():
+    """Fix round 1, the cost that remains (DTF IMPLEMENTATION.md Fix round
+    1): a glitch long enough to dominate the fit's 60-s window (+0.8 m/s for
+    1.5 s, 30 pairs of 0.8 m/s regressor against 1200 honest ones) makes the
+    fit refute INCOHERENTLY, and the dis_fit hold (R1's refuting-fit hold)
+    keeps the DVL out until those pairs leave the window [59.3 s]. It never
+    latches and it returns by itself; the proof is kept."""
+    d, f, t0, te = _glitch_run(0.8, 1.5, after_s=62.0)
+    assert d.n_trips == 0 and not d.tripped and d.proven, d.last_trip
+    post = [r for r in f.log if r[0] > te]
+    assert any(r[1] == "dis_fit" for r in post)
+    back = max(r[0] - te for r in post if r[1] != "ok")
+    assert back <= 61.0, back                       # the window, plus a tick
+    assert post[-1][1] == "ok" and post[-1][5] == 1.0, post[-1]
+
+
+def test_alignment_only_episodes_do_not_count_toward_the_repeated_latch():
+    """Fix round 1 (DTF verify/REPLAY.md §8 item 1): every counted episode on
+    the recordings was ALIGNMENT evidence alone, and on mpc_192708 two came
+    55 s apart, the second while the DVL was the better sensor — one more
+    and the "repeatedly" latch would have thrown the proof away. Three 1.5-s
+    spells of a DVL reading the motion rotated 60 deg, 20 s apart: each one
+    is HELD (dis_align) and fills the bucket [max 0.95 s], none counts
+    toward esc_repeat_n — no warning, no latch [round 0: warning at 21.4 s,
+    latched "repeatedly" at the third]; they are recorded as alignment-only
+    episodes. A false lock that keeps coming back still latches (N30: its
+    episodes carry difference evidence)."""
+    d = _paid()
+    f = _Feed(d, blend=True)
+    f.run(1200, _osc, _osc)
+    t0 = f.t
+    c, s = math.cos(math.radians(60.0)), math.sin(math.radians(60.0))
+
+    def dv(t):
+        v = _osc(t)
+        if t - t0 < 60.0 and (t - t0) % 20.0 < 1.5:
+            return (c * v[0] - s * v[1], s * v[0] + c * v[1], 0.0)
+        return v
+    f.run(1600, dv, _osc)
+    assert d.n_trips == 0 and not d.tripped and d.proven, d.last_trip
+    assert d.warn_log == [] and d.ep_log == [], (d.warn_log, d.ep_log)
+    assert len(d.ep_log_align) == 3, d.ep_log_align
+    assert 0.5 <= d.esc_max < 2.0, d.esc_max
+    spells = [k for k in range(3)
+              if any(r[1] == "dis_align" for r in f.log
+                     if t0 + 20.0 * k < r[0] <= t0 + 20.0 * k + 4.0)]
+    assert spells == [0, 1, 2], spells
+    m = d.meta()["escalation"]
+    assert m["episodes"] == 0 and m["episodes_alignment_only"] == 3, m
+    assert m["episode_kinds"] == ["difference", "fit", "scale"], m
+
+
+def test_the_held_and_released_lines_pair_up():
+    """Fix round 1 (DTF verify/tests.md §6.4, REPLAY.md §8 item 2, review.md
+    F3): a hold is remembered only once its HELD line is written. A hold
+    starting within 2 s of the last HELD line is announced once the 2 s are
+    up, or — if it ends sooner — not at all; so the log reads HELD,
+    released, HELD, released, never a "released" without its HELD. The
+    release line is written only on a tick that flies the DVL back in
+    (ok), never on a gross one [round 0: 19 released for 14 HELD on the
+    armed recordings]."""
+    with tempfile.TemporaryDirectory() as tmp:
+        TC, w, bus, _pilots, logs = _dvl_worker(tmp, reentry_s=0.0)
+        sim = _Sim(w, TC)
+        try:
+            sim.prove()
+            w.set_dvl_use(True)
+            sim.engage()
+            d = w.dvl
+            real = d.usable
+            on = {"hold": False}
+
+            def usable(t):
+                if on["hold"]:
+                    return (False, "DVL disagrees with the tag velocity "
+                            "(slow residual 6.0 > 5.0 cm/s)", "dis_diff")
+                return real(t)
+            d.usable = usable
+
+            def run(n, hold):
+                on["hold"] = hold
+                for _ in range(n):
+                    sim.step(v=(0.10, 0.0, 0.0))
+            run(20, False)
+            run(10, True)       # A: HELD at once
+            run(10, False)      # A released
+            run(6, True)        # B: 1.0 s after A's line, 0.3 s long: silent
+            run(10, False)
+            run(40, True)       # C: 1.8 s after A's line, 2 s long
+            run(20, False)      # C released
+            lines = [(lvl, m) for lvl, m in logs
+                     if m.startswith("dvl: HELD (not latched)")
+                     or m.startswith("dvl: hold released")]
+            assert [m.startswith("dvl: HELD") for _l, m in lines] == \
+                [True, False, True, False], lines
+            assert [lvl for lvl, _m in lines] == ["warn", "info"] * 2
+            # a gross tick does not release an announced hold; ok does
+            w._dvl_dis_logged = "dis_diff"
+            n0 = len(logs)
+            w._dvl_after_step_primary({}, {"dvl_code": "gross",
+                                           "dvl_why": "DVL gross"}, sim.t)
+            assert not any("hold released" in m for _l, m in logs[n0:])
+            assert w._dvl_dis_logged == "dis_diff"
+            w._dvl_after_step_primary({}, {"dvl_code": "ok"}, sim.t)
+            assert any("hold released" in m for _l, m in logs[n0:])
+            assert w._dvl_dis_logged == ""
+        finally:
+            sim.close()
+
+
+def test_the_panel_says_returns_by_itself_only_when_it_can():
+    """Fix round 1 (DTF verify/REPLAY.md §8 item 4, review.md F2): a lost
+    lock reads "— returns by itself" only when the DVL would be used again
+    with the lock back. OUT (shadow) and IN-but-unproven keep the plain
+    words; a run the worker did not arm reads "not used this run" with its
+    reason. The held note's episode count drops "of 0" (repeat latch off)
+    and older onsets than the window."""
+    t = 30.0
+    d = _paid()
+    d.note_sample(_smp((0.1, 0.0, 0.0), t, valid=False))
+    st, note = d.state(t, used=False, code="no_lock", w=0.0)
+    assert st == DV.ST_NO_LOCK and note.endswith("— returns by itself"), note
+    d.use = False
+    st, note = d.state(t, used=False, code="out", w=0.0)
+    assert st == DV.ST_NO_LOCK and "returns by itself" not in note, note
+    u = DV.DvlAid(dict(MOUNT))                # IN, not proven
+    u.use = True
+    u.note_sample(_smp((0.1, 0.0, 0.0), t, valid=False))
+    st, note = u.state(t, used=False, code="no_lock", w=0.0)
+    assert st == DV.ST_NO_LOCK and "returns by itself" not in note, note
+    z = _paid(esc_repeat_n=0)
+    z.note_sample(_smp((0.1, 0.0, 0.0), t))
+    z._esc_onsets.append(t - 1.0)
+    z._mon_t = t
+    st, note = z.state(t, used=False, why="DVL quality flag: fom (4.0 > 3.0 "
+                       "mm/s)", code="flag_fom", w=0.0)
+    assert st == DV.ST_HELD and " of 0" not in note, note
+    e = _paid()
+    e._esc_onsets.append(t - 1.0)
+    e._mon_t = t
+    assert e.episodes_recent == 1
+    e._mon_t = t + 60.5                       # frozen bucket, the window moves
+    assert e.episodes_recent == 0
+    # the worker: a run NOT armed (IN from the file, unproven) losing lock
+    with tempfile.TemporaryDirectory() as tmp:
+        TC, w, bus, _pilots, _logs = _dvl_worker(tmp, use=True, reentry_s=0.0)
+        sim = _Sim(w, TC)
+        try:
+            sts = []
+            bus.mpc_status.connect(sts.append)
+            sim.engage()
+            assert w._dvl_run_ok is False
+            for _ in range(20):
+                sim.step(v=(0.05, 0.0, 0.0), valid=False)
+            assert sts[-1].dvl_state == "not_armed", sts[-1].dvl_state
+            assert "not armed at engage" in sts[-1].dvl_note, sts[-1].dvl_note
+            assert "returns by itself" not in sts[-1].dvl_note
+        finally:
+            sim.close()
+    # ...and a SHADOW one
+    with tempfile.TemporaryDirectory() as tmp:
+        TC, w, bus, _pilots, _logs = _dvl_worker(tmp, reentry_s=0.0)
+        sim = _Sim(w, TC)
+        try:
+            sts = []
+            bus.mpc_status.connect(sts.append)
+            for _ in range(20):
+                sim.step(v=(0.05, 0.0, 0.0), valid=False)
+            assert sts[-1].dvl_state == "no_lock" and not sts[-1].dvl_use
+            assert "returns by itself" not in sts[-1].dvl_note, \
+                sts[-1].dvl_note
+        finally:
+            sim.close()
+
+
+def test_the_fade_catch_up_is_bounded_and_bit_identical():
+    """Fix round 1 (DTF verify/review.md F1): the ticks without a tag state
+    replay the fade only until w can have reached its (fixed) target, so an
+    hour without tags (72 000 ticks) costs one ordinary tick [2.0 ms before]
+    and the answer is the same, bit for bit, as replaying every one."""
+    def two_steps(w0_ok, n_skip):
+        """w after: a first step (ok = w0_ok: w snaps to 1 or 0), then a
+        step 1 s later toward the other target with n_skip skipped ticks."""
+        b = DV.DvlBlend()
+        b.step(0.0, np.zeros(3), np.array([0.1, 0.0, 0.0]), 0.0, w0_ok)
+        if w0_ok:                             # 1 -> 0: the sample went bad
+            return b.step(1.0, np.array([0.02, 0.0, 0.0]), None, None, False,
+                          n_skip=n_skip)[1]
+        return b.step(1.0, np.array([0.02, 0.0, 0.0]),
+                      np.array([0.1, 0.0, 0.0]), 1.0, True,
+                      n_skip=n_skip)[1]       # 0 -> 1: a good sample
+
+    stp = DV.DvlBlend().dt / DV.DvlBlend().xfade_s
+    for w0_ok in (True, False):
+        for n_skip in (0, 3, 9, 12, 72_000):
+            w = 1.0 if w0_ok else 0.0         # the per-tick law, every tick
+            target = 0.0 if w0_ok else 1.0
+            for _ in range(1 + n_skip):
+                if abs(target - w) <= stp + 1e-6:
+                    w = target
+                else:
+                    w = w + stp if target > w else w - stp
+            assert two_steps(w0_ok, n_skip) == w, (w0_ok, n_skip, w)
+    t0 = time.perf_counter()
+    assert two_steps(True, 2_000_000) == 0.0
+    assert time.perf_counter() - t0 < 0.01     # uncapped: ~60 ms [유도]
+
+
+def test_legacy_keeps_the_jump_reference_on_samples_primary_would_flag():
+    """R5, fix round 1 (DTF verify/tests.md §6.2: a mutant that ran the R3
+    flags under legacy survived the whole suite). Under ``selection:
+    legacy`` the four R3 flags do not exist: a report with fom 4 mm/s, 3
+    beams, after a no-lock report, or 0.25 m off the altitude median is a
+    GOOD sample that becomes the jump gate's reference (the shipped
+    _last_good), so the next report 0.14 m/s further on is not a "jump"
+    (limit 0.15 m/s at 0.05 s). Under primary the same reports are
+    flagged, the reference stays on the last unflagged one, and that next
+    report — 0.28 m/s from it after 0.10 s, limit 0.25 — IS a jump (after a
+    no-lock report the reference is 0.15 s old, limit 0.35: not a jump)."""
+    for name, bad_kw, pre in (
+            ("fom", {"fom": 0.004}, None),
+            ("beams", {"n_beams": 3}, None),
+            ("reacq", {}, "nolock"),
+            ("alt", {"alt": 0.75}, None)):
+        out = {}
+        for sel in ("legacy", "primary"):
+            d = _proven_aid(reentry_s=0.0, selection=sel)
+            d.use = True
+            t = 10.0
+            for _ in range(12):                 # 0.6 s of good reports
+                t += 0.05
+                d.note_sample(_smp((0.10, 0.0, 0.0), t))
+            if pre == "nolock":
+                t += 0.05
+                d.note_sample(_smp(None, t, valid=False))
+            t += 0.05
+            d.note_sample(_smp((0.24, 0.0, 0.0), t, **bad_kw))
+            lg = d._last_good
+            flag_b = d._s_flag
+            t += 0.05
+            d.note_sample(_smp((0.38, 0.0, 0.0), t, **{
+                k: v for k, v in bad_kw.items() if k == "alt"}))
+            out[sel] = (lg, flag_b, d._s_ok, d._s_why, dict(d.n_flag))
+        lg, flag_b, ok, why, nflag = out["legacy"]
+        assert abs(float(lg[1][0]) - 0.24) < 1e-12, (name, lg)
+        assert flag_b == "" and ok and why == "" and nflag == {}, \
+            (name, out["legacy"])
+        lg, flag_b, ok, why, nflag = out["primary"]
+        assert abs(float(lg[1][0]) - 0.10) < 1e-12, (name, lg)
+        assert flag_b.startswith("DVL quality flag: "), (name, flag_b)
+        if pre is None:
+            assert not ok and why.startswith("DVL velocity jump"), \
+                (name, out["primary"])
 
 
 def main() -> int:

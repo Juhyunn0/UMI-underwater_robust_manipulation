@@ -654,7 +654,8 @@ def test_tick_emits_pilot_and_csv_superset():
         # pwm LOWs' predicted pack current + null-space content of the sent
         # pulses (empty on every other LOW), 10-10 (b) the pwm LOWs' obs-guard
         # code pwm_guard (empty elsewhere too), 10-15 the attitude's
-        # vehicle-clock age + its time_boot_ms + the banner's age (every LOW)
+        # vehicle-clock age + its time_boot_ms + the banner's age (every LOW),
+        # 10-16 the DVL selection's seven (schema 22, every LOW)
         assert text[0].endswith(
             "grip_g,hold_frac,observe,"
             "pwm1,pwm2,pwm3,pwm4,pwm5,pwm6,pwm7,pwm8,pwm_age_s,batt_v,batt_a,"
@@ -665,7 +666,9 @@ def test_tick_emits_pilot_and_csv_superset():
             "ekf_yaw_deg,ekf_u,ekf_v,ekf_w,ekf_sig_xy_m,ekf_age_s,"
             "ekf_tag_late_s,ekf_n_tag,ekf_n_dvl,"
             "i_pred_a,null_v_us,null_h_us,pwm_guard,"
-            "att_age_v_s,att_tb_ms,banner_age_s")
+            "att_age_v_s,att_tb_ms,banner_age_s,"
+            "w_dvl,dvl_code,dvl_res_fast_m_s,dvl_res_slow_m_s,dvl_esc_s,"
+            "dvl_align,dvl_scale")
         # the ASKED-for command still ends where it did; the REPORTED block
         # was appended after it rather than interleaved
         assert ",hold_frac,observe,pwm1," in text[0]
@@ -677,7 +680,7 @@ def test_tick_emits_pilot_and_csv_superset():
         assert abs(float(first[1])) < 0.05              # px (FLU x = NED x)
         assert abs(float(first[2])) < 0.05
         meta = json.loads(Path(path).with_suffix(".meta.json").read_text())
-        assert meta["schema_version"] == 21     # 21: + att_age_v_s/att_tb_ms/banner_age_s (2026-10-15); 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
+        assert meta["schema_version"] == 22     # 22: + w_dvl/dvl_code/dvl_res_fast_m_s/dvl_res_slow_m_s/dvl_esc_s/dvl_align/dvl_scale (2026-10-16); 21: + att_age_v_s/att_tb_ms/banner_age_s (2026-10-15); 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
         # Written even with no replay flown, the imu_dr rule.
         assert meta["plan_stream"]["enabled"] is False
         # Written even when the estimator is off: an absent key cannot tell
@@ -3249,7 +3252,7 @@ def test_run_meta_records_the_estimator_as_a_record_boundary():
     # and the CSV plan_id/ref_src/grip_cmd columns. 7 added tick_ms and the
     # follow boundary; 6 added object_nav and the ten obj_*/follow_* columns;
     # 5 added station_bridge (bridge_s / bridge_tier).
-    assert m["schema_version"] == 21     # 21: + att_age_v_s/att_tb_ms/banner_age_s (2026-10-15); 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
+    assert m["schema_version"] == 22     # 22: + w_dvl/dvl_code/dvl_res_fast_m_s/dvl_res_slow_m_s/dvl_esc_s/dvl_align/dvl_scale (2026-10-16); 21: + att_age_v_s/att_tb_ms/banner_age_s (2026-10-15); 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
     # Written even with no --pose, for the imu_dr reason: an absent key cannot
     # tell "this build had no object nav" from "it was switched off".
     assert m["object_nav"]["enabled"] is False
@@ -4833,7 +4836,7 @@ def test_attitude_axes_off_is_byte_identical_on_the_4dof_path():
         assert aa["enabled_extensions_sent"] is False
         assert aa["transport"] == "manual_control_ext"
         assert m["run"]["stabilize"]["rp_axis"] == "hold"
-        assert m["schema_version"] == 21
+        assert m["schema_version"] == 22
         json.dumps(m)
         w.teardown()
 

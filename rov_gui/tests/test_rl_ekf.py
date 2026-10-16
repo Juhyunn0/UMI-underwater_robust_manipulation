@@ -458,7 +458,7 @@ def test_a_run_on_the_ekf_flies_on_it_and_records_that_it_did():
             assert st[-1].ekf_control and st[-1].ekf_flew
             assert st[-1].ekf_state == "ready" and st[-1].p_ekf_flu
             m = w._run_meta()
-            assert m["schema_version"] == 21
+            assert m["schema_version"] == 22
             assert m["ekf"]["estimator_at_engage"] == "ekf"
             assert m["ekf"]["ready_at_engage"] is True
             assert m["ekf"]["node"]["source"] == EK.RL_SOURCE
@@ -720,6 +720,111 @@ def test_the_ekf_takes_the_dvl_only_while_the_dvl_switch_is_in():
             sim.close()
 
 
+# LEGACY-PINNED (2026-10-16, SPEC §10.2b): the same, under dvl.selection legacy.
+def test_the_ekf_takes_the_dvl_only_while_the_dvl_switch_is_in_under_legacy():
+    TD = _td()
+    with tempfile.TemporaryDirectory() as tmp:
+        TC, w, _bus, _p, _l = TD._dvl_worker(tmp, reentry_s=0.0,
+                                             selection="legacy")
+        w._setup_ekf()
+        sim = TD._Sim(w, TC)
+        try:
+            assert w.ekf is not None and w.ekf.dvl_R is not None
+            for _ in range(20):
+                sim.step(v=(0.03, 0.0, 0.0))
+            assert w.ekf.n[EK.TOPIC_DVL]["in"] == 0     # OUT: not given
+            sim.prove()
+            w.set_dvl_use(True)
+            assert w.dvl.use, w.reason
+            for _ in range(10):
+                sim.step()
+            assert w.ekf.n[EK.TOPIC_DVL]["used"] > 0    # IN: fused
+        finally:
+            sim.close()
+
+
+def _spy_feed(w):
+    """Record which DVL reports the worker hands the EKF (t_valid)."""
+    fed = []
+    real = w.ekf.feed_dvl
+
+    def spy(sample, t):
+        fed.append(float(sample.t_valid))
+        return real(sample, t)
+    w.ekf.feed_dvl = spy
+    return fed
+
+
+def test_the_ekf_takes_only_a_usable_dvl():
+    """N36 (2026-10-16, selection primary). The EKF fuses the DVL with the
+    device's ~1 mm/s covariance, so a fused wrong DVL dominates it: it is
+    given a report only while the blend may use it — not during a
+    disagreement hold, not a flagged report — instead of until a trip."""
+    TD = _td()
+    with tempfile.TemporaryDirectory() as tmp:
+        TC, w, _bus, _p, _l = TD._dvl_worker(tmp, reentry_s=0.0)
+        w._setup_ekf()
+        sim = TD._Sim(w, TC)
+        try:
+            assert w.dvl.selection == "primary"
+            sim.prove()
+            w.set_dvl_use(True)
+            fed = _spy_feed(w)
+            for _ in range(10):
+                sim.step(v=(0.10, 0.0, 0.0))
+            assert len(fed) == 10                     # agreeing: all of them
+            # (b) a FLAGGED report (fom 4 mm/s) is not given, the next is
+            sim.step(v=(0.10, 0.0, 0.0), dvl=False, tick=False)
+            w.on_dvl(TD._smp((0.10, 0.0, 0.0), sim.t, fom=0.004))
+            w.tick()
+            assert w.dvl.usable(sim.t)[2] == "flag_fom"
+            assert fed[-1] != sim.t
+            sim.step(v=(0.10, 0.0, 0.0))
+            assert fed[-1] == sim.t
+            # (a) a disagreement hold: the reversed reading is not given
+            # while the hold lasts
+            held = []
+            for _ in range(60):
+                n0 = len(fed)
+                sim.step(v=(0.10, 0.0, 0.0), dvl_v=(-0.10, 0.0, 0.0))
+                if w.dvl.usable(sim.t)[2].startswith("dis_"):
+                    held.append(len(fed) - n0)
+            assert held and not any(held), held
+        finally:
+            sim.close()
+
+
+def test_the_ekf_velocity_gate_reads_the_tag_difference():
+    """N36 (c). Under primary nu[0:2] IS the DVL blend: the EKF's velocity
+    divergence (the interlock of a run on the EKF) is measured against the
+    tag finite difference, as its own comment says — an EKF that fused a
+    wrong DVL would otherwise be compared with that same DVL. Legacy keeps
+    the shipped reference (meas["nu"])."""
+    TD = _td()
+    for sel in ("primary", "legacy"):
+        with tempfile.TemporaryDirectory() as tmp:
+            TC, w, _bus, _p, _l = TD._dvl_worker(tmp, reentry_s=0.0,
+                                                 selection=sel)
+            w._setup_ekf()
+            sim = TD._Sim(w, TC)
+            try:
+                sim.prove()
+                w.set_dvl_use(True)
+                sim.engage()
+                for _ in range(30):           # DVL 3 cm/s faster: inside the
+                    sim.step(v=(0.05, 0.0, 0.0), dvl_v=(0.08, 0.0, 0.0))
+                m, h = w._ekf_meas, w._last_health
+                assert m is not None and w._ekf_err is not None
+                assert abs(float(w._last_nu[0]) - 0.08) < 1e-9, w._last_nu
+                ref = (np.asarray(h["nu_fd"], float)[:3] if sel == "primary"
+                       else np.asarray(w._last_nu, float)[:3])
+                assert np.allclose(w._ekf_err["dv"],
+                                   np.asarray(m["nu"][:3], float) - ref), sel
+                assert abs(float(h["nu_fd"][0]) - 0.05) < 0.01
+            finally:
+                sim.close()
+
+
 def test_a_run_on_the_ekf_ends_when_its_velocity_walks_away():
     """An accelerometer bias the mavros noise trusts completely: x/y stay
     tag-pinned, the velocity does not — the velocity gate ends the run."""
@@ -902,7 +1007,11 @@ def test_the_csv_header_ends_with_the_ekf_columns():
                               "ekf_age_s", "ekf_tag_late_s", "ekf_n_tag",
                               "ekf_n_dvl"]
     assert cols[i + 16:] == ["i_pred_a", "null_v_us", "null_h_us", "pwm_guard",
-                             "att_age_v_s", "att_tb_ms", "banner_age_s"]
+                             "att_age_v_s", "att_tb_ms", "banner_age_s",
+                             # schema 22 (2026-10-16): the DVL selection
+                             "w_dvl", "dvl_code", "dvl_res_fast_m_s",
+                             "dvl_res_slow_m_s", "dvl_esc_s", "dvl_align",
+                             "dvl_scale"]
     assert len(cols) == len(set(cols))
 
 

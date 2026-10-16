@@ -3613,10 +3613,36 @@ class TrajectoryWindow(QtWidgets.QWidget):
             f"{f(s.ekf_sig_m, '.1f', ' cm', 100.0)} · last tag fused "
             f"{f(s.ekf_tag_late_s, '.0f', ' ms late', 1000.0)}")
 
+    #: 2026-10-16 (dvl.selection primary): "held" = held back for a moment,
+    #: returns BY ITSELF (a quality flag, a disagreement); primary never says
+    #: "fallback" ("held back" is legacy's word), and TRIPPED is only a latch.
     _DVL_WORDS = {"no_link": "NO LINK", "no_lock": "NO LOCK",
                   "shadow": "shadow", "unproven": "NOT PROVEN",
                   "tripped": "TRIPPED", "fallback": "held back",
-                  "in_use": "in use"}
+                  "in_use": "in use", "held": "held",
+                  "not_armed": "not used this run", "no_tag": "no tag state"}
+
+    def _dvl_chip(self, s: MpcStatus) -> str:
+        """The chip's velocity word when a DVL is switched IN. Primary
+        (dvl_w known): the DVL's weight, the fade's direction and why; else
+        the shipped "v:DVL" / "v:TAG (DVL <state>)"."""
+        from rov_gui.control.dvl import reason_class
+        w = getattr(s, "dvl_w", None)
+        word = self._DVL_WORDS.get(s.dvl_state, s.dvl_state)
+        if w is None:
+            return (" · v:DVL" if s.vel_src == "dvl" else
+                    " · v:TAG (DVL " + word + ")")
+        code = str(getattr(s, "dvl_code", "") or "")
+        cls = reason_class(code)
+        if w >= 1.0:
+            return " · v:DVL"
+        if w > 0.0:
+            down = getattr(s, "dvl_target", None) == 0.0
+            return (f" · v:DVL {w * 100:.0f}%↓" + (f" ({cls})" if cls else "")
+                    if down else f" · v:DVL {w * 100:.0f}%↑")
+        extra = (cls and cls.lower() not in word.lower()
+                 and code not in ("not_armed", "latched"))
+        return " · v:TAG (DVL " + word + (": " + cls if extra else "") + ")"
 
     def _set_dvl(self, s: MpcStatus) -> None:
         """Reflect the worker's DVL truth on the button. IN/OUT is the
@@ -3649,6 +3675,35 @@ class TrajectoryWindow(QtWidgets.QWidget):
 
         def f(v, fmt, unit):
             return "--" if v is None else f"{v:{fmt}}{unit}"
+        # 2026-10-16: dvl.selection primary (the worker fills dvl_code) — a
+        # disagreement is a HOLD that returns by itself; TRIPPED is a latch.
+        primary = bool(getattr(s, "dvl_code", ""))
+        if primary:
+            lim = getattr(s, "dvl_esc_limits", None) or (None, None, None)
+            w = getattr(s, "dvl_w", None)
+            r = getattr(s, "dvl_res_slow_m_s", None)
+            k = getattr(s, "dvl_scale", None)
+            e = getattr(s, "dvl_esc_s", None)
+            rules = (
+                "HELD = the DVL is not used for a moment (a quality flag, or "
+                "it disagrees with the tag velocity); it comes back by itself "
+                "once the disagreement and its evidence are gone — nothing to "
+                "press.\n"
+                "TRIPPED = it disagreed for a sustained time or kept "
+                "disagreeing, or the device's configuration changed: fly a "
+                "proving pass in surge AND sway, then press OUT, then IN.\n\n")
+            last = (f"DVL weight {f(None if w is None else w * 100, '.0f', ' %')}"
+                    f" · slow |v_dvl - v_tag| "
+                    f"{f(None if r is None else r * 100, '.1f', ' cm/s')} · "
+                    f"scale {f(k, '.2f', 'x')} · escalation "
+                    f"{f(e, '.1f', '')} / {f(lim[0], 'g', ' s')} "
+                    f"({int(getattr(s, 'dvl_episodes', 0) or 0)} of "
+                    f"{f(lim[1], 'd', '')} episodes in {f(lim[2], 'g', ' s')})")
+        else:
+            rules = ("TRIPPED = evidence the DVL is wrong; it stays out until "
+                     "you press OUT, then IN.\n\n")
+            last = (f" · |v_dvl - v_tag| "
+                    f"{f(None if s.dvl_res_m_s is None else s.dvl_res_m_s * 100, '.1f', ' cm/s')}")
         self.btn_dvl.setToolTip(
             "DVL — the estimator's third sensor (AprilTag + IMU + DVL). "
             "HARDWARE-UNVERIFIED.\n"
@@ -3660,8 +3715,7 @@ class TrajectoryWindow(QtWidgets.QWidget):
             "against the tag velocity — fly a short pass in surge AND sway "
             "with tags in view. Whether a run may use it is decided at "
             "engage.\n"
-            "TRIPPED = evidence the DVL is wrong; it stays out until you "
-            "press OUT, then IN.\n\n"
+            + rules +
             f"state: {self._DVL_WORDS.get(st, st)}"
             + (f" — {s.dvl_note}" if s.dvl_note else "") + "\n"
             f"mount proven: {'yes' if s.dvl_proven else 'no'} · "
@@ -3669,8 +3723,7 @@ class TrajectoryWindow(QtWidgets.QWidget):
             f"altitude {f(s.dvl_alt_m, '.2f', ' m')} · "
             f"fom {f(s.dvl_fom, '.3f', ' m/s')} · "
             f"{f(s.dvl_hz, '.0f', ' Hz')} · age {f(s.dvl_age_s, '.2f', ' s')}"
-            f" · |v_dvl - v_tag| "
-            f"{f(None if s.dvl_res_m_s is None else s.dvl_res_m_s * 100, '.1f', ' cm/s')}")
+            + ("\n" + last if primary else last))
 
     def set_recording(self, on: bool) -> None:
         """Reflect what the window's recorder ACTUALLY did (honesty rule: the
@@ -3817,10 +3870,10 @@ class TrajectoryWindow(QtWidgets.QWidget):
             # WHICH velocity instrument, only when a DVL is switched IN: the
             # run was started to fly on it, so a tick that fell back to the
             # tag finite difference is worth one word on the chip.
+            # (2026-10-16, primary: the DVL's weight, the fade's direction and
+            # why — "v:DVL 60%↓ (flag fom)", "v:TAG (DVL held: disagrees)")
             if getattr(s, "dvl_use", False):
-                err += (" · v:DVL" if s.vel_src == "dvl" else
-                        " · v:TAG (DVL " + self._DVL_WORDS.get(
-                            s.dvl_state, s.dvl_state) + ")")
+                err += self._dvl_chip(s)
             # ...and which ESTIMATE, only when it is not the default.
             if getattr(s, "ekf_control", False):
                 err += " · est:EKF"

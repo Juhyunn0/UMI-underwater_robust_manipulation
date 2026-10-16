@@ -97,8 +97,11 @@ def run(profile, T, seed, mount_err=None, opt_out=False, prove_first=True,
                           depth_m=0.5, t_att=t, t_imu=t, t_baro=t,
                           conn=Conn.ONLINE, stamp=t)
 
+    # selection legacy (2026-10-16): this simulation times the SHIPPED
+    # ladder's trips, and hw_mpc.yaml / the READMEs quote its fixture.
     cfg = {"mount_rpy_deg": [0.0, 0.0, 0.0],
-           "mount_t_flu": [float(ARM[0]) + arm_err, 0.0, 0.0]}
+           "mount_t_flu": [float(ARM[0]) + arm_err, 0.0, 0.0],
+           "selection": "legacy"}
     if opt_out:
         cfg["require_proven"] = False
     aid = DV.DvlAid(cfg, fd_lp_gain=0.6 / math.sqrt(1.4))

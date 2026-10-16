@@ -2645,6 +2645,55 @@ mount not measured, not proven), the button stays as it was and the reason appea
 and currently flying on the DVL, amber = IN but currently on the tag velocity, **red `DVL TRIPPED`** = the trip described below
 (the tooltip gives reason·altitude·fom·Hz·residual).
 
+### Since 2026-10-16: `dvl.selection: primary` — a disagreement with the tag velocity is a **HOLD** that returns by itself
+
+Operator decision (2026-10-15): the DVL is the station's **main horizontal velocity sensor**. The tag finite difference is the
+worse of the two velocities (RMS against a non-causal tag fit: DVL 2.3–2.9 vs tag FD 5.5–7.0 cm/s), and the old difference
+trip fired ~18 times an hour on replay [측정: RL_controller logs/eval/vel_source_20261015]. So under the default `primary`
+(design and evidence: RL_controller `logs/eval/dvl_trip_fix_20261015/SPEC.md`):
+
+- **The velocity is the trained blend.** Exactly what the pwm11att13 policy was trained on (`dvl.DvlBlend` = RL_controller
+  `deploy/obs_builder.py DvlBlendNp`): when the newest sample cannot be used, the last good one is held for 0.45 s, then the
+  DVL weight w fades to the tag FD over 0.5 s, and back up over 0.5 s once it can be used [스펙: export `velocity_source`].
+  **No hard switch.** The re-entry wait, the innovation gate and "unchecked" are not on this path. Every CSV row carries
+  `w_dvl` (the DVL weight) and `dvl_code` (why) (schema 22). Heave stays on the tag FD.
+- **A sample is not used** on a data gate (below), on a **quality flag** — fom > 3 mm/s, an altitude jump > 0.10 m, < 4
+  beams, a lock re-acquired (the report before it failed a gate: a flickering false lock) — or on a **disagreement with the
+  tag velocity** (slow difference > 5 cm/s, the alignment verdict, a refuting fit). A disagreement is a **HOLD**: the fade
+  to the tag FD starts on that tick, and the DVL comes back **by itself** once the disagreement and its evidence are gone. The
+  proof is kept. **There is no button to press.**
+- **Panel words**: `held` = not used for a moment, returns by itself (a flag, a disagreement, gross); `not used this run` =
+  not armed at engage / a code fault (also when the lock drops in such a run); `no tag state` = this tick had no tag state.
+  A lost lock reads `… — returns by itself` only while the DVL is IN and proven (in shadow, or unproven, the plain words).
+  The chip gives the weight, the direction and why: `v:DVL`, `v:DVL 60%↓ (flag fom)` (fading out), `v:DVL 40%↑` (fading
+  in), `v:TAG (DVL held: disagrees)`. The button face says `DVL TRIPPED` **only for a latch**. In the log every
+  `dvl: HELD (not latched)` line has its `dvl: hold released` line (a hold that starts within 2 s of the previous HELD line
+  is announced when those 2 s are up, or not at all if it ends sooner).
+- **What still TRIPS (latches)** — two things: (a) the device's own configuration (rotation, sound speed) changing
+  (unchanged), (b) **escalation** — a disagreement that **lasts** (4 s of accumulated evidence, `esc_latch_s`) or **keeps
+  coming back** (3 separate episodes within 60 s, each with difference, fit or scale evidence — alignment evidence alone is
+  held but not counted; a warning at the second). On the 0.735 h of 10-13/10-15 recordings it never fired (bucket max
+  1.43 s, no counted episode); a +10 cm/s bias, a reversed sway, 180° and a 2× scale held for 30 s latched in 34/35,
+  35/35, 35/35 and 31/35 windows, and **one short glitch, even a large one, does not latch** (0 of 850 injected
+  +0.3–0.8 m/s × 0.3–1.5 s glitches; fix round 1) [측정: same folder, design/out, impl/out, fix1/out]. A latch discards
+  the proof: **proving pass (surge AND sway, tags in view) → OUT → IN** — the log line says exactly that.
+- **EKF**: it is given a DVL sample only while the blend may use it (not on a flag, a disagreement hold, a gate or a latch);
+  its control-velocity interlock compares with the tag FD.
+- **RL exports**: an export whose obs_spec says `velocity_source.trained: true` (pwm11att13 and later) loads only when the
+  station runs the same blend (primary, equal constants), and flies **only on the TAG estimator** (engage is refused with EKF
+  or imu_dr in CONTROL). The `obs_guard` block is checked the same way. Exports without the blocks (every shipped one) are
+  unchanged.
+- **Rollback**: `dvl.selection: legacy` = the 2026-10-01..15 ladder (re-entry, innovation gate, latching trips), bit for bit
+  on replay. But (a) legacy **refuses** every export trained on the blend (RL_PWM / RL_PWM_7D become unavailable, warn in the
+  log); (b) `stale_s` is also the blend's stale clock: a value other than 0.6 refuses those exports in primary too; (c)
+  `selection` is read at startup and the proof is per process — switching = a restart + a new proving pass; (d) after the
+  yaml patch (`RL_controller logs/eval/dvl_trip_fix_20261015/hw_mpc_dvl_patch.diff`) is applied, undo it first
+  (`patch -p1 -R`) before reverting the code, or setup dies on the unknown dvl keys.
+- **Remaining costs and blind spots**: KNOWN_ISSUES, "DVL `selection: primary`".
+
+The "Three rules" below and the trip / innovation-gate / re-entry text after them describe **`legacy`** (under primary, rule
+2's latches are only the two above; everything else is a hold).
+
 ### Three rules — the automatic logic only ever **removes** the DVL
 
 1. **Whether a run may use the DVL is decided once, at engage.** If switch IN + proof complete + not tripped,

@@ -2544,6 +2544,51 @@ Hz·잔차). IN(눌린 상태)이면 버튼이 그 색으로 **채워지고** �
 얼음·누름)을 렌더해서 대비 4.5:1 이상과 글씨 안 잘림을 고정한다. REC NAV 녹화 버튼도 빨강으로 채워지므로,
 TRIPPED와는 글씨로 구별한다.
 
+### 2026-10-16부터: `dvl.selection: primary` — 태그 속도와의 불일치는 **HOLD**, 누를 것 없이 돌아온다
+
+운영자 결정(2026-10-15): DVL이 스테이션의 **주 수평 속도 센서**다. 태그 유한차분이 둘 중 더 나쁜 속도이고
+(비인과 태그 적합 대비 RMS DVL 2.3–2.9 vs 태그 FD 5.5–7.0 cm/s), 옛 차이 trip은 replay에서 시간당 ~18번
+걸렸다 [측정: RL_controller logs/eval/vel_source_20261015]. 그래서 기본값 `primary`에서는(설계·근거:
+RL_controller `logs/eval/dvl_trip_fix_20261015/SPEC.md`):
+
+- **속도는 학습된 blend다.** pwm11att13 정책이 학습한 그대로(`dvl.DvlBlend` = RL_controller
+  `deploy/obs_builder.py DvlBlendNp`): 최신 샘플을 못 쓰면 마지막 좋은 샘플을 0.45 s 들고 있다가, DVL
+  가중치 w를 0.5 s에 걸쳐 태그 FD로 섞어 내리고, 다시 쓸 수 있으면 0.5 s에 걸쳐 올린다 [스펙: export
+  `velocity_source`]. **hard switch가 없다.** re-entry 대기, innovation 게이트, "unchecked"는 이 경로에 없다.
+  CSV에 행마다 `w_dvl`(DVL 가중치)과 `dvl_code`(이유)가 남는다(schema 22). heave는 여전히 태그 FD다.
+- **못 쓰는 샘플**: 데이터 게이트(아래), **품질 플래그** — fom > 3 mm/s, 고도 점프 > 0.10 m, 빔 < 4, lock
+  재획득(직전 리포트가 게이트 실패: 깜빡이는 false lock) — 그리고 **태그 속도와의 불일치**(느린 차이 > 5 cm/s,
+  정렬 판정, 적합 반박). 불일치는 **HOLD**다: 그 tick부터 바로 태그 FD로 섞어 내리고, 불일치와 그 증거가
+  사라지면 **스스로** 돌아온다. 검증(proof)도 그대로다. **누를 버튼이 없다.**
+- **패널 말**: `held` = 잠깐 안 쓴다, 스스로 돌아온다(플래그·불일치·gross), `not used this run` = 이번 런은
+  안 쓴다(engage 때 armed 아님, 코드 오류 — 그런 런에서 lock을 잃어도 이 말), `no tag state` = 이번 tick엔 태그 상태가
+  없다. lock을 잃었을 때 `… — returns by itself`는 DVL이 IN이고 검증됐을 때만 붙는다(shadow나 미검증이면 그냥 말).
+  칩은 가중치와 방향과 이유를 말한다: `v:DVL`, `v:DVL 60%↓ (flag fom)`(섞어 내리는 중), `v:DVL 40%↑`(올리는 중),
+  `v:TAG (DVL held: disagrees)`. 버튼 면은 **래치일 때만** `DVL TRIPPED`다. 로그의 `dvl: HELD (not latched)` 줄마다
+  `dvl: hold released` 줄이 짝으로 있다(직전 HELD 줄 2 s 안에 시작한 hold는 2 s가 지나면 알리고, 그 전에 끝나면 안 쓴다).
+- **그래도 TRIPPED(래치)가 되는 것은 둘뿐**: (a) 장치 자체 설정(회전·음속) 변경(그대로), (b) **에스컬레이션** —
+  불일치가 **지속**(증거 누적 4 s, `esc_latch_s`)하거나 **반복**(60 s 안에 차이·적합·스케일 증거가 있었던 별개 에피소드
+  3번 — 정렬 증거뿐인 에피소드는 hold만 하고 세지 않는다; 두 번째에 경고)될 때. 10-13/10-15 기록 0.735 h에서는 한 번도
+  걸리지 않았고(누적 최대 1.43 s, 센 에피소드 0), +10 cm/s 편향·sway 반전·180°·2× 스케일은 30 s 안에
+  34/35·35/35·35/35·31/35 래치됐으며, **짧은 글리치 하나는 커도 래치되지 않는다**(+0.3–0.8 m/s × 0.3–1.5 s 글리치
+  850회 중 0; fix round 1) [측정: 같은 폴더 design/out, impl/out, fix1/out]. 래치는 검증을 버린다: **증명 pass(surge
+  AND sway, 태그 보이게) → OUT → IN** — 로그 줄이 그대로 말한다.
+- **EKF**: blend가 그 DVL 샘플을 쓸 수 있을 때만 EKF에도 준다(플래그·불일치 hold·게이트·래치 중엔 안 준다).
+  EKF 제어의 속도 인터록은 태그 FD와 비교한다.
+- **RL export**: obs_spec에 `velocity_source.trained: true`가 있는 export(pwm11att13 이후)는 스테이션이 같은 blend
+  (primary, 같은 상수)일 때만 로드되고, **TAG 추정기로만** 난다(EKF·imu_dr CONTROL이면 engage 거부). `obs_guard`
+  블록도 같은 식으로 확인한다. 블록이 없는 export(지금 배포된 전부)는 예전과 똑같다.
+- **되돌리기**: `dvl.selection: legacy` = 2026-10-01..15 사다리(re-entry, innovation 게이트, 래치 trip) 비트 단위
+  재현. 단 (a) legacy는 blend로 학습한 export를 **거부**한다(RL_PWM / RL_PWM_7D가 unavailable, 로그 warn),
+  (b) `stale_s`는 blend의 stale 시계이기도 해서 0.6이 아니면 그 export들은 primary에서도 거부된다, (c) selection은
+  시작 때 읽고 검증은 프로세스 단위다 — 바꾸면 재시작 + 새 증명 pass, (d) yaml 패치(`RL_controller logs/eval/
+  dvl_trip_fix_20261015/hw_mpc_dvl_patch.diff`)를 적용한 뒤 코드를 되돌리려면 먼저 `patch -p1 -R`로 패치부터 되돌린다
+  (안 그러면 모르는 dvl 키로 setup이 죽는다).
+- **남은 비용·사각지대**는 KNOWN_ISSUES의 "DVL `selection: primary`" 항목.
+
+아래 "세 가지 규칙"과 그 뒤의 trip·innovation 게이트·re-entry 설명은 **`legacy`의 동작**이다(primary에서는 2번
+규칙의 래치가 위의 둘뿐이고, 나머지는 hold다).
+
 ### 세 가지 규칙 — 자동은 DVL을 **빼기만** 한다
 
 1. **한 런이 DVL을 쓸 수 있는지는 engage 때 한 번 정한다.** 스위치 IN + 검증 완료 + trip 아님이면
