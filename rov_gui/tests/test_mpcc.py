@@ -676,6 +676,369 @@ def test_circle_rejects_a_radius_that_is_not_a_circle():
         raise AssertionError(f"radius {bad} was accepted")
 
 
+# ------------------------------------- the square's yaw mode TRAVEL (2026-10-14)
+# heading_follow on a sharp square: a _Pivot at every vertex, crossed at the
+# cursor's creep speed so the heading turns IN PLACE at vertex_turn_deg_s.
+TRAVEL = {"kind": "square", "size": 1.0, "size_y": 1.0, "speed": 0.10,
+          "laps": 2, "origin_ned": [0.3, -0.2], "depth_ned": 0.5,
+          "rot_deg": 0.0, "heading_follow": True, "vertex_turn_deg_s": 20.0}
+CREEP = 0.02
+
+
+def _wrap(a):
+    return math.atan2(math.sin(a), math.cos(a))
+
+
+def _travel(rate=20.0, rot=0.0, laps=2):
+    scen = dict(TRAVEL, vertex_turn_deg_s=rate, rot_deg=rot, laps=laps)
+    p = path_from_scenario(scen, fillet_m=0.0, pivot_speed_m_s=CREEP)
+    s, v = p.speed_profile(0.10, 0.05, 0.05, v_creep=CREEP)
+    return p, s, v
+
+
+class _LegacyCursor:
+    """PathCursor.step / plan exactly as they were before 2026-10-14 — the
+    oracle for "a path without a pivot flies byte-for-byte what it did"."""
+
+    def __init__(self, path, lead_m, s_grid, v_grid, search_m=0.60, ds=0.01):
+        self.path, self.lead_m = path, max(0.0, float(lead_m))
+        self._s, self._v = np.asarray(s_grid, float), np.asarray(v_grid, float)
+        lap = float(path.lap_length)
+        cap = max(0.10, 0.25 * lap) if lap > 0.0 else float(search_m)
+        self.search_m, self.ds = float(min(float(search_m), cap)), float(ds)
+        self.theta = self._theta_cmd = 0.0
+
+    def step(self, p_ned, dt):
+        p = np.asarray(p_ned, float)
+        n = max(2, int(self.search_m / max(1e-3, self.ds)) + 1)
+        cand = np.clip(self.theta + np.linspace(0.0, self.search_m, n),
+                       0.0, self.path.total_length)
+        cx, cy, _psi, _k = self.path.sample(cand)
+        j = int(np.argmin((cx - p[0]) ** 2 + (cy - p[1]) ** 2))
+        self.theta = float(max(self.theta, cand[j]))
+        v_ref = float(np.interp(self._theta_cmd, self._s, self._v))
+        cmd = self._theta_cmd + v_ref * max(0.0, float(dt))
+        cmd = min(cmd, self.theta + self.lead_m)
+        self._theta_cmd = float(min(self.path.total_length,
+                                    max(self.theta, cmd)))
+        px, py, psi, _k2 = self.path.sample(np.array([self.theta]))
+        dx, dy = float(p[0]) - px[0], float(p[1]) - py[0]
+        s_p, c_p = math.sin(psi[0]), math.cos(psi[0])
+        tx, ty, tpsi, _k3 = self.path.sample(np.array([self._theta_cmd]))
+        return (np.array([tx[0], ty[0]]), float(tpsi[0]),
+                -(c_p * (float(p[0]) - tx[0]) + s_p * (float(p[1]) - ty[0])),
+                s_p * dx - c_p * dy, v_ref)
+
+    def plan(self, steps, dt, depth, yaw_fixed, heading_follow):
+        k, dt = max(1, int(steps)), max(1e-6, float(dt))
+        th = float(self._theta_cmd)
+        p, v = np.empty((3, k)), np.empty((3, k))
+        yaw, psi_p = np.empty(k), np.empty(k)
+        for i in range(k):
+            x, y, psi, _kap = self.path.sample(np.array([th]))
+            vr = float(np.interp(th, self._s, self._v))
+            c, sn = math.cos(psi[0]), math.sin(psi[0])
+            p[:, i] = (x[0], y[0], float(depth))
+            v[:, i] = (vr * c, vr * sn, 0.0)
+            yaw[i] = float(psi[0]) if heading_follow else float(yaw_fixed)
+            psi_p[i] = float(psi[0])
+            th = min(self.path.total_length, th + vr * dt)
+        r = np.zeros(k)
+        if heading_follow and k > 1:
+            r[:-1] = np.diff(np.unwrap(yaw)) / dt
+            r[-1] = r[-2]
+        return yaw, p, v, r, np.unwrap(psi_p)
+
+
+def test_a_path_without_pivots_flies_exactly_what_it_did_before_the_yaw_mode():
+    """The yaw mode must not touch the yaw FIXED square (every hardware square
+    on record), a filleted one, or a circle: the cursor stream — projection,
+    leash, both plan sizes — is compared ELEMENT FOR ELEMENT against the
+    pre-2026-10-14 cursor over a whole lagging-hull mission."""
+    cases = (
+        (dict(TRAVEL, heading_follow=False, rot_deg=-12.5), 0.0),
+        (dict(TRAVEL, heading_follow=False, size_y=0.7, rot_deg=33.0), 0.15),
+        (dict(TRAVEL, heading_follow=True, size_y=0.7), 0.15),   # arcs, no pivot
+        (dict(CIRCLE, speed=0.10), 0.0),
+    )
+    for scen, fillet in cases:
+        p = path_from_scenario(scen, fillet_m=fillet, pivot_speed_m_s=CREEP)
+        assert not p.pivot_spans(), (scen, fillet)
+        s, v = p.speed_profile(0.10, 0.05, 0.05, v_creep=CREEP)
+        new, old = PathCursor(p, 0.10, s, v), _LegacyCursor(p, 0.10, s, v)
+        o = scen["origin_ned"]
+        hull = np.array([o[0], o[1], 0.5])
+        for _ in range(4000):
+            a, b = new.step(hull, 0.05), old.step(hull, 0.05)
+            assert np.array_equal(a[0], b[0]) and a[1:] == b[1:], (scen, a, b)
+            for K in (1, 61):
+                pn = new.plan(K, 0.05, 0.5, 0.7, False)
+                po = old.plan(K, 0.05, 0.5, 0.7, False)
+                for x, y in zip((pn.yaw_ned, pn.p_ned, pn.v_ned, pn.r_ned,
+                                 pn.psi_path), po):
+                    assert np.array_equal(x, y), (scen, K)
+            hull[:2] += 0.1 * (a[0] - hull[:2])
+            if new.complete:
+                break
+        assert new.complete, scen
+        assert new.theta == old.theta and new.target_theta == old._theta_cmd
+
+
+def test_travel_square_turns_in_place_at_every_vertex():
+    """The geometry of yaw = travel: the rectangle's xy unchanged, and at each
+    vertex — the lap-closing one at the origin too, so every lap starts facing
+    its first side — a pivot turning +90 deg (each corner is a right turn in
+    NED, clockwise seen from above) over L = creep * |turn| / rate."""
+    for rot in (0.0, -12.5, 140.0):
+        p, _s, _v = _travel(rot=rot, laps=1)
+        kinds = [type(q).__name__ for q in p.prims]
+        assert kinds == ["_Line", "_Pivot"] * 4, kinds
+        legs = [q for q in p.prims if type(q).__name__ == "_Line"]
+        pivots = [q for q in p.prims if type(q).__name__ == "_Pivot"]
+        L = CREEP * (math.pi / 2) / math.radians(20.0)
+        for leg, pv in zip(legs, pivots):
+            end = (leg.x0 + leg.length * math.cos(leg.psi),
+                   leg.y0 + leg.length * math.sin(leg.psi))
+            assert math.hypot(end[0] - pv.x0, end[1] - pv.y0) < 1e-12
+            assert abs(pv.psi0 - leg.psi) < 1e-12
+            assert abs(pv.turn - math.pi / 2) < 1e-12, pv.turn
+            assert abs(pv.length - L) < 1e-12 and abs(pv.speed - CREEP) < 1e-12
+        # the first side leaves the tag along the (rotated) map +x
+        assert abs(_wrap(legs[0].psi - math.radians(rot))) < 1e-12
+        # the heading advances exactly one turn per lap, and the xy path is
+        # the plain rectangle's
+        s = np.linspace(0.0, p.lap_length, 1001)
+        x, y, psi, _k = p.sample(s)
+        assert abs(psi[-1] - psi[0] - 2 * math.pi) < 1e-9
+        crab = path_from_scenario(dict(TRAVEL, heading_follow=False,
+                                       rot_deg=rot, laps=1), fillet_m=0.0)
+        cx, cy, _cpsi, _ck = crab.sample(np.linspace(0.0, crab.lap_length, 4001))
+        d = np.hypot(x[:, None] - cx[None, :], y[:, None] - cy[None, :]).min(1)
+        assert d.max() < 1e-3, d.max()
+        assert abs(p.lap_length - (4.0 + 4 * L)) < 1e-12
+
+
+def test_travel_pivot_rate_and_speed_have_to_be_real():
+    for bad in (0.0, -20.0, float("nan"), float("inf")):
+        try:
+            path_from_scenario(dict(TRAVEL, vertex_turn_deg_s=bad),
+                               fillet_m=0.0)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"vertex_turn_deg_s {bad} was accepted")
+    try:
+        path_from_scenario(TRAVEL, fillet_m=0.0, pivot_speed_m_s=0.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a zero pivot speed was accepted")
+
+
+def _fly_cursor(p, s, v, model, dt=0.05, ticks=200000):
+    """Drive a PathCursor with a hull model; return per-tick stage-0 yaw/xy
+    and the cursor. Models: "lag" (first order, tau 0.5 s), "exact" (hull ON
+    the target), "short" (parks 2 cm short of a vertex until the target
+    leaves it — the RL follower's habit), "past" (shoved 2 cm along the NEXT
+    side whenever it reaches a vertex — what skipped a naive pivot)."""
+    cur = PathCursor(p, 0.10, s, v)
+    verts = [np.array(sp[2:4]) for sp in p.pivot_spans()]
+    hull = np.array(p.sample(np.array([0.0]))[:2]).ravel()
+    yaws, xys = [], []
+    for _ in range(ticks):
+        tg, *_r = cur.step(np.array([hull[0], hull[1], 0.5]), dt)
+        pl = cur.plan(1, dt, 0.5, 0.0, True)
+        yaws.append(float(pl.yaw_ned[0]))
+        xys.append(pl.p_ned[:2, 0].copy())
+        nxt = hull + (dt / 0.5) * (tg - hull) if model != "exact" else tg.copy()
+        if model == "short":
+            for vv in verts:
+                if (np.linalg.norm(tg - vv) < 1e-9
+                        and np.linalg.norm(nxt - vv) < 0.02):
+                    nxt = vv + 0.02 * (hull - vv) / max(
+                        1e-12, np.linalg.norm(hull - vv))
+        if model == "past":
+            for k, vv in enumerate(verts):
+                if np.linalg.norm(nxt - vv) < 0.01:
+                    w = verts[(k + 1) % len(verts)] - vv
+                    nxt = vv + 0.02 * w / np.linalg.norm(w)
+        hull = nxt
+        if cur.complete:
+            break
+    return cur, np.asarray(yaws), np.asarray(xys), verts
+
+
+def test_vertex_turn_rate_holds_whatever_the_hull_does():
+    """The rate is a SPECIFICATION: the stage-0 yaw reference never turns
+    faster than vertex_turn_deg_s, it turns only while the position target
+    sits on a vertex, and the mission COMPLETES — for a hull that lags, one
+    riding the target, one that parks 2 cm short of every vertex (the RL
+    follower does; a gate keyed on the projection alone deadlocked it), and
+    one shoved 2 cm past the vertex along the next side (a naive pivot let
+    the projection skip the turn: an 88-deg one-tick step). 10 deg/s makes a
+    pivot 0.18 m long, longer than the 0.10 m leash, which used to trap the
+    setpoint inside it."""
+    dt = 0.05
+    for rate in (10.0, 20.0, 30.0, 90.0):
+        p, s, v = _travel(rate=rate, rot=-12.5)
+        for model in ("lag", "exact", "short", "past"):
+            cur, yaw, xy, verts = _fly_cursor(p, s, v, model, dt)
+            assert cur.complete, (rate, model, cur.theta, p.total_length)
+            dyaw = np.array([_wrap(b - a) for a, b in zip(yaw[:-1], yaw[1:])])
+            assert np.abs(dyaw).max() <= math.radians(rate) * dt * (1 + 1e-6), \
+                (rate, model, math.degrees(np.abs(dyaw).max() / dt))
+            turning = np.abs(dyaw) > 1e-12
+            off = np.array([min(np.linalg.norm(q - vv) for vv in verts)
+                            for q in xy[1:][turning]])
+            assert off.max() < CREEP * dt + 1e-9, (rate, model, off.max())
+            # 2 laps of +90 deg turns, all of them made; completion fires
+            # within 1e-3 m of the end, i.e. a hair before the last pivot ends
+            L = p.pivot_spans()[0][1] - p.pivot_spans()[0][0]
+            tol = 90.0 * 1e-3 / L + 0.1
+            total = math.degrees(dyaw.sum())
+            assert abs(total - 720.0) < tol, (rate, model, total, tol)
+
+
+def test_inside_a_pivot_the_plan_stands_still_and_turns_at_the_rate():
+    """What every follower is handed during a turn: the vertex, ZERO velocity
+    (it used to carry v_creep along the rotating tangent), and a yaw rate
+    equal to the turn rate at every K — the PID's one-stage plan included,
+    which used to get r = 0 and lag ~16 deg behind a 30 deg/s ramp. No stage
+    of any horizon over a whole mission asks for more than the rate: the
+    sharp-vertex heading_follow plan of before handed the NMPC (pi/2)/0.05 =
+    31 rad/s in one stage."""
+    p, s, v = _travel(rate=20.0)
+    rate = math.radians(20.0)
+    a, b, x0, y0, _spd = p.pivot_spans()[1]
+    cur = PathCursor(p, 0.10, s, v)
+    cur.theta = cur._theta_cmd = a + 0.3 * (b - a)
+    pl = cur.plan(61, 0.05, 0.5, 0.0, True)
+    inside = int(round(0.7 * (b - a) / CREEP / 0.05))       # stages left
+    assert np.allclose(pl.p_ned[0, :inside], x0, atol=1e-12)
+    assert np.allclose(pl.p_ned[1, :inside], y0, atol=1e-12)
+    assert np.abs(pl.v_ned[:, :inside]).max() == 0.0
+    assert np.allclose(pl.r_ned[:inside], rate, atol=1e-12), pl.r_ned[:inside]
+    one = cur.plan(1, 0.05, 0.5, 0.0, True)
+    assert abs(one.r_ned[0] - rate) < 1e-12 and not one.v_ned.any()
+    assert cur.ref_speed() == 0.0
+    # a fixed heading through the same pivot: still standing, still no rate
+    fixed = cur.plan(61, 0.05, 0.5, 0.4, False)
+    assert np.all(fixed.yaw_ned == 0.4) and not fixed.r_ned.any()
+    assert np.abs(fixed.v_ned[:, :inside]).max() == 0.0
+    # every horizon of a whole mission, on legs and through pivots alike
+    cur = PathCursor(p, 0.10, s, v)
+    hull, worst = np.array([0.3, -0.2]), 0.0
+    for _ in range(100000):
+        tg, *_r = cur.step(np.array([hull[0], hull[1], 0.5]), 0.05)
+        worst = max(worst, float(np.abs(
+            cur.plan(61, 0.05, 0.5, 0.0, True).r_ned).max()))
+        hull = hull + 0.1 * (tg - hull)
+        if cur.complete:
+            break
+    assert cur.complete and worst <= rate * (1 + 1e-9), math.degrees(worst)
+
+
+def test_a_line_now_completes_through_its_last_turnaround():
+    """The LINE ends in a pivot (its return to the start), and the old
+    projection's first-index tie-break pinned theta at that pivot's START: a
+    line could never complete — offline this 2 m x 2-lap line stopped at
+    theta 8.07 of 8.08 forever [유도: the pre-2026-10-14 cursor], and on
+    hardware no line run has ended by completing. The pivot-aware cursor
+    finishes it, and its turnarounds now hold v = 0 instead of 2 cm/s along
+    the rotating tangent."""
+    p = path_from_scenario(LINE, turn_radius_m=0.0)
+    s, v = p.speed_profile(LINE["speed"], 0.05, 0.05, v_creep=CREEP)
+    cur = PathCursor(p, 0.10, s, v)
+    hull = np.zeros(2)
+    laps = set()
+    for _ in range(40000):
+        tg, *_r = cur.step(np.array([hull[0], hull[1], 0.5]), 0.05)
+        pl = cur.plan(1, 0.05, 0.5, 0.0, False)
+        if cur._pivot_at(cur.target_theta) >= 0:
+            assert not pl.v_ned.any(), pl.v_ned
+        hull = hull + 0.35 * (tg - hull)
+        laps.add(cur.lap())
+        if cur.complete:
+            break
+    assert cur.complete, (cur.theta, p.total_length)
+    assert laps == {0, 1, 2}, sorted(laps)
+
+
+def _ride_capped(p, s, v, vmax, dt=0.05, ticks=40000):
+    """A hull that walks straight at its target but never faster than vmax —
+    a follower slow enough that the setpoint finishes a short pivot while the
+    hull is still more than PIVOT_CAPTURE_M away."""
+    cur = PathCursor(p, 0.10, s, v)
+    hull = np.array(p.sample(np.array([0.0]))[:2]).ravel()
+    for _ in range(ticks):
+        tg, *_r = cur.step(np.array([hull[0], hull[1], 0.5]), dt)
+        d = tg - hull
+        n = float(np.linalg.norm(d))
+        if n > 1e-12:
+            hull = hull + d / n * min(n, vmax * dt)
+        if cur.complete:
+            break
+    return cur
+
+
+def test_a_slow_follower_still_completes_a_path_that_ends_in_a_pivot():
+    """Review 2026-10-14: the capture was first keyed on the SETPOINT's next
+    unfinished pivot. Behind a slow hull the setpoint finishes the LAST pivot
+    first (0.02 m on a line, ~1 s), then there is no such pivot left, and
+    the end tie pinned theta at that pivot's start — the shipped 2 m x 5
+    line behind a 0.03 m/s follower sat on its end vertex until the
+    timeout. Keyed on the HULL's next unfinished pivot, it completes; so do
+    fast-turning (short-pivot) travel squares."""
+    shipped = dict(LINE, laps=5, speed=0.10)
+    p = path_from_scenario(shipped, turn_radius_m=0.0)
+    s, v = p.speed_profile(0.10, 0.05, 0.05, v_creep=CREEP)
+    for vmax in (0.02, 0.03, 0.04):
+        cur = _ride_capped(p, s, v, vmax)
+        assert cur.complete, (vmax, cur.theta, p.total_length)
+    for rate in (60.0, 90.0):
+        p, s, v = _travel(rate=rate)
+        for vmax in (0.02, 0.03):
+            cur = _ride_capped(p, s, v, vmax)
+            assert cur.complete, (rate, vmax, cur.theta, p.total_length)
+
+
+def test_stage_zero_turns_only_as_fast_as_the_setpoint_really_moves():
+    """Review 2026-10-14: with the hull parked 5-10 cm short of a vertex the
+    leash holds the setpoint at (or inside) the pivot, the yaw reference
+    stands still — and the one-stage plan still said 20 deg/s, a PID
+    feedforward / RL goal rate against a frozen target. Stage 0's r is now
+    the setpoint's REAL advance: it equals the per-tick change of stage 0's
+    own yaw, held or moving."""
+    p, s, v = _travel(rate=20.0, laps=1)
+    a, _b, x0, y0, _spd = p.pivot_spans()[0]
+    for short in (0.10, 0.07, 0.051, 0.02):
+        cur = PathCursor(p, 0.10, s, v)
+        cur.theta = cur._theta_cmd = a - short            # hull + setpoint
+        park = np.array(p.sample(np.array([a - short]))[:2]).ravel()
+        yaws, rs = [], []
+        for _ in range(240):
+            cur.step(np.array([park[0], park[1], 0.5]), 0.05)
+            pl = cur.plan(1, 0.05, 0.5, 0.0, True)
+            yaws.append(float(pl.yaw_ned[0]))
+            rs.append(float(pl.r_ned[0]))
+        real = np.diff(np.unwrap(yaws)) / 0.05
+        # r of tick k is the reference's turn INTO tick k: the yaw change
+        # from tick k-1 to k, held (0) or moving, never the nominal rate
+        assert np.allclose(np.asarray(rs[1:]), real, atol=1e-9), (
+            short, math.degrees(np.abs(np.asarray(rs[1:]) - real).max()))
+        assert np.abs(real).max() <= math.radians(20.0) * (1 + 1e-9)
+    # ...and the end: stages clamped onto total_length hold the final yaw
+    # with r = 0, and the reference speed there is 0
+    p, s, v = _travel(rate=20.0, laps=1)
+    cur = PathCursor(p, 0.10, s, v)
+    cur.theta = cur._theta_cmd = p.total_length - 0.01
+    pl = cur.plan(61, 0.05, 0.5, 0.0, True)
+    still = np.r_[np.diff(np.unwrap(pl.yaw_ned)) == 0.0, True]
+    assert not pl.r_ned[still].any(), pl.r_ned
+    cur._theta_cmd = p.total_length
+    assert cur.ref_speed() == 0.0
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

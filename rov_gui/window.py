@@ -799,6 +799,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.source_label.setText(backend.describe())
         self.banner.setVisible(bool(getattr(backend, "simulated", False)))
         backend.start()
+        # The mission row's state reaches the worker NOW: the panel's seeding
+        # emission fired in _build, before _wire connected it to the bus, so
+        # until a field was touched the worker flew the bare YAML block.
+        if self._traj_panel is not None:
+            self._traj_panel.resend_scenario()
         if self._pool_client is not None:
             self._pool_client.start()
         self.ui_timer.start()

@@ -1741,3 +1741,69 @@ PASS_WITH_FIXES — 중간 1건 수정, 낮음 1건 문서화, DVL 없음/OUT의
   test_low_7d + test_control 161, policy/offline/replay/attitude/station-bridge/policy-worker 361; 데모 e2e `mpc_tuned square`·
   `mpc_tuned policy` 기본 프로필로 OK(meta: profile 20261004_default, active, q_scale 4 / along 3 출처 프로필) — 합성 플랜트, 배선
   검사. **실기 0런** — 다만 기본 프로필이 이전 값을 그대로 재현하므로 다른 프로필을 고르기 전까지 동작은 같다.
+
+## 2026-10-14 — 하드웨어 square의 yaw 모드: 고정(crab) | 진행 방향(꼭짓점 제자리 회전), 패널 기본 tag 37 · 1×1 m · 0.10 m/s (실기 0런)
+
+* **왜:** 운용자 요청 — square를 지금처럼 한 방향을 보고(crab) 도는 방식과, **진행 방향을 보는** 방식(+y로 가면
+  +y, +x면 +x, −y면 −y, −x면 −x)을 패널에서 고르고 싶다. 코드에는 `heading_follow`가 이미 있었지만 하드웨어
+  spatial follower(`PathCursor`, `path_fillet_m: 0.0`)에서 켜면 yaw 기준이 꼭짓점에서 **한 스테이지에 90° 계단**이
+  되고 NMPC plan의 `r_ned`엔 (π/2)/0.05 = 31 rad/s 스파이크가 실렸다 [유도]. `yaw_rate_deg_s`(60)는 wall-clock
+  샘플러와 follow 미션만 읽어 path 모드에선 아무것도 제한하지 않았다. 실기 square/circle은 전부 `heading_follow:
+  false`였다 [측정: `data/*/*/mpc_*.meta.json`]. 시뮬의 heading_follow(이동 중 60°/s 슬루)는 날카로운 꼭짓점의 위치
+  참조와 모순된다(memory square-corner-error-floor). 하드웨어 참조는 꼭짓점에서 **이미 멈추므로**, 그 자리에서
+  회전하는 것이 추가로 실현 불가능한 요구를 만들지 않는 유일한 방식이다.
+* **무엇(이론):** 필렛 0 직사각형 + heading_follow이면 꼭짓점마다 `_Pivot`(위치 고정, 헤딩만 회전)을 넣는다.
+  피벗의 명목 호장 L을 회전율로부터 정해, 커서가 그 피벗을 creep 속도로 지나는 시간이 곧 회전 시간이 되게 한다.
+
+  ```
+  ψ_ref(s) = ψ_fix = yaw_map_deg − yaw0                       (yaw fixed: crab)
+  ψ_ref(s) = ψ_path(s)                                        (yaw = travel)
+  꼭짓점 i:  p(s) = v_i,  ψ(s) = ψ_in + Δψ·(s − a_i)/L,  s ∈ [a_i, a_i + L),  Δψ = +π/2 (NED, 위에서 시계방향)
+  L = v_creep·|Δψ| / ω_turn          (0.02 m/s, 90°, 20°/s → L 0.09 m, T = L/v_creep = 4.5 s) [유도]
+  피벗 안:  v_ref = 0
+  r_ref(stage k ≥ 1) = (dψ/ds)·v_nominal              (예측: 지평선의 위치와 같은 명목 속도)
+  r_ref(stage 0)     = [ψ(θ_cmd,k) − ψ(θ_cmd,k−1)] / Δt,  |·| ≤ 명목 회전율   (실제로 일어난 기준 회전)
+  r_ref(s ≥ s_end)   = 0
+  접근·정착 헤딩 = ψ_path(0)  (첫 변; unrotated square면 맵 +x)  → 경로 시작에 yaw 계단 없음
+  랩 시간(1×1 m @0.10, a_long 0.05) ≈ 49 s → ≈ 65 s  (+ 4·4.5 s) [유도: speed_profile, 참조 기준]
+  ```
+* **어떻게:** `path_geometry.path_from_scenario`(+`pivot_speed_m_s` = `path_creep_m_s`)가 heading_follow ∧ square ∧
+  필렛≈0일 때만 `_pivoted_polygon`을 만든다 — crab·필렛·원·line의 기하는 그대로. `PathCursor`를 **pivot-aware**로:
+  (a) **setpoint**가 끝내지 않은 첫 피벗의 시작을 투영이 넘지 못한다(피벗의 모든 점이 같은 xy라 argmin 동률 → 피벗
+  건너뛰기, 88° 한 틱 계단 [유도: 오프라인 PathCursor]을 막는다), (b) **선체**가 끝내지 않은 첫 피벗에 setpoint가
+  들어갔고 선체가 도착하면(투영이 꼭짓점 또는 꼭짓점 5 cm 이내 — `PIVOT_CAPTURE_M`) 선체 진행이 setpoint를 따라간다
+  (회전은 거리가 아니라 시간; leash가 피벗 안에 setpoint를 가두는 교착과, 경로 끝 피벗에서 `complete`가 영원히 안 되는
+  결함을 없앤다 — RL은 꼭짓점 ~1.8 cm 앞에 선다 [유도: 오프라인 PathCursor + Fossen 플랜트], 그래서 거리로도 판정),
+  (c) 피벗은 자기 속도로 정확히 건넌다, (d) 피벗 안 `v_ned = 0`, `r_ned`는 위 식. 피벗이 없는 경로에서 `step()`과
+  고정 헤딩 `plan()`은 원소 단위로 이전과 같다(test의 legacy-cursor oracle); heading_follow plan의 `r_ned`는 모든 경로에서
+  의도적으로 바뀌었다(해석적, K=1 포함). 워커: 진행 방향 square/circle이면 접근·정착을 첫 접선으로(같은 곡선에서
+  읽음, `_path_start_yaw` — wall-clock 샘플러 없이 배치, 기하 오류는 START 거부), 다음 경우 **접근 전에** START 거부:
+  STABILIZE + `yaw_axis: hold`, MPCC/DOBMPCC(square), `path_fillet_m` > 0, `path_following: false`(앞의 둘은 회전율을
+  지킬 수 없고, 뒤의 둘은 꼭짓점 pivot이 생기지 않는다). HwRl은 plan이 실은 r도 `yaw_rate_max`(0.6 — export 값이 아니다:
+  제자리 0.4 / heading-follow 호 1.0 [스펙: obs_spec.json])로 clip하고 이전 yaw를 매 틱 갱신(회전 직후 한 틱 rate
+  스파이크 제거). 패널: square에서만 보이는 NoFocus 콤보 `yaw fixed +y | yaw = travel`(`heading_follow`로 시나리오에
+  실림, 다른 모양은 항상 false; 휠 무시), START부터 잠김, 칩에 `· yaw = travel`; 열린 콤보 목록에서 Esc = E-STOP(세 콤보
+  모두). 회전율 `square.vertex_turn_deg_s` 20°/s — RL 정책의 학습된 제자리 yaw rate 0.4 rad/s 안
+  [스펙: `rov_gui/control/rl_policies/traj12_s2/obs_spec.json`]; 상한 90°/s(로드 시 거부), RL LOW에서 22.9°/s를 넘으면 경고.
+  패널 기본값(YAML 시드): tag 37, 1.0 × 1.0 m, 0.10 m/s, yaw fixed — tag·속도 칸은 모든 모양 공유, 거리 칸은 모양별
+  기억(size/length/radius), 시작 모양은 station 그대로, 창이 backend에 붙을 때 패널 시나리오를 worker에 한 번 보낸다.
+* **리뷰(2026-10-14, 6렌즈 + 지적별 반박 검증) → 수정:** capture를 setpoint가 아니라 **선체** 기준 피벗으로(느린 추종자가
+  마지막 피벗을 setpoint보다 늦게 오면 `complete`가 다시 안 되던 것 — 0.03 m/s 추종자 뒤의 배포 line [유도]);
+  leash가 setpoint를 잡아 둔 동안 K=1 plan이 명목 20°/s를 보내던 것 → stage 0은 실제 기준 회전; 경로 끝 stage의 r과
+  `ref_speed` 0; fillet/path_following 거부; 시작 시 패널→worker 전달 누락; station 시작 뒤 Circle이 r 1.00 m로 열리던
+  공유 거리 칸; 콤보 Esc/휠.
+* **부수 효과(기록 경계):** line도 끝이 피벗이라 같은 결함으로 **완료될 수 없었다**(오프라인 1 m × 2랩 θ 4.07/4.08,
+  배포 2 m × 5랩 20.18/20.20에서 영구 정지 [유도: 변경 전 커서]; 실기 line은 완료 기록이 없다). pivot-aware 커서로 line이
+  완료되고(`demo_e2e.py pid line` → `line complete`, KNOWN_ISSUES 2026-08-17 "예산" 항목은 원인 오진이라 삭제), 반환점에서
+  v = 0을 받는다.
+* **기록(경계):** meta `trajectory.heading_follow`, `.vertex_turn_deg_s`(모든 square; `vertex_pivot`이 있을 때만 실제로
+  날린 값), `.vertex_pivot`(len, speed, per_lap, capture), `reference_clock.strategy = "waypoint_vertex_pivot"`,
+  `reference_clock.pivot_capture_m`(있음 = 새 커서, line 포함). crab square·시뮬 heading_follow square와 합산 금지.
+* **결과:** 단위 테스트(커서 회전율·완료·느린 추종자·실제 stage-0 r·바이트 동일 oracle, 워커 접근→정착→무장 헤딩·거부·
+  완료·meta, 설정 검증, RL r, 패널 yaw 콤보·모양별 거리 칸·Esc/휠, 창 attach 전달) 통과. Fossen 예측모델 폐루프
+  1×1 m @0.10 2랩 [예측/sim, 산출물 없음]: PID·MPC_Tuned·RL 모두 완료, 기준 yaw 변화율 최대 20.0°/s, 회전 중 목표점은
+  꼭짓점 1 mm 이내; 직선 구간 heading 오차 p95 PID ≤0.5°, MPC_Tuned ≤0.4°, RL ~12°. demo 토이 플랜트 e2e
+  `rov_gui/tests/demo_e2e.py <pid|mpc_tuned|rl> square_travel`(0.6×0.4 @0.15 1랩): 세 LOW 모두 `square complete` —
+  배선 검사일 뿐 성능 수치가 아니다 [예측/sim]. **실기 0런.** 남은 한계 [예측]: ±x 변에서 C3가 매트의 짧은 방향을 봐
+  태그 수가 줄 수 있고(경로엔 dropout bridge 없음), 랩마다 테더가 한 바퀴 꼬이며, 보고 원점이 실제 yaw 피벗보다 뒤라
+  제자리 회전 중 선체가 옮겨질 수 있고, START의 첫 회전은 램프 없는 yaw 계단이다(KNOWN_ISSUES "square `yaw = travel`").

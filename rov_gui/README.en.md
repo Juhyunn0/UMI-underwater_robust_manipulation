@@ -3061,7 +3061,7 @@ line, you cannot tell which one went quiet, and worse, you cannot tell which one
 | Device | autopilot (Navigator) | C3 onboard BNO086 |
 | Path | MAVLink `RAW_IMU` / `SCALED_IMU2` | DepthAI IMU queue |
 | Clock | vehicle `time_boot_ms` | **the same clock as the images** (`dai.Clock`) |
-| Default request | 200 Hz (`--mavlink-rate`) | 200 Hz (`--c3-imu-rate`) |
+| Default request | per message: `ATTITUDE` 50 · `RAW_IMU` 20 · `SCALED_IMU2` 20 Hz (2026-10-15; all three at 200 Hz before) | 200 Hz (`--c3-imu-rate`) |
 | Measured ceiling | **~208 Hz** | **~486 Hz** (standalone) |
 
 * **ROV IMU** (measured 2026-08-06, `SET_MESSAGE_INTERVAL`): default 2-3 Hz · request 50 → 62 ·
@@ -3069,6 +3069,15 @@ line, you cannot tell which one went quiet, and worse, you cannot tell which one
   Raising the rates is **on by default** (off with `--no-mavlink-set-rates`) — the ArduSub
   default of 2-3 Hz is good for nothing but dashboard lights, and a sensor log kept beside a depth recording
   is only worth keeping at a proper rate. When on, it **transmits** to the vehicle.
+* **Per-message request since 2026-10-15** (`rov_gui/mavlink_streams.py`, operator-approved fix 1c): the old
+  request (all three at `--mavlink-rate` 200) came out at ~166.6 Hz each, ~500 of the ~552 msg/s the vehicle sends
+  to **every** BlueOS endpoint [measured, 27 recordings, `RL_controller/logs/eval/station_fix_20261015/impl-rates/out/
+  rov_stream_scan.json`], and on 10-13 a vehicle-side queue formed on top of it at every parameter download by
+  another client. Now `--mavlink-att-rate` 50 · `--mavlink-imu-rate` 20 · `--mavlink-scaled-imu2-rate` 20 Hz
+  (90 msg/s asked); `--mavlink-rate N` is **the old request unchanged** (all three at N; giving it together with a
+  per-message flag is refused at launch). Why 50 Hz ATTITUDE, and why SCALED_IMU2 (whose accel/gyro are all zero on
+  this vehicle) stays on: `rov_gui/mavlink_streams.py` and KNOWN_ISSUES 2026-10-15. The request and the rates that
+  arrived are recorded in the run meta `mavlink_streams` and the `*_rov.json` `stream_request`.
 * **C3 IMU**: using only accel+gyro, standalone ~486 Hz (`c3_camera/pipeline.py`, measured).
   The batch threshold is 10 — at this rate, a threshold of 1 leaks samples (`c3_collect.py`, measured).
   It can be turned off with `--no-c3-imu`.

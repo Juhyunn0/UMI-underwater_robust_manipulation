@@ -1317,8 +1317,10 @@ SENSORS는 3열 SYSTEM HEALTH 아래에 **나란히** 들어간다(세로로 쌓
 768을 넘는다 — 기본 레이아웃의 one-screen(1366×768) 약속은 그대로이고,
 `--mpc`는 1080p 운용 화면을 전제한다):
 
-* **미션은 패널 맨 윗줄에서 정한다**(2026-08-14, circle은 2026-08-17):
-  `[station|line|square|circle|follow] from tag [id] [facing tag [id]] [거리|반지름] [속도]`.
+* **미션은 패널 맨 윗줄에서 정한다**(2026-08-14, circle은 2026-08-17, square의
+  yaw 모드·기본값은 2026-10-14):
+  `[station|line|square|circle|follow] from tag [id] [facing tag [id]] [거리|반지름] [× y변] [속도] [yaw fixed|yaw = travel]`
+  (y변과 yaw 칸은 square에서만 보인다).
   **쓰지 않는 칸은 사라진다** — station은 거리/속도가, follow는 `from tag`와 거리가
   아예 안 보인다(follow는 태그 id를 **하나도 안 쓴다**: 기준이 arm 순간의 기체 pose와
   물체 pose다. 2026-08-23 전에는 회색으로 남아 "그래도 뭔가 하는 칸"처럼 보였다).
@@ -1337,7 +1339,7 @@ SENSORS는 3열 SYSTEM HEALTH 아래에 **나란히** 들어간다(세로로 쌓
   된다. **line** = 그 태그 바로 위에서 시작해 `dir_deg`(기본 90° = 맵 +y)
   방향으로 입력 거리만큼 갔다가 **되돌아오는 왕복**(1 lap = 왕복 1회, 횟수는
   `hw_mpc.yaml: laps`). **square** = 그 태그를 첫 모서리로 하는 **직사각형**
-  (x변 × y변을 따로 입력). **circle** = 그 태그를 **원의 맨 아래점**으로 하는
+  (x변 × y변을 따로 입력; 헤딩은 아래 **square yaw 모드**). **circle** = 그 태그를 **원의 맨 아래점**으로 하는
   원(거리 칸이 `r` 접두어와 함께 **반지름**이 된다; 1 lap = 1바퀴). 네 모양
   모두 태그는 경로가 **지나가는 점**이지 멀리서 도는 중심이 아니다 — 원의
   중심은 태그에서 맵 +x(플롯 위쪽)로 반지름만큼 떨어진 곳에 놓이고,
@@ -1349,14 +1351,57 @@ SENSORS는 3열 SYSTEM HEALTH 아래에 **나란히** 들어간다(세로로 쌓
   코너에서는 속도 프로파일이 미리 감속한다. **circle은 반대다**: 곡률이 랩
   전체에 걸려 있어 입력 속도는 기하가 허락하지 않을 수도 있는 **상한**일 뿐이다
   (바로 위 항목).
-  이 필드들은 `cmd_mpc_scenario`로 hw_mpc.yaml의 `square:` 블록 위에
-  덮어써지고(파일 값은 패널의 시작값), 랩 수·깊이·ramp는 파일에서 온다.
+  이 필드들(+ square의 yaw 모드 = `heading_follow`)은 `cmd_mpc_scenario`로
+  hw_mpc.yaml의 `square:` 블록 위에 덮어써지고(파일 값은 패널의 시작값), 랩 수·깊이·ramp·
+  `yaw_map_deg`·`vertex_turn_deg_s`는 파일에서 온다. **tag·속도 칸은 모든 모양이
+  공유**한다 — 배포 시작값(2026-10-14: tag 37, 1.0 × 1.0 m, 0.10 m/s, yaw fixed)은
+  station·line·circle의 시작 tag/속도이기도 하다. **거리 칸은 모양별로 기억**한다
+  (2026-10-14): square는 `size`, line은 `length`, circle은 `radius`에서 시작하고, 고친 값은
+  그 모양으로 돌아오면 다시 나온다(전엔 한 값이 다음 모양으로 넘어가 station 시작 뒤 Circle이
+  r 1.00 m로 열렸다). 시작 모양은 여전히 station이다. 창이 backend에 붙는 순간 패널이 보이는
+  시나리오를 worker에 한 번 보낸다 — 전엔 필드를 건드리기 전까지 worker가 YAML 블록 그대로 날았다.
   **START를 누른 순간 미션이 스냅샷**되므로 필드는 주행 중은 물론 접근·정착
   단계에서도 잠긴다 — 그때 고친 값은 실제로 날아가지 않기 때문이다.
-  * **방위는 `yaw_map_deg`**(기본 90 = 맵 +y를 봄), **line의 진행 방향
+  * **방위는 `yaw_map_deg`**(기본 90 = 맵 +y를 봄 = 플롯 **오른쪽**; square에선
+    yaw 모드가 **fixed**일 때만), **line의 진행 방향
     `dir_deg`도 맵 절대 방위**(90 = 풀의 긴 방향 +y)다. 둘 다 datum 상대였다면
     engage 헤딩이 바뀔 때마다 다른 물리 방향을 뜻한다 — 실제로 2026-08-14에
     `dir_deg: 90`이 −x로 그려진 원인이 그거였다.
+  * **square yaw 모드**(2026-10-14, 운용자 요청 — square를 고를 때만 보이는 콤보):
+    * **`yaw fixed +y`** = 지금까지의 square. 헤딩은 미션 내내 `yaw_map_deg` 하나
+      (배포 90 = 맵 +y — 콤보 글자가 그 방향을 직접 말한다)이고 변은 옆·뒤로 **crab**해서
+      간다. 2026-10-14 이전 실기 square/circle은 전부 이것이었다
+      [측정: `data/*/*/mpc_*.meta.json`의 `trajectory.heading_follow`].
+    * **`yaw = travel`** = 변마다 **진행 방향을 본다**: +x 변 → +x, +y → +y, −x → −x,
+      −y → −y. 필렛 0(`path_fillet_m: 0.0`)에선 참조가 꼭짓점에서 이미 멈추므로
+      그 자리에서 **제자리 90° 회전**(`_Pivot`)을 하고 다음 변으로 출발한다. 회전율은
+      `square.vertex_turn_deg_s`(배포 20°/s → 꼭짓점당 4.5 s [유도]; RL 정책의 학습된
+      제자리 yaw rate 0.4 rad/s 안 [스펙: `rl_policies/traj12_s2/obs_spec.json`]).
+      접근·정착은 처음부터 **첫 변 방향**(+x)을 보고 들어가므로 경로 시작에 yaw 계단이
+      없다. 참조 랩 시간 1.0 × 1.0 m @0.10은 ~49 s → ~65 s [유도: `speed_profile`,
+      참조 기준이라 leash가 물면 선체는 더 느리다].
+    * **거부**: STABILIZE + `engage.stabilize.yaw_axis: hold`(오토파일럿이 헤딩을 쥐어
+      crab으로 날면서 meta엔 travel이 남는다), MPCC/DOBMPCC(진행을 스스로 정해 꼭짓점
+      회전율을 지킬 수 없다), `path_fillet_m` > 0(호를 따라 v/R로 돌며 움직인다)과
+      `path_following: false`(wall-clock 샘플러가 이동 중 슬루)에선 **START가 접근 전에**
+      이유와 함께 거부한다 — 제자리 회전은 필렛 0 waypoint square에서만 일어난다.
+      RL LOW에 `vertex_turn_deg_s`가 학습 범위(22.9°/s)를 넘으면 경고만 한다. 설정 상한은 90°/s.
+    * **START의 첫 회전**: 접근을 시작할 때 첫 변 방향으로 도는 것은 램프 없는 한 번의
+      yaw 계단이다(yaw fixed가 자기 헤딩으로 도는 것과 같은 방식) — 꼭짓점 회전율이 걸리지 않는다.
+    * **오프라인 확인**: `rov_gui/tests/demo_e2e.py <pid|mpc_tuned|rl> square_travel`
+      (토이 플랜트, 배선 검사일 뿐 성능 수치가 아니다).
+    * **기록 경계**: meta `trajectory.heading_follow` + `trajectory.vertex_pivot`,
+      `reference_clock.strategy = "waypoint_vertex_pivot"`. crab square와도, 시뮬의
+      heading_follow square(이동 중 60°/s 슬루, 정지 없음)와도 **합산 금지**.
+    * **실기 0런. 첫 런 전에 알 것**: 랩마다 같은 방향 360° 회전이라 5랩이면
+      **테더가 5바퀴 꼬인다** [유도]. C3가 각 변의 진행 방향을 앞·아래로 보므로 ±x
+      변에서는 매트의 **짧은** 방향을 본다 — tag 37 기준 x변 끝에서 매트 가장자리
+      태그까지 −x 쪽 0.26 m, +x 쪽 0.40 m [유도: `config/tag_map_full.yaml` 태그 중심
+      x −0.538..1.116]라 변 끝에서 태그 수가 줄 수 있다 [예측]. 태그가 ~1.1 s 끊기면
+      경로엔 dropout bridge가 없어 DISENGAGE된다(`tag_stale_s` 0.7 + `tag_stale_hold_s`
+      0.4). 보고 원점이 실제 yaw 피벗보다 뒤에 있어(KNOWN_ISSUES "C3 외부파라미터")
+      제자리 회전 중 기체가 조금 옮겨질 수 있다 [예측]. 첫 런은 MANUAL, PID나
+      MPC_Tuned, DVL OUT, 적은 랩 수로.
   * **지금 어느 단계인지 칩이 말한다**: `WARMING UP` → `GOING TO START 0.83 m
     to go` → `SETTLING 6 s` → `STATION HOLD` / `LINE` / `SQUARE`. 예전엔 접근
     중에도 `DP HOLD`라 구별이 안 됐다.
@@ -1414,7 +1459,8 @@ SENSORS는 3열 SYSTEM HEALTH 아래에 **나란히** 들어간다(세로로 쌓
   초록으로 칠해진다**(fix가 1 s 이상 끊기면 소등 — 죽은 측위가 태그를 켜둘 수
   없다). 비엔게이지 상태에선 fix가 마커를 직접 구동한다(ArduSub 텔레메트리
   없는 벤치에서도 움직임). 벽 단일 태그(104) 모드는 `geometry: wall`로 복귀.
-  20 cm square @ 0.05 m/s, yaw는 시작 헤딩 고정.
+  20 cm square @ 0.05 m/s, yaw는 시작 헤딩 고정(2026-08-13 기준 — 2026-10-14부터 패널
+  시작값은 tag 37 · 1.0 × 1.0 m @0.10 m/s, `yaw fixed` = 맵 +y).
 * **actual 궤적은 나이(시간) 색**이다: viridis 램프(어두운 보라 = 오래됨 →
   노랑 = 지금), 우하단에 `-90s → now` 범례. 90 s(`trajectory.py:
   TRAIL_AGE_S`)가 지난 점은 서서히 투명해지며 지워진다 — 교차하는 경로에서도
@@ -1562,8 +1608,9 @@ SENSORS는 3열 SYSTEM HEALTH 아래에 **나란히** 들어간다(세로로 쌓
   향하던 각도만큼 사각형이 통째로 기울어졌다 — line의 `dir_deg`와 같은 종류의
   버그. 태그가 좌하단이 되는 건 `mirror_y`(FLU→NED 미러가 y를 뒤집어 태그를
   y가 **가장 큰** 모서리로 보내던 것을 되돌린다) 덕이다.
-* **태그 번호·거리는 클릭해서 타이핑**할 수 있다(2026-08-14). 이 패널의 세 필드만
-  `ClickFocus`이고 나머지는 전부 `NoFocus`인데(창이 유일한 키 핸들러라서),
+* **태그 번호·거리는 클릭해서 타이핑**할 수 있다(2026-08-14). 이 패널의 숫자 칸(tag·facing
+  tag·거리·y변·속도)만 `ClickFocus`이고 나머지는 — square yaw 콤보(2026-10-14)를 포함해 —
+  전부 `NoFocus`인데(창이 유일한 키 핸들러라서),
   숫자가 아닌 키가 오면 **즉시 포커스를 놓고 그 키를 창으로 다시 보낸다** —
   태그 번호를 치고 곧바로 W를 눌러도 기체가 움직인다. 이게 없으면 필드가 W를
   삼켜서 "아무 이유 없이 조종이 안 되는" 상태가 된다. Enter는 확정+포커스 해제.
@@ -1701,6 +1748,14 @@ SENSORS는 3열 SYSTEM HEALTH 아래에 **나란히** 들어간다(세로로 쌓
   `rov_gui/tools/rl_pwm_interlock_replay.py` 가 같은 구현) 와 정책 쪽 관측 가드 `rl_pwm.obs_guard`(속도 slew, fix 점프 거부, 태그
   게이트 → HOLD 펄스; `HwRlPwm.step` 안에서만) 가 추가됐고 CSV 에 `pwm_guard` 열(schema 20)이 붙는다. `i_pred_a` 는 물리 추력
   규약(T200 × batt_v/20.5 V)으로 바뀌었다. 재생 결과·한계: KNOWN_ISSUES 'LOW RL_PWM' 2026-10-10 (b) 단락.
+  **2026-10-15 (자세 나이, 차량 시계)**: 10-13 수조 트립 5회의 원인 — 정책이 본 ATTITUDE 가 차량 쪽 MAVLink 큐 뒤에서 중앙값 0.43 s
+  늦었는데 `imu_age_s`(파싱 시각 기준)는 ~0.05 s 로 보였다 [측정 `RL_controller/logs/eval/pool_trips_1013_rootcause/synth/out/
+  synth_checks.json` C1_age]. MAVLink 리더가 ATTITUDE `time_boot_ms` 를 호스트 시계로 옮기고(`c3_camera/mavlink_log.py
+  VehicleClockMap`, 하한 포락선 300 ppm, 재부팅 시 리셋) CSV 에 `att_age_v_s`·`att_tb_ms`·`banner_age_s`(schema 21, 모든 LOW)를
+  남긴다. pwm LOW 만: `engage.per_thruster` **AGE** — 나이 > 0.15 s 0.5 s 또는 > 0.25 s 0.2 s 면 중립 펄스로 disengage, 모르는 나이 =
+  넘음; 교전 거부 — 시계 맵 < 30 s, `ArduSub V` 배너(다른 클라이언트의 전체 파라미터 요청) < 30 s, 최근 10 s 에 모르는 틱 1개 이상,
+  최근 10 s p99 > 0.12 s, START 순간 나이 > 0.15 s(`age_s`; 2026-10-15 fixer). 배너는
+  로그·미션 로그·events.log 에 1분에 최대 한 줄. 전부 [예측], 실기 0런; 근거·한계: KNOWN_ISSUES '자세 나이(차량 시계)' 항목.
   **기울기 천장(2026-10-03)**: 이 날까지 rl_pwm 에는 기울기 인터록이 없었다(Lua 스크립트에도 자세 로직이 없다) — 이제
   |roll| 또는 |pitch| 가 `engage.attitude_axes.abort_deg`(35°)를 0.25 s 넘으면 disengage(중립 펄스, 수동 복원). CSV `ax_*` 는 0, `uX..uN` 은 실제로 나간 throttle 의 **명목 wrench
   추정**(T200 곡선 × 전압 계수 × B)이라 다른 제어기의 명령 열과 직접 비교하지 않는다; `pwm1..8` 은 기체의 SERVO_OUTPUT_RAW.
@@ -1735,8 +1790,9 @@ SENSORS는 3열 SYSTEM HEALTH 아래에 **나란히** 들어간다(세로로 쌓
   버티는 기하에서는 이게 코너보다 더 센 요구다 — 태그를 놓치면
   `engage.tag_stale_hold_s` 디바운스를 거쳐 랩 도중에 자동 disengage 된다.
   floor 기하(태그 여러 개)에서 먼저 날려 볼 것.
-* wall 기하에서는 `heading_follow: false`(크랩 square)가 **필수**다. 코너에서
-  기수를 돌리면 벽 태그가 시야에서 사라진다.
+* wall 기하에서는 `heading_follow: false`(크랩 square = 패널 square의 `yaw fixed`)가
+  **필수**다. 코너에서 기수를 돌리면 벽 태그가 시야에서 사라진다. 코드가 `yaw = travel`을
+  막지는 않으니 wall에선 고르지 말 것.
   속도 관련 [측정 data/20260921/0921_182926]: 정책에는 명시적 속도 제한이 없다. 정지 상태에서 목표 오프셋 0.1 m → 명령 0.5, 0.2 m 이상 → 1.0(포화)이며,
   실제 속도를 정하는 것은 (1) GUI 궤적 속도(reference), (2) `axis_cap`(0.5), (3) `rl.leash_m`(먼 목표 제시 거리)뿐이다. 접근 구간 최대 0.45 m/s.
   2026-09-21 결정: `rl.axis_cap: 0.3`(RL 모드에서만 min(axis_cap, 0.3), 속도 법칙상 정상 상태 ≈ 0.14 m/s [유도]); 0.10 m/s 기준은
@@ -2477,7 +2533,16 @@ lever arm은 그 검증에 걸리지 않으므로, 검증되지 않은 숫자가
 버튼은 **요청**만 보낸다. 표시는 `MpcStatus.dvl_use`가 정한다 — 워커가 거부하면(engaged, CSV 열림,
 장착 미측정, 미검증) 버튼은 그대로이고 이유가 칩에 뜬다. 색: 회색 = OUT, 초록 = IN이고 지금 DVL로
 나는 중, 호박 = IN인데 지금은 태그 속도, **빨강 `DVL TRIPPED`** = 아래의 trip(툴팁에 이유·고도·fom·
-Hz·잔차).
+Hz·잔차). IN(눌린 상태)이면 버튼이 그 색으로 **채워지고** 글씨는 검정(보통 굵기)이다. 2026-10-13
+전에는 상태색 글씨가 앱의 하늘색 checked 배경 위에 있었다. 호박 글씨와 하늘색 배경은 휘도 대비
+약 1:1이라 글씨가 안 보였다(운영자 스크린샷; 렌더로 잰 옛 면 1.07–1.87:1, 새 면 5.0–8.8:1
+[측정: data/20261013/1013_dvl_gui_render/render_dvl_ui_out.txt]). 글씨를 굵게 두면 버튼 폭이 보통 굵기
+기준이라 `DVL TRIPPED`가 양끝에서 잘렸다. engage 중이나 CSV가 열려 있어 얼어 있을 때는 어두운 면에
+상태색 글씨와 테두리를 쓴다. 빨강 글씨 면(OUT인데 TRIPPED)은 한 단계 더 어두운 바탕에 쓴다(4.4 →
+4.7:1 [유도: WCAG]). 누르는 순간은 하늘색에 검정이다. EST 버튼도 같은 규칙을 쓴다
+(`TrajectoryWindow._state_btn_css`). `test_an_in_switch_is_readable_in_every_state`가 모든 면(체크·언체크·
+얼음·누름)을 렌더해서 대비 4.5:1 이상과 글씨 안 잘림을 고정한다. REC NAV 녹화 버튼도 빨강으로 채워지므로,
+TRIPPED와는 글씨로 구별한다.
 
 ### 세 가지 규칙 — 자동은 DVL을 **빼기만** 한다
 
@@ -2719,14 +2784,48 @@ DVL 단이 아래 단(IMU)에 넘기는 것은 **위치뿐**이다. IMU 단의 d
   크기와 방향별 정렬 값·σ). `proof`와 `agreement_now`에는 `lag_s` / `lag_sigma_s`도 들어 있다.
 * **원시 스트림**: 컨트롤러 CSV가 열려 있는 동안 `<stem>_dvl.jsonl`에 장치가 보낸 줄 그대로
   (velocity, position_local, response) + 스테이션 도착 시각. 장착을 다시 재면 재처리할 수 있다.
+  2026-10-13부터 아래 온도 페이지도 같은 파일에 들어간다(`msg: about_status`, 5 s마다 그대로).
+  런 중에 DVL이 끊겼다면 과열 때문이었는지를 여기서 읽는다.
 * 장치의 자체 dead reckoning(`position_local`)은 **쓰지 않는다** — 장치 IMU를 장치 프레임에서
   적분한 것이고 태그 세계를 모른다. 원시 로그에만 남는다.
 
-스테이션은 장치를 **읽기만** 한다. 보내는 것은 `get_config`(그 자체로 읽기)뿐이고, 설정 변경·dead
-reckoning 리셋·ping 트리거는 하지 않는다(다른 클라이언트의 계측기까지 바꾸기 때문). TCP 서버는
+스테이션은 장치를 **읽기만** 한다. 보내는 것은 `get_config`(그 자체로 읽기)와 아래 온도 페이지의
+HTTP GET뿐이고, 설정 변경·dead reckoning 리셋·ping 트리거는 하지 않는다(다른 클라이언트의
+계측기까지 바꾸기 때문). TCP 서버는
 두 클라이언트를 동시에 받았다 (벤더 **데모** 장치에서 관찰, 2026-10-01:
 `rov_gui/tests/fixtures/dvl_a50_demo_capture_20261001.README.md` — 실기에서는 미확인) → BlueOS DVL
 extension과 같이 읽을 수 있을 것으로 본다 [예측].
+
+### 온도 — SENSORS의 DVL 줄 (2026-10-13)
+
+DVL 온도는 TCP 스트림에 없다. 스트림에는 velocity `status`의 bit 0("고온, 곧 thermal shutdown")만
+있다. 숫자는 장치 웹 API `GET http://<dvl.host>/api/v1/about/status`의 `temperature`(°C)다. 벤더
+웹 GUI가 "Temperature … C"로 보여 주는 바로 그 값이다. `DvlTempPoller`가 별도 스레드에서 5 s마다
+GET 한다(`Connection: close`, http.client라 환경의 http_proxy를 타지 않는다). TCP 리더와 스레드를
+나눈 것은, 웹서버가 느려도 velocity 도착 스탬프가 밀리지 않게 하기 위해서다. 스테이션의 이 코드
+경로로 실기 A50을 읽었다: 3/3 성공, 4–6 ms [측정: data/20261013/1013_194334_dvl_temp/
+station_poller_fetch.json]. 응답이 20 s 넘게 갱신되지 않으면 숫자를 표시하지 않는다(멈춘 숫자 금지).
+요청 하나가 timeout의 3배 넘게 끝나지 않으면 "stuck"으로 보고한다. 소켓 timeout은 recv 하나에만
+걸리기 때문이다.
+
+| SENSORS DVL 줄 (형식 예시, 장치 값 아님) | 뜻 |
+|---|---|
+| `NN Hz alt N.NN m NN.N°C` (초록) | lock + 온도 |
+| `NN Hz no lock NN.N°C` (호박 점) | lock 없음. 물 밖이면 보통 이 상태다 |
+| `NN Hz HOT NN.N°C` (호박 점) | 45 °C 이상에서 HOT, 44 °C 아래에서 해제(로그와 같은 띠). BlueOS DVL extension은 45 °C **초과**에서 경고한다 [스펙]. warn 한 번 |
+| `NN Hz HIGH TEMP [NN.N°C]` (호박 점) | 장치가 직접 bit 0을 올렸다 — 다음은 shutdown. 숫자가 없어도(404 등) 뜬다. bit 0이 꺼진 뒤 10 s 동안 유지 [예측] |
+| `no link HOT NN.N°C` / `no link NN.N°C` | velocity 스트림은 없고 웹 페이지는 답한다. 오류 전문은 로그에 있다 |
+| `THERMAL SHUTDOWN?` (빨강 점 + 패널 테두리; 글씨는 다른 bad 행처럼 흐림) | 마지막으로 연결돼 있던 순간에 뜨거웠고(bit 0, 또는 54 °C 이상 [예측]), 끊긴 **뒤에** 완료된 웹 요청이 **아무 응답도 못 받았다**(거부·timeout). 404라도 응답이 오면 장치는 살아 있는 것이라 철회한다. 벤더 GUI는 자기 temperature_high 경고와 웹 연결 끊김으로 같은 말을 한다. 이 규칙 자체는 스테이션 것이다. 마지막 온도는 숫자로 두지 않고 error 로그에 남긴다 |
+
+온도·bit 0 판정은 **lock 판정보다 먼저** 한다. 과열은 물 밖에서만 생기고 물 밖에는 lock이 없다.
+그래서 예전처럼 lock 뒤에서 검사하면 경고가 "no bottom lock"에 가려져 보이지 않았다. 벤더 기준은
+55 °C 전에 경고, 55 °C에서 차단, 50 °C 아래로 식으면 자동 재시작이다
+[스펙: data/20261011/1011_155235_dvl_probe/analysis/wf/vendor_dl/p_how-to-diagnose/page.txt:237].
+2026-10-13 acoustics ON, 에코 없음 상태에서 38.25 → 39.15 °C, 0.26–0.29 °C/min으로 올랐다(끝점 기준 / 60 s 최소제곱)
+[측정: data/20261013/1013_194334_dvl_temp/]. 그때 물 밖이었다는 것은 [유도, 운영자 미확인]이다. 물 밖에서
+켜 두려면 DVL 웹 GUI에서 acoustics를 끈다. 장치 쓰기이므로 스테이션은 하지 않는다. 물에 넣기 전에는 다시
+켠다(꺼 두면 물속에서도 속도가 나오지 않는다). 런 중에는 상태 페이지가 `<stem>_dvl.jsonl`에 `about_status`로
+함께 기록된다.
 
 DVL 코드 자체가 tick 경로에서 예외를 내면 DVL은 그 세션 동안 무시되고(`CODE FAULT` 로그 한 줄)
 제어 tick은 태그 속도로 계속 돈다 — 새 센서의 부기가 engaged 상태의 tick을 중단시킬 수 없다.
@@ -2742,7 +2841,7 @@ DVL 코드 자체가 tick 경로에서 예외를 내면 DVL은 그 세션 동안
 1. 장착 후 `mount_rpy_deg`, `mount_t_flu`를 **자로 재서** 채운다. 근거를 주석에 남긴다. 검증은
    수평 회전·부호·스케일만 본다 — 기울기와 lever arm은 이 줄자가 전부다.
 2. `./c3 gui … --dvl`, 버튼은 `DVL OUT` 그대로. SENSORS의 **DVL** 줄이 Hz와 고도를 말하는지 본다
-   (물 밖에서는 과열한다 [스펙: 55 ℃ 차단] — 반드시 잠긴 상태로 켠다). 로그의
+   (물 밖에서는 과열한다 [스펙: 55 ℃ 차단] — 반드시 잠긴 상태로 켠다. 줄 끝의 °C가 온도다). 로그의
    `dvl: device config {...}`에서 `speed_of_sound`가 풀 수온에 맞는지, `mounting_rotation_offset`이
    0인지 확인한다.
 3. 태그가 보이는 곳에서 **직선으로** 전후 한 번, 좌우 한 번씩 수동 주행 → `mount PROVEN` 로그.
@@ -2884,7 +2983,7 @@ ArduSub은 `BATT_CAPACITY`와 전류 모니터가 설정돼 있지 않으면 `ba
 | 장치 | 오토파일럿(Navigator) | C3 온보드 BNO086 |
 | 경로 | MAVLink `RAW_IMU` / `SCALED_IMU2` | DepthAI IMU 큐 |
 | 시계 | 기체 `time_boot_ms` | **이미지와 같은 시계** (`dai.Clock`) |
-| 기본 요청 | 200 Hz (`--mavlink-rate`) | 200 Hz (`--c3-imu-rate`) |
+| 기본 요청 | 메시지별: `ATTITUDE` 50 · `RAW_IMU` 20 · `SCALED_IMU2` 20 Hz (2026-10-15; 그 전엔 셋 다 200 Hz) | 200 Hz (`--c3-imu-rate`) |
 | 실측 천장 | **~208 Hz** | **~486 Hz** (스탠드얼론) |
 
 * **ROV IMU**(실측 2026-08-06, `SET_MESSAGE_INTERVAL`): 기본 2-3 Hz · 요청 50 → 62 ·
@@ -2892,6 +2991,19 @@ ArduSub은 `BATT_CAPACITY`와 전류 모니터가 설정돼 있지 않으면 `ba
   레이트 올리기는 **기본으로 켜져 있다**(`--no-mavlink-set-rates`로 끔) — ArduSub
   기본값 2-3 Hz는 대시보드 불빛 말고는 쓸 데가 없고, depth 녹화 옆에 남기는 센서
   로그는 제대로 된 레이트여야 남길 값어치가 있다. 켜면 기체로 **송신**한다.
+* **2026-10-15부터 메시지별 요청**(`rov_gui/mavlink_streams.py`, 운용자 승인 1c): 예전 요청(셋 다
+  `--mavlink-rate` 200)은 기체가 각 ~166.6 Hz 로 보내 **모든** BlueOS 엔드포인트에 ~552 msg/s 중 ~500 이 IMU 스트림이었고
+  [측정 기록 27개(2026-08-09..10-13), `RL_controller/logs/eval/station_fix_20261015/impl-rates/out/rov_stream_scan.json`], 10-13 에는 다른
+  클라이언트의 파라미터 다운로드 때마다 그 위로 차량 쪽 큐가 섰다. 지금은 `--mavlink-att-rate` 50 · `--mavlink-imu-rate` 20 ·
+  `--mavlink-scaled-imu2-rate` 20 Hz(요청 합 90 msg/s), `--mavlink-rate N` 은 **예전 요청 그대로**(셋 다 N; 메시지별 플래그와
+  같이 주면 시작 거부). ATTITUDE 50 Hz 근거: 모든 LOW 가 20 Hz 틱마다 한 번 읽고, pwm LOW 의 나이 게이트는 샘플 자체의 나이도
+  센다 — 건강한 기록 21개를 ~47–50 Hz 로 솎아 재생하면 틱 나이 p99 0.069–0.086 s(166 Hz 그대로는 0.058–0.078 s), 10 s 이동
+  p99 최대 0.110 s < 거부 0.12 s, 트립 0; ~28 Hz 부터 건강한 링크도 거부(6355회 중 16회) [유도 `…/impl-rates/out/
+  age_at_rates.json`]. `SCALED_IMU2` 는 이 기체에서 가속도·자이로가 **전부 0** 인데(기록 27/27) VehicleImu `ax..az` 가 늘
+  여기서 읽혀 왔다(EKF 가속도, dobmpc EAOB 의 nudot, station bridge DVL 단) — 끄면 그 소비자들이 처음으로 진짜 가속도계(RAW_IMU)를
+  먹으므로 레이트 변경의 부수효과로 바꾸지 않고 켜 둔다(`--mavlink-scaled-imu2-rate 0` = 끄고 RAW_IMU 로 전환, 운용자 결정;
+  KNOWN_ISSUES 2026-10-15 'IMU 스트림'). 요청·실제 수신 레이트는 런 meta `mavlink_streams` 와 `*_rov.json` `stream_request` 에 남는다.
+  소비자별 표: `RL_controller/logs/eval/station_fix_20261015/impl-rates/NOTES.md`.
 * **C3 IMU**: accel+gyro만 쓰면 스탠드얼론 ~486 Hz(`c3_camera/pipeline.py` 실측).
   배치 임계값은 10 — 이 레이트에서 1이면 샘플이 샌다(`c3_collect.py` 실측).
   `--no-c3-imu`로 끌 수 있다.
@@ -4533,8 +4645,10 @@ engage:
   잡는다(`ATC_ANG_YAW_P 6`, 슬루 60°/s); 그 위는 rate 서보(cap 0.5에서 PilotGain 1이면 ~68°/s,
   부팅 기본 0.5면 ~32°/s; 적분 있는 rate PID). 스테이션의 NMPC/PID는 N을 **토크**로 계산하므로
   플랜트 가정이 통째로 어긋난다. 그래서 기본은 `hold`: yaw 축을 0으로 보내고(CSV `ax_yaw` 0, `uN`은
-  솔버 값 유지, `note_applied`엔 N=0) 헤딩은 오토파일럿의 heading hold가 잡는다 → **heading_follow·
-  circle·정책 dyaw는 기체를 못 돌린다**(engage 때 경고). `torque`는 N을 그대로 보내는 실험 모드로,
+  솔버 값 유지, `note_applied`엔 N=0) 헤딩은 오토파일럿의 heading hold가 잡는다 → **정책 dyaw는
+  기체를 못 돌린다**(engage 때 경고). 진행 방향을 보는 square/circle(heading_follow — square의
+  `yaw = travel`)은 2026-10-14부터 **START가 거부**한다(station facing tag와 같은 이유).
+  `torque`는 N을 그대로 보내는 실험 모드로,
   데드존 경계에서 hunting이 예측된다. 실기록의 yaw 지령 p50은 12–43 카운트라 MANUAL에서도 사실상
   T200 데드밴드 안이었다는 점을 같이 보라.
 * **surge/sway/heave는 MANUAL과 바이트 동일**(`control_stabilize.cpp`: forward/lateral/throttle

@@ -1992,3 +1992,79 @@ LEVEL q_des, so a 7-dim policy's roll/pitch were out of its distribution.
   held (meta: profile 20261004_default, active, q_scale 4 / along 3 from the profile) — synthetic plant, wiring only.
   **Zero water runs** — but the default profile reproduces the previous values, so behaviour is unchanged until a different
   profile is picked.
+
+## 2026-10-14 — The hardware square's yaw mode: fixed (crab) | face the direction of travel (turn in place at each vertex); panel default tag 37 · 1×1 m · 0.10 m/s (zero water runs)
+
+* **Why:** operator request — choose on the panel between today's square (one heading, crabbing) and one that **faces the
+  direction of travel** (+y side → face +y, +x → +x, −y → −y, −x → −x). `heading_follow` existed in the code, but on the
+  hardware spatial follower (`PathCursor`, `path_fillet_m: 0.0`) it made the yaw reference **step 90° in one stage** at each
+  vertex and put a (π/2)/0.05 = 31 rad/s spike into the NMPC plan's `r_ned` [유도]; `yaw_rate_deg_s` (60) is read only by the
+  wall-clock sampler and the follow mission, so in path mode it bounded nothing. Every hardware square/circle had flown
+  `heading_follow: false` [측정: `data/*/*/mpc_*.meta.json`]. The sim's heading_follow (slewing at 60°/s while moving)
+  contradicts a sharp vertex's position reference (memory square-corner-error-floor); the hardware reference already
+  **stops** at the vertex, so turning there is the one way that asks for nothing unrealizable on top.
+* **What (theory):** a fillet-0 rectangle under heading_follow gets a `_Pivot` (position fixed, heading turning) at every
+  vertex. The pivot's nominal arclength L is set from the turn rate, so the time the cursor takes to cross it at the creep
+  speed IS the turn time.
+
+  ```
+  ψ_ref(s) = ψ_fix = yaw_map_deg − yaw0                       (yaw fixed: crab)
+  ψ_ref(s) = ψ_path(s)                                        (yaw = travel)
+  vertex i:  p(s) = v_i,  ψ(s) = ψ_in + Δψ·(s − a_i)/L,  s ∈ [a_i, a_i + L),  Δψ = +π/2 (NED, clockwise from above)
+  L = v_creep·|Δψ| / ω_turn          (0.02 m/s, 90°, 20°/s → L 0.09 m, T = L/v_creep = 4.5 s) [유도]
+  inside a pivot:  v_ref = 0
+  r_ref(stage k ≥ 1) = (dψ/ds)·v_nominal              (a forecast, at the same nominal speed as the horizon's positions)
+  r_ref(stage 0)     = [ψ(θ_cmd,k) − ψ(θ_cmd,k−1)] / Δt,  |·| ≤ nominal rate   (the turn the reference really made)
+  r_ref(s ≥ s_end)   = 0
+  approach/settle heading = ψ_path(0)  (the first side; map +x unrotated)  → no yaw step when the path arms
+  lap time (1×1 m @0.10, a_long 0.05) ≈ 49 s → ≈ 65 s  (+ 4·4.5 s) [유도: speed_profile, reference time]
+  ```
+* **How:** `path_geometry.path_from_scenario` (+ `pivot_speed_m_s` = `path_creep_m_s`) builds `_pivoted_polygon` only for
+  heading_follow ∧ square ∧ fillet ≈ 0 — crab, filleted, circle and line geometry unchanged. `PathCursor` became
+  **pivot-aware**: (a) the projection may not pass the START of the first pivot the **setpoint** has not finished (every
+  point of a pivot is the same xy, so the argmin tie let the projection skip it — an 88° one-tick step [유도: offline
+  PathCursor]), (b) once the setpoint is inside the first pivot the **hull** has not finished and the hull has arrived
+  (projection at the vertex, or within 5 cm of it — `PIVOT_CAPTURE_M`), the hull's progress follows the setpoint's (a turn
+  is time, not distance; this removes the leash trapping the setpoint inside a long pivot and the path that ends in a pivot
+  never reaching `complete` — RL parks ~1.8 cm short of a vertex [유도: offline PathCursor + Fossen plant], hence the
+  distance test), (c) a pivot is crossed at its own speed exactly, (d) inside a pivot `v_ned = 0`, and `r_ned` as above.
+  On a path without pivots, `step()` and a fixed-heading `plan()` are element-for-element what they were (the test's
+  legacy-cursor oracle); a heading_follow plan's `r_ned` changed on purpose on every path (analytic, K=1 included). Worker:
+  a square/circle that faces its travel approaches and settles on its first tangent (read off the same curve,
+  `_path_start_yaw` — placed without the wall-clock sampler, a geometry error refuses START); START is refused **before the
+  approach** under STABILIZE + `yaw_axis: hold`, on MPCC/DOBMPCC (square), with `path_fillet_m` > 0 and with
+  `path_following: false` (the first two cannot honour the turn rate, the last two build no vertex pivots). HwRl clips a
+  plan-carried r to `yaw_rate_max` (0.6 — not an export number: in-place 0.4 / heading-follow arcs 1.0 [스펙:
+  obs_spec.json]) and keeps its previous yaw every tick (no one-tick rate spike after a turn). Panel: a NoFocus combo
+  `yaw fixed +y | yaw = travel`, visible for Square only, riding the scenario as `heading_follow` (always false for the
+  other shapes; deaf to the wheel), frozen from START, `· yaw = travel` on the chip; Esc on an open combo list is the
+  E-STOP (all three combos). Turn rate `square.vertex_turn_deg_s` 20°/s — inside the RL policies' trained in-place yaw rate
+  0.4 rad/s [스펙: `rov_gui/control/rl_policies/traj12_s2/obs_spec.json`]; ceiling 90°/s (refused at load), a warning
+  above 22.9°/s on an RL LOW. Panel defaults (the YAML seed): tag 37, 1.0 × 1.0 m, 0.10 m/s, yaw fixed — the tag and speed
+  boxes are shared by every shape, the distance box is remembered per shape (size/length/radius), the startup shape stays
+  station, and the window sends the panel's scenario to the worker once the backend is attached.
+* **Review (2026-10-14, 6 lenses + an adversarial verifier per finding) → fixed:** the capture is keyed on the **hull's**
+  next pivot, not the setpoint's (a slow follower reaching the last pivot after the setpoint never completed — the shipped
+  line behind a 0.03 m/s follower [유도]); the K=1 plan sent a nominal 20°/s while the leash held the setpoint still →
+  stage 0 is the turn the reference really made; r and `ref_speed` are 0 at the end; fillet/path_following refusals; the
+  panel's scenario never reached the worker at startup; the shared distance box opened Circle at r 1.00 m after a station
+  start; combo Esc/wheel.
+* **Side effect (record boundary):** a line also ends in a pivot and so, by the same defect, could **never complete**
+  (offline a 1 m × 2-lap line stalled at θ 4.07 of 4.08, the shipped 2 m × 5 at 20.18 of 20.20, forever [유도: the
+  pre-change cursor]; no hardware line has a completion on record). With the pivot-aware cursor a line completes
+  (`demo_e2e.py pid line` → `line complete`; the KNOWN_ISSUES 2026-08-17 "budget" entry had the wrong cause and is
+  deleted), and its turnarounds hold v = 0.
+* **Records (boundary):** meta `trajectory.heading_follow`, `.vertex_turn_deg_s` (every square; FLOWN only where
+  `vertex_pivot` is present), `.vertex_pivot` (len, speed, per_lap, capture), `reference_clock.strategy =
+  "waypoint_vertex_pivot"`, `reference_clock.pivot_capture_m` (present = the new cursor, lines included). Never pool with
+  crab squares or with the sim's heading_follow squares.
+* **Result:** unit tests (cursor rate/completion/slow follower/real stage-0 r/byte-identity oracle, worker approach→settle→
+  arm heading/refusals/completion/meta, config validation, RL r, panel yaw combo/per-shape distance box/Esc and wheel,
+  window attach) pass. Fossen prediction-model closed loop, 1×1 m @0.10, 2 laps [예측/sim, no artifact]: PID, MPC_Tuned
+  and RL all complete, reference yaw rate ≤ 20.0°/s, the target within 1 mm of the vertex while turning; heading error on
+  the straights p95 PID ≤0.5°, MPC_Tuned ≤0.4°, RL ~12°. Demo toy-plant e2e `rov_gui/tests/demo_e2e.py <pid|mpc_tuned|rl>
+  square_travel` (0.6×0.4 @0.15, 1 lap): all three LOWs `square complete` — a wiring check, not a performance figure
+  [예측/sim]. **Zero water runs.** Remaining limits [예측]: on the ±x sides the C3 looks across the mat's short dimension
+  and may lose tags (no dropout bridge on paths), the tether twists one turn per lap, the reported origin sits behind the
+  true yaw pivot so an in-place turn may translate the hull, and START's first turn is an unramped yaw step (KNOWN_ISSUES
+  "square `yaw = travel`").

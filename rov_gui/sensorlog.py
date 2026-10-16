@@ -54,9 +54,15 @@ class SensorLog:
     same message.
     """
 
-    def __init__(self, path: Path | str, source: str):
+    def __init__(self, path: Path | str, source: str,
+                 extra: dict | None = None):
         self.path = Path(path)
         self.source = source
+        # What the SOURCE knows about itself that the counts cannot say — e.g.
+        # the rov log's `stream_request` (the rates the station asked the
+        # vehicle for, beside the hz_measured it got; 2026-10-15). Added to
+        # the manifest; never replaces one of its own keys.
+        self.extra: dict = dict(extra) if extra else {}
         self.counts: Counter[str] = Counter()
         self.error: str = ""
         self.started_at = time.monotonic()
@@ -122,9 +128,12 @@ class SensorLog:
                      "sensor-side timestamps are preserved in each record",
             "error": self.error or None,
         }
+        for k, v in self.extra.items():
+            meta.setdefault(k, v)
         try:
-            self.path.with_suffix(".json").write_text(json.dumps(meta, indent=2))
-        except OSError:
+            self.path.with_suffix(".json").write_text(
+                json.dumps(meta, indent=2, default=_jsonable))
+        except (OSError, ValueError):
             pass
         return meta
 

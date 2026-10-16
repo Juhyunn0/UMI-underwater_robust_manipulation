@@ -18,8 +18,11 @@ Halves, in the order a failure should be read:
     worker    the real MpcWorker (stub controller): off = unchanged; the
               switch is frozen while engaged and eligibility is decided at
               engage; fallback; the bridge's DVL rung and its bounds
-    client    the TCP reader against a local fake server
-    panel     the button reflects the worker and never flips itself
+    client    the TCP reader against a local fake server; the temperature
+              poller against a local fake status page (GET only), and the
+              SENSORS row it feeds — the temperature is said BEFORE the lock
+    panel     the button reflects the worker and never flips itself, and an
+              IN switch is readable (rendered, measured contrast)
 
     QT_QPA_PLATFORM=offscreen \\
       ~/miniforge3/envs/robust/bin/python rov_gui/tests/test_dvl.py
@@ -1871,7 +1874,7 @@ def test_with_no_dvl_the_worker_is_what_it_was_and_says_so():
             w.set_dvl_use(True)               # nothing to switch
             assert "no DVL" in w.reason
             m = w._run_meta()
-            assert m["dvl"]["enabled"] is False and m["schema_version"] == 20
+            assert m["dvl"]["enabled"] is False and m["schema_version"] == 21
             rows = _rows(w)
             assert rows and all(r["vel_src"] == "tag_fd" for r in rows)
             assert all(r["dvl_u"] == "nan" and r["dvl_ok"] == "0"
@@ -3020,7 +3023,530 @@ def test_a_dead_address_is_a_reported_state_not_an_exception():
     c.stop()
 
 
-# ====================================================================== panel
+def _wait(cond, timeout_s: float, what: str = "") -> None:
+    t_end = time.monotonic() + timeout_s
+    while time.monotonic() < t_end:
+        if cond():
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {what or cond}")
+
+
+class _FakeStatusPage:
+    """The DVL's web server, as far as /api/v1/about/status goes. Records
+    every request's METHOD, path and headers, whatever the method."""
+
+    def __init__(self, body: bytes = b'{"cpu_load":1.64,"disk_free":{"data":'
+                                      b'2.46,"root":0.211},"temperature":38.25}'):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        page = self
+        self.reply = (200, body)
+        self.requests: list = []
+
+        class H(BaseHTTPRequestHandler):
+            def parse_request(self):
+                ok = super().parse_request()
+                if ok:
+                    page.requests.append((self.command, self.path,
+                                          dict(self.headers)))
+                return ok
+
+            def do_GET(self):
+                status, data = page.reply
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *_a):
+                pass
+
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.srv.daemon_threads = True
+        # the oversized page is hung up on mid-write, deliberately
+        self.srv.handle_error = lambda _request, _address: None
+        self.port = self.srv.server_address[1]
+        self.th = threading.Thread(target=self.srv.serve_forever,
+                                   kwargs={"poll_interval": 0.05}, daemon=True)
+        self.th.start()
+
+    def close(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+        self.th.join(2.0)
+
+
+class _RawPage:
+    """A TCP server that accepts and then says nothing (``"mute"``), or
+    starts an answer and drips one header byte every 50 ms for ever
+    (``"drip"`` — every recv is inside any socket timeout)."""
+
+    def __init__(self, mode: str):
+        self.mode = mode
+        self.stop = threading.Event()
+        self.srv = socket.socket()
+        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.srv.bind(("127.0.0.1", 0))
+        self.srv.listen(4)
+        self.srv.settimeout(0.1)
+        self.port = self.srv.getsockname()[1]
+        self.th = threading.Thread(target=self._run, daemon=True)
+        self.th.start()
+
+    def _run(self):
+        while not self.stop.is_set():
+            try:
+                c, _ = self.srv.accept()
+            except OSError:
+                continue
+            threading.Thread(target=self._serve, args=(c,), daemon=True).start()
+
+    def _serve(self, c):
+        try:
+            if self.mode == "drip":
+                c.sendall(b"HTTP/1.1 200 OK\r\nX-Drip: ")
+                while not self.stop.wait(0.05):
+                    c.sendall(b"a")
+            else:
+                self.stop.wait()
+        except OSError:
+            pass
+        finally:
+            c.close()
+
+    def close(self):
+        self.stop.set()
+        self.th.join(2.0)
+        self.srv.close()
+
+
+def test_the_temperature_is_a_get_of_the_status_page_and_nothing_else():
+    """The number the vendor GUI shows, from the page it shows it from. A
+    page that is missing, not JSON or not a temperature is a reported state:
+    the thread lives, and the last good reading keeps ITS stamp (the worker
+    stops showing it when it is too old — never a frozen number). A server
+    that never answers is a timeout; one that keeps a request open by
+    dripping bytes is reported STUCK, since no socket timeout ever fires."""
+    from rov_gui.backends import dvl as BD
+
+    srv = _FakeStatusPage()
+    p = None
+    try:
+        p = BD.DvlTempPoller("127.0.0.1", port=srv.port, period_s=0.03,
+                             timeout_s=0.5)
+        p.start()
+        _wait(lambda: p.latest()[0] is not None, 3.0, "a first reading")
+        assert p.latest()[0] == 38.25 and p.latest()[2] == ""
+        assert p.last_try()[1] is True
+        pages = p.drain()
+        assert pages and pages[0][1]["cpu_load"] == 1.64     # verbatim page
+        # From here no page is good, so the last good stamp can no longer
+        # move under the test.
+        srv.reply = (404, b'{"code":"not_found"}')
+        n = p.n_fail
+        _wait(lambda: p.n_fail >= n + 2, 3.0, "HTTP 404")    # a whole poll
+        temp, t_good, err = p.latest()
+        assert temp == 38.25 and "HTTP 404" in err
+        assert p.last_try()[1] is True        # a 404 is an ANSWER: it is up
+        for status, body, needle in (
+                (200, b"<html>", "JSONDecodeError"),
+                (200, b"[38.0]", "not an object"),
+                (200, b'{"cpu_load":1.0}', "not a temperature"),
+                (200, b'{"temperature":true}', "not a temperature"),
+                (200, b'{"temperature":NaN}', "not a temperature"),
+                (200, b'{"temperature":38250}', "not a temperature"),  # m°C
+                (200, b"{" + b" " * 20000 + b"}", "longer than")):
+            srv.reply = (status, body)
+            n = p.n_fail
+            _wait(lambda: p.n_fail >= n + 2, 3.0, needle)
+            temp, t_kept, err = p.latest()
+            assert needle in err, (needle, err)
+            assert temp == 38.25 and t_kept == t_good, (temp, t_kept)
+            assert p.last_try()[1] is True, needle        # answered, uselessly
+            assert p._thread is not None and p._thread.is_alive()
+        srv.reply = (200, b'{"temperature":41.5}')
+        _wait(lambda: p.latest()[0] == 41.5, 3.0, "recovery")
+        assert p.latest()[2] == "" and p.last_try()[1] is True
+        # poke(): now, not at the end of the period
+        p.period_s = 30.0
+        time.sleep(0.2)                       # the 30 s wait has begun
+        n = len(srv.requests)
+        p.poke()
+        _wait(lambda: len(srv.requests) > n, 1.0, "a poked poll")
+        th = p._thread
+        t0 = time.monotonic()
+        p.stop()
+        assert time.monotonic() - t0 < 1.0 and not th.is_alive()
+    finally:
+        if p is not None:
+            p.stop()
+        srv.close()
+    # A read and nothing else: GET, of that one page, every time — framed
+    # like the urllib probe that read the real A50 (Connection: close).
+    assert srv.requests
+    assert {m for m, _path, _h in srv.requests} == {"GET"}, srv.requests
+    assert {path for _m, path, _h in srv.requests} == {BD.STATUS_PATH}
+    assert all(h.get("Connection") == "close" for _m, _p, h in srv.requests)
+
+    mute, drip = _RawPage("mute"), _RawPage("drip")
+    q = None
+    try:
+        q = BD.DvlTempPoller("127.0.0.1", port=mute.port, period_s=0.05,
+                             timeout_s=0.3)
+        q.start()
+        _wait(lambda: q.n_fail >= 1, 3.0, "a timeout")
+        assert "timed out" in q.latest()[2], q.latest()
+        assert q.last_try()[1] is False                   # no answer at all
+        q.stop()
+        q = BD.DvlTempPoller("127.0.0.1", port=drip.port, period_s=0.05,
+                             timeout_s=0.3)
+        q.start()
+        _wait(lambda: "stuck" in q.latest()[2], 3.0, "a stuck request")
+        assert q.n_fail == 0 and q.last_try() == (None, False)
+    finally:
+        if q is not None:
+            q.stop()
+        mute.close()
+        drip.close()
+
+    # nothing listening: a state, not an exception
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    dead = s.getsockname()[1]
+    s.close()
+    q = BD.DvlTempPoller("127.0.0.1", port=dead, period_s=0.05, timeout_s=0.3)
+    try:
+        q.start()
+        _wait(lambda: q.n_fail >= 1, 3.0, "a refused GET")
+    finally:
+        q.stop()
+    assert q.latest()[0] is None and "Refused" in q.latest()[2], q.latest()
+    assert q.last_try()[1] is False
+
+
+class _TempRig:
+    """A DvlWorker on a stub TCP client and a stub poller, on a FAKE clock
+    (``backends.dvl.now`` patched, put back by ``close()``), so the 0.5 s
+    stat, the 2 s link, the 20 s staleness and BIT0_CLEAR_S are steps, not
+    sleeps."""
+
+    _KEEP = object()
+
+    def __init__(self):
+        from rov_gui.backends import dvl as BD
+        from rov_gui.bus import DataBus
+
+        TC = _harness()
+        TC._app()
+        self.BD = BD
+        self.t = 1000.0
+        self._real_now = BD.now
+        BD.now = lambda: self.t
+
+        class Client:
+            host, port, reconnect_s, error, config_poll_s = "x", 1, 1.0, "", 0.0
+            state = Conn.ONLINE
+
+            def __init__(self):
+                self.items = []
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+            def drain(self):
+                out, self.items = self.items, []
+                return out
+
+        class Temp:
+            host, period_s = "192.0.2.1", 5.0
+
+            def __init__(self):
+                self.reading = (None, None, "")
+                self.tried = (None, False)
+                self.pages = []
+                self.n_fail = 0
+                self.pokes = 0
+                self.stopped = False
+
+            def start(self):
+                pass
+
+            def stop(self):
+                self.stopped = True
+
+            def poke(self):
+                self.pokes += 1
+
+            def latest(self):
+                return self.reading
+
+            def last_try(self):
+                return self.tried
+
+            def drain(self):
+                out, self.pages = self.pages, []
+                return out
+
+        lines = [DV.parse_line(ln) for ln in CAPTURE.read_bytes().split(b"\n")]
+        self.lock = next(r for r in lines if r and r.get("type") == "velocity"
+                         and r.get("velocity_valid"))
+        self.no_lock = dict(self.lock, velocity_valid=False, altitude=-1.0)
+        self.stats, self.logs = [], []
+        bus = DataBus()
+        bus.sensor_stat.connect(self.stats.append)
+        bus.log.connect(lambda lvl, m: self.logs.append((lvl, m)))
+        self.cl, self.tp = Client(), Temp()
+        self.w = BD.DvlWorker(bus, object(), client=self.cl, temp=self.tp)
+        self.w.setup()
+
+    def row(self, rep=None, temp=_KEEP, dt=0.1):
+        """Advance the clock by ``dt``, deliver ``rep`` (if any) and a fresh
+        successful reading (if ``temp`` is given), publish one stat."""
+        self.t += dt
+        if rep is not None:
+            self.cl.items.append((self.t, rep, b"", 1))
+        if temp is not self._KEEP:
+            self.tp.reading = (temp, self.t, "")
+            self.tp.tried = (self.t, True)
+        self.w._t_stat = -1e9
+        self.w.tick()
+        return self.stats[-1]
+
+    def page_fails(self, err="TimeoutError: timed out", dt=0.1,
+                   answered=False):
+        """A request completed ``dt`` after now and failed — with no answer
+        at all, or (``answered``) with a useless one; the reading stays."""
+        self.tp.tried = (self.t + dt, answered)
+        self.tp.reading = (self.tp.reading[0], self.tp.reading[1], err)
+
+    def said(self, word):
+        return [m for _lvl, m in self.logs if word in m]
+
+    def close(self):
+        self.BD.now = self._real_now
+        self.w.teardown()
+
+
+def test_the_sensors_row_says_the_temperature_before_the_lock():
+    """Out of the water is the only place this DVL overheats, and there it
+    never has a lock: HOT / HIGH TEMP must win over "no lock" (until
+    2026-10-13 bit 0 was checked after it, out of sight) — and bit 0 with NO
+    number (an older firmware's 404) too. HOT is the 45/44 °C band in the
+    row and the log alike; bit 0 is held until clear for BIT0_CLEAR_S; each
+    change is logged once; the rate leads every detail that carries a °C,
+    or SensorRow would show the bare rate instead."""
+    from rov_gui.widgets.health import SensorRow
+
+    r = _TempRig()
+    try:
+        BD, lock, no_lock = r.BD, r.lock, r.no_lock
+        assert any("temperature GET http://192.0.2.1/api/v1/about/status" in m
+                   for _l, m in r.logs)
+        r.row(lock)
+        s = r.row(lock)                                  # two reports = a rate
+        assert s.conn is Conn.ONLINE and s.detail.startswith("10 Hz alt")
+        assert "°C" not in s.detail and not r.said("dvl: temperature ")
+        s = r.row(lock, temp=21.4)
+        assert s.conn is Conn.ONLINE and s.detail.startswith("10 Hz alt")
+        assert s.detail.endswith(" 21.4°C"), s.detail
+        s = r.row(no_lock, temp=38.2)                    # in air, still cool
+        assert s.conn is Conn.DEGRADED and s.detail == "10 Hz no lock 38.2°C"
+        s = r.row(no_lock, temp=46.3)                    # in air, HOT: wins
+        assert s.conn is Conn.DEGRADED and s.detail == "10 Hz HOT 46.3°C"
+        s = r.row(no_lock, temp=44.5)                    # inside the band
+        assert s.detail == "10 Hz HOT 44.5°C" and not r.said("back to"), s
+        s = r.row(no_lock, temp=43.9)
+        assert s.detail == "10 Hz no lock 43.9°C", s.detail
+        assert len(r.said("back to 43.9")) == 1
+        s = r.row(lock, temp=46.5)                       # a lock changes nothing
+        assert s.detail == "10 Hz HOT 46.5°C", s.detail
+        hot = r.said("dvl: HOT")
+        assert len(hot) == 2 and "acoustics OFF" in hot[0]
+        assert len(r.said("°C (HOT at")) == 1            # once, not per stat
+        # the device's own flag with NO number — an older firmware's 404
+        r.tp.reading = (None, None, "RuntimeError: HTTP 404 for /api/v1/about")
+        r.tp.n_fail = 1
+        s = r.row(dict(no_lock, status=1))
+        assert s.conn is Conn.DEGRADED and s.detail == "10 Hz HIGH TEMP", s
+        assert len(r.said("no temperature (RuntimeError: HTTP 404")) == 1
+        s = r.row(dict(no_lock, status=1), temp=40.0)   # ...or a cool one
+        assert s.detail == "10 Hz HIGH TEMP 40.0°C", s.detail
+        # held: a flag flickering at its threshold is ONE warning
+        s = r.row(no_lock, temp=40.0)
+        assert s.detail == "10 Hz HIGH TEMP 40.0°C", s.detail
+        r.row(dict(no_lock, status=1), temp=40.0)
+        s = r.row(no_lock, temp=40.0, dt=BD.BIT0_CLEAR_S - 1.0)
+        assert "HIGH TEMP" in s.detail and not r.said("flag cleared")
+        s = r.row(no_lock, temp=40.0, dt=1.5)
+        assert s.detail.endswith("no lock 40.0°C"), s.detail
+        assert len(r.said("status bit 0")) == 1
+        assert len(r.said("flag cleared")) == 1
+        # a valid report with no altitude still leads with the rate...
+        r.row(lock, temp=30.0)
+        s = r.row(dict(lock, altitude=None), temp=30.0)
+        assert s.conn is Conn.ONLINE and s.detail.endswith(" Hz 30.0°C"), s
+        assert "alt" not in s.detail
+        # ...because the row shows a detail only if it carries "Hz"
+        for st in (s, r.row(no_lock, temp=46.0)):
+            sr = SensorRow("DVL")
+            sr.update_from(st)
+            assert sr.value.text() == st.detail and "°C" in sr.value.text()
+        # a reading that stopped updating is not shown — said once, even
+        # when no request ever FAILED (a hung one never does)
+        r.tp.n_fail = 0
+        r.tp.reading = (46.0, r.t - BD.TEMP_STALE_S - 1.0,
+                        "status page request stuck 9 s")
+        s = r.row(lock)
+        assert "°C" not in s.detail and "HOT" not in s.detail, s.detail
+        r.row(lock)
+        assert len(r.said("no temperature (status page request stuck")) == 1
+        # the pages go into the run's raw log, beside the reports
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = str(Path(tmp) / "run")
+            r.w.set_raw_log(True, stem)
+            try:
+                r.tp.pages = [(r.t, {"cpu_load": 1.2, "temperature": 43.1})]
+                r.row(lock)
+            finally:
+                r.w.set_raw_log(False, "")
+            recs = [json.loads(x) for x in
+                    Path(stem + "_dvl.jsonl").read_text().splitlines()]
+            pages = [x for x in recs if x["msg"] == "about_status"]
+            assert len(pages) == 1 and pages[0]["temperature"] == 43.1
+            assert any(x["msg"] == "velocity" for x in recs)
+    finally:
+        r.close()
+    assert r.tp.stopped
+
+
+def test_a_link_lost_while_hot_is_a_shutdown_only_once_the_page_fails_too():
+    """The vendor restarts a DVL that reached 55 °C, so a velocity stream
+    that stops while it was hot MAY be a thermal shutdown — or the operator
+    turning acoustics OFF, as the station's own HOT line tells them to, or a
+    TCP hiccup. The call is made only when the DVL was hot at the last
+    linked stat (its own bit 0, or a reading at TEMP_NEAR_SHUTDOWN_C) AND a
+    status-page request completed SINCE got no answer at all; any answer —
+    even an older firmware's 404 — withdraws it. Logged once per outage,
+    with no frozen number on the row."""
+    r = _TempRig()
+    try:
+        BD, lock, no_lock = r.BD, r.lock, r.no_lock
+        r.row(lock, temp=40.0)
+        r.row(dict(no_lock, status=1), temp=40.0)        # hot: its bit 0
+        # the stream stops; no request has completed since: nothing yet
+        r.cl.state, r.cl.error = Conn.OFFLINE, "silent for 5 s"
+        s = r.row(dt=2.5)
+        assert s.conn is Conn.OFFLINE and s.detail == "no link 40.0°C", s
+        assert r.tp.pokes == 1 and not r.said("SHUTDOWN")  # asked at once
+        r.row(dt=0.5)
+        assert r.tp.pokes == 1                             # once per loss
+        # the page answers (acoustics OFF, a hiccup): the device is up
+        r.tp.tried, r.tp.reading = (r.t + 0.1, True), (40.2, r.t + 0.1, "")
+        s = r.row(dt=0.5)
+        assert s.conn is Conn.OFFLINE and not r.said("SHUTDOWN"), s
+        # ...then it stops answering too: now it is a likely thermal shutdown
+        r.page_fails()
+        s = r.row(dt=0.5)
+        assert s.conn is Conn.FAULT and s.detail == "THERMAL SHUTDOWN?", s
+        e = r.said("LIKELY THERMAL SHUTDOWN")
+        assert len(e) == 1 and "its bit 0" in e[0], e
+        r.row(dt=0.5)
+        assert len(r.said("LIKELY THERMAL SHUTDOWN")) == 1   # once per outage
+        # the page comes back: withdrawn (once); fails again: FAULT, no new
+        # error line; the row stays bounded, the error text is in the log
+        r.tp.tried, r.tp.reading = (r.t + 0.1, True), (52.0, r.t + 0.1, "")
+        s = r.row(dt=0.5)
+        assert s.conn is Conn.DEGRADED and s.detail == "no link HOT 52.0°C", s
+        assert len(r.said("answers again")) == 1
+        r.page_fails()
+        s = r.row(dt=0.5)
+        assert s.conn is Conn.FAULT
+        assert len(r.said("LIKELY THERMAL SHUTDOWN")) == 1
+        # back, and cooled: linked rows again, each change said once
+        r.cl.state, r.cl.error = Conn.ONLINE, ""
+        r.row(lock, temp=43.0, dt=BD.BIT0_CLEAR_S)
+        s = r.row(lock, temp=43.0)
+        assert s.conn is Conn.ONLINE and s.detail.endswith("43.0°C"), s
+        assert r.said("back to 43.0") and r.said("flag cleared")
+        # NOT hot at the last linked stat: the plain "no link", however
+        # hot it was before and whatever the page does
+        r.cl.state, r.cl.error = Conn.OFFLINE, "closed by the DVL"
+        r.page_fails()
+        s = r.row(dt=2.5)
+        assert s.conn is Conn.OFFLINE and s.detail == "no link 43.0°C", s
+        r.tp.tried, r.tp.reading = (r.t + 0.1, True), (47.0, r.t + 0.1, "")
+        s = r.row(dt=0.5)
+        assert s.conn is Conn.DEGRADED and s.detail == "no link HOT 47.0°C"
+        assert r.tp.pokes == 1 and len(r.said("LIKELY THERMAL")) == 1
+        # a reading at TEMP_NEAR_SHUTDOWN_C is hot-at-the-link without bit 0
+        r.cl.state, r.cl.error = Conn.ONLINE, ""
+        r.row(no_lock, temp=BD.TEMP_NEAR_SHUTDOWN_C + 0.5)
+        r.row(no_lock, temp=BD.TEMP_NEAR_SHUTDOWN_C + 0.5)
+        r.cl.state, r.cl.error = Conn.OFFLINE, "silent for 5 s"
+        r.row(dt=2.5)
+        r.page_fails()
+        s = r.row(dt=0.5)
+        assert s.conn is Conn.FAULT and r.tp.pokes == 2
+        e = r.said("LIKELY THERMAL SHUTDOWN")
+        assert len(e) == 2 and f"{BD.TEMP_NEAR_SHUTDOWN_C + 0.5:.1f} °C" in e[1]
+        # ANY answer says the device is up: a 404 after the loss is no call
+        hot = BD.TEMP_NEAR_SHUTDOWN_C + 0.5
+        r.cl.state, r.cl.error = Conn.ONLINE, ""
+        r.row(no_lock, temp=hot)
+        r.row(no_lock, temp=hot)
+        r.cl.state, r.cl.error = Conn.OFFLINE, "silent for 5 s"
+        r.page_fails(err="RuntimeError: HTTP 404 for /api/v1/about/status",
+                     answered=True)
+        s = r.row(dt=2.5)
+        assert s.conn is not Conn.FAULT, s
+        # a page already silent BEFORE the loss decides nothing until a
+        # request made AFTER it comes back silent too
+        r.cl.state, r.cl.error = Conn.ONLINE, ""
+        r.row(no_lock, temp=hot)
+        r.page_fails(dt=0.0)
+        r.row(no_lock)                                   # linked, page silent
+        r.cl.state, r.cl.error = Conn.OFFLINE, "silent for 5 s"
+        s = r.row(dt=2.5)
+        assert s.conn is not Conn.FAULT, s
+        r.page_fails()
+        s = r.row(dt=0.5)
+        assert s.conn is Conn.FAULT and len(r.said("LIKELY THERMAL")) == 3
+    finally:
+        r.close()
+
+
+def test_a_worker_that_builds_its_client_builds_the_poller_beside_it():
+    """Same host as the TCP stream (one place says where the DVL is); an
+    injected client brings its own poller or none."""
+    from rov_gui.backends import dvl as BD
+    from rov_gui.bus import DataBus
+
+    class O:
+        mpc_config = str(ROOT / "config" / "hw_mpc.yaml")
+        dvl = True
+        dvl_host = "127.0.0.1"
+        dvl_port = 9
+
+    started = []
+    real = (BD.DvlClient.start, BD.DvlTempPoller.start)
+    BD.DvlClient.start = lambda self: started.append("tcp")
+    BD.DvlTempPoller.start = lambda self: started.append("temp")
+    try:
+        w = BD.DvlWorker(DataBus(), O())
+        w.setup()
+        assert isinstance(w.temp, BD.DvlTempPoller)
+        assert w.temp.host == "127.0.0.1" and w.temp.port == 80
+        assert started == ["tcp", "temp"]
+    finally:
+        BD.DvlClient.start, BD.DvlTempPoller.start = real
+    w.teardown()
+
+
 def test_the_panel_button_reflects_the_worker_and_never_flips_itself():
     TC = _harness()
     TC._app()
@@ -3055,6 +3581,143 @@ def test_the_panel_button_reflects_the_worker_and_never_flips_itself():
     p.add_status(MpcStatus(engaged=True, mode="pid", bridge_tier="dvl",
                            dvl_state="in_use", dvl_use=True, vel_src="dvl"))
     assert "NO TAG (DVL)" in p.chip.text()
+
+
+def _pixels(btn):
+    """A rendered button: (its pixels as an [h][w] grid of RGB, background)
+    — the background being the most common colour inside the border."""
+    from collections import Counter
+
+    from rov_gui.qt import QtGui
+
+    img = btn.grab().toImage()
+    grid = [[QtGui.QColor(img.pixel(x, y)).getRgb()[:3]
+             for x in range(img.width())] for y in range(img.height())]
+    inner = [c for row in grid[4:-4] for c in row[4:-4]]
+    return grid, Counter(inner).most_common(1)[0][0]
+
+
+def _contrast(a, b):
+    def lum(c):
+        def ch(v):
+            v /= 255.0
+            return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
+        return 0.2126 * ch(c[0]) + 0.7152 * ch(c[1]) + 0.0722 * ch(c[2])
+    hi, lo = sorted((lum(a), lum(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _face(btn):
+    """(background, text, WCAG contrast): the interior pixel furthest from
+    the background is the text."""
+    grid, bg = _pixels(btn)
+    inner = [c for row in grid[4:-4] for c in row[4:-4]]
+    fg = max(inner, key=lambda c: _contrast(c, bg))
+    return bg, fg, _contrast(bg, fg)
+
+
+def _ink_width(btn) -> int:
+    """How many columns between the border carry label ink."""
+    grid, bg = _pixels(btn)
+    cols = [x for x in range(3, len(grid[0]) - 3)
+            if any(_contrast(row[x], bg) >= 3.0 for row in grid[4:-4])]
+    return 0 if not cols else cols[-1] - cols[0] + 1
+
+
+def _clipped(btn) -> bool:
+    """True when the label is cut: the same face drawn 80 px wider shows
+    more ink. (The app sheet makes checked text bold while the button is
+    sized for its regular label — "DVL TRIPPED" read ")VL TRIPPEI".)"""
+    from rov_gui.qt import QtWidgets
+
+    twin = QtWidgets.QPushButton(btn.text())
+    twin.setCheckable(btn.isCheckable())
+    twin.setChecked(btn.isChecked())
+    twin.setEnabled(btn.isEnabled())
+    twin.setStyleSheet(btn.styleSheet())
+    twin.setFixedSize(btn.width() + 80, btn.height())
+    twin.setDown(btn.isDown())
+    try:
+        return _ink_width(btn) + 1 < _ink_width(twin)
+    finally:
+        twin.deleteLater()
+
+
+def test_an_in_switch_is_readable_in_every_state():
+    """Operator screenshot 2026-10-13: "DVL IN" in amber on the app sheet's
+    light-blue checked fill, ~1:1 [유도: WCAG on theme.WARN vs theme.ACCENT;
+    1.07-1.87:1 rendered on the old faces, 측정: data/20261013/
+    1013_dvl_gui_render/render_dvl_ui_out.txt] — the widget sheet's colour beat
+    the app sheet's checked text. Rendered with the REAL app sheet, every
+    face of both state switches — checked, frozen, unchecked, pressed —
+    reads at 4.5:1 (WCAG AA); a checked one is FILLED with its state colour,
+    a frozen one keeps the dark face with the state in text and border; and
+    no label is cut."""
+    from rov_gui import theme
+    from rov_gui.widgets.trajectory import TrajectoryWindow
+
+    TC = _harness()
+    app = TC._app()
+    prev = app.styleSheet()
+    theme.apply(app)                       # the :checked fill IS the bug
+    p = None
+
+    def rgb(hex_):
+        return tuple(int(hex_[i:i + 2], 16) for i in (1, 3, 5))
+
+    def check(btn, kw, fill=None, frozen=None, down=False):
+        btn.setDown(down)
+        app.processEvents()
+        try:
+            bg, fg, cr = _face(btn)
+            assert cr >= 4.5, (kw, down, bg, fg, round(cr, 2))
+            if fill is not None:
+                assert btn.isChecked() and bg == rgb(fill), (kw, bg)
+            if frozen is not None:
+                assert not btn.isEnabled() and bg == rgb(theme.PANEL), (kw, bg)
+                assert fg == rgb(frozen), (kw, fg)
+            if down:
+                assert bg == rgb(theme.ACCENT), (kw, bg)
+            assert not _clipped(btn), (kw, down, btn.text())
+        finally:
+            btn.setDown(False)
+
+    try:
+        p = TrajectoryWindow()
+        p.show()
+        app.processEvents()
+        for kw, fill, frozen, down in (
+                (dict(dvl_state="fallback", dvl_use=True), theme.WARN, None,
+                 False),
+                (dict(dvl_state="in_use", dvl_use=True, vel_src="dvl"),
+                 theme.OK, None, False),
+                (dict(dvl_state="tripped", dvl_use=True), theme.FAIL, None,
+                 False),
+                (dict(dvl_state="tripped", dvl_use=False), None, None, False),
+                (dict(dvl_state="tripped", dvl_use=False), None, None, True),
+                (dict(dvl_state="shadow", dvl_use=False), None, None, False),
+                (dict(dvl_state="shadow", dvl_use=False), None, None, True),
+                (dict(dvl_state="in_use", dvl_use=True, vel_src="dvl",
+                      engaged=True, mode="pid"), None, theme.OK, False),
+                (dict(dvl_state="fallback", dvl_use=True, csv_open=True),
+                 None, theme.WARN, False)):
+            p.add_status(MpcStatus(**kw))
+            app.processEvents()
+            check(p.btn_dvl, kw, fill, frozen, down)
+        for kw, fill in ((dict(ekf_state="ready", ekf_control=True), theme.OK),
+                         (dict(ekf_state="warming", ekf_control=True),
+                          theme.WARN),
+                         (dict(ekf_state="fault", ekf_control=True),
+                          theme.FAIL),
+                         (dict(ekf_state="fault", ekf_control=False), None),
+                         (dict(ekf_state="ready", ekf_control=False), None)):
+            p.add_status(MpcStatus(**kw))
+            app.processEvents()
+            check(p.btn_est, kw, fill)
+    finally:
+        if p is not None:
+            p.close()
+        app.setStyleSheet(prev)
 
 
 def test_the_demo_dvl_is_synthetic_and_says_so():
@@ -3099,8 +3762,9 @@ def test_the_csv_header_carries_the_velocity_and_dvl_columns_at_the_end():
                               "dvl_ok", "dvl_valid", "dvl_fom", "dvl_alt_m",
                               "dvl_age_s"]
     # ...then schema 19's three pwm-LOW columns (2026-10-10, test_rl_pwm_scale pins them) and schema 20's
-    # pwm_guard (2026-10-10 b, test_rl_pwm_interlocks pins it): still append-at-end
-    assert cols[i + 15] == "est" and len(cols) == i + 15 + 16 + 3 + 1
+    # pwm_guard (2026-10-10 b, test_rl_pwm_interlocks pins it), and schema 21's three attitude-age columns
+    # (2026-10-15, test_att_age pins them): still append-at-end
+    assert cols[i + 15] == "est" and len(cols) == i + 15 + 16 + 3 + 1 + 3
     assert cols.index("vel_src") == cols.index("rp_track") + 1
     assert len(cols) == len(set(cols))
 

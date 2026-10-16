@@ -458,7 +458,7 @@ def test_a_run_on_the_ekf_flies_on_it_and_records_that_it_did():
             assert st[-1].ekf_control and st[-1].ekf_flew
             assert st[-1].ekf_state == "ready" and st[-1].p_ekf_flu
             m = w._run_meta()
-            assert m["schema_version"] == 20
+            assert m["schema_version"] == 21
             assert m["ekf"]["estimator_at_engage"] == "ekf"
             assert m["ekf"]["ready_at_engage"] is True
             assert m["ekf"]["node"]["source"] == EK.RL_SOURCE
@@ -891,16 +891,18 @@ def test_the_csv_header_ends_with_the_ekf_columns():
 
     cols = CSV_HEADER.strip().split(",")
     # schema 18's sixteen, located BY NAME: schema 19 (2026-10-10) appended
-    # the three pwm-LOW columns after them and schema 20 (2026-10-10 b) the
-    # pwm_guard code (test_rl_pwm_scale / test_rl_pwm_interlocks pin those) —
-    # append-at-end, so 18's stay where they were.
+    # the three pwm-LOW columns after them, schema 20 (2026-10-10 b) the
+    # pwm_guard code (test_rl_pwm_scale / test_rl_pwm_interlocks pin those)
+    # and schema 21 (2026-10-15) the three attitude-age columns (test_att_age)
+    # — append-at-end, so 18's stay where they were.
     i = cols.index("est")
     assert cols[i:i + 16] == ["est", "ekf_ok", "ekf_px", "ekf_py", "ekf_pz",
                               "ekf_roll_deg", "ekf_pitch_deg", "ekf_yaw_deg",
                               "ekf_u", "ekf_v", "ekf_w", "ekf_sig_xy_m",
                               "ekf_age_s", "ekf_tag_late_s", "ekf_n_tag",
                               "ekf_n_dvl"]
-    assert cols[i + 16:] == ["i_pred_a", "null_v_us", "null_h_us", "pwm_guard"]
+    assert cols[i + 16:] == ["i_pred_a", "null_v_us", "null_h_us", "pwm_guard",
+                             "att_age_v_s", "att_tb_ms", "banner_age_s"]
     assert len(cols) == len(set(cols))
 
 

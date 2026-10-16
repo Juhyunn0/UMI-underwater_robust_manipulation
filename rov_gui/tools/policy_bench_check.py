@@ -110,7 +110,10 @@ class Opts:
     blueos_host = "192.168.2.2"
     water_density = 997.0
     mavlink_set_rates = False
-    mavlink_rate = 200
+    mavlink_rate = None          # 2026-10-15 CLI (rov_gui/mavlink_streams.py): None =
+    mavlink_att_rate = None      # not given; a set mavlink_rate now means the
+    mavlink_imu_rate = None      # LEGACY all-three request
+    mavlink_scaled_imu2_rate = None
     c3_imu = True
     c3_imu_rate = 200
     imu_dr = None

@@ -200,7 +200,13 @@ class HwMpcc:
     def _arm(self, scen: dict, yaw_fixed_ned: float, depth_ned: float) -> None:
         fillet = float(getattr(self.cfg, "path_fillet_m", 0.15))
         turn = float(getattr(self.cfg, "path_turn_radius_m", 0.0))
-        path = path_from_scenario(scen, fillet_m=fillet, turn_radius_m=turn)
+        # pivot_speed = the cursor's creep, so this is the same curve the
+        # worker's PathCursor would fly (a heading-follow sharp square's
+        # vertex pivots — which the worker refuses to arm on a contouring LOW,
+        # see MpcWorker._heading_follow_refusal).
+        path = path_from_scenario(
+            scen, fillet_m=fillet, turn_radius_m=turn,
+            pivot_speed_m_s=float(getattr(self.cfg, "path_creep_m_s", 0.02)))
         self._install(path, float(scen.get("speed", 0.05)), depth_ned,
                       yaw_fixed_ned, bool(scen.get("heading_follow", False)))
         self._hold = None

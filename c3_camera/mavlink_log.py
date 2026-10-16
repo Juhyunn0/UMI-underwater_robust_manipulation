@@ -42,6 +42,7 @@ is never blocked on reconfiguring the vehicle.
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 import urllib.error
@@ -68,10 +69,126 @@ EVENT_MESSAGES = ("STATUSTEXT",)
 ALL_MESSAGES = tuple(dict.fromkeys(IMU_MESSAGES + TELEM_MESSAGES
                                    + CONTROL_MESSAGES + EVENT_MESSAGES))
 
+# The vehicle-clock map (2026-10-15, RL_controller/logs/eval/pool_trips_1013_rootcause,
+# fix-design station item 2a). `t_host` is when THIS process parsed a message, so
+# it cannot see a queue that forms on the VEHICLE side of the link: on 2026-10-13
+# the station's imu_age (tick - t_host) read ~0.05 s while the ATTITUDE the rl_pwm
+# policy flew on was 0.43 s old at the median (0-0.9 s sawtooth), measured on the
+# autopilot's own clock. VehicleClockMap puts ATTITUDE's time_boot_ms on the host
+# clock instead; see its docstring for the estimator and its limits.
+#: How fast the map's offset may RISE, per second of host time. The vehicle-vs-host
+#: drift measured 81-240 ppm [측정: pool_trips_1013_rootcause pool-sysid / obs-pipeline
+#: caveats]; 300 ppm covers it. A falling offset is followed at once (min()).
+VCLK_DRIFT_PER_S = 300e-6
+#: Reset rule 2 (a reboot whose new time_boot_ms is not BELOW the last one): host time
+#: advanced this much more than time_boot_ms between two consecutive ATTITUDEs. The
+#: largest such excess on record is 0.222 s (the 10-13 queue onsets; the 23.6-s
+#: outage of 0809_202049 is 0.046 s: the vehicle clock ran on) [측정: 27 recordings,
+#: RL_controller/logs/eval/station_fix_20261015/impl-age/out/host_vs_vehicle_steps.json].
+VCLK_REBOOT_GAP_S = 2.0
+#: Only the autopilot's clock is mapped (MAV_COMP_ID_AUTOPILOT1). Every ATTITUDE on
+#: record came from 1/1 [측정: same 27 recordings, attitude_stream_scan.json].
+AUTOPILOT_COMPONENT = 1
+
+
+class VehicleClockMap:
+    """time_boot_ms (the autopilot's clock) -> this host's ``time.monotonic()``,
+    causally, one ATTITUDE at a time in ARRIVAL order.
+
+    A rate-limited LOWER ENVELOPE of ``t_host - time_boot``::
+
+        off_k = min(off_{k-1} + VCLK_DRIFT_PER_S * (t_host_k - t_host_{k-1}),
+                    t_host_k - time_boot_k)
+        t_valid_k = time_boot_k + off_k      # when the sample was TRUE, host clock
+
+    Every sample's transit is >= 0, so ``t_host - time_boot`` is an upper bound of
+    the true offset and the envelope settles on the least-delayed sample (its
+    transit, ~ms, is the one thing this cannot see: ages are lower bounds by it).
+    Replayed causally over 21 healthy recordings (1.82 h) this agreed with the
+    offline floor fit within -3.0..+1.9 ms (p1..p99) [측정: RL_controller/logs/eval/
+    pool_trips_1013_rootcause/fix-design/out/fixdesign_summary.json "replay"].
+
+    RESET (a new map, ``t_start`` = that sample's arrival) when the source
+    changes, when time_boot_ms goes BACK (a reboot; 0 backward steps in ~1.3 M
+    recorded ATTITUDEs, so reordering does not trigger it), or when host time ran
+    VCLK_REBOOT_GAP_S ahead of the vehicle's between two samples (a reboot that
+    landed above the old time_boot_ms).
+
+    LIMITS, by construction: a map started while a queue is standing under-reads
+    the age until the queue first drains (by up to 0.77 s for the first 6.8 s of
+    1013_211913 [측정: fix-design/scripts/check_online_err.py]) — hence the rl_pwm
+    engage gate wants the map >= engage.per_thruster.age_map_min_s old; and a queue
+    that NEVER drains is invisible to any lower envelope. Not thread-safe: one
+    reader thread feeds it (MavlinkLogger)."""
+
+    def __init__(self, drift_per_s: float = VCLK_DRIFT_PER_S,
+                 reboot_gap_s: float = VCLK_REBOOT_GAP_S):
+        self.drift_per_s = float(drift_per_s)
+        self.reboot_gap_s = float(reboot_gap_s)
+        self.n = 0                    # samples placed, all maps
+        self.resets = 0               # maps started after the first
+        self.last_reset: dict | None = None
+        self._clear()
+
+    def _clear(self) -> None:
+        self.off: float | None = None
+        self.t_start: float | None = None
+        self.src = None
+        self._t_prev: float | None = None
+        self._tb_prev: float | None = None
+
+    def update(self, t_host, time_boot_ms, src=None) -> float | None:
+        """One sample -> its ``t_valid`` (host clock), or None when it cannot be
+        placed (missing / non-numeric stamp: nothing changes)."""
+        try:
+            th = float(t_host)
+            tb = float(time_boot_ms) / 1000.0
+        except (TypeError, ValueError):
+            return None
+        if not (math.isfinite(th) and math.isfinite(tb)):
+            return None
+        if self.off is not None:
+            why = None
+            if src != self.src:
+                why = f"source {self.src} -> {src}"
+            elif tb < self._tb_prev:
+                why = (f"time_boot_ms went back {self._tb_prev:.3f} -> {tb:.3f} s "
+                       f"(reboot)")
+            elif (th - self._t_prev) - (tb - self._tb_prev) > self.reboot_gap_s:
+                why = (f"host clock ran {(th - self._t_prev) - (tb - self._tb_prev):.1f}"
+                       f" s ahead of time_boot_ms between two samples (reboot)")
+            if why is not None:
+                self.resets += 1
+                self.last_reset = {"t_host": th, "why": why}
+                self._clear()
+        cand = th - tb
+        if self.off is None:
+            self.off, self.t_start, self.src = cand, th, src
+        else:
+            self.off = min(self.off + self.drift_per_s * max(0.0, th - self._t_prev),
+                           cand)
+        self._t_prev, self._tb_prev = th, tb
+        self.n += 1
+        return tb + self.off
+
+    def summary(self) -> dict:
+        return {"estimator": "rate-limited lower envelope of t_host - time_boot_ms "
+                             "(ATTITUDE, autopilot only)",
+                "drift_ppm": round(self.drift_per_s * 1e6, 3),
+                "reboot_gap_s": self.reboot_gap_s,
+                "samples": self.n, "resets": self.resets,
+                "last_reset": self.last_reset}
+
 # Rates we ask for when --mavlink-set-rates is given. ArduSub's defaults are far
 # too low for anything time-sensitive. The ROV IMU is NOT the primary VIO IMU here
 # (the camera's BNO086 is), so these are for context and cross-checking, and there
-# is no reason to push the link hard.
+# is no reason to push the link hard. The first three are always replaced: by
+# default_rate_hz (one rate for all three), or per message by stream_rates_hz —
+# which is how rov_gui asks since 2026-10-15 (rov_gui/mavlink_streams.py).
+#: The IMU streams whose request decides ``rates_sent_t`` (a send error on any
+#: of them = the request did not go out; MavlinkLogger._request_rates).
+IMU_STREAMS = ("RAW_IMU", "SCALED_IMU2", "ATTITUDE")
+
 DEFAULT_RATES_HZ = {
     "RAW_IMU": 50,
     "SCALED_IMU2": 50,
@@ -127,7 +244,8 @@ class MavlinkLogger:
                  set_rates: bool = False,
                  rates_hz: dict | None = None,
                  default_rate_hz: int = 50,
-                 verbose: bool = True):
+                 verbose: bool = True,
+                 stream_rates_hz: dict | None = None):
         self.connection = connection
         self.transport = transport
         self.rest_url = rest_url.rstrip("/")
@@ -136,9 +254,31 @@ class MavlinkLogger:
         self.rates_hz = dict(DEFAULT_RATES_HZ)
         if rates_hz:
             self.rates_hz.update(rates_hz)
-        # --mavlink-rate raises the time-critical ones together.
-        for k in ("RAW_IMU", "SCALED_IMU2", "ATTITUDE"):
-            self.rates_hz[k] = default_rate_hz
+        # Messages this logger asks the autopilot to STOP sending (interval -1).
+        # Only ever from stream_rates_hz: on the default_rate_hz path a rate
+        # <= 0 still means "not requested", as it always has.
+        self.stream_off: tuple = ()
+        if stream_rates_hz is not None:
+            # Per message (rov_gui since 2026-10-15, rov_gui/mavlink_streams.py):
+            # Hz, and 0 = off. default_rate_hz is not used.
+            self.rates_hz.update(stream_rates_hz)
+            self.stream_off = tuple(sorted(
+                k for k, hz in stream_rates_hz.items()
+                if hz is not None and hz <= 0))
+        else:
+            # --mavlink-rate raises the time-critical ones together.
+            for k in ("RAW_IMU", "SCALED_IMU2", "ATTITUDE"):
+                self.rates_hz[k] = default_rate_hz
+        # time.monotonic() when _request_rates last transmitted, None = never
+        # (rates off, REST, no traffic within start()'s wait, or a send error
+        # on one of the IMU streams — rates_failed): the vehicle then keeps
+        # whatever it was last asked for, by anyone.
+        self.rates_sent_t: float | None = None
+        # the names whose SET_MESSAGE_INTERVAL raised on the last request
+        # (2026-10-15; a request every send of which failed used to read
+        # 'sent' — verify-review F2, RL_controller/logs/eval/
+        # station_fix_20261015)
+        self.rates_failed: list[str] = []
         self.verbose = verbose
 
         self.master = None
@@ -154,6 +294,10 @@ class MavlinkLogger:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._first_msg_at: float | None = None
+        # ATTITUDE time_boot_ms -> host clock, fed by the reader thread only
+        # (_stamp_vehicle_clock). Every ATTITUDE record leaves with `t_valid`
+        # and `vclk_t0` (None when it could not be placed).
+        self.vclock = VehicleClockMap()
 
     # ------------------------------------------------------------------ start
     def start(self, wait_s: float = 6.0) -> bool:
@@ -250,8 +394,26 @@ class MavlinkLogger:
                        "_srccomp": msg.get_srcComponent()}
                 rec.update(msg.to_dict())
                 rec.pop("mavpackettype", None)
+                if mtype == "ATTITUDE":
+                    self._stamp_vehicle_clock(rec)
                 with self._lock:
                     self._records.append(rec)
+
+    def _stamp_vehicle_clock(self, rec: dict) -> None:
+        """ATTITUDE only, in the reader thread, at arrival: ``t_valid`` = when
+        the sample was TRUE on the vehicle, on this host's clock (VehicleClockMap),
+        and ``vclk_t0`` = the arrival of the first sample of the map in force (its
+        age gates the rl_pwm engage). Both None for a record the map cannot place
+        — another component's clock, or no usable time_boot_ms — which a consumer
+        must read as "age unknown", never as fresh."""
+        comp = rec.get("_srccomp")
+        if comp is not None and comp != AUTOPILOT_COMPONENT:
+            rec["t_valid"] = rec["vclk_t0"] = None
+            return
+        t_valid = self.vclock.update(rec.get("t_host"), rec.get("time_boot_ms"),
+                                     src=(rec.get("_srcsys"), comp))
+        rec["t_valid"] = t_valid
+        rec["vclk_t0"] = self.vclock.t_start if t_valid is not None else None
 
     def _note_heartbeat(self, msg) -> None:
         """Arm state and mode, from the AUTOPILOT's heartbeat only.
@@ -311,6 +473,10 @@ class MavlinkLogger:
                 self.stats[mtype].update(t)
                 rec = {"t_host": t, "msg_type": mtype}
                 rec.update({k: v for k, v in body.items() if k != "type"})
+                if mtype == "ATTITUDE":
+                    # t_host is the POLL time here, so the map's floor carries
+                    # the best-case poll delay too (same lower-bound caveat)
+                    self._stamp_vehicle_clock(rec)
                 with self._lock:
                     self._records.append(rec)
                 if mtype == "HEARTBEAT":
@@ -323,6 +489,12 @@ class MavlinkLogger:
 
         param1 = message id, param2 = interval in MICROseconds (0 = default,
         -1 = disable). This is the only thing this module ever transmits.
+        A name in ``stream_off`` is sent -1 (stop); any other rate <= 0 is not
+        requested at all.
+
+        ``rates_sent_t`` is stamped only when at least one request went out and
+        none of the IMU streams' (``IMU_STREAMS``) raised; the names whose send
+        raised are kept in ``rates_failed`` either way.
         """
         if self.master is None:
             print("  MAVLink: cannot set rates over the REST transport "
@@ -335,21 +507,44 @@ class MavlinkLogger:
         if self.verbose:
             print(f"  MAVLink: requesting rates from system {target_sys} "
                   f"(this transmits to the autopilot)")
+        sent: list[str] = []
+        failed: list[str] = []
         for name, hz in sorted(self.rates_hz.items()):
             msg_id = getattr(mavutil.mavlink, f"MAVLINK_MSG_ID_{name}", None)
-            if msg_id is None or hz <= 0:
+            if msg_id is None:
                 continue
-            interval_us = int(1_000_000 / hz)
+            if name in self.stream_off:
+                interval_us = -1
+            elif hz is None or hz <= 0:
+                continue
+            else:
+                interval_us = int(1_000_000 / hz)
             try:
                 self.master.mav.command_long_send(
                     target_sys, target_comp,
                     mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
                     msg_id, interval_us, 0, 0, 0, 0, 0)
+                sent.append(name)
             except Exception as e:  # noqa: BLE001
+                failed.append(name)
                 print(f"    could not request {name}: {e}")
+        self.rates_failed = failed
+        imu_failed = [k for k in failed if k in IMU_STREAMS]
+        if sent and not imu_failed:
+            self.rates_sent_t = time.monotonic()
+        else:
+            why = (f"send error on {', '.join(failed)}" if failed
+                   else "nothing to request")
+            print(f"  MAVLink: rate request NOT sent ({why}): the vehicle "
+                  f"keeps the rates it was last asked for, by anyone")
+            return
         if self.verbose:
             print(f"    requested: " + ", ".join(
-                f"{k}@{v}Hz" for k, v in sorted(self.rates_hz.items())))
+                f"{k} off" if k in self.stream_off else f"{k}@{v}Hz"
+                for k, v in sorted(self.rates_hz.items())
+                if k not in failed))
+            if failed:
+                print(f"    NOT sent (send error): {', '.join(failed)}")
             print("    achieved rates are printed in the live stats and written "
                   "to metadata, so you can verify rather than assume")
 
@@ -396,8 +591,15 @@ class MavlinkLogger:
             "mode_last_seen": self.mode,
             "set_rates_requested": self.set_rates,
             "requested_rates_hz": self.rates_hz if self.set_rates else None,
+            # asked to STOP (interval -1); their requested_rates_hz entry is 0
+            "requested_off": list(self.stream_off) if self.set_rates else None,
+            # did the request actually go out (see rates_sent_t)
+            "rates_sent": self.rates_sent_t is not None,
+            # names whose SET_MESSAGE_INTERVAL raised on the last request
+            "rates_failed": list(self.rates_failed),
             "set_message_interval_ack": self.rate_acks.get("last"),
             "achieved_rates_hz": {m: round(s.hz, 2)
                                   for m, s in sorted(self.stats.items())},
             "message_counts": {m: s.count for m, s in sorted(self.stats.items())},
+            "vehicle_clock": self.vclock.summary(),
         }

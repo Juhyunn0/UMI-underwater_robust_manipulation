@@ -64,7 +64,9 @@
   `rov_gui/tests/test_dvl.py` 96/96, `demo_e2e_dvl.py`, 합성 타이밍 시뮬레이션 `sim_dvl_monitors.py`는 논리를
   고정할 뿐 이 기체·이 풀에 대한 근거가 아니다.
   기본 OFF(`hw_mpc.yaml dvl.enabled: false`)라 켜지 않으면 추정 경로는 이전과 비트 단위로 같다.
-- **모르는 것**: (1) 장착 `mount_rpy_deg` / `mount_t_flu` — null, 재기 전에는 IN이 거부된다. (2) `stale_s 0.6`,
+- **모르는 것**: (1) 장착 `mount_rpy_deg` / `mount_t_flu` — 2026-10-13 운영자 줄자로 채움([0,0,0] / [−0.192, 0, −0.104],
+  LED 뒤 + 장치 offset 180; 근거는 hw_mpc.yaml 주석). 위치는 `cam_t_flu`(x/z 의심)를 물려받고, 237 mm가 백플레이트
+  윗면 기준이라는 가정 — proof는 회전만 검증하고 위치는 못 본다. (2) `stale_s 0.6`,
   `fom_max 0.05`, `reentry_s 0.5`, `a_max_m_s2 2.0`, `innov_max_m_s 0.15`, `agree_*`, `station_bridge.dvl_hold_s 10`
   / `dvl_max_speed_m_s 0.3` / `dvl_max_disp_m 0.5` — 전부 [예측]. (3) 실제 지연과 속도 잡음. 2026-10-11 첫 장치
   읽기(정지, 물 담은 용기, 고도 0.083 m)에서 `tot − tov` 80.5–113.9 ms [측정: data/20261011/1011_155235_dvl_probe/
@@ -186,7 +188,9 @@
   사본 data/20261011/1011_155235_dvl_probe/analysis/wf/src_master/])와 ArduSub 자신의 EMERGENCY 메시지. leak/pressure/
   config는 그 위 분기에서 먼저 분류되므로 영향 없음. mavlink2rest(REST) transport에서는 severity가 dict라 `int(dict)`가
   TypeError로 tick을 실패시킨다는 검증자 보고가 있다(미재현).
-- **임시 대응**: DVL 과열은 SENSORS DVL 행(status bit0 → `HIGH TEMPERATURE`, lock이 있을 때만)과 QGC/BlueOS 화면으로 본다.
+- **임시 대응**: DVL 과열은 스테이션 자신이 SENSORS DVL 줄에서 본다(2026-10-13부터 °C 숫자 + 45 °C `HOT` + bit 0
+  `HIGH TEMP`, lock과 무관 — rov_gui/README.md "온도 — SENSORS의 DVL 줄"). 확장의 STATUSTEXT 경고만 여기서 계속 버려지고,
+  ArduSub 자신의 EMERGENCY는 QGC/BlueOS 화면으로 본다.
 - **제대로 고치는 법**: `int(6 if sev is None else sev)` + REST 경로 정규화, severity 0 STATUSTEXT가 warn으로 뜨는 회귀 테스트.
 
 ### ATTITUDE 레이트 요청은 **접속 때 1회**뿐 — ArduSub 재부팅이나 BlueOS DVL extension의 5 Hz 요청이 덮으면 그 세션 내내 5–10 Hz (2026-10-11)
@@ -198,7 +202,122 @@
   덮는다. `engage.imu_stale_s 0.3`에 5 Hz면 여유 100 ms라 ATTITUDE 하나 유실로 imu stale [유도]. health `Compass` 행은
   max(ATTITUDE, AHRS2)라 AHRS2 10 Hz가 이 저하를 가린다. 스테이션 링크에서의 실제 ATTITUDE 레이트는 아직 재지 않았다.
 - **임시 대응**: 스테이션이 켜진 채 기체를 재부팅했거나 DVL을 늦게 연결했으면 스테이션도 재시작(그래야 200 Hz 요청이 마지막이 된다).
+  (2026-10-15부터 기본 요청은 ATTITUDE 50 Hz — `--mavlink-att-rate`, 아래 'IMU 스트림 요청' 항목; 접속 때 1회인 것은 그대로이고, 런 meta
+  `mavlink_streams.achieved_hz` 로 덮였는지 보인다.)
 - **제대로 고치는 법**: ATTITUDE 실측 Hz를 감시해 요청값보다 크게 낮으면 재요청(주기적 재요청), ATTITUDE를 health에 따로 표시.
+
+### pwm LOW(`rl_pwm`, `rl_pwm_7d`)의 **자세 나이(차량 시계) 인터록·교전 거부는 실기 0런** — 임계값 전부 [예측], 끝내 안 빠지는 큐는 못 본다 (2026-10-15)
+- **왜(근거 폴더 `RL_controller/logs/eval/pool_trips_1013_rootcause/` = RC)**: 10-13 수조에서 rl_pwm 이 7회 중 5회 RATE/TILT 로 트립한
+  것은 정책이 **차량 시계로 중앙값 0.43 s 늦은** ATTITUDE(roll/pitch/p/q/r)를 보고 날았기 때문이다 — 다른 클라이언트가 전체 파라미터
+  목록을 요청할 때마다(`ArduSub V4.5.7` 배너 STATUSTEXT, 21:17 기록의 배너 112개 중 111개 뒤) 차량 쪽 MAVLink 큐가 찼고, 같은 교전의
+  CSV `imu_age_s`(스테이션 **파싱 시각** 기준)는 p50 0.054–0.058 s 로 보였다 [측정 RC/synth/out/synth_checks.json C1_age, C4_queue].
+- **바뀐 것(2026-10-15 운용자 승인 1a·1b·1d)**: (a) `c3_camera/mavlink_log.py VehicleClockMap` — ATTITUDE `time_boot_ms` 를 호스트 시계로
+  옮기는 하한 포락선(상승 300 ppm 제한, 실측 드리프트 81–240 ppm), `time_boot_ms` 감소 또는 두 샘플 사이 호스트가 차량보다 2 s 넘게
+  앞서면(재부팅) 리셋, 자동조종기(1/1) ATTITUDE 만. 리더 스레드가 도착 시 레코드에 `t_valid`/`vclk_t0` 를 찍는다(`*_rov.jsonl` 에도 남음)
+  → `VehicleImu.t_att_v / att_tb_ms / att_map_t0` → state_assembler health `att_age_v`(태그 없는 틱에도) → CSV schema **21**
+  `att_age_v_s, att_tb_ms, banner_age_s`(모든 LOW) + meta `att_age`. `imu_age_s` 와 `imu_stale_s` 0.3 s 규칙은 **그대로**. 이 추정기를
+  건강한 기록 21개(1.82 h)에 인과적으로 재생하면 오프라인 바닥 피팅과 −3.0..+1.9 ms(p1..p99) 일치 [측정 RC/fix-design/out/
+  fixdesign_summary.json "replay"]. 리셋 규칙 근거: 기록 27개·약 130만 ATTITUDE 에서 `time_boot_ms` 역행 0회, 두 샘플 사이 호스트-차량
+  초과 최대 0.222 s(10-13 큐 시작; 0809_202049 의 23.6 s 단절은 0.046 s) [측정 RL_controller/logs/eval/station_fix_20261015/impl-age/out/
+  attitude_stream_scan.json, host_vs_vehicle_steps.json]. (b) `engage.per_thruster` **AGE**(pwm LOW 만, `PwmInterlocks` 맨 앞 — TILT/RATE 가
+  같은 늦은 자세를 보므로): 나이 > 0.15 s 가 0.5 s, 또는 > 0.25 s 가 0.2 s → 중립 펄스 disengage + 미션 로그/events.log
+  "PER-THRUSTER INTERLOCK AGE"; **모르는 나이 = 넘음**(0.2 s 에 트립). 교전 거부(`workers._att_age_refusal`, 순서대로): 나이 모름 /
+  시계 맵 < 30 s / 배너 < 30 s / 최근 10 s 에 모르는 틱이 **하나라도** / 최근 10 s 틱 나이(+지금)의 p99 > 0.12 s / **START 순간 나이 >
+  `age_s` 0.15 s**. 끝의 둘은 같은 날 검증 후 수정(verify-review F1: START 순간 하나는 200틱 p99 를 못 움직여 이미 늦은 자세가 통과하고
+  0.2 s 뒤 트립했다; verify-replay I1: 모르는 틱 2개가 창 200틱이면 거부·201틱이면 통과하던 보간 의존 제거) — 새 규칙으로 재생하면 건강 21개의
+  웜업 뒤 START 120 982회 중 4회 거부(모두 단발 0.16–0.19 s 틱, 다음 틱엔 통과), 혼잡 10-13 은 그대로 100 % 거부 [측정 RL_controller/logs/
+  eval/station_fix_20261015/fixer/out/refusal_rules_replay.txt]. RATE 40 deg/s·0.15 s, TILT 20°·0.25 s 불변.
+  이 규칙 그대로의 재생 [측정 RC/fix-design/out/fixdesign_summary.json, age_guard_replay.txt]: 건강 21개 트립 0·거부 0, 10-13 혼잡 5개
+  거부 100 %·큐 시작 29번 중 28번을 실제 나이 0.10 s 통과 0.40 s(p95 ≤ 0.47 s) 뒤 트립, 놓친 위험 구간 0. 0.15 s = pwm11att6_s2 가
+  명목 명령 경로에서 버틴 마지막 지속 나이(0.15 s 0/7, 0.20 s 2/7) [sim RC/synth/isaac/trip1014_att6s2_track_latency/metrics.json].
+  (d) `ArduSub V` 로 시작하는 STATUSTEXT = 배너: VehicleWorker 로그 경고와 MpcWorker 미션 로그 + events.log 한 줄
+  ("vehicle banner: another client requested the full parameter list"), 각각 **1분에 최대 1번**(묶인 개수와 함께; 1분 안에 끝난
+  묶음의 나머지도 1분이 지나면 한 줄 — VehicleWorker 쪽은 2026-10-15 fixer 수정 전까지 다음 배너가 와야만 말했다; 유휴 중이면
+  events.log 줄은 다음 런 폴더의 머리에). 오프라인 재생 도구는 schema ≥ 21 + `att_age_v_s` 열이 있는 파일에서만 AGE 를 판정한다.
+- **모르는 것 / 설계상 한계**: (1) 임계값 전부 [예측], 수조 0런. (2) **끝내 빠지지 않는 큐**는 어떤 하한 포락선으로도 안 보인다(TIMESYNC
+  RTT 는 승인되지 않음). (3) 큐가 서 있을 때 시작한 맵은 큐가 처음 빠질 때까지 나이를 낮게 읽는다 — 1013_211913 첫 6.8 s 동안 최대
+  0.77 s [측정 RC/fix-design/scripts/check_online_err.py] — 그래서 맵 30 s 요건. (4) 나이는 링크 **최소 전송 지연만큼의 하한**(수 ms);
+  REST transport 에서는 폴링 지연의 최솟값까지 포함. (5) 스테이션 시작·기체 재부팅 직후 30 s 는 pwm 교전 불가(맵 + 부팅 배너) [의도].
+  (6) 차량 시계 드리프트가 300 ppm 을 넘으면 나이를 **과대** 추정(안전 쪽). (7) 이 변경은 스트림 레이트(`--mavlink-rate`)를 바꾸지 않았다
+  — 레이트는 같은 날 승인 1c 로 따로 바뀌었다(ATTITUDE 50 Hz, 바로 아래 'IMU 스트림 요청' 항목): 나이에는 샘플 자체의 나이가 최대 ~20 ms 더 붙는다.
+- **확인할 것**: RC fix-design `pool_procedure` 0단계(전체 부하 5 분 유휴: 배너 0, 틱 `att_age_v_s` p99 < 0.08 s — 166 Hz 에서 정한 값, 50 Hz 에서는
+  아래 항목의 (2) 참조 — , ATTITUDE ≥ 45 Hz)와
+  0c(파라미터 다운로드 1회 → 배너 로그 + 30 s 거부, `--mavlink-rate 200` 에서는 AGE 트립이 CSV·events.log 에). 테스트: 신규
+  `rov_gui/tests/test_att_age.py` + 갱신된 핀(schema 20→21, CSV 꼬리, per_thruster 기본값, 테스트 VehicleImu 헬퍼에 건강한 차량 시계).
+  미커밋.
+
+### MAVLink IMU 스트림 요청을 **메시지별로 낮췄다**(ATTITUDE 50 · RAW_IMU 20 · SCALED_IMU2 20 Hz) — 수조 미검증, 그리고 **SCALED_IMU2 는 이 기체에서 0 만 보낸다**(가속도 소비자 셋이 0 을 먹어 왔다) (2026-10-15)
+- **운용 요약**: 2026-10-15부터 스테이션(`--source hw`)은 ATTITUDE 50 · RAW_IMU 20 · SCALED_IMU2 20 Hz 를 요청한다(합 90 msg/s, 예전 600 요청 /
+  ~500 수신 [측정 IR/out/rov_stream_scan.json]). **예전 동작 = `--mavlink-rate 200`**(셋 다 200, 시작 때 LEGACY 경고 한 줄; 메시지별 플래그와
+  같이 주면 시작 거부 exit 2). `--mavlink-rate N` 은 **N ≥ 1 일 때만** 예전 요청과 같다 — 0·음수는 시작 거부(예전 스테이션은 0 을 50 Hz 로,
+  음수를 'IMU 셋 요청 안 함'으로 바꿨다 [측정 RL_controller/logs/eval/station_backup_20261015/rov_gui/backends/hardware.py:1776
+  `int(... or 50)`, c3_camera/mavlink_log.py:340 `hz <= 0` 건너뜀]); N < 50 이면 ATTITUDE 나이 하한 경고도 같이 뜬다. 메시지별로 바꾸려면 `--mavlink-att-rate` / `--mavlink-imu-rate` / `--mavlink-scaled-imu2-rate`(0 = 끔, 가속도 소스가
+  RAW_IMU 로 바뀜). 무엇을 요청했고 실제 몇 Hz 가 왔는지는 런 meta `mavlink_streams`(`policy` per_message|legacy, `requested_hz`, `sent`,
+  `achieved_hz`)와 `*_rov.json` `stream_request` 에 남는다 — pwm 런의 `att_age_v_s` 는 이 값과 같이 읽을 것(50 Hz 에서 샘플 나이 +≤ 20 ms [유도]).
+- **왜(근거 RC = `RL_controller/logs/eval/pool_trips_1013_rootcause`, IR = `RL_controller/logs/eval/station_fix_20261015/impl-rates`)**:
+  예전 요청(RAW_IMU·SCALED_IMU2·ATTITUDE 셋 다 `--mavlink-rate` 기본 200)을 기체는 각 ~166.6 Hz 로 보냈고, 그것이 **모든** BlueOS
+  엔드포인트(이 스테이션의 텔레메트리·명령 포트, QGC)로 가는 ~552 msg/s 중 ~500 이었다 [측정 기록 27개(2026-08-09..10-13; 파일 28개 중 하나는 오프라인 사본), IR/out/
+  rov_stream_scan.json]. 10-13 에는 다른 클라이언트의 파라미터 다운로드 때마다 그 위로 차량 쪽 큐가 섰다(위 항목). fix-design station item 1,
+  운용자 승인 1c(2026-10-15): "소비자를 전부 세고, 각 소비자가 계속 동작하는 레이트로".
+- **바뀐 것**: `rov_gui/mavlink_streams.py`(기본값·하한·해석 한 곳) → 플래그 `--mavlink-att-rate`(기본 50) · `--mavlink-imu-rate`(RAW_IMU, 20) ·
+  `--mavlink-scaled-imu2-rate`(20, 0 = 끔 = 간격 −1), **`--mavlink-rate N` = 예전 요청 그대로**(셋 다 N, 가속도 소스 그대로; 메시지별 플래그와
+  같이 주면 시작 거부, ATTITUDE·RAW_IMU 끄기도 거부). 요청 합 600 → **90 msg/s**. `c3_camera/mavlink_log.MavlinkLogger(stream_rates_hz=)`
+  (c3_collect 의 `default_rate_hz` 경로는 그대로: ≤ 0 = 요청 안 함, 끄기 아님). VehicleWorker 가 setup 때 요청을 한 줄로 말한다(안 보냈으면
+  NOT sent + 이유: `--no-mavlink-set-rates` / REST / 3 s 안에 텔레메트리 없음 / **send error**(IMU 스트림 셋 중 하나라도 SET_MESSAGE_INTERVAL
+  전송이 예외 — 2026-10-15 fixer 수정 전에는 전부 실패해도 'sent' 로 기록됐다) — 그러면 기체는 **누군가 마지막에 요청한 레이트**에 머문다).
+  기록: 런 meta `mavlink_streams`(schema 21 안, 요청·보냈는지·전송 실패 이름 `failed`·ack·`achieved_hz`·`last_arrival_age_s`), `*_rov.json`
+  `stream_request`, 로거 `summary()["rates_failed"]`.
+- **소비자와 고른 레이트**(전체 표 IR/NOTES.md): **ATTITUDE 50** — 20 Hz VehicleImu 스냅샷(모든 LOW 의 roll/pitch/p/q/r, RL 관측, PID 7d,
+  pwm 인터록, EKF shadow 입력, imu_dr 정착 창·'vehicle' 자세, DVL 레버암 각속도 이력, 태그 해의 rp 힌트)과 10 Hz Telemetry 가 틱마다 하나씩
+  읽고, `VehicleClockMap` 은 전부 읽는다. pwm 나이 게이트는 샘플 자체의 나이도 센다 — 건강한 기록 21개(1.82 h)를 ~47–50 Hz 로 솎아 스테이션
+  자체 코드로 재생: 틱 나이 p99 0.069–0.086 s(166 Hz 그대로 0.058–0.078 s), 10 s 이동 p99 최대 0.110 s < 거부 0.12 s, 트립 0·p99 거부 0;
+  ~28 Hz 는 6355회 중 16회, 20 Hz 는 122회 거부; 100 Hz 도 최대 0.106 s 라 더 올려도 얻는 게 적다(링크 지연이 지배) [유도 IR/out/
+  age_at_rates.json]. 오프라인 `calib_c3_imu --fit rotation` 은 50 Hz 로 솎아도 R 이 0.03–0.53° 움직임(두 테이크 반복성 0.81°) [유도 IR/out/
+  calib_at_rates.json]. **RAW_IMU 20** — 실제 가속도계(|a| p50 999–1001 mg, 기록 27개 전체), `*_rov.jsonl` 기록, health `IMU (ROV)` 행(≥ 10 Hz),
+  SCALED_IMU2 를 끄면 가속도 소스. **SCALED_IMU2 20** — 아래처럼 죽은 스트림이지만 VehicleImu `ax..az` 가 늘 여기서 읽혀 왔으므로 **켜 둔다**
+  (fix design 의 '끔'에서 벗어남: 끄면 EKF·dobmpc 가 처음으로 진짜 가속도계를 먹는다 — 레이트 변경의 부수효과로 할 일이 아니다).
+- **SCALED_IMU2 가 0 인 문제(전부터 있던 것, 이번에 셈)**: 가속도·자이로가 기록 27/27 에서 **전 레코드 0** [측정 IR/out/rov_stream_scan.json].
+  `hardware._publish_imu` 가 SCALED_IMU2 를 RAW_IMU 보다 먼저 쓰므로 `ax..az` = 0: `*_ekf_inputs.jsonl` 71개의 imu 레코드 60 098 개 전부
+  acc 0(2026-10-04 항목의 (b)), 10-13 EKF shadow `|ekf_w|` p50 12.3–12.6 m/s·`|ekf_pz − pz|` p50 0.70–0.93 m, dobmpc 실기 런 7개(08-14..08-23)
+  전부 EAOB heave 추정 w2 가 클립 +45 N 에(행의 83–96 %) [측정 IR/out/accel_consumers_evidence.json]. RAW_IMU 가속도로 바꿔 EKF 를 재생하면
+  heave 오차 3–6 mm(p50)로 고쳐지지만 수평 속도는 1.76→1.03, 0.17→0.13 m/s 에 그친다(가속도 융합 안 하면 0.01, 0.11) [유도 IR/out/
+  ekf_accel_source.json] — mavros 잡음(0.0003)이 가속도계를 다 믿기 때문. **운용자 결정**: 전환 스위치는 `--mavlink-scaled-imu2-rate 0`
+  (SCALED_IMU2 끄기 + `ax..az` 는 RAW_IMU 만, 요청 전에 받아 둔 SCALED_IMU2 레코드는 다시 안 읽음); 그 전에 `ekf_replay --set` 으로 가속도
+  잡음/융합 변형을 비교할 것. dobmpc 는 nudot 이 바뀌면 heave 거동이 달라진다(지금까지는 +45 N 클립에 붙어서 날았다).
+- **모르는 것 / 한계**: (1) 부하를 ~5배 줄이면 파라미터 다운로드 한 번으로 큐가 차지 않는다는 것은 [예측] — RC fix-design 0c 로 확인.
+  (2) fix design 의 수용 기준 "틱 `att_age_v_s` p99 < 0.08 s"(0·1·4단계)는 166 Hz 에서 정한 값: 50 Hz 에서는 건강한 링크도 0.069–0.086 s,
+  재생한 21개 중 5개가 0.08 s 를 넘는다 [유도 IR/out/age_at_rates.json, 보수적 — 솎은 레이트 47–50 Hz·500 msg/s 링크의 지연 그대로].
+  50 Hz 에서는 ~0.09 s 로 읽거나 0단계 실측으로 다시 정할 것; 교전 거부(0.12 s)·AGE 트립(0.15 s)은 여유가 있다. (3) 요청은 여전히 **접속 때
+  1회**(위 2026-10-11 항목): 기체 재부팅, BlueOS DVL extension 의 ATTITUDE 5 Hz, `thruster_probe` 의 25 Hz 가 덮으면 그대로 간다 — meta
+  `achieved_hz`/`last_arrival_age_s` 에 보이고, pwm 교전은 25 Hz 에서 이미 거부가 늘어난다(재생 41회). (4) 50 Hz 요청의 실제 수신은
+  47–62 Hz 사이로 [예측](솎음 재생 vs README 2026-08-06 실측 62 Hz); 건강한 링크에서 10 Hz 요청은 차량 시계로 정확히 100 ms 간격
+  [측정 IR/out/send_spacing.json]. (5) `*_rov.jsonl` 을 쓰는 오프라인 분석은 이제 ATTITUDE ~50 Hz 를 받는다(바닥 피팅·캘리브레이션은 충분).
+- **확인할 것**: 0단계에서 런 meta `mavlink_streams.sent` true, `achieved_hz.ATTITUDE` ≥ 45, RAW_IMU·SCALED_IMU2 ≈ 20, `*_rov.json`
+  `hz_measured` 합 ~140 msg/s [예측: IMU 셋 ~90 + 나머지 ~52, 예전 ~552]; 0c (a) 새 레이트에서 파라미터 다운로드 1회, (b) `--mavlink-rate 200`
+  로 같은 것. 테스트: 신규
+  `rov_gui/tests/test_mavlink_rates.py`. 미커밋.
+
+### LOW `RL_PWM_7D` 에 **pwm11att7_s0 를 설치**했다(goal-frame 관측) — **수조 0런**, 다음 수조 전에 벤치 0단계·0c 와 6-D 수평 hold 부터 (2026-10-15)
+- **무엇(SF = `RL_controller/logs/eval/station_fix_20261015`)**: `rov_gui/control/rl_policies/pwm11att7_s0`(RL_controller
+  `logs/rsl_rl/rov_posehold/2026-10-15_02-01-35_pwm11att7_s0/exported`, model_1799; 네 파일 sha1 = export [측정 SF/install/install_sha1.txt]),
+  `config/hw_mpc.yaml` `rl_pwm_7d.policy_dir: null` → 이 폴더(옛 값은 주석에). 시뮬 게이트 full PASS·사각형 xy 0.028 m·예측 전류 2.5 A·
+  포화 0 [측정 RL_controller/logs/eval/PWM11ATT7_GATE.md], 자세 지연 0.25 s 트립 1회(1 env; pwm11k0.2_s0 12회)·헤딩 180° 포화 0 % [측정
+  PWM11ATT7_ROBUST.md], 수평 세계 평균 정상오차 pitch 3.6° / roll 1.7°·기수-위 목표는 못 미침 [측정 ATT_COMPARE_PWM11ATT7.md; 같은 문서의
+  B7 승격 기준 [예측]은 att7 시드 전부 미달]. 관측이 goal-frame 쿼터니언이라 같은 날의 `rl_policy.py` 지원이 있어야 빌드된다. 상세·전제: 폴더 README.md.
+- **수용(설치된 폴더 + 실제 hw_mpc.yaml)**: 45 검사 0 FAIL — 빌드 줄·관측이 RL_controller 빌더와 비트 동일(120 프레임, 24틱 ±180°)·워커 교전·
+  AGE 트립/교전 거부(같은 날 추가된 '모르는 틱 1개'·'START 순간 나이' 포함)·옛 export(traj12_s2, pwm11k0.2_s0) 바이트 동일 [측정
+  SF/install/out/accept_att7_installed.txt]. 이 export 는 rl_pwm(6-D)에도 빌드되어 수평으로 난다 — `rl_pwm.policy_dir` 은 pwm11k0.2_s0 그대로
+  [측정 SF/verify-accept/REPORT.md F1].
+- **다음 수조 전 절차**(근거 RC fix-design `pool_procedure`, RC = `RL_controller/logs/eval/pool_trips_1013_rootcause`): **0단계** — 전체 부하
+  (GUI·FoundationStereo·DVL·C3 녹화)로 **5 분 유휴**, BlueOS 웹 UI·다른 GCS 닫음. 통과: 배너("vehicle banner: …") **0**, CSV `att_age_v_s`
+  p99 **≤ ~0.09 s**(50 Hz 기준 [유도 SF/impl-rates/NOTES.md 열린 문제 2]; REC 로 CSV 를 열고 카메라가 태그를 보게 둘 것 — 행은 태그 fix 가 있는
+  틱에만 써진다), **AGE 거부 0**(rl_pwm 을 골라 START — AGE 거부는 맨 마지막 검사라 MANUAL·게이트·프로브가 먼저 통과해야 의미가 있다).
+  **0c** — BlueOS 웹 UI 를 **한 번** 연다 → 배너 경고(로그·미션 로그)가 뜨고 START 가 **30 s** 거부("'ArduSub V' banner N s ago"); 닫고 30 s 뒤
+  통과. 그다음 수조에서 **6-D `pwm11k0.2_s0`(rl_pwm) 수평 hold 30 s → 검토 → 60 s**(RC 4단계: 트립 0, |p/q| p95 ≤ 15°/s, roll/pitch p2p ≤ 6°)
+  — 이것이 통과한 뒤에만 `rl_pwm_7d` 비행.
+- **모르는 것**: 수조 0런 [예측 전부]; roll/pitch 추종은 P 제어처럼 정상오차가 남는다(시뮬); 10-13 같은 스톨 링크는 시뮬에서도 트립(link1013 5회)
+  — 그 링크를 AGE 인터록·교전 거부가 막는지도 수조 0런; 부호 프로브 아티팩트(data/20261013/1013_181137_probe)는 30 일 한도.
+- **되돌리기**: `rl_pwm_7d.policy_dir: null`(LOW 꺼짐, 2026-10-10 상태). 폴더는 남겨도 된다.
 
 ### LOW `RL_PWM_7D`(roll/pitch를 펄스로 추종하는 RL): 정책 `att7pwm_s0`는 시뮬 승격 기준 미달인 채 켜져 있고, **수중 런 2회(2026-10-03 DP 추종, 2026-10-05 station hold) 모두 실패** — 수직 공동수축·침강·태그 튐에 대한 고이득 반응 (2026-10-03, 10-05 갱신)
 - **무엇**: `rl_pwm_7d` = RL_PWM과 같은 전송(펄스 8개, Lua override, MANUAL, 기체에서 읽은 게이트, 상한 `rl_pwm.pwm_cap`)에 roll/pitch
@@ -797,7 +916,8 @@
   `stabilize.yaw_axis: hold`; README "STABILIZE에서 engage하기"). 세 자문(제어이론·수중운용·정책관측) 판정은 모두
   **conditional**: roll/pitch는 이득, yaw는 의미가 토크→rate로 바뀌어 손실. 검토는 MANUAL 단독 기본을 권했으나
   **운용자 결정으로 기본값이 `[MANUAL, STABILIZE]`**(2026-09-08): STAB 버튼 → START가 그대로 STAB 아래서 돈다.
-- 미해결: (1) `hold`에선 heading_follow·circle·정책 dyaw가 동작하지 않고, `torque`는 데드존(axis ≤ 0.10) 경계 hunting이
+- 미해결: (1) `hold`에선 정책 dyaw가 동작하지 않고(진행 방향을 보는 square/circle — heading_follow, 패널 square의
+  `yaw = travel` — 은 2026-10-14부터 START가 접근 전에 거부한다), `torque`는 데드존(axis ≤ 0.10) 경계 hunting이
   [예측]; 제대로 하려면 N→yaw-rate 재해석 + 데드존 역보상인데 PilotGain(위 항목)을 못 읽어 미구현(`rate` 거부).
   (2) `mode_settle_s 2.0`은 [예측]이고, 게임패드의 모드 버튼은 기체로 직행해 스테이션이 못 보므로 그 경로의 전환은 HEARTBEAT(1 Hz)
   지연만큼 늦게 인지된다(패널 경로는 요청 시점에 시계를 찍음). (3) E-STOP/데드맨의 중립 송신은 STABILIZE에서 정지가 아니다(수평·헤딩
@@ -805,6 +925,26 @@
   (4) 펌웨어 버전 미확인 — 4.1.0이면 STABILIZE 자세 목표가 '마지막 yaw 입력 시 자세'로 잠겨 전제가 깨진다. (5) 수직 추진기를
   roll/pitch PID와 나눠 써 접촉 국면 heave 권한 감소 [유도]. (6) 스테이션 UI에 STAB 상태 칩/툴팁 없음(거부 문구만).
 - 첫 세션 절차와 측정 항목은 README 해당 절. 그 산출물이 생기기 전엔 STABILIZE 런의 수치를 MANUAL 런과 합산·인용 금지.
+
+### square `yaw = travel`(진행 방향을 보는 square)이 **실기 0런** — 꼭짓점 제자리 회전·태그 시야·테더 (2026-10-14)
+- **무엇**: 패널 square의 yaw 콤보 `yaw = travel`(`heading_follow: true`). 변마다 진행 방향을 보고, 필렛 0 꼭짓점마다
+  `_Pivot`으로 제자리 회전한다(`square.vertex_turn_deg_s` 20°/s, 90°에 4.5 s [유도]). README "square yaw 모드" 절.
+  실기 square/circle은 그 전까지 전부 `heading_follow: false`였다 [측정: `data/*/*/mpc_*.meta.json`].
+- **검증된 것은 오프라인뿐**: 단위 테스트(`test_mpcc.py`·`test_control.py`·`test_offline.py`의 travel/yaw_mode 테스트),
+  demo 토이 플랜트 `rov_gui/tests/demo_e2e.py <pid|mpc_tuned|rl> square_travel`(배선 검사), Fossen 예측모델 폐루프
+  [예측/sim] — 기체의 90° yaw 권한·지연·오버슈트는 미측정이다(이 기체의 yaw 계단 시험은 −13.3/+26.3°,
+  `data/20260914/0914_190226/mpc_190335.csv`, `mpc_190532.csv`).
+- **첫 런 전에 알 것** [예측]: (1) C3가 각 변의 진행 방향을 보므로 tag 37 기준 ±x 변 끝에서 매트 가장자리 태그까지
+  −x 0.26 m, +x 0.40 m [유도: `config/tag_map_full.yaml`] — 태그 수가 줄고, 경로엔 dropout bridge가 없어 ~1.1 s
+  끊기면 DISENGAGE. (2) 랩마다 같은 방향 360°라 5랩이면 테더 5바퀴 [유도]. (3) 보고 원점이 실제 yaw 피벗보다 뒤에
+  있어(위 "C3 외부파라미터 cam_t_flu" 항목) 제자리 회전 중 선체가 옮겨질 수 있다. (4) RL은 학습한 제자리 yaw rate(0.4 rad/s) 안이지만
+  90° 연속 회전 자체는 학습 분포에서 드물다; Fossen 예측모델에서 회전 끝 yaw 지연이 최대 ~23° [예측/sim].
+- **임시 대응**: 첫 런은 MANUAL, LOW PID 또는 MPC_Tuned, DVL OUT, `laps`를 줄이고(YAML), E-STOP에 손.
+  START가 거부하는 경우: STABILIZE(`yaw_axis: hold`), MPCC/DOBMPCC, `path_fillet_m` > 0, `path_following: false`
+  (제자리 회전은 필렛 0 waypoint square에서만 일어난다). START의 첫 회전(접근 시작, 첫 변 방향으로)은 램프 없는 한 번의
+  yaw 계단이다 — yaw fixed가 자기 헤딩으로 도는 것과 같은 방식.
+- **기록 경계**: `trajectory.heading_follow`, `reference_clock.strategy = "waypoint_vertex_pivot"`. crab square·시뮬
+  heading_follow square(이동 중 60°/s 슬루)와 합산 금지. 실기 런과 결과가 생기면 이 항목을 갱신/삭제.
 
 ### 7d LOW 추종자(`PID_7D` / `MPC_Tuned_7D` / `RL_7D`)가 **실기 0런** — PID_7D 게인은 지연·복원강성 미측정 위에 서 있고, RL_7D는 학습된 정책이 없다 (2026-10-03)
 - **무엇**: roll/pitch까지 제어하는 LOW 세 개(README "7d LOW 추종자" 절). K/M은 `*_7d` LOW + `engage.attitude_axes.enabled`일 때만
@@ -1432,6 +1572,15 @@
   (b) **교착 워치독이 없다.** `e_along ≥ 0.95·lead_m` && `|v| < ε`가 N초 지속되면 경고/중단
       해야 한다. 지금은 MPCC 데드락 2건(memory: mpcc-contouring-control)과 똑같이
       solver status 0으로 조용히 실패한다.
+- **2026-10-14 갱신**: 패널 시작값이 **바로 이 미션**(tag 37 · 1.0 × 1.0 m @0.10 m/s, `path_fillet_m: 0.0`)이
+  됐다(`data/20260818/0818_143802/mpc_143802.meta.json` `mission.panel_override`와 같은 값). 위 임시 대응의
+  "0.05–0.06 m/s"와 충돌한다. 다만 2026-09-13부터 `pid.omega_derate` 0.6→0.9라 leash 상한 힘이
+  kp_x 116.4 × 0.103 + i_max 4.0 ≈ 16.0 N으로, 교착 때 실측 9.47 N과 직선 이동 중 11.3–11.6 N 둘 다를 넘는다 [유도: 배포 게인].
+  실제로 같은 설정(PID, derate 0.9, 필렛 0, lead 0.10)의 1.0 × 1.0 m 5랩 square가 교착 없이 완료됐다 [측정:
+  `data/20260913/0913_172850/mpc_173248.meta.json` + `events.log` 17:33:00 started → 17:36:22 complete — 단 tag 36,
+  0.2 m/s 1런]. tag 37 @0.10에서는 미확인. 같은 날 바뀐 PathCursor는 필렛 0 crab 꼭짓점을 원소 단위로 그대로 둔다
+  (`test_mpcc.py::test_a_path_without_pivots_flies_exactly_what_it_did_before_the_yaw_mode`). 기본 미션으로 LOW PID
+  1런을 날려 확인한 뒤 삭제하거나 유지할 것.
 
 ### 미스 사유가 1 Hz로만 기록돼 CSV가 dropout을 15.6배 과소보고 (2026-09-06)
 - **증상**: [`workers.py:290`](rov_gui/control/workers.py#L290)의
@@ -1462,6 +1611,24 @@
   이어 쓰며 seq를 이어 받게 한다. 또는 `run_dir`이 프로세스(launch)마다 다른 leaf를 내게 한다(합류는 같은 launch의 writer끼리만).
 
 ## 🐛 테스트 / 스크립트 함정
+
+### `test_dvl.py::test_the_shipped_config_has_the_dvl_off_and_the_mount_unmeasured`가 2026-10-13 장착값 입력 뒤로 **red** (2026-10-13)
+- **증상**: 이 테스트는 배포 `config/hw_mpc.yaml`의 `dvl.mount_rpy_deg` / `mount_t_flu`가 **null**이고 모든 값이
+  `DV.DEFAULTS`와 같다고 단정한다. 2026-10-13 운영자 줄자 장착값(`[0,0,0]` / `[-0.192, 0, -0.104]`, 아직 미커밋)이 들어가면서
+  `assert cfg["mount_rpy_deg"] is None` 등에서 실패한다. 같은 날 DVL 온도 변경 뒤 `test_dvl.py`는 robust·rovgui-pose 모두
+  100/101이고 이 하나만 실패한다(변경 전 기준선 95/96도 같은 테스트 하나).
+- **임시 대응**: 실패 원인이 이 테스트 하나뿐인지 출력으로 확인한다. 장착값은 의도된 변경이다.
+- **제대로 고치는 법**: 장착값을 커밋할 때 테스트를 "배포 config는 장착이 실측돼 있고 DEFAULTS(null)와 다르다"로 바꾸거나,
+  장착 두 키를 DEFAULTS 일치 단정에서 빼고 값의 형식만 단정한다.
+
+### SENSORS 줄의 긴 `no link (<예외 문구>)`가 `--mpc` 배치에서 PROPULSION을 밀어낸다 (2026-10-13, 이전부터 있던 것)
+- **증상**: `SensorRow.value`는 생략(elide)하지 않는 일반 QLabel이다. DVL 행의 `no link (ConnectionRefusedError: [Errno 111]
+  Connection refused)`처럼 긴 detail이 오면 PROPULSION|SENSORS 짝의 경계가 움직여 PROPULSION이 233 → 196 px로 줄고,
+  오른쪽 정렬된 값은 **앞부분**이 잘린다 [측정: data/20261013/1013_dvl_gui_render/measure_layout_out.txt, 1920×1080 오프스크린].
+  2026-10-13 DVL 온도 표시는 온도가 있을 때 오류 문구를 빼고(`no link HOT 47.0°C`) 이 길이를 피한다. 온도가 없을 때의
+  긴 오류 문구는 그대로다.
+- **임시 대응**: 오류 전문은 로그(`dvl: link down (…)`)와 행 툴팁에 있다.
+- **제대로 고치는 법**: `SensorRow.value`를 `ElidedLabel`(health.py가 이미 import)로, 왼쪽 생략 + 전문 툴팁.
 
 ### `filter_plan_yaw`가 `PlanMsg`를 필드 나열로 다시 만든다 — 새 trailing 필드는 yaw 필터가 켜진 live 경로에서 **조용히 사라진다** (2026-10-05)
 - **증상**: `rov_gui/control/policy_frames.py:1329-1331`이 `PlanMsg(plan_id=…, obs_t=…, arrival_t=…, rp=rp_msg)`로 새 객체를 만든다.
@@ -2274,20 +2441,6 @@ SAM2 추적(1단계), 메시 기반 6-DoF(2단계), 현장 재구성(3단계)을
 - **순서**: 벤치 캘리브 2종 → 물 밖 트롤리에서 DR 궤적이 태그와 **같은 방향**을
   가리키는지 → 풀 station shadow → 풀 station control → line/square/circle.
 
-### `demo_e2e.py line`이 드라이버 예산(60 s) 안에 안 끝난다 (2026-08-17, 기존 결함)
-- **증상**: `demo_e2e.py pid line` → `FAIL: line never completed`. **DR과 무관**
-  (`dr` 없이도 재현). station과 square는 통과한다. circle은 드라이버에
-  아직 없다 — 넣는다면 예산은 `2*pi*R*laps/speed`가 아니라
-  `2*pi*R*laps/min(speed, sqrt(a_lat*R))`로 잡아야 이 결함을 그대로 재현하지
-  않는다(작은 반지름에서는 곡률 상한이 지배한다).
-- **원인 추정**: demo 토이 플랜트의 추종오차가 커서(err p95 14 cm) governed
-  path clock이 크게 감속 → 21 s 짜리 경로가 60 s 안에 안 끝난다. 즉 governor가
-  설계대로 동작한 결과이고 드라이버 예산이 짧은 것.
-- **임시 대응**: 없음. line 회귀는 `test_control.py`의
-  `test_line_mission_is_placed_at_a_tag` 등이 덮는다.
-- **제대로 고치는 법**: `demo_e2e`의 60 s 상한을 경로 길이에서 유도하거나, demo
-  `SHAPES["line"]`를 더 짧게. 고치면 이 항목 삭제.
-
 ### DP 데이터셋: `extract_pose`가 tilt 0 extrinsic을 합성하는데 실기 C3는 43.3° 숙여 있다 (2026-09-01)
 - **증상**: `umi_handheld/extract_pose.py:149`가 `--extrinsic c3` 기본 경로에서
   **cam_tilt_deg = 0(forward-level)** 등록을 합성한다. 실기 값은
@@ -2873,7 +3026,7 @@ AprilTag PnP → EAOB+acados NMPC → MANUAL_CONTROL 폐루프(`rov_gui/control/
   VFOV ±19.3° 밖으로 빠지고 ROV 턱(약 11.5°)은 보이는 비대칭이 생긴다 [유도].
 
 ---
-*마지막 갱신: 2026-10-05*
+*마지막 갱신: 2026-10-14*
 
 ### 정책+GUI 테스트를 한 pytest 프로세스로 길게 이어 돌리면 `pupil_apriltags`에서 멈춘다(힙 손상) — HEAD에서도 재현 (2026-10-03)
 - **증상**: `test_policy_*`·`test_plan_stream`·`test_replay` 묶음 뒤에 `test_control.py`를 같은 프로세스로 돌리면 `test_control` 초반
@@ -2926,7 +3079,7 @@ AprilTag PnP → EAOB+acados NMPC → MANUAL_CONTROL 폐루프(`rov_gui/control/
 - **원인 [유도]**: `config/hw_mpc.yaml plant.linear_damping [86.7, 133.8, …]`(2026-09-08 실기값, 모델의 21.5×)는 **제어기 모델**에만
   들어가고 데모 플랜트(`rov_gui/control/plant.py`)는 marinegym 원본 항력(4.03)으로 돈다 → EAOB가 그 차이를 외란으로 추정해
   접근 중 클립에 붙는다. 덮어쓰기를 뺀 임시 설정으로 다시 돌리면 접근은 되지만 10 s 정착이 드라이버의 20 s 예산을 넘겨
-  `settling over the start point (5 s)`에서 FAIL(`demo_e2e.py line`의 예산 결함과 같은 부류). 6-DoF 변형과 무관(변형 OFF, dobmpc 제어 출력은
+  `settling over the start point (5 s)`에서 FAIL(드라이버 예산 문제. 같은 부류로 등재됐던 `demo_e2e.py line` 미완료는 실제로는 경로 끝 피벗의 투영 동률이었고 2026-10-14 pivot-aware 커서로 해결돼 삭제됨). 6-DoF 변형과 무관(변형 OFF, dobmpc 제어 출력은
   `test_attitude_axes`/`test_control`의 바이트 동일 검사 대상).
 - **경계**: 2026-08-14 이후 dobmpc square 데모 행이 통과한 기록은 저널에 없다(마지막 녹색은 damping 덮어쓰기 이전). 실기 dobmpc 런에 옮겨 읽지 말 것.
 - **후속**: 데모 플랜트가 `plant.linear_damping` 덮어쓰기를 같이 받게 하거나(데모의 목적이 "제어기 모델 = 플랜트"라면) 드라이버 예산을

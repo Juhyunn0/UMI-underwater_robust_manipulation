@@ -30,7 +30,11 @@ roll_deg / pitch_deg (ATTITUDE), batt_v / batt_a (BATTERY_STATUS, ~1 Hz, held), 
     check, not persisted];
   * the cap per file is meta ``controller.pwm_cap`` (0.25 on 10-01, 1.0 after) and the pinned item judges the
     vehicle's report against it;
-  * rows after the disengage (``engaged`` 0) are skipped — the live interlock never saw them either.
+  * rows after the disengage (``engaged`` 0) are skipped — the live interlock never saw them either;
+  * AGE (2026-10-15) is judged only on a file that RECORDED the attitude's vehicle-clock age: meta schema_version >=
+    21 with the CSV column ``att_age_v_s`` (an empty / nan cell there is "unknown", which the live item counts as
+    over). Every earlier file never logged it, so the item is skipped (``age_judged`` false) — the 10-13 ages exist
+    only as the offline floor fit of RL_controller/logs/eval/pool_trips_1013_rootcause (its fix-design replay).
 Nothing here is a measurement of what the interlocks WILL do on the vehicle: it is the recorded signals judged by the
 code that will judge the live ones. Numbers in the report are [측정: the named CSV] through [예측] thresholds.
 
@@ -92,6 +96,9 @@ def load_csv(path: str) -> dict:
     d["tag_age"] = np.array([_f(r.get("tag_age_s")) for r in rows])
     d["engaged"] = np.array([_f(r.get("engaged", 1)) for r in rows])
     d["p_xyz"] = np.array([[_f(r.get("px")), _f(r.get("py")), _f(r.get("pz"))] for r in rows]).reshape(n, 3)
+    # schema 21: the attitude's vehicle-clock age (nan = unknown, or the column is absent: see has_att_age)
+    d["has_att_age"] = bool(rows) and "att_age_v_s" in rows[0]
+    d["att_age"] = np.array([_f(r.get("att_age_v_s")) for r in rows])
     return d
 
 
@@ -196,14 +203,21 @@ def replay_file(csv_path: str, thresholds: dict, null_us_values=(100.0, 120.0), 
     i0 = _first_pulse_index(d)
     t_ref = float(d["t"][i0]) if i0 is not None else (float(d["t"][0]) if d["n"] else 0.0)
     live = d["engaged"] >= 0.5 if d["n"] else np.array([], dtype=bool)
+    # AGE only where the file recorded it (schema >= 21 + the column); see the module docstring
+    try:
+        schema = int(meta.get("schema_version") or 0)
+    except (TypeError, ValueError):
+        schema = 0
+    judge_age = bool(schema >= 21 and d["has_att_age"])
     out = {"file": csv_path, "mode": d["mode"], "cap": cap, "hz": hz, "rate_src": rate_src, "rows": int(d["n"]),
            "duration_s": (float(d["t"][-1] - d["t"][0]) if d["n"] else 0.0),
            "first_pulse_s": (None if i0 is None else float(d["t"][i0] - d["t"][0])),
-           "t_ref": t_ref, "trips": {}, "peak": None, "hold_guard_s": None, "hold_guard_frac": None}
+           "t_ref": t_ref, "trips": {}, "peak": None, "hold_guard_s": None, "hold_guard_frac": None,
+           "age_judged": judge_age}
     for nu in null_us_values:
         thr = dict(thresholds)
         thr["null_us"] = float(nu)
-        ilk = PwmInterlocks(thr, hz, cap)
+        ilk = PwmInterlocks(thr, hz, cap, judge_age=judge_age)
         trip = None
         pwm_us = None
         for i in range(d["n"]):
@@ -213,7 +227,7 @@ def replay_file(csv_path: str, thresholds: dict, null_us_values=(100.0, 120.0), 
             if not np.any(np.isnan(pw)):
                 pwm_us = tuple(int(round(v)) for v in pw)       # else: the previous report, carried forward
             why = ilk.step(d["roll"][i], d["pitch"][i], p[i], q[i], batt_a=d["batt_a"][i], batt_v=d["batt_v"][i],
-                           pwm_us=pwm_us)
+                           pwm_us=pwm_us, att_age_s=d["att_age"][i])
             if why:
                 lt = ilk.last_trip or {}
                 trip = {"name": lt.get("name"), "t_s": float(d["t"][i] - t_ref), "row": i, "why": why,
@@ -378,7 +392,9 @@ def main(argv=None) -> int:
         "inputs [측정: each CSV]: roll_deg/pitch_deg (ATTITUDE), batt_v/batt_a (BATTERY_STATUS ~1 Hz, held), pwm1..8 "
         "(the vehicle's SERVO_OUTPUT_RAW, ~0.14 s behind the sent frame — NOT the sent pulses; an empty row carries the "
         "previous report forward), n_tags/tag_age_s; "
-        "rate = gyro (ekf_inputs.jsonl pqr, aligned by t0_csv) or fd (np.gradient of the logged angles, 10-01: no sidecar)",
+        "rate = gyro (ekf_inputs.jsonl pqr, aligned by t0_csv) or fd (np.gradient of the logged angles, 10-01: no sidecar); "
+        "AGE = att_age_v_s, judged only on schema >= 21 files "
+        f"({sum(1 for r in results if r.get('age_judged'))}/{len(results)} here; earlier files never logged it)",
         "columns: trip = first interlock to reach its debounce and seconds after the first non-neutral vehicle pulse "
         "(pulse@ = that pulse's time from the file's first row); peaks = max tilt deg / max |p|,|q| deg/s / max batt_a / "
         "min batt_v / max |null| us / max thrusters at the cap; tag gate HOLD@ = when rl_pwm.obs_guard would first have "

@@ -183,14 +183,52 @@ def build_parser() -> argparse.ArgumentParser:
                         "only worth keeping at a real rate. It does TRANSMIT "
                         "(MAV_CMD_SET_MESSAGE_INTERVAL) — pass this to keep the "
                         "station strictly passive.")
-    g.add_argument("--mavlink-rate", type=int, default=200,
-                   help="rate to request for RAW_IMU / SCALED_IMU2 / ATTITUDE "
-                        "(default: %(default)s Hz). This is the AUTOPILOT's IMU "
-                        "— the C3's BNO086 is a different sensor with its own "
-                        "flag, --c3-imu-rate. Measured on this vehicle "
+    # 2026-10-15: one request per message instead of one rate for all three
+    # (rov_gui/mavlink_streams.py has the consumer-by-consumer reasons). The
+    # per-message flags default to None = the module's DEFAULT_HZ, so the
+    # launch check can tell a typed value from a default; only the vehicle
+    # worker and the run meta read them, both through mavlink_streams.
+    g.add_argument("--mavlink-rate", type=int, default=None, metavar="N",
+                   help="LEGACY: request RAW_IMU, SCALED_IMU2 and ATTITUDE "
+                        "all at N Hz — the request before 2026-10-15, when N "
+                        "defaulted to 200. Measured on this vehicle "
                         "2026-08-06: default 2-3 Hz; request 50 -> 62, 100 -> "
-                        "125, 200 -> 208, and 400 or 1000 -> still 208. ~208 Hz "
-                        "is the ceiling, and costs about 0.2 Mbit/s.")
+                        "125, 200 -> 208, and 400 or 1000 -> still 208; the "
+                        "healthy recordings at 200 show ~166.6 Hz of each, "
+                        "~500 msg/s to EVERY BlueOS endpoint, which on "
+                        "2026-10-13 queued behind a parameter download and "
+                        "aged the attitude 0.43 s (median). N >= 1 "
+                        "reproduces that old request exactly; 0 or a negative "
+                        "N is REFUSED at launch (the old station turned 0 into "
+                        "50 Hz and a negative N into no request for these "
+                        "three). Given, it replaces the three flags "
+                        "below (giving both is refused at launch) and the run "
+                        "meta records it (mavlink_streams.policy legacy). "
+                        "This is the AUTOPILOT's IMU — the C3's BNO086 is a "
+                        "different sensor with its own flag, --c3-imu-rate.")
+    g.add_argument("--mavlink-att-rate", type=int, default=None, metavar="HZ",
+                   help="ATTITUDE request (default 50 Hz). Every LOW reads it "
+                        "once per 20 Hz tick; the pwm LOWs' attitude-age gate "
+                        "counts the sample's own age, and replayed on the 21 "
+                        "healthy recordings 50 Hz keeps the rolling 10-s p99 "
+                        "at <= 0.110 s against the 0.12 s engage refusal "
+                        "while ~28 Hz starts refusing healthy links "
+                        "(rov_gui/mavlink_streams.py). Cannot be off.")
+    g.add_argument("--mavlink-imu-rate", type=int, default=None, metavar="HZ",
+                   help="RAW_IMU request (default 20 Hz): the autopilot's live "
+                        "accelerometer — the *_rov.jsonl record, the IMU (ROV) "
+                        "health row (>= 10 Hz), and the accelerometer when "
+                        "SCALED_IMU2 is off. Cannot be off.")
+    g.add_argument("--mavlink-scaled-imu2-rate", type=int, default=None,
+                   metavar="HZ",
+                   help="SCALED_IMU2 request (default 20 Hz). Its accel/gyro "
+                        "read ZERO on this vehicle, but it is what the EKF's "
+                        "accelerometer and the dobmpc EAOB's nudot have always "
+                        "been fed, so it stays on unless you say otherwise. "
+                        "0 = ask the vehicle to STOP it and read the "
+                        "accelerometer from RAW_IMU instead — a real "
+                        "accelerometer those consumers have never run on "
+                        "(KNOWN_ISSUES 2026-10-15).")
     g.add_argument("--c3-imu-rate", type=int, default=200,
                    help="rate to ask the C3's BNO086 for (default: %(default)s "
                         "Hz). Asking for MORE gets less: 200 requested measured "
@@ -1660,6 +1698,65 @@ def check_fstereo_process(a):
                     "pool plan age, infer_ms or FS rate across it.")
 
 
+def check_mavlink_rates(a):
+    """The MAVLink IMU-stream flags at launch (2026-10-15,
+    rov_gui/mavlink_streams.py): ``("refuse"|"warn", text)`` or None.
+
+    REFUSED: --mavlink-rate together with a per-message flag, or a value below
+    its floor (ATTITUDE or RAW_IMU off) — past this point the vehicle worker
+    would request nothing at all. WARNED, once: a typed flag that does nothing
+    here (not --source hw, --mavlink-transport none), --no-mavlink-set-rates
+    beside a typed rate, the legacy request (the 10-13 load; a record
+    boundary), ATTITUDE below the age gate's floor and SCALED_IMU2 off (the
+    accelerometer source changes). Silent for the defaults.
+    """
+    from rov_gui import mavlink_streams as MS
+
+    try:
+        res = MS.resolve_opts(a)
+    except ValueError as e:
+        return ("refuse", str(e))
+    typed = MS.typed(a)
+    if not typed:
+        return None
+    src = getattr(a, "source", "demo")
+    transport = getattr(a, "mavlink_transport", "udp")
+    if src != "hw" or transport == "none":
+        return ("warn", f"{', '.join(typed)} does nothing with --source {src} "
+                        f"--mavlink-transport {transport}: only the hardware "
+                        f"source's telemetry worker asks the vehicle for "
+                        f"rates.")
+    notes = []
+    if not bool(getattr(a, "mavlink_set_rates", True)):
+        notes.append("--no-mavlink-set-rates: NOTHING is requested — the "
+                     "vehicle keeps the rates it was last asked for (by "
+                     "anyone).")
+    if res["policy"] == "legacy":
+        notes.append(
+            f"{MS.LEGACY_FLAG} {res['legacy_hz']}: the LEGACY request, "
+            f"RAW_IMU, SCALED_IMU2 and ATTITUDE all at {res['legacy_hz']} Hz "
+            f"({MS.requested_msg_per_s(res):.0f} msg/s asked, against "
+            f"{MS.requested_msg_per_s(MS.resolve()):.0f} by default; at 200 it "
+            f"was the 2026-10-13 load). RECORD BOUNDARY: run meta "
+            f"mavlink_streams.policy legacy.")
+    # the RESOLVED ATTITUDE rate, whichever flag set it (--mavlink-rate 20
+    # asks for ATTITUDE at 20 Hz too — verify-review F3, 2026-10-15)
+    att = res["rates_hz"]["ATTITUDE"]
+    if att < MS.ATT_AGE_FLOOR_HZ:
+        notes.append(
+            f"ATTITUDE at {att} Hz: below {MS.ATT_AGE_FLOOR_HZ} Hz the pwm "
+            f"LOWs' attitude-age gate starts refusing healthy links (the "
+            f"sample's own age counts; replayed, ~28 Hz refused 16 of "
+            f"6355 engage checks and 20 Hz 122).")
+    if res["off"]:                        # (never on the legacy request)
+        notes.append(
+            f"{', '.join(res['off'])} OFF: VehicleImu.ax..az now come "
+            f"from RAW_IMU — a live accelerometer the EKF and the dobmpc "
+            f"EAOB (nudot) have never run on; until now they were fed "
+            f"SCALED_IMU2's zeros (KNOWN_ISSUES 2026-10-15).")
+    return ("warn", " ".join(notes)) if notes else None
+
+
 def check_fstereo(a) -> str | None:
     """--fstereo only does anything on the hardware source. Say so at launch.
 
@@ -1693,7 +1790,8 @@ def main(argv: list[str] | None = None) -> int:
     bad = check_fstereo(a)
     if bad:
         print(f"rov_gui: {bad}", file=sys.stderr)
-    for check in (check_slam, check_fstereo_process, check_policy):
+    for check in (check_slam, check_fstereo_process, check_policy,
+                  check_mavlink_rates):
         got = check(a)
         if not got:
             continue

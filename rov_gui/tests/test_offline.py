@@ -3462,6 +3462,188 @@ def test_trajectory_panel_carries_the_speed():
     assert started and started[0] == len(got), "scenario must precede START"
 
 
+def test_trajectory_panel_square_yaw_mode():
+    """The square's yaw mode (operator, 2026-10-14: fixed heading, or face
+    the direction of travel). A combo that speaks KEYS, seeded from the
+    YAML's heading_follow, riding the scenario as heading_follow — False for
+    every other shape, so a seed can never turn a circle whose panel shows
+    no box — NoFocus like the HIGH/LOW combos (a focused combo eats the
+    pilot's keys), frozen from START, and named for the heading it holds:
+    the shipped yaw_map_deg 90 is map +y, which is not "+x"."""
+    from rov_gui.state import MpcStatus
+    from rov_gui.widgets.trajectory import TrajectoryWindow
+
+    _app()
+    panel = TrajectoryWindow()
+    got: list = []
+    panel.scenario_requested.connect(got.append)
+    panel.set_mission_defaults({"shape": "square", "origin_tag": 37,
+                                "size": 1.0, "size_y": None, "speed": 0.10,
+                                "heading_follow": False, "yaw_map_deg": 90.0,
+                                "yaw_fixed_deg": "current"})
+    assert got[-1] == {"shape": "square", "origin_tag": 37,
+                       "heading_tag": None, "heading_follow": False,
+                       "size": 1.0, "size_y": 1.0, "speed": 0.1}, got[-1]
+    assert panel.yaw_box.currentData() == "fixed"
+    assert panel.yaw_box.currentText() == "yaw fixed +y"
+    assert panel.yaw_box.isVisibleTo(panel)
+    assert "SW corner at tag 37, yaw fixed +y" in panel.mission_lbl.text(), \
+        panel.mission_lbl.text()
+    assert panel.yaw_box.focusPolicy() == Qt.FocusPolicy.NoFocus
+    assert panel.yaw_box not in panel._num_fields
+    panel.yaw_box.setCurrentIndex(panel.yaw_box.findData("travel"))
+    assert got[-1]["heading_follow"] is True
+    assert "yaw = travel" in panel.mission_lbl.text()
+    for shape in ("station", "line", "circle", "follow", "replay", "policy"):
+        panel.set_shape(shape)
+        assert got[-1]["heading_follow"] is False, shape
+        assert not panel.yaw_box.isVisibleTo(panel), shape
+    panel.set_shape("square")
+    assert got[-1]["heading_follow"] is True, "the box keeps its choice"
+    # frozen from START (the worker snapshots the mission there), editable
+    # while staging
+    for ph in ("approach", "settle"):
+        panel.add_status(MpcStatus(engaged=True, traj_on=False, phase=ph))
+        assert not panel.yaw_box.isEnabled(), ph
+    panel.add_status(MpcStatus(engaged=True, traj_on=False, phase="warmup"))
+    assert panel.yaw_box.isEnabled()
+    # the chip reads the ARMED scenario
+    armed = {"kind": "square", "size": 1.0, "size_y": 1.0,
+             "origin_ned": [0.0, 0.0], "rot_deg": 0.0}
+    panel.add_status(MpcStatus(engaged=True, traj_on=True, scenario=dict(
+        armed, heading_follow=True)))
+    assert not panel.yaw_box.isEnabled()
+    assert "yaw = travel" in panel.chip.text(), panel.chip.text()
+    panel.add_status(MpcStatus(engaged=True, traj_on=True, scenario=dict(
+        armed, heading_follow=False)))
+    assert "yaw = travel" not in panel.chip.text()
+    # START commits the typed numbers; the combo is not one of them
+    panel.add_status(MpcStatus(engaged=False, traj_on=False))
+    started: list = []
+    panel.mission_requested.connect(lambda: started.append(True))
+    panel.btn_start.confirmed.emit()
+    assert started and got[-1]["heading_follow"] is True
+    # a quoted "true" seeds FIXED (MpcConfig.load refuses it anyway), and
+    # the fixed item names whatever heading the seed holds
+    panel.set_mission_defaults({"shape": "square", "heading_follow": "true",
+                                "yaw_map_deg": 0.0})
+    assert panel.yaw_box.currentData() == "fixed"
+    assert panel.yaw_box.currentText() == "yaw fixed +x"
+    panel.set_mission_defaults({"shape": "square", "heading_follow": True,
+                                "yaw_map_deg": None,
+                                "yaw_fixed_deg": "current"})
+    assert panel.yaw_box.currentData() == "travel"
+    assert panel.yaw_box.itemText(panel.yaw_box.findData("fixed")) == \
+        "yaw fixed START"
+
+
+def test_trajectory_panel_distance_box_is_remembered_per_shape():
+    """Review 2026-10-14: the ONE distance box used to carry its value into
+    the next shape, so with the square seeded at 1.0 m a station start opened
+    Circle at r 1.00 m (0.6 m past the last tag from tag 37) instead of the
+    file's radius. Each shape now gets its own file value back — and the
+    operator's own edit back when they return to a shape."""
+    from rov_gui.widgets.trajectory import TrajectoryWindow
+
+    _app()
+    panel = TrajectoryWindow()
+    got: list = []
+    panel.scenario_requested.connect(got.append)
+    panel.set_mission_defaults({"shape": "station", "origin_tag": 37,
+                                "size": 1.0, "size_y": None, "length": 2.0,
+                                "radius": 0.5, "speed": 0.10})
+    panel.set_shape("circle")
+    assert got[-1]["radius"] == 0.5, got[-1]
+    panel.set_shape("line")
+    assert got[-1]["length"] == 2.0, got[-1]
+    panel.set_shape("square")
+    assert got[-1]["size"] == 1.0, got[-1]
+    panel.len_box.setValue(1.5)                       # the operator's edit
+    panel.set_shape("circle")
+    assert got[-1]["radius"] == 0.5
+    panel.set_shape("square")
+    assert got[-1]["size"] == 1.5, "the operator's square side came back"
+
+
+def test_the_yaw_box_ignores_the_wheel_and_an_open_combo_esc_is_estop():
+    """Review 2026-10-14. A wheel notch over the NoFocus yaw combo flipped the
+    mission's heading without a click; and an OPEN combo list grabs the
+    keyboard and spends Esc on closing itself — Esc is the E-STOP everywhere
+    else, so the panel takes it there too (the CkptFileDialog rule)."""
+    from rov_gui.qt import QtGui
+    from rov_gui.widgets.trajectory import TrajectoryWindow
+
+    app = _app()
+    panel = TrajectoryWindow()
+    panel.set_mission_defaults({"shape": "square", "heading_follow": False})
+    panel.show()
+    _pump(app, 30)
+    pos = QtCore.QPointF(5.0, 5.0)
+    wheel = QtGui.QWheelEvent(pos, pos, QtCore.QPoint(0, 0),
+                              QtCore.QPoint(0, -120), Qt.MouseButton.NoButton,
+                              Qt.KeyboardModifier.NoModifier,
+                              Qt.ScrollPhase.NoScrollPhase, False)
+    QtWidgets.QApplication.sendEvent(panel.yaw_box, wheel)
+    assert panel.yaw_box.currentData() == "fixed", "the wheel flipped it"
+    stops: list = []
+    panel.estop_requested.connect(lambda: stops.append(True))
+    for combo in (panel.yaw_box, panel.shape_box, panel.mode_box):
+        combo.showPopup()
+        _pump(app, 20)
+        esc = QtGui.QKeyEvent(QtCore.QEvent.Type.KeyPress, Qt.Key.Key_Escape,
+                              Qt.KeyboardModifier.NoModifier)
+        QtWidgets.QApplication.sendEvent(combo.view(), esc)
+        _pump(app, 20)
+        assert stops, f"Esc on the open {combo} list was not an E-STOP"
+        assert not combo.view().isVisible(), "the list stayed open"
+        stops.clear()
+    panel.hide()
+
+
+def test_window_sends_the_panel_scenario_when_the_backend_attaches():
+    """Review 2026-10-14: the panel's seeding emission fires while the window
+    is being BUILT, before anything is connected, so until a field was
+    touched the worker flew the bare YAML block instead of the panel — a
+    YAML heading_follow could turn a circle whose panel shows no yaw box.
+    attach() now re-sends what the panel shows."""
+    from rov_gui.window import MainWindow
+
+    root = Path(__file__).resolve().parents[2]
+
+    class MpcOpts(Opts):
+        mpc = True
+        mpc_config = str(root / "config" / "hw_mpc.yaml")
+        nav_config = str(root / "config" / "hw_nav.yaml")
+        nav_geometry = None
+
+    class _Backend:
+        name = "spy"
+        simulated = True
+
+        def describe(self):
+            return "spy backend"
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    app = _app()
+    win = MainWindow(MpcOpts())
+    sent: list = []
+    win.bus.cmd_mpc_scenario.connect(sent.append)
+    win.attach(_Backend())
+    _pump(app, 30)
+    panel = win._traj_panel
+    assert sent, "attach sent the worker nothing"
+    assert sent[-1]["shape"] == panel.current_shape()
+    assert sent[-1]["heading_follow"] is (
+        panel.current_shape() == "square"
+        and panel.yaw_box.currentData() == "travel")
+    win.shutdown()
+
+
 def test_start_is_instant_for_policy_and_a_hold_for_every_other_shape():
     """2026-09-02, operator request: `policy` starts on ONE CLICK.
 
@@ -3908,7 +4090,7 @@ def test_trajectory_panel_ckpt_widgets_share_the_high_row_and_add_no_height():
     assert p.lbl_ckpt.x() > p.shape_box.x(), "right after the HIGH combo"
     assert p.btn_ckpt.x() < p.mission_lbl.x()
     for w in (p.lbl_tag, p.tag_box, p.lbl_face, p.face_box, p.len_box,
-              p.lbl_y, p.leny_box, p.spd_box):
+              p.lbl_y, p.leny_box, p.spd_box, p.yaw_box):
         assert w.isHidden(), "every numeric field of row0 is hidden for policy"
     # a long name AND a 48-char refusal leave the panel's minimum width alone
     p.set_policy_status(PolicyStatus(
@@ -4080,6 +4262,17 @@ def test_window_wires_the_ckpt_picker_and_seeds_it_from_the_yaml():
         os.path.basename(str(cfg.policy["ckpt"])))
     assert panel.ckpt_name.toolTip() == str(cfg.policy["ckpt"]), "full path in the tooltip"
     assert panel.current_mode() == str(cfg.mode).lower(), "LOW seeded from the file"
+    # ...and the MISSION row from the same file's square: block, whatever
+    # numbers it ships (2026-10-14: tag 37, 1.0 x 1.0 m, 0.10 m/s, yaw fixed)
+    sq = cfg.square
+    assert panel.current_shape() == sq["shape"]
+    assert panel.tag_box.value() == int(sq["origin_tag"] or 0)
+    if sq["shape"] not in ("line", "circle"):
+        assert abs(panel.len_box.value() - float(sq["size"])) < 1e-9
+    assert abs(panel.leny_box.value() - float(sq["size_y"] or sq["size"])) < 1e-9
+    assert abs(panel.spd_box.value() - float(sq["speed"])) < 1e-9
+    assert panel.yaw_box.currentData() == (
+        "travel" if sq["heading_follow"] else "fixed")
     got: list = []
     win.bus.cmd_policy_ckpt.connect(got.append)
     panel._apply_ckpt_choice("/gui/picked.ckpt")

@@ -46,6 +46,7 @@ import numpy as np
 from ..state import (ACTION_REPR_POS_RPY_WIDTH, POLICY_ACTION_REPR,  # noqa: F401
                      POLICY_ACTION_REPR_AUTO, POLICY_ACTION_REPRS_FLYABLE,
                      POLICY_CKPT_DEFAULT, POLICY_UMI_REPO)
+from .path_geometry import VERTEX_TURN_DEG_S, VERTEX_TURN_DEG_S_MAX
 
 S_FLU_FRD = np.diag([1.0, -1.0, -1.0])     # same involution as dobmpc.frames.S
 
@@ -1149,7 +1150,10 @@ def default_per_thruster_block() -> dict:
     """``engage.per_thruster`` defaults (control/rl_pwm.PER_THRUSTER_DEFAULTS):
     the per-thruster interlocks of the pwm LOWs — tilt 20 deg / 0.25 s, rate
     40 deg/s / 0.15 s, pack 50 A / 1.0 s + 13.5 V, null 80 us / 0.5 s,
-    >= 3 thrusters pinned at the cap / 1.0 s. Armed ONLY under rl_pwm /
+    >= 3 thrusters pinned at the cap / 1.0 s, and (2026-10-15) the
+    attitude's vehicle-clock AGE 0.15 s / 0.5 s or 0.25 s / 0.2 s (unknown =
+    over) with its engage refusal (map >= 30 s, 10-s p99 <= 0.12 s, no
+    'ArduSub V' banner in 30 s). Armed ONLY under rl_pwm /
     rl_pwm_7d (workers._runtime_fault, after the attitude ceiling); every
     other LOW never reads the block, so its presence changes nothing for them
     (their suites prove it)."""
@@ -1569,7 +1573,13 @@ class MpcConfig:
         "length": 2.0, "dir_deg": 90.0, "ramp_s": 1.0,
         "radius": 0.5,               # CIRCLE only; the tag is on the rim
         "depth_ned": None,
+        # heading_follow: the SQUARE's yaw mode (panel, 2026-10-14) — False =
+        # FIXED (the heading rules below), True = TRAVEL (face along each
+        # side, turning in place at each vertex at vertex_turn_deg_s).
+        # yaw_rate_deg_s is the wall-clock sampler's slew and the follow
+        # mission's yaw cap, NOT the vertex turn.
         "heading_follow": False, "yaw_rate_deg_s": 60.0,
+        "vertex_turn_deg_s": VERTEX_TURN_DEG_S,
         "origin": "current", "origin_tag": None, "rot_deg": 0.0,
         # Heading held during the mission. "current" = whatever the vehicle
         # had at START. A NUMBER in yaw_map_deg is an ABSOLUTE heading in the
@@ -1815,6 +1825,23 @@ class MpcConfig:
             raise ValueError(f"square.shape must be one of {list(SHAPES)}, "
                              f"got {cfg.square.get('shape')!r}")
         cfg.square["shape"] = shape
+        # The square's YAW MODE seed (2026-10-14) and its vertex turn rate.
+        # A real bool only: every consumer reads it as bool(...), so a quoted
+        # "false" would seed the panel's yaw box as TRAVEL and fly it.
+        if not isinstance(cfg.square.get("heading_follow"), bool):
+            raise ValueError(
+                f"square.heading_follow must be true or false, got "
+                f"{cfg.square.get('heading_follow')!r}")
+        try:
+            vt = float(cfg.square.get("vertex_turn_deg_s"))
+        except (TypeError, ValueError):
+            vt = float("nan")
+        if not (0.0 < vt <= VERTEX_TURN_DEG_S_MAX):
+            raise ValueError(
+                f"square.vertex_turn_deg_s must be a rate in (0, "
+                f"{VERTEX_TURN_DEG_S_MAX:.0f}] deg/s, got "
+                f"{cfg.square.get('vertex_turn_deg_s')!r}")
+        cfg.square["vertex_turn_deg_s"] = vt
         if "engage" in raw and raw["engage"]:
             # The ONE safety block that used to merge blind. object_nav,
             # station_bridge, imu_dr and mpc_tuned all reject unknown keys for

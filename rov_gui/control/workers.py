@@ -41,7 +41,8 @@ import numpy as np
 
 from .. import runstore
 from ..qt import Slot
-from ..state import (ACTION_REPR_POS_RPY_WIDTH, Conn, MpcStatus, NavFix,
+from ..state import (ACTION_REPR_POS_RPY_WIDTH, BANNER_LINE,
+                     BANNER_WARN_EVERY_S, Conn, MpcStatus, NavFix,
                      ObjectFix, PilotInput, PwmCommand,
                      POLICY_ACTION_REPR_AUTO, POLICY_ACTION_REPRS_FLYABLE,
                      POLICY_GRID_WHY_IDLE, PolicyPlanViz, PolicyState,
@@ -54,11 +55,13 @@ from .geometry import (HANDHELD_TCP_OFFSET_CAM_M, LOW_7D_BASE,
                        policy_rp_tracked, resolve_policy_action_repr,
                        yaw_from_R)
 from .imu_dr import ImuCalibration, ImuDeadReckoner
+from .path_geometry import (PIVOT_CAPTURE_M, RL_INPLACE_TURN_DEG_S,
+                            VERTEX_TURN_DEG_S)
 from . import dvl as DV
 from . import rl_ekf as EK
 from . import object_nav as ON
 from . import station_bridge as SB
-from .state_assembler import G_NED, StateAssembler, rot_zyx
+from .state_assembler import G_NED, StateAssembler, att_age_v, rot_zyx
 from ..backends.base import TimerWorker
 
 
@@ -721,7 +724,8 @@ CSV_HEADER = ("t,px,py,pz,rx,ry,yaw_deg,pitch_deg,lap,"
               "est,ekf_ok,ekf_px,ekf_py,ekf_pz,ekf_roll_deg,ekf_pitch_deg,"
               "ekf_yaw_deg,ekf_u,ekf_v,ekf_w,ekf_sig_xy_m,ekf_age_s,"
               "ekf_tag_late_s,ekf_n_tag,ekf_n_dvl,"
-              "i_pred_a,null_v_us,null_h_us,pwm_guard\n")
+              "i_pred_a,null_v_us,null_h_us,pwm_guard,"
+              "att_age_v_s,att_tb_ms,banner_age_s\n")
 # 2026-09-08: the eleven trailing columns. `pwm1..pwm8` are the vehicle's OWN
 # SERVO_OUTPUT_RAW microseconds per thruster (1500 = neutral; EMPTY when that
 # output is unconfigured or the vehicle has not reported yet), `pwm_age_s` is
@@ -1009,6 +1013,26 @@ CSV_HEADER = ("t,px,py,pz,rx,ry,yaw_deg,pitch_deg,lap,"
 #     runtime interlocks that END an engagement are not here: they are
 #     mission-log lines (events.log "PER-THRUSTER INTERLOCK ...") and meta
 #     controller.interlocks.last_trip.
+# 2026-10-15: three trailing columns arrived with schema 21, on EVERY LOW
+# (they describe the link, not a controller) — RL_controller/logs/eval/
+# pool_trips_1013_rootcause: on 10-13 the rl_pwm policy flew on an ATTITUDE
+# 0.43 s old (median) while `imu_age_s` read ~0.05 s, because that column
+# starts the clock at the station's PARSE time and a queue on the VEHICLE side
+# of the link is invisible to it. `imu_age_s` is unchanged (and still what
+# imu_stale_s judges); read the new one beside it:
+#   * `att_age_v_s` = how old this row's roll/pitch/p/q/r were, on the
+#     VEHICLE clock: t - (the ATTITUDE's time_boot_ms put on the host clock by
+#     the MAVLink reader's rate-limited lower-envelope map, 300 ppm, reset on
+#     a reboot — c3_camera/mavlink_log.VehicleClockMap). A LOWER BOUND by the
+#     link's minimum transit (~ms). `nan` = unknown (no map: no ATTITUDE yet,
+#     REST without time_boot_ms, a foreign clock). The pwm LOWs' AGE
+#     interlock trips on it (engage.per_thruster.age_*; unknown = over).
+#   * `att_tb_ms` = that ATTITUDE's own time_boot_ms (`nan` = none), so the
+#     true age can be re-fitted offline against the rov.jsonl stream.
+#   * `banner_age_s` = seconds since the vehicle's last 'ArduSub V' banner
+#     STATUSTEXT (another client pulled the parameter list, or a reboot); `nan`
+#     = none this session. A row with banner_age_s < ~2 s sits inside the
+#     downlink queue that followed every 10-13 banner.
 
 
 class MpcWorker(TimerWorker):
@@ -1133,6 +1157,17 @@ class MpcWorker(TimerWorker):
         self._pwm_last_sent_us = None
         self._pwm_guard = 0
         self._pwm_ilk = None
+        # 2026-10-15 (AGE, RL_controller/logs/eval/pool_trips_1013_rootcause):
+        # (t, att_age_v) of every tick, engaged or not, over the last
+        # engage.per_thruster.age_engage_window_s — the pwm LOWs' engage
+        # refusal reads its p99 (_att_age_refusal). maxlen bounds a window a
+        # config could stretch; pruned by time on every tick.
+        self._att_age_hist: deque = deque(maxlen=20000)
+        # ...and the vehicle banner's mission line (_banner_tick): banners
+        # seen on VehicleImu, those not yet said, when the last line went out.
+        self._banners_seen = 0
+        self._banners_unsaid = 0
+        self._banner_event_t = None
         self._attitude_cap = (0.2, 0.3)    # (roll, pitch) wire caps in force
         self._attitude_at_engage: dict = {}   # the record (survives disengage)
         self._att_ceiling_ticks = 0        # abort_deg debounce (interlock ii)
@@ -1145,6 +1180,10 @@ class MpcWorker(TimerWorker):
         # must refuse while the sink CANNOT deliver (no peer / SYSID
         # mismatch). Absent in demo.
         self.sink_status_fn = None
+        # ...and the VehicleWorker's stream_meta(): the MAVLink IMU-stream
+        # request this session made and what arrived (run meta
+        # `mavlink_streams`, 2026-10-15). Absent in demo.
+        self.mavlink_streams_fn = None
         # commands-out-vs-motors-silent watchdog (2026-08-12 pool session:
         # 24 s of |axes|~0.2 with the vehicle not moving and nothing said so)
         self._cmd_active_ticks = 0
@@ -3626,12 +3665,14 @@ class MpcWorker(TimerWorker):
         self._log("warn", f"ctrl: {msg}")
         self._log_event(msg)
 
-    def _pwm_interlock_fault(self, meas) -> str:
+    def _pwm_interlock_fault(self, meas, health) -> str:
         """One tick of the per-thruster interlocks on the MEASURED state
         (roll/pitch and the vehicle's gyro from `meas`, the latest pack
-        sample from telemetry, the pulses that last left) -> "" or the trip
-        sentence with its numbers. The trip is also a mission line; the
-        caller disengages (neutral pulses) with the sentence."""
+        sample from telemetry, the pulses that last left, and — 2026-10-15 —
+        the attitude's vehicle-clock age from the assembler's `health`, None
+        = unknown = over) -> "" or the trip sentence with its numbers. The
+        trip is also a mission line; the caller disengages (neutral pulses)
+        with the sentence."""
         ilk = self._pwm_ilk
         if ilk is None:
             return ""
@@ -3648,7 +3689,8 @@ class MpcWorker(TimerWorker):
                                if tel is not None else None),
                        batt_v=(getattr(tel, "battery_v", None)
                                if tel is not None else None),
-                       pwm_us=self._pwm_last_sent_us)
+                       pwm_us=self._pwm_last_sent_us,
+                       att_age_s=(health or {}).get("att_age_v"))
         if why:
             name = str((ilk.last_trip or {}).get("name", "?")).upper()
             self._event(f"PER-THRUSTER INTERLOCK {name} — disengaged "
@@ -4581,8 +4623,9 @@ class MpcWorker(TimerWorker):
             # sends, once, where the operator reads.
             yaw_note = (
                 "the station's yaw axis is HELD at 0 — the autopilot's heading "
-                "hold owns heading, so heading_follow / circle / policy dyaw "
-                "will NOT turn the vehicle (engage.stabilize.yaw_axis: hold)"
+                "hold owns heading, so policy dyaw will NOT turn the vehicle "
+                "and START refuses a square/circle that faces its travel "
+                "(heading_follow; engage.stabilize.yaw_axis: hold)"
                 if self._yaw_hold else
                 "the station's yaw axis goes out as TORQUE, which ArduSub reads "
                 "as a yaw-RATE demand: |axis| <= 0.10 (N <= 2 N*m) is ignored "
@@ -4949,7 +4992,148 @@ class MpcWorker(TimerWorker):
             why = probe()
             if why:
                 return str(why)
+        # 2026-10-15 (AGE): is the attitude the policy will fly on fresh, on
+        # the VEHICLE's clock? Last, so every earlier reason keeps its place.
+        why = self._att_age_refusal()
+        if why:
+            return why
         return ""
+
+    def _att_age_cfg(self) -> dict:
+        """engage.per_thruster validated (MpcConfig.load already did; a hand-
+        built config gets the defaults the same way)."""
+        from .rl_pwm import parse_per_thruster_block
+
+        return parse_per_thruster_block(
+            (self.cfg.engage.get("per_thruster") if self.cfg else None) or None)
+
+    def _note_att_age(self, t: float, health) -> None:
+        """One tick's vehicle-clock attitude age (None = unknown) into the
+        window the engage refusal reads, pruned to age_engage_window_s. Every
+        tick, engaged or not, every LOW: the window has to be full the moment
+        a pwm LOW is picked and START pressed."""
+        try:
+            win = float((self.cfg.engage.get("per_thruster") or {}).get(
+                "age_engage_window_s", 10.0)) if self.cfg else 10.0
+        except (TypeError, ValueError, AttributeError):
+            win = 10.0
+        h = self._att_age_hist
+        h.append((float(t), (health or {}).get("att_age_v")))
+        while h and float(t) - h[0][0] > win:
+            h.popleft()
+
+    def _att_age_refusal(self) -> str:
+        """The pwm LOWs' engage gate on the ATTITUDE's vehicle-clock age
+        (2026-10-15, operator-approved station fix 1b; RL_controller/logs/
+        eval/pool_trips_1013_rootcause). "" = engage may proceed. Refuses
+        when (in this order):
+          1. the age cannot be measured — no ATTITUDE placed on the vehicle
+             clock (MAVLink reader's VehicleClockMap; REST or a foreign clock
+             included). Unknown is never fresh;
+          2. the clock map is younger than age_map_min_s (30 s): a map that
+             started inside a standing queue under-reads until it drains;
+          3. an 'ArduSub V' banner arrived less than banner_hold_s (30 s)
+             ago — another client pulled the parameter list and the downlink
+             queues behind it (every 10-13 queue onset followed one);
+          4. ANY tick of the last age_engage_window_s (10 s) had no
+             measurable age — fail-safe, whatever the window's length (a
+             percentile would let 2 unknown ticks refuse a 200-tick window
+             and pass a 201-tick one: verify-replay I1, 2026-10-15);
+          5. the p99 of the age over those ticks, plus the age NOW, exceeds
+             age_engage_p99_s (0.12 s). The window is whatever ticks the
+             worker has — it ticks from setup, and rule 2 already asks for
+             30 s of vehicle stream;
+          6. the age NOW exceeds age_s (0.15 s, the runtime soft limit): one
+             sample among ~200 cannot move the p99, so an attitude already
+             stale at START was admitted and tripped 0.2 s later
+             (verify-review F1, 2026-10-15).
+        The runtime half (0.15 s / 0.5 s, 0.25 s / 0.2 s) is the AGE item of
+        rl_pwm.PwmInterlocks."""
+        c = self._att_age_cfg()
+        t = now()
+        imu = self.imu
+        low = str(self.cfg.mode) if self.cfg else "rl_pwm"
+        age_now = att_age_v(imu, t)
+        t0 = getattr(imu, "att_map_t0", None) if imu is not None else None
+        if age_now is None or t0 is None:
+            return (f"{low}: attitude age UNKNOWN — no ATTITUDE placed on the "
+                    f"vehicle clock yet (time_boot_ms map; needs the UDP/REST "
+                    f"MAVLink reader and the autopilot's own ATTITUDE) — the "
+                    f"policy cannot be told how old its roll/pitch/gyro are")
+        map_age = t - float(t0)
+        if map_age < float(c["age_map_min_s"]):
+            return (f"{low}: the vehicle-clock map is {map_age:.0f} s old "
+                    f"(< engage.per_thruster.age_map_min_s "
+                    f"{float(c['age_map_min_s']):g} s; started or restarted — "
+                    f"vehicle reboot?) — wait, then press START again")
+        t_b = getattr(imu, "t_banner", None)
+        if t_b is not None and t - float(t_b) < float(c["banner_hold_s"]):
+            return (f"{low}: 'ArduSub V' banner {t - float(t_b):.0f} s ago "
+                    f"(< engage.per_thruster.banner_hold_s "
+                    f"{float(c['banner_hold_s']):g} s) — another client "
+                    f"requested the full parameter list and the MAVLink "
+                    f"downlink queues behind it; close it (BlueOS / Cockpit / "
+                    f"QGC tab, an extension) and wait")
+        win = float(c["age_engage_window_s"])
+        ticks = [a for (ti, a) in self._att_age_hist if t - ti <= win]
+        # an unknown tick is never fresh: ONE refuses (no percentile decides
+        # it, so the window's length cannot either)
+        n_unk = sum(1 for a in ticks if a is None)
+        if n_unk:
+            return (f"{low}: {n_unk} of the last {len(ticks)} ticks "
+                    f"({win:g} s) had NO measurable attitude age (vehicle-"
+                    f"clock map lost or not placed; unknown is never fresh) — "
+                    f"wait for {win:g} s of measured ticks, then press START "
+                    f"again")
+        vals = [float(a) for a in ticks]
+        vals.append(float(age_now))
+        p99 = float(np.percentile(np.asarray(vals, float), 99))
+        if not (p99 <= float(c["age_engage_p99_s"])):      # nan refuses too
+            return (f"{low}: attitude age p99 {p99:.2f} s over the last "
+                    f"{win:g} s ({len(vals)} ticks; now {age_now:.2f} s) > "
+                    f"engage.per_thruster.age_engage_p99_s "
+                    f"{float(c['age_engage_p99_s']):g} s — the ATTITUDE is "
+                    f"arriving late (vehicle-side MAVLink queue): find the "
+                    f"load (another client, stream rates)")
+        # the instant itself: one sample among ~200 cannot move the p99
+        if not (float(age_now) <= float(c["age_s"])):
+            return (f"{low}: the attitude is {age_now:.2f} s old NOW "
+                    f"(> engage.per_thruster.age_s {float(c['age_s']):g} s, "
+                    f"the runtime limit; the last {win:g} s p99 {p99:.2f} s "
+                    f"cannot show one late sample) — the ATTITUDE is arriving "
+                    f"late right now: wait, then press START again")
+        return ""
+
+    def _banner_tick(self, t: float) -> None:
+        """The vehicle's 'ArduSub V' banner as a MISSION line (bus.mpc_event +
+        events.log), at most once per BANNER_WARN_EVERY_S with how many
+        arrived since the last line (the VehicleWorker says the same on the
+        station log). Outside any run folder the file half is held
+        (`pending`) and heads the next events.log, like a LOW-combo line —
+        a station left idle must not open a folder per minute."""
+        imu = self.imu
+        n = int(getattr(imu, "n_banners", 0) or 0) if imu is not None else 0
+        if n < self._banners_seen:            # a new reader (VehicleWorker restart)
+            self._banners_seen = n
+        if n > self._banners_seen:
+            self._banners_unsaid += n - self._banners_seen
+            self._banners_seen = n
+        if self._banners_unsaid <= 0:
+            return
+        if self._banner_event_t is not None and \
+                t - self._banner_event_t < BANNER_WARN_EVERY_S:
+            return
+        k, self._banners_unsaid = self._banners_unsaid, 0
+        self._banner_event_t = t
+        try:
+            hold = float(self._att_age_cfg()["banner_hold_s"])
+        except (ValueError, TypeError):
+            hold = 30.0
+        self._event(f"{BANNER_LINE} ({k} 'ArduSub V' banner"
+                    f"{'s' if k != 1 else ''} since the last line) — the "
+                    f"MAVLink downlink queues behind it; rl_pwm / rl_pwm_7d "
+                    f"refuse to engage for {hold:g} s after one",
+                    pending=not (self.engaged or self._csv is not None))
 
     def _engage_refusal(self) -> str:
         e = self.cfg.engage if self.cfg else {}
@@ -5256,16 +5440,51 @@ class MpcWorker(TimerWorker):
                            (float(self._eta[0]), float(self._eta[1])),
                            float(self._eta[5]), float(self._eta[2]))
             return
+        # A path that FACES ITS DIRECTION OF TRAVEL (heading_follow — the
+        # panel's square yaw mode TRAVEL, 2026-10-14) is refused here, BEFORE
+        # the approach, wherever the loop cannot fly it: refusing after a
+        # minute of approach (the station's facing-tag check in _arm_path) is
+        # a minute of the operator waiting for a "no".
+        follow_heading = (shape in ("square", "circle")
+                          and bool(sq.get("heading_follow", False)))
+        if follow_heading:
+            why = self._heading_follow_refusal(shape)
+            if why:
+                self._refuse(why)
+                return
         origin_xy = self._mission_origin(sq)
         if origin_xy is None:
             return                            # reason already logged
-        # heading_tag is a STATION idea (a path's heading is its direction of
-        # travel, or heading_follow). A value left in hw_mpc.yaml must not
-        # steer a line/square/circle from a box the panel hides for them
-        # (safety review 2026-09-11, HIGH).
-        yaw_fixed = self._mission_yaw(
-            sq if shape == "station" else {**sq, "heading_tag": None},
-            origin_xy)
+        # heading_tag is a STATION idea (a path's heading is the yaw mode's:
+        # yaw_map_deg, or the direction of travel under heading_follow). A
+        # value left in hw_mpc.yaml must not steer a line/square/circle from
+        # a box the panel hides for them (safety review 2026-09-11, HIGH).
+        #
+        # Under heading_follow the approach and the settle already face the
+        # path's FIRST tangent, so arming it is not a yaw step: with the
+        # shipped yaw_map_deg 90 (map +y) against a first side along map +x
+        # the reference would step 90 deg on the first path tick, and a
+        # circle's (first tangent map -y) 180 [유도]. yaw_map_deg keeps
+        # meaning what it says for the FIXED mode only.
+        if follow_heading:
+            try:
+                yaw_fixed = self._path_start_yaw(sq, shape, origin_xy)
+            except (KeyError, TypeError, ValueError) as e:
+                self._refuse(f"invalid path geometry ({e})")
+                return
+            rate = float(sq.get("vertex_turn_deg_s", VERTEX_TURN_DEG_S))
+            if (shape == "square" and str(self.cfg.mode).startswith("rl")
+                    and rate > RL_INPLACE_TURN_DEG_S):
+                self._log(
+                    "warn", f"ctrl: square.vertex_turn_deg_s {rate:.0f} is "
+                            f"above the RL policies' trained in-place yaw "
+                            f"rate ({RL_INPLACE_TURN_DEG_S:.1f} deg/s) — "
+                            f"{self.cfg.mode.upper()} turns at the vertices "
+                            f"out of its training distribution")
+        else:
+            yaw_fixed = self._mission_yaw(
+                sq if shape == "station" else {**sq, "heading_tag": None},
+                origin_xy)
         if yaw_fixed is None:
             return                            # reason already logged
         depth = sq.get("depth_ned")
@@ -5372,6 +5591,102 @@ class MpcWorker(TimerWorker):
         yf = sq.get("yaw_fixed_deg", "current")
         return (float(self._eta[5]) if yf in ("current", None)
                 else math.radians(float(yf)))
+
+    def _datumized(self, sq: dict, shape: str) -> dict:
+        """A copy of the mission with its MAP-frame angle in the DATUM frame.
+
+        dir_deg (line) and rot_deg (square, circle) are MAP angles: 0 means
+        the same physical direction every run. The reference is built in the
+        DATUM frame, so the engage yaw comes off — without it a line ran
+        along datum +y (operator: "+y is the pool's long side but it drew
+        along -x", 2026-08-14) and the rectangle came out tilted by whatever
+        heading the vehicle held at START (operator screenshot, 2026-08-14).
+        ONE copy of that arithmetic, for _arm_path and the heading-follow
+        start heading alike, so the two cannot disagree."""
+        sq = dict(sq)
+        yaw0 = self._datum["yaw0"] if self._datum else 0.0
+        if shape == "line":
+            sq["dir_deg"] = math.degrees(_wrap_pi(
+                math.radians(float(sq.get("dir_deg", 90.0))) - yaw0))
+        elif shape in ("square", "circle"):
+            sq["rot_deg"] = math.degrees(_wrap_pi(
+                math.radians(float(sq.get("rot_deg", 0.0))) - yaw0))
+        return sq
+
+    def _heading_follow_refusal(self, shape: str) -> str:
+        """Why a square/circle that FACES ITS DIRECTION OF TRAVEL cannot fly
+        here, or "" (2026-10-14, the panel's square yaw mode TRAVEL).
+
+        * STABILIZE with engage.stabilize.yaw_axis: hold — the yaw axis goes
+          out as 0 and the autopilot's heading hold owns heading, so the path
+          would be flown as a CRAB while the meta said heading_follow. The
+          station's facing-tag refusal, for the same reason.
+        * A contouring LOW (mpcc/dobmpcc) and a SQUARE — it owns its own
+          progress (theta is a solver decision), so the vertex turn RATE is
+          not something the reference can impose on it: in an offline sim
+          plant its turn peaked at ~31 deg/s whatever the rate asked
+          [예측: Fossen plant, 2026-10-14]. A record that names a turn rate
+          the run did not fly is the failure this guards. (A circle has no
+          vertex and keeps flying it.)
+        * A SQUARE whose curve will carry no vertex pivots — path_fillet_m
+          above 0 (the heading then turns along each arc at v/R, 33 deg/s at
+          R 0.15 and faster on smaller arcs [유도: sqrt(a_lat/R)], while the
+          hull keeps moving) or path_following false (the wall-clock sampler
+          slews at yaw_rate_deg_s through the corner). The panel says
+          "turns in place at the corners"; only the waypoint square does."""
+        if self._yaw_hold:
+            return (f"yaw mode TRAVEL needs the yaw axis, but the vehicle "
+                    f"engaged in {self._flight_mode_at_engage} with "
+                    f"engage.stabilize.yaw_axis: hold — the autopilot's "
+                    f"heading hold owns heading, so the {shape} would fly as "
+                    f"a crab. Engage in MANUAL, or pick yaw fixed.")
+        if (shape == "square" and self.ctrl is not None
+                and hasattr(self.ctrl, "progress_m")):
+            return (f"yaw mode TRAVEL is not flown by {self.cfg.mode.upper()}"
+                    f" — a contouring LOW decides its own progress, so the "
+                    f"vertex turn rate (square.vertex_turn_deg_s) would not "
+                    f"be honoured. Pick PID / MPC / MPC_Tuned / RL, or yaw "
+                    f"fixed.")
+        if shape == "square" and not self.cfg.path_following:
+            return ("yaw mode TRAVEL turns in place only on the spatial "
+                    "path follower — path_following is false, so the corners "
+                    "would be slewed at yaw_rate_deg_s while moving. Set "
+                    "path_following: true, or pick yaw fixed.")
+        if shape == "square" and float(self.cfg.path_fillet_m) > 1e-9:
+            return (f"yaw mode TRAVEL turns in place only on the sharp "
+                    f"(waypoint) square — path_fillet_m is "
+                    f"{float(self.cfg.path_fillet_m):.2f}, so the heading "
+                    f"would swing along each corner arc at v/R, faster than "
+                    f"square.vertex_turn_deg_s. Set path_fillet_m: 0.0, or "
+                    f"pick yaw fixed.")
+        return ""
+
+    def _path_start_yaw(self, sq: dict, shape: str, origin_xy) -> float:
+        """The DATUM-frame heading of the path's first tangent — what a path
+        flown facing its direction of travel starts out facing, and so what
+        its approach and settle hold.
+
+        Read off the SAME curve the follower will fly (reference placement ->
+        path_from_scenario, built with the worker's own fillet/creep), not
+        from a formula of rot_deg: a convention that drifted between the two
+        would be a yaw step at the first path tick, which is what this exists
+        to remove."""
+        from .path_geometry import path_from_scenario
+        from .reference import place_circle_ned, place_square_ned
+
+        place = place_circle_ned if shape == "circle" else place_square_ned
+        # Placed WITHOUT heading_follow: the curve does not depend on it, and
+        # with it the placement precomputes the wall-clock sampler's whole
+        # slewed yaw profile (a Python loop over T_run/dt) for nothing — on
+        # the control thread, inside the tick that pressed START.
+        _fn, scen = place(dict(self._datumized(sq, shape),
+                               heading_follow=False),
+                          origin_xy, 0.0, 0.0, dt=1.0 / self.cfg.ctrl_hz)
+        scen["heading_follow"] = True
+        path = path_from_scenario(scen, fillet_m=self.cfg.path_fillet_m,
+                                  turn_radius_m=self.cfg.path_turn_radius_m,
+                                  pivot_speed_m_s=self.cfg.path_creep_m_s)
+        return _wrap_pi(float(path.sample(np.array([0.0]))[2][0]))
 
     def _tag_map_xy(self, tag, what: str):
         """MAP-frame (x, y) of one tag id, or None after a logged refusal:
@@ -5517,9 +5832,10 @@ class MpcWorker(TimerWorker):
         if self.ctrl is not None and hasattr(self.ctrl, "progress_m"):
             return float(getattr(self, "_mpcc_v_theta", 0.0))
         if self._path_cursor is not None:
-            return float(np.interp(self._path_cursor.target_theta,
-                                   self._path_cursor._s,
-                                   self._path_cursor._v))
+            # 0 while a pivot turns the heading in place (the speed profile's
+            # creep there is the turn's clock, not a velocity the hull is
+            # being asked for); the profile everywhere else.
+            return float(self._path_cursor.ref_speed())
         return None
 
     def _path_theta(self):
@@ -8666,16 +8982,20 @@ class MpcWorker(TimerWorker):
             self._log_event(f"STATION - {what}")
             self._log("warn", f"ctrl: {what}")
             return
+        if (shape in ("square", "circle")
+                and bool(sq.get("heading_follow", False))):
+            # Belt and braces: set_traj refused this BEFORE the approach, and
+            # neither the flight mode (pinned at engage) nor the LOW (frozen
+            # while engaged) can change in between — but a path that faces
+            # its travel must never be armed where it cannot turn.
+            why = self._heading_follow_refusal(shape)
+            if why:
+                self._refuse(why)
+                return
         if shape == "line":
-            # dir_deg is a MAP heading (90 = the pool's +y). The reference is
-            # built in the DATUM frame, so it has to be rotated by the engage
-            # yaw — without this the line ran along datum +y, which is a
-            # different physical direction every run (operator: "+y is the
-            # pool's long side but it drew along -x", 2026-08-14).
-            sq = dict(sq)
-            sq["dir_deg"] = math.degrees(_wrap_pi(
-                math.radians(float(sq.get("dir_deg", 90.0)))
-                - (self._datum["yaw0"] if self._datum else 0.0)))
+            # dir_deg is a MAP heading (90 = the pool's +y), datumized
+            # (_datumized has the why).
+            sq = self._datumized(sq, shape)
             scen = self.ctrl.set_line_ned(sq, origin_xy, yaw_fixed, depth)
             scen["dir_map_deg"] = float(
                 (self._scenario_override.get("dir_deg")
@@ -8690,11 +9010,8 @@ class MpcWorker(TimerWorker):
             # MAP rotation for the same reason the rectangle's is — it is
             # datumized here so rot 0 always means the same physical circle,
             # centre at +x of the tag, tag at the bottom of the plot.
-            sq = dict(sq)
             rot_map = float(sq.get("rot_deg", 0.0))
-            sq["rot_deg"] = math.degrees(_wrap_pi(
-                math.radians(rot_map)
-                - (self._datum["yaw0"] if self._datum else 0.0)))
+            sq = self._datumized(sq, shape)
             scen = self.ctrl.set_circle_ned(sq, origin_xy, yaw_fixed, depth)
             scen["rot_map_deg"] = rot_map
             what = (f"CIRCLE r {scen['radius']:.2f} m @ {scen['speed']} m/s, "
@@ -8708,17 +9025,22 @@ class MpcWorker(TimerWorker):
             # this the rectangle came out tilted by however the vehicle
             # happened to be pointing at START (operator screenshot,
             # 2026-08-14).
-            sq = dict(sq)
             rot_map = float(sq.get("rot_deg", 0.0))
-            sq["rot_deg"] = math.degrees(_wrap_pi(
-                math.radians(rot_map)
-                - (self._datum["yaw0"] if self._datum else 0.0)))
+            sq = self._datumized(sq, shape)
             scen = self.ctrl.set_square_ned(sq, origin_xy, yaw_fixed, depth)
             scen["rot_map_deg"] = rot_map
+            # The turn rate rides the SCENARIO, which is what the curve below
+            # is built from and what the meta records — never a module
+            # default the operator's YAML did not say (place_square_ned
+            # already puts it there; a bridge that does not is filled here).
+            scen.setdefault("vertex_turn_deg_s",
+                            float(sq.get("vertex_turn_deg_s",
+                                         VERTEX_TURN_DEG_S)))
             what = (f"SQUARE {scen['size']:.2f} x "
                     f"{scen.get('size_y', scen['size']):.2f} m @ "
                     f"{scen['speed']} m/s, {scen['laps']} lap(s), "
-                    f"heading_follow={scen['heading_follow']}")
+                    f"heading_follow={scen['heading_follow']}"
+                    + (" (yaw = travel)" if scen["heading_follow"] else ""))
         # ONE curve for every controller. MPCC built its own inside the
         # bridge (it needs it as an optimizer parameter); a PID gets the same
         # ArcPath through a projection cursor, so "PID vs MPCC" is a
@@ -8737,7 +9059,21 @@ class MpcWorker(TimerWorker):
             try:
                 path = path_from_scenario(
                     scen, fillet_m=self.cfg.path_fillet_m,
-                    turn_radius_m=self.cfg.path_turn_radius_m)
+                    turn_radius_m=self.cfg.path_turn_radius_m,
+                    pivot_speed_m_s=self.cfg.path_creep_m_s)
+                pivots = path.pivot_spans()
+                if shape == "square" and pivots:
+                    # What a TRAVEL square flies at each vertex, on the
+                    # record: the curve's own numbers, not the request's.
+                    a0, b0, _x0, _y0, spd = pivots[0]
+                    scen["vertex_pivot"] = {
+                        "turn_deg_s": float(scen["vertex_turn_deg_s"]),
+                        "len_m": float(b0 - a0), "speed_m_s": float(spd),
+                        "per_lap": len(pivots) // max(1, path.laps),
+                        "capture_m": float(PIVOT_CAPTURE_M)}
+                    what += (f", turns in place at "
+                             f"{float(scen['vertex_turn_deg_s']):.0f} deg/s "
+                             f"at each vertex")
                 s_grid, v_grid = path.speed_profile(
                     float(scen.get("speed", 0.05)),
                     self.cfg.path_lat_accel_m_s2,
@@ -8996,6 +9332,10 @@ class MpcWorker(TimerWorker):
         vel_xy, disp_xy, dvl_why = self._dvl_inputs(t)
         meas, health = self.asm.step(self.fix, self.imu, t, dt,
                                      vel_xy=vel_xy, disp_xy=disp_xy)
+        # 2026-10-15: every tick's vehicle-clock attitude age into the engage
+        # refusal's window, and the banner's once-a-minute mission line.
+        self._note_att_age(t, health)
+        self._banner_tick(t)
         self._dvl_after_step(meas, health,
                              vel_xy if meas is not None else None, dvl_why, t)
         if meas is not None and self._datum is not None:
@@ -9567,7 +9907,10 @@ class MpcWorker(TimerWorker):
             # offline replay (control/rl_pwm.PwmInterlocks). Judged on the
             # MEASURED state (`meas`: the tag state, or the bridge's with
             # the vehicle's own roll/pitch/gyro), never on the estimate.
-            why_pt = self._pwm_interlock_fault(meas)
+            # 2026-10-15: AGE first — the vehicle-clock age of that roll/
+            # pitch/gyro (`health` att_age_v, set on bridged ticks too),
+            # 0.15 s / 0.5 s or 0.25 s / 0.2 s, unknown = over.
+            why_pt = self._pwm_interlock_fault(meas, health)
             if why_pt:
                 return why_pt
         # No position abort. Until 2026-08-14 leaving the geofence box (plus a
@@ -10119,7 +10462,7 @@ class MpcWorker(TimerWorker):
             except OSError:
                 pass
         return {
-            "schema_version": 20,         # 2: + plant, mission, meta_trigger
+            "schema_version": 21,         # 2: + plant, mission, meta_trigger
                                           # 3: + imu_dr, hardware.cam_tilt_deg
                                           # 4: + circle; `trajectory` is now
                                           #    PER-SHAPE (a circle carries
@@ -10475,6 +10818,75 @@ class MpcWorker(TimerWorker):
                                           #    RECORD BOUNDARY: never pool
                                           #    plan age / infer_ms / FS rate
                                           #    across fstereo.process.mode.
+                                          #    Within 20 (2026-10-14, no
+                                          #    bump: keys only): the
+                                          #    square's yaw mode TRAVEL —
+                                          #    trajectory.heading_follow
+                                          #    true, which no hardware
+                                          #    square/circle before it had
+                                          #    [측정: data/*/*/mpc_*.meta
+                                          #    .json] — adds trajectory
+                                          #    .vertex_turn_deg_s (every
+                                          #    square; FLOWN only where
+                                          #    .vertex_pivot is present)
+                                          #    and .vertex_pivot,
+                                          #    and reference_clock.strategy
+                                          #    "waypoint_vertex_pivot";
+                                          #    reference_clock
+                                          #    .pivot_capture_m marks the
+                                          #    pivot-aware cursor, which
+                                          #    also changes a LINE (v = 0
+                                          #    through its turnarounds, and
+                                          #    the run can COMPLETE). RECORD
+                                          #    BOUNDARY: never pool across
+                                          #    trajectory.heading_follow or
+                                          #    reference_clock
+                                          #    .pivot_capture_m.
+                                          # 21 (2026-10-15): + CSV columns
+                                          #    att_age_v_s, att_tb_ms,
+                                          #    banner_age_s on EVERY LOW
+                                          #    (CSV_HEADER's 2026-10-15
+                                          #    note), top-level `att_age`
+                                          #    (the clock-map estimator,
+                                          #    the engage gate's numbers,
+                                          #    banners seen), and the pwm
+                                          #    LOWs' AGE interlock + engage
+                                          #    refusal: controller.
+                                          #    interlocks gains age_judged,
+                                          #    hold_ticks.age / age_hard,
+                                          #    peak.att_age_s_max /
+                                          #    att_age_unknown_ticks and
+                                          #    the eight age_* /
+                                          #    banner_hold_s thresholds.
+                                          #    `imu_age_s` is unchanged
+                                          #    (parse-time; blind to a
+                                          #    vehicle-side queue). RECORD
+                                          #    BOUNDARY: a pwm run before
+                                          #    21 flew with NO attitude-
+                                          #    age guard (the 10-13 trips);
+                                          #    never pool pwm runs across
+                                          #    it.
+                                          #    Within 21 (2026-10-15 b, the
+                                          #    same fix set, before any 21
+                                          #    run; no bump): top-level
+                                          #    `mavlink_streams` (ALWAYS
+                                          #    written) — the IMU-stream
+                                          #    request (rov_gui/
+                                          #    mavlink_streams.py: ATTITUDE
+                                          #    50 / RAW_IMU 20 / SCALED_IMU2
+                                          #    20 Hz by default, `legacy` =
+                                          #    --mavlink-rate N, all three
+                                          #    at N) and the rates that
+                                          #    arrived. Runs before it
+                                          #    asked for all three at
+                                          #    --mavlink-rate (default 200;
+                                          #    not recorded). RECORD
+                                          #    BOUNDARY: imu_age_s /
+                                          #    att_age_v_s include the
+                                          #    ATTITUDE sample's own age
+                                          #    (+<=20 ms at 50 Hz) — never
+                                          #    pool them across
+                                          #    mavlink_streams.requested_hz.
             # `source` answers "was the plant real". A LAND DRY-RUN is the
             # third answer and needs saying out loud: the vehicle IS the real
             # one, but it could not move and could not be commanded, and the
@@ -10602,6 +11014,14 @@ class MpcWorker(TimerWorker):
                 #        set_path_plan_ned — the diffusion-policy seam
                 #   plan_stream_policy           (2026-09-02 on) the LIVE
                 #        diffusion policy's chunks through that same seam
+                #   waypoint_vertex_pivot        (2026-10-14 on) the sharp
+                #        square flown facing its travel (heading_follow):
+                #        the reference parks at each vertex and TURNS in
+                #        place at trajectory.vertex_turn_deg_s
+                #        (trajectory.vertex_pivot). Never pooled with the
+                #        crab waypoint_vertex_stop squares, nor with the
+                #        sim's heading_follow squares (they slew while
+                #        moving, 60 deg/s, no stop).
                 # Keyed on the ARMED scenario, not on _replay_last: a square
                 # armed after a replay in the same engagement must not keep
                 # wearing the replay label (scenario.kind is what flips).
@@ -10619,11 +11039,22 @@ class MpcWorker(TimerWorker):
                     else "mpcc_contouring"
                     if self.ctrl is not None
                     and hasattr(self.ctrl, "progress_m")
-                    else (("waypoint_vertex_stop"
+                    else ((("waypoint_vertex_pivot"
+                            if ((getattr(self.ctrl, "scenario", None)
+                                 or {}).get("kind") == "square"
+                                and (getattr(self.ctrl, "scenario", None)
+                                     or {}).get("vertex_pivot"))
+                            else "waypoint_vertex_stop")
                            if self.cfg and self.cfg.path_fillet_m <= 1e-9
                            else "arc_projection_cursor")
                           if self.cfg and self.cfg.path_following
                           else "wall_clock_trajectory")),
+                # The pivot-aware PathCursor (2026-10-14): a pivot is a turn
+                # the hull's progress follows once it has arrived within this
+                # of the vertex. Present = the cursor that also lets a LINE
+                # complete and holds v = 0 through its turnarounds; absent =
+                # every run before it. A record boundary for lines too.
+                "pivot_capture_m": float(PIVOT_CAPTURE_M),
                 "fillet_m": (float(self.cfg.path_fillet_m)
                              if self.cfg else None),
                 "turn_radius_m": (float(self.cfg.path_turn_radius_m)
@@ -10717,7 +11148,94 @@ class MpcWorker(TimerWorker):
             # the others fell back.
             "dvl": self._dvl_meta(),
             "ekf": self._ekf_meta(),
+            # THE ATTITUDE'S TRUE AGE (schema 21). ALWAYS written: how the
+            # CSV att_age_v_s was computed and what the pwm engage gate
+            # would say about the link at this moment.
+            "att_age": self._att_age_meta(),
+            # THE IMU STREAMS ASKED FOR (within 21, 2026-10-15 b). ALWAYS
+            # written, the imu_dr rule: what the vehicle was asked to send
+            # (and whether the request went out) decides how old a sample
+            # can be before the link adds anything.
+            "mavlink_streams": self._mavlink_streams_meta(),
         }
+
+    def _mavlink_streams_meta(self) -> dict:
+        """meta `mavlink_streams`: VehicleWorker.stream_meta, injected by
+        HardwareBackend (the fstereo_meta_fn pattern) — the request this
+        session made (rov_gui/mavlink_streams.py), whether it was sent, the
+        SET_MESSAGE_INTERVAL ack and the rates that arrived. Without it (demo,
+        ros2, a test) only the flags as given. Never raises."""
+        fn = getattr(self, "mavlink_streams_fn", None)
+        if fn is not None:
+            try:
+                return dict(fn())
+            except Exception as e:                               # noqa: BLE001
+                return {"error": f"{type(e).__name__}: {e}"}
+        o = self.opts
+        return {"link": None,
+                "why": "no vehicle telemetry worker (demo / ros2 source, or "
+                       "not wired)",
+                "flags": {k: getattr(o, k, None) for k in (
+                    "mavlink_rate", "mavlink_att_rate", "mavlink_imu_rate",
+                    "mavlink_scaled_imu2_rate", "mavlink_set_rates",
+                    "mavlink_transport")}}
+
+    def _att_age_meta(self) -> dict:
+        """meta `att_age` (schema 21): the estimator behind CSV att_age_v_s,
+        the snapshot the meta was written at (map age, banners, the window's
+        p50/p99) and the engage gate's thresholds. Never raises."""
+        try:
+            from c3_camera.mavlink_log import (VCLK_DRIFT_PER_S,
+                                               VCLK_REBOOT_GAP_S)
+            est = {"where": "c3_camera/mavlink_log.VehicleClockMap (reader "
+                            "thread, at arrival) -> VehicleImu.t_att_v -> "
+                            "state_assembler.att_age_v",
+                   "kind": "rate-limited lower envelope of t_host - "
+                           "time_boot_ms (ATTITUDE, autopilot 1/1 only)",
+                   "drift_ppm": round(VCLK_DRIFT_PER_S * 1e6, 3),
+                   "reboot_gap_s": VCLK_REBOOT_GAP_S,
+                   "lower_bound_by": "the link's minimum transit (~ms)"}
+        except Exception as e:                                   # noqa: BLE001
+            est = {"error": f"{type(e).__name__}: {e}"}
+        try:
+            t = now()
+            imu = self.imu
+            t0 = getattr(imu, "att_map_t0", None) if imu is not None else None
+            t_b = getattr(imu, "t_banner", None) if imu is not None else None
+            ages = [a for (_t, a) in self._att_age_hist if a is not None]
+            n_unk = sum(1 for (_t, a) in self._att_age_hist if a is None)
+            snap = {"map_age_s": (round(t - float(t0), 1) if t0 is not None
+                                  else None),
+                    "age_now_s": att_age_v(imu, t),
+                    "banners_seen": int(getattr(imu, "n_banners", 0) or 0)
+                    if imu is not None else 0,
+                    "last_banner_age_s": (round(t - float(t_b), 1)
+                                          if t_b is not None else None),
+                    "window_ticks": len(self._att_age_hist),
+                    "window_unknown_ticks": int(n_unk),
+                    "window_p50_s": (round(float(np.percentile(ages, 50)), 4)
+                                     if ages else None),
+                    "window_p99_s": (round(float(np.percentile(ages, 99)), 4)
+                                     if ages else None)}
+        except Exception as e:                                   # noqa: BLE001
+            snap = {"error": f"{type(e).__name__}: {e}"}
+        try:
+            c = self._att_age_cfg()
+            gate = {k: c[k] for k in ("age_s", "age_hold_s", "age_hard_s",
+                                      "age_hard_hold_s", "age_engage_p99_s",
+                                      "age_engage_window_s", "age_map_min_s",
+                                      "banner_hold_s")}
+        except Exception as e:                                   # noqa: BLE001
+            gate = {"error": f"{type(e).__name__}: {e}"}
+        return {"estimator": est, "at_write": snap,
+                "pwm_gate": {"lows": ["rl_pwm", "rl_pwm_7d"],
+                             "thresholds": gate,
+                             "runtime": "AGE item of controller.interlocks",
+                             "engage": "workers._att_age_refusal"},
+                "note": ("CSV att_age_v_s = t - ATTITUDE time_boot_ms on the "
+                         "host clock; imu_age_s (parse time) is unchanged and "
+                         "cannot see a vehicle-side queue — 2026-10-15, "
+                         "RL_controller/logs/eval/pool_trips_1013_rootcause")}
 
     def _station_bridge_meta(self) -> dict:
         """StationBridge.meta(), corrected for the pwm transport (2026-10-03):
@@ -11073,6 +11591,24 @@ class MpcWorker(TimerWorker):
             # the row keeps its width whatever happens (the _dvl_row rule)
             return ["nan", "nan", "nan", "nan"]
 
+    def _att_age_row(self, health, t) -> list[str]:
+        """The three schema-21 columns (2026-10-15): this tick's vehicle-clock
+        attitude age (the assembler's, the one the AGE interlock judged), the
+        ATTITUDE's time_boot_ms, and the age of the vehicle's last banner.
+        `nan` for anything unknown; every LOW."""
+        try:
+            a = (health or {}).get("att_age_v")
+            imu = self.imu
+            tb = getattr(imu, "att_tb_ms", None) if imu is not None else None
+            t_b = getattr(imu, "t_banner", None) if imu is not None else None
+            return [(f"{float(a):.3f}" if a is not None else "nan"),
+                    (str(int(tb)) if tb is not None else "nan"),
+                    (f"{max(0.0, float(t) - float(t_b)):.2f}"
+                     if t_b is not None else "nan")]
+        except (TypeError, ValueError):
+            # the row keeps its width whatever happens (the _dvl_row rule)
+            return ["nan", "nan", "nan"]
+
     def _write_row(self, meas, health, u, info, axes, t_traj, t) -> None:
         if self._csv is None:
             return
@@ -11273,6 +11809,9 @@ class MpcWorker(TimerWorker):
         # content of the pulses this tick SENT; empty elsewhere. See
         # CSV_HEADER's 2026-10-10 note.
         row += self._pwm_row()
+        # THE ATTITUDE'S TRUE AGE (schema 21), every LOW. See CSV_HEADER's
+        # 2026-10-15 note.
+        row += self._att_age_row(health, t)
         try:
             self._csv.write(",".join(row) + "\n")
             self._rows += 1

@@ -65,6 +65,14 @@ This module is numpy only (no Qt, no pymavlink) so the gate and the conversions 
     inverse) until the tags are back. The CSV column ``pwm_guard`` (schema 20) says which guard acted;
   * the predicted current's thrust convention is the physical one of RL_controller (rewards.thruster_current_proxy,
     rov_env /batt/I_pred_a): F = T200(thr) * batt_v / PACK_V_CURVE, the fit's 1.0 being the ~20 V datasheet curve.
+
+2026-10-15 (RL_controller/logs/eval/pool_trips_1013_rootcause; operator-approved station fix 1b): the 10-13 pool trips
+(5 of 7 engagements on RATE/TILT) were the policy flying on an ATTITUDE 0.43 s old at the median, behind a vehicle-side
+MAVLink queue the station's parse-time imu_age could not see. ``PwmInterlocks`` gains AGE (first in the order): the
+attitude's VEHICLE-clock age (state_assembler.att_age_v, c3_camera/mavlink_log.VehicleClockMap) over 0.15 s for 0.5 s
+or 0.25 s for 0.2 s trips, and an unknown age counts as over. The engage refusal that rides the same keys (clock map
+>= 30 s old, no 'ArduSub V' banner in 30 s, no unknown tick in the last 10 s, rolling 10-s p99 <= 0.12 s, the age at
+START <= age_s 0.15 s) is workers._att_age_refusal.
 """
 
 from __future__ import annotations
@@ -629,6 +637,37 @@ RL_PWM_KEYS = ("policy_dir", "pwm_cap", "pwm_cap_mode", "allow_caps_below_traine
 #:                         mixer files [측정 same folder];
 #:   pinned_n / pinned_s   >= 3 thrusters at the cap for 1.0 s (the 10-01 collapse signature
 #:                         [측정 KNOWN_ISSUES: thrusters 3/4/6 at the cap 61-94 % of the time]).
+#: 2026-10-15 — the attitude AGE (operator-approved station fix 1b, RL_controller/logs/eval/pool_trips_1013_rootcause;
+#: "RC" below). On 10-13 the ATTITUDE the policy flew on (roll/pitch + p/q) was 0.43 s old at the median, 0-0.9 s
+#: sawtooth, behind a vehicle-side MAVLink queue; RATE and TILT then acted on the same stale data:
+#:   age_s / age_hold_s    the VEHICLE-clock age of that attitude (state_assembler.att_age_v) > 0.15 s for 0.5 s, OR
+#:   age_hard_s / age_hard_hold_s  > 0.25 s for 0.2 s -> trip. An UNKNOWN age (no clock map, a foreign clock) counts
+#:                         as over on both: the hard rule trips it in 0.2 s (fail-safe). Replayed causally — this rule,
+#:                         this estimator, the station's present 20 Hz republish chain — over every recording: 21
+#:                         healthy ones (1.82 h, tick age p99 0.058-0.078 s, max 0.063-0.173 s) 0 trips; the five
+#:                         congested 10-13 ones caught 28 of 29 queue onsets 0.40 s (p95 <= 0.47 s) after the true age
+#:                         crossed 0.10 s, 0 stretches > 0.25 s for >= 1 s missed; the 23.6-s ATTITUDE outage of
+#:                         0809_202049 trips too [측정 RC/fix-design/out/fixdesign_summary.json "replay",
+#:                         age_guard_replay.txt]. 0.15 s = pwm11att6_s2's last stable SUSTAINED age on the nominal
+#:                         command path (0/7 programs trip at 0.15 s, 2/7 at 0.20 s) [sim RC/synth/isaac/
+#:                         trip1014_att6s2_track_latency/metrics.json]. Thresholds [예측];
+#:   age_engage_p99_s / age_engage_window_s
+#:                         ENGAGE refusal (workers._att_age_refusal): the p99 of that age over the last 10 s of control
+#:                         ticks (+ the engage instant) > 0.12 s. The replay refused 100 % of the checks on the five
+#:                         congested recordings and 0 % on the 21 healthy ones [측정 same files] [예측]. Since the
+#:                         verify-review / verify-replay fixes (2026-10-15, RL_controller/logs/eval/
+#:                         station_fix_20261015/fixer): ONE unknown tick in the window refuses by itself (no percentile
+#:                         decides it), and age_s is also an ENGAGE limit — the age at START > 0.15 s refuses (one
+#:                         sample cannot move a 200-tick p99). Re-replayed: 4 of 120 982 healthy post-warm-up START
+#:                         checks refused, all single-tick stalls of 0.16-0.19 s; congested still 100 % [측정
+#:                         fixer/out/refusal_rules_replay.txt];
+#:   age_map_min_s         ENGAGE refusal: the clock map is younger than 30 s. A map started inside a standing queue
+#:                         under-reads the age until the queue first drains (by up to 0.77 s for the first 6.8 s of
+#:                         1013_211913 [측정 RC/fix-design/scripts/check_online_err.py]); 30 s is margin [예측];
+#:   banner_hold_s         ENGAGE refusal: an 'ArduSub V' banner (another client pulled the parameter list) less than
+#:                         30 s ago — 111 of 112 banners on 10-13 21:17 started a queue [측정 RC/synth/out/
+#:                         synth_checks.json C4_queue]; a reboot also says it, so a fresh boot waits 30 s [예측].
+#: RATE 40 deg/s / 0.15 s and TILT 20 deg / 0.25 s are unchanged; the trip is the same neutral-pulse disengage.
 PER_THRUSTER_DEFAULTS = {
     "abort_deg": 20.0, "abort_s": 0.25,
     "rate_dps": 40.0, "rate_s": 0.15,            # 2026-10-10 리플레이: 60 은 14회 중 2회 미검출, 40 은 14/14 (+0.43..0.60 s), 믹서 91 파일 오탐 0
@@ -636,8 +675,16 @@ PER_THRUSTER_DEFAULTS = {
     "volt_min": 13.5,
     "null_us": 80.0, "null_s": 0.5,              # 80 µs 는 pwm10_s1 의 수평 squeeze(+82..+107)도 잡음; pwm11 게이트 통과치 |c| <= 0.1 = 40 µs
     "pinned_n": 3, "pinned_s": 1.0,
+    # 2026-10-15 자세 나이(차량 시계) — 위 주석 참고, 전부 [예측] (근거: RC fix-design 재생)
+    "age_s": 0.15, "age_hold_s": 0.5,
+    "age_hard_s": 0.25, "age_hard_hold_s": 0.2,
+    "age_engage_p99_s": 0.12, "age_engage_window_s": 10.0,
+    "age_map_min_s": 30.0, "banner_hold_s": 30.0,
 }
 PER_THRUSTER_KEYS = tuple(PER_THRUSTER_DEFAULTS)
+#: The age keys (2026-10-15) — the AGE runtime interlock and the engage refusal.
+AGE_KEYS = ("age_s", "age_hold_s", "age_hard_s", "age_hard_hold_s", "age_engage_p99_s", "age_engage_window_s",
+            "age_map_min_s", "banner_hold_s")
 
 
 def _finite_positive(name: str, v, allow_zero: bool = False) -> float:
@@ -659,10 +706,13 @@ def parse_per_thruster_block(raw) -> dict:
     out = dict(PER_THRUSTER_DEFAULTS)
     out.update(raw)
     for k in ("abort_deg", "abort_s", "rate_dps", "rate_s", "current_a", "current_s", "volt_min", "null_us",
-              "null_s", "pinned_s"):
+              "null_s", "pinned_s") + AGE_KEYS:
         out[k] = _finite_positive(f"engage.per_thruster.{k}", out[k])
     if out["abort_deg"] >= 89.0:
         raise ValueError(f"engage.per_thruster.abort_deg must be < 89 deg, got {out['abort_deg']!r}")
+    if out["age_hard_s"] < out["age_s"]:
+        raise ValueError(f"engage.per_thruster.age_hard_s ({out['age_hard_s']!r}) must be >= age_s "
+                         f"({out['age_s']!r}): the hard rule is the faster trip for the WORSE age")
     n = out["pinned_n"]
     if isinstance(n, bool) or not isinstance(n, (int, float)) or int(n) != n or not (1 <= int(n) <= N_MOTORS):
         raise ValueError(f"engage.per_thruster.pinned_n must be an integer 1..{N_MOTORS}, got {n!r}")
@@ -676,32 +726,40 @@ class PwmInterlocks:
     limit with hold 0 trips on the first tick). ``step`` is called once per control tick with what that tick knows
     — the measured attitude and gyro, the latest pack sample, the pulses that LAST LEFT (the worker judges the
     previous tick's frame; the replay judges the vehicle's SERVO_OUTPUT_RAW) — and returns "" or the FIRST trip's
-    sentence, with the measured numbers, in the fixed order tilt, rate, volt, current, null, pinned. No I/O, no
-    clock: the worker and rov_gui/tools/rl_pwm_interlock_replay.py run this one implementation."""
+    sentence, with the measured numbers, in the fixed order age, tilt, rate, volt, current, null, pinned. No I/O, no
+    clock: the worker and rov_gui/tools/rl_pwm_interlock_replay.py run this one implementation.
 
-    NAMES = ("tilt", "rate", "volt", "current", "null", "pinned")
+    AGE (2026-10-15) comes first because every item after it reads the attitude it judges: a stale roll/pitch/p/q makes
+    TILT and RATE late by the same age. It is the one item where a MISSING input counts as over (``att_age_s`` None or
+    non-finite = the station cannot say how old the attitude is) — fail-safe, so a caller that never passes the age
+    trips in age_hard_hold_s. ``judge_age=False`` is for the offline replay of a recording that never logged the age
+    (CSV schema < 21): the item is then skipped and the meta says so; the worker always judges it."""
+
+    NAMES = ("age", "tilt", "rate", "volt", "current", "null", "pinned")
     #: a pulse within this many us of the cap window's edge counts as "at the cap" (scale mode puts the binding
     #: thruster EXACTLY at it; the 2026-10-01 clip pinned several)
     PINNED_TOL_US = 2
 
-    def __init__(self, cfg=None, hz: float = 20.0, cap: float = 1.0):
+    def __init__(self, cfg=None, hz: float = 20.0, cap: float = 1.0, judge_age: bool = True):
         self.cfg = parse_per_thruster_block(cfg)
         self.hz = float(hz)
         if not (math.isfinite(self.hz) and self.hz > 0.0):
             raise ValueError(f"PwmInterlocks: hz must be finite and > 0, got {hz!r}")
         self.cap = float(cap)
+        self.judge_age = bool(judge_age)
         self.reset()
 
     def _need(self, key: str) -> int:
         return max(1, int(round(float(self.cfg[key]) * self.hz)))
 
     def reset(self) -> None:
-        self.ticks = {n: 0 for n in self.NAMES}
+        self.ticks = {n: 0 for n in self.NAMES}       # "age" = the soft rule (age_s / age_hold_s)
+        self.age_hard_ticks = 0                        # the hard rule (age_hard_s / age_hard_hold_s)
         self.n_steps = 0
         self.n_trips = 0
         self.last_trip = None
         self.peak = {"tilt_deg": 0.0, "rate_dps": 0.0, "batt_a_max": None, "batt_v_min": None,
-                     "null_us_max": 0.0, "pinned_n_max": 0}
+                     "null_us_max": 0.0, "pinned_n_max": 0, "att_age_s_max": None, "att_age_unknown_ticks": 0}
 
     @staticmethod
     def _num(v):
@@ -715,14 +773,34 @@ class PwmInterlocks:
         self.ticks[name] = self.ticks[name] + 1 if over else 0
 
     def step(self, roll_rad, pitch_rad, p_rad_s, q_rad_s, batt_a=None, batt_v=None, pwm_us=None,
-             cap=None) -> str:
+             cap=None, att_age_s=None) -> str:
         """One control tick -> "" or the trip sentence. Missing / non-finite inputs are "not over" for their item
-        (a pack that never reported cannot trip the pack items; no pulses yet = nothing to judge)."""
+        (a pack that never reported cannot trip the pack items; no pulses yet = nothing to judge) — EXCEPT the
+        attitude age, where unknown is over (see the class docstring)."""
         c = self.cfg
         self.n_steps += 1
         cap = self.cap if cap is None else float(cap)
         span = cap_span_us(cap)
         trips = []
+        # (0) attitude age on the vehicle clock — unknown counts as over
+        age = None
+        if self.judge_age:
+            age = self._num(att_age_s)
+            if age is None:
+                self.peak["att_age_unknown_ticks"] += 1
+            else:
+                prev = self.peak["att_age_s_max"]
+                self.peak["att_age_s_max"] = age if prev is None else max(prev, age)
+            self._count("age", age is None or age > c["age_s"])
+            self.age_hard_ticks = self.age_hard_ticks + 1 if (age is None or age > c["age_hard_s"]) else 0
+            hard = self.age_hard_ticks >= self._need("age_hard_hold_s")
+            if hard or self.ticks["age"] >= self._need("age_hold_s"):
+                lim, hold = ((c["age_hard_s"], c["age_hard_hold_s"]) if hard else (c["age_s"], c["age_hold_s"]))
+                what = ("UNKNOWN (no vehicle-clock map of ATTITUDE time_boot_ms — fail-safe)" if age is None
+                        else f"{age:.2f} s > {lim:g} s")
+                trips.append(("age", f"per-thruster interlock AGE: attitude age {what} for {hold:g} s — the roll/"
+                                     f"pitch/p/q the policy acts on are stale (vehicle-side MAVLink queue?); neutral "
+                                     f"pulses"))
         # (1) tilt — the inner ceiling; the 35 deg engage.attitude_axes.abort_deg stays outside it
         r, p = self._num(roll_rad), self._num(pitch_rad)
         tilt = None if r is None or p is None else math.degrees(max(abs(r), abs(p)))
@@ -788,26 +866,33 @@ class PwmInterlocks:
         name, why = trips[0]
         self.n_trips += 1
         self.last_trip = {"name": name, "why": why, "tick": int(self.n_steps),
-                          "values": {"tilt_deg": tilt, "rate_dps": rate, "batt_a": a, "batt_v": v,
+                          "values": {"att_age_s": age, "tilt_deg": tilt, "rate_dps": rate, "batt_a": a, "batt_v": v,
                                      "null_v_us": nv, "null_h_us": nh, "pinned_n": n_pin}}
         return why
 
     def describe(self) -> str:
         c = self.cfg
-        return (f"tilt {c['abort_deg']:g} deg/{c['abort_s']:g} s, rate {c['rate_dps']:g} deg/s/{c['rate_s']:g} s, "
+        age = (f"age {c['age_s']:g} s/{c['age_hold_s']:g} s | {c['age_hard_s']:g} s/{c['age_hard_hold_s']:g} s "
+               f"(vehicle clock, unknown = over), " if self.judge_age else "age NOT judged, ")
+        return (f"{age}tilt {c['abort_deg']:g} deg/{c['abort_s']:g} s, rate {c['rate_dps']:g} deg/s/{c['rate_s']:g} s, "
                 f"pack {c['current_a']:g} A/{c['current_s']:g} s + {c['volt_min']:g} V, null {c['null_us']:g} us/"
                 f"{c['null_s']:g} s, pinned >= {c['pinned_n']}/{c['pinned_s']:g} s at cap {self.cap:.2f}")
 
     def meta(self) -> dict:
         return {"armed": True, "thresholds": dict(self.cfg), "hz": self.hz, "cap": self.cap,
-                "hold_ticks": {"tilt": self._need("abort_s"), "rate": self._need("rate_s"), "volt": 1,
+                "age_judged": bool(self.judge_age),
+                "hold_ticks": {"age": self._need("age_hold_s"), "age_hard": self._need("age_hard_hold_s"),
+                               "tilt": self._need("abort_s"), "rate": self._need("rate_s"), "volt": 1,
                                "current": self._need("current_s"), "null": self._need("null_s"),
                                "pinned": self._need("pinned_s")},
                 "n_steps": int(self.n_steps), "n_trips": int(self.n_trips), "last_trip": self.last_trip,
                 "peak": dict(self.peak),
                 "note": ("pwm LOWs only (rl_pwm, rl_pwm_7d); every number [예측] unless the yaml says otherwise; "
-                         "null/pinned judge the pulses that LAST LEFT (one tick behind); evaluated in "
-                         "workers._runtime_fault after the attitude ceiling (35 deg stays the outer limit)")}
+                         "null/pinned judge the pulses that LAST LEFT (one tick behind); age is the ATTITUDE's "
+                         "vehicle-clock age (state_assembler.att_age_v), unknown = over; evaluated in "
+                         "workers._runtime_fault after the attitude ceiling (35 deg stays the outer limit); the "
+                         "age_engage_* / age_map_min_s / banner_hold_s keys are the ENGAGE refusal "
+                         "(workers._att_age_refusal), not runtime items")}
 
 
 # ----------------------------------------------------------------------------- the observation guards (2026-10-10 b)
@@ -1172,7 +1257,8 @@ __all__ = ["PwmModel", "PwmGate", "T200CurveNp", "ThrusterProbeCheck", "throttle
            "pack_rc_override", "scale_throttles", "pulses_within_cap", "cap_span_us", "null_space_us",
            "predicted_pack_current_a", "thrust_scale_at_voltage", "parse_rl_pwm_block", "RL_PWM_KEYS",
            "PwmInterlocks", "PwmObsGuard", "parse_per_thruster_block", "parse_obs_guard_block", "hold_throttles",
-           "PER_THRUSTER_DEFAULTS", "PER_THRUSTER_KEYS", "OBS_GUARD_DEFAULTS", "OBS_GUARD_KEYS", "PACK_V_CURVE",
+           "PER_THRUSTER_DEFAULTS", "PER_THRUSTER_KEYS", "AGE_KEYS", "OBS_GUARD_DEFAULTS", "OBS_GUARD_KEYS",
+           "PACK_V_CURVE",
            "GUARD_NONE", "GUARD_SLEW", "GUARD_JUMP", "GUARD_HOLD",
            "NEUTRAL_PULSES", "PWM_NEUTRAL_US", "PWM_SPAN_US", "PWM_MIN_US", "PWM_MAX_US", "PWM_CHANNELS_DEFAULT",
            "PWM_CAP_FIRST_WATER", "PWM_CAP_MODES", "PWM_CAP_MODE_DEFAULT", "CAP_TOL", "SCRIPT_HEARTBEAT_NAME",

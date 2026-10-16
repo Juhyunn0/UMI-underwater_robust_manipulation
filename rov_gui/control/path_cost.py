@@ -31,11 +31,15 @@ the same model, the same horizon, and differ in exactly one thing. There is no
 second code generation and no second build wait.
 
 WHICH ANGLE. The PATH's tangent (``NedPlan.psi_path``), never the vehicle's
-heading. Under ``heading_follow: false`` — every mission flown so far — the
-vehicle crabs: it holds one heading while the path turns 90 degrees under it,
-so the two angles are unrelated. Deriving the tangent from the reference
-VELOCITY instead would fail exactly at the corners this exists for, because
-``speed_profile`` brakes the reference to a crawl there.
+heading. Under ``heading_follow: false`` — the square's yaw FIXED, and every
+hardware square/circle flown before 2026-10-14 [측정: data/*/*/
+mpc_*.meta.json trajectory.heading_follow] — the vehicle crabs: it holds one
+heading while the path turns 90 degrees under it, so the two angles are
+unrelated. Under the square's yaw = TRAVEL they coincide, through the vertex
+pivots too (the tangent turns in place there, and so does the weight).
+Deriving the tangent from the reference VELOCITY instead would fail exactly
+at the corners this exists for, because ``speed_profile`` brakes the
+reference to a crawl there (and a pivot holds it at zero).
 
 WHAT IT INTERACTS WITH, and this is not obvious. ``PathCursor`` already
 bounds along-track error at ``path_lead_m`` (the leash), so lowering

@@ -111,8 +111,10 @@ rl:
                           # 0921_182926). 0.3 -> ~0.14 m/s steady state by the speed law 0.692*(|axis|-0.096);
                           # a 0.10 m/s reference needs ~0.24, so keep GUI trajectory speeds <= 0.10 m/s at this cap.
   leash_m: 0.8            # far goals are presented at <= 0.8 m along the true bearing (trained offset clip 1.0 m)
-  yaw_rate_ff: true       # K=1 plans carry r_ned == 0: recover the yaw-rate feed-forward from d(yaw_ref)/dt
-  yaw_rate_max: 0.6       # rad/s, the trained goal yaw-rate range
+  yaw_rate_ff: true       # a K=1 reference with r_ned == 0 (station/approach/crab path) gets its yaw-rate feed-forward from
+                          # d(yaw_ref)/dt; a heading-follow plan carries its own r (2026-10-14), used even when this is false
+  yaw_rate_max: 0.6       # rad/s, clip on every r_ref. NOT an export number: obs_spec.json moving_goal.yaw_rate_max 0.4
+                          # (in-place) / turn_rate_max 1.0 (heading-follow arcs) [스펙: traj12_s2, traj10_s1, pwm11k0.2_s0]
 
 # LOW mode rl_pwm (panel: RL_PWM, 2026-09-30) — the per-thruster RL policy: 8 raw pulses, ArduSub's mixer BYPASSED.
 # UNTESTED ON THE VEHICLE [예측]: the pulses reach the thrusters only through the Lua timeout override
@@ -132,7 +134,7 @@ rl_pwm:
   # 전부 통과 [측정 RL_controller/logs/eval/PWM11_GATE.md], 수조 미검증 (rl_policies/pwm11k0.2_s0/README.md). 추진기별 부호 프로브
   # 아티팩트가 없으면 교전 거부(require_thruster_probe). 이전 pwm10_s1 은 수조 실패 원인 정책이라 비행 금지(RL_controller README §13.8).
   policy_dir: rov_gui/control/rl_policies/pwm11k0.2_s0   # was rov_gui/control/rl_policies/pwm10_s1 (2026-09-30 .. 10-10)
-  pwm_cap: 0.5            # = pwm11k0.2_s0 의 학습 캡 pwm_cap_trained (env.pwm_cap 0.5); 스케일 모드에서 추력 공간 균일 축소. 이력:
+  pwm_cap: 0.25            # = pwm11k0.2_s0 의 학습 캡 pwm_cap_trained (env.pwm_cap 0.5); 스케일 모드에서 추력 공간 균일 축소. 이력:
                           # 1.0 #0.25  # |throttle| ceiling on the wire (fraction of +-400 us). 0.25 (1400..1600 us) was the
                           # first-water value [예측]; the policy was trained at 1.0. [결정 2026-10-01 operator: 1.0 in one
                           # step] after the 0.25 run saturated and limit-cycled (data/20261001/1001_172910: thrusters
@@ -199,9 +201,12 @@ rl_pwm:
 # att7pwm_s0 although it FAILED the sim promotion gate [예측] (steady pitch error up to 7-9 deg in trim worlds, roll
 # wobble, saturation 24-38 % — RL_controller/logs/eval/ATT_COMPARE_20261003.md). null disables the LOW again.
 rl_pwm_7d:
-  # 2026-10-10 (operator): att7pwm_s0 은 수조 실패(수직+수평 공동수축 26~44 A, 침강) 정책이라 비행 금지 → null = LOW 꺼짐.
-  # roll/pitch 기준 추종 pwm 정책은 pwm11 이 수조 래더를 통과한 뒤 pwm11att 로 다시 학습한다 [예측].
-  policy_dir: null   # was rov_gui/control/rl_policies/att7pwm_s0 (2026-10-03 operator request)
+  # 2026-10-15 (운용자 승인 설치): pwm11att7_s0 — goal-frame 관측(같은 날 rl_policy.py 지원 필요), 시뮬 게이트 full PASS·사각형 xy
+  # 0.028 m·예측 전류 2.5 A·자세 지연 0.25 s 트립 1회(1 env) [측정 RL_controller/logs/eval/PWM11ATT7_GATE.md, PWM11ATT7_ROBUST.md].
+  # 수조 0런 [예측] — 전제·벤치 절차는 폴더의 README.md 와 KNOWN_ISSUES 'pwm11att7_s0 를 설치' 항목. 되돌리기 = null.
+  # (이전) 2026-10-10 (operator): att7pwm_s0 은 수조 실패(수직+수평 공동수축 26~44 A, 침강) 정책이라 비행 금지 → null = LOW 꺼짐;
+  # 계획은 pwm11 수조 래더 통과 뒤 pwm11att 재학습이었다 — pwm11k0.2_s0 는 10-13 에 7회 중 5회 트립(원인: 늦은 자세)으로 아직 미통과.
+  policy_dir: rov_gui/control/rl_policies/pwm11att9X_s0   # was null (2026-10-10); before that rov_gui/control/rl_policies/att7pwm_s0 (2026-10-03 operator request)
   leash_m: 0.8
   yaw_rate_ff: true
   yaw_rate_max: 0.6
@@ -461,6 +466,12 @@ traj_timeout_factor: 3.0    # wall-clock backstop
 # filleted ones. 0.15 is the value the best recorded mission used
 # (0817_110145) and what MPCC wants, since its contouring frame needs a
 # tangent; keep it there unless you are deliberately flying waypoints.
+# Under the square's yaw mode TRAVEL (heading_follow, 2026-10-14) each vertex
+# also carries an in-place PIVOT: the reference parks on the vertex while the
+# heading turns at square.vertex_turn_deg_s, then leaves along the next side
+# (path_geometry._pivoted_polygon). Labelled "waypoint_vertex_pivot" — never
+# pooled with the crab "waypoint_vertex_stop" squares. With a fillet the
+# heading turns along the arc instead and no pivot is inserted.
 path_fillet_m: 0.0
 path_turn_radius_m: 0.0
 # a_lat / a_long shape the feasible speed profile. Both are back at 0.05
@@ -493,10 +504,11 @@ path_creep_m_s: 0.02
 # `mpc_tuned` are one compiled solver and one build.
 #
 # The angle is NedPlan.psi_path, the path's own tangent — never the vehicle
-# heading. Under heading_follow: false the vehicle crabs, so the two are
-# unrelated, and the reference VELOCITY cannot stand in for the tangent
-# either because speed_profile brakes it to a crawl at exactly the corners
-# this exists for.
+# heading. Under heading_follow: false (the square's yaw fixed) the vehicle
+# crabs, so the two are unrelated, and the reference VELOCITY cannot stand in
+# for the tangent either because speed_profile brakes it to a crawl at exactly
+# the corners this exists for. (Under yaw = travel they coincide, through the
+# vertex pivots too.)
 #
 # READ WITH path_lead_m. PathCursor already caps along-track error at the
 # leash (0.10 m), so lowering along_scale cannot let the reference run away —
@@ -1365,8 +1377,24 @@ dvl:
   #                  on the A50 [스펙: axes page]. It is the lever arm: at
   #                  0.3 rad/s of yaw a 0.2 m arm is 6 cm/s of apparent
   #                  velocity [유도: v = omega x r].
-  mount_rpy_deg: null
-  mount_t_flu: null
+  #
+  # MEASURED 2026-10-13 (operator, tape, reported in the Claude session):
+  #   LED edge faces AFT, transducers down, bracket level. The device's own
+  #   mounting_rotation_offset is 180 (data/20261011/1011_155235_dvl_probe/
+  #   api/config.json), so the device already outputs the vehicle frame ->
+  #   yaw 0 here (ONE place only). If the device offset is ever set back to
+  #   0 for this mount, this becomes [0, 0, 180].
+  #   DVL vs the C3 centre lens (CAM_A): 498.23 mm aft, 0 lateral, 237 mm
+  #   below, taken to the TOP of the back plate (centre) [측정: 운영자 줄자,
+  #   2026-10-13]; + 28 mm back plate -> origin [스펙: axes page]; + the lens
+  #   position cam_t_flu [0.30584, 0.0, 0.10501] (hw_nav.yaml — x/z SUSPECT
+  #   since 2026-09-08, and this inherits that error) [유도]:
+  #     x = 0.30584 - 0.49823         = -0.192
+  #     z = 0.10501 - 0.237 + 0.028    = -0.104
+  #   (Had the 237 mm been taken to the transducer face instead, the origin
+  #   is 25 mm higher — A50 height [스펙: datasheet] — z = -0.079.)
+  mount_rpy_deg: [0.0, 0.0, 0.0]
+  mount_t_flu: [-0.192, 0.0, -0.104]
   # ---- per-sample gates (a sample failing any is not used that tick) ----
   # Oldest sample age still used. The vendor's own example report is 0.19 s
   # old when transmitted [스펙 예시 1건: time_of_transmission - time_of_validity
@@ -1574,7 +1602,8 @@ nudot_source: imu
 #     alpha   sigma_v     lag
 #      0.35   0.78 cm/s   124 ms      <- was
 #      0.60   1.11 cm/s    44 ms      <- is
-# Mission speed is 0.05 m/s, so both noise figures are well under the signal;
+# Mission speed was 0.05 m/s (0.10 is the panel default since 2026-10-14), so
+# both noise figures are well under the signal;
 # the 80 ms comes straight off the PID's D-term path (kd_x = 59.7 N.s/m) and
 # off the MPC's velocity state. The remaining lag is transport: tag_age p50
 # 0.191 s (data/20260814/2131/mpc_213128.csv),
@@ -1600,10 +1629,12 @@ eaob_sigmas:
   acc: 0.5
   # aacc / alloc: keep the params.py defaults unless P3 says otherwise
 
-# The square (world = NED datum frame — first fix is (0,0) with
-# datum: first_fix in hw_nav.yaml). origin/yaw 'current' = wherever the
-# vehicle is holding when the trajectory starts, so START right after the
-# datum zeroes = a 0.2 m square from (0,0) at the initial heading.
+# The mission (world = NED datum frame — first fix is (0,0) with
+# datum: first_fix in hw_nav.yaml). This block SEEDS the trajectory panel;
+# origin 'current' / tag 0 = wherever the vehicle holds when START is pressed.
+# Shipped seed (operator 2026-10-14): a 1.0 m x 1.0 m square from tag 37 at
+# 0.10 m/s, yaw fixed — the mission typed by hand on earlier runs (e.g.
+# data/20260921/0921_182926/mpc_183031.meta.json mission.panel_override).
 square:
   # THE MISSION. shape: "line" = out-and-back along dir_deg (one lap = there
   # AND back); "square" = a rectangle, size = x side, size_y = y side;
@@ -1611,18 +1642,25 @@ square:
   # origin_tag anchors the path to a physical tag id — the vehicle must be
   # within engage.start_err_max_m of it when START is pressed, so it never
   # lunges across the pool. The trajectory panel writes these fields (shape /
-  # origin_tag / distances / speed) live; everything else comes from here.
+  # origin_tag / heading_tag / distances / speed / the square's yaw mode =
+  # heading_follow) live; everything else comes from here.
   # STATION FIRST. If the vehicle cannot hold a point it cannot track a line,
   # and every number a line run produced would be measuring that instead.
   shape: station
-  # LINE: 2 m along +y (dir_deg 90 in the tag-map frame) from tag 79,
+  # LINE: 2 m along +y (dir_deg 90 in the tag-map frame) from origin_tag,
   # 5 round trips. ramp_s is the cosine speed ramp at each turnaround —
   # without it the reference reverses in one sample and floors the tracking
   # error the way the square's corners do (memory: square-corner-error-floor).
   length: 2.0
   dir_deg: 90.0
   ramp_s: 1.0
-  origin_tag: 79
+  # ONE tag box on the panel for every shape, so station / line / circle
+  # start from this tag too. Tag 37 sits at map (-0.280, -0.859); the 1 m
+  # square from it spans x -0.28..0.72, y -0.86..0.14, inside the tag field
+  # (tag centres x -0.538..1.116, y -1.935..2.132) [측정: config/
+  # tag_map_full.yaml]. Was 79 (2026-08-16..10-13 in run metas'
+  # mission.config_square, e.g. data/20260816/0816_172211/mpc_172211.meta.json).
+  origin_tag: 37
   # STATION only: face THIS tag id while holding origin_tag — the heading is
   # the MAP bearing origin_tag -> heading_tag, so "sit on 47 looking at 97"
   # is one line and the same physical heading every run (2026-09-11). Takes
@@ -1636,7 +1674,8 @@ square:
   # rot_deg below tilts it AWAY from that; it is a MAP rotation, not a
   # datum one, so the same number means the same physical rectangle every run.
   size_y: null
-  size: 0.2                 # 20 cm x 20 cm (2026-08-12 mission)
+  size: 1.0                 # 1.0 m x 1.0 m (operator 2026-10-14; 0.2 was the
+                            # 2026-08-12 mission)
   # CIRCLE: the entered tag is a point on the RIM — its minimum-x point, which
   # is the BOTTOM of the top-down plot — and the centre sits one radius along
   # the map's +x from it (rot_deg swings the centre around the tag). Same
@@ -1646,9 +1685,9 @@ square:
   # A circle is the only mission here with nothing unrealizable in it: no
   # 90-deg vertex (memory: square-corner-error-floor) and no 180-deg reversal.
   # The price is that its curvature limit applies to the WHOLE lap, not just
-  # to corners: v <= sqrt(path_lat_accel_m_s2 * R), so at the 0.05 shipped
-  # above a 0.5 m circle caps at 0.158 m/s and a 0.3 m one at 0.122 m/s
-  # whatever the speed box says.
+  # to corners: v <= sqrt(path_lat_accel_m_s2 * R), so at the
+  # path_lat_accel_m_s2 0.05 shipped above a 0.5 m circle caps at 0.158 m/s
+  # and a 0.3 m one at 0.122 m/s whatever the speed box says.
   # [유도: v = sqrt(path_lat_accel_m_s2 * R); pinned by
   #  rov_gui/tests/test_mpcc.py ::
   #  test_circle_speed_is_curvature_limited_over_the_whole_lap. NOT measured
@@ -1656,11 +1695,48 @@ square:
   # The worker logs a warning when that cap binds, so the number in the speed
   # box is never quietly overridden by the geometry.
   radius: 0.5
-  speed: 0.05               # panel seed (m/s box); 16 s per lap here — slow
-                            # enough for the RTP-feed lag
+  # Panel seed (m/s box), shared by every shape like origin_tag (so a follow's
+  # speed cap starts here too). 1.0 x 1.0 m: ~49 s per lap of REFERENCE with
+  # the a_long 0.05 corner ramps, 244 s for 5 laps (40 s/lap at constant
+  # speed); yaw = travel adds 4 x 4.5 s of vertex turns, ~65 s/lap
+  # [유도: path_geometry.speed_profile, fillet 0, creep 0.02 — the hull is
+  # slower whenever the leash binds]. 0.10 is also the most the rl: block
+  # above says to ask for at its axis_cap 0.3.
+  speed: 0.10
   laps: 5                   # LINE: 5 round trips; SQUARE/CIRCLE: 5 circuits
   depth_ned: null           # null = hold the engage depth
-  heading_follow: false     # yaw stays at the START heading (crab square)
+  # The SQUARE's yaw mode — the panel's yaw box seed (2026-10-14; a real
+  # true/false, MpcConfig.load refuses anything else):
+  #   false = yaw FIXED: one heading the whole mission, by the heading rules
+  #           below (yaw_map_deg 90 = map +y as shipped — screen RIGHT on the
+  #           plot, not +x). The sides are flown crabbing; every hardware
+  #           square/circle before 2026-10-14 flew this [측정: data/*/*/
+  #           mpc_*.meta.json trajectory.heading_follow].
+  #   true  = yaw = TRAVEL: face along each side (+x side -> +x, +y -> +y,
+  #           -x -> -x, -y -> -y), turning 90 deg IN PLACE at each vertex at
+  #           vertex_turn_deg_s; approach and settle already face the first
+  #           side. Refused at START in STABILIZE with engage.stabilize
+  #           .yaw_axis: hold, on mpcc/dobmpcc, and unless path_fillet_m is
+  #           0 and path_following is true (only the waypoint square turns
+  #           in place). N laps = N full turns of the tether, always the
+  #           same way. 0 water runs.
+  # The panel sends heading_follow false for every other shape — from the
+  # moment the backend attaches (window.attach re-sends the panel's
+  # scenario), so this seed never reaches a circle the panel shows no yaw
+  # box for. A headless worker still reads it for a circle.
+  # The ONE distance box on the panel is remembered per shape: size seeds the
+  # square's, length the line's, radius the circle's.
+  heading_follow: false
+  # The in-place turn rate at each vertex under yaw = travel [deg/s]. 20 is
+  # inside the RL policies' trained in-place yaw rate (moving_goal
+  # .yaw_rate_max 0.4 rad/s = 22.9 deg/s [스펙: rov_gui/control/rl_policies/
+  # traj12_s2/obs_spec.json]); the vehicle's own authority over a 90-deg turn
+  # is unmeasured (the station yaw-step test stepped -13.3 / +26.3 deg,
+  # data/20260914/0914_190226/mpc_190335.csv, mpc_190532.csv). 90 deg takes
+  # 4.5 s at 20 [유도].
+  vertex_turn_deg_s: 20.0
+  # NOT the vertex turn: the wall-clock sampler's heading slew
+  # (path_following: false) and the follow mission's yaw-rate cap.
   yaw_rate_deg_s: 60
   origin: current           # current | [x_ned, y_ned]
   rot_deg: 0.0              # MAP-frame tilt of the rectangle (0 = axis-aligned);
@@ -1670,7 +1746,8 @@ square:
   # ABSOLUTE heading in the tag-map frame, degrees (90 = facing +y). This is
   # what "sit on the tag facing +y" means; yaw_fixed_deg is datum-relative and
   # therefore means something different every time you engage. null = use
-  # yaw_fixed_deg.
+  # yaw_fixed_deg. Used by a station without heading_tag, a line, and the
+  # square's yaw FIXED — never under yaw = travel.
   yaw_map_deg: 90.0
 
 engage:
@@ -1704,7 +1781,9 @@ engage:
   # heading; above it the axis is a rate, ~68 deg/s at cap 0.5 with PilotGain
   # 1 (~32 at the boot default 0.5) [ArduSub source, Sub-4.1/4.5; unmeasured].
   #   hold   : send 0 — the autopilot's heading hold owns heading. DEFAULT.
-  #            heading_follow / circle / policy dyaw will NOT turn (warned).
+  #            policy dyaw will NOT turn (warned); a square/circle that faces
+  #            its travel (heading_follow — the square's yaw = travel) is
+  #            REFUSED at START, like station facing tag (2026-10-14).
   #   torque : send the follower's N unchanged (experiment; predicted to
   #            hunt at the deadzone edge).
   #   rate   : reserved — the deadzone-inverting remap needs PilotGain,
@@ -1729,7 +1808,8 @@ engage:
   # 0.26 s (p95 0.40) under dobmpc — whose solve spikes to 17-32 ms and slows
   # the shared process. At 0.5 s dobmpc had ZERO headroom and both runs died
   # on one late frame. 0.7 s costs 3.5 cm of position knowledge at the 0.05
-  # m/s mission speed, which vel_propagation already bridges.
+  # m/s mission speed of the time (7 cm at the 0.10 m/s panel default since
+  # 2026-10-14 [유도: 0.7 s x v]), which vel_propagation already bridges.
   tag_stale_s: 0.7
   # ...and the gate must HOLD this long before it disengages. Every other
   # interl  ock debounces (max_solver_fails: 3); this one did not.
@@ -1862,6 +1942,27 @@ engage:
     null_s: 0.5             # 2026-10-10 리플레이 민감 설정(0.5 s): 짧은 교전(1.3~1.7 s)도 트립
     pinned_n: 3             # 캡에 붙은 추진기가 이 수 이상인 상태가 pinned_s 지속 (10-01 붕괴 서명 [측정 KNOWN_ISSUES: 캡 61-94 %])
     pinned_s: 1.0
+    # ---- 2026-10-15: 자세 나이(AGE) 인터록 + 교전 거부 (운용자 승인 2026-10-15; 근거 폴더
+    # RL_controller/logs/eval/pool_trips_1013_rootcause = 아래 "RC") ----
+    # 10-13 수조에서 rl_pwm 이 7회 중 5회 RATE/TILT 로 트립한 원인: 정책이 본 ATTITUDE(roll/pitch + p/q)가 차량 시계로
+    # 중앙값 0.43 s 늦었다(0-0.9 s 톱니; 다른 클라이언트의 전체 파라미터 요청 -> 'ArduSub V' 배너 -> 차량 쪽 MAVLink 큐).
+    # 같은 교전의 CSV imu_age_s(파싱 시각 기준)는 p50 0.054-0.058 s 로 보였다 [측정 RC/synth/out/synth_checks.json C1_age].
+    # 나이 = 틱 - (ATTITUDE time_boot_ms 를 호스트 시계로 옮긴 값; c3_camera/mavlink_log.VehicleClockMap — 하한 포락선,
+    # 300 ppm, 재부팅 시 리셋) = CSV att_age_v_s (schema 21). 모르면(맵 없음) 넘은 것으로 친다(fail-safe).
+    # pwm LOW(rl_pwm, rl_pwm_7d)만; RATE/TILT 는 그대로. 이 규칙 그대로(이 추정기 + 현재 20 Hz 재발행 경로)를 전 기록에
+    # 인과적으로 재생: 건강한 21개(1.82 h, 틱 나이 p99 0.058-0.078 s) 트립 0·거부 0; 10-13 혼잡 5개는 교전 거부 100 %,
+    # 큐 시작 29번 중 28번을 실제 나이가 0.10 s 를 넘은 뒤 0.40 s(p95 <= 0.47 s)에 트립, 놓친 위험 구간(> 0.25 s 가
+    # 1 s 이상) 0 [측정 RC/fix-design/out/fixdesign_summary.json "replay", RC/fix-design/out/age_guard_replay.txt].
+    # 임계값은 전부 [예측]. age_engage_* / age_map_min_s / banner_hold_s 는 런타임이 아니라 교전 거부
+    # (workers._att_age_refusal) 이다.
+    age_s: 0.15             # 런타임: 나이 > age_s 가 age_hold_s 지속 -> 트립(중립 펄스). 0.15 s = pwm11att6_s2 가 명목 명령 경로에서 버틴 마지막 지속 나이(0.15 s 0/7, 0.20 s 2/7 트립) [sim RC/synth/isaac/trip1014_att6s2_track_latency/metrics.json]. 교전 거부에도 쓴다(2026-10-15 fixer): START 순간의 나이 > age_s 면 거부 — 200틱 p99 는 샘플 하나로 안 움직임. 재생: 건강 START 120 982회 중 4회 거부(단발 0.16-0.19 s) [측정 RL_controller/logs/eval/station_fix_20261015/fixer/out/refusal_rules_replay.txt]
+    age_hold_s: 0.5
+    age_hard_s: 0.25        # 런타임: 나이 > age_hard_s 가 age_hard_hold_s 지속 -> 트립 (모르는 나이도 여기서 0.2 s 에 트립). age_s 이상이어야 함(로더가 RAISE)
+    age_hard_hold_s: 0.2
+    age_engage_p99_s: 0.12  # 교전 거부: 최근 age_engage_window_s 동안의 틱 나이(+ 지금)의 p99 가 이 값 초과 [측정 위 재생: 혼잡 거부 100 %, 건강 0 %]. 창 안에 모르는 틱이 하나라도 있으면 p99 와 무관하게 거부(2026-10-15 fixer, 창 길이에 따라 결과가 바뀌던 보간 제거)
+    age_engage_window_s: 10.0
+    age_map_min_s: 30.0     # 교전 거부: 시계 맵이 이보다 젊음(시작·재부팅 직후). 큐가 서 있을 때 시작한 맵은 큐가 빠질 때까지 나이를 낮게 읽음 — 1013_211913 첫 6.8 s 동안 최대 0.77 s [측정 RC/fix-design/scripts/check_online_err.py]
+    banner_hold_s: 30.0     # 교전 거부: 'ArduSub V' 배너 STATUSTEXT 가 이보다 최근. 10-13 21:17 배너 112개 중 111개 뒤에 큐 [측정 RC/synth/out/synth_checks.json C4_queue]; 재부팅도 배너를 냄 -> 부팅 후 30 s 대기
 
 # ROOT of the dated run tree (rov_gui/runstore.py), NOT the folder written to.
 # NOTE: `--rec-dir` OVERRIDES this, so one run always lands in one tree — the

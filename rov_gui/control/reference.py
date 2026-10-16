@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from .path_geometry import VERTEX_TURN_DEG_S
+
 
 # --------------------------------------------------------------------------
 # VERBATIM from experiments/run_compare.py:114 (see module docstring)
@@ -539,6 +541,13 @@ def place_square_ned(square: dict, origin_ned_xy, yaw_fixed_ned: float,
                 "speed": speed, "laps": laps, "depth_ned": float(depth_ned),
                 "heading_follow": follow,
                 "yaw_rate_deg_s": float(square.get("yaw_rate_deg_s", 60.0)),
+                # The in-place turn rate at each vertex when the spatial
+                # follower flies this square facing its travel
+                # (path_geometry._pivoted_polygon). yaw_rate_deg_s above is
+                # the WALL-CLOCK sampler's slew (path_following: false) and
+                # the follow mission's yaw cap — not this.
+                "vertex_turn_deg_s": float(square.get("vertex_turn_deg_s",
+                                                      VERTEX_TURN_DEG_S)),
                 "origin_ned": [float(origin_ned_xy[0]),
                                float(origin_ned_xy[1])],
                 "rot_deg": float(square.get("rot_deg", 0.0)),

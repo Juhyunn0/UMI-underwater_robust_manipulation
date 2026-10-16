@@ -233,9 +233,14 @@ def _imu(roll=0.0, pitch=0.0, yaw=0.0, r=0.0, depth=0.8, t=None,
          f=None):
     t = now() if t is None else t
     f = (0.0, 0.0, -9.80665) if f is None else f
+    # 2026-10-15: a HEALTHY link on the vehicle clock too — the sample was
+    # true at `t` and the clock map has run for 60 s, so the pwm LOWs' AGE
+    # gates (engage.per_thruster.age_*) pass exactly as before they existed.
+    # test_att_age.py drives the unhealthy cases.
     return VehicleImu(roll=roll, pitch=pitch, yaw=yaw, p=0.0, q=0.0, r=r,
                       ax=f[0], ay=f[1], az=f[2], depth_m=depth,
-                      t_att=t, t_imu=t, t_baro=t, conn=Conn.ONLINE, stamp=t)
+                      t_att=t, t_imu=t, t_baro=t, t_att_v=t,
+                      att_map_t0=t - 60.0, conn=Conn.ONLINE, stamp=t)
 
 
 def test_assembler_velocity_rotates_into_body():
@@ -648,7 +653,8 @@ def test_tick_emits_pilot_and_csv_superset():
         # which estimate flew + the robot_localization EKF's state, 10-10 the
         # pwm LOWs' predicted pack current + null-space content of the sent
         # pulses (empty on every other LOW), 10-10 (b) the pwm LOWs' obs-guard
-        # code pwm_guard (empty elsewhere too)
+        # code pwm_guard (empty elsewhere too), 10-15 the attitude's
+        # vehicle-clock age + its time_boot_ms + the banner's age (every LOW)
         assert text[0].endswith(
             "grip_g,hold_frac,observe,"
             "pwm1,pwm2,pwm3,pwm4,pwm5,pwm6,pwm7,pwm8,pwm_age_s,batt_v,batt_a,"
@@ -658,7 +664,8 @@ def test_tick_emits_pilot_and_csv_superset():
             "est,ekf_ok,ekf_px,ekf_py,ekf_pz,ekf_roll_deg,ekf_pitch_deg,"
             "ekf_yaw_deg,ekf_u,ekf_v,ekf_w,ekf_sig_xy_m,ekf_age_s,"
             "ekf_tag_late_s,ekf_n_tag,ekf_n_dvl,"
-            "i_pred_a,null_v_us,null_h_us,pwm_guard")
+            "i_pred_a,null_v_us,null_h_us,pwm_guard,"
+            "att_age_v_s,att_tb_ms,banner_age_s")
         # the ASKED-for command still ends where it did; the REPORTED block
         # was appended after it rather than interleaved
         assert ",hold_frac,observe,pwm1," in text[0]
@@ -670,7 +677,7 @@ def test_tick_emits_pilot_and_csv_superset():
         assert abs(float(first[1])) < 0.05              # px (FLU x = NED x)
         assert abs(float(first[2])) < 0.05
         meta = json.loads(Path(path).with_suffix(".meta.json").read_text())
-        assert meta["schema_version"] == 20     # 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
+        assert meta["schema_version"] == 21     # 21: + att_age_v_s/att_tb_ms/banner_age_s (2026-10-15); 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
         # Written even with no replay flown, the imu_dr rule.
         assert meta["plan_stream"]["enabled"] is False
         # Written even when the estimator is off: an absent key cannot tell
@@ -2657,6 +2664,276 @@ def test_a_heading_tag_left_in_the_config_does_not_steer_a_path():
 
 
 # =============================================================================
+# The square's yaw mode (heading_follow), 2026-10-14
+# =============================================================================
+def _wrap_rad(a: float) -> float:
+    return math.atan2(math.sin(a), math.cos(a))
+
+
+def _travel_square(**kw) -> dict:
+    d = {"shape": "square", "origin_tag": 26, "size": 0.5, "size_y": 0.4,
+         "speed": 0.1, "laps": 1, "yaw_map_deg": 90.0,
+         "heading_follow": True}
+    d.update(kw)
+    return d
+
+
+def test_travel_square_settles_facing_its_first_side():
+    """yaw = travel faces along each side, so the approach and the settle
+    must already face the FIRST one — map +x for an unrotated square — or
+    arming the path is a 90-deg yaw step (yaw_map_deg 90 against a +x side).
+    yaw fixed keeps holding yaw_map_deg exactly as before."""
+    tmp = tempfile.mkdtemp(prefix="travel_settle_")
+    w, _tm, _logs = _station_worker_on_tag(tmp, 26, yaw0_deg=30.0)
+    w.cfg.path_fillet_m = 0.0                      # the shipped waypoints
+    for travel, want_map, rot in ((True, 0.0, 0.0), (True, 25.0, 25.0),
+                                  (False, 90.0, 0.0)):
+        w.set_traj(False)
+        w.set_scenario(_travel_square(heading_follow=travel, rot_deg=rot))
+        w.set_traj(True)
+        assert w.traj_on, w.reason         # on the tag with settle 0: armed
+        want = _wrap_rad(math.radians(want_map - 30.0))         # datum frame
+        assert abs(_wrap_rad(w._path_yaw_fixed - want)) < 1e-9, \
+            (travel, rot, math.degrees(w._path_yaw_fixed))
+        # ...and the first plan the follower gets starts there: no yaw step
+        plan = w._path_cursor.plan(1, 0.05, 0.8, w._path_yaw_fixed, travel)
+        assert abs(_wrap_rad(float(plan.yaw_ned[0]) - want)) < 1e-9
+        sc = w.ctrl.scenario
+        assert sc["heading_follow"] is travel
+        if travel:
+            vp = sc["vertex_pivot"]
+            assert vp["per_lap"] == 4 and vp["turn_deg_s"] == 20.0, vp
+            assert abs(vp["len_m"] - w.cfg.path_creep_m_s * (math.pi / 2)
+                       / math.radians(20.0)) < 1e-12, vp
+        else:
+            assert "vertex_pivot" not in sc
+    w.set_traj(False)
+    w.teardown()
+
+
+def test_travel_square_is_refused_where_the_vehicle_cannot_turn():
+    """Two places a square that faces its travel cannot be flown, both
+    refused at START — BEFORE the approach, not a minute later at the tag:
+    STABILIZE with engage.stabilize.yaw_axis: hold (yaw goes out as 0, the
+    autopilot owns heading: the run would crab while its meta said travel),
+    and a contouring LOW (it decides its own progress, so the vertex turn
+    rate would not be the reference's). yaw fixed flies in both."""
+    tmp = tempfile.mkdtemp(prefix="travel_refuse_")
+    w, _tm, _logs = _station_worker_on_tag(tmp, 26, yaw0_deg=0.0)
+    w.cfg.path_fillet_m = 0.0
+    off_tag = np.array([0.8, 0.0, 0.0, 0.0, 0.0, 0.0])   # START would approach
+    w._yaw_hold = True                          # what a STABILIZE engage sets
+    w._flight_mode_at_engage = "STABILIZE"
+    for scen in (_travel_square(),
+                 {"shape": "circle", "origin_tag": 26, "radius": 0.5,
+                  "speed": 0.1, "heading_follow": True}):
+        w._eta = off_tag.copy()
+        w.set_scenario(scen)
+        w.set_traj(True)
+        assert w._approach is None and not w.traj_on, (scen, w.reason)
+        assert "STABILIZE" in w.reason and "yaw axis" in w.reason, w.reason
+    w.set_scenario(_travel_square(heading_follow=False))
+    w.set_traj(True)
+    assert w._approach is not None, w.reason
+    w.set_traj(False)
+    # belt and braces: the arm itself refuses too
+    w._eta = np.zeros(6)
+    w._arm_path(dict(w.cfg.square, **_travel_square()), "square",
+                (0.0, 0.0), 0.0, 0.8)
+    assert not w.traj_on and "yaw axis" in w.reason, w.reason
+
+    w._yaw_hold = False
+
+    class _Contouring(StubCtrl):
+        progress_m = 0.0
+
+    stub, w.ctrl = w.ctrl, _Contouring(w.cfg)
+    w._eta = off_tag.copy()
+    w.set_scenario(_travel_square())
+    w.set_traj(True)
+    assert w._approach is None and not w.traj_on, w.reason
+    assert "contouring" in w.reason, w.reason
+    w.ctrl = stub
+    w.set_traj(True)
+    assert w._approach is not None, w.reason
+    w.set_traj(False)
+    # Only the WAYPOINT square turns in place (review 2026-10-14): with a
+    # fillet the heading would swing along the arcs at v/R, without the
+    # spatial follower the wall-clock sampler slews through the corner — the
+    # panel's "turns in place at the corners" would be false either way.
+    for knob, value, why in (("path_fillet_m", 0.15, "path_fillet_m"),
+                             ("path_following", False, "path_following")):
+        old_value = getattr(w.cfg, knob)
+        setattr(w.cfg, knob, value)
+        w._eta = off_tag.copy()
+        w.set_traj(True)
+        assert w._approach is None and not w.traj_on, (knob, w.reason)
+        assert why in w.reason, w.reason
+        w.set_scenario(_travel_square(heading_follow=False))   # fixed: flies
+        w.set_traj(True)
+        assert w._approach is not None, (knob, w.reason)
+        w.set_traj(False)
+        w.set_scenario(_travel_square())
+        setattr(w.cfg, knob, old_value)
+    w.teardown()
+
+
+def test_travel_approach_and_settle_hold_the_first_tangent():
+    """The whole START sequence, not just an immediate arm (review
+    2026-10-14): from off the tag, the approach target and every settle tick
+    face the path's first tangent, and the first plan the follower is handed
+    after the settle starts exactly there — for a square and a circle, with
+    the datum and the mission both rotated."""
+    from rov_gui.control.path_geometry import PathCursor  # noqa: F401
+
+    for scen in (_travel_square(rot_deg=25.0),
+                 {"shape": "circle", "origin_tag": 26, "radius": 0.4,
+                  "speed": 0.1, "laps": 1, "rot_deg": -40.0,
+                  "heading_follow": True}):
+        tmp = tempfile.mkdtemp(prefix="travel_seq_")
+        w, _tm, _logs = _station_worker_on_tag(tmp, 26, yaw0_deg=-35.0)
+        w.cfg.path_fillet_m = 0.0
+        w.cfg.engage["settle_s"] = 1.0
+        w.cfg.engage["start_err_max_m"] = 0.2
+        w._eta = np.array([0.6, -0.3, 0.0, 0.0, 0.0, 0.0])     # off the tag
+        w.set_scenario(scen)
+        w.set_traj(True)
+        assert w._approach is not None and not w.traj_on, w.reason
+        want = w._approach["yaw"]
+        assert abs(_wrap_rad(w.ctrl._target[1] - want)) < 1e-12
+        t = now()
+        w._approach["t_prev"] = t
+        k = 0
+        while w._approach is not None and k < 4000:
+            k += 1
+            # a hull that walks onto the approach setpoint, then holds it
+            sp = w._approach["sp"]
+            w._eta = np.array([sp[0], sp[1], 0.0, 0.0, 0.0, want])
+            w._tick_approach(t + 0.05 * k)
+            if w._approach is not None:
+                assert abs(_wrap_rad(w.ctrl._target[1] - want)) < 1e-12
+        assert w.traj_on, w.reason
+        w._tau_t = t + 0.05 * k
+        w._advance_path_clock(t + 0.05 * (k + 1), {"eta": w._eta.copy()})
+        first = float(w.ctrl._path_plan.yaw_ned[0])
+        # a circle's setpoint has crept one tick along the arc by then
+        tol = 1e-9 if scen["shape"] == "square" else math.radians(0.5)
+        assert abs(_wrap_rad(first - want)) < tol, (
+            scen["shape"], math.degrees(first), math.degrees(want))
+        w.set_traj(False)
+        w.teardown()
+
+
+def test_travel_square_turns_in_place_and_completes_on_the_record():
+    """A vehicle riding the plan the worker installs: the heading is each
+    side's, it changes only while the target sits on a vertex and never
+    faster than vertex_turn_deg_s, the run COMPLETES one full turn later, and
+    the meta says which maneuver this was (never pooled with crab squares)."""
+    tmp = tempfile.mkdtemp(prefix="travel_fly_")
+    w, _tm, _logs = _station_worker_on_tag(tmp, 26, yaw0_deg=30.0)
+    w.cfg.path_fillet_m = 0.0
+    w.set_scenario(_travel_square())
+    w.set_traj(True)
+    assert w.traj_on, w.reason
+    meta = w._run_meta()
+    assert meta["reference_clock"]["strategy"] == "waypoint_vertex_pivot"
+    assert meta["reference_clock"]["pivot_capture_m"] == 0.05
+    assert meta["trajectory"]["heading_follow"] is True
+    assert meta["trajectory"]["vertex_turn_deg_s"] == 20.0
+    assert meta["mission"]["panel_override"]["heading_follow"] is True
+    corners = [np.asarray(c, float) for c in
+               (sp[2:4] for sp in w._path_cursor.path.pivot_spans())]
+    t = now()
+    w._tau_t = t
+    eta = np.zeros(6)
+    eta[5] = w._path_yaw_fixed
+    yaws, xys = [], []
+    for k in range(1, 40000):
+        w._advance_path_clock(t + 0.05 * k, {"eta": eta.copy()})
+        plan = w.ctrl._path_plan
+        eta[:2], eta[5] = plan.p_ned[:2, 0], plan.yaw_ned[0]
+        yaws.append(float(plan.yaw_ned[0]))
+        xys.append(plan.p_ned[:2, 0].copy())
+        if w._path_done(None, 0.0):
+            break
+    assert w._path_done(None, 0.0), (w._path_cursor.theta,
+                                     w._path_cursor.path.total_length)
+    d = np.diff(np.unwrap(yaws))
+    assert np.abs(d).max() <= math.radians(20.0) * 0.05 * (1 + 1e-6)
+    turning = np.abs(d) > 1e-12
+    off = [min(np.linalg.norm(q - c) for c in corners)
+           for q in np.asarray(xys)[1:][turning]]
+    assert max(off) < 0.02 * 0.05 + 1e-9, max(off)
+    assert abs(math.degrees(np.unwrap(yaws)[-1] - yaws[0]) - 360.0) < 2.0
+    # a crab square of the same geometry keeps the old label
+    w.set_traj(False)
+    w.set_scenario(_travel_square(heading_follow=False))
+    w.set_traj(True)
+    assert w._run_meta()["reference_clock"]["strategy"] == \
+        "waypoint_vertex_stop"
+    w.set_traj(False)
+    w.teardown()
+
+
+def test_the_square_yaw_mode_seed_and_turn_rate_are_validated():
+    """heading_follow is read as bool(...) everywhere it goes, so a quoted
+    "false" in the YAML would seed the panel's yaw box as TRAVEL and fly it;
+    a turn rate that is not a positive number would make a pivot of no or
+    infinite length. Both refuse at load."""
+    from rov_gui.control.geometry import MpcConfig
+
+    tmp = tempfile.mkdtemp(prefix="yawmode_cfg_")
+    p = Path(tmp) / "mpc.yaml"
+    for body, why in (('  heading_follow: "false"\n', "heading_follow"),
+                      ("  heading_follow: 1\n", "heading_follow"),
+                      ("  vertex_turn_deg_s: 0\n", "vertex_turn_deg_s"),
+                      ("  vertex_turn_deg_s: -20\n", "vertex_turn_deg_s"),
+                      ("  vertex_turn_deg_s: 200\n", "vertex_turn_deg_s"),
+                      ("  vertex_turn_deg_s: fast\n", "vertex_turn_deg_s")):
+        p.write_text("mode: dobmpc\nsquare:\n" + body)
+        try:
+            MpcConfig.load(str(p))
+        except ValueError as e:
+            assert why in str(e), (body, e)
+        else:
+            raise AssertionError(f"accepted {body!r}")
+    p.write_text("mode: dobmpc\nsquare:\n  heading_follow: true\n"
+                 "  vertex_turn_deg_s: 30\n")
+    cfg = MpcConfig.load(str(p))
+    assert cfg.square["heading_follow"] is True
+    assert cfg.square["vertex_turn_deg_s"] == 30.0
+    shipped = MpcConfig.load(ROOT / "config" / "hw_mpc.yaml").square
+    assert isinstance(shipped["heading_follow"], bool)
+    assert shipped["vertex_turn_deg_s"] > 0.0
+
+
+def test_rl_takes_a_plans_yaw_rate_clipped_and_never_spikes_after_a_turn():
+    """A heading-follow plan CARRIES its yaw rate since 2026-10-14 (K=1
+    included): HwRl uses it, clipped to yaw_rate_max like the rate it
+    recovers itself — and keeps the previous reference yaw EVERY tick. It
+    used to freeze it while a plan carried r, so the first r == 0 tick after
+    a vertex turn differenced against the heading from before the turn."""
+    from rov_gui.control.geometry import MpcConfig
+    from rov_gui.control.path_geometry import NedPlan
+    from rov_gui.control.rl_policy import HwRl
+
+    rl = HwRl(MpcConfig(), log=lambda m: None)
+    eta = np.array([0.0, 0.0, -0.7, 0.0, 0.0, 0.0])
+
+    def feed(yaw, r):
+        rl.set_path_plan_ned(NedPlan(np.array([[0.0], [0.0], [-0.7]]),
+                                     np.array([yaw]), np.zeros((3, 1)),
+                                     np.array([r]), np.array([yaw])))
+        return rl.observation(eta, np.zeros(6), 0.0)[: rl.frame_dim][20]
+
+    assert abs(feed(0.0, 0.0)) < 1e-12               # straight: no rate
+    assert abs(feed(0.0, 0.3) - (-0.3)) < 1e-9       # carried (ccw negative)
+    assert abs(feed(0.5, 5.0) + rl.yaw_rate_max) < 1e-9   # ...clipped
+    assert abs(feed(1.0, 0.3) - (-0.3)) < 1e-9
+    assert abs(feed(1.0, 0.0)) < 1e-9, "a rate spike after the turn"
+
+
+# =============================================================================
 # IMU dead reckoning — the worker's half (the mechanization is test_imu_dr.py)
 # =============================================================================
 def _dr_worker(tmp, mode="shadow", control=False, attitude="gyro"):
@@ -2972,7 +3249,7 @@ def test_run_meta_records_the_estimator_as_a_record_boundary():
     # and the CSV plan_id/ref_src/grip_cmd columns. 7 added tick_ms and the
     # follow boundary; 6 added object_nav and the ten obj_*/follow_* columns;
     # 5 added station_bridge (bridge_s / bridge_tier).
-    assert m["schema_version"] == 20     # 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
+    assert m["schema_version"] == 21     # 21: + att_age_v_s/att_tb_ms/banner_age_s (2026-10-15); 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
     # Written even with no --pose, for the imu_dr reason: an absent key cannot
     # tell "this build had no object nav" from "it was switched off".
     assert m["object_nav"]["enabled"] is False
@@ -4556,7 +4833,7 @@ def test_attitude_axes_off_is_byte_identical_on_the_4dof_path():
         assert aa["enabled_extensions_sent"] is False
         assert aa["transport"] == "manual_control_ext"
         assert m["run"]["stabilize"]["rp_axis"] == "hold"
-        assert m["schema_version"] == 20
+        assert m["schema_version"] == 21
         json.dumps(m)
         w.teardown()
 

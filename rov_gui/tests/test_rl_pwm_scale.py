@@ -558,7 +558,7 @@ def test_worker_refuses_to_engage_without_a_passing_probe_and_engages_with_one()
         assert w.engaged, w.reason
         m = w._run_meta()
         c = m["controller"]
-        assert m["schema_version"] == 20 and c["pwm_cap_mode"] == "scale" and c["require_thruster_probe"] is True
+        assert m["schema_version"] == 21 and c["pwm_cap_mode"] == "scale" and c["require_thruster_probe"] is True
         assert c["thruster_probe"]["ok"] is True and c["thruster_probe"]["path"] == str(good)
         assert c["caps_below_trained"] is True and c["allow_caps_below_trained"] is True
         w.teardown()
@@ -579,7 +579,8 @@ def test_the_csv_carries_the_predicted_current_and_null_space_of_the_sent_pulses
     from rov_gui.tests.test_rl_pwm import _gate
 
     cols = CSV_HEADER.strip().split(",")
-    assert cols[-4:] == ["i_pred_a", "null_v_us", "null_h_us", "pwm_guard"] and len(cols) == len(set(cols))
+    # schema 21 (2026-10-15) appended the three attitude-age columns after these four (test_att_age pins them)
+    assert cols[-7:-3] == ["i_pred_a", "null_v_us", "null_h_us", "pwm_guard"] and len(cols) == len(set(cols))
     with tempfile.TemporaryDirectory() as tmp:
         w, bus, pilots, pwms, logs = _worker_with(tmp, require_thruster_probe=False)
         w.on_enable(True)

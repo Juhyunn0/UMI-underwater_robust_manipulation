@@ -1220,7 +1220,7 @@ def test_the_csv_has_the_object_columns_and_the_meta_says_schema_7():
     path = w._csv_path
     m = w._run_meta("test")
     w.disengage("done")
-    assert m["schema_version"] == 20, m["schema_version"]     # 20: + pwm_guard (2026-10-10 b); 19: + pwm-LOW CSV columns (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + top-level mode / LOW None holder (2026-09-11)
+    assert m["schema_version"] == 21, m["schema_version"]     # 21: + att_age_v_s/att_tb_ms/banner_age_s (2026-10-15); 20: + pwm_guard (2026-10-10 b); 19: + pwm-LOW CSV columns (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + top-level mode / LOW None holder (2026-09-11)
     on = m["object_nav"]
     assert on["enabled"] and on["source_ok"]
     assert on["pair_exact_ratio"] == 1.0, on

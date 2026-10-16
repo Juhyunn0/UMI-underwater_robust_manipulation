@@ -13,7 +13,9 @@ What is pinned:
 1. control/rl_pwm.PwmInterlocks + parse_per_thruster_block — the defaults, the config loader (engage.per_thruster,
    unknown keys raise, MpcConfig() carries the block), each of the six trips on a synthetic tick sequence with its
    debounce (one tick short holds, the next trips, one quiet tick resets), the trip sentence carries the numbers,
-   quiet data never trips, missing inputs never trip, the fixed order and meta.
+   quiet data never trips, missing inputs never trip, the fixed order and meta. (2026-10-15: the seventh item, AGE,
+   is first in the order and the one where a MISSING input counts as over — test_att_age.py pins it; QUIET here
+   carries a healthy 0.05 s age.)
 2. control/rl_pwm.PwmObsGuard + hold_throttles + parse_obs_guard_block — the velocity slew, the fix-jump reject under
    a thin fix, the tag gate's hold / release timing, the hold allocation's signs and magnitude (4 N up on the four
    verticals, horizontals neutral, |K|,|M| ~ 0).
@@ -55,7 +57,8 @@ from rov_gui.state import Conn, NavFix, Telemetry, VehicleImu, now              
 PWM10 = ROOT / "rov_gui" / "control" / "rl_policies" / "pwm10_s1"
 HZ = 20.0
 QUIET = dict(roll_rad=math.radians(5.0), pitch_rad=math.radians(-6.0), p_rad_s=math.radians(10.0),
-             q_rad_s=math.radians(-8.0), batt_a=20.0, batt_v=15.5)
+             q_rad_s=math.radians(-8.0), batt_a=20.0, batt_v=15.5,
+             att_age_s=0.05)        # 2026-10-15: a healthy vehicle-clock attitude age (AGE: test_att_age.py)
 QUIET_PW = (1580, 1500, 1480, 1500, 1530, 1470, 1510, 1490)          # null_v 0, null_h 25 us, nothing at the cap
 
 
@@ -84,7 +87,11 @@ def test_the_defaults_are_the_report_numbers_and_the_loader_is_strict():
 
     d = parse_per_thruster_block(None)
     assert d == {"abort_deg": 20.0, "abort_s": 0.25, "rate_dps": 40.0, "rate_s": 0.15, "current_a": 50.0,
-                 "current_s": 1.0, "volt_min": 13.5, "null_us": 80.0, "null_s": 0.5, "pinned_n": 3, "pinned_s": 1.0}
+                 "current_s": 1.0, "volt_min": 13.5, "null_us": 80.0, "null_s": 0.5, "pinned_n": 3, "pinned_s": 1.0,
+                 # 2026-10-15: the AGE interlock + engage refusal (test_att_age.py)
+                 "age_s": 0.15, "age_hold_s": 0.5, "age_hard_s": 0.25, "age_hard_hold_s": 0.2,
+                 "age_engage_p99_s": 0.12, "age_engage_window_s": 10.0, "age_map_min_s": 30.0,
+                 "banner_hold_s": 30.0}
     assert d == PER_THRUSTER_DEFAULTS and parse_per_thruster_block({}) == d
     assert parse_per_thruster_block({"null_us": 100})["null_us"] == 100.0
     for bad in ({"abort_deg": 0}, {"abort_deg": 90}, {"rate_dps": float("nan")}, {"volt_min": -1},
@@ -125,7 +132,8 @@ def test_the_defaults_are_the_report_numbers_and_the_loader_is_strict():
 def test_each_interlock_trips_after_its_debounce_with_the_numbers_in_the_sentence():
     # tilt: 25 deg for 4 ticks holds, the 5th (0.25 s) trips; the sentence carries roll, pitch and the limit
     ilk = PwmInterlocks(None, HZ, 1.0)
-    assert ilk.meta()["hold_ticks"] == {"tilt": 5, "rate": 3, "volt": 1, "current": 20, "null": 10, "pinned": 20}
+    assert ilk.meta()["hold_ticks"] == {"age": 10, "age_hard": 4, "tilt": 5, "rate": 3, "volt": 1, "current": 20,
+                                        "null": 10, "pinned": 20}
     assert _ticks(ilk, 4, roll_rad=math.radians(25.0)) == ""
     why = _ticks(ilk, 1, roll_rad=math.radians(25.0))
     assert "TILT" in why and "25.0 deg > 20 deg" in why and "0.25 s" in why and "roll +25.0" in why, why
@@ -409,8 +417,9 @@ def _fix(t, n_tags=4, p=(-2.0, 0.0, 0.8)):
 
 
 def _imu(t, roll=0.0, pitch=0.0, p=0.0, q=0.0):
+    # 2026-10-15: fresh on the vehicle clock too, with a 60-s-old clock map (the AGE gates pass; test_att_age.py)
     return VehicleImu(roll=roll, pitch=pitch, yaw=0.0, p=p, q=q, r=0.0, ax=0.0, ay=0.0, az=-9.80665, depth_m=0.8,
-                      t_att=t, t_imu=t, t_baro=t, conn=Conn.ONLINE, stamp=t)
+                      t_att=t, t_imu=t, t_baro=t, t_att_v=t, att_map_t0=t - 60.0, conn=Conn.ONLINE, stamp=t)
 
 
 def _feed(w, roll=0.0, pitch=0.0, p=0.0, q=0.0, n_tags=4, batt_v=15.5, current_a=20.0, pos=(-2.0, 0.0, 0.8)):
@@ -610,7 +619,8 @@ def test_the_csv_pwm_guard_column_and_the_4dof_lows_are_untouched():
     from rov_gui.tests.test_control import _last_csv_row, _worker
 
     cols = CSV_HEADER.strip().split(",")
-    assert cols[-4:] == ["i_pred_a", "null_v_us", "null_h_us", "pwm_guard"] and len(cols) == len(set(cols))
+    # schema 21 (2026-10-15) appended att_age_v_s, att_tb_ms, banner_age_s after these four (test_att_age.py)
+    assert cols[-7:-3] == ["i_pred_a", "null_v_us", "null_h_us", "pwm_guard"] and len(cols) == len(set(cols))
     with tempfile.TemporaryDirectory() as tmp:
         w, bus, pwms, logs, events = _pwm_worker(tmp)
         _engage(w)

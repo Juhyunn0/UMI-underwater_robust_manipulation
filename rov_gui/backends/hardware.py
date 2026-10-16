@@ -60,6 +60,7 @@ from pathlib import Path
 import numpy as np
 
 from .. import imaging
+from .. import mavlink_streams as MS
 # bus pulls in nothing heavier than Qt, which this module already needs.
 from ..bus import StereoMailbox
 from ..perception.fs_gate import FS_DRAIN, FS_GO, FsGate
@@ -67,7 +68,8 @@ from ..leak import PRESSURE_REPEAT_S, LeakMonitor
 from ..net import NicMonitor
 from ..qt import Qt, Slot, import_cv2
 from ..sensorlog import SensorLog
-from ..state import (Conn, FStereoState, ImuBatch, PayloadState, PilotInput,
+from ..state import (BANNER_LINE, BANNER_PREFIX, BANNER_WARN_EVERY_S, Conn,
+                     FStereoState, ImuBatch, PayloadState, PilotInput,
                      PolicyStatus, PoseTrack, SensorStat, Telemetry,
                      ThrusterState, VehicleImu, VideoStat, now)
 from ..widgets.propulsion import pwm_to_norm
@@ -1682,6 +1684,24 @@ class VehicleWorker(TimerWorker):
     lets it stay a TimerWorker and keep an event loop for command slots.
     """
 
+    # 2026-10-15: the banner bookkeeping (_note_banner), also as CLASS
+    # defaults — tests build this worker with __new__, and a missing
+    # attribute on a Qt object whose __init__ never ran raises RuntimeError,
+    # not AttributeError (so a getattr default would not catch it).
+    _t_banner: float | None = None
+    _n_banners: int = 0
+    _banner_warned_t: float | None = None
+    _banner_warned_n: int = 0
+    _banner_text: str = ""
+    # 2026-10-15 (rov_gui/mavlink_streams.py), class defaults for the same
+    # reason: the resolved IMU-stream request (None = none resolved: no link
+    # yet, or a refused flag combination whose text is _streams_error), and
+    # where VehicleImu.ax..az are read from — mavlink_streams.ACCEL_SOURCE,
+    # the order every --mpc build has used, until setup() says otherwise.
+    _streams: dict | None = None
+    _streams_error: str | None = None
+    _accel_msgs: tuple = ("SCALED_IMU2", "RAW_IMU")
+
     def __init__(self, bus, opts):
         # With --mpc the tick doubles to 20 Hz: the control loop needs
         # VehicleImu at its own rate, while the Telemetry snapshot stays
@@ -1744,6 +1764,14 @@ class VehicleWorker(TimerWorker):
         # is dropped and counted.
         self._aa_target = (int(getattr(opts, "target_sysid", 1) or 1), 1)
         self._aa_foreign = 0
+        # 2026-10-15: the vehicle's 'ArduSub V…' banner (_note_banner): newest
+        # arrival, session count, and the once-a-minute log line's bookkeeping
+        # (class defaults above too).
+        self._t_banner: float | None = None
+        self._n_banners = 0
+        self._banner_warned_t: float | None = None
+        self._banner_warned_n = 0
+        self._banner_text = ""
 
     def setup(self) -> None:
         from c3_camera.mavlink_log import MavlinkLogger
@@ -1762,6 +1790,19 @@ class VehicleWorker(TimerWorker):
                         "none) — nothing is sent to or read from the vehicle")
             return
 
+        # WHICH IMU streams, how fast (2026-10-15, rov_gui/mavlink_streams.py):
+        # ATTITUDE 50 / RAW_IMU 20 / SCALED_IMU2 20 Hz by default, where this
+        # used to ask for all three at --mavlink-rate (200) — ~500 msg/s that
+        # a parameter download on 10-13 queued behind. --mavlink-rate N is
+        # still that old request. A combination the launch check refuses
+        # (main() exits first) can only reach here from an embedder: then
+        # NOTHING is requested, and the log and the run meta say why.
+        try:
+            self._streams = MS.resolve_opts(self.opts)
+            self._streams_error = None
+            self._accel_msgs = tuple(self._streams["accel_source"])
+        except ValueError as e:
+            self._streams, self._streams_error = None, str(e)
         self.logger = MavlinkLogger(
             connection=getattr(self.opts, "mavlink", "udpin:0.0.0.0:14551"),
             transport=getattr(self.opts, "mavlink_transport", "udp"),
@@ -1772,13 +1813,103 @@ class VehicleWorker(TimerWorker):
             # stays opt-in (c3_camera/mavlink_log.py explains why). ArduSub's
             # defaults are low — 2 Hz IMU on this vehicle — which is fine for a
             # dashboard and useless for anything time-critical.
-            set_rates=bool(getattr(self.opts, "mavlink_set_rates", False)),
-            default_rate_hz=int(getattr(self.opts, "mavlink_rate", 50) or 50),
+            set_rates=(bool(getattr(self.opts, "mavlink_set_rates", False))
+                       and self._streams is not None),
+            stream_rates_hz=(dict(self._streams["rates_hz"])
+                             if self._streams is not None else None),
             verbose=False)
         ok = self.logger.start(wait_s=3.0)
         self.bus.log.emit("info" if ok else "warn",
                           f"mavlink: {'connected' if ok else 'no telemetry yet'} "
                           f"({self.logger.transport})")
+        self._log_stream_request()
+
+    def _log_stream_request(self) -> None:
+        """One line at setup: what this session asked the vehicle for, or why
+        it asked for nothing — a request that never went out leaves the
+        vehicle on whatever it was last asked (an earlier session's 200 Hz
+        included), and only the achieved rates would show it."""
+        st, lg = self._streams, self.logger
+        if st is None:
+            self.bus.log.emit(
+                "error", f"mavlink: IMU stream request NOT sent — "
+                         f"{self._streams_error}")
+            return
+        line = f"mavlink: IMU streams {MS.describe(st)}"
+        # the names whose SET_MESSAGE_INTERVAL raised (MavlinkLogger.
+        # rates_failed): a send error on an IMU stream leaves rates_sent_t
+        # None, one on another message only says so (verify-review F2)
+        failed = list(getattr(lg, "rates_failed", None) or []) \
+            if lg is not None else []
+        if lg is not None and lg.rates_sent_t is not None:
+            if failed:
+                self.bus.log.emit(
+                    "warn", f"{line} — sent, except {', '.join(failed)}: "
+                            f"NOT sent (send error); those keep the rates the "
+                            f"vehicle was last asked for")
+                return
+            self.bus.log.emit("warn" if st["policy"] == "legacy" or st["off"]
+                              else "info", line)
+            return
+        why = ("--no-mavlink-set-rates" if not bool(getattr(
+                   self.opts, "mavlink_set_rates", False))
+               else "the REST transport is read-only"
+               if getattr(self.opts, "mavlink_transport", "udp") == "rest"
+               else f"send error on {', '.join(failed)}" if failed
+               else "no telemetry within 3 s of start")
+        self.bus.log.emit(
+            "warn", f"{line} — NOT sent ({why}): the vehicle keeps the rates "
+                    f"it was last asked for, by anyone")
+
+    def stream_meta(self, achieved: bool = True) -> dict:
+        """The MAVLink IMU-stream request of this session (2026-10-15) — run
+        meta ``mavlink_streams`` (MpcWorker.mavlink_streams_fn, injected by
+        HardwareBackend) and, without ``achieved``, the *_rov.json sidecar's
+        ``stream_request``. Reads plain fields and MessageStat.hz of the
+        reader thread (a dict get, never an iteration) — safe cross-thread
+        like the sink's status(). Never raises."""
+        try:
+            st, lg = self._streams, self.logger
+            out = {
+                "transport": str(getattr(self.opts, "mavlink_transport", "udp")),
+                "set_rates": bool(getattr(self.opts, "mavlink_set_rates", False)),
+                "policy": st["policy"] if st else None,
+                "legacy_hz": st["legacy_hz"] if st else None,
+                "requested_hz": dict(st["rates_hz"]) if st else None,
+                "off": list(st["off"]) if st else [],
+                "requested_msg_per_s": (MS.requested_msg_per_s(st) if st
+                                        else None),
+                "accel_source": list(self._accel_msgs),
+                "error": self._streams_error,
+                "sent": bool(lg is not None and lg.rates_sent_t is not None),
+                # SET_MESSAGE_INTERVAL sends that raised (an IMU stream among
+                # them = sent false)
+                "failed": (list(getattr(lg, "rates_failed", None) or [])
+                           if lg is not None else []),
+                "ack": (lg.rate_acks.get("last") if lg is not None else None),
+                "defaults_hz": dict(MS.DEFAULT_HZ),
+                "provenance": "rov_gui/mavlink_streams.py; consumer table "
+                              "RL_controller/logs/eval/station_fix_20261015/"
+                              "impl-rates/NOTES.md",
+            }
+            if achieved:
+                rates, ages = {}, {}
+                t = time.monotonic()            # MessageStat's own clock
+                for m in MS.STREAMS:
+                    s = lg.stats.get(m) if lg is not None else None
+                    rates[m] = round(float(s.hz), 2) if s is not None else None
+                    ages[m] = (round(t - float(s.last_t), 3)
+                               if s is not None and s.last_t is not None
+                               else None)
+                out["achieved_hz"] = rates
+                out["last_arrival_age_s"] = ages
+                out["achieved_note"] = ("host-clock rate over the last 200 "
+                                        "arrivals of each, at meta time; it "
+                                        "does not decay when a stream stops "
+                                        "— last_arrival_age_s does")
+            return out
+        except Exception as e:                                   # noqa: BLE001
+            return {"error": f"{type(e).__name__}: {e}"}
 
     def tick(self) -> None:
         if self.logger is None:                 # --mavlink-transport none
@@ -1819,6 +1950,9 @@ class VehicleWorker(TimerWorker):
             if self._log is not None and rec["msg_type"] in self._log_msgs:
                 self._log.write(rec["msg_type"], rec)
         t = time.monotonic()
+        # banners held back by the once-a-minute limit are said once the
+        # minute has passed, even when no new one arrives (_banner_say)
+        self._banner_say(t)
         # Telemetry stays a 10 Hz human-rate snapshot even when the worker
         # ticks at 20 Hz for the MPC; VehicleImu goes out every tick.
         if t - self._last_tel >= 0.1:
@@ -1852,6 +1986,8 @@ class VehicleWorker(TimerWorker):
         """
         text = str(rec.get("text", "") or "").replace("\x00", "").strip()
         sev = rec.get("severity")
+        if text.startswith(BANNER_PREFIX):
+            self._note_banner(rec, text)
         kind = self._leak.note_statustext(text, sev, t=now())
         if kind == "leak":
             if self._leak.leaks_seen != self._leak_reported:
@@ -1872,6 +2008,50 @@ class VehicleWorker(TimerWorker):
             # dropped one layer down until 2026-08-14, which is why prearm
             # refusals never appeared on this station.
             self.bus.log.emit("warn", f"vehicle: {text[:80]}")
+
+    def _note_banner(self, rec: dict, text: str) -> None:
+        """The autopilot's banner ('ArduSub V…', INFO severity — so nothing
+        above ever said it) — 2026-10-15, RL_controller/logs/eval/
+        pool_trips_1013_rootcause. Outside a reboot it means another client
+        asked for the full parameter list, and on 2026-10-13 every downlink
+        queue onset followed one (state.BANNER_PREFIX has the numbers); the
+        culprit re-asked every ~1.9 s. Its ARRIVAL time and the session count
+        ride VehicleImu (t_banner / n_banners) into the controller CSV
+        (banner_age_s) and the pwm LOWs' engage refusal
+        (engage.per_thruster.banner_hold_s). The log line is said at most once
+        per BANNER_WARN_EVERY_S, with how many arrived since the last one
+        (_banner_say)."""
+        try:
+            t_b = float(rec.get("t_host"))
+        except (TypeError, ValueError):
+            t_b = now()
+        self._t_banner = t_b
+        self._n_banners = int(self._n_banners) + 1
+        self._banner_text = text
+        self._banner_say(t_b)
+
+    def _banner_say(self, t: float) -> None:
+        """The banner log line, at most once per BANNER_WARN_EVERY_S, with the
+        count not yet said: from _note_banner at an arrival, and from tick()
+        so the tail of a burst that ENDED inside the minute is said once the
+        minute has passed (like MpcWorker._banner_tick) — it used to wait for
+        a next banner that might never come (verify-replay F2, 2026-10-15,
+        RL_controller/logs/eval/station_fix_20261015). Same monotonic clock
+        as the record's t_host."""
+        n_new = int(self._n_banners) - int(self._banner_warned_n)
+        if n_new <= 0:
+            return
+        last = self._banner_warned_t
+        if last is not None and t - last < BANNER_WARN_EVERY_S:
+            return
+        self._banner_warned_t = t
+        self._banner_warned_n = self._n_banners
+        self.bus.log.emit(
+            "warn", f"{BANNER_LINE} ({self._banner_text[:40]!r}; {n_new} since "
+                    f"the last warning, {self._n_banners} this session) — the "
+                    f"MAVLink downlink queues behind it and the attitude goes "
+                    f"stale; find the client (BlueOS / Cockpit / QGC tab, an "
+                    f"extension) and close it")
 
     def _internal_pressure_hpa(self) -> float | None:
         """The ENCLOSURE barometer, absolute hPa.
@@ -2097,9 +2277,21 @@ class VehicleWorker(TimerWorker):
         reads ~(0,0,-1000)); the conversion to body acceleration (gravity,
         transport term) belongs to the state assembler, which owns the one
         rotation matrix it needs.
+
+        ON THIS VEHICLE SCALED_IMU2's accel and gyro are ZERO in every record
+        (27/27 recordings 2026-08-09..10-13; RAW_IMU is the live one), so
+        ax..az have been 0.0 on every --mpc run [측정: RL_controller/logs/eval/
+        station_fix_20261015/impl-rates/out/rov_stream_scan.json,
+        accel_consumers_evidence.json]. The accelerometer is the first of
+        ``_accel_msgs`` that has arrived — SCALED_IMU2 then RAW_IMU, as always,
+        unless this session asked the vehicle to stop SCALED_IMU2
+        (--mavlink-scaled-imu2-rate 0, rov_gui/mavlink_streams.py): then
+        RAW_IMU only, so a SCALED_IMU2 left in ``_latest`` from before the
+        request can never be read as the current reading.
         """
         att = self._latest.get("ATTITUDE")
-        imu = self._latest.get("SCALED_IMU2") or self._latest.get("RAW_IMU")
+        imu = next((self._latest[m] for m in self._accel_msgs
+                    if self._latest.get(m)), None)
         baro = self._latest.get("SCALED_PRESSURE2") \
             or self._latest.get("SCALED_PRESSURE")
         v = VehicleImu(conn=Conn.ONLINE if att is not None else Conn.OFFLINE,
@@ -2112,8 +2304,20 @@ class VehicleWorker(TimerWorker):
             v.q = att.get("pitchspeed")
             v.r = att.get("yawspeed")
             v.t_att = att.get("t_host")
+            # 2026-10-15: the VEHICLE-clock capture time (MavlinkLogger stamps
+            # it at arrival, c3_camera/mavlink_log.VehicleClockMap), the raw
+            # time_boot_ms and the map's start — None when the record could
+            # not be placed, which the pwm LOWs read as "age unknown".
+            v.t_att_v = att.get("t_valid")
+            v.att_tb_ms = att.get("time_boot_ms")
+            v.att_map_t0 = att.get("vclk_t0")
+        # The banner rides every snapshot (it is not part of any record).
+        v.t_banner = self._t_banner
+        v.n_banners = int(self._n_banners)
         if imu is not None:
-            MG = 9.80665 / 1000.0            # SCALED_IMU2 accel is mg
+            # SCALED_IMU2 accel is mg; so is ArduPilot's RAW_IMU (|a| p50
+            # 999-1001 in all 27 recordings, rov_stream_scan.json)
+            MG = 9.80665 / 1000.0
             for src, dst in (("xacc", "ax"), ("yacc", "ay"), ("zacc", "az")):
                 raw = imu.get(src)
                 if raw is not None:
@@ -2219,7 +2423,12 @@ class VehicleWorker(TimerWorker):
         """Queued onto this worker's event loop, so the file is opened, written
         and closed by the one thread that drains the vehicle."""
         if on and self._log is None:
-            self._log = SensorLog(Path(f"{stem}_rov.jsonl"), "rov")
+            # The sidecar says which rates were ASKED for beside the
+            # hz_measured it reports (2026-10-15): the IMU streams' rate is
+            # this session's choice, and a log read without it is ambiguous.
+            self._log = SensorLog(Path(f"{stem}_rov.jsonl"), "rov",
+                                  extra={"stream_request":
+                                         self.stream_meta(achieved=False)})
             self.bus.log.emit("info", f"rov sensor log -> {self._log.path}")
         elif not on and self._log is not None:
             meta = self._log.close()
@@ -2490,6 +2699,10 @@ class MavlinkCommandSink(TimerWorker):
         self.bit_tilt_down = _bit("btn_tilt_down")
         self.bit_tilt_center = _bit("btn_tilt_center")
         self._btn_checked: set[str] = set()
+        self._btn_logged: dict[int, int] = {}      # bit -> BTNn_FUNCTION value already reported (2026-10-13: log once)
+        self._sysid_logged = None                  # SYSID_MYGCS value already reported (the rl_pwm gate re-reads it every 10 s)
+        self.drain_backlog_ticks = 0               # ticks that ended with messages still waiting (see _drain)
+        self._drain_warned_at = -1e9
         self.grip_drive = 0.0            # -1 close / 0 idle / +1 open, HELD
         self.tilt_drive = 0.0            # -1 down / 0 idle / +1 up, HELD
         self.tilt_deg: float | None = None
@@ -3393,8 +3606,18 @@ class MavlinkCommandSink(TimerWorker):
                 continue
             self._btn_checked.add(key)
             want, label = BTN_FUNCTION[key]
+            # 2026-10-13: every PARAM_VALUE of BTNn_FUNCTION used to print a line, and BlueOS routes everyone's parameter
+            # replies to this endpoint — report a button only the first time and when its value changes.
+            repeat = self._btn_logged.get(bit) == value
+            self._btn_logged[bit] = value
             if value == want:
-                self.bus.log.emit("info", f"button {bit} = {label} — {key} ok")
+                if not repeat:
+                    self.bus.log.emit("info", f"button {bit} = {label} — {key} ok")
+                continue
+            if repeat:
+                attr = self._BIT_ATTR.get(key)
+                if attr:
+                    setattr(self, attr, None)
                 continue
             # Two things can be wrong here and the message must not pick one:
             # the button may be assigned to something else on this vehicle, or
@@ -3457,6 +3680,9 @@ class MavlinkCommandSink(TimerWorker):
         if pid != "SYSID_MYGCS":
             return
         self.sysid_mygcs = float(msg.param_value)
+        if self._sysid_logged == int(self.sysid_mygcs):
+            return                       # 2026-10-13: already reported; the rl_pwm gate re-reads it every 10 s
+        self._sysid_logged = int(self.sysid_mygcs)
         if int(self.sysid_mygcs) == self.sysid:
             self.bus.log.emit("info", f"SYSID_MYGCS = {int(self.sysid_mygcs)} — "
                                       f"this station is the accepted GCS")
@@ -3478,13 +3704,29 @@ class MavlinkCommandSink(TimerWorker):
         """
         if self.master is None or not self.listening:
             return
-        for _ in range(40):                  # bounded: never starve the tick
+        # 2026-10-13: this was a fixed 40 messages per 20 Hz tick (<= 800 msg/s, less whenever a tick runs late).
+        # With the IMU/ATTITUDE streams at 140-167 Hz the vehicle sends ~480-565 msg/s to every BlueOS endpoint
+        # [측정 data/20261013/1013_190700, 1013_205916 c3_fs_depth_*_rov.json hz_measured], so a backlog built up:
+        # the rl_pwm gate then read rl_pwm_override.lua's 2 Hz "RLPWM" heartbeat from BEFORE the pulses (stamped
+        # fresh on receipt) and disengaged with "RLPWM = 0 after 1.0 s" while the motors WERE following the pulses
+        # [측정 data/20261013/1013_205916/mpc_2100*.csv pwm1..8], and PARAM_VALUE replies were lost so the
+        # SYSID/button check never finished and kept re-asking (the repeated "button N = ..." lines).
+        # Now: read until the socket is empty, bounded by TIME so the tick is never starved.
+        t_end = time.monotonic() + self.DRAIN_BUDGET_S
+        n = 0
+        emptied = False
+        while n < self.DRAIN_MAX_MSGS:
+            if n and time.monotonic() > t_end:
+                break
             try:
                 msg = self.master.recv_msg()
             except Exception:                                    # noqa: BLE001
+                emptied = True
                 break
             if msg is None:
+                emptied = True
                 break
+            n += 1
             mt = msg.get_type()
             if mt == "PARAM_VALUE":
                 self._note_param(msg)
@@ -3517,6 +3759,20 @@ class MavlinkCommandSink(TimerWorker):
                             for i in range(1, 9))
                     except (TypeError, ValueError):
                         pass
+        self._note_drain(n, emptied)
+
+    def _note_drain(self, n: int, emptied: bool) -> None:
+        """One warning a minute when the sink ends a tick with messages still waiting (2026-10-13)."""
+        if emptied:
+            return
+        self.drain_backlog_ticks += 1
+        t = time.monotonic()
+        if t - self._drain_warned_at > 60.0:
+            self._drain_warned_at = t
+            self.bus.log.emit(
+                "warn", f"command link: {n} messages read in one tick and more are waiting — the vehicle streams "
+                        f"faster than this sink reads ({self.drain_backlog_ticks} such ticks so far); rl_pwm "
+                        f"heartbeats and parameter replies may arrive late")
 
     def _peer_count(self) -> int:
         clients = getattr(self.master, "clients", None)
@@ -3536,6 +3792,11 @@ class MavlinkCommandSink(TimerWorker):
     # released again or the next press is not a change.
     PULSE_ON_TICKS = 2
     PULSE_OFF_TICKS = 2
+
+    # _drain budget (2026-10-13): half a 50 ms tick, and a count cap far above one tick of traffic (~30 msgs at
+    # 600 msg/s). pymavlink parses ~20-60 us per message [예측], so 25 ms drains ~400-1000 messages.
+    DRAIN_BUDGET_S = 0.025
+    DRAIN_MAX_MSGS = 2000
 
     def queue_presses(self, bit: int | None, count: int) -> None:
         """Queue ``count`` presses of one button bit (for stepped functions)."""
@@ -5454,6 +5715,10 @@ class HardwareBackend(Backend):
             # sink cannot deliver (no peer / SYSID mismatch) helps nobody.
             # status() only reads plain fields — safe cross-thread.
             self.mpc.sink_status_fn = self.sink.status
+            # The MAVLink IMU-stream request + achieved rates for the run meta
+            # (`mavlink_streams`, 2026-10-15). Same rule: plain fields and a
+            # dict get on the reader's stats, never an iteration.
+            self.mpc.mavlink_streams_fn = self.vehicle.stream_meta
             # Commands + the safety fan-out: E-STOP and COMMAND ENABLE off
             # must reach the MPC as well as the sink.
             bus.cmd_mpc_engage.connect(self.mpc.set_engaged)

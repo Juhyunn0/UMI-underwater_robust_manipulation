@@ -552,7 +552,7 @@ class KeyChip(QtWidgets.QWidget):
         f.setPixelSize(11)
         f.setBold(self._active)
         p.setFont(f)
-        p.setPen(_c("#04121b" if self._active else theme.TEXT_DIM))
+        p.setPen(_c(theme.TEXT_ON_FILL if self._active else theme.TEXT_DIM))
         p.drawText(r, int(Qt.AlignmentFlag.AlignCenter), self._cap)
 
 

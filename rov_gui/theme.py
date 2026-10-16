@@ -31,6 +31,12 @@ State language, used everywhere
 Grey for OFFLINE and red for FAULT is a deliberate split. "This module is not
 plugged in" and "this module is broken" need different reactions, and a
 dashboard that paints both red trains the pilot to ignore red.
+
+One standing exception: ``QPushButton#Rec:checked`` (recording) is filled
+red too. Since 2026-10-13 a checked state switch is filled with its state
+colour, so a tripped DVL / faulted EKF switch and REC NAV recording are all
+red slabs on the trajectory panel's second row — told apart by their text
+("DVL TRIPPED", "EST EKF", "REC ●"), not their colour.
 """
 
 from __future__ import annotations
@@ -47,6 +53,13 @@ TEXT = "#c7d5e2"
 TEXT_DIM = "#7b8ea1"
 TEXT_FAINT = "#4d5f70"
 ACCENT = "#38bdf8"      # interactive / selection
+# Text ON a saturated fill — the checked-button and selection text below. A
+# state colour is a fine FILL but unreadable as text on ACCENT: amber on this
+# blue is 1.0:1 luminance contrast, green 1.06:1, red 1.8:1 [유도: WCAG
+# formula]. A widget that fills itself with a state colour writes on it in
+# this, 5.0:1 on FAIL and 8-9:1 on OK/WARN [유도] (trajectory panel DVL / EST
+# switches, 2026-10-13).
+TEXT_ON_FILL = "#04121b"
 VIDEO_BG = "#000000"
 
 OK = "#22c55e"
@@ -182,7 +195,7 @@ QPushButton:pressed,
 QPushButton:checked {{
     background: {ACCENT};
     border-color: {ACCENT};
-    color: #04121b;
+    color: {TEXT_ON_FILL};
     font-weight: 600;
 }}
 QPushButton:disabled {{
@@ -231,7 +244,7 @@ QTabBar#PageTabs::tab:hover {{ border-color: {ACCENT}; }}
 QTabBar#PageTabs::tab:selected {{
     background: {ACCENT};
     border-color: {ACCENT};
-    color: #04121b;
+    color: {TEXT_ON_FILL};
 }}
 
 /* Combo boxes and spin boxes. Written out because Qt's defaults are a LIGHT
@@ -246,7 +259,7 @@ QComboBox, QAbstractSpinBox {{
     padding: 2px 6px;
     color: {TEXT};
     selection-background-color: {ACCENT};
-    selection-color: #04121b;
+    selection-color: {TEXT_ON_FILL};
 }}
 QComboBox:hover, QAbstractSpinBox:hover {{ border-color: {ACCENT}; }}
 /* A typed-into field must be obviously the thing the keyboard is talking to:
@@ -272,7 +285,7 @@ QLineEdit {{
     padding: 2px 6px;
     color: {TEXT};
     selection-background-color: {ACCENT};
-    selection-color: #04121b;
+    selection-color: {TEXT_ON_FILL};
 }}
 QLineEdit:hover {{ border-color: {ACCENT}; }}
 QLineEdit:focus {{ border: 1px solid {ACCENT}; background: {PANEL}; }}
@@ -290,7 +303,7 @@ QPlainTextEdit, QTextEdit {{
     border-radius: 4px;
     color: {TEXT_DIM};
     selection-background-color: {ACCENT};
-    selection-color: #04121b;
+    selection-color: {TEXT_ON_FILL};
 }}
 
 /* Scroll bars. The application sheet styles these even inside a widget that
@@ -347,7 +360,7 @@ QComboBox QAbstractItemView {{
     border: 1px solid {BORDER_HI};
     color: {TEXT};
     selection-background-color: {ACCENT};
-    selection-color: #04121b;
+    selection-color: {TEXT_ON_FILL};
     outline: none;
 }}
 QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {{

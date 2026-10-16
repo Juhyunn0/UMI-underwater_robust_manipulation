@@ -2,7 +2,7 @@
 """demo_e2e.py — the offline closed-loop check, promoted from a scratchpad.
 
     <py> rov_gui/tests/demo_e2e.py [pid|mpc|dobmpc|mpc_tuned|dobmpc_tuned]
-                                   [station|line|square|follow|replay|policy]
+                                   [station|line|square|square_travel|follow|replay|policy]
                                    [dr] [rp]
 
 Real MainWindow + demo backend + the REAL controller (acados dobmpc by
@@ -250,6 +250,12 @@ SHAPES = {
     "station": {"shape": "station", "origin_tag": None, "yaw_map_deg": 90.0},
     "square": {"shape": "square", "size": 0.6, "size_y": 0.4, "speed": 0.15,
                "laps": 1, "origin_tag": None},
+    # The same square with the panel's yaw mode TRAVEL (2026-10-14): faces
+    # each side, turns in place at every vertex (hw_mpc.yaml
+    # square.vertex_turn_deg_s; needs the shipped path_fillet_m 0.0).
+    "square_travel": {"shape": "square", "size": 0.6, "size_y": 0.4,
+                      "speed": 0.15, "laps": 1, "origin_tag": None,
+                      "heading_follow": True},
     "line": {"shape": "line", "length": 0.8, "speed": 0.15, "laps": 2,
              "ramp_s": 0.7, "dir_deg": 90.0, "origin_tag": None},
     # No geometry at all: what a follow holds is the offset the vehicle
@@ -995,6 +1001,14 @@ def main() -> int:
         if "complete" not in why:
             print("FAIL: the replay ended without completing — a rejected or "
                   "diverged plan also drops traj_on, and that is not success")
+            rc |= 1
+    if SHAPE in ("line", "square", "square_travel"):
+        # A path that TIMED OUT also drops traj_on into a DP hold; until
+        # 2026-10-14 this driver printed OK for it.
+        why = state.get("end_reason", "")
+        print(f"[{SHAPE}] mission ended: {why!r}")
+        if "complete" not in why:
+            print("FAIL: the path ended without completing")
             rc |= 1
     if SHAPE == "follow":
         rc |= _report_follow(statuses, objects)

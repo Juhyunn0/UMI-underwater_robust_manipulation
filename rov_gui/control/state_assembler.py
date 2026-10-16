@@ -145,6 +145,12 @@ class StateAssembler:
         and the rates are NOT touched either way: a DVL is a velocity sensor.
         """
         h = {"tag_age": None, "imu_age": None, "ok": False, "why": ""}
+        # The attitude's TRUE age (2026-10-15, see att_age_v below), set
+        # BEFORE every early return: a tick with no tag fix still has an
+        # attitude — the station bridge flies on it, the pwm LOWs' AGE
+        # interlock judges it and the engage refusal pools it. It decides
+        # nothing here: `imu_age` and the imu_stale_s rule are unchanged.
+        h["att_age_v"] = att_age_v(imu, t_now)
         if fix is None or not fix.ok:
             h["why"] = "no tag fix"
             return None, h
@@ -279,6 +285,34 @@ class StateAssembler:
         h["rp_residual_deg"] = self.rp_residual_deg
         h["rp_residual_rp_deg"] = self.rp_residual_rp_deg
         return {"eta": eta, "nu": nu, "nudot": nudot}, h
+
+
+def att_age_v(imu, t_now: float) -> float | None:
+    """How old the ATTITUDE in ``imu`` (roll, pitch, p, q, r) is at ``t_now``,
+    on the VEHICLE's clock: ``t_now - imu.t_att_v``, where ``t_att_v`` is that
+    sample's time_boot_ms put on the host clock by the MAVLink reader's
+    lower-envelope map (c3_camera/mavlink_log.VehicleClockMap) — 2026-10-15,
+    RL_controller/logs/eval/pool_trips_1013_rootcause.
+
+    ``imu_age`` (``t_now - t_att``) starts the clock at the station's PARSE
+    time, so a queue on the vehicle side of the link is invisible to it: on
+    the 2026-10-13 engagements #1, #3, #4, #5 the CSV imu_age_s read p50
+    0.054-0.058 s while this age read p50 0.35-0.51 s [측정: pool_trips_1013_
+    rootcause/synth/out/synth_checks.json C1_age].
+
+    None = unknown (no snapshot, no map, a non-finite stamp) — never 0: the
+    pwm LOWs count an unknown age as over (rl_pwm.PwmInterlocks). Floored at 0
+    like ``imu_age`` (a synthetic stamp may sit ahead of ``t_now``)."""
+    t_v = getattr(imu, "t_att_v", None) if imu is not None else None
+    if t_v is None:
+        return None
+    try:
+        a = float(t_now) - float(t_v)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(a):
+        return None
+    return max(0.0, a)
 
 
 def _wrap(a: float) -> float:

@@ -2228,8 +2228,10 @@ class TrajectoryWindow(QtWidgets.QWidget):
     mission_requested = Signal()
     mode_requested = Signal(str)
     estop_requested = Signal()
-    # {shape, origin_tag, size|length, size_y, speed} merged over
-    # hw_mpc.yaml's square block (station omits the distance/speed keys)
+    # {shape, origin_tag, heading_tag, heading_follow, size|length|radius,
+    # size_y, speed} merged over hw_mpc.yaml's square block (station omits
+    # the distance/speed keys; heading_tag and heading_follow ride EVERY
+    # shape, None/False unless station / the square's yaw box set them)
     scenario_requested = Signal(object)
     # Raw localization recording (map.json + fixes.csv), independent of the
     # engage-gated MPC CSV: the operator can log a hand-flown survey pass.
@@ -2267,6 +2269,40 @@ class TrajectoryWindow(QtWidgets.QWidget):
     # the mission row and the LOW row and the window's height budget is ~6 px
     # (test_control: test_mpc_panel_lives_in_the_grid_and_fits_the_operator_screen).
     _CKPT_BTN_CSS = "QPushButton{font-size:11px; padding:1px 6px;}"
+
+    @classmethod
+    def _state_btn_css(cls, colour: str) -> str:
+        """The face of a switch whose colour IS a state (DVL, EST).
+
+        A widget sheet's ``color`` beats the app sheet's ``:checked`` rule, so
+        a checked switch used to write its state colour on the ACCENT fill —
+        amber "DVL IN" on light blue, 1.0:1 [유도: WCAG on theme.WARN vs
+        theme.ACCENT; operator screenshot 2026-10-13, not in the repo].
+        Checked, the switch is now FILLED with its state colour and written on
+        in ``theme.TEXT_ON_FILL``; frozen (disabled: engaged, or a controller
+        CSV open) it keeps the dark face with the state in its text and —
+        since 2026-10-13 — its border; pressed, the ACCENT flash gets the same
+        dark text. All at REGULAR weight: the app sheet makes checked/pressed
+        text bold, but the button is sized for its regular label, and bold
+        "DVL TRIPPED" was cut at both ends. A FAIL face sits on PANEL, not
+        PANEL_HI: red on PANEL_HI is 4.4:1, on PANEL 4.7:1 [유도: WCAG].
+        """
+        base = cls._BTN_CSS[:-1] + f" color:{colour};"
+        if colour == theme.FAIL:
+            base += f" background:{theme.PANEL};"
+        # :pressed restates the app sheet's ACCENT flash: a widget sheet's
+        # background (the FAIL face's) would otherwise win over it, leaving
+        # dark text on a dark face. :checked comes after it, so a checked
+        # switch held down keeps its state fill.
+        return (base + "}"
+                f"QPushButton:pressed{{background:{theme.ACCENT};"
+                f" border-color:{theme.ACCENT}; color:{theme.TEXT_ON_FILL};"
+                f" font-weight:normal;}}"
+                f"QPushButton:checked{{background:{colour};"
+                f" border-color:{colour}; color:{theme.TEXT_ON_FILL};"
+                f" font-weight:normal;}}"
+                f"QPushButton:checked:disabled{{background:{theme.PANEL};"
+                f" border-color:{colour}; color:{colour};}}")
 
     def __init__(self):
         super().__init__()
@@ -2327,7 +2363,9 @@ class TrajectoryWindow(QtWidgets.QWidget):
         # These are what the operator changes between runs, so they are
         # on the panel rather than in the YAML. They are sent as a scenario
         # OVERRIDE (cmd_mpc_scenario) and merged over hw_mpc.yaml's square
-        # block, so laps/depth/ramp still come from the file.
+        # block, so laps/depth/ramp — and the FIXED heading (yaw_map_deg) and
+        # the vertex turn rate (vertex_turn_deg_s) — still come from the file.
+        # The square's yaw MODE is the one heading choice on the panel.
         self.shape_box = QtWidgets.QComboBox()
         # (LABEL, KEY) items in SHAPES order — the KEY is what `_emit_scenario`
         # sends and what `set_shape`/`current_shape` speak (SHAPE_LABELS).
@@ -2339,7 +2377,9 @@ class TrajectoryWindow(QtWidgets.QWidget):
             "Station: sit on the tag and hold, heading included — fly THIS "
             "first\n"
             "Line: out and back along +y from the tag (1 lap = there AND back)\n"
-            "Square: a rectangle with the tag as its first corner\n"
+            "Square: a rectangle with the tag as its first corner — yaw "
+            "fixed (crab) or yaw = travel (faces each side, turns in place "
+            "at the corners)\n"
             "Circle: the tag is the BOTTOM of the circle, not its centre — "
             "the box sets the radius\n"
             "Follow: hold the relative pose you have RIGHT NOW on the object "
@@ -2388,11 +2428,12 @@ class TrajectoryWindow(QtWidgets.QWidget):
         self.leny_box.setSuffix(" m")
         self.leny_box.setToolTip("square: the y side")
         self.spd_box = QtWidgets.QDoubleSpinBox()
-        # 0.50 m/s GUI ceiling — well above every mission flown so far
-        # (hw_mpc.yaml ships 0.05; the sim squares used 0.12). [예측] nothing
-        # has been flown faster, so localizer robustness (motion blur, tag
-        # loss) above that is unmeasured; the spatial follower's corner brake
-        # and the axis caps still bound what the vehicle actually does.
+        # 0.50 m/s GUI ceiling — above every mission flown so far (hw_mpc.yaml
+        # ships 0.10 since 2026-10-14; squares have been commanded up to 0.30,
+        # e.g. data/20260816/0816_191641/mpc_192224.meta.json). Localizer
+        # robustness (motion blur, tag loss) above that is unmeasured; the
+        # spatial follower's corner brake and the axis caps still bound what
+        # the vehicle actually does.
         self.spd_box.setRange(0.01, 0.50)
         self.spd_box.setSingleStep(0.01)
         self.spd_box.setDecimals(2)
@@ -2405,6 +2446,37 @@ class TrajectoryWindow(QtWidgets.QWidget):
         self.spd_box.setToolTip("desired speed along the active path segment; "
                                 "the spatial follower brakes to zero and "
                                 "captures every corner before continuing")
+        # THE SQUARE'S YAW MODE (2026-10-14, operator: "yaw를 +x축으로 보게
+        # 하는 방식이랑, trajectory와 같은 방향으로 보게 하는 모드"). A COMBO
+        # that speaks KEYS like the HIGH/LOW ones — not a checkable button,
+        # whose app-sheet bold :checked face has already cut a label here
+        # (_state_btn_css) — and NoFocus like them: a focused combo eats
+        # Up/Down and letter keys, i.e. the pilot's W/A/S/D. It rides the
+        # scenario as heading_follow, the key the reference, the cursor, every
+        # bridge and the meta already carry. The FIXED item names the heading
+        # it holds, from the YAML seed (set_mission_defaults): the shipped
+        # yaw_map_deg 90 is map +y — screen RIGHT — which is not "+x".
+        self.yaw_box = QtWidgets.QComboBox()
+        self.yaw_box.addItem("yaw fixed", "fixed")
+        self.yaw_box.addItem("yaw = travel", "travel")
+        self.yaw_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.yaw_box.setToolTip(
+            "SQUARE yaw mode\n"
+            "yaw fixed: one heading the whole mission — hw_mpc.yaml "
+            "yaw_map_deg (shipped 90 = map +y = screen right); the sides are "
+            "flown crabbing, like every hardware square so far\n"
+            "yaw = travel: face along each side (+x side -> +x, +y -> +y, "
+            "-x -> -x, -y -> -y). At each corner the vehicle stops and turns "
+            "90 deg IN PLACE at square.vertex_turn_deg_s, then goes. START "
+            "turns the vehicle to face the first side for the approach and "
+            "settle (one unramped turn, like yaw fixed's to its heading).\n"
+            "Refused in STABILIZE with yaw_axis hold, on MPCC/DOBMPCC, and "
+            "unless path_fillet_m is 0 and path_following is on (only the "
+            "waypoint square turns in place). "
+            "Every lap is one full turn of the tether, always the same way. "
+            "The C3 looks along each side, so the ±x sides look across the "
+            "narrow mat — watch the tag count. Frozen from START.")
+        self._fixed_yaw = ""               # "+y" etc., from the YAML seed
         self.lbl_y = QtWidgets.QLabel("×")
         # NOT setStyleSheet(): a widget-level sheet REPLACES the application
         # sheet for that widget, so styling these three individually is what
@@ -2413,7 +2485,7 @@ class TrajectoryWindow(QtWidgets.QWidget):
         small = QtGui.QFont()
         small.setPointSize(8)
         for w in (self.shape_box, self.tag_box, self.face_box, self.len_box,
-                  self.leny_box, self.spd_box):
+                  self.leny_box, self.spd_box, self.yaw_box):
             w.setFont(small)
         # (_shape_changed is connected at the END of __init__, next to the
         # call that seeds it: it now touches btn_start, which is built below,
@@ -2662,6 +2734,7 @@ class TrajectoryWindow(QtWidgets.QWidget):
         row0.addWidget(self.lbl_y)
         row0.addWidget(self.leny_box)
         row0.addWidget(self.spd_box)
+        row0.addWidget(self.yaw_box)       # square only (_shape_changed)
         # Eliding, so a long mission sentence never sets the window's minimum
         # width (see ElidingLabel); the full text is its tooltip. Its width
         # is IGNORED and it takes the row's LEFTOVER (stretch 1): since the
@@ -2728,7 +2801,24 @@ class TrajectoryWindow(QtWidgets.QWidget):
         self._pol_unavailable = ()     # *_7d LOWs with no export to fly
         self._pol_status_last = None   # re-rendered when the seed arrives
         self._mission_colour = theme.TEXT_FAINT
+        # The ONE distance box, remembered PER SHAPE (2026-10-14 review): it
+        # used to carry whatever it held into the next shape, and with the
+        # square seed at 1.0 m a station start opened Circle at r 1.00 m —
+        # a circle reaching 0.6 m past the last tag from tag 37 — instead of
+        # the file's radius. Seeded from size / length / radius; the shape
+        # whose value the box holds now is _len_shape.
+        self._len_by_shape: dict = {}
+        self._len_shape = None
+        # Each combo's popup list -> the combo (Esc = E-STOP, eventFilter).
+        self._combo_views = {}
+        for cb in (self.shape_box, self.mode_box, self.yaw_box):
+            view = cb.view()
+            view.installEventFilter(self)
+            self._combo_views[view] = cb
+        self.yaw_box.installEventFilter(self)       # wheel guard
         self.shape_box.currentIndexChanged.connect(self._shape_index_changed)
+        self.yaw_box.currentIndexChanged.connect(
+            lambda _i: self._emit_scenario())
         self._shape_changed(self.current_shape())
         self._refresh_tune_row()
 
@@ -2743,8 +2833,25 @@ class TrajectoryWindow(QtWidgets.QWidget):
     def eventFilter(self, obj, ev):
         """Digits stay in the field; anything else is a PILOT key — release
         the focus and re-deliver it to the window, so reaching for W after
-        typing a tag number flies the vehicle instead of doing nothing."""
-        if (ev.type() == QtCore.QEvent.Type.KeyPress
+        typing a tag number flies the vehicle instead of doing nothing.
+
+        Two combo rules (2026-10-14 review): an OPEN combo list grabs the
+        keyboard and spends Esc on closing itself, so Esc there is taken
+        here as the E-STOP it is everywhere else (the CkptFileDialog rule);
+        and the yaw box ignores the mouse wheel — a notch over a NoFocus combo
+        changes it without a click, and that one flips the heading of the
+        whole mission."""
+        kind = ev.type()
+        if (kind == QtCore.QEvent.Type.KeyPress
+                and ev.key() == Qt.Key.Key_Escape
+                and obj in getattr(self, "_combo_views", {})):
+            self._combo_views[obj].hidePopup()
+            self.estop_requested.emit()
+            return True
+        if (kind == QtCore.QEvent.Type.Wheel
+                and obj is getattr(self, "yaw_box", None)):
+            return True
+        if (kind == QtCore.QEvent.Type.KeyPress
                 and obj in getattr(self, "_num_fields", ())):
             k = ev.key()
             if not (Qt.Key.Key_0 <= k <= Qt.Key.Key_9
@@ -2835,9 +2942,18 @@ class TrajectoryWindow(QtWidgets.QWidget):
         """Seed the controls from hw_mpc.yaml so the panel and the file agree
         at startup (the panel then owns these fields)."""
         boxes = (self.shape_box, self.tag_box, self.face_box, self.len_box,
-                 self.leny_box, self.spd_box)
+                 self.leny_box, self.spd_box, self.yaw_box)
         for w in boxes:
             w.blockSignals(True)
+        # The square's yaw mode, from the SAME key the worker reads — and
+        # `is True`, never truthiness: a quoted "false" must not seed TRAVEL
+        # (MpcConfig.load refuses one anyway).
+        self.yaw_box.setCurrentIndex(self.yaw_box.findData(
+            "travel" if sq.get("heading_follow") is True else "fixed"))
+        self._fixed_yaw = self._fixed_yaw_words(sq)
+        self.yaw_box.setItemText(
+            self.yaw_box.findData("fixed"),
+            f"yaw fixed {self._fixed_yaw}".rstrip())
         shape = str(sq.get("shape", "square")).lower()
         self.set_shape(shape if shape in SHAPES else "square")
         tag = sq.get("origin_tag")
@@ -2851,12 +2967,50 @@ class TrajectoryWindow(QtWidgets.QWidget):
             "line": float(sq.get("length", 2.0) or 2.0),
             "circle": float(sq.get("radius", 0.5) or 0.5),
         }.get(shape, size))
+        # ...and REMEMBERED per shape from the keys the dict actually has, so
+        # switching shape later brings each one's own file value back
+        # (_shape_changed) — a key the dict lacks leaves that shape to carry
+        # whatever the box holds, as before.
+        self._len_by_shape = {
+            shp: float(sq[key]) for key, shp in (("size", "square"),
+                                                 ("length", "line"),
+                                                 ("radius", "circle"))
+            if sq.get(key) not in (None, "")}
+        self._len_shape = shape if shape in ("line", "circle") else "square"
         sy = sq.get("size_y")
         self.leny_box.setValue(size if sy in (None, "") else float(sy))
         self.spd_box.setValue(float(sq.get("speed", 0.12) or 0.12))
         for w in boxes:
             w.blockSignals(False)
         self._shape_changed(self.current_shape())
+
+    @staticmethod
+    def _fixed_yaw_words(sq: dict) -> str:
+        """The heading the square's FIXED mode holds, in the plot's words —
+        the worker's rule (MpcWorker._mission_yaw, no heading_tag for a
+        path): yaw_map_deg if it is a number ("+y" for the shipped 90),
+        else yaw_fixed_deg ("START" for "current"). "" when the dict says
+        neither (a bare panel): the label then claims nothing."""
+        ym = sq.get("yaw_map_deg")
+        if ym not in (None, "", "current"):
+            try:
+                a = float(ym)
+            except (TypeError, ValueError):
+                return ""
+            for deg, words in ((0.0, "+x"), (90.0, "+y"), (180.0, "-x"),
+                               (270.0, "-y")):
+                if abs((a - deg + 180.0) % 360.0 - 180.0) < 1e-6:
+                    return words
+            return f"{a:.0f} deg"
+        if "yaw_fixed_deg" not in sq and "yaw_map_deg" not in sq:
+            return ""
+        yf = sq.get("yaw_fixed_deg", "current")
+        if yf in (None, "", "current"):
+            return "START"
+        try:
+            return f"{float(yf):.0f} deg datum"
+        except (TypeError, ValueError):
+            return ""
 
     def _shape_changed(self, shape: str) -> None:
         station = (shape == "station")
@@ -2872,6 +3026,24 @@ class TrajectoryWindow(QtWidgets.QWidget):
         replay = shape in ("replay", "policy")
         self.leny_box.setVisible(shape == "square")
         self.lbl_y.setVisible(shape == "square")
+        # The yaw mode is the SQUARE's (operator, 2026-10-14). A circle can
+        # fly heading_follow too, but its start heading and its approach
+        # were never asked for here — the box goes with the shape, and
+        # _emit_scenario sends heading_follow False for every other one.
+        self.yaw_box.setVisible(shape == "square")
+        # The distance box follows the shape it now means (see _len_by_shape):
+        # keep what the box held for the shape it meant until now, then bring
+        # back this shape's own value if there is one. Signals blocked — the
+        # one scenario this change sends is the one at the end.
+        if shape in ("square", "line", "circle"):
+            if self._len_shape is not None:
+                self._len_by_shape[self._len_shape] = float(
+                    self.len_box.value())
+            if shape in self._len_by_shape:
+                self.len_box.blockSignals(True)
+                self.len_box.setValue(self._len_by_shape[shape])
+                self.len_box.blockSignals(False)
+            self._len_shape = shape
         # FOLLOW has no distance and no origin tag: what it holds is the
         # offset the vehicle already has, and the "path" is wherever the
         # object goes. The SPEED box stays — for a follow it caps how fast
@@ -2889,9 +3061,10 @@ class TrajectoryWindow(QtWidgets.QWidget):
         # through one id the operator picked.)
         self.tag_box.setVisible(not follow and not replay)
         self.lbl_tag.setVisible(not follow and not replay)
-        # "facing tag" is a STATION idea only: a path's heading is its
-        # direction of travel (or heading_follow), so the box vanishes with
-        # the shape rather than greying out (the follow rule above).
+        # "facing tag" is a STATION idea only: a path's heading is the yaw
+        # mode's (yaw_map_deg, or the direction of travel under the square's
+        # yaw = travel), so the box vanishes with the shape rather than
+        # greying out (the follow rule above).
         self.face_box.setVisible(station)
         self.lbl_face.setVisible(station)
         # station does not move; replay's speed is replay.v_max_m_s (config)
@@ -2929,15 +3102,26 @@ class TrajectoryWindow(QtWidgets.QWidget):
             "starts at engage")
         self._emit_scenario()
 
+    def resend_scenario(self) -> None:
+        """Send what the panel shows once more. The window calls it after the
+        backend is attached: the seeding's own emission happens while the
+        panel is being BUILT, before anything is connected, so until the
+        operator touched a field the worker flew the bare YAML block — not the
+        panel (a YAML heading_follow could turn a circle whose panel shows
+        no yaw box; 2026-10-14 review)."""
+        self._emit_scenario()
+
     def _emit_scenario(self) -> None:
         shape = self.current_shape()
         tag = int(self.tag_box.value())
         # heading_tag is written for EVERY shape (None unless station sets
         # it) so the panel's scenario always overrides a value left in
         # hw_mpc.yaml — a hidden box must not steer a path (safety review
-        # 2026-09-11).
+        # 2026-09-11). heading_follow likewise (2026-10-14): False unless
+        # the SQUARE's yaw box says travel, so a YAML seed can never turn a
+        # circle whose panel shows no yaw box at all.
         d = {"shape": shape, "origin_tag": (None if tag == 0 else tag),
-             "heading_tag": None}
+             "heading_tag": None, "heading_follow": False}
         text = ""
         if shape == "follow":
             # The origin tag means nothing here, so it is not sent: a follow
@@ -2973,11 +3157,16 @@ class TrajectoryWindow(QtWidgets.QWidget):
             d["size"] = float(self.len_box.value())
             d["size_y"] = float(self.leny_box.value())
             d["speed"] = float(self.spd_box.value())
+            travel = self.yaw_box.currentData() == "travel"
+            d["heading_follow"] = travel
             text = (f"{self.len_box.value():.2f} m +x × "
                     f"{self.leny_box.value():.2f} m +y @ "
                     f"{self.spd_box.value():.2f} m/s"
                     + (f", SW corner at tag {tag}" if tag
-                       else ", SW corner here"))
+                       else ", SW corner here")
+                    + (", yaw = travel (turns in place at the corners)"
+                       if travel else
+                       f", yaw fixed {self._fixed_yaw}".rstrip()))
         elif shape == "circle":
             d["radius"] = float(self.len_box.value())
             d["speed"] = float(self.spd_box.value())
@@ -3398,7 +3587,7 @@ class TrajectoryWindow(QtWidgets.QWidget):
         colour = (theme.FAIL if st == "fault" else
                   theme.TEXT_DIM if not on else
                   theme.OK if st == "ready" else theme.WARN)
-        css = (self._BTN_CSS[:-1] + f" color:{colour};}}")
+        css = self._state_btn_css(colour)
         if css != self._est_css:
             self._est_css = css
             self.btn_est.setStyleSheet(css)
@@ -3453,7 +3642,7 @@ class TrajectoryWindow(QtWidgets.QWidget):
         colour = (theme.FAIL if st == "tripped" else
                   theme.TEXT_DIM if not use else
                   theme.OK if st == "in_use" else theme.WARN)
-        css = (self._BTN_CSS[:-1] + f" color:{colour};}}")
+        css = self._state_btn_css(colour)
         if css != self._dvl_css:
             self._dvl_css = css
             self.btn_dvl.setStyleSheet(css)
@@ -3582,7 +3771,7 @@ class TrajectoryWindow(QtWidgets.QWidget):
         # ~190 s) in which the panel said one thing and the run flew another.
         busy = s.traj_on or s.phase in ("approach", "settle")
         for w in (self.shape_box, self.tag_box, self.face_box, self.len_box,
-                  self.leny_box, self.spd_box):
+                  self.leny_box, self.spd_box, self.yaw_box):
             w.setEnabled(not busy)
         if s.engaged:
             warm = (f" · warm-up {s.warmup_left_s:.1f}s"
@@ -3605,6 +3794,11 @@ class TrajectoryWindow(QtWidgets.QWidget):
                     and scn.get("action_repr") == ACTION_REPR_POS_RPY_WIDTH):
                 what += (" · 7d rp TRACKED" if scn.get("attitude_track")
                          else " · 7d rp DROPPED")
+            # ...and which way a square is FACING (2026-10-14), from the
+            # armed scenario — the panel's yaw box may have moved since.
+            if (s.traj_on and kind in ("square", "circle")
+                    and scn.get("heading_follow") is True):
+                what += " · yaw = travel"
             det = f" {s.phase_detail}" if s.phase_detail else ""
             if s.err_cross is not None and s.err_along is not None:
                 err = (f" · off {s.err_cross * 100:+.0f} cm"

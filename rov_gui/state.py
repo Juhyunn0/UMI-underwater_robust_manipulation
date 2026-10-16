@@ -601,8 +601,41 @@ class VehicleImu:
     t_att: float | None = None       # host arrival stamps per message
     t_imu: float | None = None
     t_baro: float | None = None
+    # 2026-10-15 (RL_controller/logs/eval/pool_trips_1013_rootcause): WHEN the
+    # ATTITUDE above was true, on the VEHICLE's clock — its time_boot_ms put on
+    # the host clock by the reader's lower-envelope map
+    # (c3_camera/mavlink_log.VehicleClockMap) — so `now - t_att_v` is how old
+    # roll/pitch/p/q/r really are. `t_att` is the PARSE time and cannot see a
+    # vehicle-side MAVLink queue: on 2026-10-13 tick - t_att read ~0.05 s while
+    # the attitude was 0.43 s old (median). None = unknown (no ATTITUDE yet, no
+    # time_boot_ms, another component's clock): consumers must not read it as
+    # fresh (the pwm LOWs' AGE interlock counts it as over).
+    t_att_v: float | None = None
+    att_tb_ms: int | None = None     # that ATTITUDE's own time_boot_ms
+    att_map_t0: float | None = None  # host time the clock map in force began (a reboot restarts it)
+    # The vehicle's 'ArduSub V…' banner STATUSTEXT: ArduSub sends it at boot and
+    # when ANY client asks for the full parameter list, and every 10-13 downlink
+    # queue onset followed one. Host arrival time of the newest this session and
+    # the session count (VehicleWorker._note_banner; see BANNER_PREFIX below).
+    t_banner: float | None = None
+    n_banners: int = 0
     conn: Conn = Conn.OFFLINE
     stamp: float = field(default_factory=now)
+
+
+#: A STATUSTEXT starting with this is the autopilot's banner (2026-10-15). ArduSub
+#: sends it from handle_param_request_list and MAV_CMD_DO_SEND_BANNER [스펙: ArduPilot
+#: libraries/GCS_MAVLink/GCS_Param.cpp:216, GCS_Common.cpp:5212, the copy in
+#: data/20261011/1011_155235_dvl_probe/analysis/wf/ap_src], and a reboot says it too.
+#: This station sends neither request, so outside a reboot it means ANOTHER client
+#: pulled the parameter list — and 111 of 112 banners in the 10-13 21:17 recordings
+#: started a downlink queue (peak ~0.83 s within 2 s, p50) [측정: RL_controller/logs/
+#: eval/pool_trips_1013_rootcause/synth/out/synth_checks.json C4_queue].
+BANNER_PREFIX = "ArduSub V"
+#: The sentence the station says about it (VehicleWorker log, MpcWorker mission
+#: line + events.log), at most once per BANNER_WARN_EVERY_S each.
+BANNER_LINE = "vehicle banner: another client requested the full parameter list"
+BANNER_WARN_EVERY_S = 60.0
 
 
 @dataclass

@@ -21,6 +21,11 @@ _reference_ned_at). Body-frame vectors: (u, v, w)_FRD -> (u, -v, -w)_FLU, (p, q,
 Observation frame (25 floats, newest-first history of ``history_len`` frames):
     [q_des(w,x,y,z), offset_b(3), q_est(w,x,y,z), v_b(3), gyro_b(3), goal_v_b(3), goal_yaw_rate(1), prev_action(4)]
     q_* canonicalised to w >= 0 (obs_spec.obs_quat_unique); offset clipped to +-obs_offset_clip [m].
+    Goal frame (2026-10-15, obs_spec.obs_goal_frame: true — RL_controller pwm11att7 and later): q_des and q_est are first
+    rotated by -goal yaw (the ZYX yaw of q_des), THEN canonicalised, so q_des carries no yaw and q_est only the heading
+    error (goal_frame_quats); offset_b and goal_v_b stay in the body frame of the WORLD q_est. Such an export names the
+    two slots q_des_goalframe / q_est_goalframe, and every RL LOW accepts that layout ONLY with obs_goal_frame true and
+    the plain one ONLY without it (check_frame_layout) — anything else is refused at build.
 Action: [surge(+fwd), sway(+right), heave(+up), yaw(+clockwise from above)] in [-1, 1] == MANUAL_CONTROL convention.
 
 Assumptions the policy carries (recorded in meta()): vehicle JS_GAIN_DEFAULT 0.5 (obs_spec.pilot_gain_assumed) — a
@@ -99,6 +104,84 @@ def _unique(q: np.ndarray) -> np.ndarray:
     return -q if q[0] < 0 else q
 
 
+def yaw_from_q(q: np.ndarray) -> float:
+    """ZYX yaw of a (w,x,y,z) quaternion — RL_controller deploy/obs_builder.yaw_from_q (= rov_rl.utils.math.yaw_from_quat)."""
+    w, x, y, z = q
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Hamilton product a (x) b, (w,x,y,z) — RL_controller deploy/obs_builder.quat_mul_np, verbatim."""
+    w1, x1, y1, z1 = a
+    w2, x2, y2, z2 = b
+    return np.array([w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2, w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                     w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2, w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2])
+
+
+def goal_frame_quats(q_des: np.ndarray, q_est: np.ndarray) -> tuple:
+    """obs_goal_frame (2026-10-15): (q_des, q_est) rotated by -goal yaw, the goal yaw being the ZYX yaw of q_des —
+    RL_controller rov_env._get_observations / deploy/obs_builder.py, transcribed operation for operation. The caller
+    canonicalises AFTER this (as training does): the canonical yaw quaternion flips sign at +-180 deg of heading, and the
+    att6 actors answered that flip with a yaw-command jump [측정 RL_controller logs/eval/att6_verify_20261014/robustness];
+    in the goal frame q_des has no yaw and q_est carries only the heading ERROR, so the flip sits at an error of 180 deg."""
+    yg = yaw_from_q(q_des)
+    q_rot = np.array([math.cos(-0.5 * yg), 0.0, 0.0, math.sin(-0.5 * yg)])
+    return quat_mul(q_rot, q_des), quat_mul(q_rot, q_est)
+
+
+#: The two spellings of an export's quaternion slots (RL_controller rov_rl/obs_spec.frame_layout): world frame (every
+#: export before 2026-10-15) and goal-heading frame (obs_goal_frame: true). The rename is the export's own "do not fly me
+#: without the transform": a station that compares frame_layout slot for slot refuses it until it implements it.
+Q_SLOTS_WORLD = ("q_des(w,x,y,z)", "q_est(w,x,y,z)")
+Q_SLOTS_GOAL = ("q_des_goalframe(w,x,y,z)", "q_est_goalframe(w,x,y,z)")
+
+
+def frame_layout(goal_velocity: bool, n_actions: int, goal_frame: bool = False) -> list:
+    """The frame_layout an export with these keys declares — RL_controller rov_rl/obs_spec.frame_layout, transcribed
+    (2026-10-15); the goal-frame layout renames ONLY the two quaternion slots."""
+    q_des, q_est = Q_SLOTS_GOAL if goal_frame else Q_SLOTS_WORLD
+    core = [q_des, "offset_b(3)", q_est, "v_b_est(3)", "gyro_b(3)"]
+    if goal_velocity:
+        core += ["goal_v_b(3)", "goal_yaw_rate(1)"]
+    return core + [f"prev_action({int(n_actions)})"]
+
+
+def check_frame_layout(spec: dict, who: str, where: str, goal_velocity: bool | None = None,
+                       n_actions: int | None = None) -> bool:
+    """The layout gate every RL LOW passes at build (2026-10-15) -> the export's obs_goal_frame.
+
+    The goal-frame layout (q_des_goalframe / q_est_goalframe) is accepted ONLY with ``obs_goal_frame: true``, the
+    world-frame layout ONLY with it false or absent. A non-boolean obs_goal_frame, a layout that is neither, or a
+    frame_dim that is not the layout's width is REFUSED (ValueError naming the export and what is wrong).
+    ``goal_velocity`` / ``n_actions`` pin what the LOW flies (rl_7d / rl_pwm_7d: the feed-forward and 6 / 8 outputs);
+    None = the export's own obs_goal_velocity / num_actions (rl, rl_pwm — whose action mode is checked before this)."""
+    gf = spec.get("obs_goal_frame", False)
+    if not isinstance(gf, bool):
+        raise ValueError(f"{who}: policy {where} has obs_goal_frame {gf!r} — expected true or false (absent = false); "
+                         f"refused, the frame its quaternion slots are in is unknown")
+    gv = bool(spec.get("obs_goal_velocity", False)) if goal_velocity is None else bool(goal_velocity)
+    na = int(spec.get("num_actions", -1)) if n_actions is None else int(n_actions)
+    want = frame_layout(gv, na, goal_frame=gf)
+    got = spec.get("frame_layout")
+    if got != want:
+        if got == frame_layout(gv, na, goal_frame=not gf):
+            if gf:
+                raise ValueError(f"{who}: policy {where} says obs_goal_frame: true but its frame_layout names the "
+                                 f"WORLD-frame quaternion slots {list(Q_SLOTS_WORLD)} — an inconsistent export; refused "
+                                 f"(re-export with RL_controller scripts/export_policy.py)")
+            raise ValueError(f"{who}: policy {where} frame_layout names the GOAL-FRAME quaternion slots "
+                             f"{list(Q_SLOTS_GOAL)} but obs_goal_frame is "
+                             f"{'false' if 'obs_goal_frame' in spec else 'absent'} — refused: q_des / q_est are rotated "
+                             f"into the goal frame only for an export that says obs_goal_frame: true")
+        raise ValueError(f"{who}: policy {where} frame_layout {got} != {want} (the layout of obs_goal_frame "
+                         f"{str(gf).lower()}, obs_goal_velocity {str(gv).lower()}, {na} actions); refused")
+    width = 17 + (4 if gv else 0) + na
+    if spec.get("frame_dim") != width:
+        raise ValueError(f"{who}: policy {where} frame_dim {spec.get('frame_dim')!r} != {width}, the width of its "
+                         f"frame_layout; refused")
+    return gf
+
+
 # ----------------------------------------------------------------------------- the controller
 class HwRl(HwPid):
     """RL follower with HwPid's harness surface (reference API inherited)."""
@@ -154,6 +237,11 @@ class HwRl(HwPid):
         self.clip_m = float(self.spec.get("obs_offset_clip", 1.0))
         self.quat_unique = bool(self.spec.get("obs_quat_unique", True))
         self.goal_velocity = bool(self.spec.get("obs_goal_velocity", False))
+        #: 2026-10-15 (obs_spec.obs_goal_frame, RL_controller pwm11att7 and later): q_des / q_est in the goal-heading frame
+        #: (goal_frame_quats, BEFORE the canonicalization) for every LOW that loads such an export. The layout gate refuses
+        #: an export whose frame_layout and obs_goal_frame disagree, whatever the LOW (rl / rl_pwm compared no layout
+        #: before this — a goal-frame export would have flown there on world-frame quaternions).
+        self.goal_frame = check_frame_layout(self.spec, self.CFG_KEY, os.path.relpath(pdir, REPO_ROOT))
         if self.policy.obs_dim != self.frame_dim * self.K or self.policy.act_dim != self.n_act:
             raise ValueError(f"rl: policy dims {self.policy.obs_dim}->{self.policy.act_dim} do not match obs_spec "
                              f"({self.frame_dim}x{self.K} -> {self.n_act})")
@@ -179,8 +267,11 @@ class HwRl(HwPid):
         #: Goal leash [m]: the policy never saw goal offsets beyond obs_offset_clip (1.0 m, where the clip destroys the
         #: bearing), so a far target (station hold from metres away) is pulled to this distance along the true bearing.
         self.leash_m = float(raw.get("leash_m", 0.8))
-        #: The K=1 path plan carries r_ned == 0 even while the heading slews (path_geometry.py), so the yaw-rate
-        #: feed-forward is recovered by differencing the reference yaw between ticks, clipped to the trained range.
+        #: A K=1 reference with r_ned == 0 (a station / approach setpoint, a crab path) gets its yaw-rate feed-forward by
+        #: differencing the reference yaw between ticks; a heading-follow plan carries its own (2026-10-14). Either is
+        #: clipped to yaw_rate_max. NOTE the shipped 0.6 matches neither export number: moving_goal.yaw_rate_max 0.4
+        #: (in-place / independent yaw drift) and turn_rate_max 1.0 (heading-follow arcs) in traj10_s1, traj12_s2 and
+        #: pwm11k0.2_s0 obs_spec.json [스펙].
         self.yaw_rate_ff = bool(raw.get("yaw_rate_ff", True))
         self.yaw_rate_max = float(raw.get("yaw_rate_max", 0.6))
         self._yaw_ref_prev = None
@@ -194,7 +285,8 @@ class HwRl(HwPid):
         _pg = self.spec.get("pilot_gain_assumed", 0.5)
         self.pilot_gain_assumed = 0.5 if _pg is None else float(_pg)
         log(f"rl: policy {os.path.relpath(pdir, REPO_ROOT)} ({self.spec.get('checkpoint', '?')}), obs {self.policy.obs_dim} "
-            f"(K={self.K}, feed-forward={'on' if self.goal_velocity else 'off'}), act {self.n_act}, probe {self.probe_ms:.2f} ms; "
+            f"(K={self.K}, feed-forward={'on' if self.goal_velocity else 'off'}"
+            f"{', goal-frame quaternions' if self.goal_frame else ''}), act {self.n_act}, probe {self.probe_ms:.2f} ms; "
             f"assumes JS_GAIN_DEFAULT {self.pilot_gain_assumed} and no axis slew [스펙 obs_spec.json]")
 
     # ------------------------------------------------------------------ observation
@@ -212,9 +304,12 @@ class HwRl(HwPid):
             d = d * (self.leash_m / n)
         q_des = self._q_des(yaw_ref)
         offset_b = np.clip(quat_apply_inverse(q_est, d), -self.clip_m, self.clip_m)
-        q_d, q_o = (_unique(q_des), _unique(q_est)) if self.quat_unique else (q_des, q_est)
+        q_d, q_o = q_des, q_est
+        if self.goal_frame:                        # 2026-10-15: rotated by -goal yaw BEFORE the canonicalization
+            q_d, q_o = goal_frame_quats(q_des, q_est)
+        q_d, q_o = (_unique(q_d), _unique(q_o)) if self.quat_unique else (q_d, q_o)
         parts = [q_d, offset_b, q_o, v_b, gyro]
-        if self.goal_velocity:
+        if self.goal_velocity:                     # body frame of the WORLD q_est, goal frame or not (as trained)
             goal_v = C_NED_TO_UP @ np.asarray(v_ref_ned, float)
             parts += [quat_apply_inverse(q_est, goal_v), np.array([-float(r_ref_ned)])]
         return np.concatenate(parts + [self._prev_action])
@@ -228,11 +323,14 @@ class HwRl(HwPid):
         eta = np.asarray(eta_ned, float)
         nu = np.asarray(nu_ned, float)
         p_ref, yaw_ref, v_ref, r_ref = self._reference_ned_at(t)
-        if self.yaw_rate_ff and r_ref == 0.0:
-            if self._yaw_ref_prev is not None:
-                r_ref = math.atan2(math.sin(yaw_ref - self._yaw_ref_prev), math.cos(yaw_ref - self._yaw_ref_prev)) / self.dt
-                r_ref = float(np.clip(r_ref, -self.yaw_rate_max, self.yaw_rate_max))
-            self._yaw_ref_prev = float(yaw_ref)
+        if self.yaw_rate_ff and r_ref == 0.0 and self._yaw_ref_prev is not None:
+            r_ref = math.atan2(math.sin(yaw_ref - self._yaw_ref_prev), math.cos(yaw_ref - self._yaw_ref_prev)) / self.dt
+        # Since 2026-10-14 a heading-follow K=1 plan CARRIES its yaw rate (analytic, PathCursor.plan): the plan's value is
+        # used as is, and every r_ref — recovered or carried — is clipped to yaw_rate_max. The previous yaw is kept
+        # EVERY tick: while a plan carried r the old code froze it, so the first r == 0 tick after a vertex turn would
+        # difference against the heading from before the turn — a one-tick (clipped) rate spike.
+        r_ref = float(np.clip(r_ref, -self.yaw_rate_max, self.yaw_rate_max))
+        self._yaw_ref_prev = float(yaw_ref)
         frame = self._frame(eta, nu, p_ref, yaw_ref, v_ref, r_ref)
         if self._hist is None:
             self._hist = np.tile(frame, (self.K, 1))
@@ -280,6 +378,7 @@ class HwRl(HwPid):
                 "checkpoint": self.spec.get("checkpoint"), "obs_dim": int(self.policy.obs_dim),
                 "history_len": self.K, "frame_layout": self.spec.get("frame_layout"),
                 "obs_quat_unique": self.quat_unique, "obs_goal_velocity": self.goal_velocity,
+                "obs_goal_frame": self.goal_frame,
                 "obs_offset_clip_m": self.clip_m, "dr_preset": self.spec.get("dr_preset"),
                 "pilot_gain_assumed": self.pilot_gain_assumed,
                 "axis_gain_for_pseudo_wrench": dict(self._gains),
@@ -287,7 +386,9 @@ class HwRl(HwPid):
                 "yaw_rate_ff": self.yaw_rate_ff, "yaw_rate_max": self.yaw_rate_max,
                 "axes_note": "u = axes * axis_gain (pseudo-wrench); the worker's wrench_to_axes returns the policy axes, "
                              "capped by axis_cap; roll/pitch not commanded",
-                "frames": "policy world z-up / body FLU; station NED/FRD mirrored with diag(1,-1,-1)",
+                "frames": "policy world z-up / body FLU; station NED/FRD mirrored with diag(1,-1,-1)"
+                          + ("; q_des / q_est rotated by -goal yaw (ZYX yaw of q_des) before the w>=0 canonicalization "
+                             "(obs_goal_frame)" if self.goal_frame else ""),
                 "ref_preview": False, "path_reference": "shared spatial plan, stage 0 (+ its velocity as feed-forward)",
                 "provenance": "RL_controller (Isaac Lab, PPO), see rl_policies/<name>/RL_controller_README.md"}
 
@@ -397,7 +498,8 @@ class HwRlPwm(HwRl):
         self.last_pwm_us = None
         og = self.obs_guard.cfg
         log(f"rl_pwm: policy {os.path.relpath(self.policy_dir, REPO_ROOT)} ({self.spec.get('checkpoint', '?')}), obs "
-            f"{self.policy.obs_dim} (K={self.K}), 8 thruster throttles, |throttle| <= {self.pwm_cap:.2f} on the wire "
+            f"{self.policy.obs_dim} (K={self.K}{', goal-frame quaternions' if self.goal_frame else ''}), 8 thruster "
+            f"throttles, |throttle| <= {self.pwm_cap:.2f} on the wire "
             f"as a thrust-space {self.pwm_cap_mode} (trained {self.model.cap_trained:.2f}"
             f"{', BELOW trained — recorded opt-out' if self.caps_below_trained else ''}), rc channels "
             f"{list(self.pwm_channels)}, expects MOT_1..8_DIRECTION {self.model.motor_direction}; sign probe "
@@ -551,7 +653,8 @@ class HwRlPwm(HwRl):
 # ----------------------------------------------------------------------------- roll/pitch reference (LOW mode ``rl_7d``)
 from .attitude_ref import AttitudeRefMixin  # noqa: E402
 
-#: The frame an rl_7d export must declare, element for element (RL_controller rov_rl/obs_spec.frame_layout(True, 6)).
+#: The frame an rl_7d export must declare, element for element (RL_controller rov_rl/obs_spec.frame_layout(True, 6)) —
+#: or, since 2026-10-15, the same with the q_*_goalframe slots together with obs_goal_frame: true (check_frame_layout).
 RL7D_FRAME_LAYOUT = ["q_des(w,x,y,z)", "offset_b(3)", "q_est(w,x,y,z)", "v_b_est(3)", "gyro_b(3)", "goal_v_b(3)",
                      "goal_yaw_rate(1)", "prev_action(6)"]
 
@@ -601,8 +704,8 @@ class HwRl7d(AttitudeRefMixin, HwRl):
         if not bool(ar.get("trained", False)):
             raise ValueError(f"rl_7d: policy {pdir} was trained with a LEVEL goal (obs_spec attitude_reference.trained is "
                              f"not true) — a tilted q_des would be out of its distribution; train the att7 recipe")
-        if list(spec.get("frame_layout") or []) != RL7D_FRAME_LAYOUT:
-            raise ValueError(f"rl_7d: policy {pdir} frame_layout {spec.get('frame_layout')} != {RL7D_FRAME_LAYOUT}")
+        # RL7D_FRAME_LAYOUT (world-frame quaternions) or its goal-frame twin with obs_goal_frame true (2026-10-15)
+        check_frame_layout(spec, "rl_7d", pdir, goal_velocity=True, n_actions=6)
         super().__init__(cfg, log=lambda m: None)
         self.mode = "rl_7d"
         self.solver_kind = "rl_7d"
@@ -627,7 +730,8 @@ class HwRl7d(AttitudeRefMixin, HwRl):
         self._rp_clip_ticks = 0
         self._rp_rate_ticks = 0
         self._rp_flown = (0.0, 0.0)
-        log(f"rl_7d: policy {os.path.relpath(self.policy_dir, REPO_ROOT)} ({self.spec.get('checkpoint', '?')}), axes6, "
+        log(f"rl_7d: policy {os.path.relpath(self.policy_dir, REPO_ROOT)} ({self.spec.get('checkpoint', '?')}), axes6"
+            f"{', goal-frame quaternions' if self.goal_frame else ''}, "
             f"trained roll/pitch envelope +-{math.degrees(self.att_roll_max):.1f} / +-{math.degrees(self.att_pitch_max):.1f} "
             f"deg, trained caps (station units) {self.attitude_cap_trained_station}")
 
@@ -733,7 +837,8 @@ class HwRl7d(AttitudeRefMixin, HwRl):
 
 
 # ----------------------------------------------------------------------------- roll/pitch reference on PULSES (LOW ``rl_pwm_7d``)
-#: The frame an rl_pwm_7d export must declare (RL_controller rov_rl/obs_spec.frame_layout(True, 8)).
+#: The frame an rl_pwm_7d export must declare (RL_controller rov_rl/obs_spec.frame_layout(True, 8)) — or its goal-frame
+#: twin with obs_goal_frame: true (2026-10-15, pwm11att7 and later; check_frame_layout).
 RLPWM7D_FRAME_LAYOUT = RL7D_FRAME_LAYOUT[:-1] + ["prev_action(8)"]
 
 
@@ -784,8 +889,8 @@ class HwRlPwm7d(AttitudeRefMixin, HwRlPwm):
         if not bool(ar.get("trained", False)):
             raise ValueError(f"rl_pwm_7d: policy {pdir} was trained with a LEVEL goal (obs_spec attitude_reference.trained "
                              f"is not true) — a tilted q_des would be out of its distribution; fly it on rl_pwm")
-        if list(spec.get("frame_layout") or []) != RLPWM7D_FRAME_LAYOUT:
-            raise ValueError(f"rl_pwm_7d: policy {pdir} frame_layout {spec.get('frame_layout')} != {RLPWM7D_FRAME_LAYOUT}")
+        # RLPWM7D_FRAME_LAYOUT (world-frame quaternions) or its goal-frame twin with obs_goal_frame true (2026-10-15)
+        check_frame_layout(spec, "rl_pwm_7d", pdir, goal_velocity=True, n_actions=8)
         super().__init__(cfg, log=lambda m: None)
         self.mode = "rl_pwm_7d"
         self.solver_kind = "rl_pwm_7d"
@@ -812,7 +917,8 @@ class HwRlPwm7d(AttitudeRefMixin, HwRlPwm):
         self._rp_clip_ticks = 0
         self._rp_rate_ticks = 0
         self._rp_flown = (0.0, 0.0)
-        log(f"rl_pwm_7d: policy {os.path.relpath(self.policy_dir, REPO_ROOT)} ({self.spec.get('checkpoint', '?')}), pwm, "
+        log(f"rl_pwm_7d: policy {os.path.relpath(self.policy_dir, REPO_ROOT)} ({self.spec.get('checkpoint', '?')}), pwm"
+            f"{', goal-frame quaternions' if self.goal_frame else ''}, "
             f"trained roll/pitch envelope +-{math.degrees(self.att_roll_max):.1f} / +-{math.degrees(self.att_pitch_max):.1f} "
             f"deg, |throttle| <= {self.pwm_cap:.2f} (transport rl_pwm.pwm_cap; trained {self.model.cap_trained:.2f}) — "
             f"roll/pitch as PULSES, never s/t; UNTESTED on the vehicle [예측]")

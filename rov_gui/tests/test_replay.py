@@ -207,7 +207,7 @@ def test_replay_arms_at_current_pose_and_completes():
         # 10 (2026-09-02): + policy block / grip_w_est,hold_frac columns —
         # a replay run still reads plan_stream_replay, never _policy.
         meta = w._run_meta()
-        assert meta["schema_version"] == 20     # 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + top-level mode / LOW None holder (2026-09-11)
+        assert meta["schema_version"] == 21     # 21: + att_age_v_s/att_tb_ms/banner_age_s (2026-10-15); 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + top-level mode / LOW None holder (2026-09-11)
         assert meta["policy"]["enabled"] is False        # always written
         assert meta["plan_stream"]["enabled"] is True
         assert meta["plan_stream"]["run"]["installed"] >= 1
