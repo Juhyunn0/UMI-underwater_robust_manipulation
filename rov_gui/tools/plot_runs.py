@@ -63,6 +63,17 @@ with (x0, y0, yaw0) = ``meta.hardware.datum_tag_frame``. A run recorded without
 a datum cannot be placed in the pool and is REPORTED, not silently drawn
 somewhere plausible.
 
+A log opened beside a feed recording (``c3_*_mpc.csv``) can hold SEVERAL
+engagements, each re-zeroed at its own engage, while meta.json keeps only the
+last one's datum and mission. Such a CSV makes one figure per engagement
+(``..._<hhmmss>_e<k>.png``), each lifted with its own datum: the last from
+meta.json, the earlier ones from their ``ENGAGED ... datum p0=[...] yaw0 ...``
+line in the folder's events.log — trusted only when the last engagement's line
+reproduces meta.json's datum, otherwise reported (2026-10-18; before, every
+row rode the last datum and 2026-10-17 22:07:33's two aborted squares landed
+0.7-1.6 m off, joined to the real one by lines nobody flew). Within one
+figure, the pen also lifts between two separate trajectory windows.
+
 Screen orientation follows the GUI plot and plot_nav_run.py: screen up = +x_map,
 screen right = +y_map.
 
@@ -452,6 +463,19 @@ def check_pool(box: dict, run: "Run", tol: float = 0.01) -> str | None:
 
 
 # ============================================================== loading a run
+def _break_at(win, *arrays):
+    """``arrays`` with a NaN between samples of different windows, so a line
+    plot lifts the pen there instead of drawing a jump nobody flew. Unchanged
+    (the same objects) when there is only one window."""
+    win = np.asarray(win)
+    if not arrays or win.size != np.asarray(arrays[0]).size or win.size < 2:
+        return arrays
+    cut = np.flatnonzero(win[1:] != win[:-1]) + 1
+    if not cut.size:
+        return arrays
+    return tuple(np.insert(np.asarray(a, float), cut, np.nan) for a in arrays)
+
+
 @dataclass
 class Run:
     """One controller CSV, lifted into the map frame and ready to draw."""
@@ -470,6 +494,12 @@ class Run:
     ox: np.ndarray = field(default_factory=lambda: np.empty(0))  # object, map
     oy: np.ndarray = field(default_factory=lambda: np.empty(0))
     ot: np.ndarray = field(default_factory=lambda: np.empty(0))  # its own clock
+    # Which selected window each sample came from (a new id wherever the
+    # segment mask restarts): no line is drawn from one window into the next.
+    win: np.ndarray = field(default_factory=lambda: np.empty(0))
+    # (k, n, "HH:MM:SS") when this figure is engagement k of n in a CSV that
+    # holds several (a log opened beside a feed recording); None otherwise.
+    engagement: tuple | None = None
     modes: tuple = ()            # the controller(s) the plotted rows ran under
     stats: dict = field(default_factory=dict)
 
@@ -485,12 +515,26 @@ class Run:
         if single_lap and self.lap.size == self.rx.size and self.lap.size:
             m = self.lap == self.lap[0]
             if 2 <= int(m.sum()) < self.rx.size:
+                # Two trajectory windows both start at lap 0: lift the pen
+                # between them rather than join them with a dash.
+                i = np.flatnonzero(m)
+                brk = np.diff(i) > 1
+                if self.win.size == self.rx.size:
+                    brk |= self.win[i][1:] != self.win[i][:-1]
+                cut = np.flatnonzero(brk) + 1
+                if cut.size:
+                    return (np.insert(self.rx[m], cut, np.nan),
+                            np.insert(self.ry[m], cut, np.nan))
                 return self.rx[m], self.ry[m]
-        return self.rx, self.ry
+        return _break_at(self.win, self.rx, self.ry)
 
     @property
     def name(self) -> str:
-        return f"{self.date}/{self.run_dir.name}/{self.csv_path.stem}"
+        base = f"{self.date}/{self.run_dir.name}/{self.csv_path.stem}"
+        if self.engagement:
+            k, n, hms = self.engagement
+            return f"{base} [engagement {k}/{n} @ {hms}]"
+        return base
 
     @property
     def ctrl(self) -> str:
@@ -541,8 +585,13 @@ class Run:
         is ``mpc_212021.csv``. Naming the figure after the stem would ship a
         PID result as ``..._mpc_....png``. The controller comes out of
         meta.json and goes in the name instead.
+
+        One engagement of a CSV that holds several gets ``_e<k>`` after the
+        stamp, k counting from 1 in the order they were flown.
         """
         d = self.run_dir.name
+        if self.engagement:
+            return f"{self.date}_{d}_{self.ctrl}_{self.stamp}_e{self.engagement[0]}"
         # The stamp is dropped only when it would repeat the folder AND there
         # is nothing else in that folder to confuse it with — a folder holding
         # three CSVs needs all three names to differ.
@@ -627,6 +676,239 @@ def _to_map(px, py, datum):
     x0, y0, yaw0 = datum
     c, s = math.cos(yaw0), math.sin(yaw0)
     return x0 + c * xn - s * yn, y0 + s * xn + c * yn
+
+
+# --------------------------------------------- several engagements in one CSV
+#: A log opened beside a feed recording (``c3_*_<hhmmss>_mpc.csv``) stays open
+#: for the whole recording, so it can hold several ENGAGEs — and every engage
+#: re-zeroes px/py/yaw (workers.py ``_datumize``), while meta.json keeps only
+#: the LAST engage's datum and mission. Lifting every row with that one datum
+#: put 2026-10-17 22:07:33's two aborted squares 0.5-1.5 m from where they
+#: were flown, joined to the real one by straight lines nobody flew. So such a
+#: CSV becomes one figure per engagement, each lifted with ITS OWN datum:
+#: the last from meta.json, the earlier ones from the line each engage writes
+#: into the run folder's events.log (workers.py, unchanged since 2026-08-23)::
+#:
+#:     2026-10-17 22:07:35 ENGAGED (rl_pwm_7d) datum p0=[-0.286, -1.18, -0.384] yaw0 46.9 deg; ...
+#:
+#: An engagement whose datum cannot be found that way is reported, not drawn.
+_ENGAGED_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ENGAGED \(([^)]*)\) datum "
+    r"p0=\[([^\]]*)\] yaw0 (-?[0-9.]+) deg")
+_EVENT_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (.*)$")
+#: The mission lines (workers.py: ``<SHAPE> started - <what>``, ``STATION -``,
+#: ``FOLLOW ...``) — what an EARLIER engagement flew, which meta.json no
+#: longer says. Numbers as the station printed them.
+_TRAJ_RE = {
+    "square": re.compile(r"^SQUARE started - SQUARE ([0-9.]+) x ([0-9.]+) m @ "
+                         r"([0-9.]+) m/s, (\d+) lap"),
+    "circle": re.compile(r"^CIRCLE started - CIRCLE r ([0-9.]+) m @ "
+                         r"([0-9.]+) m/s, (\d+) lap"),
+    "line": re.compile(r"^LINE started - LINE ([0-9.]+) m @ ([0-9.]+) m/s, "
+                       r"(\d+) round trip"),
+}
+_ORIGIN_RE = re.compile(r", origin tag (\d+)")
+_TS_FMT = "%Y-%m-%d %H:%M:%S"
+
+#: events.log stamps and meta ``run.started`` are both whole seconds, so an
+#: engage row and its line can differ by up to ~1 s; engagements are seconds
+#: apart. The datum in the line is rounded to 1 mm and 0.1 deg, which is what
+#: the last engagement's line must agree with meta.json to.
+ENGAGE_MATCH_S = 2.5
+DATUM_AGREE_M = 0.002
+DATUM_AGREE_DEG = 0.06
+
+
+def _engagement_bounds(col: dict) -> list[tuple[int, int]]:
+    """[a, b) row ranges, one per engage: from the row ``engaged`` rises to
+    the row before the next rise. A released tail stays with the engagement
+    before it — ``_datumize`` keeps that datum until the next engage. Rows
+    before the first rise are in an earlier engagement's frame (often one
+    from another CSV) and belong to none."""
+    n = col["t"].size
+    e = col.get("engaged", np.zeros(n)) > 0.5
+    if not e.any():
+        return []
+    rise = np.flatnonzero(e[1:] & ~e[:-1]) + 1
+    if e[0]:
+        rise = np.concatenate(([0], rise))
+    edges = [int(v) for v in rise] + [n]
+    return [(edges[k], edges[k + 1]) for k in range(len(edges) - 1)]
+
+
+def _read_events(run_dir: Path) -> list[tuple]:
+    """(datetime, message) per stamped line of the folder's events.log."""
+    from datetime import datetime
+    p = run_dir / "events.log"
+    if not p.exists():
+        return []
+    out = []
+    for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        mt = _EVENT_RE.match(line)
+        if mt:
+            try:
+                out.append((datetime.strptime(mt.group(1), _TS_FMT), mt.group(2)))
+            except ValueError:
+                continue
+    return out
+
+
+def _mission_from_events(msgs: list[str]) -> tuple:
+    """(trajectory, mission, object_nav) for meta.json's three per-mission
+    keys, rebuilt from one engagement's own events.log lines — the shape
+    ``_traj_line`` and ``_shape`` read. Nothing found = an engage-and-hold."""
+    traj, shape, ended = None, None, None
+    for msg in msgs:
+        if traj is None:
+            for kind, rx in _TRAJ_RE.items():
+                mt = rx.match(msg)
+                if not mt and msg.startswith(f"{kind.upper()} started - "):
+                    traj = {"kind": kind}           # said, but not parseable
+                if not mt:
+                    continue
+                g = mt.groups()
+                if kind == "square":
+                    traj = {"kind": kind, "size": float(g[0]),
+                            "size_y": float(g[1]), "speed": float(g[2]),
+                            "laps": int(g[3])}
+                elif kind == "circle":
+                    traj = {"kind": kind, "radius": float(g[0]),
+                            "speed": float(g[1]), "laps": int(g[2])}
+                else:
+                    traj = {"kind": kind, "length": float(g[0]),
+                            "speed": float(g[1]), "laps": int(g[2])}
+                mo = _ORIGIN_RE.search(msg)
+                if mo:
+                    traj["origin_tag"] = int(mo.group(1))
+            if traj is None and (msg.startswith("POLICY started - ")
+                                 or msg.startswith("POLICY OBSERVE started - ")):
+                traj = {"kind": "policy"}
+            elif traj is None and msg.startswith("REPLAY started - "):
+                traj = {"kind": "replay"}
+        if shape is None and msg.startswith("STATION - "):
+            shape = "station"
+        elif msg.startswith("FOLLOW"):
+            shape = "follow"
+            if msg.startswith("FOLLOW ENDED - "):
+                ended = msg[len("FOLLOW ENDED - "):].split(";")[0].strip()
+    mission = {"panel_override": {"shape": shape}} if shape else {}
+    obj = {"follow": {"ended": ended}} if shape == "follow" else {}
+    return traj, mission, obj
+
+
+def _split_engagements(run_dir: Path, meta: dict, col: dict,
+                       bounds: list[tuple[int, int]], frame_map: bool):
+    """Per engagement: (meta, datum | None, why-not | None, "HH:MM:SS").
+
+    The LAST engagement is the one meta.json describes, so it keeps meta.json
+    — datum and mission — untouched. Each earlier one is matched to its
+    ``ENGAGED ... datum`` line by wall clock (meta ``run.started`` + the
+    CSV's ``t`` at the engage row, same LOW), and its meta is a copy with the
+    per-engagement keys replaced by what its own lines say. The matching is
+    trusted only if the last engagement's line reproduces meta.json's datum;
+    otherwise every earlier engagement is reported, not guessed.
+    """
+    from datetime import datetime, timedelta
+    n = len(bounds)
+    events = _read_events(run_dir)
+    eng_lines = [(i, ts, m) for i, (ts, msg) in enumerate(events)
+                 for m in [_ENGAGED_RE.match(f"{ts.strftime(_TS_FMT)} {msg}")]
+                 if m]
+    try:
+        started = datetime.strptime(str((meta.get("run") or {})
+                                        .get("started", "")), _TS_FMT)
+    except ValueError:
+        started = None
+    modes = col.get("mode")
+
+    # wall clock of each engage row, and the events.log line it matches
+    walls, hits, last_i = [], [], -1
+    for a, _b in bounds:
+        wall = (started + timedelta(seconds=float(col["t"][a]))
+                if started is not None and np.isfinite(col["t"][a]) else None)
+        walls.append(wall)
+        mode = str(modes[a]) if modes is not None and modes[a] else ""
+        best = None
+        if wall is not None:
+            for i, ts, m in eng_lines:
+                if i <= last_i or (mode and m.group(2) != mode):
+                    continue
+                d = abs((ts - wall).total_seconds())
+                if d <= ENGAGE_MATCH_S and (best is None or d < best[0]):
+                    best = (d, i, m)
+        hits.append(best)
+        if best is not None:
+            last_i = best[1]
+
+    def hms(k):
+        if hits[k] is not None:
+            return hits[k][2].group(1)[-8:]
+        return walls[k].strftime("%H:%M:%S") if walls[k] is not None else "?"
+
+    def line_datum(m):
+        p0 = [float(v) for v in m.group(3).split(",")]
+        return p0[0], p0[1], math.radians(float(m.group(4)))
+
+    # Is the matching right? The last line must reproduce meta.json's datum.
+    meta_d = _datum(meta)
+    trust, why_not = False, ""
+    if not frame_map:
+        trust = True
+    elif not events:
+        why_not = "the run folder has no events.log"
+    elif started is None:
+        why_not = "meta.json has no run.started to place the engage rows"
+    elif hits[-1] is None or meta_d is None:
+        why_not = ("the last engagement has no ENGAGED datum line in "
+                   "events.log to check the matching against meta.json")
+    else:
+        x0, y0, yaw0 = line_datum(hits[-1][2])
+        dp = math.hypot(x0 - meta_d[0], y0 - meta_d[1])
+        dyaw = abs(math.degrees(math.atan2(math.sin(yaw0 - meta_d[2]),
+                                           math.cos(yaw0 - meta_d[2]))))
+        trust = dp <= DATUM_AGREE_M and dyaw <= DATUM_AGREE_DEG
+        if not trust:
+            why_not = (f"the last engagement's events.log datum is "
+                       f"{dp * 1000:.1f} mm / {dyaw:.2f} deg off meta.json's")
+
+    out = []
+    for k, (a, _b) in enumerate(bounds):
+        if k == n - 1:
+            out.append((meta, meta_d if frame_map else None, None, hms(k)))
+            continue
+        if frame_map and (not trust or hits[k] is None):
+            why = why_not or (f"no events.log ENGAGED datum line within "
+                              f"{ENGAGE_MATCH_S:.1f} s of its engage row")
+            out.append((None, None, why, hms(k)))
+            continue
+        nxt = next((i for i, _ts, _m in eng_lines
+                    if hits[k] is not None and i > hits[k][1]), len(events))
+        msgs = ([msg for _ts, msg in events[hits[k][1] + 1:nxt]]
+                if hits[k] is not None else [])
+        bm = dict(meta)
+        traj, mission, obj = _mission_from_events(msgs)
+        # config_square is the station's YAML, the same for every engagement
+        # of one launch — kept, so a hold reads like a standalone CSV's.
+        conf = (meta.get("mission") or {}).get("config_square")
+        if conf:
+            mission = {"config_square": conf, **mission}
+        bm["trajectory"], bm["mission"], bm["object_nav"] = traj, mission, obj
+        ctrl = dict(meta.get("controller") or {})
+        mode = str(modes[a]) if modes is not None and modes[a] else ""
+        if mode and mode != ctrl.get("type"):
+            ctrl = {"type": mode}      # the solver & co. described the last LOW
+        bm["controller"] = ctrl
+        datum = None
+        if frame_map:
+            datum = line_datum(hits[k][2])
+            hw = dict(meta.get("hardware") or {})
+            hw["datum_tag_frame"] = {
+                "p0": [float(v) for v in hits[k][2].group(3).split(",")],
+                "yaw0_deg": float(hits[k][2].group(4)),
+                "source": "events.log (rounded to 1 mm / 0.1 deg)"}
+            bm["hardware"] = hw
+        out.append((bm, datum, None, hms(k)))
+    return out
 
 
 def _along_cross(P: np.ndarray, R: np.ndarray):
@@ -737,38 +1019,88 @@ def _object_track(col: dict, m: np.ndarray, datum, t_rel: np.ndarray,
 
 
 def load_run(date: str, run_dir: Path, meta_path: Path, cfg: dict):
-    """(Run, None) or (None, "why this one produced no figure")."""
+    """(Run, None) or (None, "why this one produced no figure") — the first
+    of :func:`load_runs`, for a caller that knows its CSV has one engagement."""
+    return load_runs(date, run_dir, meta_path, cfg)[0]
+
+
+def load_runs(date: str, run_dir: Path, meta_path: Path, cfg: dict):
+    """[(Run, None) or (None, "why")] — one per figure this CSV makes.
+
+    That is one, except for a CSV holding several engagements: one each,
+    lifted with its own datum (see ``_ENGAGED_RE``). ``(None, None)`` is a
+    controller-filter miss, not a failure.
+    """
     csv_path = meta_path.with_suffix("").with_suffix(".csv")
     if not csv_path.exists():
         csv_path = meta_path.parent / (meta_path.name[:-len(".meta.json")] + ".csv")
     label = f"{date}/{run_dir.name}/{csv_path.stem}"
     if not csv_path.exists():
-        return None, f"{label}: meta.json without a CSV beside it"
+        return [(None, f"{label}: meta.json without a CSV beside it")]
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:                          # noqa: BLE001
-        return None, f"{label}: meta.json unreadable ({e})"
+        return [(None, f"{label}: meta.json unreadable ({e})")]
 
     want = [c.lower() for c in (cfg["controllers"] or [])]
     ctrl = str((meta.get("controller") or {}).get("type", "?")).lower()
-    if want and ctrl not in want:
-        return None, None                          # filtered out, not a failure
 
     try:
         col = read_csv(csv_path)
     except OSError as e:
-        return None, f"{label}: CSV unreadable ({e})"
+        return [(None, f"{label}: CSV unreadable ({e})")]
     if not col or col.get("t") is None or col["t"].size == 0:
-        return None, f"{label}: CSV has a header and no rows (nothing was flown)"
+        if want and ctrl not in want:
+            return [(None, None)]
+        return [(None, f"{label}: CSV has a header and no rows (nothing was flown)")]
 
-    datum = _datum(meta)
-    if cfg["frame"] == "map" and datum is None:
-        return None, (f"{label}: no hardware.datum_tag_frame in meta.json — the "
-                      f"run cannot be placed in the pool (use frame: datum to "
-                      f"plot it in its own frame)")
-    if cfg["frame"] != "map":
-        datum = None
+    frame_map = cfg["frame"] == "map"
+    bounds = _engagement_bounds(col)
+    if len(bounds) <= 1:
+        if want and ctrl not in want:
+            return [(None, None)]                  # filtered out, not a failure
+        datum = _datum(meta)
+        if frame_map and datum is None:
+            return [(None, (f"{label}: no hardware.datum_tag_frame in meta.json "
+                            f"— the run cannot be placed in the pool (use "
+                            f"frame: datum to plot it in its own frame)"))]
+        return [_build_run(date, run_dir, csv_path, meta, col,
+                           datum if frame_map else None, label, cfg)]
 
+    out = []
+    for k, ((a, b), (bm, datum, why, hms)) in enumerate(zip(
+            bounds, _split_engagements(run_dir, meta, col, bounds, frame_map))):
+        lab = f"{label} [engagement {k + 1}/{len(bounds)} @ {hms}]"
+        if bm is None:
+            out.append((None, f"{lab}: not drawn — {why}"))
+            continue
+        bctrl = str((bm.get("controller") or {}).get("type", "?")).lower()
+        if want and bctrl not in want:
+            continue
+        if frame_map and datum is None:
+            out.append((None, f"{lab}: no hardware.datum_tag_frame in meta.json "
+                              f"— cannot be placed in the pool"))
+            continue
+        run, why = _build_run(date, run_dir, csv_path, bm,
+                              {c: v[a:b] for c, v in col.items()}, datum, lab, cfg)
+        if run is not None:
+            run.engagement = (k + 1, len(bounds), hms)
+            run.stats["eng_note"] = (
+                f"engagement {k + 1}/{len(bounds)} of a CSV with "
+                f"{len(bounds)} engages, rows {a}-{b - 1}; datum from "
+                + ("meta.json" if k == len(bounds) - 1 else
+                   "events.log" if frame_map else "none (frame: datum)")
+                # Rows logged before the first engage are in a frame this CSV
+                # does not say (the previous engage's, maybe another CSV's).
+                + (f"; rows 0-{a - 1} precede the first engage and are in "
+                   f"no figure" if k == 0 and a > 0 else ""))
+        out.append((run, why))
+    return out or [(None, None)]
+
+
+def _build_run(date: str, run_dir: Path, csv_path: Path, meta: dict,
+               col: dict, datum, label: str, cfg: dict):
+    """(Run, None) or (None, why) from the rows of ONE engagement frame."""
     seg = str(cfg["segment"]).lower()
     n = col["t"].size
     on_traj = col.get("traj_on", np.zeros(n)) > 0.5
@@ -791,6 +1123,11 @@ def load_run(date: str, run_dir: Path, meta_path: Path, cfg: dict):
         m, seg_note = on_eng, "engaged"
     else:
         m, seg_note = np.ones(n, bool), "whole log"
+    # A new window id wherever the SEGMENT restarts (a second trajectory in
+    # one engagement): the drawn line breaks there. Taken before the finite
+    # filter below, so a dropped row inside a window does not break it.
+    win = np.cumsum(np.concatenate(([bool(m[0])], m[1:] & ~m[:-1]))) \
+        if n else np.zeros(0, int)
     m &= np.isfinite(col["px"]) & np.isfinite(col["py"])
     m &= np.isfinite(col.get("rx", np.full(n, np.nan)))
     m &= np.isfinite(col.get("ry", np.full(n, np.nan)))
@@ -805,6 +1142,7 @@ def load_run(date: str, run_dir: Path, meta_path: Path, cfg: dict):
     run.rx, run.ry = _to_map(col["rx"][m], col["ry"][m], datum)
     run.t = col["t"][m] - float(col["t"][m][0])
     run.lap = col["lap"][m] if "lap" in col else np.empty(0)
+    run.win = win[m]
     if "mode" in col:
         seen_modes, order = set(), []
         for v in col["mode"][m]:
@@ -896,11 +1234,11 @@ def discover(base: Path, specs: list[tuple[str, str]], cfg: dict):
                 if mp in seen:
                     continue                     # two entries, the same run
                 seen.add(mp)
-                run, why = load_run(date, run_dir, mp, cfg)
-                if run is not None:
-                    runs.append(run)
-                elif why:
-                    skips.append(why)
+                for run, why in load_runs(date, run_dir, mp, cfg):
+                    if run is not None:
+                        runs.append(run)
+                    elif why:
+                        skips.append(why)
         if not found_any:
             skips.append(
                 f"{entry}: nothing matches"
@@ -1210,16 +1548,22 @@ def _draw_paths(ax, run, th, st, lw_scale=1.0):
     if st["time_color"] and run.t.size == run.x.size and run.x.size > 1:
         pts = np.column_stack([run.y, run.x]).reshape(-1, 1, 2)
         segs = np.concatenate([pts[:-1], pts[1:]], axis=1)
+        seg_t = run.t[:-1]
+        if run.win.size == run.x.size and (run.win[1:] != run.win[:-1]).any():
+            # no segment from one window into the next (_break_at)
+            same = run.win[1:] == run.win[:-1]
+            segs, seg_t = segs[same], seg_t[same]
         lc = LineCollection(segs, cmap=_cmap(th["ramp"], "veh", bands),
                             norm=_norm(t0, t1), linewidths=st["actual_lw"] * lw_scale,
                             capstyle="round", joinstyle="round", zorder=4)
-        lc.set_array(run.t[:-1])
+        lc.set_array(seg_t)
         ax.add_collection(lc)
         act = th["ramp"][1]                       # the mid step, for markers
         if st["time_ticks"]:
             _draw_time_ticks(ax, run, th, st, bands, t0, t1, lw_scale)
     else:
-        ax.plot(run.y, run.x, color=act, lw=st["actual_lw"] * lw_scale,
+        vx, vy = _break_at(run.win, run.x, run.y)
+        ax.plot(vy, vx, color=act, lw=st["actual_lw"] * lw_scale,
                 alpha=0.95, solid_capstyle="round", solid_joinstyle="round",
                 zorder=4, label="actual")
 
@@ -1460,6 +1804,8 @@ def main(argv=None) -> int:
             print(f"[warn] {w}")
         if r.stats.get("obj_note"):
             print(f"[obj]  {r.name}: {r.stats['obj_note']}")
+        if r.stats.get("eng_note"):
+            print(f"[eng]  {r.name}: {r.stats['eng_note']}")
         for who, xs, ys in (("vehicle", r.x, r.y), ("object", r.ox, r.oy)):
             n_out = outside_box(box, xs, ys)
             if n_out:

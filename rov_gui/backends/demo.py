@@ -63,6 +63,47 @@ DEMO_MIX = np.array([
 ])
 
 
+def parse_tag_blackout(raw) -> tuple:
+    """``opts.demo_tag_blackout`` -> ((t0, t1), ...): windows, in seconds
+    since the backend started, in which the synthetic vehicle publishes NO
+    NavFix (t0 <= t < t1; t1 may be inf). None / empty = none. A malformed
+    window RAISES: a blackout mistyped into one that never happens would let
+    a dropout test pass without a single fix ever going missing."""
+    if not raw:
+        return ()
+    out = []
+    for w in raw:
+        try:
+            t0, t1 = (float(x) for x in w)
+        except (TypeError, ValueError):
+            raise ValueError(f"demo_tag_blackout: {w!r} is not a (t0, t1) "
+                             f"pair of seconds") from None
+        if not math.isfinite(t0) or math.isnan(t1) or t1 <= t0:
+            raise ValueError(f"demo_tag_blackout: ({t0!r}, {t1!r}) needs a "
+                             f"finite t0 and t1 > t0")
+        out.append((t0, t1))
+    return tuple(out)
+
+
+def station_dvl_mount(cfg: dict, opts) -> tuple:
+    """(R_frd_dvl, r_frd) the STATION will take the synthetic DVL's reports
+    back through: the resolved ``dvl:`` block's mount (control/dvl.py
+    mount_from_cfg, the function DvlAid builds its own from) under
+    MpcWorker._setup_dvl's demo rule — ``--source demo`` with either mount
+    key null flies the IDENTITY for both. That rule is restated here, not
+    imported (it lives inline in the worker); the demo DVL is only right
+    while the two agree, and test_vehicle_gyro checks the round trip."""
+    from ..control import dvl as DV
+
+    c = dict(cfg)
+    if str(getattr(opts, "source", "")) == "demo" and (
+            c.get("mount_rpy_deg") is None or c.get("mount_t_flu") is None):
+        c["mount_rpy_deg"] = [0.0, 0.0, 0.0]
+        c["mount_t_flu"] = [0.0, 0.0, 0.0]
+    R, r, _measured = DV.mount_from_cfg(c)
+    return np.asarray(R, float), np.asarray(r, float)
+
+
 # =============================================================================
 # synthetic imagery
 # =============================================================================
@@ -362,6 +403,27 @@ class DemoVehicleWorker(TimerWorker):
         self._dvl_rng = np.random.default_rng(11)
         self._dvl_n = 0
         self._dvl_t_prev = None
+        # ...and the mount the STATION corrects its reports with, so the
+        # synthetic DVL reports what a DVL THERE would read (setup(),
+        # station_dvl_mount). Identity until resolved: a body-origin sensor.
+        self._dvl_R = np.eye(3)
+        self._dvl_r = np.zeros(3)
+        # --dvl_pose (2026-10-18): the autopilot's RAW_IMU gyro integral and
+        # its Bar30, as VehicleImu.gyro_int / depth_sp2_m carry them from the
+        # hardware reader — here the plant's TRUE body rates integrated per
+        # tick (_step_gyro) and its true depth. Knobs, SYNTHETIC like the
+        # rest: opts.demo_gyro_bias_dps (deg/s on the z rate — the RAW_IMU
+        # bias the pose learns from tags; NOT demo_imu_gyro_bias, which is
+        # the C3 BNO086's) and opts.demo_depth_offset_m (on depth_sp2_m).
+        self._gyro_int = np.zeros(3)
+        self._n_gyro = 0
+        # opts.demo_tag_blackout: windows (t0, t1), seconds since the backend
+        # started, with NO NavFix — the camera frames, the IMU, the DVL and
+        # the telemetry carry on — so a tag dropout can be flown end to end.
+        self._blackout = parse_tag_blackout(
+            getattr(opts, "demo_tag_blackout", None))
+        self._blackout_win = None          # the window in force, or None
+        self.n_fix_withheld = 0
 
     def setup(self) -> None:
         # The same switch the real sink reads (engage.attitude_axes), so a
@@ -382,7 +444,10 @@ class DemoVehicleWorker(TimerWorker):
             self.set_attitude_axes(False)
         from .dvl import dvl_config
 
-        self.dvl_on = self.mpc_on and dvl_config(self.opts) is not None
+        dcfg = dvl_config(self.opts) if self.mpc_on else None
+        self.dvl_on = dcfg is not None
+        if dcfg is not None:
+            self._dvl_R, self._dvl_r = station_dvl_mount(dcfg, self.opts)
 
     def set_attitude_axes(self, enabled: bool, sign=(1.0, 1.0)) -> None:
         """The command sink's slot, mirrored (hardware.MavlinkCommandSink)."""
@@ -743,7 +808,13 @@ class DemoVehicleWorker(TimerWorker):
         The noise floor (1 cm position, 0.5 deg yaw) is in the ballpark the
         real single-tag PnP is EXPECTED to produce — close enough for the
         loop's behaviour to be representative, fabricated like everything
-        else in this module."""
+        else in this module.
+
+        Inside an ``opts.demo_tag_blackout`` window the NavFix alone is
+        withheld (_tag_blackout): the fix is still computed — its noise drawn
+        — so the fixes after the window are the ones a run without it gets,
+        and the frame stamp the synthetic object pairs on still advances (a
+        frame with no tags in it is still a frame)."""
         from ..control.state_assembler import rot_zyx
 
         R = rot_zyx(self.roll, self.pitch, self.yaw)
@@ -758,14 +829,15 @@ class DemoVehicleWorker(TimerWorker):
         # t_capture, which is what a shared camera frame means.
         self._nav_t, self._nav_p, self._nav_R = t, np.asarray(
             [self.x, self.y, self.depth - self.mat_depth], float), R
-        self.bus.nav_fix.emit(NavFix(
-            t_capture=t, n_tags=1, tag_ids=(25,),
-            p_ned=tuple(float(v) for v in p),
-            R_ned_body=tuple(float(v) for v in Rn.ravel()),
-            yaw_ned=float(math.atan2(Rn[1, 0], Rn[0, 0])),
-            reproj_rms_px=0.4, detect_ms=2.0, geometry="demo",
-            src_w=960, src_h=540, conn=Conn.ONLINE,
-            note="synthetic", stamp=t))
+        if not self._tag_blackout():
+            self.bus.nav_fix.emit(NavFix(
+                t_capture=t, n_tags=1, tag_ids=(25,),
+                p_ned=tuple(float(v) for v in p),
+                R_ned_body=tuple(float(v) for v in Rn.ravel()),
+                yaw_ned=float(math.atan2(Rn[1, 0], Rn[0, 0])),
+                reproj_rms_px=0.4, detect_ms=2.0, geometry="demo",
+                src_w=960, src_h=540, conn=Conn.ONLINE,
+                note="synthetic", stamp=t))
         # Body velocity for the accel FD: u, v from the plant, w from the
         # depth integrator's own gain (see tick()).
         nu = np.array([self.vel[0], self.vel[1], -0.8 * self.vel[2]])
@@ -778,35 +850,111 @@ class DemoVehicleWorker(TimerWorker):
         omega = np.array([self.rate_p, self.rate_q,
                           float(self.vel[3] * 1.4)])
         f = a + np.cross(omega, nu) - R.T @ g
+        gyro_int, gyro_raw = self._step_gyro(omega, dt)
+        z_off = float(getattr(self.opts, "demo_depth_offset_m", 0.0) or 0.0)
         self.bus.vehicle_imu.emit(VehicleImu(
             roll=self.roll, pitch=self.pitch, yaw=self.yaw,
             p=float(self.rate_p), q=float(self.rate_q),
             r=float(self.vel[3] * 1.4),
             ax=float(f[0]), ay=float(f[1]), az=float(f[2]),
             depth_m=float(self.depth), t_att=t, t_imu=t, t_baro=t,
+            gyro_int=gyro_int, t_gyro=t, n_gyro=int(self._n_gyro),
+            n_gyro_gaps=0, gyro_raw=gyro_raw,
+            depth_sp2_m=float(self.depth) + z_off, t_sp2=t,
             conn=Conn.ONLINE, stamp=t))
         self._publish_camera_imu(f, omega, t, dt)
         if self.dvl_on:
-            self._publish_dvl(nu, t)
+            self._publish_dvl(nu, omega, t)
 
-    def _publish_dvl(self, nu, t: float) -> None:
+    def _step_gyro(self, omega, dt: float) -> tuple:
+        """One tick of the synthetic RAW_IMU gyro -> (gyro_int, gyro_raw).
+
+        The plant's TRUE body rates, plus ``opts.demo_gyro_bias_dps`` on z.
+        tick() steps yaw by r*dt with THIS tick's rate (and roll / pitch by
+        exactly rate_p*dt / rate_q*dt), so the plant's rates are piecewise
+        constant and the exact integral is the rectangle sum. The hardware
+        reader's trapezoid is the right rule for a SAMPLED rate; this is the
+        right one for a plant that IS piecewise constant, and it lets a test
+        demand the yaw change to rounding. The first tick is the starting
+        point and integrates nothing (gyro_int None: the hardware's
+        one-record rule), so a difference of two snapshots is exactly the
+        rotation between their ticks."""
+        b = math.radians(float(getattr(self.opts, "demo_gyro_bias_dps", 0.0)
+                               or 0.0))
+        rates = np.asarray(omega, float) + np.array([0.0, 0.0, b])
+        if self._n_gyro > 0:
+            self._gyro_int = self._gyro_int + rates * float(dt)
+        self._n_gyro += 1
+        gi = (tuple(float(x) for x in self._gyro_int)
+              if self._n_gyro >= 2 else None)
+        return gi, tuple(float(x) for x in rates)
+
+    def _tag_blackout(self) -> bool:
+        """Is this tick inside an ``opts.demo_tag_blackout`` window? Said on
+        the log as each window starts and ends (``n_fix_withheld`` counts the
+        fixes it kept back), so a run that flew one cannot hide it."""
+        if not self._blackout:
+            return False
+        t = time.monotonic() - self._t0
+        win = next((w for w in self._blackout if w[0] <= t < w[1]), None)
+        if win != self._blackout_win:
+            if win is not None:
+                self.bus.log.emit(
+                    "warn", f"demo: TAG BLACKOUT {win[0]:g}-{win[1]:g} s — no "
+                            f"NavFix (IMU, DVL and telemetry carry on)")
+            else:
+                self.bus.log.emit(
+                    "info", f"demo: tag blackout over at {t:.1f} s — NavFix "
+                            f"again ({self.n_fix_withheld} withheld so far)")
+            self._blackout_win = win
+        if win is not None:
+            self.n_fix_withheld += 1
+        return win is not None
+
+    def _publish_dvl(self, nu, omega, t: float) -> None:
         """A SYNTHETIC DvlSample every other tick (10 Hz): the plant's own
-        body velocity plus 3 mm/s of noise, valid while more than 5 cm above
+        velocity plus 3 mm/s of noise, valid while more than 5 cm above
         the mat. FABRICATED like everything in this module — the rate, the
         noise and the zero latency are placeholders that only have to make
         the plumbing run, and say nothing about the real device.
 
+        What a DVL AT THE MOUNT would read (2026-10-18): the velocity of
+        that point, v_origin + omega x r, in its output frame, R_frd_dvl^T
+        (...) — with the mount the station corrects it with
+        (station_dvl_mount), so DvlAid's body_velocity gives the body-origin
+        velocity back. Until this date the report WAS the body-origin
+        velocity, which a measured lever arm turned into a false sway of
+        ~0.232 r m/s on the deployed mount [유도: config/hw_mpc.yaml
+        dvl.mount_t_flu x, through dvl.body_velocity]. A null mount (the
+        demo's identity rule) reads exactly as before. ``omega`` = the body
+        rates of the VehicleImu of this same tick — what the station's rate
+        history returns for this t_valid.
+
         ``opts.demo_dvl_yaw_deg`` rotates the reported velocity about the
         down axis: a deliberately WRONG mount, so the refusal the agreement
         gate gives can be seen (and tested) before it is ever needed.
-        ``opts.demo_dvl_lock`` False = no bottom lock."""
+        ``opts.demo_dvl_lock`` False = no bottom lock.
+        ``opts.demo_dvl_scale`` (1.0) and ``opts.demo_dvl_bias_m_s`` ((u, v),
+        body FRD, m/s) corrupt the BODY-ORIGIN velocity the station recovers
+        — scale * v + bias, before the lever arm — so a DVL dead reckoning
+        drifts by exactly (scale - 1) * distance + bias * time and a test can
+        say so."""
         self._dvl_n += 1
         if self._dvl_n % 2:
             return
+        sc = getattr(self.opts, "demo_dvl_scale", None)
+        bias = getattr(self.opts, "demo_dvl_bias_m_s", None) or (0.0, 0.0)
+        bu, bv = (float(x) for x in bias)
+        v_o = (1.0 if sc is None else float(sc)) * np.asarray(nu, float) \
+            + np.array([bu, bv, 0.0])
+        # the rigid-body velocity of the DVL's own point, in its own frame
+        v_m = self._dvl_R.T @ (v_o + np.cross(np.asarray(omega, float),
+                                              self._dvl_r))
         yaw = math.radians(float(getattr(self.opts, "demo_dvl_yaw_deg", 0.0)
                                  or 0.0))
         c, sn = math.cos(yaw), math.sin(yaw)
-        v = np.array([c * nu[0] + sn * nu[1], -sn * nu[0] + c * nu[1], nu[2]])
+        v = np.array([c * v_m[0] + sn * v_m[1], -sn * v_m[0] + c * v_m[1],
+                      v_m[2]])
         v = v + self._dvl_rng.normal(0.0, 0.003, 3)
         alt = self.mat_depth - self.depth
         lock = bool(getattr(self.opts, "demo_dvl_lock", True)) and alt >= 0.05
@@ -979,6 +1127,10 @@ class DemoBackend(Backend):
             bus.dvl_info.connect(self.mpc.on_dvl_info)
             bus.cmd_dvl_use.connect(self.mpc.set_dvl_use)
             bus.cmd_estimator.connect(self.mpc.set_estimator)
+            # --dvl_pose's TAG FIX switch (2026-10-18), as the hardware wires it
+            bus.cmd_dvl_pose_tag.connect(self.mpc.set_dvl_pose_tag)
+            # --state-noise's NOISE switch (2026-10-19)
+            bus.cmd_state_noise.connect(self.mpc.set_state_noise)
             bus.telemetry.connect(self.mpc.on_telemetry)
             bus.cmd_mode.connect(self.mpc.on_mode_request)
             bus.thrusters.connect(self.mpc.on_thrusters)

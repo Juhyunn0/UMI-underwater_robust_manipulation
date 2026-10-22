@@ -305,12 +305,13 @@ def _vehicle_worker():
 
 
 def test_the_banner_is_recorded_and_said_at_most_once_a_minute():
+    """(said at level "error" — red in the mission log — since 2026-10-18, the operator's ask)"""
     w, logs, _imus = _vehicle_worker()
     t0 = 1000.0
     # the 10-13 culprit re-asked every ~1.9 s: 40 banners over 74 s
     for k in range(40):
         w._note_statustext({"text": BANNER + "\x00\x00", "severity": 6, "t_host": t0 + 1.9 * k})
-    warns = [m for lvl, m in logs if lvl == "warn" and BANNER_LINE in m]
+    warns = [m for lvl, m in logs if lvl == "error" and BANNER_LINE in m]
     assert len(warns) == 2, warns                             # at t0 and at the first banner >= t0 + 60 s
     k2 = math.ceil(BANNER_WARN_EVERY_S / 1.9)                 # 32 -> 1060.8 s
     assert "1 since the last warning" in warns[0] and f"{k2} since the last warning" in warns[1], warns
@@ -341,7 +342,7 @@ def test_the_tail_of_a_banner_burst_is_said_once_the_minute_has_passed():
     w._last_tel = w._last_link = float("inf")       # no Telemetry publish, no link sample: only the banner bookkeeping
 
     def warns():
-        return [m for lvl, m in logs if lvl == "warn" and BANNER_LINE in m]
+        return [m for lvl, m in logs if lvl == "error" and BANNER_LINE in m]
 
     t = _time.monotonic()
     # a burst of 4 banners 70..64 s ago: the first is said at its arrival, the other 3 are held by the limit
@@ -784,9 +785,12 @@ def test_the_csv_columns_and_the_meta(monkeypatch):
     cols = CSV_HEADER.strip().split(",")
     i = cols.index("att_age_v_s")
     assert cols[i:i + 3] == ["att_age_v_s", "att_tb_ms", "banner_age_s"] and len(cols) == len(set(cols))
-    # schema 22 (2026-10-16): the DVL selection's seven follow them (test_dvl pins their meaning)
-    assert cols[-7:] == ["w_dvl", "dvl_code", "dvl_res_fast_m_s", "dvl_res_slow_m_s", "dvl_esc_s",
-                         "dvl_align", "dvl_scale"]
+    # schema 22 (2026-10-16): the DVL selection's seven follow them (test_dvl pins their meaning), and
+    # schema 23 (2026-10-18) the DVL pose's 20 after those (test_dvl_pose_worker pins their meaning),
+    # schema 24 (2026-10-19) the state noise's 16 after those (test_state_noise pins their meaning)
+    assert cols[-7 - 20 - 16:-20 - 16] == ["w_dvl", "dvl_code", "dvl_res_fast_m_s", "dvl_res_slow_m_s", "dvl_esc_s",
+                                 "dvl_align", "dvl_scale"]
+    assert cols[-20 - 16:-16] == ["tagfix", "dvp_src", "dvp_ok", "dvp_px", "dvp_py", "dvp_pz", "dvp_yaw_deg", "dvp_u", "dvp_v", "dvp_w", "dvp_err_m", "dvp_err_yaw_deg", "dvp_since_fix_s", "dvp_dist_m", "dvp_gap_s", "dvp_corr_m", "dvp_bias_dps", "dvp_unobs_m", "dvp_blind_s", "dvp_why"]
     with tempfile.TemporaryDirectory() as tmp:
         w, bus, pwms, logs, events = _pwm(tmp, "rl_pwm", monkeypatch)
         _engage_healthy(w)
@@ -796,7 +800,7 @@ def test_the_csv_columns_and_the_meta(monkeypatch):
         assert len(row) == len(cols) and float(row["att_age_v_s"]) == pytest.approx(0.05, abs=0.03)
         assert row["att_tb_ms"] == "4242000" and float(row["banner_age_s"]) == pytest.approx(40.0, abs=0.5)
         m = w._run_meta()
-        assert m["schema_version"] == 22
+        assert m["schema_version"] == 24
         a = m["att_age"]
         assert a["estimator"]["drift_ppm"] == 300.0 and a["estimator"]["reboot_gap_s"] == 2.0
         assert a["pwm_gate"]["thresholds"]["age_engage_p99_s"] == 0.12 and a["pwm_gate"]["lows"] == ["rl_pwm",

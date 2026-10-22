@@ -1,0 +1,159 @@
+{
+ "meta": {
+  "generator": "/home/bdml/Desktop/RL_controller/logs/r2dev_20261018/station_port/make_law_texts_fixture_20261018.py",
+  "recorded": "2026-10-18",
+  "sha256": {
+   "dev_export_policy": "875d6f700689992c6b2b08c18f751ff420c74cbe1722cb358c553a12c9c4baa1",
+   "dev_obs_spec": "e70275ea8e4ef49650beba3c03deccf1e6a4ba1382946ca20df3cd9b2d2a6658",
+   "live_export_policy": "0595d452292044240dff10c02e8eb728333db52b5ea60c38cde09f50e3cd732d",
+   "live_obs_spec": "989a8e729328140d14c39acbd4cfad6896a0e5f956c91bb2b7917bff650afa2c"
+  },
+  "what": "obs_integral update_law texts (rov_rl/obs_spec.integral_update_law, live = round 1, dev = the r2dev copy with the round-2 clauses) and the exporters' units string — what the station's rl_policy.obs_integral_law_text / OBS_INTEGRAL_UNITS_TEXT must equal (review F4)"
+ },
+ "texts": [
+  {
+   "att_error": "quat_xy",
+   "att_max": 0.8,
+   "cond_att_rad": 0.0,
+   "cond_pos_m": 0.0,
+   "dev": "per control tick (dt = control_dt), AFTER the estimator / observation guard / goal update and BEFORE the frame is assembled: e_pos_w = clip(p_goal_w - p_est_w, -obs_offset_clip, +obs_offset_clip) per world axis (world z-up; p_est_w = exactly the position offset_b uses); q_err = conj(q_est_f) (x) q_des_f with q_des_f / q_est_f = the frame's two quaternion slots (goal-heading frame when obs_goal_frame, w >= 0 canonicalization applied); e_att = 2 sign(q_err.w) (q_err.x, q_err.y) (roll, pitch error, body FLU: + = the hull must roll right-side-down / pitch nose-DOWN to reach the goal); I_pos = clip(I_pos (1 - dt / 4) + dt e_pos_w, +-0.4); I_att = clip(I_att (1 - dt / 4) + dt e_att, +-0.8) (leak, then add, then clip, per component). Slots: int_pos_b(3) = R(q_est_w)^T I_pos / 0.4 (q_est_w = the world-frame estimated attitude offset_b uses, not the goal-frame slot), int_att_rp(2) = I_att / 0.8. I_pos = I_att = 0 at engage / episode reset (whenever the history is refilled), BEFORE that tick's update, so the first frame already carries dt e.",
+   "live": "per control tick (dt = control_dt), AFTER the estimator / observation guard / goal update and BEFORE the frame is assembled: e_pos_w = clip(p_goal_w - p_est_w, -obs_offset_clip, +obs_offset_clip) per world axis (world z-up; p_est_w = exactly the position offset_b uses); q_err = conj(q_est_f) (x) q_des_f with q_des_f / q_est_f = the frame's two quaternion slots (goal-heading frame when obs_goal_frame, w >= 0 canonicalization applied); e_att = 2 sign(q_err.w) (q_err.x, q_err.y) (roll, pitch error, body FLU: + = the hull must roll right-side-down / pitch nose-DOWN to reach the goal); I_pos = clip(I_pos (1 - dt / 4) + dt e_pos_w, +-0.4); I_att = clip(I_att (1 - dt / 4) + dt e_att, +-0.8) (leak, then add, then clip, per component). Slots: int_pos_b(3) = R(q_est_w)^T I_pos / 0.4 (q_est_w = the world-frame estimated attitude offset_b uses, not the goal-frame slot), int_att_rp(2) = I_att / 0.8. I_pos = I_att = 0 at engage / episode reset (whenever the history is refilled), BEFORE that tick's update, so the first frame already carries dt e.",
+   "pos_max": 0.4,
+   "tau_s": 4.0
+  },
+  {
+   "att_error": "quat_xy",
+   "att_max": 0.8,
+   "cond_att_rad": 0.3,
+   "cond_pos_m": 0.1,
+   "dev": "per control tick (dt = control_dt), AFTER the estimator / observation guard / goal update and BEFORE the frame is assembled: e_pos_w = clip(p_goal_w - p_est_w, -obs_offset_clip, +obs_offset_clip) per world axis (world z-up; p_est_w = exactly the position offset_b uses); q_err = conj(q_est_f) (x) q_des_f with q_des_f / q_est_f = the frame's two quaternion slots (goal-heading frame when obs_goal_frame, w >= 0 canonicalization applied); e_att = 2 sign(q_err.w) (q_err.x, q_err.y) (roll, pitch error, body FLU: + = the hull must roll right-side-down / pitch nose-DOWN to reach the goal); I_pos = clip(I_pos (1 - dt / 4) + dt e_pos_w, +-0.4); I_att = clip(I_att (1 - dt / 4) + dt e_att, +-0.8) (leak, then add, then clip, per component). Slots: int_pos_b(3) = R(q_est_w)^T I_pos / 0.4 (q_est_w = the world-frame estimated attitude offset_b uses, not the goal-frame slot), int_att_rp(2) = I_att / 0.8. I_pos = I_att = 0 at engage / episode reset (whenever the history is refilled), BEFORE that tick's update, so the first frame already carries dt e. ROUND-2 OPTIONS: CONDITIONAL integration per component: the add term dt e is used only while |e| < threshold (position 0.1 m, attitude 0.3 rad; 0 = always), else 0; the leak and the clip always run (leak, then the masked add, then clip).",
+   "live": null,
+   "pos_max": 0.4,
+   "tau_s": 4.0
+  },
+  {
+   "att_error": "quat_xy",
+   "att_max": 0.8,
+   "cond_att_rad": 0.0,
+   "cond_pos_m": 0.1,
+   "dev": "per control tick (dt = control_dt), AFTER the estimator / observation guard / goal update and BEFORE the frame is assembled: e_pos_w = clip(p_goal_w - p_est_w, -obs_offset_clip, +obs_offset_clip) per world axis (world z-up; p_est_w = exactly the position offset_b uses); q_err = conj(q_est_f) (x) q_des_f with q_des_f / q_est_f = the frame's two quaternion slots (goal-heading frame when obs_goal_frame, w >= 0 canonicalization applied); e_att = 2 sign(q_err.w) (q_err.x, q_err.y) (roll, pitch error, body FLU: + = the hull must roll right-side-down / pitch nose-DOWN to reach the goal); I_pos = clip(I_pos (1 - dt / 4) + dt e_pos_w, +-0.4); I_att = clip(I_att (1 - dt / 4) + dt e_att, +-0.8) (leak, then add, then clip, per component). Slots: int_pos_b(3) = R(q_est_w)^T I_pos / 0.4 (q_est_w = the world-frame estimated attitude offset_b uses, not the goal-frame slot), int_att_rp(2) = I_att / 0.8. I_pos = I_att = 0 at engage / episode reset (whenever the history is refilled), BEFORE that tick's update, so the first frame already carries dt e. ROUND-2 OPTIONS: CONDITIONAL integration per component: the add term dt e is used only while |e| < threshold (position 0.1 m, attitude 0 rad; 0 = always), else 0; the leak and the clip always run (leak, then the masked add, then clip).",
+   "live": null,
+   "pos_max": 0.4,
+   "tau_s": 4.0
+  },
+  {
+   "att_error": "quat_xy",
+   "att_max": 0.8,
+   "cond_att_rad": 0.3,
+   "cond_pos_m": 0.0,
+   "dev": "per control tick (dt = control_dt), AFTER the estimator / observation guard / goal update and BEFORE the frame is assembled: e_pos_w = clip(p_goal_w - p_est_w, -obs_offset_clip, +obs_offset_clip) per world axis (world z-up; p_est_w = exactly the position offset_b uses); q_err = conj(q_est_f) (x) q_des_f with q_des_f / q_est_f = the frame's two quaternion slots (goal-heading frame when obs_goal_frame, w >= 0 canonicalization applied); e_att = 2 sign(q_err.w) (q_err.x, q_err.y) (roll, pitch error, body FLU: + = the hull must roll right-side-down / pitch nose-DOWN to reach the goal); I_pos = clip(I_pos (1 - dt / 4) + dt e_pos_w, +-0.4); I_att = clip(I_att (1 - dt / 4) + dt e_att, +-0.8) (leak, then add, then clip, per component). Slots: int_pos_b(3) = R(q_est_w)^T I_pos / 0.4 (q_est_w = the world-frame estimated attitude offset_b uses, not the goal-frame slot), int_att_rp(2) = I_att / 0.8. I_pos = I_att = 0 at engage / episode reset (whenever the history is refilled), BEFORE that tick's update, so the first frame already carries dt e. ROUND-2 OPTIONS: CONDITIONAL integration per component: the add term dt e is used only while |e| < threshold (position 0 m, attitude 0.3 rad; 0 = always), else 0; the leak and the clip always run (leak, then the masked add, then clip).",
+   "live": null,
+   "pos_max": 0.4,
+   "tau_s": 4.0
+  },
+  {
+   "att_error": "euler_rp",
+   "att_max": 0.8,
+   "cond_att_rad": 0.0,
+   "cond_pos_m": 0.0,
+   "dev": "per control tick (dt = control_dt), AFTER the estimator / observation guard / goal update and BEFORE the frame is assembled: e_pos_w = clip(p_goal_w - p_est_w, -obs_offset_clip, +obs_offset_clip) per world axis (world z-up; p_est_w = exactly the position offset_b uses); q_err = conj(q_est_f) (x) q_des_f with q_des_f / q_est_f = the frame's two quaternion slots (goal-heading frame when obs_goal_frame, w >= 0 canonicalization applied); e_att = 2 sign(q_err.w) (q_err.x, q_err.y) (roll, pitch error, body FLU: + = the hull must roll right-side-down / pitch nose-DOWN to reach the goal); I_pos = clip(I_pos (1 - dt / 4) + dt e_pos_w, +-0.4); I_att = clip(I_att (1 - dt / 4) + dt e_att, +-0.8) (leak, then add, then clip, per component). Slots: int_pos_b(3) = R(q_est_w)^T I_pos / 0.4 (q_est_w = the world-frame estimated attitude offset_b uses, not the goal-frame slot), int_att_rp(2) = I_att / 0.8. I_pos = I_att = 0 at engage / episode reset (whenever the history is refilled), BEFORE that tick's update, so the first frame already carries dt e. ROUND-2 OPTIONS: e_att REPLACED by the heading-invariant (wrap(roll_des - roll_est), pitch_des - pitch_est) with ZYX Euler roll = atan2(2(wx + yz), 1 - 2(x^2 + y^2)), pitch = asin(clip(2(wy - zx), -1, 1)) of the same two frame quaternions (FLU: + roll = right-side-down, + pitch = nose-DOWN), wrap = atan2(sin, cos).",
+   "live": null,
+   "pos_max": 0.4,
+   "tau_s": 4.0
+  },
+  {
+   "att_error": "euler_rp",
+   "att_max": 0.8,
+   "cond_att_rad": 0.3,
+   "cond_pos_m": 0.1,
+   "dev": "per control tick (dt = control_dt), AFTER the estimator / observation guard / goal update and BEFORE the frame is assembled: e_pos_w = clip(p_goal_w - p_est_w, -obs_offset_clip, +obs_offset_clip) per world axis (world z-up; p_est_w = exactly the position offset_b uses); q_err = conj(q_est_f) (x) q_des_f with q_des_f / q_est_f = the frame's two quaternion slots (goal-heading frame when obs_goal_frame, w >= 0 canonicalization applied); e_att = 2 sign(q_err.w) (q_err.x, q_err.y) (roll, pitch error, body FLU: + = the hull must roll right-side-down / pitch nose-DOWN to reach the goal); I_pos = clip(I_pos (1 - dt / 4) + dt e_pos_w, +-0.4); I_att = clip(I_att (1 - dt / 4) + dt e_att, +-0.8) (leak, then add, then clip, per component). Slots: int_pos_b(3) = R(q_est_w)^T I_pos / 0.4 (q_est_w = the world-frame estimated attitude offset_b uses, not the goal-frame slot), int_att_rp(2) = I_att / 0.8. I_pos = I_att = 0 at engage / episode reset (whenever the history is refilled), BEFORE that tick's update, so the first frame already carries dt e. ROUND-2 OPTIONS: e_att REPLACED by the heading-invariant (wrap(roll_des - roll_est), pitch_des - pitch_est) with ZYX Euler roll = atan2(2(wx + yz), 1 - 2(x^2 + y^2)), pitch = asin(clip(2(wy - zx), -1, 1)) of the same two frame quaternions (FLU: + roll = right-side-down, + pitch = nose-DOWN), wrap = atan2(sin, cos); CONDITIONAL integration per component: the add term dt e is used only while |e| < threshold (position 0.1 m, attitude 0.3 rad; 0 = always), else 0; the leak and the clip always run (leak, then the masked add, then clip).",
+   "live": null,
+   "pos_max": 0.4,
+   "tau_s": 4.0
+  },
+  {
+   "att_error": "euler_rp",
+   "att_max": 0.8,
+   "cond_att_rad": 0.0,
+   "cond_pos_m": 0.1,
+   "dev": "per control tick (dt = control_dt), AFTER the estimator / observation guard / goal update and BEFORE the frame is assembled: e_pos_w = clip(p_goal_w - p_est_w, -obs_offset_clip, +obs_offset_clip) per world axis (world z-up; p_est_w = exactly the position offset_b uses); q_err = conj(q_est_f) (x) q_des_f with q_des_f / q_est_f = the frame's two quaternion slots (goal-heading frame when obs_goal_frame, w >= 0 canonicalization applied); e_att = 2 sign(q_err.w) (q_err.x, q_err.y) (roll, pitch error, body FLU: + = the hull must roll right-side-down / pitch nose-DOWN to reach the goal); I_pos = clip(I_pos (1 - dt / 4) + dt e_pos_w, +-0.4); I_att = clip(I_att (1 - dt / 4) + dt e_att, +-0.8) (leak, then add, then clip, per component). Slots: int_pos_b(3) = R(q_est_w)^T I_pos / 0.4 (q_est_w = the world-frame estimated attitude offset_b uses, not the goal-frame slot), int_att_rp(2) = I_att / 0.8. I_pos = I_att = 0 at engage / episode reset (whenever the history is refilled), BEFORE that tick's update, so the first frame already carries dt e. ROUND-2 OPTIONS: e_att REPLACED by the heading-invariant (wrap(roll_des - roll_est), pitch_des - pitch_est) with ZYX Euler roll = atan2(2(wx + yz), 1 - 2(x^2 + y^2)), pitch = asin(clip(2(wy - zx), -1, 1)) of the same two frame quaternions (FLU: + roll = right-side-down, + pitch = nose-DOWN), wrap = atan2(sin, cos); CONDITIONAL integration per component: the add term dt e is used only while |e| < threshold (position 0.1 m, attitude 0 rad; 0 = always), else 0; the leak and the clip always run (leak, then the masked add, then clip).",
+   "live": null,
+   "pos_max": 0.4,
+   "tau_s": 4.0
+  },
+  {
+   "att_error": "euler_rp",
+   "att_max": 0.8,
+   "cond_att_rad": 0.3,
+   "cond_pos_m": 0.0,
+   "dev": "per control tick (dt = control_dt), AFTER the estimator / observation guard / goal update and BEFORE the frame is assembled: e_pos_w = clip(p_goal_w - p_est_w, -obs_offset_clip, +obs_offset_clip) per world axis (world z-up; p_est_w = exactly the position offset_b uses); q_err = conj(q_est_f) (x) q_des_f with q_des_f / q_est_f = the frame's two quaternion slots (goal-heading frame when obs_goal_frame, w >= 0 canonicalization applied); e_att = 2 sign(q_err.w) (q_err.x, q_err.y) (roll, pitch error, body FLU: + = the hull must roll right-side-down / pitch nose-DOWN to reach the goal); I_pos = clip(I_pos (1 - dt / 4) + dt e_pos_w, +-0.4); I_att = clip(I_att (1 - dt / 4) + dt e_att, +-0.8) (leak, then add, then clip, per component). Slots: int_pos_b(3) = R(q_est_w)^T I_pos / 0.4 (q_est_w = the world-frame estimated attitude offset_b uses, not the goal-frame slot), int_att_rp(2) = I_att / 0.8. I_pos = I_att = 0 at engage / episode reset (whenever the history is refilled), BEFORE that tick's update, so the first frame already carries dt e. ROUND-2 OPTIONS: e_att REPLACED by the heading-invariant (wrap(roll_des - roll_est), pitch_des - pitch_est) with ZYX Euler roll = atan2(2(wx + yz), 1 - 2(x^2 + y^2)), pitch = asin(clip(2(wy - zx), -1, 1)) of the same two frame quaternions (FLU: + roll = right-side-down, + pitch = nose-DOWN), wrap = atan2(sin, cos); CONDITIONAL integration per component: the add term dt e is used only while |e| < threshold (position 0 m, attitude 0.3 rad; 0 = always), else 0; the leak and the clip always run (leak, then the masked add, then clip).",
+   "live": null,
+   "pos_max": 0.4,
+   "tau_s": 4.0
+  },
+  {
+   "att_error": "quat_xy",
+   "att_max": 0.5,
+   "cond_att_rad": 0.0,
+   "cond_pos_m": 0.0,
+   "dev": "per control tick (dt = control_dt), AFTER the estimator / observation guard / goal update and BEFORE the frame is assembled: e_pos_w = clip(p_goal_w - p_est_w, -obs_offset_clip, +obs_offset_clip) per world axis (world z-up; p_est_w = exactly the position offset_b uses); q_err = conj(q_est_f) (x) q_des_f with q_des_f / q_est_f = the frame's two quaternion slots (goal-heading frame when obs_goal_frame, w >= 0 canonicalization applied); e_att = 2 sign(q_err.w) (q_err.x, q_err.y) (roll, pitch error, body FLU: + = the hull must roll right-side-down / pitch nose-DOWN to reach the goal); I_pos = clip(I_pos (1 - dt / 2.5) + dt e_pos_w, +-0.25); I_att = clip(I_att (1 - dt / 2.5) + dt e_att, +-0.5) (leak, then add, then clip, per component). Slots: int_pos_b(3) = R(q_est_w)^T I_pos / 0.25 (q_est_w = the world-frame estimated attitude offset_b uses, not the goal-frame slot), int_att_rp(2) = I_att / 0.5. I_pos = I_att = 0 at engage / episode reset (whenever the history is refilled), BEFORE that tick's update, so the first frame already carries dt e.",
+   "live": "per control tick (dt = control_dt), AFTER the estimator / observation guard / goal update and BEFORE the frame is assembled: e_pos_w = clip(p_goal_w - p_est_w, -obs_offset_clip, +obs_offset_clip) per world axis (world z-up; p_est_w = exactly the position offset_b uses); q_err = conj(q_est_f) (x) q_des_f with q_des_f / q_est_f = the frame's two quaternion slots (goal-heading frame when obs_goal_frame, w >= 0 canonicalization applied); e_att = 2 sign(q_err.w) (q_err.x, q_err.y) (roll, pitch error, body FLU: + = the hull must roll right-side-down / pitch nose-DOWN to reach the goal); I_pos = clip(I_pos (1 - dt / 2.5) + dt e_pos_w, +-0.25); I_att = clip(I_att (1 - dt / 2.5) + dt e_att, +-0.5) (leak, then add, then clip, per component). Slots: int_pos_b(3) = R(q_est_w)^T I_pos / 0.25 (q_est_w = the world-frame estimated attitude offset_b uses, not the goal-frame slot), int_att_rp(2) = I_att / 0.5. I_pos = I_att = 0 at engage / episode reset (whenever the history is refilled), BEFORE that tick's update, so the first frame already carries dt e.",
+   "pos_max": 0.25,
+   "tau_s": 2.5
+  },
+  {
+   "att_error": "quat_xy",
+   "att_max": 0.5,
+   "cond_att_rad": 0.2,
+   "cond_pos_m": 0.05,
+   "dev": "per control tick (dt = control_dt), AFTER the estimator / observation guard / goal update and BEFORE the frame is assembled: e_pos_w = clip(p_goal_w - p_est_w, -obs_offset_clip, +obs_offset_clip) per world axis (world z-up; p_est_w = exactly the position offset_b uses); q_err = conj(q_est_f) (x) q_des_f with q_des_f / q_est_f = the frame's two quaternion slots (goal-heading frame when obs_goal_frame, w >= 0 canonicalization applied); e_att = 2 sign(q_err.w) (q_err.x, q_err.y) (roll, pitch error, body FLU: + = the hull must roll right-side-down / pitch nose-DOWN to reach the goal); I_pos = clip(I_pos (1 - dt / 2.5) + dt e_pos_w, +-0.25); I_att = clip(I_att (1 - dt / 2.5) + dt e_att, +-0.5) (leak, then add, then clip, per component). Slots: int_pos_b(3) = R(q_est_w)^T I_pos / 0.25 (q_est_w = the world-frame estimated attitude offset_b uses, not the goal-frame slot), int_att_rp(2) = I_att / 0.5. I_pos = I_att = 0 at engage / episode reset (whenever the history is refilled), BEFORE that tick's update, so the first frame already carries dt e. ROUND-2 OPTIONS: CONDITIONAL integration per component: the add term dt e is used only while |e| < threshold (position 0.05 m, attitude 0.2 rad; 0 = always), else 0; the leak and the clip always run (leak, then the masked add, then clip).",
+   "live": null,
+   "pos_max": 0.25,
+   "tau_s": 2.5
+  },
+  {
+   "att_error": "euler_rp",
+   "att_max": 0.5,
+   "cond_att_rad": 0.0,
+   "cond_pos_m": 0.0,
+   "dev": "per control tick (dt = control_dt), AFTER the estimator / observation guard / goal update and BEFORE the frame is assembled: e_pos_w = clip(p_goal_w - p_est_w, -obs_offset_clip, +obs_offset_clip) per world axis (world z-up; p_est_w = exactly the position offset_b uses); q_err = conj(q_est_f) (x) q_des_f with q_des_f / q_est_f = the frame's two quaternion slots (goal-heading frame when obs_goal_frame, w >= 0 canonicalization applied); e_att = 2 sign(q_err.w) (q_err.x, q_err.y) (roll, pitch error, body FLU: + = the hull must roll right-side-down / pitch nose-DOWN to reach the goal); I_pos = clip(I_pos (1 - dt / 2.5) + dt e_pos_w, +-0.25); I_att = clip(I_att (1 - dt / 2.5) + dt e_att, +-0.5) (leak, then add, then clip, per component). Slots: int_pos_b(3) = R(q_est_w)^T I_pos / 0.25 (q_est_w = the world-frame estimated attitude offset_b uses, not the goal-frame slot), int_att_rp(2) = I_att / 0.5. I_pos = I_att = 0 at engage / episode reset (whenever the history is refilled), BEFORE that tick's update, so the first frame already carries dt e. ROUND-2 OPTIONS: e_att REPLACED by the heading-invariant (wrap(roll_des - roll_est), pitch_des - pitch_est) with ZYX Euler roll = atan2(2(wx + yz), 1 - 2(x^2 + y^2)), pitch = asin(clip(2(wy - zx), -1, 1)) of the same two frame quaternions (FLU: + roll = right-side-down, + pitch = nose-DOWN), wrap = atan2(sin, cos).",
+   "live": null,
+   "pos_max": 0.25,
+   "tau_s": 2.5
+  },
+  {
+   "att_error": "euler_rp",
+   "att_max": 0.5,
+   "cond_att_rad": 0.2,
+   "cond_pos_m": 0.05,
+   "dev": "per control tick (dt = control_dt), AFTER the estimator / observation guard / goal update and BEFORE the frame is assembled: e_pos_w = clip(p_goal_w - p_est_w, -obs_offset_clip, +obs_offset_clip) per world axis (world z-up; p_est_w = exactly the position offset_b uses); q_err = conj(q_est_f) (x) q_des_f with q_des_f / q_est_f = the frame's two quaternion slots (goal-heading frame when obs_goal_frame, w >= 0 canonicalization applied); e_att = 2 sign(q_err.w) (q_err.x, q_err.y) (roll, pitch error, body FLU: + = the hull must roll right-side-down / pitch nose-DOWN to reach the goal); I_pos = clip(I_pos (1 - dt / 2.5) + dt e_pos_w, +-0.25); I_att = clip(I_att (1 - dt / 2.5) + dt e_att, +-0.5) (leak, then add, then clip, per component). Slots: int_pos_b(3) = R(q_est_w)^T I_pos / 0.25 (q_est_w = the world-frame estimated attitude offset_b uses, not the goal-frame slot), int_att_rp(2) = I_att / 0.5. I_pos = I_att = 0 at engage / episode reset (whenever the history is refilled), BEFORE that tick's update, so the first frame already carries dt e. ROUND-2 OPTIONS: e_att REPLACED by the heading-invariant (wrap(roll_des - roll_est), pitch_des - pitch_est) with ZYX Euler roll = atan2(2(wx + yz), 1 - 2(x^2 + y^2)), pitch = asin(clip(2(wy - zx), -1, 1)) of the same two frame quaternions (FLU: + roll = right-side-down, + pitch = nose-DOWN), wrap = atan2(sin, cos); CONDITIONAL integration per component: the add term dt e is used only while |e| < threshold (position 0.05 m, attitude 0.2 rad; 0 = always), else 0; the leak and the clip always run (leak, then the masked add, then clip).",
+   "live": null,
+   "pos_max": 0.25,
+   "tau_s": 2.5
+  },
+  {
+   "att_error": "quat_xy",
+   "att_max": 0.5,
+   "cond_att_rad": 0.123456,
+   "cond_pos_m": 0.05,
+   "dev": "per control tick (dt = control_dt), AFTER the estimator / observation guard / goal update and BEFORE the frame is assembled: e_pos_w = clip(p_goal_w - p_est_w, -obs_offset_clip, +obs_offset_clip) per world axis (world z-up; p_est_w = exactly the position offset_b uses); q_err = conj(q_est_f) (x) q_des_f with q_des_f / q_est_f = the frame's two quaternion slots (goal-heading frame when obs_goal_frame, w >= 0 canonicalization applied); e_att = 2 sign(q_err.w) (q_err.x, q_err.y) (roll, pitch error, body FLU: + = the hull must roll right-side-down / pitch nose-DOWN to reach the goal); I_pos = clip(I_pos (1 - dt / 10) + dt e_pos_w, +-1); I_att = clip(I_att (1 - dt / 10) + dt e_att, +-0.5) (leak, then add, then clip, per component). Slots: int_pos_b(3) = R(q_est_w)^T I_pos / 1 (q_est_w = the world-frame estimated attitude offset_b uses, not the goal-frame slot), int_att_rp(2) = I_att / 0.5. I_pos = I_att = 0 at engage / episode reset (whenever the history is refilled), BEFORE that tick's update, so the first frame already carries dt e. ROUND-2 OPTIONS: CONDITIONAL integration per component: the add term dt e is used only while |e| < threshold (position 0.05 m, attitude 0.123456 rad; 0 = always), else 0; the leak and the clip always run (leak, then the masked add, then clip).",
+   "live": null,
+   "pos_max": 1.0,
+   "tau_s": 10.0
+  },
+  {
+   "att_error": "euler_rp",
+   "att_max": 0.8,
+   "cond_att_rad": 0.0,
+   "cond_pos_m": 0.0,
+   "dev": "per control tick (dt = control_dt), AFTER the estimator / observation guard / goal update and BEFORE the frame is assembled: e_pos_w = clip(p_goal_w - p_est_w, -obs_offset_clip, +obs_offset_clip) per world axis (world z-up; p_est_w = exactly the position offset_b uses); q_err = conj(q_est_f) (x) q_des_f with q_des_f / q_est_f = the frame's two quaternion slots (goal-heading frame when obs_goal_frame, w >= 0 canonicalization applied); e_att = 2 sign(q_err.w) (q_err.x, q_err.y) (roll, pitch error, body FLU: + = the hull must roll right-side-down / pitch nose-DOWN to reach the goal); I_pos = clip(I_pos (1 - dt / 0.75) + dt e_pos_w, +-0.4); I_att = clip(I_att (1 - dt / 0.75) + dt e_att, +-0.8) (leak, then add, then clip, per component). Slots: int_pos_b(3) = R(q_est_w)^T I_pos / 0.4 (q_est_w = the world-frame estimated attitude offset_b uses, not the goal-frame slot), int_att_rp(2) = I_att / 0.8. I_pos = I_att = 0 at engage / episode reset (whenever the history is refilled), BEFORE that tick's update, so the first frame already carries dt e. ROUND-2 OPTIONS: e_att REPLACED by the heading-invariant (wrap(roll_des - roll_est), pitch_des - pitch_est) with ZYX Euler roll = atan2(2(wx + yz), 1 - 2(x^2 + y^2)), pitch = asin(clip(2(wy - zx), -1, 1)) of the same two frame quaternions (FLU: + roll = right-side-down, + pitch = nose-DOWN), wrap = atan2(sin, cos).",
+   "live": null,
+   "pos_max": 0.4,
+   "tau_s": 0.75
+  }
+ ],
+ "units": {
+  "dev": "I_pos [m*s] world z-up, I_att [rad*s] body FLU (roll, pitch). int_att_rp = I_att / att_max lies in [-1, 1]; int_pos_b = R(q_est)^T I_pos / pos_max where I_pos is clamped PER WORLD AXIS, so a body component can reach sqrt(2) level and sqrt(3) tilted — do NOT clip or range-assert it to [-1, 1] at deployment",
+  "live": "I_pos [m*s] world z-up, I_att [rad*s] body FLU (roll, pitch). int_att_rp = I_att / att_max lies in [-1, 1]; int_pos_b = R(q_est)^T I_pos / pos_max where I_pos is clamped PER WORLD AXIS, so a body component can reach sqrt(2) level and sqrt(3) tilted — do NOT clip or range-assert it to [-1, 1] at deployment"
+ }
+}

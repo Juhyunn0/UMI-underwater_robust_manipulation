@@ -397,6 +397,19 @@ def main(argv=None) -> int:
     state = MissionState(mission_csv)
     obs = ObsStore(folder)
     records = [json.loads(l) for l in (folder / "plans.jsonl").open()]
+    # --state-noise-policy runs (2026-10-19, safety review MEDIUM-3): the live
+    # DP saw a NOISED proprio and anchor, while this tool rebuilds the
+    # proprio from the CSV truth — a replay would mix the two and blame the
+    # difference on the checkpoint. Refused, not approximated.
+    noised = [r for r in records if r.get("sn_policy")]
+    sn_eng = ((meta.get("state_noise") or {}).get("at_engage") or {})
+    if noised or sn_eng.get("policy"):
+        raise SystemExit(
+            f"[fail] {folder.name}: {len(noised)} plan(s) were taken with "
+            f"--state-noise-policy (plans.jsonl sn_policy / meta "
+            f"state_noise.at_engage.policy) — the live DP saw a noised "
+            f"proprio and anchor, this tool feeds the CSV truth. Not "
+            f"supported.")
     records = [r for r in records if "raw" in r and r.get("obs_rows_t")]
     print(f"{folder.name}: {len(records)} installed plans, "
           f"{len(obs.t)} recorded observations")

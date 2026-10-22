@@ -284,6 +284,82 @@ def build_parser() -> argparse.ArgumentParser:
                         "hw_mpc.yaml and proven against the tag velocity. "
                         "With --source demo a SYNTHETIC DVL is simulated. "
                         "HARDWARE-UNVERIFIED (2026-10-01).")
+    g.add_argument("--dvl_pose", "--dvl-pose", dest="dvl_pose", nargs="?",
+                   const="control", default=None,
+                   choices=("off", "shadow", "control"),
+                   help="DVL dead-reckoned POSE (control/dvl_pose.py): x, y "
+                        "integrated from the DVL A50's bottom velocity, yaw "
+                        "from the RAW_IMU gyro, z from the Bar30, roll/pitch "
+                        "from ArduSub — with AprilTag fixes as optional "
+                        "corrections, switched by the TAG FIX button on the "
+                        "trajectory panel (ON = the tag state while a fix is "
+                        "fresh, the DVL carries tag dropouts; OFF = DVL only, "
+                        "tags still recorded and watched for divergence). "
+                        "Bare --dvl_pose = 'control': the controller AND the "
+                        "interlocks fly on this pose, so a tag dropout no "
+                        "longer ends the engagement while the DVL can carry "
+                        "it. 'shadow' = the controller stays on the tag "
+                        "state and this pose is drawn and recorded beside it "
+                        "(TAG FIX OFF then measures the drift). Implies "
+                        "--dvl. Overrides hw_mpc.yaml dvl_pose.mode. "
+                        "HARDWARE-UNVERIFIED (2026-10-18).")
+    g.add_argument("--dvl-trust", dest="dvl_trust", action="store_const",
+                   const=True, default=None,
+                   help="TRUST mode (hw_mpc.yaml dvl.trust and "
+                        "dvl_pose.trust_dvl, both shipped false): the DVL is "
+                        "believed as the device reports it. Under --dvl the "
+                        "velocity blend flies every sample the device's own "
+                        "gates and quality flags pass: IN with no proving "
+                        "pass, no tag-velocity hold, a latch recorded only. "
+                        "Under --dvl_pose also — the switch goes "
+                        "IN by itself at the first sample with no proving "
+                        "pass (an OUT sticks), DvlAid's tag-velocity holds "
+                        "and latch do not stop the dead reckoning, a DVL gap "
+                        "makes no hole (its unintegrated motion is warned; "
+                        "past max_corr_m it ends an engaged run / refuses a "
+                        "START until a TAG FIX ONCE), and TAG FIX OFF does "
+                        "not wait for the gyro bias (learnt under ON, seeded "
+                        "from the last session's data/dvl_pose_gyro_bias.json). "
+                        "The tags anchor, correct (TAG FIX ONCE) and end a "
+                        "run the pose disagrees with. Operator decision "
+                        "2026-10-19.")
+    g.add_argument("--dvl-strict", dest="dvl_trust", action="store_const",
+                   const=False,
+                   help="STRICT mode (the shipped default): under --dvl the "
+                        "2026-10-16 tag-velocity holds and escalation latch "
+                        "on the velocity blend; under --dvl_pose the gates "
+                        "of the 2026-10-18 "
+                        "reviews — a proving pass before the DVL goes IN, "
+                        "60 s of TAG FIX ON for the gyro bias before OFF, "
+                        "DvlAid's tag-velocity holds and latch stop the dead "
+                        "reckoning, a DVL gap after the anchor is a hole "
+                        "until the tags re-anchor.")
+    g.add_argument("--state-noise", dest="state_noise", nargs="?",
+                   type=float, const=True, default=None, metavar="SCALE",
+                   help="STATE NOISE (control/state_noise.py): Gaussian noise "
+                        "added ONLY to the state the LOW controller is handed "
+                        "(every LOW: pid / mpc_tuned / rl / rl_pwm / ...). "
+                        "The plot, CSV px/py, the DP proprio and every "
+                        "interlock stay on the un-noised state. Builds the "
+                        "NOISE button on the trajectory panel (OFF at start; "
+                        "switches only while disengaged with no CSV open). "
+                        "Sigmas = hw_mpc.yaml state_noise; SCALE multiplies "
+                        "them (bare = the yaml scale). CSV sn_* = the noise "
+                        "each row added, meta state_noise = the sigmas and "
+                        "the seed. HARDWARE-UNVERIFIED (2026-10-19).")
+    g.add_argument("--state-noise-policy", dest="state_noise_policy",
+                   action="store_true", default=None,
+                   help="with --state-noise: the DP policy sees the SAME noisy "
+                        "pose the LOW controller is handed on that tick — its "
+                        "proprio rows, the anchor its plans are composed on "
+                        "and the policy START pose (CLI only, no yaml key). "
+                        "The NOISE button still switches it, so ON = LOW + DP "
+                        "for this session; an attitude-tracked (7-dim) "
+                        "policy is refused at ARM. "
+                        "Interlocks, plot and CSV px/py stay un-noised; "
+                        "plans.jsonl sn_policy = the noise each plan's rows "
+                        "and anchor carried. Without --state-noise nothing is "
+                        "built. HARDWARE-UNVERIFIED (2026-10-19).")
     g.add_argument("--ekf", choices=("off", "shadow", "control"),
                    default=None,
                    help="the robot_localization EKF (AprilTag + IMU + DVL, "
@@ -968,6 +1044,25 @@ def build_parser() -> argparse.ArgumentParser:
                         "from a different matcher than the training data; "
                         "--fstereo is the parity path. Bench experiments "
                         "only.")
+    g.add_argument("--policy-dr", dest="policy_dr", action="store_true",
+                   help="let the diffusion-policy mission fly ON THE DVL "
+                        "DEAD-RECKONED POSE (= hw_mpc.yaml policy."
+                        "allow_dr_pose true; operator decision "
+                        "2026-10-19). Needs --policy, --mpc and --dvl_pose "
+                        "(control). Without it a dead-reckoned / held "
+                        "tick is BRIDGED (design decision A9): plans are "
+                        "skipped and the mission ends after "
+                        "policy.stale_s ('POLICY flew on a bridged/DR "
+                        "state'). With it, under --dvl_pose control, a "
+                        "DR/HELD tick anchors the plan on the flown DVL "
+                        "pose and adds one row per tick to the policy's "
+                        "proprio history; the tag-dropout ladder and "
+                        "--imu-dr control are still bridged. TAG FIX OFF "
+                        "+ this flag = the policy runs on DVL dead "
+                        "reckoning only (the tags still record "
+                        "dvp_err_m). UNVERIFIED in water. RECORD "
+                        "BOUNDARY: meta policy.dr_pose (allowed / ticks / "
+                        "plans) and every plan line's dvp_state.")
     g.add_argument("--policy-observe", action="store_true",
                    help="start with LOW level = None (teleop) preselected — "
                         "identical to picking None in the trajectory panel; "
@@ -1428,6 +1523,8 @@ def check_policy(a):
     * ``--fstereo-alpha`` below 0.5 under ``--policy``: WARNING — the 224 obs
       crop is not covered at alpha 0 (97.92 % < 98.5 %, refused by the
       builder at run time; the mission would arm and never receive a plan).
+    * ``--policy-dr`` without ``--policy``, ``--mpc`` or ``--dvl_pose``
+      (control): REFUSED — the flag would silently do nothing.
     * ``--policy-fs-schedule`` other than ``free`` without ``--policy``, or
       on ``--source hw`` without ``--fstereo``: REFUSED — no gate is built
       and the run would silently be ``free``. On a non-hw source: WARNING
@@ -1466,6 +1563,24 @@ def check_policy(a):
                               f"follower. Drop one of them — LOW level can "
                               f"be changed in the trajectory panel between "
                               f"engagements.")
+    if bool(getattr(a, "policy_dr", False)):
+        # A REFUSAL, not a warning (2026-10-19): the knob lives in the policy
+        # mission and acts only under --dvl_pose control, so without those
+        # the operator would launch believing the DP will fly the dead
+        # reckoning and watch the A9 stop end the run instead.
+        if not bool(getattr(a, "policy", False)):
+            return ("refuse", "--policy-dr needs --policy: it changes how the "
+                              "diffusion-policy mission treats a dead-"
+                              "reckoned tick, and without --policy there is "
+                              "no such mission.")
+        if not bool(getattr(a, "mpc", False)):
+            return ("refuse", "--policy-dr needs --mpc: the MpcWorker owns "
+                              "the policy mission and the DVL pose.")
+        if str(getattr(a, "dvl_pose", None) or "off") != "control":
+            return ("refuse", "--policy-dr needs --dvl_pose (control): the "
+                              "dead-reckoned pose it lets the policy fly on "
+                              "is the DVL pose, and only in control mode is "
+                              "that pose what the controller flies.")
     if bool(getattr(a, "record_depth", False)) and not bool(getattr(a, "mpc",
                                                                     False)):
         # The recorder files its frames in the CONTROLLER's run folder, which
@@ -1698,6 +1813,46 @@ def check_fstereo_process(a):
                     "pool plan age, infer_ms or FS rate across it.")
 
 
+def check_state_noise_policy(a):
+    """--state-noise-policy at launch: ``("refuse"|"warn", text)`` or None.
+
+    A REFUSAL without --state-noise — the DP is shown the LOW controller's
+    own draw, and without --state-noise there is none (the --fstereo-process
+    rule: a flag that silently does nothing). A warning without --policy (no
+    DP to show it to), and otherwise the record boundary, said once. Silent
+    when the flag is not given.
+    """
+    if not bool(getattr(a, "state_noise_policy", None)):
+        return None
+    if getattr(a, "state_noise", None) is None:
+        return ("refuse", "--state-noise-policy needs --state-noise: the DP "
+                          "is shown the SAME draw the LOW controller gets, "
+                          "and without --state-noise there is none. Add "
+                          "--state-noise, or drop --state-noise-policy.")
+    if not bool(getattr(a, "policy", False)):
+        return ("warn", "--state-noise-policy does nothing without --policy: "
+                        "there is no DP to show the noise to (the LOW still "
+                        "gets it on NOISE ON).")
+    sn = getattr(a, "state_noise", None)
+    scale = (f" SCALE {float(sn):g} > 1: the safety review (2026-10-19) "
+             f"asks for SCALE <= 1 on the first water runs — the DP's motion "
+             f"cue is already noise-dominated at 1."
+             if sn is not True and float(sn) > 1.0 else "")
+    return ("warn", "--state-noise-policy: NOISE ON now also noises the DP "
+                    "policy's proprio rows, plan anchor and START pose with "
+                    "the LOW's own draw (an attitude-tracked 7-dim policy is "
+                    "refused at ARM). HARDWARE-UNVERIFIED — preview it on "
+                    "land first (--land-dry-run). RECORD BOUNDARY: meta "
+                    "state_noise.at_engage.policy and plans.jsonl sn_policy — "
+                    "do not pool these runs with LOW-only noise runs."
+                    + scale)
+
+
+#: The RAW_IMU rate below which --dvl_pose cannot integrate its heading:
+#: twice per GYRO_MAX_DT_S (0.5 s) with margin. [유도]
+DVL_POSE_MIN_RAW_IMU_HZ = 5.0
+
+
 def check_mavlink_rates(a):
     """The MAVLink IMU-stream flags at launch (2026-10-15,
     rov_gui/mavlink_streams.py): ``("refuse"|"warn", text)`` or None.
@@ -1716,6 +1871,21 @@ def check_mavlink_rates(a):
         res = MS.resolve_opts(a)
     except ValueError as e:
         return ("refuse", str(e))
+    # --dvl_pose's heading integrates RAW_IMU and counts every interval over
+    # 0.5 s as a gap (backends/hardware.py GYRO_MAX_DT_S): below ~5 Hz every
+    # interval is one, and the pose can never dead-reckon (review
+    # 2026-10-18). Refused at launch, in words, rather than met as
+    # 'gap after the anchor' at the pool.
+    dvp = str(getattr(a, "dvl_pose", None) or "off")
+    if dvp in ("shadow", "control") and getattr(a, "source", "demo") == "hw":
+        raw = res["rates_hz"].get("RAW_IMU")
+        if raw is not None and float(raw) < DVL_POSE_MIN_RAW_IMU_HZ:
+            return ("refuse",
+                    f"--dvl_pose {dvp} needs RAW_IMU at >= "
+                    f"{DVL_POSE_MIN_RAW_IMU_HZ:g} Hz (its heading integrates "
+                    f"the RAW_IMU gyro and counts any interval over 0.5 s as "
+                    f"a gap); the request resolves to {raw} Hz — raise "
+                    f"--mavlink-imu-rate")
     typed = MS.typed(a)
     if not typed:
         return None
@@ -1730,7 +1900,11 @@ def check_mavlink_rates(a):
     if not bool(getattr(a, "mavlink_set_rates", True)):
         notes.append("--no-mavlink-set-rates: NOTHING is requested — the "
                      "vehicle keeps the rates it was last asked for (by "
-                     "anyone).")
+                     "anyone)"
+                     + (" — and --dvl_pose's heading needs RAW_IMU at >= "
+                        f"{DVL_POSE_MIN_RAW_IMU_HZ:g} Hz"
+                        if dvp in ("shadow", "control") else "")
+                     + ".")
     if res["policy"] == "legacy":
         notes.append(
             f"{MS.LEGACY_FLAG} {res['legacy_hz']}: the LEGACY request, "
@@ -1791,7 +1965,7 @@ def main(argv: list[str] | None = None) -> int:
     if bad:
         print(f"rov_gui: {bad}", file=sys.stderr)
     for check in (check_slam, check_fstereo_process, check_policy,
-                  check_mavlink_rates):
+                  check_mavlink_rates, check_state_noise_policy):
         got = check(a)
         if not got:
             continue

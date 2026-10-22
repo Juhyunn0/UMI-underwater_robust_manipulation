@@ -606,4 +606,7 @@ def test_world_frame_exports_are_byte_identical_to_the_pre_change_module(low, pd
     # carries either block, so both read "none")
     assert mn.pop("velocity_source") == {"export": None, "station": None}
     assert mn.pop("obs_guard_trained", None) is None
+    # (2026-10-18: the pwm LOWs' heave trim, off by default — rl_pwm.trim_and_cap; test_rl_pwm_heave_trim.py)
+    assert mn.pop("heave_trim_n", 0.0) == 0.0
+    assert (mn.pop("heave_trim", None) or {"applied": False})["applied"] is False
     assert mn.pop("obs_goal_frame") is False and mn == mo

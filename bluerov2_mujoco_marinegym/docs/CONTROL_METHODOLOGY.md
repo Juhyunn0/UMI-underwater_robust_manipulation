@@ -2068,3 +2068,766 @@ LEVEL q_des, so a 7-dim policy's roll/pitch were out of its distribution.
   and may lose tags (no dropout bridge on paths), the tether twists one turn per lap, the reported origin sits behind the
   true yaw pivot so an in-place turn may translate the hull, and START's first turn is an unramped yaw step (KNOWN_ISSUES
   "square `yaw = travel`").
+
+## 2026-10-18 — The DVL gives the position too: `--dvl_pose` (DVL dead-reckoned pose + a TAG FIX switch; zero water runs)
+
+* **Why:** the station's state is the tag state. `StateAssembler.step` makes no state without a fresh fix, and since
+  2026-10-01 the DVL is only a velocity source (`nu[0:2]`), so a tag dropout disengages after `tag_stale_s` 0.7 +
+  `tag_stale_hold_s` 0.4 — 15 of the 54 disengages on 2026-10-17 [측정: data/20261017/*/events.log]. Operator request
+  (2026-10-17): use the tags only for the first pose and re-corrections, and with the button off estimate the position
+  from the DVL alone. The companion question — why the DVL cannot be used "from the start" (each session must prove the
+  mount against the tag velocity before IN, and even IN, x/y/yaw come from the tags only) — is the same gap.
+* **What (theory):** the standard AUV navigation structure — dead reckoning on DVL velocity and an attitude reference,
+  with intermittent absolute fixes (AprilTags here). The axis split is the station bridge's (absolute: z = barometer,
+  roll/pitch = autopilot; integrated: x, y, yaw). Instead of an EKF that would have to be tuned without data, TAG FIX ON
+  **passes the tag state through** (the controller sees what it sees today — a clean A/B, unchanged RL observations) while
+  the dead reckoning is re-anchored every tick and takes over in a dropout. The heading integrates the RAW_IMU gyro (the
+  compass field bends in this pool) with a bias learnt from the tags.
+
+  ```
+  v_o,k = R_mount v_dvl,k − ω(t_k) × r_dvl                          (body origin, FRD — DvlAid, existing)
+  p(t_k) = p(t_k−1) + ½ [R(φ,θ,ψ(t_k−1)) v_o,k−1 + R(φ,θ,ψ(t_k)) v_o,k]_xy · (t_k − t_k−1)     (Δ ≤ 0.6 s)
+         = p(t_k−1) + [R v_o,k−1]_xy · 0.45 s                       (Δ > 0.6 s: committed as it was shown)
+  p(t)   = p(t_k) + [R v_o,k]_xy · min(t − t_k, 0.45 s)              (output; > 0.45 s held, > 1.5 s lost)
+  ψ̇ = (q sinφ + r cosφ) / cosθ,      (q, r) = Δ∫ω_RAW_IMU / Δt        (r alone under-turns 1.3–3.1 % at θ 9–14° [유도])
+  ψ(t) = ψ_raw(t) + c − b̂ · (t − t_a)                               (c, t_a: the last anchor; ψ_raw extrapolated at its
+                                                                       own rate up to 0.2 s past the newest sample — link latency)
+  b̂ = slope_t [ψ_raw(t_c) − ψ_tag(t_c)]   over 120 s of TAG FIX ON fixes (span ≥ 60 s, ≥ 200, |res| ≤ 2°)
+  z = d_Bar30 + z_off,  z_off = z_fix(t_c) + δ_z − d_Bar30(t_c)        (z_source tag: the un-bridged fix and the Bar30 then)
+  w = [LP(clamp(ḋ_Bar30, ±0.5)) − R₂₀u − R₂₁v] / R₂₂                 (ḋ on vehicle-clock stamps; intervals < 0.02 s skipped)
+  ON, fresh tag:   η = η_tag + δ;   δ → 0 at 2 cm/s, 1°/s (engaged),  δ = 0 (disengaged)
+  e_k = η_tag,k − η_DR,k  (e_z = z_fix(t_c) − (d_Bar30(t_c) + z_off));   |e_k − e_ref| > 10 cm · 5° · z 10 cm  or a
+        re-acquisition after DR  →  believed after 5 fixes agree within the same limits (collected across tag gaps, 10 s window)
+                            (e_ref = the last accepted e, −δ after a pass-through with no DR;  re-acquired with no DR after a
+                             dead-reckoned pose was shown, e = η_tag − η_shown, the last pose put out)
+  accept:  δ := −e  (the pose is continuous that tick);   engaged, a correction AFTER DR (reacquire, blind) with xy|yaw > 0.25 m · 10°
+           →  fault (control);   a level change with the tags in view all along (jump) and any z difference: slewed whatever its
+           size, with a warning;   δ also slews on DR ticks, on the track
+  OFF:   any of |e| ≥ 0.25 m · 10° · z 0.20 m on 5+ fresh fixes for over 1 s  →  fault (control);  a tick with no tag does not
+         clear that evidence (it expires after 10 s);   ≥ 0.10 m  warning      (abort_* ≤ max_corr_*)
+  hole:  one gap > 1.5 s after the anchor,  or  Σ (gap − 0.45 s) · max(|v|, 0.02 m/s) > 0.10 m (the open gap included, stretches
+         the tags re-anchored excluded)  →  stale until re-anchored
+  control faults:  > 20 s since the tags last VOUCHED for the pose (were it, or were compared within the abort limits);
+                   the 1 s mean of |v_DVL| > 0.30 m/s while DR;   the DVL latched OUT while DR under OFF (at once; stale under ON)
+  ```
+* **How:** `rov_gui/control/dvl_pose.py` (`DvlPose`, `GyroHeading`; no Qt). Worker (`workers.py`): the station bridge's
+  seam — in control mode `meas` := the DVL pose (interlocks, `ctrl.step`, `_eta`, the path clock) and `meas_truth` := the
+  tag state (plot hull, CSV px/py, the EKF's comparison, imu_dr, the policy's proprio). The bridge is bypassed in control
+  (its fresh-fix branch would re-anchor on every DR tick), a follow is demoted to station when the pose is not the tag
+  state, the DP policy counts DR ticks as bridged, and the RL_PWM observation guard is told (min_tags, the DVL sample age)
+  on DR ticks. DVL samples go through `DvlAid.usable` in control (IN + proof) and the new
+  `usable_for_pose(require_in=False)` in shadow. Engage is judged on the pose (refused: no pose / not anchored / DVL not IN and proven /
+  with OFF, every OFF condition). `set_dvl_pose_tag` is accepted **while engaged** (re-correction is its purpose; every row
+  records `tagfix`). `--dvl_pose` builds the DVL; YAML control alone flies shadow; exclusive with EKF / imu_dr control.
+  Backends: `VehicleWorker._note_raw_imu` integrates RAW_IMU **per record** over time_usec (trapezoid; > 0.5 s intervals and
+  reboots counted as gaps, not integrated) and publishes SCALED_PRESSURE2 as its own depth with its own stamp (no clamp);
+  the demo has a synthetic gyro and Bar30, `demo_tag_blackout`, and a synthetic DVL that reads at its mount point. Panel:
+  `TAG FIX ON/OFF` in row2 (live while engaged), a violet DVL-pose ghost, chip `· pose:DVL 12s`. Record: CSV schema 23's
+  20 trailing columns `tagfix, dvp_*`, meta `dvl_pose` (toggles, corrections = "N cm off after T s, D m" at each
+  re-correction, faults, the bias). Decisions and reasons: heading = RAW_IMU (the measurements below); ON = pass-through
+  (today's observations); long gaps committed as shown (filling them with the held velocity put 207–273 cm tails on the
+  60–120 s error [측정: data/20261017/1017_dvl_pose_feasibility/out/summary.json sensitivity]); in v1 a DVL loss is a
+  debounced disengage, not a coast (no coast for path missions yet); control needs the DVL proof (a wrong mount is
+  wrong-signed position feedback).
+* **Review (2026-10-18):** P2 — underwater, control-theory and hardware advisors reviewing independently, the open-loop
+  replay with an independent re-computation (results below), and an implementation review workflow ("Review → fixes"
+  under this entry).
+* **Record (boundary):** CSV schema 23 (`tagfix, dvp_src, dvp_ok, dvp_px/py/pz, dvp_yaw_deg, dvp_u/v/w, dvp_err_m,
+  dvp_err_yaw_deg, dvp_since_fix_s, dvp_dist_m, dvp_gap_s, dvp_corr_m, dvp_bias_dps, dvp_unobs_m, dvp_blind_s, dvp_why`),
+  meta `dvl_pose`. `px…` stay the tag state (ground truth; `nan` without one — such rows are now written). In control, rows with `dvp_src`
+  dr/held did not fly on the tags: never pool their tracking error with tag-flown rows.
+* **Result:** open-loop replay (the 10-13..10-17 tag-flown logs re-computed DVL-only, confirmed by an independent
+  re-computation): 10-17 (new mount), tag-yaw upper bound, 60 s p50/p90 4.4/17.1 cm, 120 s 5.7/20.1 cm, p90 above 10 cm
+  after 15–19 s [측정: data/20261017/1017_dvl_pose_feasibility/out/summary.json, verify/out/agg_curves_perm_drift.txt].
+  Heading at 60 s p50/p95: ArduSub yaw 3.71/12.55°, integrated ATTITUDE rate 2.02/6.94°, RAW_IMU + same-day bias
+  0.36/1.20° [측정: …/sources/heading_lens/out/s5_horizon_rawgyro.txt]; the ATTITUDE rate integrates the compass error
+  (correlation p50 +0.54 [측정: …/verify/out/heading_checks.txt]). Rule of thumb [유도]: a station hold (< 0.3 m net) lasts
+  minutes; moving missions need a re-correction every 15–20 s or accept 10–25 cm in 1–2 min. Unit, worker, panel and
+  backend tests pass ('Review → fixes' below). **Zero water runs.** Remaining limits [예측]: the closed-loop DR error is
+  unmeasured; DVL altitude outside 0.10–0.60 m is unverified; a DVL loss on a path mission ends the run (no coast); Bar30 z
+  and tag z part by 43–57 mm per metre of tag y [측정: …/sources/heading_lens/out/s6_depth_lever.txt] (a map plane
+  ~3° off gravity [유도]); the proof's tolerance (14°/25 %) is loose for a position.
+* **Review → fixes (2026-10-18, seven passes the same day):**
+  - Implementation review (workflow wf_d410d672-cf5: safety, estimator, integration, GUI/backends and tests lenses, each
+    adversarially verified): 40 of 41 findings confirmed (high 5, medium 10, low 25); safety FAIL. Fixed:
+    - finite budgets for tagless DR (blind 20 s, DR speed 0.30 m/s);
+    - DVL-gap holes;
+    - z in the gates, the divergence abort and the correction size;
+    - tags back with no DR judged against the last pose shown;
+    - OFF refused while slewing; ON refused while engaged;
+    - NaN guards; sentinels on rows the controller did not step;
+    - the policy anchored on the flown pose;
+    - a launch refusal below 5 Hz RAW_IMU;
+    - vehicle-clock gyro stamps.
+  - Fix verification (wf_e1708dfd-d7f): 11 of 15 fixed, 4 partly; safety audit FAIL.
+    - Confirmed issues:
+      - (HIGH) a flickering view stopped both the re-anchor and the OFF abort: the pending fixes were cleared on every tick
+        with no tag, and the abort timer reset on every such tick;
+      - (MEDIUM) the unobserved budget was judged only when the next sample arrived;
+      - (HIGH) a DVL gap longer than the ~60 s gyro history skipped the hole rule.
+    - Fixed:
+      - fixes collected across gaps in a 10 s window (`agree_window_s`);
+      - divergence evidence needs 5 fixes and expires after 10 s;
+      - the open gap's share of the budget in real time;
+      - history-independent holes;
+      - a latch is stale under ON;
+      - a dropout with no DR shown passes the tags back;
+      - e_ref = −δ;
+      - shadow records every stop;
+      - a pose fault ends a run on a tick with no pose;
+      - START re-gated at its own instant;
+      - the depth source pinned;
+      - path errors on DR rows;
+      - z_source pressure's START re-calibration followed (disengaged only);
+      - slews continue on the DR track.
+  - Re-verification (wf_9e7cfed7-93e, including a real-log lens): the rules replayed on 120 recorded segments.
+    - Under ON, `--dvl_pose` alone ended 18 of 111 control runs, 13 of them on refused z corrections. Under OFF, the KM median
+      time to a hole was 73 s with the seconds budget [측정: data/20261017/1017_dvl_pose_feasibility/rules_replay/
+      out_round3/].
+    - Cause: the DR z was anchored every tick to the assembler's z, which between fixes is bridged with the **tag
+      finite-difference heave × age**.
+    - Fixed:
+      - the z offset and the z difference taken on the fix itself (at capture) against the Bar30 then;
+      - the ON→DR z split slewed;
+      - jumps (a held level change with the tags in view) and z differences slewed whatever their size; only xy/yaw of a
+        correction after DR ends a run;
+      - the unobserved budget in metres, counted after the anchor and excluding stretches the tags covered;
+      - blind refreshed only when the tags vouch for the pose;
+      - the DR speed taken as a 1 s mean;
+      - Bar30 heave differenced on vehicle-clock stamps, intervals under 0.02 s skipped, clamped at ±0.5 m/s;
+      - gyro latency extrapolated at the yaw rate; gyro staleness on the host arrival;
+      - START refused while re-acquiring; the debounce reset at every START;
+      - a tagless START under pressure keeps the offset;
+      - blind reuses the fixes it already had;
+      - observe runs are not ended by pose faults.
+  - Results:
+    - In the same replay, `--dvl_pose` alone ends 4 of 111 ON runs:
+      - 10–12 cm of unobserved motion (2);
+      - a 0.30 m/s 1 s DVL mean (1);
+      - 35 cm xy after the DVL died (1).
+    - It carries 16 runs that the station without `--dvl_pose` ended.
+    - OFF: 147.5 s on 10-17 and 25.3 s on 10-15. Most holes are now single DVL dropouts over 1.5 s (151 of 186 on 10-17)
+      [측정: …/rules_replay/out_round4/on_summary.txt, off_summary.txt].
+    - Tests: test_dvl_pose 90, test_dvl_pose_worker 53, test_dvl_pose_panel 10, test_vehicle_gyro 14, all pass.
+    - Mutation checks: the new tests catch all 22 estimator and 4 worker mutants of the round-2 fixes and
+      all 20 estimator mutants of the round-3 fixes; 11 round-3 worker tests fail on the code before them (scratch).
+    - Full suite (per file, robust): 1868 pass, 14 fail. The failures are the 5 that predate this work and 9 in another
+      session's in-progress `test_rl_integral_obs`.
+  - Round-5 verification (wf_acf79996-110) confirmed three things.
+    - (HIGH) Round 4's slewed ON→DR z split was a **ratchet**. Every accepted jump added the split to the correction
+      offset, and the flown z walked away. A sub-gate glitch was compared against itself, so each return was held as a
+      "2× jump".
+    - (HIGH) The gyro's **lateness had no bound**. Staleness was judged on arrival, so a queued downlink flew a heading
+      wrong by rate × lateness (a 20 deg/s pivot: 20 deg/s × (L − 0.2 s), 8–14° at 10-13's L of 0.6–0.9 s [유도]; on the
+      round-4 code's real-log replay the newly flown ticks reached 49.6° [측정: data/20261017/1017_dvl_pose_feasibility/
+      rules_replay/out_round6/evidence/gyro_lag_real_round4code.out]). Bursts of records 1 ms apart read tens of times the rate.
+    - (MEDIUM) A Bar30 spike reached the DR z. The speed stop's 1 s mean let a false lock integrate ~0.3 m before it
+      spoke. A sparse view refused START/OFF for as long as it lasted. A jump whose DR dropped out mid-agreement turned
+      blind and was refused.
+    - The replay engine was wrong too: build2 gave its fixes no `p_ned`, so the round-4 replay never ran the fix-based z.
+  - Fixed (round 5):
+    ```
+    gyro lateness:  L = t_now − t_gyro(newest, vehicle clock)
+                    r = ψ̇ over Δt ≥ 20 ms, clamped |r| ≤ 2.5 rad/s
+                    stale ⇔ L − 0.2 s > 0 ∧ ( |r|·(L − 0.2 s) > gyro_late_deg 3° ∨ L − 0.2 s > gyro_late_max_s 1 s )
+    Bar30 spike:    |d_k − d_acc| > 0.5 m/s·(t_k − t_acc) + 0.02 m  ⇒  d_k refused (until the level has held 1 s)
+    DR z:           z_DR(t) = d(t) + z_off,   z_off = z_fix(t_c) − d(t_c) + off_z     (no ON→DR split carried)
+    accept (slew):  off ← −e_state  (the pose stays where it was);   agreement / jump judged on e_fix (z from the fix)
+    pass-through:   e_ref ← −off   (not the glitch)
+    speed stop:     mean_1s |v_xy| > v_max   ∨   |v_xy|_k > 2·v_max
+    ```
+    - On a dropout tick z steps to the DR z (the Bar30 truth), as the station bridge steps to its pressure depth.
+    - Pending fixes refuse START/OFF only while the newest is under 1 s old (agreement keeps its 10 s window).
+    - A jump that goes on blind stays a jump (slewed, not refused).
+    - Wording: shadow's disengaged line is "a control START now would be refused", and START clears the fault-log key.
+      The banner and the START refusal ("n/5 agree" → "n fixes so far, 5 must agree") are fixed too.
+    - Replay engine: the capture-matched NavFix's `p_ned` goes in; the direct rule is in metres.
+    - `gyro_late_deg` started at 1°. That ended 20 of 23 OFF anchors on 10-13 at a median 3.6 s: 18 on 2.4–5.9 deg/s station
+      corrections (1.0–2.6°), 2 on 10 and 26 deg/s turns; 3 never stopped. It is now 3°, under the 5° the tag gate itself
+      calls one level (`jump_yaw_deg`) [측정: data/20261017/1017_dvl_pose_feasibility/rules_replay/out_round5/
+      off_pass_late1deg.json].
+  - Results (round 5), in the same replay with the fix-based z now actually running:
+    - `--dvl_pose` alone ends 2 of 111 ON runs. Both are pivots on 10-13 (34 deg/s at 0.66 s late, 37 deg/s at 0.79 s),
+      and round 4 ended the same two runs for other reasons. It carries the 16 runs the station ended.
+    - Held jumps per day fall from 54/391/26/260 to 28/161/6/27. (The "largest slewed z 0.437 → 0.189 m" written here
+      was the fix-based z that judged the correction, not the slew. Round-6 correction: the real slew is 0.238 m.)
+    - OFF, KM median to a hole: 137.5 s on 10-17, 21.4 s on 10-15, 82.3 s on 10-13; the metre direct rule's medians agree
+      within 0.06–5.1 s. Counting every stop: 112.1 s on 10-17 and 15.1 s on 10-13 (13 of 23 OFF anchors end on the gyro lateness,
+      5–14 deg/s) [측정: …/rules_replay/out_round5/on_summary.txt, off_summary.txt].
+    - Tests: test_dvl_pose 102, test_dvl_pose_worker 53, all pass.
+    - Mutation check: the new tests catch all 12 round-5 mutants (lateness bound ×2, rate floor and clamp, spike
+      refuse/take/use, 2× stop, 1 s pending bound, jump→blind, e_state, e_ref). At 1° the slow-correction test fails.
+    - Full suite (per file, robust): 1929 pass, 14 fail — the same list as round 4 (5 that predate this work, 9 in the
+      other session's `test_rl_integral_obs`).
+  - Round-6 verification (wf_0e5903e0-a6d — estimator, safety-code-reviewer and replay/docs lenses, one refuter per finding):
+    11 confirmed, 1 refuted.
+    - (HIGH) **Heading anchors taken on a late gyro.** Anchoring at t_now through the extrapolation froze the rotation
+      still in the queue into the offset. Once the backlog drained the late rule went quiet, and the DR flew that error
+      (6–10° synthetic). On the round-5 code's real-log replay, 10-13's anchors were off by p99 20.18°, max 52.97° [측정: …/
+      rules_replay/out_round6/evidence/anchor_err_round5code.txt]. Early in a turn, the queued rotation read as a yaw
+      "jump" that held the right tags and showed the late DR (2 engaged on 10-13, 13.4° [측정: …/evidence/
+      jump_causes_round5code.txt]).
+    - (MEDIUM) **The late rule failed open.** Past the reader's 2 s window the vehicle-clock stamp is dropped. The heading
+      then fell back to the arrival time and read "0.02 s late". The att_rate heading was stamped with the parse time, so
+      the rule never fired there.
+    - (MEDIUM) Round 5's 1 s pending bound let START through during a **re-acquisition already past max_corr**, and the
+      next fix ended the run (round 4 refused it, and the agreement snapped while disengaged). A sibling of this finding
+      was refuted: the stop itself is right, because the pose really is that far off.
+    - (MEDIUM) A jump whose DR dropped out and came back mid-agreement **turned into a re-acquisition**, and a jump over
+      25 cm ended the run.
+    - (LOW) Five issues:
+      - a shadow START on a fault control would have refused was logged as "would have ended";
+      - `_last_depth` was a refused spike;
+      - a Bar30 level change under ON was flown as a z "jump";
+      - a disengage mid-slew read as a jump;
+      - the replay's "slewed z" was the judging value.
+      Doc figures were wrong too (13/101, 8–26°, "every").
+  - Fixed (round 6):
+    ```
+    heading anchor:  on a tag tick, the newest queued fix whose capture the gyro history covers (t_c ≤ t_gyro,newest):
+                     ψ_DR(t_c) := ψ_fix(t_c) + off_ψ        (raw interpolated at t_c; never at t_now through the extrapolation)
+    yaw innovation:  e_ψ = ψ_fix(t_c) − ψ_DR(t_c)    if the history covers t_c
+                     e_ψ = e_ref,ψ   (not judged)    otherwise — x, y, z are still judged
+    one clock:       once a gyro record is on the vehicle clock (from the start with --source hw),
+                     a record the map cannot place  ⇒  lateness unknown  ⇒  stale
+    START / OFF:     refused while a kept re-acquisition (≤ agree_window_s) has |e_xy| > max_corr_m or |e_ψ| > max_corr_yaw
+    Bar30 level:     a refused level taken (1 s hold, or the elapsed-time bound) ⇒ history restarts;
+                     under ON the next fix captured on it re-takes z_off, the z jump test off until then
+    ```
+    - A jump stays a jump through blind and the DR's return (not if the tags dropped meanwhile). The disengaged
+      pass-through reference is 0.
+    - A fault standing at a shadow START is logged once as "a control START would have been refused here", and the meta
+      faults record it as that. It is not counted again as the run's end.
+    - Corrections carry `slew_m / slew_yaw_deg / slew_z_m` (what the slew moves) and `yaw_judged`.
+    - Replay engine changes:
+      - the Bar30 gets its vehicle-clock time;
+      - the real slewed z is used;
+      - the censoring count is recorded;
+      - a missing cache stops the run.
+  - Results (round 6):
+    - `--dvl_pose` alone ends 2 of 111 ON runs. Both are gyro-late stops on 10-13's queued link (0.66 s at 34 deg/s,
+      0.55 s at 10 deg/s). It carries the 16 runs the station ended.
+    - Yaw corrections over 5° per day fall from 3/3/0/0 to 0/0/0/0.
+    - The largest really slewed z is 0.238 m (10-15, a segment whose depth is the clean tag z), and 0.108 m on the
+      segments with a recorded Bar30.
+    - OFF, KM median to a hole: 137.5 s on 10-17, 21.4 s on 10-15, 82.3 s on 10-13. Counting every stop: 112.0 s on 10-17
+      and 12.0 s on 10-13 (15 of 25 OFF anchors end on the gyro lateness) [측정: …/rules_replay/out_round6/on_summary.txt,
+      off_summary.txt].
+    - Tests: test_dvl_pose 117, test_dvl_pose_worker 55, test_dvl_pose_panel 10, test_vehicle_gyro 14, all pass in both
+      envs.
+    - Mutation check: all 14 new estimator tests fail on the round-5 code, and the tests catch all 18 mutants that revert
+      one round-6 fix each. That includes clearing `_z_retake` under z_source pressure, found in self-review.
+    - Full suite (per file):
+      - robust: 1995 pass, 5 fail;
+      - rovgui-pose: 2002 pass, 6 fail.
+      The failures are the 5 that predate this work, plus `test_rl_goal_frame`'s legacy fixture in rovgui-pose. The other
+      session's `test_rl_integral_obs` now passes.
+    - The demo e2e scripts (`demo_e2e_dvl_pose.py`, `demo_e2e_dvl.py`) pass.
+  - Round-7 verification (wf_0a38afc8-48f — estimator, safety-code-reviewer (FAIL), replay/docs lenses, one refuter per
+    finding): most confirmed, 1 refuted (the replay engine's missing need_vclk changed nothing on the replay data).
+    - (HIGH) Round 6's "unjudged yaw = the expected value" **turned every yaw check off**: the OFF 10° stop, the blind
+      vouching, the correction limit and the ON refusal all read 0. A 12–15° heading error could fly on a queued link with
+      nothing to stop it [유도: the round-7 review's synthetic scenarios] (round 5 caught it). 53.3 % of 10-13's compared tag ticks were unjudged [측정: …/rules_replay/out_round7/
+      evidence/yaw_unjudged_round6code.txt]. Agreements that mixed judged and unjudged fixes failed while the DR flew.
+    - (HIGH) **z had the same hole**: with the Bar30 stamped on the vehicle clock, a queued link put the fix capture over 0.5 s
+      past the newest Bar30 stamp. 15.5–47.6 % of the fixes on 10-13's queued segments were judged on the bridged state z
+      [측정: …/out_round7/evidence/fix_z_coverage.txt]. That z "jump" made the replay's mpc_212056 stop (not the gyro lateness
+      alone). (That file's "round 7: 0–2.5 %" came from the pre-lag-guard snapshot; the final round-7 code gives 0–2.6 % —
+      round-8 review [측정: …/rules_replay/out_round8/evidence/fix_z_coverage_pinned.txt].)
+    - (MEDIUM) Three issues:
+      - On an accept tick, queued pre-accept fixes were anchored with the post-accept offset, a step of the level change
+        (8° for a synthetic J = 8° [유도: the round-7 review's synthetic scenario]; ~1.5–2.8° estimated from the real
+        slew_yaw) (a regression from round 5).
+      - The first anchor left raw tag poses pending, which produced a bogus 141 cm "jump" record.
+      - A shadow START on a LOST pose was counted as "would have ended".
+    - (LOW) The blind correction's `yaw_judged` flag was stale. Doc figures were also wrong:
+      - exact values were cited to rounded artifacts;
+      - a p99 was called a max;
+      - the 0.7 s figure had no source;
+      - the cause of the 10-15 yaw-correction drop was misattributed;
+      - 0.0 was reported for days with no recorded Bar30.
+  - Fixed (round 7):
+    ```
+    yaw judgment:   e_ψ = ψ_fix(t_c) − ψ_DR(t_c)   on the NEWEST fix whose capture the gyro history covers, captured
+                    within YAW_EVIDENCE_S (1.5 s) — this tick's on a healthy link, one L old on a queued one
+                    none ⇒ e_ψ = ψ_tag(t_now) − ψ_DR(t_now)   (measured, the queued rotation in it; yaw_judged false)
+                    — never e_ref,ψ ; every yaw check reads this one value
+    Bar30 past its newest stamp (the capture of a queued link):
+                    d(t_c) = d_newest + ẑ·(t_c − t_newest)   while the Bar30 still arrives, t_c − t_newest ≤ depth_stale_s
+    anchor:         ψ_DR(t_c) := ψ_fix(t_c) + off_ψ(when that fix was the pose)
+                    after a SNAP: no dead reckoning until an anchor at or after the new level's capture
+    ON held jump:   no OFF divergence stop (it is slewed when it agrees)
+    heading lag:    lag = |e_ψ,state(t_now) − e_ψ,judged|   (the rotation the gyro history has not delivered)
+                    lag > gyro_late_deg ∧ t_gyro,newest < t(lag) ∧ no agreement pending  ⇒  stale
+                    (a judged fix older than an accepted tag level reads that level change, not a lag: ignored)
+    ```
+    - The late rule cannot see a turn that started within the lateness, because the newest rate is still the old one.
+      The tags measure that lag directly (above). It is not used while an agreement is pending: a tag level change
+      reads the same for L, and it sent a held jump blind past the debounce.
+    - The first anchor empties the pending set, and no raw poses are pended after the raw-pose agreement.
+    - A shadow START uses all of control's START refusals (a fault, no pose, …). A LOST stretch it started in is not
+      counted as the run's end.
+    - Replay engine: need_vclk (as the station), and "–" for days with no recorded Bar30.
+  - Results (round 7):
+    - `--dvl_pose` alone ends 1 of 111 ON runs: a 34 deg/s pivot on 10-13's queued link, 0.66 s late. Round 6's second
+      stop was the bridged state z, and it is gone.
+    - It carries the 16 runs the station ended. Yaw corrections over 5°: 0.
+    - The really slewed z is at most 0.036 m (10-13) and 0.108 m (10-15) on the recorded-Bar30 segments.
+    - OFF, KM median to a hole: 137.5 s on 10-17, 21.3 s on 10-15, 82.3 s on 10-13. Counting every stop: 112.0 s on
+      10-17 and 4.8 s on 10-13. There the heading checks end 19 of the 25 OFF anchors first, because a queued link
+      cannot carry a heading [측정: …/rules_replay/out_round7/on_summary.txt, off_summary.txt].
+    - Of 10-13's 643 tag ticks with the DR heading more than 3° behind, the heading checks were said to block 639 (349
+      of 640 before the lag guard) [측정: …/out_round7/evidence/dropout_yaw_step.txt, dropout_yaw_step_without_lag_guard.txt].
+      **The round-8 review showed this is not a dropout measure**: the check was read after the tick had used its fix. On a
+      real loss-of-view replay the round-7 code carried 142 dropouts with the heading more than 3° off (round 8 below).
+    - Tests: test_dvl_pose 130, test_dvl_pose_worker 56. Of the 13 new estimator tests, 11 fail on the round-6 code. The
+      other 2 pin the lag guard's limits (not while an agreement is pending; cleared by an accept) and catch the mutants
+      that revert them. The new worker test also fails on round 6.
+    - Mutation check: the tests catch 14 of the 15 round-7 mutants (first miscounted as "15 of the 16" — round-8
+      review). The survivor is emptying the pending set at the
+      first anchor. It overlaps the guard that stops pending raw poses after the agreement, and it is kept deliberately
+      as a second defence.
+    - Full suite (per file): robust 2010 pass, 5 fail; rovgui-pose 2016 pass, 6 fail — the same list that predates this
+      work. Both demo e2e scripts pass. `demo_e2e_dvl_pose.py` did sometimes die at interpreter exit AFTER printing
+      PASS (4 of 15 runs, exit 134/139): the driver never called `win.shutdown()`, so the worker threads outlived
+      `main()`. With the `aboutToQuit` hook added, 6 of 6 runs exit 0
+      [측정: data/20261017/1017_dvl_pose_feasibility/e2e_exit_race_20261018/README.md].
+  - Round-8 verification (wf_21856d6c-69a — estimator, safety and replay/docs lenses plus one refuter per finding, on the
+    round-7 code): all 10 findings confirmed, 0 refuted. Most were holes of the queued link (a gyro that arrives late).
+    - (HIGH, a round-7 regression) One tag-yaw outlier fix passed as the pose before the gyro covered it, and once covered
+      it became the **heading's anchor**. Every clean fix after it then read as a jump, was slewed and re-anchored, with no
+      stop. Outliers injected into real records: 19 of 104 cascades on 10-13, 5 of 276 on 10-17
+      [측정: 주입 시험, …/rules_replay/out_round8/evidence/wf_21856d6c-69a_result.json estimator F1].
+    - (HIGH) The heading-lag record was not re-measured while stale and released on time alone. A dropout at a lull in a
+      turn was carried with a wrong heading (round-8 docs F1's examples: 10–27°). A real loss-of-view replay found 142
+      dropouts carried more than 3° off (10 more than 10°, max 30–32°) [측정: …/out_round8/evidence/
+      bridged_dropout_round7code.txt] — do not read "10–27°" as the replay's range (round-9 docs R8D-9). The round-7 "639 of 643 blocked" was no
+      dropout measure.
+    - (HIGH) A short re-acquisition's yaw was judged on fixes from **before** the dropout, so the correction limit was
+      blind and 12–27° errors flew (synthetic). A state difference with lateness in it, taken into the correction, turned
+      wrong once the queue drained and cycled [측정: 합성, same json, estimator F4].
+    - (MEDIUM) One outlier read as heading lag kept the DR stale for L (OFF runs ended).
+    - (MEDIUM) While a jump was held, only `max_blind_s` watched the DR's drift (synthetic: the 15 of 30 seeds stopped
+      blind reached 0.69–0.77 m; over all 30 seeds the true error p50/max is 0.607/0.768 m — round-9 docs R8D-2).
+    - (MEDIUM, pre-existing) A dropout mid-slew read the slew's remainder as the re-acquisition's drift and ended the run.
+    - (LOW) Docs: the mutation count, the fix-z evidence's label, evidence scripts that did not pin their module, and
+      synthetic numbers without a source.
+  - **Operator decisions (2026-10-18)**:
+    - The TAG FIX button, pressed while OFF, corrects **once and goes back to OFF by itself** (TAG FIX ONCE). The use is
+      to clear the drift now and then on a long DR flight.
+    - `max_blind_s` (end a run after 20 s with no tag) is removed (null).
+    - The queue's cause — a banner every ~2 s [측정: data/20261013/1013_param_banner_scan/], read as another client
+      re-asking the parameter list [유도: the same README] (round-9 docs R8D-6) — is said as a **red** `LINK DELAYED`
+      line in the log window.
+  - Fixed (round 8):
+    ```
+    lateness cap:   gyro_late_max_s 1.0 → 0.1   (late − min(t_now − t_hist, 0.2) > 0.1  ⇔  L > 0.3 s  ⇒  no heading)
+                    healthy days L_max 0.123 / 0.13 s;  10-13: 63 % of engaged ticks have L > 0.3 s
+    anchor judgment: anchor on a covered queued fix only if
+                    |wrap(ψ_fix(t_c) + off_ψ,queued − ψ_DR(t_c))| ≤ jump_yaw_deg
+                    (free: no anchor yet, a gyro hole since it, a snap's new level)
+    held-jump drift: e_hold,ref = median(first anchor_n held innovations)
+                    d = e_now − e_hold,ref ;  |d_xy| ≥ abort_err_m ∨ |d_ψ| ≥ abort_err_yaw ∨ |d_z| ≥ abort_err_z
+                    for abort_hold_s over anchor_n fresh fixes  ⇒  stop ("drifted from a held tag jump's level")
+                    accept: |median(pending) − e_hold,ref| > max_corr_*  (engaged)  ⇒  refused
+    re-acquisition as drift:  e_d = argmin_{e, e + off} score(·),
+                    score(x) = max(|x_xy| / max_corr_m, |x_ψ| / max_corr_yaw, |x_z| / max_corr_z)
+                    — the pose shown (e = 0) or the level the correction in flight slews to (e = −off);
+                    used by the accept limit, pending_too_big, the ON divergence watch and the vouching
+    one-shot:       OFF —press→ ON (oneshot) → [anchor_n agree → slew/snap] → off ≈ 0 ∧ no pending → OFF (through OFF's refusal)
+                    no correction in oneshot_timeout_s (10 s) → OFF, uncorrected
+    ```
+    - B and C (a lag-guard redesign, and no accept while lateness is left) were not added: with the cap, the DR is off
+      on a queued link, and their scenarios (L 0.36–0.9 s) are gone. Inside the cap (L ≤ 0.3 s) what is left is
+      rate × L [유도].
+  - Results (round 8, open-loop replay):
+    - **ON**: `--dvl_pose` alone ends 2 of 111 runs, both on 10-13 at the lateness cap. One is new: a jump was held, the
+      cap turned the DR off, and a blind wait of 8 ticks ended the run. The healthy days (10-15/16/17) are as in round 7:
+      0 ended, 16 runs carried, 0 yaw corrections over 5° [측정: …/rules_replay/out_round8/on_summary.txt].
+    - **OFF**: 10-17 hole KM 137.5 s and every stop 112.0 s (as in round 7). 10-13 every stop 1.25 s, all 20 at the cap
+      [측정: …/out_round8/off_summary.txt].
+    - **Real loss-of-view replay**: dropouts carried more than 3° off, 142 → 0 [측정: …/out_round8/evidence/
+      bridged_dropout_round8.txt].
+    - **Outlier injection**: 10-13 19/104 → 0/104, 10-17 5/276 → 0/276 [측정: 주입 시험, …/out_round8/evidence/
+      scan_*_round8.txt].
+    - **Held-jump drift (synthetic)**: true error before the stop or the accept p50/max 0.28/0.38 m (round 7:
+      0.69–0.77 m) [측정: 합성, …/out_round8/evidence/held_jump_drift_round8.txt]. (Round-9 correction: 10 seeds against
+      the 15 blind-stopped of round 7's 30 — not the same statistic. With the same 30 seeds: round 7 0.607/0.768 → round 8
+      0.348/0.555 m; see round 9, R8D-2.)
+  - Tests: test_dvl_pose 145, test_dvl_pose_worker 58, test_dvl_pose_panel 11, test_att_age 27 (the banner at level
+    error).
+    - Of the 15 new estimator tests, 12 fail on the round-7 code. The other 3 pin that round 8 does not overreach: E does
+      not cover a real drift, tags back on the old level are still slewed, and the anchor judgment does not block a
+      re-anchor after a gyro hole.
+    - The new worker tests (the one-shot's timeout and OFF-refusal paths) fail on the round-7 code. Twelve queued-link
+      tests now set the 1.0 s cap explicitly, so they keep pinning that machinery.
+    - The tests catch all 20 round-8 mutants [측정: …/out_round8/evidence/mutants_round8.txt].
+    - Full suite (per file): robust 2032 pass, 5 fail; rovgui-pose 2038 pass, 6 fail — the failures are the same list that
+      predates this work.
+    - Both demo e2e scripts pass (`demo_e2e_dvl_pose.py`: TAG FIX OFF → ONCE… → OFF, 0 timer warnings).
+  - Round-9 verification (wf_f143a3fa-24b — estimator, safety and replay/docs lenses plus one refuter per finding, on the
+    round-8 code): of the 12 findings sent to a refuter, 11 confirmed and 1 refuted (safety R8-2: that the RAW_IMU 5 Hz
+    launch minimum leaves no lateness margin). The 8 not sent to a refuter (mostly docs) were fixed too
+    [측정: …/rules_replay/out_round9/evidence/wf_f143a3fa-24b_result.json].
+    - (HIGH, a round-8 regression) A re-acquisition judged as drift took the **whole** correction in flight as a level.
+      A re-acquisition's own leftover became one too, so each dropout in a chain discounted the previous leftover, and a
+      drift past 25 cm was slewed instead of ending the run (synthetic, estimator R8E-1).
+    - (MEDIUM) The held-jump drift (e − reference) read the estimator's own slew as drift. A hold that began while an
+      earlier correction was slewing stopped on the slew alone (a false stop), or, in the other direction, masked the
+      drift (estimator R8D-2, safety R8-1).
+    - (MEDIUM) A jump → blind → jump round trip threw the hold's reference away and counted the drift from scratch
+      (estimator R8D-1).
+    - (MEDIUM) The docs say z never ends an ON run, but the hold's drift watch could end one on 20 cm of z (docs R8D-3).
+    - (LOW–MEDIUM) The one-shot went back to OFF through OFF's own refusal. A view whose fixes never agree, or a glimpse's
+      leftover pending fixes, held it, so it stayed ON past its timeout (estimator R8O-1, docs R8D-1).
+    - (LOW) The one-shot's own OFF while disengaged overwrote the reason the run ended (safety R8-3). On that tick the CSV
+      `tagfix` differed from the switch the row's pose was computed under (R8-4). Docs: the hold-drift comparison used
+      mismatched statistics (R8D-2); the archived mutation script counted every mutant KILLED with no test run when run
+      from the archive (R8D-4); the evidence scripts read the scratch cache and the live module (R8D-5); other citation
+      fixes (R8D-6, 7, 9, 10).
+  - Fixed (round 9):
+    ```
+    jump part:       off_j ← off          at a jump accept
+                     off_j kept           at a re-acquisition judged on the slew target
+                     off_j ← 0            at a re-acquisition judged on the pose shown, a snap, while disengaged
+                     off_j ← k · off_j    in the decay, the same k per axis group as off
+    re-acquisition as drift:  e_d = argmin_{e, e + off_j} score(·)          (round 8: e + off)
+                     — only a jump's leftover is a level the tags may come back on; a re-acquisition's leftover is flown error
+    held-jump drift: h(e) = e + off                                          (the estimator's own slew is no drift)
+                     e_hold,ref = median(h over the first anchor_n held fixes)
+                     d = h(e_now) − e_hold,ref ;  |d_xy| ≥ abort_err_m ∨ |d_ψ| ≥ abort_err_yaw       (no z)
+                     accept: |median_i(e_i + off_i) − e_hold,ref| > max_corr_m / max_corr_yaw (engaged)  ⇒  refused
+                     e_hold,ref kept through jump → blind → jump (one hold, counted once); e_ref ← −off after each DR-tick slew
+    one-shot OFF:    due = 'done' (accepted ∧ |off_xy| ≤ 1 mm ∧ |off_z| ≤ 1 mm ∧ |off_ψ| ≤ 1e-4 rad)  or  'timeout'
+                     due ∧ anchored ∧ no slew left ∧ the DR can fly  ⇒  drop the pending fixes, OFF
+                     (round 8: through OFF's refusal, which a pending agreement also held)
+    ```
+  - Results (round 9, open-loop replay and synthetic):
+    - **ON and OFF**: as in round 8 — `--dvl_pose` alone ends 2 of 111 runs, 16 runs carried, 0 yaw corrections over 5°.
+      The OFF summary and KM are byte-identical. Jumps held: 10-13 20 → 17 (a hold counted once — reverting just that
+      change gives 20 again), 10-15 153 → 149 [측정: …/rules_replay/out_round9/on_summary.txt, off_summary.txt,
+      evidence/hold_count_check.txt].
+    - **Real loss-of-view replay** 0, **outlier injection** 0/104 and 0/276, fix z 0–3.8 %, yaw unjudged 0 % — as in
+      round 8 [측정: …/out_round9/evidence/].
+    - **Held-jump drift (synthetic, the same 30 seeds)**: true error before the first accept or stop, p50/max, round 7
+      0.607/0.768 → round 8 0.348/0.555 → round 9 0.348/0.555 m. Round 9 stops 4 more runs and refuses 1 accept, all on
+      the hold after the first jump was accepted — drift that round 8's slew had masked [측정: 합성, …/out_round9/
+      evidence/held_jump_drift_round{7,8,9}_30seeds.txt].
+  - Tests: test_dvl_pose 153, test_dvl_pose_worker 61, test_dvl_pose_panel 11.
+    - All 11 new tests (8 estimator, 3 worker) fail on the round-8 code. Two estimator tests fail on an API round 8 does
+      not have; their behaviour is checked by mutants instead [측정: …/out_round9/evidence/new_tests_on_round8.txt].
+    - The tests catch all 13 round-9 mutants (fail-closed: KILLED only when pytest reports failures). On the first run
+      R9M2 (a re-acquisition judged on the pose leaving off_jump behind) survived, so a test for that path was added
+      [측정: …/out_round9/evidence/mutants_round9.txt].
+    - Full suite (per file): robust 2043 pass, 5 fail; rovgui-pose 2049 pass, 6 fail — the failures are the same list that
+      predates this work.
+    - Both demo e2e scripts pass (`demo_e2e_dvl_pose.py`: TAG FIX OFF → ONCE… → OFF, 0 timer warnings).
+  - Round-10 verification (wf_ce59a697-8bd — estimator, safety-code-reviewer and test/mutation-adequacy lenses plus one
+    refuter per finding, on the round-9 code; the session dropped mid-run and the refuter stage was resumed): all 9
+    findings sent to a refuter confirmed, 0 refuted. The 7 lower ones not sent (5 test gaps, 1 wording, 1 score tie) were
+    fixed too. The main session found the largest one (R10E-1) on its own as well
+    [측정: …/rules_replay/out_round10/evidence/wf_ce59a697-8bd_result.json].
+    - (HIGH → MEDIUM, a round-9 regression) A jump accept took the **whole** correction in flight as the jump's part
+      (off_jump). A re-acquisition's leftover and the hold's own DR drift were laundered into a 'level'. With a tag level
+      change in every view, each re-acquisition read only its newest drift (~22 cm) and the pose flew 1.6–1.9 m off in
+      120 s with no stop (synthetic; the one-shot never returned to OFF). The refuter lowered it to medium: it needs a
+      level change in nearly every view, narrower than R8E-1 (estimator R10E-1).
+    - (MEDIUM, a round-9 regression) When a jump → blind → jump round trip's DR came back on an old-level tick, the
+      restored hold reference was never cleared. The next jump, at any later time, was judged against that dead
+      reference: a clean 30 cm jump was refused as '60 cm of drift' with every sensor right (estimator R10D-1, safety R9-2).
+    - (MEDIUM, a round-9 regression) A blind-from-jump accept bounded tags back on the level the jump LEFT as the hold's
+      drift. The whole jump read as drift and a run ended with a correction of 0 (safety R9-1, reproduced by the refuter).
+    - (MEDIUM) The ON re-acquisition watch ended runs on z: on a re-acquisition's own z slew left over, seen sparsely
+      (round-9 regression), and on a first re-acquisition of a 25 cm map-z cluster seen sparsely (rounds 7–9). The docs
+      say z never ends an ON run (estimator R10Z-1).
+    - (MEDIUM) The one-shot's own OFF while disengaged recorded the standing reason instead of its own line. After a bench
+      one-shot the chip kept 'TAG FIX ONCE'; after an E-STOP a second 'disengaged: E-STOP' was recorded (tests R10-1,
+      safety R9-3).
+    - (MEDIUM–LOW) Test gaps: mutants reverting several round-9 rules survived — off_jump kept at an on-target
+      re-acquisition (N31), the correction in flight in the hold's accept bound (N8, N16b), a resumed hold back on the old
+      level (N19), the blind-from-jump bound (N17), 'done' regardless of the pending list (N23), off_jump's yaw decay (N3),
+      and the ON watch discounting only the jump part (N12) (tests R10-2 … R10-8).
+    - (LOW) The launch line said the hold watch judges 20 cm of z, and the hold-drift stop printed a '0 cm z' it never
+      judged (safety R9-4). A re-acquisition score tied on z judged a re-acquisition on a jump's level 'on the pose' and
+      wiped the jump part (estimator R10E-2).
+  - Fixed (round 10):
+    ```
+    jump part at a jump accept:  off_j ← off_j − e_hold,ref           (round 9: off_j ← off)
+                     e_hold,ref = median(e + off over the first anchor_n held fixes) = the jump's own level change
+                     (no hold reference: off_j ← off_j + (off − off_prev))
+                     — a re-acquisition's leftover and the hold's DR drift stay drift
+    restored hold:   DR back from jump → blind on a tick that is not a jump ⇒ unpend (the restored reference too);
+                     a fresh hold starts with no items
+    blind-from-jump: x = e + off;  |x_xy| ≤ jump_m ∧ |x_ψ| ≤ jump_yaw_deg  ⇒  kind blind (the jump is over), no hold bound
+                     else  hold = (|x_xy − ref_xy|, |x_ψ − ref_ψ|),  level = ref
+    ON watch:        _jerr under ON → (err_xy, err_ψ, None)       (z never ends an ON run; OFF keeps abort_err_z_m)
+    score:           s(x) = (max(|x_xy| / max_corr_m, |x_ψ| / max_corr_yaw), |x_z| / max_corr_z)   lexicographic
+    one-shot OFF:    record line = 'TAG FIX OFF (correction in | no correction)' always;
+                     reason kept only when auto ∧ disengaged ∧ reason starts 'disengaged:'
+    ```
+  - Results (round 10, open-loop replay and synthetic):
+    - **ON and OFF**: as in round 9 — `--dvl_pose` alone ends 2 of 111 runs, 16 runs carried, 0 yaw corrections over 5°;
+      the OFF summary and KM are byte-identical. What changed: two jump accepts became blind accepts of the same size
+      (10-13 3.3 cm, 10-15 7.6 cm — tags back inside the gate of the level the jump left: R9-1's path occurs in real
+      records) [측정: …/rules_replay/out_round10/on_summary.txt, on_pass2.json].
+    - **Real loss-of-view replay** 0, **outlier injection** 0/104 and 0/276, fix z 0–3.8 %, yaw unjudged 0 %,
+      **held-jump drift (synthetic)** 0.348/0.555 m — as in round 9 [측정: …/out_round10/evidence/].
+  - Tests: test_dvl_pose 168, test_dvl_pose_worker 63, test_dvl_pose_panel 11, test_att_age 27.
+    - Of the 17 new tests (15 estimator, 2 worker), 10 fail on the round-9 code (at least one per fixed defect). The other
+      7 pin round-9 rules (to kill the surviving mutants) and pass on round 9 too [측정: …/out_round10/evidence/
+      new_tests_on_round9.txt].
+    - The tests catch all 20 round-10 mutants: 10 reverting a round-10 change, and the tenth review's survivors N3, N8,
+      N12, N16b, N17, N19, N23, N31, W1, W2 re-applied. One equivalent mutant (a fresh hold starting with no items — B
+      already closes that path) survives [측정: …/out_round10/evidence/mutants_round10.txt].
+    - Full suite (per file): robust 2060 pass, 5 fail; rovgui-pose 2066 pass, 6 fail — the failures are the same list
+      that predates this work.
+    - Demo e2e: `demo_e2e_dvl_pose.py` passes (TAG FIX OFF → ONCE… → OFF, 0 timer warnings). `demo_e2e_dvl.py` passed all its checks (OK) and then aborted on exit (exit 134) — the known exit race of the drivers that do not call `win.shutdown()` (KNOWN_ISSUES) [측정: data/20261017/1017_dvl_pose_feasibility/e2e_exit_race_20261018/observed/].
+  - Round-11 verification (wf_1e670663-eb4 — estimator and safety-code-reviewer lenses plus one refuter per finding,
+    on round 10's regressions only): all 4 findings sent to a refuter confirmed (1 medium, 3 low). The 1 low one not sent
+    was fixed too [측정: …/rules_replay/out_round10b/evidence/wf_1e670663-eb4_result.json].
+    - (MEDIUM, a round-10 regression) The jump's part was taken from the median of the hold's **first** 5 fixes (the
+      hold reference), so that reference's noise (5–12 cm) went into the correction in flight as 'drift'. The next
+      re-acquisition on the slew target was misjudged both ways — 200 random draws (sparse single-tag fixes, σ 8 cm,
+      2 Hz): misses 12 → 18, false stops 0 → 2 (estimator R11E-1, synthetic).
+    - (LOW, rounds 9–10) A yaw both readings carry tied the larger term of the score, so a re-acquisition on a jump's
+      level was judged on the pose and the jump part wiped — R10E-2's yaw twin (estimator R11E-2).
+    - (LOW) Wording: the refusal text printed a z it does not judge and a '0.2 m' z limit (R11E-3). The DEFAULTS
+      comment's "142 real dropouts" were 142 of 56,455 simulated tag losses (the camera stopped after each fix of the
+      real records) — safety R11-1, a hedge dropped on citation. The launch line and the class docstring left out the
+      ON re-acquisition watch (R11-2).
+  - Fixed (round 10b):
+    ```
+    jump part at a jump accept:  off_j ← off_j + (off − off_prev) + b(m − e_hold,ref)
+                     m = median_i(e_i + off_i) over the agreeing fixes;  e_hold,ref = median over the first anchor_n held fixes
+                     b(d)_xy = d_xy · max(0, |d_xy| − jump_m) / |d_xy|,   b(d)_ψ = sign(d_ψ) · max(0, |d_ψ| − jump_yaw),   b(d)_z = 0
+                     — what THIS accept changed; the leftover stays drift; the hold's shift beyond the jump gate is booked as drift
+    score:           s(x) = (max(a, b), a + b, |x_z| / max_corr_z),  a = |x_xy| / max_corr_m,  b = |x_ψ| / max_corr_yaw   (lexicographic)
+    ```
+  - Results (round 10b, open-loop replay and synthetic):
+    - On the 200 random draws the verdicts equal round 9's (12 misses, 0 false stops). The 12 left are the inherent
+      ambiguity of a drift along the remaining slew, in round 9 too [측정: 합성, …/rules_replay/out_round10b/evidence/
+      noisy_hold_battery/summary.txt].
+    - A wobbling hold (±6 cm) reads a zero drift as 0.001 (round 10: 0.04); a 27.5 cm drift is refused and a 23.9 cm
+      one slewed (round 10 swapped the two) [측정: 합성, same folder, wobble_hold_r9_r10_r10b.txt].
+    - The real-log replay (ON and OFF) is identical to round 10 segment by segment [측정: …/out_round10b/on_pass2.json,
+      off_summary.txt].
+  - Tests (10b): test_dvl_pose 172 (4 new, 1 strengthened), test_dvl_pose_worker 63.
+    - All 5 round-10b tests fail on the round-10 code [측정: …/out_round10b/evidence/new_tests_on_round10.txt].
+    - The tests catch all 26 non-equivalent of the 27 round-10b mutants (R10M4 is equivalent). On the first run R10bM5
+      (the hold's yaw shift never booked) survived; a yaw-booking test was added and that mutant re-run
+      [측정: …/out_round10b/evidence/mutants_round10b.txt].
+    - Full suite (per file, before the yaw-booking test): robust 2063 pass, 5 fail; rovgui-pose 2069 pass, 6 fail — the
+      failures are the same list that predates this work.
+    - Both demo e2e scripts pass (`demo_e2e_dvl_pose.py`: TAG FIX OFF → ONCE… → OFF, 0 timer warnings; `demo_e2e_dvl.py`: OK, exit 0, the known 6 warning lines). The final files (172 estimator tests) pass in both envs: 273 tests over the four dvl_pose files.
+
+
+## 2026-10-18 — RL_PWM retrain pwm12 → pwm13: smoothing inside training, measured-plant / dropout / payload DR, an error-integral observation (+ its station port), a station heave trim (zero water runs)
+
+* **Why:** att14 (`pwm11att14R_s1`) removed the cap-0.5 jitter with measured-plant DR — on 10-17 a 165 s cap-0.5 hold with zero trips and a
+  roll/pitch band RMS of 1.04–1.10 deg/s [측정: data/20261017/1017_204524/mpc_204524.csv; data/20261017/1017_analysis_offline/verify_att14-cap025-vs-05/].
+  What remained: (1) a −9.0° (nose-up) steady pitch error — a P-type response leaves constant disturbances (rest trim, payload, buoyancy) in place
+  [측정: same folder, att14_cap_compare_v2/report.txt]; (2) the operator's request (2026-10-18): smoothing and output parameterization inside training,
+  payload DR / heave trim, and train-evaluate iterations until the result is good; (3) the plant measured on 10-17 — 0.16–0.20 s from a command to the
+  first motion [유도], a thrust gain of 0.49–0.63 of the model over 0.3 s [측정], a roll/pitch ωn² ratio of 0.87 (sim 0.57) [측정], Lua override
+  releases at 2.3–8.0 per minute [측정] (data/20261017/1017_analysis_offline/{verify_joystick-pulse-id/v4/report.txt, hydrostatic_id_poletilt_v2/axis_summary.csv,
+  verify_att14-cap025-vs-05/report.txt}).
+* **What (theory):** (a) smoothing as losses outside the reward — CAPS spatial smoothness (a slightly perturbed observation must give the same mean
+  action), a squared action-change penalty, a floor on the exploration noise. (b) output parameterization wrench6 — a 6-D wrench through a fixed
+  allocation A instead of 8 throttles, which removes the null space (co-contraction) by construction. (c) an error-integral OBSERVATION — a leaky
+  integral of the position and roll/pitch error lets the policy cancel constant disturbances like a PI controller (information, not structure: the
+  gains are learned). (d) DR — command delay, thrust gain, per-axis rotational inertia, actuation dropouts, a payload (a point weight at the jaw).
+  (e) a station heave trim — a constant feed-forward outside the policy.
+  ```
+  CAPS     L = L_PPO + λ_s · mean_b ‖μ(s_b) − μ(s_b + ε_b)‖²,   ε_b ~ N(0, (0.05 · std_batch(s))²),   λ_s = 0.5
+  rate²    r_t ← r_t − 0.05 · ‖a_t − a_{t−1}‖²     (0 → 0.05 over 2400 env steps);   σ_explore ≥ 0.075
+  wrench6  thr = t_max · A a,  a ∈ [−1, 1]⁶,  A = colnorm(pinv(B_thr→wrench));   cap: thr ← s·thr,  s = min(1, cap / max|thr|)
+  I-obs    e_p = clip(p_goal − p_obs, ±1 m)                                     (world z-up)
+           e_a = 2·sign(w)·(x, y) of q_est⁻¹ ⊗ q_des                            (round 1)
+               = (wrap(φ_des − φ_est), θ_des − θ_est)   ZYX                     (round 2: heading-invariant)
+           I ← clip(I·(1 − dt/τ) + m ⊙ dt·e, ±I_max),   τ = 4 s,  I_max = (0.4 m·s, 0.8 rad·s)
+           m = 1  (round 1);   m_i = [|e_i| < c_i],  c = (0.15 m, 0.3 rad)  (round 2: conditional integration)
+           slots = [R(q_est)ᵀ I_p / 0.4,  I_a / 0.8]                            (frame 29 → 34)
+  payload  F_b = R(q)ᵀ (0, 0, −W),   τ_b = r_b × F_b,   W ∈ [0.5, 3] N,   r_b,x ∈ [0.45, 0.55] (pwm12) / [0.30, 0.60] (pwm13) m
+  trim     thr = s · (thr_π + B_v⁺ R(φ, θ)ᵀ (0, 0, F_up)),   prev_action = s · thr_π       (the cap acts on the total; the policy is fed its own share)
+  vel-fine r_t ← r_t + k_z · exp(−(Δv_z / 0.025)²) + k_xy · exp(−(‖Δv_xy‖ / 0.03)²),   Δv = v_goal − v     (round 2)
+  ```
+* **How:** RL_controller — `rov_rl/algorithms/caps_ppo.py` (a copy of rsl_rl 2.3.3 `PPO.update` plus the CAPS lines; bit-identical to stock at λ = 0),
+  `rov_rl/obs_integral.py` + `deploy/obs_builder.py` (numpy twin), `rov_rl/plant_dr.py` (dropout, payload, per-axis inertia), `rov_rl/rewards.py`
+  (att_mid, vel_fine), `configs/dr_presets.yaml` (pwm12, pwm13), `scripts/_launch_pwm12.sh` / `_launch_pwm13.sh`, verdicts `scripts/pwm12_gate.py`
+  (null/cost, full gate, pool gate at 0.5 / 0.25, robustness, square; every threshold [가정]). Station — `rov_gui/control/rl_pwm.py` (heave trim,
+  `trim_and_cap`), `rov_gui/control/rl_policy.py` (`StationErrorIntegrator`, `check_obs_integral`; existing exports bit-identical, zero observation
+  difference against the RL ObsBuilder). Decisions and why: variants P / PI / WI × 2 seeds separate the integral from the output parameterization;
+  every new feature defaults OFF; during HOLD / coast, which training never had, the station only leaks the integral and adds nothing; round 2 keeps
+  only the round-1 winner's family (PI), two strengths of the narrow velocity terms × 3 seeds.
+* **Reviews:** implementation wf_6fbcaea3-398 (5 packages, each reviewed and fixed), station port wf_f9c26d63-9b3 + follow-up wf_92ccfd50-e79
+  (3 lenses incl. safety-code-reviewer, mutation checks, both numpy versions), peg payload wf_3c8c8b7b-d80 (2 verifiers).
+* **Record (boundary):** RL runs `pwm12{P,PI,WI}_s{0,1}` (2026-10-18 05:01), `pwm13{A,B}_s{0,1,2}` (09:48); export `obs_spec.json obs_integral`
+  (round 2 adds the `att_error` / `cond_*` keys). Station meta `controller.obs_integral`, `controller.heave_trim`. The integral state and the trim
+  share are not in the CSV.
+* **Result (round 1, simulator):** 0 of 6 candidates pass every criterion [측정: RL_controller/logs/eval/PWM12_SUMMARY.md, PWM12_GATE.md, PWM12_POOL.json].
+  Best `pwm12PI_s0`: steady pitch 1.34° in pool17 (att14R_s1 6.39°), 1.63° trim11, 0.53° peg; steady z 2.9 cm in hwlike; square xy 0.86×; pool gate
+  PASS at cap 0.5 and 0.25; its one failure is a worst-case pegstep recovery of 8.0 s. That 'slow recovery' is a recovery finished in 2–3 s followed
+  by a 0.2 Hz z wobble crossing the 3 cm band late — 'peg' world z RMS 0.81–1.15 cm for the integral variants vs 0.45–0.70 cm without
+  [유도: RL_controller/logs/r2dev_20261018/round1_wobble/wobble_and_recovery_out.txt]. wrench6 (WI) failed the cost gate on both seeds (predicted current,
+  vertical effort, saturation, sign flips): removing the null space did not make the wrench-space output calmer. Peg analysis: the point-weight sign
+  (nose-down) holds, W is only weakly bounded at 0.4–2.4 N → pwm13 widens the payload x range. Round 2 (pwm13: narrow velocity terms + heading-invariant
+  and conditional integration, 3 seeds) is running. Limits: zero water runs; thresholds [가정]; no integral state in the CSV; the Lua dropouts
+  (4.7/min on 10-17) are covered by training DR only.
+
+
+## 2026-10-19 — RL_PWM retrain rounds 3–5: pool disturbances (current, tether, wash), no bias force, a seed search → the first full pass `pwm16N_s3` (zero water runs)
+
+* **Why:** the best policy after round 2 (`pwm12PI_s0`) had one failing check left (a recovery metric tripped by a late z wobble), and the
+  operator asked for "mostly calm pool, sometimes current". The two hypotheses of the previous entry (thrust-curve step, weak velocity reward)
+  did not explain the z wobble.
+* **What (theory):** (a) pool disturbances as DR — a weak current (25 %), a tether (at its attachment point, OU variation + tugs), wash /
+  circulation (an OU force). (b) remove the COM bias force that acted in every episode, so calm episodes exist. (c) seeds dominate the
+  outcome, so run more seeds of the same recipe.
+  ```
+  current  v_w = (V̄ + Ṽ(t)) [cos θ_c, sin θ_c, 0],  V̄ ~ U[0.02, 0.10] m/s,  Ṽ = Gauss-Markov (τ 20 s),  P(current) = 0.25
+  tether   F(t) = max(0, F0 + x(t)) + tug(t),   x: OU(σ = 0.5 F0, τ ∈ [3, 10] s),   F0 ~ U[0, 2] N,  P = 0.4
+           tug(t) = A sin²(π s / T)  (Poisson 0–2 /min, A ∈ [0.5, 3] N, T ∈ [0.5, 2] s)
+           f_w = F [cos el cos az, cos el sin az, sin el],   f_b = Rᵀ f_w,   τ_b = r_b × f_b,   r_b ≈ (−0.25…−0.15, ±0.03, 0…0.10) m
+  wash     f_w ← a f_w + σ √(1 − a²) ξ,  a = e^(−dt/τ),  σ ∈ [0, 0.4] N (z × 0.5),  τ ∈ [0.3, 1.5] s,  P = 0.4
+  pwm15    bias_force_n [0, 4] N → [0, 0]   (the tether model carries that role)
+  ```
+* **How:** `RL_controller/rov_rl/plant_dr.py` (`TetherModel`, `TurbulenceModel`; off = bit-identical to the previous module —
+  `tests/test_pwm14_dist.py`), `configs/dr_presets.yaml` (pwm14, pwm15), the evaluation shift keys `tether_*` / `turb_*` with
+  `scripts/_pipeline_eval_dist.sh` / `dist_report.py` (disturbance worlds are reported, not gated), `scripts/_pipeline_pwm13_seed.sh`
+  (per-variant preset and resume arguments). Decisions: the calm-water gate stays first; every range is [가정] (nothing measured).
+* **Review:** independent review of the pwm14 disturbance code PASS (0 high/medium, 7 low — `RL_controller/logs/r2dev_20261018/review_pwm14/`).
+* **Result (simulator):** round 3 `pwm14B_s0` — square in a 0.05 m/s current 2.90 cm (PI_s0 6.14), but a larger z wobble (1.30 cm). Round 4
+  `pwm15N_s0` (no bias force) — first to pass every robustness check, one failure left (square z 3.6 cm); integral tau 2 s raised the wobble,
+  the B_s0 fine-tune failed the cost gate. Round 5 (N × seeds 2–7) — **`pwm16N_s3` passes every criterion**: steady pitch 0.78–0.96°, square z
+  1.6 cm, pegdrop worst 5.45 s, pool gate PASS at 0.5 / 0.25 [측정: RL_controller/logs/eval/PWM14_SUMMARY.md, PWM15_SUMMARY.md,
+  PWM16_SUMMARY.md, *_DIST.md]. The z wobble is a lightly damped heave mode driven by sensor noise — zero noise cuts the late ez std PI_s0
+  0.70→0.20, B_s0 1.10→0.42 cm [측정: RL_controller/logs/r2dev_20261018/zwobble/quiet/quiet_summary.txt]. Limits: zero water runs; seeds
+  dominate (0–3 failures with one recipe); the next lever is a cleaner vertical state (Bar30, DVL w — a station change).
+
+
+## 2026-10-19 — `--dvl_pose` TRUST mode: the DVL is believed as the device reports it (`--dvl-trust`, zero water runs)
+
+* **Why:** The first pool attempt to fly on the DVL alone (data/20261019/1019_211310) spent 96 s in gates before OFF was allowed (the DVL
+  proving pass 21:11:45–21:12:07 — "0/60 moving pairs" → "motion along one body axis only" → "not decided yet" — then the gyro bias
+  "34/60 s … 57/60 s"); after OFF the vehicle sank to the floor while a checkpoint was being chosen (altitude 0.10 → 0.04 m), the DVL lost
+  its lock, and START was refused with "a DVL gap of 4.9 s after the anchor (position unknown — TAG FIX ON to re-anchor)"; the run started
+  after a ONCE re-anchor ended in 1.9 s on DvlAid's `dis_fit` hold (the DVL reporting 2–4 cm/s against ~1 cm/s from the tags)
+  [측정: that folder's mission_log.txt, events.log, mpc_211336.csv]. The operator's judgement: "the DVL velocity is better than the tag
+  finite difference, and people fly dead reckoning on a DVL alone — the conditions are excessive; make it convenient."
+* **What (theory):** The tags are not the DVL's judge: they anchor, correct and end a run the pose contradicts. The dead reckoning's
+  validity is the device's own gates.
+  ```
+  strict (the 2026-10-18 reviews 1–10b):   usable = switch ∧ ¬latch ∧ data ∧ proven ∧ ¬flag ∧ ¬dis_*
+                                           OFF needs  anchor ∧ bias ok (60 s) ;  gap > lost_s after the anchor ⇒ HOLE ⇒ no START
+  trust (2026-10-19):                      usable = switch ∧ data ∧ ¬flag          (data: lock, fom, altitude ≥ 0.05 m, jump, stale)
+                                           switch IN ← first sample (mount measured);  OFF needs  anchor only
+                                           gap ⇒ no hole: p resumes, unobserved_m = Σ (gap − hold_s) · max(|v_last|, v_floor)  recorded + warned
+                                           bias: b ← saved fit (age ≤ bias_seed_max_age_h) until this session's fit is ok
+  what still ends an engaged run:          no sample for lost_s;  |pose − tags| > abort_err (xy 25 cm, 10°) for abort_hold_s with tags in view;
+                                           |v_DVL| > max_dr_speed_m_s;  the heading rules (late gyro, gyro hole);  a re-acquisition > max_corr
+  ```
+* **How:** `dvl_pose.trust_dvl` (YAML, default false) ← `--dvl-trust` / `--dvl-strict` (the command line wins). `rov_gui/control/dvl.py`
+  `DvlAid.trust_refusal / usable_trusted / set_use(trust) / arm_refusal(trust)`; `dvl_pose.py` TRUST MODE paragraph, `_gap_warn`
+  (`GAP_WARN_S` 6 s) and `n_gaps_trusted` in place of the hole, `GyroHeading.seed_bias` (state `saved`), meta `trust_dvl / gaps_trusted /
+  bias_seed`; `workers.py` `_dvp_auto_in` (IN at the first sample, only disengaged with no CSV open), `_dvp_save_bias` (an atomic write of
+  `data/dvl_pose_gyro_bias.json` every 10 s once ok), `_dvp_seed_bias` (seeded within 12 h), the launch line's TRUST/strict clause.
+  Decisions: the repository default stays strict (the reviewed gates); trust is switched on from the command line; the bias file is written
+  in both modes (in strict a seed opens no OFF — it is not "ok" — it only improves the anchored heading).
+* **Review:** one safety-code-reviewer pass — FAIL (2 HIGH, 5 MEDIUM, 5 LOW), all fixed. HIGH: (1) the auto-IN undid the operator's OUT on the next sample → once only, an OUT sticks;
+  (2) `unobserved_m` was unbounded — past 25 cm the ONCE the warning asks for ends the run, so no way out → an `unobserved` stop at `max_corr_m` (ends an engaged run / refuses a START; a ONCE snap clears it).
+  MEDIUM: the tag ticks (the blend, strict verdict) and the DR ticks (trust) had different velocity sources → one verdict through `DvlAid.trust`; the gap warning expired after 6 s → kept until a re-anchor;
+  the seed reached strict mode → trust only; the seed file had no heading source or bound → `heading` recorded, seeded only on the same source, within ±0.5 deg/s, from a fit at least the session's own; a fixed temp name → mkstemp. LOW: wording (the YAML default, the `saved` state, lost_s + the debounce), the warning overwrite, the save period 60 s.
+* **Record (boundaries):** meta `dvl_pose.trust_dvl` is the mode. In a trust run the `dvp_src` / `dvl_code` columns' `dis_*` codes are
+  **informational** (the dead reckoning used those samples). A non-zero `gaps_trusted` means motion during a gap is missing from the pose
+  (`dvp_unobs_m`). A `bias_seed` means that session's heading bias was another session's fit.
+* **Results:** synthetic and worker tests only: test_dvl_pose +4 (OFF at once, a gap → a warning and START allowed, the seed),
+  test_dvl_pose_worker +5 (the auto-IN, the command line over the YAML, dead reckoning through a DvlAid hold vs strict HELD/LOST, the bias
+  saved / seeded / expired, the CLI flags), test_dvl +1. The demo e2e passes in strict and in trust (`DVP_TRUST=1`) (updated below).
+  **Zero water runs.** Limits: a wrong DVL is caught only with tags in view; motion during a gap is estimated only; on the floor
+  (altitude < 5 cm) neither mode has a dead reckoning; whether 10-19's `dis_fit` was a device error or DvlAid's low-speed judgement is
+  undecided (KNOWN_ISSUES).
+
+### The same evening — extended to the velocity path (`--dvl` alone): `dvl.trust` (zero water runs)
+* **Why:** a 21:50 pool log (operator-supplied; run folder not identified), flying `--dvl` without a pose: `dvl: HELD (not latched) — DVL
+  disagrees with the tag velocity: alignment (bearing -50 deg: alignment -0.06, the tags see 0.11 of it)` → 1 s later `hold released (slow
+  residual 0.4 cm/s)` → 3 s later `velocity fading to the tag finite difference (DVL has no bottom lock)`. Operator: "the DVL velocity is
+  more accurate than the tags — why take it out for differing from them; drop that condition." The TRUST mode above switched `DvlAid.trust`
+  on only under `--dvl_pose` control; the velocity blend on its own still had the 2026-10-16 holds and latch.
+* **What (theory):** the tags are not the DVL's judge on the velocity path either. A sample's validity is the device's own gates and quality
+  flags; the comparisons with the tags (slow difference, alignment, fit refutation, escalation) keep being computed and recorded, and decide
+  nothing.
+  ```
+  strict (2026-10-16):  usable = switch ∧ ¬latch ∧ mount ∧ data ∧ proven ∧ ¬flag ∧ ¬dis_*     dis_* ⇒ w: 1 → 0 over 0.5 s (tag FD)
+                        escalation ≥ 4 s, or 3 episodes / 60 s ⇒ latch (DVL out until a proof + OUT/IN)
+  trust (dvl.trust):    usable = switch ∧ mount ∧ data ∧ ¬flag                                 (data: lock, fom, altitude, jump, stale)
+                        IN / arm ← mount ∧ data (no proving pass);  dis_* and the latch are recorded only (w stays 1; the next engage arms)
+  still acting:         data gates, R3 flags, the device-configuration latch (latch_acts)
+                        blend gross |v_dvl − LP(v_tag)| > 0.5 m/s is inert at 0.1 m/s ⇒ NO tag cross-check below 0.5 m/s
+  ```
+* **How:** `rov_gui/control/dvl.py` DEFAULTS `trust` (shipped false, primary only — resolve refuses it under legacy), `DvlAid.__init__`
+  `self.trust = cfg["trust"]` (a `--dvl_pose` control pose under trust_dvl still raises it, as before), `resolve_with_opts` applies
+  `--dvl-trust` / `--dvl-strict` to `dvl.trust` too, meta `dvl.trust`; `workers.py` `_dvl_arm_run` ORs `d.trust` into its trust, the setup
+  line says `TRUST (dvl.trust)`, the TRIPPED and "one more latches it" lines say "recorded only"; `__main__.py` help; `hw_mpc.yaml
+  dvl.trust: false`; `command.md`'s `--dvl` line carries `--dvl-trust`. Decision: the repository default stays strict; the operator's runs
+  turn trust on from the command line (as the morning's pose decision did).
+* **Record (boundary):** meta `dvl.trust` and the setup log line. A trust run's CSV `dvl_code` has no `dis_*` because the verdict is off —
+  the monitors still land in `dvl_res_slow_m_s`, `dvl_esc_s`, meta `disagreement.hold_onsets` and `escalation.latches`, whose count is the
+  recorded would-be latches.
+* **Results:** worker tests only: test_dvl +2 (YAML, CLI, legacy refused, IN without a proof; 2 s reversed → no hold, only the device's jump
+  gate and re-acquired flag for 2 ticks; 15 s reversed → a TRIPPED line saying "recorded only", no tripped state on the panel, the run kept,
+  the next engagement armed), the 11 pose trust tests pass. **Zero water runs.** Cost: a wrong DVL velocity enters nu[0:2] with the tags
+  in view; whether the 21:50 event was a device error or a judgement error is still unknown (KNOWN_ISSUES).
+* **Review:** safety-code-reviewer once → FAIL (CRITICAL 1 accepted, HIGH 1, MEDIUM 4, LOW 2) → fixed: (HIGH) the device-configuration
+  latch still acts under trust (`DvlAid.latch_acts`, `CONFIG_TRIP`); (MEDIUM) a recorded latch no longer throws away the proof, the
+  monitors or the slow residual — only the escalation bucket restarts, so the next latch is recorded too (no permanent freeze after the
+  first; rung_admit's refusals kept); the YAML hybrid (dvl.trust true + trust_dvl false, control pose) is refused at setup, and the reverse
+  pair logs where the blend becomes trusted; the panel's IN USE note says "latched, recorded only"; (CRITICAL, accepted) the setup line,
+  the YAML and the README no longer present the 0.5 m/s gross check as a protection — below 0.5 m/s there is no tag cross-check and the
+  mount is the only defence. Left (LOW): the EKF path still honours a recorded latch (conservative); a shadow pose gets the trusted verdict
+  too (meta `trust` is the boundary). Tests +3 (config latch, hybrid refused, reverse-pair log).
+
+## 2026-10-19 — `--policy-dr` / `policy.allow_dr_pose`: the DP on the DVL dead-reckoned pose (a switch for design decision A9; **zero water runs**)
+
+* **Motive (operator):** running the diffusion policy under `--dvl_pose --dvl-trust` stopped after 1.5 s with `POLICY flew on a
+  bridged/DR state for more than 1.5 s — a policy conditioned on an estimated pose is not this run's purpose; holding HERE`. A9
+  (2026-09-02) counts a DR/HELD tick as bridged: plans are skipped (`skip_bridge`) and the mission ends after `policy.stale_s`. The
+  operator: "I want to see whether the diffusion policy succeeds on the DVL's dead reckoning alone" → a switch that turns A9 off.
+* **Design:** YAML `policy.allow_dr_pose` (default **false** = A9 as reviewed) = CLI `--policy-dr` (the flag wins over the YAML, the
+  `--dvl-trust` rule; refused by `check_policy` without `--policy`, `--mpc` and `--dvl_pose` (control)). Acts only under `--dvl_pose`
+  control (`MpcWorker._policy_dr_pose`):
+  - `_policy_bridged`: a DR/HELD tick is not bridged. The station tag-dropout ladder (tier ≠ none) and `--imu-dr` control stay bridged.
+  - `_emit_policy_state`: **a DR tick, with or without a tag in view**, is `fix_fresh = True`, `t_fix = the tick`, eta = the DVL pose
+    flown this tick (`_flown_meas`) — the policy worker (`backends/policy.py`) adds one proprio row per tick and infers. A HELD tick
+    (no usable DVL sample for 0.45 s, pose frozen with u_v = 0) adds no row (and is no stop). A tick with no pose (LOST/FAULT/blind
+    re-acquisition) is no anchor, as before.
+  - Record: run record `dr_ticks` (DR ticks that anchored), `dr_plans` (plans that met a dr/held pose at intake), `dr_installed`
+    (those installed), `dr_pose_active` pinned at ARM; plan lines `dvp_state`; meta `policy.dr_pose{allowed, active, pinned, ticks,
+    plans, installed, blind_bound_s}`, `gates_enforced.bridge_stop_dr_pose` (the A9 stop), `bridge_stop` (the station ladder — false
+    under control, where the ladder is never stepped, `bridge_stop_via: dvl_pose`). The ARM line says `ON THE DVL POSE (--policy-dr)
+    … blind bound …`.
+  - setup: YAML true with a pose that is not in control (no `--dvl_pose`, shadow, demoted) → an `INERT` error line; control with both
+    `dvl_pose.max_unaided_s` and `max_blind_s` null → a "NO blind-flight bound" warning.
+* **Review:** safety-code-reviewer once → **FAIL** (HIGH 1, MEDIUM 5, LOW 3). HIGH: with the A9 stop gone **a dead-reckoned flight with no
+  tag in view has no time bound** (`max_unaided_s`/`max_blind_s` null — operator 2026-10-18, "no blind limit"); `div_max_m` and the
+  workspace box are judged inside the drifting frame and cannot catch the drift (10-17 open-loop p90 > 10 cm after 15–19 s [measured:
+  data/20261017/1017_dvl_pose_feasibility/verify/out/agg_curves_perm_drift.txt]); what remains is `max_run_s` 500 s, the pose's own
+  faults (speed 0.30, lost 1.5 s, unobserved 0.25 m) and the operator's STOP. → **Accepted per the 10-18 operator decision, not
+  forced**: a setup warning + the ARM line + meta `blind_bound_s`; `max_blind_s` is the one-line bound. MEDIUM 5, all fixed: (#2) a DR
+  tick with a tag in view took the `t_capture` branch, so the stamp rule differed from a tagless tick (tick stamp) and `dr_ticks`
+  undercounted → the pose state is tested first; (#3) HELD = a frozen pose was called a "fresh anchor" → no row; (#4) `dr_plans` was
+  an intake count ahead of every gate → `dr_installed` added; (#5) `gates_enforced.bridge_stop: true` under control was vacuous (the
+  ladder never steps) → false + `bridge_stop_via`; (#6) a YAML true could be silently inert → setup `INERT`. LOW: (#7) the refusal reads
+  only the CLI flag (YAML `dvl_pose.mode: control` alone gets `--policy-dr` refused; documented), (#8) the ARM pin, (#9) under observe
+  the ARM line says the drawn plans sit on a drifting frame.
+* **Results (all synthetic):** `test_dvl_pose_worker` +4 (DR/HELD bridged both ways; the anchor branch: tagless, tagged, HELD, no pose,
+  ladder; the whole mission — a 3 s blackout ends in `bridge` with the knob off and goes on with it on, `dr_ticks ≥ 40`, `skip_bridge
+  0`; setup INERT / no-bound warning; the three CLI refusals). After the review fixes the batch (`test_dvl_pose_worker/test_dvl_pose/
+  test_dvl/test_policy/test_attitude_axes`) passes 554 and `test_control`/`test_replay` 151 (running all six files in one pytest
+  process hung on a futex after a child process's glibc `corrupted size` abort — unrelated to this change; split, all pass).
+  e2e `rov_gui/tests/demo_e2e_dvl_pose_policy.py` (stub policy, OFF → START → a 5 s tag blackout → STOP), after the review fixes: **knob on PASS** —
+  all 291 dr ticks dead-reckoned, 242 of them anchored (tag or no tag; the rest precede START, no HELD), 23/23 plans installed (all
+  `dvp_state dr`), skip_bridge 0, end_reason `stop`, the "NO blind-flight bound" warning at setup; **`DVP_POLICY_DR=0` PASS** — ended
+  in `bridge` 1.5 s after START, skip_bridge 3, 0 installed (the stop the operator saw). The first
+  attempt flew 32 s and the stub's straight-ahead chunk left the workspace box (`escalated` — that guard is alive) → the flight is 12 s.
+* **Pool procedure:** `./c3 gui --source hw --allow-command --mpc --fstereo --policy --fstereo-scale 0.5 --fstereo-process --dvl_pose --dvl-trust --policy-dr`
+  → tags in view ~1 s → HIGH Diffusion Policy + ckpt → **TAG FIX OFF** → START. Altitude 0.2–0.5 m (bottom lock). **Zero water runs.**

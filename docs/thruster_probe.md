@@ -14,7 +14,35 @@ $P -m rov_gui.tools.thruster_probe --seq A                   # 기체: ARMED + M
 $P -m rov_gui.tools.thruster_probe --seq E,A,B,D --note "jaw empty, 16.1 V"
 $P -m rov_gui.tools.thruster_probe --seq C                   # 개루프 강성 (±1 N·m)
 $P -m rov_gui.tools.thruster_probe --seq C --free-decay 30   # 자유감쇠 기록 (중립 펄스만)
+$P -m rov_gui.tools.thruster_probe --seq E,A,D --arm         # 2026-10-17: 기체가 DISARMED면 도구가 ARM하고 끝나면 DISARM
 ```
+
+**`--arm` (2026-10-17; 같은 날 safety·MAVLink·테스트 3렌즈 리뷰 + 지적 25건 반박 검증 → 전부 반영).** ArduSub의 조종 입력
+failsafe는 SYSID_MYGCS의 MANUAL_CONTROL/RC override가 `FS_PILOT_TIMEOUT` 동안 끊기면 DISARM한다(`FS_PILOT_INPUT 2`
+[스펙 ArduSub Parameters.cpp 기본값 FS_PILOT_INPUT_DISARM, 3.0 s]; **이 기체의 실제 값은 `--arm` 런마다 읽어
+`probe_run.json["vehicle_failsafe"]`에 기록된다** — 그게 아티팩트다). GCS failsafe(`FS_GCS_ENABLE 2`)는 마지막 heartbeat 뒤
+2.5 s에 DISARM한다 [스펙 Sub-4.5 defines.h FS_GCS_TIMEOUT_MS 2500]. 그래서 §3이 요구하는 대로 QGC와 스테이션을 끄면 기체는 늘
+DISARMED라 `REFUSED: DISARMED`가 났다(`data/20261017/1017_1916*_probe`). `--arm`의 동작:
+1. 사전 점검의 **다른 항목이 전부 통과**해야 한다(MANUAL, 기울기, 깊이 띠, 전류, 메시지 나이, 게이트, 스크립트 하트비트, 팩) + 기체가
+   `FS_PILOT_INPUT = 2`라고 말해야 한다(종료 경로가 그 failsafe에 기댄다; 아니면 거부).
+2. `--arm`인데 **이미 ARMED**로 발견되면 거부한다 — 그 상태는 두 번째 송신자(QGC 조이스틱·스테이션 GUI·이 도구의 다른 인스턴스)가
+   조종 입력을 흘리고 있거나 failsafe가 전제와 다르다는 신호다.
+3. 중립 MANUAL_CONTROL을 1 s 흘린 뒤 **운용자의 ENTER**를 기다린다(30 s 안에 없으면 거부; 스테이션의 길게-눌러 ARM과 같은 "사람의
+   행위"). 재점검 후 COMPONENT_ARM_DISARM을 **한 번**(force 없음) 보내고, 기다리는 동안에도 매 틱 중단 조건을 본다.
+4. 기체 자신의 HEARTBEAT가 5 s 안에 ARMED라고 말할 때만 진행한다. COMMAND_ACK는 기록만 하고 믿지 않는다(ACK ACCEPTED인데
+   HEARTBEAT가 DISARMED면 거부). HEARTBEAT는 1 Hz라 로그의 "x.x s after the request"는 양자화된 값이지 지연이 아니다.
+5. 비행 모드는 절대 바꾸지 않는다(MANUAL이 아니면 거부).
+6. 끝날 때(정상·중단·Ctrl-C 두 번 모두) 중립 버스트 뒤 **ARM 요청이 나갔다면 무조건** DISARM을 보낸다 — 확인이 안 됐어도 늦게 무장됐을 수
+   있고, 이미 DISARMED인 기체에 DISARM은 ACCEPTED no-op이다 [스펙 Sub-4.5 GCS_Common]. 0.5 s마다 재전송하며 2 s 안에 HEARTBEAT가
+   DISARMED라고 하면 멈춘다. 그동안 MANUAL_CONTROL은 보내지 않아 조종 입력 failsafe가 두 번째 경로로 남는다.
+7. `probe_run.json`: `arm_requested`, `arm_sent`, `armed_by_tool`, `t_arm_sent_s`, `t_armed_seen_s`, `n_disarm_sent`,
+   `disarm_confirmed`, `armed_at_exit`, `vehicle_failsafe`, `command_acks`.
+
+드라이런: `--dry-run --arm --dry-disarmed`(기체가 DISARMED로 시작), `--dry-arm-refused`(기체가 ARM을 거부). 합성 기체는 조종 입력
+failsafe(MANUAL_CONTROL과 RC override 둘 다 리셋), 늦은 ARM, ACK만 보내는 ARM, 유실·무시되는 DISARM을 모델한다. 테스트 19건
+(`rov_gui/tests/test_thruster_probe.py` §8). **실기 0런 [예측]** — 첫 실기 `--arm` 런은 추진기가 돌지 않는
+`--seq E --rest-s 5 --arm`으로 ARM → engage → DISARM 수명주기만 확인하고, `probe_run.json`의 `vehicle_failsafe`·`disarm_confirmed`를
+읽은 뒤에 A/B/C/D로 간다.
 
 정책이 날아가는 **바로 그 전송 경로**(RC_CHANNELS_OVERRIDE ch 9..16 → Navigator의 `rl_pwm_override.lua`,
 `rov_gui/control/rl_pwm.py`의 PwmGate 전 항목 통과, 스크립트 하트비트 `RLPWM` 신선)로 추진기 하나씩을 구동해
@@ -68,7 +96,7 @@ B/C/D/E는 수정 계획 1단계(학습 세계 재구축)의 범위를 실측으
 
 실행 전 운용자가 확보할 것:
 
-1. 기체 **ARMED, MANUAL**, 프로펠러 **장착**, 풀 중앙(COM 바닥 위 ≥ 0.6 m), 테더 느슨, **물속에 아무도 없음**(자유감쇠의 기울이기는
+1. 기체 **ARMED, MANUAL**(QGC·스테이션을 끄면 3 s 뒤 스스로 DISARM되므로 실제로는 `--arm`으로 도구가 무장시킨다 — 위 §0), 프로펠러 **장착**, 풀 중앙(COM 바닥 위 ≥ 0.6 m), 테더 느슨, **물속에 아무도 없음**(자유감쇠의 기울이기는
    장대로, 손을 프로펠러 근처에 두지 말 것).
 2. 팩 ≥ 15.5 V(도구가 거부), B의 +300 µs(~25 A [예측])는 15.0 V 이상에서만.
 3. Lua 오버라이드 설치(`rov_gui/tools/install_rl_pwm_lua.py`; 2026-10-01 설치 기록 `data/20261001/1001_145846_vehicle_setup/`),

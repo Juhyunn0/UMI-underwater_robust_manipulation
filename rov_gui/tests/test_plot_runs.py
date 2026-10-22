@@ -568,6 +568,158 @@ def test_the_stamp_survives_the_feed_recording_naming():
         assert r.slug == "20260823_0823_195927_mpc_tuned"
 
 
+# ------------------------------------------- several engagements in one CSV
+#: Three engages in one feed-recording CSV (2026-10-17 22:07:33's shape):
+#: (tag-frame engage pose, LOW, events.log mission line or None). The datums
+#: are exact at the events.log rounding (1 mm, 0.1 deg) so either source
+#: reproduces them.
+ENGAGES = [((0.5, -0.25, -1.0), 30.0, "mpc",
+            "SQUARE started - SQUARE 1.00 x 1.00 m @ 0.05 m/s, 2 lap(s), "
+            "heading_follow=False, origin tag 37"),
+           ((-0.75, 1.0, -0.9), -60.0, "pid", "STATION - STATION hold at tag "
+                                              "74, heading +90 deg (map)"),
+           ((1.25, 0.5, -0.8), 120.0, "mpc",
+            "SQUARE started - SQUARE 1.00 x 1.00 m @ 0.05 m/s, 2 lap(s), "
+            "heading_follow=False, origin tag 74")]
+
+
+def _set(row: str, **kv) -> str:
+    """One CSV row with named fields replaced (HEADER's column order)."""
+    names = HEADER.strip().split(",")
+    f = row.rstrip("\n").split(",")
+    for k, v in kv.items():
+        f[names.index(k)] = str(v)
+    return ",".join(f) + "\n"
+
+
+def _multi_engage_run(base: Path, events: bool = True, meta_yaw=None):
+    """A feed-recording CSV with ENGAGES flown back to back, 5 s apart.
+
+    Each engagement flies the same square in ITS OWN datum frame, so its
+    reference starts at (0, 0) — i.e. at its engage pose in the map. Rows
+    before the first engage and between engagements are disengaged."""
+    d = base / "20261017" / "1017_220707"
+    d.mkdir(parents=True)
+    rows, lines, t = [], [], 0.0
+    for _ in range(10):                           # 0.5 s before the first engage
+        rows.append(_set(_square_rows(laps=1)[0], t=f"{t:.4f}", engaged=0,
+                         traj_on=0, px=9.0, py=9.0))
+        t += 0.05
+    for k, (p0, yaw, mode, mission) in enumerate(ENGAGES):
+        stamp = 22 * 3600 + 7 * 60 + 33 + int(t)       # run.started + t
+        hh, mm, ss = stamp // 3600, stamp // 60 % 60, stamp % 60
+        lines.append(f"2026-10-17 {hh:02d}:{mm:02d}:{ss:02d} ENGAGED ({mode}) "
+                     f"— holding (+0.00, +0.00, +0.00) NED")
+        lines.append(f"2026-10-17 {hh:02d}:{mm:02d}:{ss:02d} ENGAGED ({mode}) "
+                     f"datum p0={list(p0)} yaw0 {yaw:.1f} deg; vehicle "
+                     f"flight mode MANUAL")
+        traj = mission.startswith("SQUARE")
+        if mission:
+            lines.append(f"2026-10-17 {hh:02d}:{mm:02d}:{ss:02d} {mission}")
+        for r in _square_rows(laps=1, offset=0.0, traj_on=traj):
+            rows.append(_set(r, t=f"{t:.4f}", mode=mode))
+            t += 0.05
+        for _ in range(100):                      # released, 5 s
+            rows.append(_set(rows[-1], t=f"{t:.4f}", engaged=0, traj_on=0))
+            t += 0.05
+        lines.append(f"2026-10-17 {hh:02d}:{mm:02d}:{ss:02d} DISENGAGED - released")
+    stem = "c3_fs_depth_20261017_220733_mpc"
+    (d / f"{stem}.csv").write_text(HEADER + "".join(rows), encoding="utf-8")
+    meta = _meta("mpc")
+    meta["run"] = {"started": "2026-10-17 22:07:33"}
+    p0, yaw = ENGAGES[-1][0], ENGAGES[-1][1]
+    meta["hardware"]["datum_tag_frame"] = {
+        "p0": list(p0), "yaw0_deg": yaw if meta_yaw is None else meta_yaw}
+    meta["trajectory"]["origin_tag"] = 74
+    (d / f"{stem}.meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    if events:
+        (d / "events.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return d
+
+
+def test_each_engagement_of_one_csv_is_its_own_figure_in_its_own_datum():
+    """meta.json keeps only the LAST engage's datum; lifting every row with
+    it put 2026-10-17's two aborted squares 0.7-1.6 m from where they flew."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _multi_engage_run(base)
+        runs, skips = PR.discover(base, [("20261017", "")], _cfg(base))
+        assert not skips, skips
+        assert [r.engagement[:2] for r in runs] == [(1, 3), (2, 3), (3, 3)]
+        assert [r.slug for r in runs] == [
+            "20261017_1017_220707_mpc_220733_e1",
+            "20261017_1017_220707_pid_220733_e2",
+            "20261017_1017_220707_mpc_220733_e3"]
+        for r, (p0, _yaw, _m, _l) in zip(runs, ENGAGES):
+            # the reference starts at (0, 0) of its datum = the engage pose
+            assert abs(r.rx[0] - p0[0]) < 1e-6 and abs(r.ry[0] - p0[1]) < 1e-6, \
+                (r.name, r.rx[0], r.ry[0], p0)
+        # what each one flew comes from its own events.log lines
+        assert "origin tag 37" in PR._traj_line(runs[0].meta)
+        assert runs[1].stats["seg"] == "engaged"
+        assert PR._shape(runs[1].meta) == "station"
+        assert runs[1].headline("auto")[0] == "radial RMS"
+        assert "origin tag 74" in PR._traj_line(runs[2].meta)
+        assert runs[2].meta is not runs[0].meta
+        # the 0.5 s logged before the first engage is in no figure
+        assert all(abs(x) < 5 for r in runs for x in r.x)
+
+
+def test_earlier_engagements_are_reported_when_their_datum_cannot_be_trusted():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _multi_engage_run(base, events=False)
+        runs, skips = PR.discover(base, [("20261017", "")], _cfg(base))
+        assert [r.engagement[0] for r in runs] == [3]
+        assert len(skips) == 2 and all("no events.log" in s for s in skips)
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        # events.log's last line disagrees with meta.json: the matching is
+        # wrong somewhere, so nothing earlier is placed on its say-so
+        _multi_engage_run(base, meta_yaw=ENGAGES[-1][1] + 0.5)
+        runs, skips = PR.discover(base, [("20261017", "")], _cfg(base))
+        assert [r.engagement[0] for r in runs] == [3]
+        assert len(skips) == 2 and all("off meta.json" in s for s in skips)
+
+
+def test_the_controller_filter_applies_per_engagement():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _multi_engage_run(base)
+        runs, _ = PR.discover(base, [("20261017", "")],
+                              _cfg(base, controllers=["pid"]))
+        assert [(r.ctrl, r.engagement[0]) for r in runs] == [("pid", 2)]
+
+
+def test_no_line_is_drawn_between_two_trajectory_windows():
+    """Two squares in ONE engagement: the rows between them are a hold, not
+    a straight dash from the end of one to the start of the next."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        a = _square_rows(laps=1)
+        hold = [_set(a[-1], traj_on=0, px=3.0, py=3.0) for _ in range(40)]
+        b = [_set(r, px=float(r.split(",")[1]) + 0.5) for r in _square_rows(laps=1)]
+        rows = [_set(r, t=f"{i * 0.05:.4f}") for i, r in enumerate(a + hold + b)]
+        _write_run(base / "20260814", "2055", "mpc_205520", rows, _meta())
+        r = PR.discover(base, [("20260814", "")], _cfg(base))[0][0]
+        assert r.x.size == len(a) + len(b) and set(r.win) == {1, 2}
+        vx, vy = PR._break_at(r.win, r.x, r.y)
+        assert vx.size == r.x.size + 1 and np.isnan(vx[len(a)])
+        rx, _ry = r.ref_xy(single_lap=True)
+        assert np.isnan(rx).sum() == 1
+        # an aborted first window (lap 0 only) before a 2-lap one: the
+        # one-lap reference picks lap-0 rows of BOTH, adjacent in the arrays
+        b2 = [_set(r, px=float(r.split(",")[1]) + 0.5)
+              for r in _square_rows(laps=2)]
+        rows = [_set(r, t=f"{i * 0.05:.4f}") for i, r in enumerate(a + hold + b2)]
+        _write_run(base / "20260814", "2056", "mpc_205620", rows, _meta())
+        r2 = PR.discover(base, [("20260814", "2056")], _cfg(base))[0][0]
+        rx, _ry = r2.ref_xy(single_lap=True)
+        assert np.isnan(rx).sum() == 1 and rx.size == len(a) + 100 + 1
+        # one window: the very same arrays, so every other figure is unchanged
+        assert PR._break_at(np.ones(5), np.arange(5.0))[0].tolist() == list(range(5))
+
+
 def test_a_station_hold_is_not_quoted_as_cross_track():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)

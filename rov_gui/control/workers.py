@@ -33,6 +33,9 @@ import hashlib
 import inspect
 import json
 import math
+import os
+import re
+import tempfile
 import time
 from collections import deque
 from pathlib import Path
@@ -58,8 +61,10 @@ from .imu_dr import ImuCalibration, ImuDeadReckoner
 from .path_geometry import (PIVOT_CAPTURE_M, RL_INPLACE_TURN_DEG_S,
                             VERTEX_TURN_DEG_S)
 from . import dvl as DV
+from . import dvl_pose as DVP
 from . import rl_ekf as EK
 from . import object_nav as ON
+from . import state_noise as SN
 from . import station_bridge as SB
 from .state_assembler import G_NED, StateAssembler, att_age_v, rot_zyx
 from ..backends.base import TimerWorker
@@ -708,6 +713,33 @@ class TagNavWorker(TimerWorker):
 #: must not be able to pass for.
 OBSERVE_SOLVER_STATUS = -1
 
+
+def _dvp_key(text: str) -> str:
+    """A DVL-pose fault / warning minus its numbers: what the mission log
+    says once per onset (the numbers move every tick)."""
+    return re.sub(r"[-+]?\d+(?:\.\d+)?", "#", str(text))[:64]
+
+
+#: THE DVL POSE's columns (schema 23, 2026-10-18; the note below CSV_HEADER).
+#: --dvl_pose trust mode: a saved gyro bias (data/dvl_pose_gyro_bias.json)
+#: further from zero than this is not seeded — 10x the biases measured on
+#: 10-15 / 10-17 (+1.46, -1.28..-2.38 deg/min = 0.02..0.04 deg/s [측정:
+#: data/20261017/1017_dvl_pose_feasibility/sources/heading_lens/out/
+#: s4_gyro_mag.txt, s5_horizon_rawgyro.txt]); a garbled value would spin
+#: the yaw reference (safety review 2026-10-19). [예측]
+DVP_BIAS_SEED_MAX_DPS = 0.5
+DVP_CSV_COLUMNS = ("tagfix", "dvp_src", "dvp_ok", "dvp_px", "dvp_py",
+                   "dvp_pz", "dvp_yaw_deg", "dvp_u", "dvp_v", "dvp_w",
+                   "dvp_err_m", "dvp_err_yaw_deg", "dvp_since_fix_s",
+                   "dvp_dist_m", "dvp_gap_s", "dvp_corr_m", "dvp_bias_dps",
+                   "dvp_unobs_m", "dvp_blind_s", "dvp_why")
+
+#: THE STATE NOISE's columns (schema 24, 2026-10-19; the note below CSV_HEADER).
+SN_CSV_COLUMNS = ("sn_on", "sn_dx", "sn_dy", "sn_dz", "sn_droll_deg",
+                  "sn_dpitch_deg", "sn_dyaw_deg", "sn_du", "sn_dv", "sn_dw",
+                  "sn_dp_dps", "sn_dq_dps", "sn_dr_dps", "sn_dax", "sn_day",
+                  "sn_daz")
+
 CSV_HEADER = ("t,px,py,pz,rx,ry,yaw_deg,pitch_deg,lap,"
               "rz,ryaw_deg,t_traj,mode,engaged,traj_on,"
               "solver,solver_status,solve_ms,"
@@ -733,7 +765,9 @@ CSV_HEADER = ("t,px,py,pz,rx,ry,yaw_deg,pitch_deg,lap,"
               "i_pred_a,null_v_us,null_h_us,pwm_guard,"
               "att_age_v_s,att_tb_ms,banner_age_s,"
               "w_dvl,dvl_code,dvl_res_fast_m_s,dvl_res_slow_m_s,dvl_esc_s,"
-              "dvl_align,dvl_scale\n")
+              "dvl_align,dvl_scale,"
+              + ",".join(DVP_CSV_COLUMNS) + ","
+              + ",".join(SN_CSV_COLUMNS) + "\n")
 # 2026-09-08: the eleven trailing columns. `pwm1..pwm8` are the vehicle's OWN
 # SERVO_OUTPUT_RAW microseconds per thruster (1500 = neutral; EMPTY when that
 # output is unconfigured or the vehicle has not reported yet), `pwm_age_s` is
@@ -1068,6 +1102,63 @@ CSV_HEADER = ("t,px,py,pz,rx,ry,yaw_deg,pitch_deg,lap,"
 #   RECORD BOUNDARY: never pool velocity statistics (vel_src shares, nu error,
 #   fallback rates) across meta `dvl.selection` — the two modes switch
 #   differently by design.
+# 2026-10-18: twenty trailing columns arrived with schema 23, with
+# --dvl_pose (control/dvl_pose.py; HARDWARE-UNVERIFIED). All empty / `nan`
+# without it. px, py, pz, yaw_deg, pitch_deg and roll_deg stay the TAG state
+# — `nan` on a row with no fresh tag, which under --dvl_pose is WRITTEN (it
+# used to be skipped: the pose that flew it exists). e_along / e_cross are
+# the FOLLOWER's own path errors (under dvl_pose.control: against the pose,
+# the imu_dr / EKF convention — the path cursor and MPCC judge the pose they
+# fly; only with path_following: false are they computed from the tag
+# state) — the tag-truth error is px/py vs rx/ry. An
+# engaged row the controller did not step carries the observe sentinels (u,
+# w nan, solver_status -1). These say what the pose was:
+#   * `tagfix` = the TAG FIX switch this row (1 = tags set / correct the pose,
+#     0 = DVL only); it may change MID-RUN (meta dvl_pose.toggles).
+#   * `dvp_src` = no_anchor | tag (the pose IS the tag state) | blend (the tag
+#     state + a re-correction still being slewed in) | dr (DVL dead
+#     reckoning) | held (dead reckoning with no usable DVL > hold_s: position
+#     held, u = v = 0) | lost | fault; `dvp_ok` = a pose existed.
+#   * `dvp_px/py/pz/yaw_deg` = that pose in px's convention (world FLU, datum
+#     frame while engaged); `dvp_u/v/w` = its body velocity (nu_u's FRD).
+#     Under meta dvl_pose.control true these are what the CONTROLLER flew on.
+#   * `dvp_err_m`, `dvp_err_yaw_deg` = |pose - the fresh tag state| (`nan`
+#     without one) — under tagfix 0 this is the dead reckoning's drift, the
+#     number this mode exists to measure; `dvp_since_fix_s`, `dvp_dist_m` =
+#     time and horizontal path since the last tag correction; `dvp_gap_s` =
+#     age of the newest usable DVL sample; `dvp_corr_m` = the correction still
+#     being slewed in; `dvp_bias_dps` = the RAW_IMU yaw-rate bias in use;
+#     `dvp_unobs_m` = motion left unintegrated since the track's anchor, in
+#     metres (each gap's time beyond the hold x the speed before it, the
+#     open gap included; past dvl_pose.max_unobserved_m the track has a
+#     HOLE); `dvp_blind_s` = time since the tags last VOUCHED for the pose
+#     (were the pose, or were compared within the abort limits; past
+#     dvl_pose.max_blind_s, when set — null by default since 2026-10-18 —
+#     a control run ends);
+#     `dvp_why` = why there is no pose / the fault / the active warning
+#     (commas -> ';').
+#   RECORD BOUNDARY: a row with dvp_src dr|held under control did NOT fly on
+#   the tags — never pool its tracking error with tag-flown rows; and the
+#   `vel_src`/`dvl_code` columns of a tagless row still describe the tag
+#   pipeline ("no_tag"), not the pose.
+#
+# 2026-10-19: sixteen trailing columns arrived with schema 24, with
+# --state-noise (control/state_noise.py; HARDWARE-UNVERIFIED): the noise
+# ADDED to the state the controller was handed on this row. `sn_on` = "" (no
+# --state-noise), 0 (built, nothing added this row — switch OFF, disengaged,
+# observe, or no state), 1 (added). The rest are `nan` unless sn_on is 1:
+#   * `sn_dx/dy/dz` = position noise in px's convention (world FLU);
+#     `sn_droll/dpitch/dyaw_deg` in roll_deg/pitch_deg/yaw_deg's signs;
+#   * `sn_du/dv/dw` (m/s), `sn_dp/dq/dr_dps` (deg/s), `sn_dax/day/daz`
+#     (m/s^2, nudot) in nu_u's FRD body frame.
+# px/py/pz, roll/pitch/yaw_deg and nu_u/v/w stay the UN-NOISED state (every
+# interlock reads it too); the controller flew state + sn_* (when the
+# estimator was the tag state — `est`). EXCEPTION: e_along / e_cross (and
+# path completion / laps / the cursor's leash) come from the path cursor,
+# which projects the NOISED state the controller flies (the meas_ctrl rule):
+# they are the controller's view; the true error is px/py vs rx/ry. sn_on 0
+# inside an ON run = a tick with no state (stale-fix debounce). RECORD BOUNDARY: never pool sn_on 1
+# rows with sn_on 0 rows as one condition (meta state_noise.at_engage).
 
 
 class MpcWorker(TimerWorker):
@@ -1298,6 +1389,23 @@ class MpcWorker(TimerWorker):
         # tick() at 20 Hz with the vehicle engaged (the replay guard's rule).
         self._dvl_fault = ""
         self._dvl_at_engage: dict = {}     # the record (survives disengage)
+        # DVL POSE (--dvl_pose, control/dvl_pose.py, 2026-10-18). None is the
+        # off state — built in setup() only with --dvl_pose / dvl_pose.mode —
+        # and every call site checks it, so a station without it runs the
+        # tick it always ran. `dvp_control` = the controller AND the
+        # interlocks fly on its pose (mode control); otherwise shadow.
+        self.dvp = None
+        self.dvp_control = False
+        # (re-initialised by _setup_dvl_pose; here so a worker that never
+        # ran setup() still answers every call site)
+        self._dvp_last = (None, {})        # (datum-frame meas | None, health)
+        self._dvp_fault = ""
+        self._dvp_logged_state = ""
+        self._dvp_warn_logged = ""
+        self._dvp_at_engage: dict = {}
+        self._dvp_shadow_lost_n = 0        # shadow: consecutive lost ticks
+        self._dvp_shadow_lost_said = False
+        self._dvp_asm_zoff = None          # the assembler z offset last seen
         # THE ROBOT_LOCALIZATION EKF (control/rl_ekf.py, 2026-10-02): the
         # paper's estimator, run beside the assembler on every tick and
         # recorded. None = not built. `ekf_control` is the ESTIMATOR switch
@@ -1308,6 +1416,18 @@ class MpcWorker(TimerWorker):
         # the tag state either way, as under imu_dr control.
         self.ekf: EK.RlEkfNode | None = None
         self.ekf_control = False
+        # THE STATE NOISE (--state-noise, control/state_noise.py, 2026-10-19):
+        # None = not built. `snoise_on` is the NOISE switch (bus.cmd_state_
+        # noise), OFF at start; it changes only while disengaged with no
+        # controller CSV open (the EST rule). Added to `meas_ctrl` only.
+        self.snoise: SN.StateNoise | None = None
+        self.snoise_on = False
+        self._sn_why = "start the station with --state-noise"
+        self._sn_last = None               # the 15-vector this tick added
+        self._sn_at_engage: dict = {}
+        # --state-noise-policy (2026-10-19): the noise each policy START pose
+        # carried this engagement (meta state_noise.policy_starts)
+        self._sn_pol_starts: list = []
         self._ekf_fault = ""               # latched, the _dvl_fault rule
         self._ekf_out = None               # the node's last published output
         self._ekf_meas = None              # ...as {eta, nu, nudot}, datum frame
@@ -1391,6 +1511,10 @@ class MpcWorker(TimerWorker):
         # tick eta). One row per fix, 3 s deep, cleared at engage.
         self._policy_eta_hist = None       # policy_frames.EtaHistory
         self._policy_hist_last_fix = None
+        # --state-noise-policy (2026-10-19): the un-noised twin of the history
+        # above, same stamps — built only when the DP is shown the noise, and
+        # read only by the record (plans.jsonl sn_policy).
+        self._policy_eta_hist_truth = None
         # Open-loop jaw width (v2 A12), alive from setup() for the whole
         # process — every cmd_gripper_drive (pilot AND policy) integrates it.
         self._grip_est = None              # policy_frames.GripperWidthEstimator
@@ -1488,6 +1612,11 @@ class MpcWorker(TimerWorker):
             self.cfg.policy["ckpt"] = str(self.opts.policy_ckpt)
         if getattr(self.opts, "policy_repo", None):
             self.cfg.policy["repo"] = str(self.opts.policy_repo)
+        if bool(getattr(self.opts, "policy_dr", False)):
+            # --policy-dr (2026-10-19): the DP flies on the DVL dead-reckoned
+            # pose under --dvl_pose control (hw_mpc.yaml policy.allow_dr_pose
+            # is the other spelling; the flag wins, like --dvl-trust)
+            self.cfg.policy["allow_dr_pose"] = True
         # ONE root per run. --rec-dir governs the recorders and the nav
         # recording; without this line hw_mpc.yaml's log_dir governs the CSV
         # and events.log independently, and `--rec-dir /media/ssd/runs` would
@@ -1515,6 +1644,9 @@ class MpcWorker(TimerWorker):
         self._setup_station_bridge()
         self._setup_dvl()
         self._setup_ekf()
+        self._setup_dvl_pose()
+        self._policy_dr_setup_check()
+        self._setup_state_noise()
         self._setup_object_nav()
         self._setup_policy()
         # Both controller families are built up front: the PID costs nothing
@@ -1679,6 +1811,8 @@ class MpcWorker(TimerWorker):
             w_init=float(pc["gripper_width_init_m"]),
             travel_s=float(pc["gripper_travel_s"]))
         self._policy_eta_hist = EtaHistory(keep_s=3.0)
+        self._policy_eta_hist_truth = (EtaHistory(keep_s=3.0)
+                                       if self._sn_policy_cfg() else None)
         R_bc, t_bc = self.nav_cfg.R_t_frd_cam("main")
         off = pc.get("tcp_offset_cam_m")
         if off is None:
@@ -1963,18 +2097,24 @@ class MpcWorker(TimerWorker):
         else:
             sel = (". selection LEGACY (the 2026-10-01..15 ladder: re-entry, "
                    "innovation gate, latching trips)")
+        if primary and cfg["trust"]:
+            # (2026-10-19 dvl.trust / --dvl-trust: the velocity path flies
+            # on the device's word — say what no longer acts, and what does)
+            sel += ". " + self._dvl_trust_sentence("dvl.trust")
+        need = ("IN needs the mount and DVL data (TRUST — no proof)"
+                if primary and cfg["trust"] else
+                "IN needs the mount proven against the tag velocity"
+                + ("" if cfg["require_proven"] else
+                   " — require_proven is FALSE (recorded opt-out of the "
+                   "first proof; the escalation and device-configuration "
+                   "latches stay armed)" if primary else
+                   " — require_proven is FALSE (recorded opt-out; the "
+                   "runtime trips stay armed)"))
         self._log(
             "warn", f"dvl: built ({cfg['host']}:{cfg['port']}), switch "
                     f"{'IN' if self.dvl.use else 'OUT (shadow)'}; {m}. "
                     f"HARDWARE-UNVERIFIED — thresholds are [예측]. The switch "
-                    f"changes only while disengaged; IN needs the mount "
-                    f"proven against the tag velocity"
-                    + ("" if cfg["require_proven"] else
-                       " — require_proven is FALSE (recorded opt-out of the "
-                       "first proof; the escalation and device-configuration "
-                       "latches stay armed)" if primary else
-                       " — require_proven is FALSE (recorded opt-out; the "
-                       "runtime trips stay armed)") + sel)
+                    f"changes only while disengaged; {need}{sel}")
         if primary:
             # A legacy-only key tuned at the pool would change NOTHING under
             # primary: say so, once, where the operator reads.
@@ -2038,6 +2178,7 @@ class MpcWorker(TimerWorker):
                 self._dvl_note_proof(was, trips)
             except Exception as e:                               # noqa: BLE001
                 self._dvl_trip_fault("sample", e)
+            self._dvp_note_dvl(sample)
             return
         try:
             if sample is not None and not self._dvl_fault:
@@ -2048,6 +2189,8 @@ class MpcWorker(TimerWorker):
                     self._dvl_note_proof(was, trips)
                 except Exception as e:                           # noqa: BLE001
                     self._dvl_trip_fault("sample", e)
+                # --dvl_pose: the same sample, as the aid just judged it
+                self._dvp_note_dvl(sample)
         finally:
             self._ekf_feed("dvl", sample)
 
@@ -2096,6 +2239,33 @@ class MpcWorker(TimerWorker):
                                f"{rpy[2]} deg — the yaw is applied TWICE. Set "
                                f"one of them to 0.")
 
+    @staticmethod
+    def _dvl_trust_sentence(source: str, pose: bool = False) -> str:
+        """The operator's record of what trust switches off and what still
+        stands — logged wherever DvlAid.trust is switched on (the "dvl:
+        built" line, or a control pose under dvl_pose.trust_dvl). Review
+        2026-10-19: name the gap, not a protection that is inert — the
+        blend's gross limit is 0.5 m/s, so at this vehicle's speeds there
+        is NO cross-check against the tags. ``pose``: a control pose is
+        still checked by its own divergence abort with tags in view."""
+        gap = ("Below 0.5 m/s the velocity blend has NO cross-check against "
+               "the tags (its gross limit is 0.5 m/s); the control pose is "
+               "still checked by its divergence abort and correction limit "
+               "with tags in view, and the mount in hw_mpc.yaml is what "
+               "stands between a wrong sign and the controller's velocity"
+               if pose else
+               "Below 0.5 m/s there is NO cross-check against the tags at "
+               "all (the blend's gross limit is 0.5 m/s): a wrong-signed DVL "
+               "flies at full weight, and the mount in hw_mpc.yaml is the "
+               "only thing between a wrong sign and the controller")
+        return (f"TRUST ({source}): the DVL is believed as the device reports "
+                f"it — IN and the engagement need the mount and DVL data (no "
+                f"proving pass); no tag-velocity hold takes a sample away; a "
+                f"disagreement that latches is RECORDED ONLY (the switch "
+                f"stays IN; the next one is recorded too). {gap}. Still "
+                f"acting: the data gates, the quality flags, the "
+                f"device-configuration latch")
+
     def _dvl_note_proof(self, was: bool, trips: int) -> None:
         """Say it ONCE when the mount becomes proven, and once per trip.
         (primary: a trip is one of the two LATCHES — an escalation or the
@@ -2119,6 +2289,18 @@ class MpcWorker(TimerWorker):
                        f"and then set the switch OUT and IN. Check the mount "
                        f"(dvl.mount_rpy_deg, the device's mounting rotation "
                        f"offset), the lever arm and the bottom lock first.")
+            if getattr(d, "trust", False) and not d.latch_acts():
+                msg += (" TRUST MODE: recorded only — the DVL stays IN as "
+                        "reported (the velocity blend, and a control pose, "
+                        "keep flying it); the checks are the device's own "
+                        "gates and, for the pose, the divergence abort with "
+                        "tags in view; the switch OUT is yours to press. The "
+                        "next lasting disagreement is recorded too.")
+            elif getattr(d, "trust", False):
+                msg += (" TRUST MODE: this latch still ACTS — the device's "
+                        "own output changed, which the mount no longer "
+                        "describes; the DVL is out until you set the switch "
+                        "OUT and IN (no proving pass under trust).")
             self._log("error", msg)
             if self.engaged:
                 self._event(msg)
@@ -2206,7 +2388,8 @@ class MpcWorker(TimerWorker):
             self._log("warn", f"ctrl: {self.reason}")
             return
         try:
-            why = self.dvl.set_use(on)
+            why = self.dvl.set_use(on, trust=bool(self.dvp_control
+                                                  and self._dvp_trust))
         except Exception as e:                                   # noqa: BLE001
             self._dvl_trip_fault("switch", e)
             why = "DVL code fault"
@@ -2214,6 +2397,9 @@ class MpcWorker(TimerWorker):
             self.reason = f"DVL switch refused: {why}"
             self._log("warn", f"ctrl: {self.reason}")
             return
+        if not on:
+            # (trust mode: the operator's OUT is final — no auto-IN after it)
+            self._dvp_auto_in_done = True
         self.reason = (f"DVL {'IN' if on else 'OUT (shadow)'}"
                        + (" (re-armed)" if rearm else ""))
         self._log("warn" if on else "info",
@@ -2258,16 +2444,21 @@ class MpcWorker(TimerWorker):
         self._dvl_run_ok, self._dvl_run_why = False, ""
         if d is None:
             return
+        # (--dvl_pose trust mode: the pose, which the controller flies,
+        # takes the DVL as reported — no latch, no proof — so the run is
+        # armed on the same terms: dvl_pose.py TRUST MODE)
+        trust = bool(self.dvp_control and self._dvp_trust) \
+            or bool(getattr(d, "trust", False))     # dvl.trust (2026-10-19)
         if not d.use:
             self._dvl_run_why = "DVL is OUT (shadow)"
         elif self._dvl_fault:
             self._dvl_run_why = "DVL code fault"
-        elif d.tripped:
+        elif d.tripped and not trust:
             self._dvl_run_why = "DVL tripped before engage"
         else:
             try:
-                why = (d.arm_refusal() if self._dvl_primary()
-                       else d.refusal(True))
+                why = (d.arm_refusal(trust=trust) if self._dvl_primary()
+                       else d.refusal(True, trust=trust))
             except Exception as e:                               # noqa: BLE001
                 # set_engaged must not die on the DVL's bookkeeping.
                 self._dvl_trip_fault("arm", e)
@@ -2398,8 +2589,10 @@ class MpcWorker(TimerWorker):
         # — one more latches it. Any switch state (a shadow DVL can be
         # latched too, and the operator should hear it before switching IN).
         for _t, text in d.take_warnings():
-            msg = (f"dvl: {text} — one more latches it. Check the mount, the "
-                   f"lever arm and the bottom lock.")
+            msg = (f"dvl: {text} — one more latches it"
+                   + (" (trust mode: recorded only, the DVL stays IN)"
+                      if getattr(d, "trust", False) else "")
+                   + ". Check the mount, the lever arm and the bottom lock.")
             self._log("warn", msg)
             if self.engaged:
                 self._event(msg)
@@ -2801,6 +2994,8 @@ class MpcWorker(TimerWorker):
             return f"EKF code fault ({self._ekf_fault})"
         if self.dr_control:
             return "imu_dr is in CONTROL (one estimate flies)"
+        if self.dvp_control:
+            return "--dvl_pose is in CONTROL (one estimate flies)"
         if not self._ekf_ok:
             return f"EKF not ready: {self._ekf_why}"
         # Every "here" target (the engage hold, a mission's origin) is set
@@ -2926,6 +3121,1135 @@ class MpcWorker(TimerWorker):
                   "ctrl: ESTIMATOR TAG — the controller is handed the state "
                   "assembler's state; the EKF keeps running in shadow")
         self._log_event(self.reason, pending=True)
+
+    @Slot(bool)
+    def set_dvl_pose_tag(self, on: bool) -> None:
+        """The panel's TAG FIX switch (bus.cmd_dvl_pose_tag) under
+        --dvl_pose: True = AprilTag fixes set / correct the DVL pose, False =
+        DVL-only dead reckoning. Accepted WHILE ENGAGED (unlike the DVL and
+        EST switches): a re-correction mid-run is what it is for, and every
+        CSV row says which way it stood (``tagfix``). OFF is refused until
+        the dead reckoning can carry the vehicle (DvlPose.tag_refusal). ON
+        from OFF is a ONE-SHOT (2026-10-18, the operator's use — clear the
+        drift now and then): one correction, then OFF again by itself
+        (_dvp_oneshot_tick). The button re-syncs from MpcStatus.dvp_tag_on /
+        dvp_oneshot (honesty rule)."""
+        on = bool(on)
+        if self.dvp is None:
+            self.reason = ("TAG FIX switch refused: no DVL pose built (start "
+                           "with --dvl_pose)")
+            self._log("warn", f"ctrl: {self.reason}")
+            return
+        if on == self.dvp.tag_on:
+            return
+        why = self._dvp_tag_refusal(on)
+        if why:
+            self.reason = f"TAG FIX {'ON' if on else 'OFF'} refused: {why}"
+            self.dvp.say(self.reason, now())
+            self._log("warn", f"ctrl: {self.reason}")
+            return
+        if on:
+            self._dvp_start_oneshot(now())
+        else:
+            self._dvp_set_tag(False, now())
+
+    # ------------------------------------------------------------- DVL pose
+    def _setup_dvl_pose(self) -> None:
+        """--dvl_pose (control/dvl_pose.py, 2026-10-18; HARDWARE-UNVERIFIED).
+
+        Built after the DVL (it flies on it) and the EKF (one estimate flies:
+        --ekf control, like imu_dr control, takes a dvl_pose control down to
+        shadow). ANY failure here disables the DVL pose only — never the
+        worker (the dvl / ekf rule)."""
+        self.dvp, self.dvp_control = None, False
+        self._dvp_last = (None, {})
+        self._dvp_fault = ""
+        self._dvp_logged_state = ""
+        self._dvp_warn_logged = ""
+        self._dvp_fault_logged = ""
+        self._dvp_start_fault = ""
+        self._dvp_at_engage: dict = {}
+        self._dvp_shadow_lost_n = 0
+        self._dvp_shadow_lost_said = False
+        self._dvp_oneshot_said = ""
+        self._dvp_asm_zoff = None
+        self._dvp_trust = False
+        self._dvp_bias_saved_t = None
+        self._dvp_bias_seed = None
+        self._dvp_auto_in_said = ""
+        self._dvp_auto_in_done = False
+        try:
+            raw = dict(getattr(self.cfg, "dvl_pose", None) or {})
+            # --dvl-trust / --dvl-strict (2026-10-19) win over the YAML
+            cli_trust = getattr(self.opts, "dvl_trust", None)
+            if cli_trust is not None:
+                raw["trust_dvl"] = bool(cli_trust)
+            cfg = DVP.resolve(raw)
+        except Exception as e:                                   # noqa: BLE001
+            self._log("error", f"dvl_pose: config error: {e} — DISABLED")
+            return
+        mode, note = DVP.mode_from(cfg["mode"],
+                                   getattr(self.opts, "dvl_pose", None))
+        if note and mode == "shadow" and cfg["mode"] == "control":
+            self._log("warn", f"dvl_pose: {note}")
+        if mode == "off":
+            return
+        if self.dvl is None:
+            self._log("error", "dvl_pose: no DVL was built (dvl.enabled false, "
+                               "or its config failed — see the dvl: lines "
+                               "above) — the DVL pose is DISABLED")
+            return
+        if not self._dvl_primary():
+            # The pose judges every sample with DvlAid.usable / usable_for_pose,
+            # whose flags and holds are selection primary's; the legacy
+            # ladder's own holds (innovation, re-entry) never reach them, so
+            # under legacy the dead reckoning would integrate samples the
+            # ladder is holding back.
+            self._log("error", "dvl_pose: needs dvl.selection primary (the "
+                               "legacy ladder's holds are not the pose's) — "
+                               "the DVL pose is DISABLED")
+            return
+        if mode == "control" and (self.dr_control or self.ekf_control):
+            other = "imu_dr" if self.dr_control else "the EKF (--ekf control)"
+            self._log("error", f"dvl_pose: control REFUSED — {other} is in "
+                               f"CONTROL and only one estimate can fly; the "
+                               f"DVL pose runs in shadow")
+            mode = "shadow"
+        try:
+            self.dvp = DVP.DvlPose(
+                cfg, mode=mode, nudot_source=self.cfg.nudot_source,
+                imu_stale_s=float(self.cfg.engage["imu_stale_s"]),
+                z_from_fix=(str(getattr(self.asm, "z_source", "tag"))
+                            == "tag"),
+                # the station's hardware: a gyro record not placed on the
+                # vehicle clock is lateness unknown — never fresh (round 6)
+                need_vclk=(str(getattr(self.opts, "source", "")) == "hw"))
+        except Exception as e:                                   # noqa: BLE001
+            self._log("error", f"dvl_pose: {type(e).__name__}: {e} — DISABLED")
+            self.dvp = None
+            return
+        self.dvp_control = mode == "control"
+        self._dvp_trust = bool(cfg["trust_dvl"])
+        if self.dvp_control and not self._dvp_trust \
+                and bool(getattr(self.dvl, "trust", False)):
+            # (review 2026-10-19: a YAML-only pair — dvl.trust true,
+            # dvl_pose.trust_dvl false — would dead-reckon on the trusted
+            # verdict while the pose's own strict gates stay on: a hybrid
+            # nobody designed. --dvl-trust sets both; so must the YAML.)
+            self._log("error", "dvl_pose: dvl.trust is true but "
+                               "dvl_pose.trust_dvl is false — a control pose "
+                               "needs the two to agree (--dvl-trust sets "
+                               "both, --dvl-strict clears both) — DISABLED")
+            self.dvp, self.dvp_control = None, False
+            return
+        if self.dvp_control and self._dvp_trust:
+            # (one verdict for the blend, the panel, the CSV and the pose —
+            # dvl.py DvlAid.trust; a shadow pose leaves the controller's
+            # DVL strict)
+            if not self.dvl.trust:
+                # (the "dvl: built" line said strict: say here, where the
+                # velocity path becomes trusted — review 2026-10-19)
+                self._log("warn", "dvl: " + self._dvl_trust_sentence(
+                    "dvl_pose.trust_dvl, control pose", pose=True)
+                    + " — from now on")
+            self.dvl.trust = True
+        if self._dvp_trust:
+            self._dvp_seed_bias()
+        try:
+            self._log("warn" if self.dvp_control else "info",
+                      self._dvp_banner())
+        except Exception as e:                                   # noqa: BLE001
+            # (the docstring's rule: the operator must be told the limits
+            # the pose flies under, or it does not fly)
+            self._log("error", f"dvl_pose: {type(e).__name__}: {e} — DISABLED")
+            self.dvp, self.dvp_control = None, False
+            return
+        if self.dvp_control:
+            self._event("POSE: DVL dead reckoning (--dvl_pose control"
+                        + (", TRUST" if self._dvp_trust else ", strict") + ")",
+                        defer=True)
+
+    # ---- trust mode (2026-10-19, dvl_pose.py TRUST MODE)
+    def _dvp_bias_file(self) -> Path:
+        """Where a session leaves its gyro-bias fit for the next one."""
+        return Path(str(self.cfg.log_dir)) / "dvl_pose_gyro_bias.json"
+
+    def _dvp_seed_bias(self) -> None:
+        """(trust mode) Seed this session's heading bias from the last
+        session's saved fit while it is younger than
+        dvl_pose.bias_seed_max_age_h, fitted on the same heading source, of
+        a fit at least as long as this session would need, and inside
+        DVP_BIAS_SEED_MAX_DPS (safety review 2026-10-19: a bias from the
+        ATTITUDE rate is not the RAW_IMU's; a garbled value would spin the
+        yaw reference). Any failure leaves the heading unseeded (logged)."""
+        p = self.dvp
+        if p is None:
+            return
+        max_h = float(p.cfg["bias_seed_max_age_h"])
+        if max_h <= 0.0:
+            return
+        path = self._dvp_bias_file()
+        try:
+            if not path.exists():
+                return
+            rec = json.loads(path.read_text())
+            dps = float(rec["bias_dps"])
+            age_h = (time.time() - float(rec["t_unix"])) / 3600.0
+            if not math.isfinite(dps) or not math.isfinite(age_h):
+                return
+            if age_h < 0.0 or age_h > max_h:
+                self._log("info", f"dvl_pose: the saved gyro bias in {path} "
+                                  f"is {age_h:.1f} h old (> {max_h:g}) — not "
+                                  f"seeded; learnt afresh under TAG FIX ON")
+                return
+            bad = ""
+            if str(rec.get("heading", "")) != str(p.head.source):
+                bad = (f"fitted on heading {rec.get('heading')!r}, this "
+                       f"session's is {p.head.source!r}")
+            elif abs(dps) > DVP_BIAS_SEED_MAX_DPS:
+                bad = (f"{dps:+.3f} deg/s is outside +-"
+                       f"{DVP_BIAS_SEED_MAX_DPS:g}")
+            elif (int(rec.get("n", 0)) < int(p.cfg["bias_min_n"])
+                  or float(rec.get("span_s", 0.0))
+                  < float(p.cfg["bias_min_span_s"])):
+                bad = (f"a fit of {rec.get('n')} fixes over "
+                       f"{rec.get('span_s')} s, less than this session's "
+                       f"bias_min_n {p.cfg['bias_min_n']} / bias_min_span_s "
+                       f"{p.cfg['bias_min_span_s']:g}")
+            if bad:
+                self._log("warn", f"dvl_pose: the saved gyro bias in {path} "
+                                  f"is not seeded — {bad}; learnt afresh "
+                                  f"under TAG FIX ON")
+                return
+            se = rec.get("se_dps")
+            se = None if se is None else float(se)
+            p.head.seed_bias(dps, se, now(), age_h)
+            self._dvp_bias_seed = dict(rec, age_h=round(age_h, 2),
+                                       path=str(path))
+            self._log("info", f"dvl_pose: gyro bias seeded from {path}: "
+                              f"{dps:+.4f} deg/s ({age_h:.1f} h old"
+                              + (f", se {se:.4f}" if se is not None else "")
+                              + ") — in force until this session's own fit "
+                              "is ok")
+        except Exception as e:                                   # noqa: BLE001
+            self._log("warn", f"dvl_pose: the saved gyro bias could not be "
+                              f"read ({type(e).__name__}: {e}) — learnt "
+                              f"afresh")
+
+    def _dvp_save_bias(self) -> None:
+        """Write the heading's bias fit for the next session once it is
+        "ok": a small JSON, at most every 60 s, on the worker thread (local
+        disk, ~1 ms), through a uniquely named temp file and os.replace (two
+        stations on one data/ root, or a duplicate session, cannot cross:
+        safety review 2026-10-19). Never raises; a failure is said once."""
+        p = self.dvp
+        if p is None:
+            return
+        try:
+            hd = p.head
+            if hd.bias_state != "ok" or hd.bias_t is None:
+                return
+            if (self._dvp_bias_saved_t is not None
+                    and hd.bias_t - self._dvp_bias_saved_t < 60.0):
+                return
+            info = hd.bias_info()
+            path = self._dvp_bias_file()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=str(path.parent),
+                                       prefix=path.name + ".", suffix=".tmp")
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps({
+                    "bias_dps": info["dps"], "se_dps": info["se_dps"],
+                    "span_s": info["span_s"], "n": info["n"],
+                    "heading": str(hd.source),
+                    "t_unix": time.time(),
+                    "saved": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "note": "yaw-rate bias of `heading` fitted against the "
+                            "tag yaw while TAG FIX was ON (dvl_pose.py "
+                            "GyroHeading); a --dvl-trust session seeds its "
+                            "heading with it while younger than "
+                            "dvl_pose.bias_seed_max_age_h, on the same "
+                            "heading source"}))
+            os.replace(tmp, path)
+            self._dvp_bias_saved_t = hd.bias_t
+        except Exception as e:                                   # noqa: BLE001
+            if self._dvp_bias_saved_t is None:
+                self._log("warn", f"dvl_pose: the gyro bias could not be "
+                                  f"saved ({type(e).__name__}: {e})")
+            self._dvp_bias_saved_t = float("inf")   # (said once; stop trying)
+
+    def _dvp_auto_in(self) -> None:
+        """Trust mode: the DVL switch goes IN by itself ONCE, when the
+        first sample has arrived — no proving pass (DvlAid.trust_refusal) —
+        while disengaged and no controller CSV is open (the switch's own
+        rules). Once it has, or once the operator has set the switch OUT,
+        the switch is the operator's: an OUT sticks (safety review
+        2026-10-19 — it used to go IN again on the next sample, and OUT is
+        the one manual way to keep a gate-passing wrong DVL out)."""
+        d = self.dvl
+        if (d is None or d.use or self._dvp_auto_in_done or self.engaged
+                or self._csv is not None or self._dvl_fault):
+            return
+        try:
+            why = d.set_use(True, trust=True)
+        except Exception as e:                                   # noqa: BLE001
+            self._dvl_trip_fault("switch", e)
+            return
+        if why:
+            if why != self._dvp_auto_in_said:
+                self._dvp_auto_in_said = why
+                self._log("warn", f"dvl_pose: the DVL cannot go IN yet — {why}")
+            return
+        self._dvp_auto_in_said = ""
+        self._dvp_auto_in_done = True
+        self.reason = "DVL IN (trust mode, no proving pass)"
+        self._log("warn", "ctrl: DVL IN by itself — --dvl_pose trust mode: "
+                          "no proving pass, the mount in hw_mpc.yaml is taken "
+                          "as measured; the tags anchor, correct (TAG FIX) "
+                          "and end a run the pose disagrees with")
+        self._log_event(self.reason, pending=True)
+
+    def _dvp_banner(self) -> str:
+        """The launch line: every limit the pose flies under."""
+        c = self.dvp.cfg
+
+        def say(key, fmt, scale=1.0):
+            return [] if c[key] is None else [fmt.format(c[key] * scale)]
+        ab = " / ".join(say("abort_err_m", "{:.0f} cm", 100.0)
+                        + say("abort_err_yaw_deg", "{:g} deg")
+                        + say("abort_err_z_m", "{:.0f} cm z", 100.0)) or "off"
+        # (the held jump's watch judges xy and yaw only — z left it in round
+        # 9: z never ends an ON run)
+        ab_hold = " / ".join(say("abort_err_m", "{:.0f} cm", 100.0)
+                             + say("abort_err_yaw_deg", "{:g} deg")) or "off"
+
+        def for_s(lim):
+            return lim if lim == "off" else f"{lim} for {c['abort_hold_s']:g} s"
+        # (max_blind_s null — the default since 2026-10-18, the operator's
+        # choice — is said too: it is a limit the run does NOT have)
+        budget = "; ".join((say("max_blind_s", "tagless DR <= {:g} s")
+                            or ["no time limit without tags"])
+                           + say("max_dr_speed_m_s",
+                                 "DVL <= {:g} m/s while dead-reckoning")
+                           + say("max_unaided_s", "unaided <= {:g} s"))
+        return (
+            f"dvl_pose: DVL dead-reckoned pose, heading {c['heading']} (bias "
+            f"learnt from the tags while TAG FIX is ON), z Bar30; TAG FIX "
+            f"{'ON' if self.dvp.tag_on else 'OFF'} at start; DVL hold "
+            f"{c['hold_s']:g} s, lost {c['lost_s']:g} s; corrections slewed at "
+            f"{c['corr_rate_m_s'] * 100:.0f} cm/s while engaged — after "
+            f"dead reckoning > {c['max_corr_m'] * 100:.0f} cm / "
+            f"{c['max_corr_yaw_deg']:g} deg ends the run, a held tag jump "
+            f"and z are slewed (a held jump's drift, and an ON "
+            f"re-acquisition's not yet agreed, are watched in xy / yaw: "
+            f"{for_s(ab_hold)}); the OFF divergence abort: {for_s(ab)}; no "
+            f"heading from a gyro more than "
+            f"{DVP.GYRO_EXTRAP_S + c['gyro_late_max_s']:.1f} s late; TAG FIX "
+            f"pressed while OFF corrects ONCE, then OFF again (none in "
+            f"{c['oneshot_timeout_s']:g} s: OFF, uncorrected)"
+            + (f"; {budget}" if budget and self.dvp_control else "")
+            + " — "
+            + ("CONTROL: the controller AND the interlocks fly on this pose "
+               "(a tag dropout no longer ends a run the DVL can carry)"
+               if self.dvp_control else
+               "SHADOW: drawn and recorded beside the tag state")
+            + (f"; TRUST MODE: the DVL is believed as reported — no proving "
+               f"pass (the switch goes IN by itself at the first sample; an "
+               f"OUT sticks), DvlAid's tag-velocity holds and latch do not "
+               f"stop the dead reckoning (the blend, the panel and the CSV "
+               f"show the same trusted verdict), a DVL gap makes no hole "
+               f"(unintegrated motion warned until a re-anchor; past "
+               f"{c['max_corr_m'] * 100:.0f} cm it ends an engaged run / "
+               f"refuses a START), OFF does not wait for the gyro bias "
+               f"(learnt under ON, seeded from the last session's file); a "
+               f"wrong DVL is caught only by the divergence abort with tags "
+               f"in view"
+               if self._dvp_trust else "; strict gates (proof, bias, holds)")
+            + ". HARDWARE-UNVERIFIED; thresholds are [예측]")
+
+    def _dvp_dvl_ok(self) -> tuple:
+        """-> (ok, why): may the DVL carry a pose the controller flies on?
+        The DVL's own gates: the switch IN, no latch, no code fault, the
+        session's proof (DvlAid.arm_refusal) — and, while engaged, this
+        run's arming (_dvl_arm_run: one run = one estimator)."""
+        d = self.dvl
+        if d is None:
+            return False, "no DVL"
+        if self._dvl_fault:
+            return False, f"DVL code fault ({self._dvl_fault})"
+        if not d.use:
+            return False, "the DVL switch is OUT — set it IN (disengaged)"
+        if d.tripped and not self._dvp_trust:
+            return False, f"DVL latched OUT ({d.tripped})"
+        if self.engaged and not self._dvl_run_ok:
+            return False, self._dvl_run_why or "DVL not armed for this run"
+        try:
+            why = (d.arm_refusal(trust=self._dvp_trust) if self._dvl_primary()
+                   else d.refusal(True, trust=self._dvp_trust))
+        except Exception as e:                                   # noqa: BLE001
+            self._dvl_trip_fault("dvl pose", e)
+            return False, "DVL code fault"
+        return (not why), why
+
+    def _dvp_tag_refusal(self, on: bool) -> str:
+        """Why the TAG FIX switch may NOT go this way ("" = it may)."""
+        if self._dvp_fault:
+            return f"DVL pose code fault ({self._dvp_fault})"
+        ok, why = (self._dvp_dvl_ok() if self.dvp_control else (True, ""))
+        try:
+            return self.dvp.tag_refusal(on, now(), dvl_ok=ok, dvl_why=why,
+                                        engaged=bool(self.engaged))
+        except Exception as e:                                   # noqa: BLE001
+            self._dvp_trip_fault("switch", e)
+            return "DVL pose code fault"
+
+    def _dvp_dr_refusal(self) -> str:
+        """Why the DVL pose's dead reckoning cannot carry a START now
+        (DvlPose.dr_refusal: OFF's needs minus 'no correction in flight')."""
+        if self._dvp_fault:
+            return f"DVL pose code fault ({self._dvp_fault})"
+        ok, why = (self._dvp_dvl_ok() if self.dvp_control else (True, ""))
+        try:
+            return self.dvp.dr_refusal(now(), dvl_ok=ok, dvl_why=why)
+        except Exception as e:                                   # noqa: BLE001
+            self._dvp_trip_fault("switch", e)
+            return "DVL pose code fault"
+
+    def _dvp_start_oneshot(self, t: float) -> None:
+        """TAG FIX pressed while OFF: one correction, then OFF again
+        (DvlPose.start_oneshot / oneshot_due, _dvp_oneshot_tick)."""
+        self.dvp.start_oneshot(t, self.engaged)
+        self._dvp_oneshot_said = ""
+        self.reason = ("TAG FIX ONCE"
+                       + (" (shadow)" if not self.dvp_control else ""))
+        to = float(self.dvp.cfg["oneshot_timeout_s"])
+        c = self.dvp.cfg
+        msg = (f"TAG FIX ONCE — the next {c['anchor_n']} agreeing "
+               f"tag fixes correct the pose (slewed in while engaged, snapped "
+               f"while not); it goes back to OFF by itself when the "
+               f"correction is in, or after {to:g} s without one. Engaged in "
+               f"control, a correction past {c['max_corr_m'] * 100:.0f} cm / "
+               f"{c['max_corr_yaw_deg']:g} deg ends the run (press before "
+               f"the drift gets there)")
+        self._log("info", f"ctrl: {msg}" + ("" if self.dvp_control else
+                                           " [shadow: the controller stays "
+                                           "on the tag state]"))
+        if self.engaged:
+            self._event(self.reason)
+        else:
+            self._log_event(self.reason, pending=True)
+
+    def _dvp_oneshot_tick(self, t: float) -> None:
+        """A one-shot TAG FIX whose correction is in — or that had none in
+        oneshot_timeout_s — goes back to OFF once DvlPose.oneshot_refusal
+        lets it (OFF's refusal minus the agreement in progress, whose fixes
+        are dropped: round 9; a refusal is said once per reason; it stays ON
+        and tries again next tick)."""
+        try:
+            due = self.dvp.oneshot_due(t)
+        except Exception as e:                                   # noqa: BLE001
+            self._dvp_trip_fault("switch", e)
+            return
+        if not due:
+            return
+        # (a pending agreement does not hold it — a glimpse's leftover fixes
+        # kept it ON for as long as the tags stayed away, a view whose fixes
+        # never agree held it past the timeout: round 9 — the DR's own
+        # ability and a slew still in flight do)
+        why = self._dvp_oneshot_refusal()
+        if why:
+            key = f"{due}:{_dvp_key(why)}"
+            if key != self._dvp_oneshot_said:
+                self._dvp_oneshot_said = key
+                what = ("the correction is in" if due == "done"
+                        else "no correction")
+                self._log("warn", f"ctrl: TAG FIX ONCE: {what} — back to "
+                                  f"OFF waits: {why}")
+            return
+        self._dvp_oneshot_said = ""
+        try:
+            self.dvp.drop_pending()
+        except Exception as e:                                   # noqa: BLE001
+            self._dvp_trip_fault("switch", e)
+            return
+        self._dvp_set_tag(False, t, auto=due)
+
+    def _dvp_oneshot_refusal(self) -> str:
+        """DvlPose.oneshot_refusal with the worker's DVL verdict."""
+        if self._dvp_fault:
+            return f"DVL pose code fault ({self._dvp_fault})"
+        ok, why = (self._dvp_dvl_ok() if self.dvp_control else (True, ""))
+        try:
+            return self.dvp.oneshot_refusal(now(), dvl_ok=ok, dvl_why=why)
+        except Exception as e:                                   # noqa: BLE001
+            self._dvp_trip_fault("switch", e)
+            return "DVL pose code fault"
+
+    def _dvp_set_tag(self, on: bool, t: float, auto: str = "") -> None:
+        self.dvp.set_tag_on(on, t, self.engaged, auto=auto)
+        tail = ("" if not auto else " (correction in)" if auto == "done"
+                else " (no correction)")
+        text = (f"TAG FIX {'ON' if on else 'OFF'}{tail}"
+                + (" (shadow)" if not self.dvp_control else ""))
+        # (the one-shot's own OFF while DISENGAGED keeps the reason a run
+        # ENDED on — the chip and the SENSORS row show it: round 9 — and
+        # only that one: a bench one-shot's own 'TAG FIX ONCE' stayed on the
+        # chip after the switch was OFF: round 10, R10-1 / R9-3)
+        if not (auto and not self.engaged
+                and str(self.reason).startswith("disengaged:")):
+            self.reason = text
+        msg = ("TAG FIX ON — the pose is the tag state while a fix is fresh; "
+               "the DVL carries the gaps (a re-correction is slewed in while "
+               "engaged)" if on else
+               "TAG FIX OFF — the pose is DVL dead reckoning only; the tags "
+               "are recorded and watched for divergence, never fused")
+        if auto == "done":
+            msg = "TAG FIX ONCE: the correction is in — back to OFF. " + msg
+        elif auto == "timeout":
+            msg = (f"TAG FIX ONCE: no correction accepted in "
+                   f"{float(self.dvp.cfg['oneshot_timeout_s']):g} s (no tags in "
+                   f"view, or fixes that never agreed) — back to OFF, the pose "
+                   f"was NOT corrected. " + msg)
+        self._log("warn" if not on else "info",
+                  f"ctrl: {msg}" + ("" if self.dvp_control else
+                                    " [shadow: the controller stays on the "
+                                    "tag state]"))
+        # An engaged toggle is part of THIS run's record, now; a bench click
+        # waits for the next run folder (the LOW-combo pattern). The line is
+        # the switch's own, never the reason kept above: that wrote a second
+        # 'disengaged: E-STOP' (or 'TAG FIX ONCE') where the OFF belonged
+        # (round 10, R10-1 / R9-3).
+        if self.engaged:
+            self._event(text)
+        else:
+            self._log_event(text, pending=True)
+
+    def _dvp_trip_fault(self, where: str, e: Exception) -> None:
+        """Latch the DVL pose out after an exception in its own code (the
+        DVL rule). A control run on it then has no state: the stale debounce
+        ends it (never a silent fall back to the tag state)."""
+        if self._dvp_fault:
+            return
+        self._dvp_fault = f"{where}: {type(e).__name__}: {e}"
+        msg = (f"dvl_pose: CODE FAULT in {self._dvp_fault} — the DVL pose is "
+               f"off for the rest of this session")
+        self._log("error", msg)
+        if self.engaged:
+            self._event(msg)
+
+    def _rp_at(self, t: float):
+        """(roll, pitch) at station time ``t`` from the ATTITUDE history, or
+        the newest snapshot's (the DVL's ~0.1 s of latency is ~0 deg of roll
+        or pitch at this vehicle's rates)."""
+        h = self._vimu_hist
+        if h:
+            for rec in reversed(h):
+                if rec[0] <= t:
+                    return rec[4], rec[5]
+        imu = self.imu
+        if imu is not None and imu.roll is not None:
+            return float(imu.roll), float(imu.pitch)
+        return None, None
+
+    def _dvp_note_dvl(self, sample) -> None:
+        """Hand the DVL pose the sample DvlAid just judged (on_dvl)."""
+        d, p = self.dvl, self.dvp
+        if (p is None or d is None or self._dvp_fault or self._dvl_fault
+                or sample is None):
+            # (a DvlAid code fault mid-sample leaves it half judged: not into
+            # the track — fix verification 2026-10-18)
+            return
+        try:
+            if d.sample is not sample:
+                return                  # out of order: not the newest
+            t = now()
+            if self._dvp_trust:
+                # (trust mode: the device's own word; no tag-velocity hold,
+                # no latch, no proof — and the switch IN by itself)
+                if self.dvp_control and not d.use:
+                    self._dvp_auto_in()
+                ok, why, code = d.usable_trusted(
+                    t, require_in=bool(self.dvp_control))
+            elif self.dvp_control:
+                ok, why, code = d.usable(t)
+            else:
+                ok, why, code = d.usable_for_pose(t, require_in=False)
+            roll, pitch = self._rp_at(float(sample.t_valid))
+            p.note_dvl(float(sample.t_valid), d.v_body, bool(ok), code,
+                       roll, pitch, getattr(sample, "altitude", None),
+                       t_rx=t)
+        except Exception as e:                                   # noqa: BLE001
+            self._dvp_trip_fault("sample", e)
+
+    def _dvp_step(self, meas, health, t: float, dt: float,
+                  oneshot: bool = True):
+        """One tick of the DVL pose on the assembler's state (MAP frame,
+        before the datum) -> (meas | None, health) in the MAP frame. Never
+        raises (the tick's guard rule). ``oneshot``: a one-shot TAG FIX may
+        go back to OFF after this step (not on the engage instant's step:
+        the START is judged on the switch it was asked under)."""
+        if self._dvp_fault:
+            return None, {"ok": False, "state": DVP.ST_FAULT,
+                          "why": f"dvl pose stale: code fault "
+                                 f"({self._dvp_fault})",
+                          "fault": "", "warn": "", "tag_on": self.dvp.tag_on}
+        try:
+            m, h = self.dvp.step(t, self.imu, meas, self.fix if meas is not None
+                                 else None, self.engaged, dt)
+        except Exception as e:                                   # noqa: BLE001
+            self._dvp_trip_fault("step", e)
+            return None, {"ok": False, "state": DVP.ST_FAULT,
+                          "why": "dvl pose stale: code fault", "fault": "",
+                          "warn": "", "tag_on": self.dvp.tag_on}
+        if m is not None and not (np.all(np.isfinite(m["eta"]))
+                                  and np.all(np.isfinite(m["nu"]))
+                                  and np.all(np.isfinite(m["nudot"]))):
+            # Belt and braces: nothing non-finite may reach a controller.
+            m = None
+            h = dict(h, ok=False, state=DVP.ST_LOST,
+                     why="dvl pose stale: non-finite state")
+        self._dvp_say(h, t)
+        self._dvp_save_bias()
+        if oneshot:
+            self._dvp_oneshot_tick(t)
+        return m, h
+
+    def _dvp_say(self, h, t: float) -> None:
+        """Log a change of the pose's source once, and a correction / a
+        warning / a fault as it happens (the mission log is the operator's
+        record of what flew)."""
+        st = str(h.get("state", ""))
+        if (not self.dvp_control and self.engaged and not self.observe
+                and st == DVP.ST_LOST):
+            # SHADOW: a lost pose is a stop a control run takes too — at once
+            # for a why _runtime_fault does not debounce, after
+            # tag_stale_hold_s of ticks for a 'stale' one — said once per
+            # onset, and kept in meta faults (fix verification 2026-10-18:
+            # shadow showed only the change of state)
+            why = str(h.get("why", "") or "")
+            self._dvp_shadow_lost_n += 1
+            need = (max(1, int(float(self.cfg.engage.get(
+                "tag_stale_hold_s", 0.4)) * self.cfg.ctrl_hz))
+                if "stale" in why else 1)
+            if (self._dvp_shadow_lost_n >= need
+                    and not self._dvp_shadow_lost_said):
+                self._dvp_shadow_lost_said = True
+                msg = (f"dvl_pose (shadow): a control run would have ended "
+                       f"here — the pose was lost: {why}")
+                self._log("warn", msg)
+                self._event(msg)
+                self.dvp.note_fault(t, f"(shadow) the pose was lost: {why}")
+        else:
+            self._dvp_shadow_lost_n, self._dvp_shadow_lost_said = 0, False
+        if st != self._dvp_logged_state:
+            if st in (DVP.ST_DR, DVP.ST_LOST) or self._dvp_logged_state in (
+                    DVP.ST_DR, DVP.ST_HELD, DVP.ST_LOST):
+                text = {DVP.ST_DR: "pose: DVL dead reckoning",
+                        DVP.ST_HELD: "pose: DVL HELD (no usable sample)",
+                        DVP.ST_LOST: f"pose: LOST — {h.get('why', '')}",
+                        DVP.ST_TAG: "pose: tag state",
+                        DVP.ST_BLEND: "pose: tag state + correction",
+                        DVP.ST_NO_ANCHOR: "pose: no anchor yet"}.get(st, st)
+                lvl = "warn" if st in (DVP.ST_LOST, DVP.ST_HELD) else "info"
+                self._log(lvl, f"dvl_pose: {text}")
+                if self.engaged and self.dvp_control and st != DVP.ST_HELD:
+                    self._event(f"dvl_pose: {text}")
+            self._dvp_logged_state = st
+        rec = h.get("correction")
+        if rec:
+            since = rec.get("since_fix_s")
+            msg = (f"dvl_pose: the DVL pose was {rec['err_m'] * 100:.1f} cm / "
+                   f"{rec['err_yaw_deg']:.1f} deg / "
+                   f"{abs(rec.get('err_z_m') or 0.0) * 100:.1f} cm z off the "
+                   f"tags"
+                   + (f" after {since:.1f} s, {rec['dist_m']:.2f} m"
+                      if since is not None else "")
+                   + f" ({rec['kind']}, {rec['applied']})")
+            self._log("warn", msg)
+            if self.engaged:
+                self._event(msg)
+        f = str(h.get("fault", "") or "")
+        if f and _dvp_key(f) != getattr(self, "_dvp_fault_logged", ""):
+            # once per fault (its wording minus the numbers): under control
+            # _runtime_fault ends the run on it; under SHADOW it is the run a
+            # control session would have ended — the record says so
+            self._dvp_fault_logged = _dvp_key(f)
+            if not self.engaged:
+                # no run to end: what a START now would be refused on (the
+                # record of a run is its engaged stretch — fix verification
+                # 2026-10-18); shadow does not refuse a START on it
+                self._log("warn", f"dvl_pose: (disengaged) a "
+                                  f"{'' if self.dvp_control else 'control '}"
+                                  f"START now would be refused — {f}")
+            elif self.dvp_control:
+                self._log("error", f"dvl_pose: FAULT — {f}")
+            elif not self.observe:
+                self._log("warn", f"dvl_pose (shadow): a control run would "
+                                  f"have ended here — {f}")
+                self._event(f"dvl_pose (shadow): would have ended a "
+                            f"control run — {f}")
+        elif not f:
+            self._dvp_fault_logged = ""
+        w = str(h.get("warn", "") or "")
+        if w and _dvp_key(w) != self._dvp_warn_logged:
+            self._log("warn", f"dvl_pose: {w}")
+            self._dvp_warn_logged = _dvp_key(w)
+        elif not w:
+            self._dvp_warn_logged = ""
+
+    def _dvp_follow_asm_z(self) -> None:
+        """z_source pressure: the assembler's z offset IS the tag state's z
+        frame, and it is re-taken at every START (calibrate_z_offset). The
+        pose follows a change made while DISENGAGED — set_engaged calls this
+        before the datum is taken — so the START's re-calibration is not
+        read as a z jump (on a tilted map it held a DR START and slewed
+        0.15 m in at rest, or ended the run: fix verification 2026-10-18).
+        A change while ENGAGED (the assembler's self-anchor on the first
+        fresh fix after a tagless START) is NOT followed: shifting there
+        would step the flown z unslewed; the gate slews it in as a
+        correction, or refuses it (max_corr_z_m). z_source tag, the
+        station's, never moves it."""
+        if self.dvp is None or getattr(self.asm, "z_source", "") != "pressure":
+            return
+        cur = self.asm.z_offset
+        if cur is None:
+            return           # (reset at START: the next one is judged
+            #                   against the last one seen)
+        ref = self._dvp_asm_zoff
+        self._dvp_asm_zoff = float(cur)
+        if (ref is not None and abs(float(cur) - ref) > 1e-9
+                and not self.engaged):
+            self.dvp.shift_z(float(cur) - ref)
+
+    def _dvp_engage_state(self, t_e: float, meas_tag, h_tag):
+        """set_engaged's state under --dvl_pose control: the pose at the
+        engage instant (MAP frame) from the engage-time tag state, and the
+        record of how this run started (meta dvl_pose.at_engage)."""
+        m, h = self._dvp_step(meas_tag, h_tag, t_e, 1.0 / self.cfg.ctrl_hz,
+                              oneshot=False)
+        hh = dict(h_tag)
+        if m is None:
+            hh["why"] = f"no DVL pose ({h.get('why') or 'not computed'})"
+        elif h.get("fault"):
+            m = None
+            hh["why"] = f"the DVL pose has a fault: {h['fault']}"
+        elif (not self.dvp.tag_on
+              or h.get("state") in (DVP.ST_DR, DVP.ST_HELD)):
+            # THIS step is the pose the datum is taken from: _engage_refusal
+            # judged the previous tick's, and the tags may have dropped in
+            # between — the dead-reckoning gates again, on this one (fix
+            # verification 2026-10-18)
+            why = self._dvp_dr_start_refusal(h, t_e)
+            if why:
+                m = None
+                hh["why"] = why
+        bi = self.dvp.head.bias_info()
+        self._dvp_at_engage = {
+            "tag_on": bool(self.dvp.tag_on), "state": h.get("state", ""),
+            "anchored": bool(self.dvp.anchored),
+            "bias_state": bi["state"], "bias_dps": bi["dps"],
+            "since_fix_s": h.get("since_fix_s"),
+            "dvl_armed": bool(self._dvl_run_ok)}
+        # (`_dvp_last` is NOT replaced: it is the DATUM-frame output, and the
+        # next tick writes it in the new datum)
+        return m, hh
+
+    def _dvp_engage_refusal(self, t: float) -> str:
+        """The localizer gate of a --dvl_pose control engage: the pose must
+        exist NOW and the DVL must be able to carry it; with TAG FIX OFF,
+        everything OFF itself needs."""
+        if self._dvp_fault:
+            return f"DVL pose code fault ({self._dvp_fault})"
+        m, h = self._dvp_last
+        if m is None:
+            return f"no DVL pose ({h.get('why') or 'not computed yet'})"
+        if h.get("fault"):
+            return f"the DVL pose has a fault: {h['fault']}"
+        ok, why = self._dvp_dvl_ok()
+        if not ok:
+            return (f"--dvl_pose control flies on the DVL, and it cannot "
+                    f"carry the pose: {why}")
+        p = self.dvp
+        if not p.anchored:
+            # with TAG FIX ON the pose may still be the tag state, but the
+            # first late frame would then be a pose with nothing to carry it
+            # — an undebounced disengage (review 2026-10-18)
+            return ("the DVL pose is not anchored yet — keep TAG FIX ON with "
+                    "tags in view until "
+                    f"{p.cfg['anchor_n']} fixes agree")
+        why = p._heading_why(t) or p._xy_why()
+        if why:
+            return why
+        if not p.tag_on or h.get("state") in (DVP.ST_DR, DVP.ST_HELD):
+            return self._dvp_dr_start_refusal(h, t)
+        return ""
+
+    def _dvp_dr_start_refusal(self, h, t: float) -> str:
+        """A START whose pose is DEAD-RECKONING (TAG FIX OFF, or ON with the
+        tags not the pose): everything the dead reckoning needs, the learnt
+        bias included — and under ON no re-acquisition still agreeing: it
+        would finish after the START, engaged, slewed or refused where it
+        would have snapped (fix verification 2026-10-18). A slew still in
+        flight is no reason: the engage-time step is disengaged and snaps."""
+        p = self.dvp
+        n = p.pending_n(t) if p.tag_on else 0
+        mode = ("OFF" if not p.tag_on else
+                "ON, re-acquiring" if n else
+                "ON, tags held back" if h.get("err_m") is not None
+                else "ON, no tag")
+        if n:
+            big = p.pending_too_big()
+            return (f"the pose is dead-reckoning (TAG FIX {mode}): the tags "
+                    f"are being re-acquired ({n} fix{'es' if n > 1 else ''} "
+                    f"so far, {p.cfg['anchor_n']} must agree)"
+                    + (" and already show the pose further from them than a "
+                       "correction may be once engaged — it snaps while "
+                       "disengaged" if big else "")
+                    + " — wait until the pose is the tag state")
+        why = self._dvp_dr_refusal()
+        if why:
+            return f"the pose is dead-reckoning (TAG FIX {mode}) but {why}"
+        return ""
+
+    def _dvp_runtime_fault(self, health) -> str:
+        """The DVL pose's own interlocks (control mode only): a refused
+        re-correction, the OFF divergence abort, max_unaided_s."""
+        if not self.dvp_control or self.observe:
+            # (POLICY OBSERVE commands nothing: like the EKF's, the pose's
+            # faults are logged and kept, never a reason to drop the session
+            # — fix verification 2026-10-18)
+            return ""
+        return str((self._dvp_last[1] or {}).get("fault") or "")
+
+    def _dvp_fix_report(self, health):
+        """(n_tags, age_s) for the pwm followers' observation guard
+        (HwRlPwm.note_fix). On a tick whose pose is the tag state: the fix,
+        as without --dvl_pose. On a dead-reckoned tick the guard judges the
+        state the follower is handed, and that is the DVL's: n_tags = the
+        guard's own min_tags (the state is not a thin fix) and the age = the
+        newest usable DVL sample's — so the guard's HOLD fires when the DVL
+        goes stale, exactly as it fires for a stale fix."""
+        n = self.fix.n_tags if self.fix is not None else 0
+        age = health.get("tag_age")
+        if not self.dvp_control:
+            return n, age
+        h = self._dvp_last[1] or {}
+        if h.get("state") in (DVP.ST_DR, DVP.ST_HELD):
+            g = getattr(getattr(self.ctrl, "obs_guard", None), "cfg", None)
+            n_min = int((g or {}).get("min_tags", 2))
+            return max(n, n_min), h.get("gap_s")
+        return n, age
+
+    def _publish_dvp(self, s: MpcStatus) -> None:
+        """The DVL-pose half of a status row ("" mode = none built, so the
+        panel's button stays hidden on a station without it)."""
+        p = self.dvp
+        if p is None:
+            return
+        try:
+            m, h = self._dvp_last
+            s.dvp_mode = p.mode
+            s.dvp_tag_on = bool(p.tag_on)
+            s.dvp_oneshot = bool(p.tag_on and p.oneshot is not None)
+            s.dvp_state = (DVP.ST_FAULT if self._dvp_fault
+                           else str(h.get("state", "") or ""))
+            s.dvp_ok = bool(m is not None and h.get("ok"))
+            # a refusal answers the operator's press: it outranks a standing
+            # why / warn for its 6 s (a fault outranks it)
+            note = (h.get("fault") or p.note_now(now()) or h.get("why")
+                    or h.get("warn") or "")
+            s.dvp_note = str(note)
+            if m is not None:
+                px, py, pz = _flu_of_ned(*m["eta"][:3])
+                s.p_dvp_flu = (px, py, pz)
+                s.yaw_dvp_flu_deg = math.degrees(-float(m["eta"][5]))
+            s.dvp_err_m = h.get("err_m")
+            s.dvp_err_yaw_deg = h.get("err_yaw_deg")
+            s.dvp_since_fix_s = h.get("since_fix_s")
+            s.dvp_dist_m = h.get("dist_m")
+            s.dvp_corr_m = h.get("corr_m")
+            s.dvp_bias_dps = h.get("bias_dps")
+            s.dvp_bias_state = str(h.get("bias_state", "") or "")
+        except Exception as e:                                   # noqa: BLE001
+            self._dvp_trip_fault("status", e)
+
+    def _dvp_row(self) -> list:
+        """The DVL-pose columns (schema 23; CSV_HEADER's 2026-10-18 note).
+        Row width preserved on any failure (the _dvl_row rule)."""
+        n = len(DVP_CSV_COLUMNS)
+        if self.dvp is None:
+            return ["", "", ""] + ["nan"] * (n - 4) + [""]
+        try:
+            m, h = self._dvp_last
+
+            def f(v, fmt):
+                return (fmt.format(float(v)) if v is not None
+                        and math.isfinite(float(v)) else "nan")
+            if m is not None:
+                px, py, pz = _flu_of_ned(*m["eta"][:3])
+                yaw = math.degrees(-float(m["eta"][5]))
+                u, v, w = (float(x) for x in m["nu"][:3])
+            else:
+                px = py = pz = yaw = u = v = w = None
+            why = str(h.get("fault") or h.get("why") or h.get("warn") or "")
+            why = why.replace(",", ";").replace("\n", " ")
+            # (the switch this row's pose was computed under — a one-shot's
+            # own OFF comes after the step, the same tick: round 9)
+            return [str(int(bool(h.get("tag_on", self.dvp.tag_on)))),
+                    str(h.get("state", "") or ""),
+                    str(int(m is not None)),
+                    f(px, "{:.5f}"), f(py, "{:.5f}"), f(pz, "{:.5f}"),
+                    f(yaw, "{:.3f}"), f(u, "{:.4f}"), f(v, "{:.4f}"),
+                    f(w, "{:.4f}"), f(h.get("err_m"), "{:.4f}"),
+                    f(h.get("err_yaw_deg"), "{:.2f}"),
+                    f(h.get("since_fix_s"), "{:.2f}"),
+                    f(h.get("dist_m"), "{:.3f}"), f(h.get("gap_s"), "{:.3f}"),
+                    f(h.get("corr_m"), "{:.4f}"),
+                    f(h.get("bias_dps"), "{:.5f}"),
+                    f(h.get("unobserved_m"), "{:.3f}"),
+                    f(h.get("blind_s"), "{:.2f}"), why]
+        except Exception as e:                                   # noqa: BLE001
+            self._dvp_trip_fault("csv", e)
+            return ["", "", ""] + ["nan"] * (n - 4) + [""]
+
+    def _dvp_meta(self) -> dict:
+        """ALWAYS written (the imu_dr / dvl rule)."""
+        if self.dvp is None:
+            # (YAML reads `mode: off` as the boolean False — review
+            # 2026-10-18: resolve it the way _setup_dvl_pose does)
+            try:
+                raw = DVP.resolve(dict(getattr(self.cfg, "dvl_pose", None)
+                                       or {}))["mode"]
+            except Exception:                                    # noqa: BLE001
+                raw = "off"
+            mode, _note = DVP.mode_from(raw, getattr(self.opts, "dvl_pose",
+                                                     None))
+            return {"enabled": False, "mode": mode}
+        try:
+            out = {"enabled": True, "control": bool(self.dvp_control),
+                   **self.dvp.meta(),
+                   "bias_seed_file": self._dvp_bias_seed,
+                   "at_engage": dict(self._dvp_at_engage),
+                   "fault": self._dvp_fault or None,
+                   # the rules a reader of this run needs (README §dvl_pose)
+                   "rules": ("px/py/pz/yaw_deg are the TAG state (nan without "
+                             "one); dvp_* is the pose the controller flew on "
+                             "in control mode; tagfix is per row and may "
+                             "change mid-run")}
+            return out
+        except Exception as e:                                   # noqa: BLE001
+            self._dvp_trip_fault("meta", e)
+            return {"enabled": True, "fault": self._dvp_fault}
+
+    # ---------------------------------------------------------- state noise
+    def _setup_state_noise(self) -> None:
+        """--state-noise [SCALE] (control/state_noise.py, 2026-10-19;
+        HARDWARE-UNVERIFIED). Without the flag nothing is built and no row,
+        status or meta changes beyond `enabled: false`. A bad config or
+        SCALE disables the mode only (logged), never the worker."""
+        self.snoise, self.snoise_on = None, False
+        self._sn_last = None
+        self._sn_at_engage = {}
+        self._sn_pol_starts = []
+        arg = getattr(self.opts, "state_noise", None)
+        # --state-noise-policy (2026-10-19): the DP sees the same draw too.
+        # CLI ONLY — a yaml `state_noise.policy` is refused below.
+        pol = bool(getattr(self.opts, "state_noise_policy", None))
+        if arg is None:
+            self._sn_why = "start the station with --state-noise"
+            if pol:
+                self._sn_why = ("--state-noise-policy needs --state-noise "
+                                "(start the station with both)")
+                self._log("error", f"ctrl: {self._sn_why} — no state noise "
+                                   f"built")
+            return
+        try:
+            # bare flag = True (argparse const) = the yaml's own scale
+            scale = None if arg is True else float(arg)
+            raw = dict(getattr(self.cfg, "state_noise", None) or {})
+            if "policy" in raw:
+                # one explicit switch per launch (safety review 2026-10-19,
+                # LOW-4): a yaml left at true would noise the DP unannounced
+                raise ValueError("state_noise.policy is not a yaml key — the "
+                                 "DP noise is turned on only by "
+                                 "--state-noise-policy")
+            if pol:
+                raw["policy"] = True
+            cfg = SN.resolve(raw, scale)
+            self.snoise = SN.StateNoise(cfg, 1.0 / float(self.cfg.ctrl_hz))
+        except Exception as e:                                   # noqa: BLE001
+            self.snoise = None
+            self._sn_why = f"not built ({type(e).__name__}: {e})"
+            self._log("error", f"ctrl: --state-noise {self._sn_why}")
+            return
+        self._sn_why = ""
+        if self._sn_policy_cfg():
+            who = ("the controller's state AND the DP policy's proprio rows, "
+                   "plan anchor and START pose (the SAME draw)")
+            rec = "CSV sn_*, plans.jsonl sn_policy"
+        else:
+            who, rec = "the controller's state only", "CSV sn_*"
+        self._log("warn", f"ctrl: STATE NOISE available — NOISE button, OFF "
+                          f"at start; {self.snoise.describe()}. Added to "
+                          f"{who}; plot/px/interlocks stay un-noised ({rec})")
+
+    @Slot(bool)
+    def set_state_noise(self, on: bool) -> None:
+        """The panel's NOISE switch (bus.cmd_state_noise). Refused without
+        --state-noise, while engaged, or while a controller CSV is open (one
+        run = one noise condition, meta state_noise.at_engage). The button
+        re-syncs from MpcStatus.sn_state (honesty rule)."""
+        on = bool(on)
+        if self.snoise is None:
+            self.reason = f"NOISE switch refused: {self._sn_why}"
+            self._log("warn", f"ctrl: {self.reason}")
+            return
+        if on == self.snoise_on:
+            return
+        if self.engaged:
+            why = "not while engaged"
+        elif self._csv is not None:
+            why = ("not while a controller CSV is open (REC) — stop the "
+                   "recording first")
+        else:
+            why = ""
+        if why:
+            self.reason = f"NOISE switch refused: {why}"
+            self._log("warn", f"ctrl: {self.reason}")
+            return
+        self.snoise_on = on
+        self.reason = (f"STATE NOISE ON ({self.snoise.describe()})" if on
+                       else "STATE NOISE OFF")
+        self._log("warn" if on else "info", f"ctrl: {self.reason}")
+        self._log_event(self.reason, pending=True)
+
+    def _sn_apply(self, meas_ctrl):
+        """The tick's seam: -> meas_ctrl with the noise added (a NEW dict;
+        the truth `meas` is never touched), or unchanged when the switch is
+        OFF / disengaged / observe / no state. Sets `_sn_last`."""
+        self._sn_last = None
+        if (self.snoise is None or not self.snoise_on or not self.engaged
+                or self.observe or meas_ctrl is None):
+            return meas_ctrl
+        noisy, d = self.snoise.apply(meas_ctrl)
+        self._sn_last = d
+        return noisy
+
+    def _sn_policy_cfg(self) -> bool:
+        """--state-noise-policy / hw_mpc.yaml state_noise.policy: the DP
+        policy is to see the controller's draw (2026-10-19;
+        HARDWARE-UNVERIFIED). Fixed for the process."""
+        return bool(self.snoise is not None
+                    and self.snoise.cfg.get("policy", False))
+
+    def _sn_policy_d(self):
+        """The pose half (eta, 6: NED m, rad) of the draw THIS tick handed
+        the controller, when this engagement shows it to the DP too — else
+        None. ONE noisy estimator: the same realization, never a second
+        draw, so a tick that added nothing to the controller (switch OFF,
+        disengaged, observe, no state) adds nothing to the DP."""
+        if (self._sn_last is None or not self.engaged or self.observe
+                or not self._sn_at_engage.get("policy", False)):
+            return None
+        return np.asarray(self._sn_last[0:6], float)
+
+    def _sn_policy_plan_extra(self, plan, obs_t_mono: float) -> dict:
+        """plans.jsonl `sn_policy` (--state-noise-policy): the noise this
+        plan's two proprio rows (`rows_d`, at obs_rows_t) and the anchor's
+        MEASUREMENT (`x_meas_d`, at obs_t) carried — this worker's history
+        minus its truth twin at the same stamps, datum NED m and
+        roll/pitch/yaw deg. `x_meas_d` is NOT the noise of the anchor flown:
+        the leash (anchor = the reference while the noisy measurement is
+        within anchor_leash_m of it) and the yaw reference filter absorb
+        part of it — the same record's anchor_pose_meas vs anchor_pose_used
+        show what was used. The twin holds fresh-tag rows only; the policy
+        worker also appends a row whenever t_fix advances (bridged / DR
+        ticks), so `rows_d` is exact only while every row is a fresh tag one
+        (a bridged tick's plan is skipped anyway). {} when the DP was not
+        shown noise. A record: never raises."""
+        if not self._sn_at_engage.get("policy", False):
+            return {}
+        hn, ht = self._policy_eta_hist, self._policy_eta_hist_truth
+        if hn is None or ht is None or not len(hn) or not len(ht):
+            return {}
+        out = {"frame": "datum NED [m], roll/pitch/yaw [deg]; noisy - truth"}
+
+        def d_at(ts):
+            d = (np.asarray(hn.interp(float(ts)), float)
+                 - np.asarray(ht.interp(float(ts)), float))
+            return ([float(v) for v in d[0:3]]
+                    + [math.degrees(_wrap_pi(float(v))) for v in d[3:6]])
+        try:
+            out["x_meas_d"] = d_at(obs_t_mono)
+            rows = getattr(plan, "obs_rows_t", None)
+            if rows is not None and len(rows) == 2:
+                out["rows_d"] = [d_at(rows[0]), d_at(rows[1])]
+        except Exception as e:                                   # noqa: BLE001
+            out["error"] = f"{type(e).__name__}: {e}"
+        return out
+
+    def _sn_row(self) -> list:
+        """The state-noise columns (schema 24; CSV_HEADER's 2026-10-19
+        note). Row width preserved whatever happens (the _dvl_row rule)."""
+        n = len(SN_CSV_COLUMNS)
+        if self.snoise is None:
+            return [""] + ["nan"] * (n - 1)
+        d = self._sn_last
+        if d is None:
+            return ["0"] + ["nan"] * (n - 1)
+        try:
+            r2d = 180.0 / math.pi
+            dx, dy, dz = _flu_of_ned(*d[0:3])
+            vals = [dx, dy, dz, d[3] * r2d, -d[4] * r2d, -d[5] * r2d,
+                    d[6], d[7], d[8], d[9] * r2d, d[10] * r2d, d[11] * r2d,
+                    d[12], d[13], d[14]]
+            return ["1"] + [f"{float(v):.6f}" for v in vals]
+        except Exception:                                        # noqa: BLE001
+            return ["1"] + ["nan"] * (n - 1)
+
+    def _sn_meta(self) -> dict:
+        """ALWAYS written (the imu_dr / dvl rule)."""
+        if self.snoise is None:
+            return {"enabled": False, "why": self._sn_why}
+        return {"enabled": True,
+                "cli_scale": getattr(self.opts, "state_noise", None),
+                "cli_policy": bool(getattr(self.opts, "state_noise_policy",
+                                           None)),
+                "on_now": bool(self.snoise_on),
+                "at_engage": dict(self._sn_at_engage),
+                "policy_starts": [dict(x) for x in self._sn_pol_starts],
+                **self.snoise.meta(),
+                "rules": ("added ONLY to the state handed to ctrl.step and to "
+                          "the path cursor / coast retarget that must agree "
+                          "with it — so CSV e_along / e_cross, path "
+                          "completion, laps and the cursor's projection "
+                          "leash are the CONTROLLER's (noised) view; the "
+                          "true tracking error is px/py vs rx/ry. Plot, "
+                          "px/py and every other interlock are un-noised; "
+                          "so is the DP proprio unless at_engage.policy "
+                          "(--state-noise-policy): then the DP sees the SAME "
+                          "draw — its proprio rows and the anchor history "
+                          "its plans are composed on (each tag-fix row "
+                          "carries that tick's draw) and the START pose "
+                          "(policy_starts, NED m / deg); plans.jsonl "
+                          "sn_policy = what each plan's rows and anchor "
+                          "carried. Per-row truth is CSV sn_on / sn_* "
+                          "(sn_on 0 inside an ON run = a tick with no state, "
+                          "e.g. a stale-fix debounce); the switch changes "
+                          "only while disengaged with no controller CSV "
+                          "open")}
+
+    def _publish_sn(self, s: MpcStatus) -> None:
+        """The NOISE half of a status row; nothing without --state-noise, so
+        the button stays hidden."""
+        if self.snoise is None:
+            return
+        s.sn_state = "on" if self.snoise_on else "off"
+        s.sn_desc = self.snoise.describe()
+        # "+DP" says what THIS engagement adds while engaged (an OBSERVE or a
+        # NOISE OFF engagement adds nothing), the process's setting otherwise
+        s.sn_policy = (bool(self._sn_at_engage.get("policy", False))
+                       if self.engaged else self._sn_policy_cfg())
 
     def _ekf_meta(self) -> dict:
         """ALWAYS written (the imu_dr / dvl rule)."""
@@ -3536,6 +4860,13 @@ class MpcWorker(TimerWorker):
     def on_vehicle_imu(self, imu) -> None:
         self.imu = imu
         self._ekf_feed("imu", imu)
+        if self.dvp is not None and not self._dvp_fault:
+            # --dvl_pose: the RAW_IMU gyro integral, every snapshot (the
+            # heading's own rate — the tick is not involved)
+            try:
+                self.dvp.note_imu(imu)
+            except Exception as e:                               # noqa: BLE001
+                self._dvp_trip_fault("imu", e)
         # A short history of the autopilot's ATTITUDE message, kept ONLY for
         # the dead reckoner's settle-window calibration: the rates so the gyro
         # bias can be differenced against the vehicle's real rotation, and the
@@ -4723,9 +6054,25 @@ class MpcWorker(TimerWorker):
             self._log("warn", f"ctrl: {self.reason}")
             self._log_event(self.reason)
             return
+        z_keep = self.asm.z_offset
         self.asm.reset()
-        self.asm.calibrate_z_offset(self.fix, self.imu)
         t_e = now()
+        if not self.dvp_control or (
+                self.fix is not None and self.fix.ok
+                and t_e - float(self.fix.t_capture)
+                <= float(self.cfg.engage["tag_stale_s"])):
+            # (--dvl_pose control engages with no fresh fix too: an offset
+            # taken on the last, stale one would bias every tag state of the
+            # run by the depth change since — review 2026-10-18.)
+            self.asm.calibrate_z_offset(self.fix, self.imu)
+        elif (z_keep is not None
+              and getattr(self.asm, "z_source", "") == "pressure"):
+            # ...and it keeps the frame it HAD (z_source pressure): without
+            # it the assembler self-anchored on the first fresh fix MID-RUN,
+            # a reference change the pose read as a z correction — > 0.20 m
+            # on a tilted map ended the run (fix verification 2026-10-18).
+            # Not a calibration on the stale fix: no new offset is taken.
+            self.asm.keep_z_offset(z_keep)
         # THE ESTIMATOR OF THIS RUN (2026-10-01), decided here and nowhere
         # else: the DVL switch is frozen from now to the disengage
         # (set_dvl_use refuses while engaged) and so is the run's
@@ -4749,6 +6096,16 @@ class MpcWorker(TimerWorker):
             meas, h = self.asm.step(self.fix, self.imu, t_e,
                                     1.0 / self.cfg.ctrl_hz, vel_xy=vel_xy,
                                     disp_xy=disp_xy)
+        if self.dvp is not None:
+            # (shadow too: its pose must follow the START's re-calibration
+            # like control's, or it records a z correction control never
+            # makes — fix verification 2026-10-18)
+            self._dvp_follow_asm_z()
+        if self.dvp_control:
+            # --dvl_pose control: THIS engagement starts from the pose (the
+            # datum and the hold point below), stepped on the engage-time
+            # tag state exactly as a tick would step it
+            meas, h = self._dvp_engage_state(t_e, meas, h)
         if meas is None:
             self.reason = f"engage refused: {h['why']}"
             self._log("warn", f"ctrl: {self.reason}")
@@ -4768,6 +6125,25 @@ class MpcWorker(TimerWorker):
             {} if self.ekf is None else
             {"estimator": "ekf" if self.ekf_control else "tag",
              "ok": bool(self._ekf_ok), "why": self._ekf_why})
+        # STATE NOISE: one condition per engagement, a fresh (or the pinned)
+        # seed each time — the seed reproduces the run's noise sequence.
+        self._sn_at_engage = {}
+        self._sn_pol_starts = []
+        self._sn_last = None
+        if self.snoise is not None:
+            # under OBSERVE nothing is ever added (_sn_apply): the meta must
+            # not say a noised run happened (review 2026-10-19)
+            on = bool(self.snoise_on and not self.observe)
+            self._sn_at_engage = {"on": on}
+            if self.snoise_on and self.observe:
+                self._sn_at_engage["observe"] = True
+            if on:
+                self._sn_at_engage["seed"] = self.snoise.reset(
+                    self.snoise.cfg["seed"])
+                self._sn_at_engage["describe"] = self.snoise.describe()
+                # --state-noise-policy: the DP sees this engagement's draw
+                # too (_emit_policy_state rows + anchor, the START pose)
+                self._sn_at_engage["policy"] = self._sn_policy_cfg()
         # THE datum moment: this pose, in the tag frame, is (0,0,0)/yaw 0 for
         # the whole run. The EAOB and NMPC are (re)built in the datum frame
         # from their first tick, so nothing ever jumps mid-engagement.
@@ -4782,8 +6158,49 @@ class MpcWorker(TimerWorker):
         self._bridge_anchor = None
         self.ctrl.set_target_ned(meas["eta"][:3], meas["eta"][5])
         self._eta = meas["eta"]
+        # a fresh run's debounce starts at zero (a run the stale debounce
+        # ended left it at its limit, and the next run's first late frame
+        # ended it at once — fix verification 2026-10-18; every mission)
+        self._stale_ticks = 0
+        # ...and a pose fault standing from before it: control refused this
+        # START on it (_dvp_engage_refusal); SHADOW starts anyway — and says
+        # it is a START control would have REFUSED, not the end of a run
+        # control would never have begun (fix verification round 6). Any
+        # other fault is said again as this run's.
+        self._dvp_fault_logged = ""
+        self._dvp_start_fault = ""
+        if self.dvp is not None and not self.dvp_control:
+            # (whatever control would have refused this START on — a fault,
+            # no pose at all, a dead reckoning that cannot fly — not only a
+            # standing fault: a LOST pose at START was recorded as the end
+            # of a run control would never have begun; round 7)
+            try:
+                why0 = self._dvp_engage_refusal(t_e)
+            except Exception as e:                           # noqa: BLE001
+                why0 = ""
+                self._dvp_trip_fault("start", e)
+            if why0:
+                self._dvp_start_fault = why0
+                f0 = str((self._dvp_last[1] or {}).get("fault") or "")
+                if f0:
+                    self._dvp_fault_logged = _dvp_key(f0)
+                if self._dvp_last[0] is None:
+                    # the pose LOST at START: that stretch is no run's end
+                    # (the next one, after it is back, is)
+                    self._dvp_shadow_lost_said = True
+                try:
+                    self.dvp.note_start_fault(t_e, why0)
+                except Exception as e:                       # noqa: BLE001
+                    self._dvp_trip_fault("start", e)
         self.engaged = True
         self.traj_on = False
+        if self.snoise is not None and self.snoise_on and not self.observe:
+            msg = (f"STATE NOISE ON — {self.snoise.describe()}, seed "
+                   f"{self._sn_at_engage.get('seed')}")
+            self._log("warn", f"ctrl: {msg}. The controller flies a NOISED "
+                              f"state; plot/px/interlocks stay un-noised "
+                              f"(CSV sn_*, meta state_noise)")
+            self._log_event(msg)
         # 3 of 4 (see MpcWorker.follow). Belt and braces — disengage already
         # cleared both — but an engagement that inherited a mission from the
         # previous one is exactly the kind of state leak that is invisible
@@ -4801,6 +6218,8 @@ class MpcWorker(TimerWorker):
         if self._policy_eta_hist is not None:
             self._policy_eta_hist.clear()
             self._policy_hist_last_fix = None
+        if self._policy_eta_hist_truth is not None:
+            self._policy_eta_hist_truth.clear()
         self._t0_traj = None
         self._path_cursor = None
         self._path_err = (None, None)
@@ -4976,6 +6395,11 @@ class MpcWorker(TimerWorker):
         self._event(f"ENGAGED ({self.cfg.mode}) — holding "
                     f"({meas['eta'][0]:+.2f}, {meas['eta'][1]:+.2f}, "
                     f"{meas['eta'][2]:+.2f}) NED")
+        if getattr(self, "_dvp_start_fault", ""):
+            msg = (f"dvl_pose (shadow): a control START would have been "
+                   f"refused here — {self._dvp_start_fault}")
+            self._log("warn", msg)
+            self._event(msg)
         if self.dvl is not None and self.dvl.use:
             self._log_event(
                 f"DVL IN at engage — "
@@ -5679,10 +7103,18 @@ class MpcWorker(TimerWorker):
                               f"level None — the {self.ctrl.solver_kind} "
                               f"holder is never stepped)")
         t = now()
-        if self.fix is None or not self.fix.ok:
-            return "no tag fix"
-        if t - float(self.fix.t_capture) > float(e["tag_stale_s"]):
-            return "tag fix stale"
+        if self.dvp_control:
+            # --dvl_pose control: the localizer gate is the POSE (it may be
+            # dead-reckoned with no tag in view, TAG FIX OFF) and the DVL
+            # that carries it — not a fresh fix (_dvp_engage_refusal)
+            why = self._dvp_engage_refusal(t)
+            if why:
+                return why
+        else:
+            if self.fix is None or not self.fix.ok:
+                return "no tag fix"
+            if t - float(self.fix.t_capture) > float(e["tag_stale_s"]):
+                return "tag fix stale"
         if self.imu is None or self.imu.roll is None:
             return "no vehicle attitude"
         # 2026-10-16: an RL export trained on the DVL-primary blend
@@ -7149,6 +8581,9 @@ class MpcWorker(TimerWorker):
             if verdict.status in ("accept", "clip") and verdict.plan is not None:
                 st.install(verdict.plan, float(t_rel))
                 rp["installed"] += 1
+                if policy and self._policy_dvp_dr():
+                    # --policy-dr: installed on a dead-reckoned / held pose
+                    rp["dr_installed"] = int(rp.get("dr_installed", 0)) + 1
                 rp["t_last_accept"] = float(t_rel)
                 if verdict.status == "clip":
                     rp["clipped"] += 1
@@ -7967,6 +9402,19 @@ class MpcWorker(TimerWorker):
             self._refuse(f"policy action_repr {pinned or '(unset)'} is not "
                          f"flyable at ARM")
             return
+        # --state-noise-policy x ATTITUDE TRACKING (safety review 2026-10-19,
+        # MEDIUM-2): a tracked mission flies the anchor's roll/pitch as its
+        # ATTITUDE reference, so the DP's rp draw would enter it whenever the
+        # rp leash clips. Refused until that path has its own review; a
+        # 5-dim checkpoint (or NOISE OFF) flies.
+        if (self._sn_at_engage.get("policy", False)
+                and self._policy_wants_attitude_track(pinned)
+                and bool(self.rp_track_live) and not self.observe):
+            self._refuse("--state-noise-policy does not fly an attitude-"
+                         "tracked (7-dim) policy yet — its roll/pitch noise "
+                         "would enter the attitude reference. NOISE OFF, or "
+                         "a 5-dim checkpoint")
+            return
         if self._csv is not None:            # meta, after the mission ends:
             self._policy_pin_csv = pinned    # latched into the OPEN record only
         # ATTITUDE (2026-09-26): the rp gates are set ONLY for a tracked
@@ -8024,6 +9472,19 @@ class MpcWorker(TimerWorker):
         p0 = np.asarray(self._eta[:3], float).copy()
         yaw0 = float(self._eta[5])
         self._policy_eta_start = tuple(float(v) for v in self._eta)
+        # --state-noise-policy (2026-10-19): the START pose the DP's wrt_start
+        # rows are measured from is the noisy estimate too — the draw of the
+        # tick self._eta came from (meta state_noise.policy_starts). p0/yaw0
+        # (the mission's own start) stay the un-noised pose.
+        d_pol = self._sn_policy_d()
+        if d_pol is not None:
+            self._policy_eta_start = tuple(
+                float(a) + float(b)
+                for a, b in zip(self._policy_eta_start, d_pol))
+            self._sn_pol_starts.append(
+                {"epoch": int(self._policy_epoch),
+                 "d": ([float(v) for v in d_pol[0:3]]
+                       + [math.degrees(float(v)) for v in d_pol[3:6]])})
         t = now()
         w0 = self._grip_est.width(t)
         # THE POLICY'S FIRST EDGE ALWAYS DRIVES (2026-10-01). The state used
@@ -8061,6 +9522,9 @@ class MpcWorker(TimerWorker):
             "observe": bool(self.observe),
             "epoch": int(self._policy_epoch),
             "ckpt_sha1": ckpt_sha1,      # the armed network (intake gate)
+            # --policy-dr as it stood at ARM (meta policy.dr_pose.pinned;
+            # safety review 2026-10-19 #8 — the knob is read every tick)
+            "dr_pose_active": self._policy_dr_pose(),
             # --policy-fs-schedule as the policy worker reported it at ARM
             # ("free" from a worker that predates the field, or has no gate).
             "fs_schedule": str(getattr(st, "fs_schedule", "free") or "free"),
@@ -8202,7 +9666,19 @@ class MpcWorker(TimerWorker):
                    else " (forced off by OBSERVE)")
                 + f"; jaw width estimate {w0 * 1e3:.0f} mm at START "
                 f"(open-loop; the policy's first open/close edge drives "
-                f"regardless)")
+                f"regardless)"
+                + ((", ON THE DVL POSE (--policy-dr): dead-reckoned ticks "
+                    "anchor plans and feed the proprio history (held: no "
+                    "row); TAG FIX OFF = DVL dead reckoning only; blind "
+                    "bound " + str(self._policy_dr_blind_bound())
+                    + (" (NONE: max_run_s / the pose's faults / STOP)"
+                       if not any(v is not None for v in
+                                  self._policy_dr_blind_bound().values())
+                       else "")
+                    + ("; OBSERVE: the drawn plans sit on a drifting frame"
+                       if self.observe else "")
+                    + ". UNVERIFIED in water")
+                   if self._policy_dr_pose() else ""))
         if self.observe:
             # WHAT IS DISARMED, ONCE, IN FULL. An observe run deliberately
             # removes every automatic stop, so the operator must be able to
@@ -8293,11 +9769,80 @@ class MpcWorker(TimerWorker):
             self._log_event(f"FS SCHEDULE {sched} (--policy-fs-schedule; "
                             f"unverified in water)")
 
+    def _policy_dr_pose(self) -> bool:
+        """--policy-dr / policy.allow_dr_pose under --dvl_pose control
+        (2026-10-19, operator decision): a dead-reckoned / held DVL pose is
+        a plan anchor, not a bridged state. False whenever the DVL pose is
+        not what the controller flies (shadow / no --dvl_pose): the knob
+        then has nothing to act on."""
+        return bool(self.dvp_control and self.cfg is not None
+                    and self.cfg.policy.get("allow_dr_pose"))
+
+    def _policy_dvp_dr(self, anchor: bool = False) -> bool:
+        """This tick's DVL pose is dead-reckoned (state dr) or held, under
+        --dvl_pose control. ``anchor=True`` asks the stricter question —
+        may --policy-dr anchor a plan on it — and that is state dr ONLY:
+        a HELD pose is frozen (no usable DVL sample for > hold_s, u_v = 0)
+        for up to lost_s, so a row from it would tell the policy "standing
+        still" while the vehicle may move (safety review 2026-10-19 #3).
+        HELD is still not bridged (no A9 stop); it just adds no row."""
+        st = (self._dvp_last[1] or {}).get("state")
+        if not self.dvp_control:
+            return False
+        return st == DVP.ST_DR if anchor else st in (DVP.ST_DR, DVP.ST_HELD)
+
+    def _policy_dr_blind_bound(self) -> dict:
+        """The DVL pose's own blind-flight limits as configured (seconds;
+        None = none). With --policy-dr these, max_run_s and the operator
+        are what bound a dead-reckoned policy flight with no tag in view
+        (safety review 2026-10-19 #1: the shipped config has both null —
+        operator decision 2026-10-18, "no blind limit")."""
+        c = self.dvp.cfg if self.dvp is not None else {}
+        return {"max_unaided_s": c.get("max_unaided_s"),
+                "max_blind_s": c.get("max_blind_s")}
+
+    def _policy_dr_setup_check(self) -> None:
+        """Say so, at setup, when policy.allow_dr_pose / --policy-dr can do
+        nothing (safety review 2026-10-19 #6): the knob acts only under
+        --dvl_pose CONTROL, and the YAML key or a control pose demoted to
+        shadow at setup (imu_dr / EKF in control, no DVL, ...) would leave
+        the operator launching into the A9 stop believing the DP flies
+        the dead reckoning."""
+        if self.cfg is None or not self.cfg.policy.get("allow_dr_pose"):
+            return
+        if not self.dvp_control:
+            self._log("error",
+                      "ctrl: policy.allow_dr_pose / --policy-dr is INERT — the "
+                      "DVL pose is not in control (no --dvl_pose, shadow, or "
+                      "demoted at setup); a dead-reckoned tick stays bridged "
+                      "(A9) and a policy run on it ends after policy.stale_s.")
+            return
+        b = self._policy_dr_blind_bound()
+        if b["max_unaided_s"] is None and b["max_blind_s"] is None:
+            self._log("warn",
+                      "ctrl: --policy-dr with NO blind-flight bound "
+                      "(dvl_pose.max_unaided_s and max_blind_s are null, "
+                      "operator 2026-10-18): with no tag in view a dead-"
+                      "reckoned policy run is bounded only by policy.max_run_s, "
+                      "the pose's own faults (speed / lost / unobserved) and "
+                      "YOU (STOP). The workspace box and div_max_m are judged "
+                      "in the drifting frame. Set dvl_pose.max_blind_s for a "
+                      "time bound.")
+
     def _policy_bridged(self) -> bool:
         """Is the controller flying on something other than a fresh tag fix
         (station bridge tier != none, or DR control)? (v2 A9)"""
         if self._bridge is not None and self._bridge.tier != SB.TIER_NONE:
             return True
+        if self._policy_dvp_dr():
+            # --dvl_pose control: a plan composed against a dead-reckoned
+            # pose would be drawn in a frame that drifts from the tags' (the
+            # policy's proprio stays the tag state, publish(meas_truth)) —
+            # UNLESS the operator asked for exactly that (--policy-dr /
+            # policy.allow_dr_pose, 2026-10-19): the DR/HELD tick is then
+            # the anchor, the plan relative to the flown pose, the DR error
+            # riding on both the anchor and the proprio alike.
+            return not self._policy_dr_pose()
         return bool(self.dr_control and self._dr_last is not None
                     and self._dr_last.get("ok"))
 
@@ -8618,6 +10163,16 @@ class MpcWorker(TimerWorker):
         # skipped / rejected lines carry it too — a late plan is the one whose
         # timing matters most.
         base_extra.update(_plan_timing(plan))
+        if self.dvp_control:
+            # --dvl_pose control: which pose the plan met at intake (tag /
+            # blend / dr / held / ...); under --policy-dr a dr/held plan is
+            # anchored on the dead reckoning (meta policy.dr_pose.plans)
+            dvp_state = str((self._dvp_last[1] or {}).get("state") or "")
+            base_extra["dvp_state"] = dvp_state
+            if not bridged and self._policy_dvp_dr():
+                # plans that MET a dr/held pose at intake; the installed
+                # ones are counted at install (dr_installed, review #4)
+                rp["dr_plans"] = int(rp.get("dr_plans", 0)) + 1
         if bridged:
             rp["skip_bridge"] = int(rp.get("skip_bridge", 0)) + 1
             why = ("skipped: the controller is flying on a bridged/DR state, "
@@ -8778,6 +10333,9 @@ class MpcWorker(TimerWorker):
                 f"(age {age:.2f} s)", t_rel, obs_t_rel)
             return
         anchor, ainfo = self._policy_anchor(obs_t_mono, obs_t_rel)
+        sn_pol = self._sn_policy_plan_extra(plan, obs_t_mono)
+        if sn_pol:
+            base_extra["sn_policy"] = sn_pol
         # YAW REFERENCE FILTER, part 1 (policy.yaw_ref_filter, 2026-09-14):
         # the plan is COMPOSED against the flown reference yaw at its t0
         # (guard-clamped to the fresh measured yaw), not the measured yaw
@@ -8995,6 +10553,7 @@ class MpcWorker(TimerWorker):
         fix = self.fix
         fix_ok = bool(fix is not None and fix.ok)
         t_fix = float(fix.t_capture) if fix_ok else None
+        dr_anchor = False          # --policy-dr: this tick anchored on DR
         flying_dr = bool(self.dr_control and self._dr_last is not None
                          and self._dr_last.get("ok"))
         bridged = bool(self._bridge is not None
@@ -9002,8 +10561,55 @@ class MpcWorker(TimerWorker):
         fix_fresh = bool(meas is not None and fix_ok and not bridged
                          and not flying_dr)
         eta_src = meas["eta"] if meas is not None else self._eta
+        flown = getattr(self, "_flown_meas", None)
+        if (self.dvp_control and flown is not None and not bridged
+                and self._policy_dr_pose() and self._policy_dvp_dr(anchor=True)):
+            # --policy-dr (2026-10-19): a dead-reckoned tick is a fresh anchor
+            # — the flown pose, stamped with the TICK, with or without a tag
+            # in view (TAG FIX OFF records the tags; the pose is still the
+            # dead reckoning, so the stamp is the tick's, not t_capture —
+            # one stamp rule across the tagless / tagged seam, safety review
+            # 2026-10-19 #2). The DVL pose has no capture stamp of its own:
+            # it is the controller's state this tick, ~50 ms old at most.
+            # Without the knob a tagless dr tick stays out (A9: bridged, no
+            # row); so does a tick with no pose at all (flown None: on its
+            # way to the lost-pose fault) and a HELD tick (frozen pose, #3:
+            # not bridged, but no row — the worker waits).
+            fix_fresh = True
+            t_fix = t
+            eta_src = flown["eta"]
+            dr_anchor = True
+        elif self.dvp_control and meas is not None and flown is not None:
+            # --dvl_pose control (review 2026-10-18): the follower flies the
+            # POSE, which differs from the tag state while a correction is
+            # slewed in (tag + off) — so the anchor history and the proprio
+            # are the pose, or every replan would re-apply the correction
+            # the slew exists to spread. Fresh only on a fresh-tag tick (a
+            # dead-reckoned tick is bridged: _policy_bridged).
+            eta_src = flown["eta"]
+        elif self.dvp_control and meas is not None:
+            # a fresh tag state but NO pose (a blind re-acquisition still
+            # agreeing): nothing is flown this tick, and the tag state is not
+            # the frame the history is in — it stays out (fix verification
+            # 2026-10-18: it went in, between pose rows a few cm away)
+            fix_fresh = False
+            eta_src = self._eta
         eta = (tuple(float(v) for v in eta_src) if eta_src is not None
                else (float("nan"),) * 6)
+        # --state-noise-policy (2026-10-19; HARDWARE-UNVERIFIED): the DP sees
+        # the SAME draw the controller was handed THIS tick — on the eta its
+        # worker keys its proprio rows on AND on the anchor history below (a
+        # plan is composed where the noisy estimate says the vehicle was).
+        # One noisy estimator: None whenever the controller got no noise this
+        # tick. The truth twin keeps the same stamps, for the record only.
+        eta_truth = eta
+        try:
+            d_pol = self._sn_policy_d()
+            if d_pol is not None:
+                eta = tuple(float(a) + float(b)
+                            for a, b in zip(eta, d_pol, strict=True))
+        except Exception:                                        # noqa: BLE001
+            eta = eta_truth   # never abort the publish: the DP gets the truth
         if (fix_fresh and t_fix is not None and self.engaged
                 and t_fix != self._policy_hist_last_fix
                 and self._policy_eta_hist is not None):
@@ -9011,10 +10617,16 @@ class MpcWorker(TimerWorker):
             # the tag frame and the history is cleared at engage anyway.
             if self._policy_eta_hist.append(t_fix, eta):
                 self._policy_hist_last_fix = t_fix
+                if self._policy_eta_hist_truth is not None:
+                    self._policy_eta_hist_truth.append(t_fix, eta_truth)
         rp = self.replay
         kind_policy = bool(rp is not None and rp.get("kind") == "policy")
         halted = bool(kind_policy and rp.get("halted"))
         active = bool(kind_policy and self.traj_on and not halted)
+        if dr_anchor and active:
+            # the run record counts the ticks the policy was anchored on the
+            # dead reckoning (meta policy.dr_pose.ticks)
+            rp["dr_ticks"] = int(rp.get("dr_ticks", 0)) + 1
         self.bus.policy_state.emit(PolicyState(
             t=t, t_fix=t_fix, eta=eta, fix_fresh=fix_fresh,
             epoch=int(self._policy_epoch), active=active, halted=halted,
@@ -9062,6 +10674,24 @@ class MpcWorker(TimerWorker):
             # was never closed.
             "synthetic": bool(src != "hw" or stub or self.observe),
             "observe": bool(self.observe),
+            # --policy-dr / policy.allow_dr_pose (2026-10-19): did the DP fly
+            # on the DVL dead reckoning? `allowed` is the knob, `active` the
+            # knob AND --dvl_pose control (where it acts), ticks / plans how
+            # often this run was anchored on a dr/held pose. A RECORD
+            # BOUNDARY: a run with dr ticks > 0 flew plans whose frame
+            # drifted with the DR error; do not pool with tag-anchored runs.
+            "dr_pose": {
+                "allowed": bool(pc.get("allow_dr_pose")),
+                "active": self._policy_dr_pose(),
+                "pinned": (bool(rp.get("dr_pose_active")) if rp else None),
+                "ticks": int(rp.get("dr_ticks", 0)) if rp else 0,
+                # plans that met a dr/held pose at intake / were installed on one
+                "plans": int(rp.get("dr_plans", 0)) if rp else 0,
+                "installed": int(rp.get("dr_installed", 0)) if rp else 0,
+                # the blind-flight bound in effect (None = none: max_run_s,
+                # the pose's faults and the operator; review 2026-10-19 #1)
+                "blind_bound_s": self._policy_dr_blind_bound(),
+            },
             # WHICH GUARDS WERE ACTUALLY ARMED, as booleans, beside the config
             # values they came from. `config` prints hw_mpc.yaml verbatim, so
             # a runtime bypass is otherwise invisible — the existing
@@ -9072,7 +10702,16 @@ class MpcWorker(TimerWorker):
             "gates_enforced": {
                 "divergence": not (self.observe or self.land_dry_run),
                 "escalation_latch": not self.observe,
-                "bridge_stop": not self.observe,
+                # the station tag-dropout ladder is never stepped under
+                # --dvl_pose control (the pose carries a dropout itself), so
+                # its stop cannot fire there (safety review 2026-10-19 #5)
+                "bridge_stop": not (self.observe or self.dvp_control),
+                "bridge_stop_via": ("dvl_pose" if self.dvp_control
+                                    else "station_bridge"),
+                # the A9 stop on a dead-reckoned / held pose: off under
+                # --policy-dr (and under observe, like every stop)
+                "bridge_stop_dr_pose": not (self.observe
+                                            or self._policy_dr_pose()),
                 "workspace_box": not self.observe,
                 "tag_loss_disengage": not self.observe,
                 "vehicle_arm_mode_gates": not (self.observe
@@ -9739,6 +11378,7 @@ class MpcWorker(TimerWorker):
         t = now()
         dt = 1.0 / self.cfg.ctrl_hz
         self._pwm_live_tick = False   # set only when POLICY pulses leave this tick
+        self._stepped = False         # set only when ctrl.step runs (--dvl_pose rows)
         self._pwm_sent_us = None      # set by whatever this tick puts on cmd_pwm
         self._pwm_guard = 0           # the follower's obs-guard code (CSV pwm_guard)
         self._pwm_keepalive(t)
@@ -9765,8 +11405,38 @@ class MpcWorker(TimerWorker):
         self._banner_tick(t)
         self._dvl_after_step(meas, health,
                              vel_xy if meas is not None else None, dvl_why, t)
+        # THE DVL POSE (--dvl_pose, 2026-10-18): stepped on the assembler's
+        # state in the MAP frame — before the datum, like the tag state it is
+        # compared with — on every tick, engaged or not, so its anchor, the
+        # heading's bias and the dead reckoning exist before START.
+        meas_dvp, h_dvp = None, {}
+        if self.dvp is not None:
+            self._dvp_follow_asm_z()
+            meas_dvp, h_dvp = self._dvp_step(meas, health, t, dt)
         if meas is not None and self._datum is not None:
             meas["eta"] = self._datumize(meas["eta"])
+        if self.dvp is not None:
+            if meas_dvp is not None and self._datum is not None:
+                meas_dvp["eta"] = self._datumize(meas_dvp["eta"])
+            self._dvp_last = (meas_dvp, h_dvp)
+        health_ctl = health
+        meas_truth = meas
+        self._flown_meas = None
+        if self.dvp_control:
+            # THE STATE IS THE DVL POSE (control mode). Substituted into
+            # `meas` — the station bridge's seam (below) — because that is
+            # what `_runtime_fault` reads: the stale-FIX interlock gives way
+            # to the pose's own (DVL / gyro / attitude / depth stale, which
+            # it debounces the same way, and the pose's divergence and
+            # correction faults) while every OTHER interlock keeps working.
+            # The tag state rides on as `meas_truth`: the plot's hull, the
+            # CSV's px/py, the policy's proprio and the EKF's comparison stay
+            # ground truth (the imu_dr / EKF rule).
+            meas_truth, meas = meas, meas_dvp
+            self._flown_meas = meas
+            if meas is None:
+                health_ctl = dict(health)
+                health_ctl["why"] = str(h_dvp.get("why") or "dvl pose lost")
         # A FOLLOW THAT LOSES THE TAG IS DEMOTED FIRST, then bridged.
         # Three reasons, and the order matters:
         #   1. the bridge's own premise excludes this mission — its docstring
@@ -9781,16 +11451,26 @@ class MpcWorker(TimerWorker):
         # The moment `self.station` is non-None the existing ladder picks it
         # up exactly as it always has, and station_bridge.py itself is
         # untouched.
-        if (self.engaged and self.follow is not None and meas is None
-                and SB.is_bridgeable(health.get("why", ""))):
+        # (--dvl_pose control: the same demotion whenever the pose is not the
+        # tag state — the object is placed FROM fixes, the vehicle would be
+        # dead-reckoned: two frames that drift apart.)
+        if self.engaged and self.follow is not None and (
+                (meas is None and SB.is_bridgeable(health.get("why", "")))
+                if not self.dvp_control else
+                h_dvp.get("state") not in (DVP.ST_TAG, DVP.ST_BLEND)):
             self._follow_to_station("tag fix lost")
         # A TAG DROPOUT IS NOT A REASON TO STOP CONTROLLING (station only).
         # Substituted into `meas` on purpose — that is what `_runtime_fault`
         # reads, so the stale-fix interlock stops firing while every other
-        # interlock keeps working. See station_bridge.py.
-        meas = self._station_bridge(meas, health, t, dt)
+        # interlock keeps working. See station_bridge.py. NOT under
+        # --dvl_pose control: the pose carries a dropout itself, and the
+        # bridge's fresh-fix branch would re-anchor on every dead-reckoned
+        # tick (it reads `meas is not None` as "the fix is back").
+        if not self.dvp_control:
+            meas = self._station_bridge(meas, health, t, dt)
+            meas_truth = meas
         self._last_health = health
-        self._ekf_tick(t, meas, health)
+        self._ekf_tick(t, meas_truth, health)
         u = np.zeros(6)
         info = {}
         axes = None
@@ -9808,7 +11488,7 @@ class MpcWorker(TimerWorker):
         if self.dr is not None:
             self._drain_dr()
             self.dr.note_depth(*self._dr_depth())
-            self._dr_last = self.dr.state(t, meas_tag=meas,
+            self._dr_last = self.dr.state(t, meas_tag=meas_truth,
                                           imu_vehicle=self.imu)
             self.dr.note_tick(dt)
             if self.dr_control and self._dr_last["ok"]:
@@ -9821,9 +11501,25 @@ class MpcWorker(TimerWorker):
                 and self._ekf_meas is not None:
             meas_ctrl = self._ekf_meas
             self._ekf_flew = bool(self.engaged and not self.observe)
+        # THE STATE NOISE (--state-noise, 2026-10-19): added LAST, to whatever
+        # the controller is handed (tag / imu_dr / EKF / DVL pose) and to
+        # nothing else — `meas` / `meas_truth` (plot, CSV px/py, policy
+        # proprio, every interlock) stay un-noised. The path cursor and the
+        # coast retarget below see it, because they must agree with the
+        # controller (the meas_ctrl rule above). The ONE opt-in exception is
+        # --state-noise-policy: _emit_policy_state then hands the DP this
+        # tick's SAME draw (_sn_policy_d) on top of its usual pose.
+        # GUARDED (safety review 2026-10-19, the _tick_replay rule): a raise
+        # here would abort the tick BEFORE _runtime_fault, the step and the
+        # CSV row while engaged stays True — so it disengages instead.
+        try:
+            meas_ctrl = self._sn_apply(meas_ctrl)
+        except Exception as e:                                   # noqa: BLE001
+            self._sn_last = None
+            self.disengage(f"state noise raised: {type(e).__name__}: {e}")
 
         if self.engaged:
-            why = self._runtime_fault(meas, health, t)
+            why = self._runtime_fault(meas, health_ctl, t)
             if why:
                 self.disengage(why)
             elif meas is None or self._ekf_hold:
@@ -9847,8 +11543,10 @@ class MpcWorker(TimerWorker):
                     # operator's question is not "is it about to stop" but
                     # "why has the map gone quiet". Overwriting it here made
                     # that note dead on every tick it was set.
-                    self.phase_detail = (f"waiting for a fix "
-                                         f"({self._stale_ticks})")
+                    self.phase_detail = (
+                        f"waiting for the DVL pose ({self._stale_ticks}): "
+                        f"{health_ctl.get('why', '')}" if self.dvp_control
+                        else f"waiting for a fix ({self._stale_ticks})")
             else:
                 if self._warmup_left > 0:
                     self._warmup_left -= 1
@@ -9896,9 +11594,9 @@ class MpcWorker(TimerWorker):
                 if not self.engaged:
                     # the replay guard disengaged us mid-tick; the neutral is
                     # already out (disengage), so publish/record and stop.
-                    self._publish(meas, health, u, info, axes, t_traj)
+                    self._publish(meas_truth, health, u, info, axes, t_traj)
                     self._object_heartbeat(t)
-                    self._write_row(meas, health, u, info, axes, t_traj, t)
+                    self._write_row(meas_truth, health, u, info, axes, t_traj, t)
                     return
                 if self.observe:
                     # POLICY OBSERVE ENDS THE TICK HERE. Everything above ran
@@ -9933,9 +11631,9 @@ class MpcWorker(TimerWorker):
                             "w_hat": np.full(6, np.nan)}
                     axes = None
                     self._tick_ms = float("nan")
-                    self._publish(meas, health, u, info, axes, t_traj)
+                    self._publish(meas_truth, health, u, info, axes, t_traj)
                     self._object_heartbeat(t)
-                    self._write_row(meas, health, u, info, axes, t_traj, t)
+                    self._write_row(meas_truth, health, u, info, axes, t_traj, t)
                     return
                 # WALL TIME, MEASURED HERE. Every controller used to report
                 # its own, and none of them reported the truth: HwDobMpc and
@@ -9952,11 +11650,13 @@ class MpcWorker(TimerWorker):
                     # is untouched.
                     note_fix = getattr(self.ctrl, "note_fix", None)
                     if callable(note_fix):
-                        note_fix(self.fix.n_tags if self.fix is not None else 0,
-                                 health.get("tag_age"))
+                        # (--dvl_pose control: on a dead-reckoned tick the
+                        # pose's own freshness — _dvp_fix_report)
+                        note_fix(*self._dvp_fix_report(health))
                 _t_step = time.perf_counter()
                 u, info = self.ctrl.step(meas_ctrl["eta"], meas_ctrl["nu"],
                                          meas_ctrl["nudot"], t_traj)
+                self._stepped = True
                 if coasting:
                     u = self._bridge.release_horizontal(u)
                     if self._attitude_axes:
@@ -10038,9 +11738,9 @@ class MpcWorker(TimerWorker):
                             self._log("error", f"ctrl: {why}")
                             self.disengage(why)
                             axes = PilotInput(source="mpc")
-                            self._publish(meas, health, u, info, axes, t_traj)
+                            self._publish(meas_truth, health, u, info, axes, t_traj)
                             self._object_heartbeat(t)
-                            self._write_row(meas, health, u, info, axes,
+                            self._write_row(meas_truth, health, u, info, axes,
                                             t_traj, t)
                             return
                         pw = tuple(int(p) for p in pw)
@@ -10135,9 +11835,9 @@ class MpcWorker(TimerWorker):
                                         "disengaged")
                             self._log("error", f"ctrl: {why_att}")
                             self.disengage(why_att)
-                            self._publish(meas, health, u, info, axes, t_traj)
+                            self._publish(meas_truth, health, u, info, axes, t_traj)
                             self._object_heartbeat(t)
-                            self._write_row(meas, health, u, info, axes,
+                            self._write_row(meas_truth, health, u, info, axes,
                                             t_traj, t)
                             return
                     wall_traj = (t - self._t0_traj
@@ -10166,9 +11866,9 @@ class MpcWorker(TimerWorker):
                         self._log("warn", f"ctrl: {kind} COMPLETE — "
                                                   "holding the final pose")
 
-        self._publish(meas, health, u, info, axes, t_traj)
+        self._publish(meas_truth, health, u, info, axes, t_traj)
         self._object_heartbeat(t)
-        self._write_row(meas, health, u, info, axes, t_traj, t)
+        self._write_row(meas_truth, health, u, info, axes, t_traj, t)
 
     def _object_heartbeat(self, t: float) -> None:
         """Age the object marker even when the TRACKER goes silent.
@@ -10226,6 +11926,14 @@ class MpcWorker(TimerWorker):
             self._log_event(msg)
 
     def _runtime_fault(self, meas, health, t) -> str:
+        if self.dvp_control:
+            # --dvl_pose control: a pose FAULT ends the run whether or not
+            # this tick has a pose — a refused blind re-acquisition returns
+            # none, and the stale debounce below would have absorbed it (fix
+            # verification 2026-10-18)
+            why_dvp = self._dvp_runtime_fault(health)
+            if why_dvp:
+                return why_dvp
         if meas is None:
             why = health.get("why", "state lost")
             # DEBOUNCE the stale-fix gate. Measured 2026-08-14: tag_age is
@@ -10262,6 +11970,12 @@ class MpcWorker(TimerWorker):
         why_ekf = self._ekf_runtime_fault(health, t)
         if why_ekf:
             return why_ekf
+        # --dvl_pose control: the pose's own faults (a re-correction too big
+        # to slew while engaged, the OFF divergence abort, max_unaided_s) —
+        # immediate, like the EKF's: each is already a persistent condition.
+        why_dvp = self._dvp_runtime_fault(health)
+        if why_dvp:
+            return why_dvp
         if not self._ekf_hold:
             # Reset only on a tick that will actually be flown: an EKF hold
             # tick commands nothing too, so it must not restart the tag
@@ -10405,7 +12119,11 @@ class MpcWorker(TimerWorker):
                     float(self._datum["p0"][2]), self._datum["yaw0"])),
             t_traj=t_traj, reason=self.reason,
             conn=(Conn.ONLINE if self.engaged
-                  else (Conn.CONNECTING if meas is not None else Conn.DEGRADED)),
+                  else (Conn.CONNECTING
+                        if (meas is not None
+                            or (self.dvp_control
+                                and self._dvp_last[0] is not None))
+                        else Conn.DEGRADED)),
             stamp=now())
         if meas is not None:
             px, py, pz = _flu_of_ned(*meas["eta"][:3])
@@ -10439,6 +12157,8 @@ class MpcWorker(TimerWorker):
         self._publish_dr(s, meas)
         self._publish_dvl(s, meas, health)
         self._publish_ekf(s)
+        self._publish_dvp(s)
+        self._publish_sn(s)
         if self.engaged and self.ctrl is not None:
             p_ref, yaw_ref, _v_ref = self.ctrl.ref_ned_at(t_traj or 0.0)
             rx, ry, rz = _flu_of_ned(*p_ref)
@@ -10994,7 +12714,7 @@ class MpcWorker(TimerWorker):
             except OSError:
                 pass
         return {
-            "schema_version": 22,         # 2: + plant, mission, meta_trigger
+            "schema_version": 24,         # 2: + plant, mission, meta_trigger
                                           # 3: + imu_dr, hardware.cam_tilt_deg
                                           # 4: + circle; `trajectory` is now
                                           #    PER-SHAPE (a circle carries
@@ -11441,6 +13161,26 @@ class MpcWorker(TimerWorker):
                                           #    dvl.selection (primary
                                           #    blends, legacy switches hard
                                           #    and latches on disagreement).
+                                          # 23 (2026-10-18): + CSV columns
+                                          #    tagfix, dvp_* (20, CSV_HEADER's
+                                          #    2026-10-18 note) and meta
+                                          #    `dvl_pose` (--dvl_pose: mode,
+                                          #    TAG FIX toggles, corrections =
+                                          #    measured drift, faults, the
+                                          #    gyro bias). Under --dvl_pose a
+                                          #    row with no tag IS written
+                                          #    (px.. nan). RECORD BOUNDARY:
+                                          #    rows with dvp_src dr|held
+                                          #    under dvl_pose.control did not
+                                          #    fly on the tags.
+                                          # 24 (2026-10-19): + CSV columns
+                                          #    sn_on, sn_* (16, CSV_HEADER's
+                                          #    2026-10-19 note) and meta
+                                          #    `state_noise` (--state-noise:
+                                          #    sigmas, seed at engage).
+                                          #    RECORD BOUNDARY: sn_on 1 rows
+                                          #    flew a deliberately noised
+                                          #    controller state.
             # `source` answers "was the plant real". A LAND DRY-RUN is the
             # third answer and needs saying out loud: the vehicle IS the real
             # one, but it could not move and could not be commanded, and the
@@ -11702,6 +13442,9 @@ class MpcWorker(TimerWorker):
             # the others fell back.
             "dvl": self._dvl_meta(),
             "ekf": self._ekf_meta(),
+            "dvl_pose": self._dvp_meta(),
+            # THE STATE NOISE (schema 24). ALWAYS written, the imu_dr rule.
+            "state_noise": self._sn_meta(),
             # THE ATTITUDE'S TRUE AGE (schema 21). ALWAYS written: how the
             # CSV att_age_v_s was computed and what the pwm engage gate
             # would say about the link at this moment.
@@ -12170,8 +13913,10 @@ class MpcWorker(TimerWorker):
             # Normally a tick with no fix writes nothing — there is no state to
             # describe. With the dead reckoner running there is: drift across a
             # tag dropout is precisely what the experiment records, and a gap
-            # in the file exactly where the tag was lost would delete it.
-            if self.dr is None:
+            # in the file exactly where the tag was lost would delete it. The
+            # same for --dvl_pose (its pose flew, or was lost, on this tick:
+            # the dvp_* columns say which).
+            if self.dr is None and self.dvp is None:
                 return
             px = py = pz = yaw_flu = pitch_flu = roll_flu = float("nan")
         else:
@@ -12194,7 +13939,17 @@ class MpcWorker(TimerWorker):
             if not self.observe:
                 ref_speed = float(np.linalg.norm(
                     np.asarray(v_ref, float)[:2]))
-                if meas is not None:
+                if self.dvp_control:
+                    # --dvl_pose control: the follower's own errors, judged
+                    # on the pose it FLEW, on a tick it stepped — never a
+                    # stale _path_err beside the no-step sentinels, never the
+                    # tag state (CSV_HEADER's 2026-10-18 note; fix
+                    # verification 2026-10-18)
+                    flown = getattr(self, "_flown_meas", None)
+                    if flown is not None and getattr(self, "_stepped", False):
+                        e_along, e_cross = self._path_split(flown, p_ref,
+                                                            t_traj)
+                elif meas is not None:
                     e_along, e_cross = self._path_split(meas, p_ref, t_traj)
             if self.traj_on and self.ctrl.scenario:
                 lap = self._path_lap(t_traj)
@@ -12217,6 +13972,19 @@ class MpcWorker(TimerWorker):
             # the one reading CSV_HEADER, the schema-11 note and the launch
             # banner all promise cannot appear in an observe file. A guard at
             # the emitter cannot be routed around by a caller.
+            u = np.full(6, np.nan)
+            w = np.full(6, np.nan)
+            ax = (float("nan"),) * 4
+            nis = float("nan")
+            status = OBSERVE_SOLVER_STATUS
+            solve_ms = None
+            tick_ms = float("nan")
+        elif self.engaged and self.dvp is not None and not getattr(
+                self, "_stepped", True):
+            # A --dvl_pose ENGAGED ROW THE CONTROLLER DID NOT STEP (2026-10-18:
+            # such rows are written now — a debounce tick with no pose, a
+            # shadow run's tag dropout). The observe / EKF-hold rule: never
+            # "commanded zero, solver fine" for a tick that sent nothing.
             u = np.full(6, np.nan)
             w = np.full(6, np.nan)
             ax = (float("nan"),) * 4
@@ -12369,6 +14137,13 @@ class MpcWorker(TimerWorker):
         # THE DVL SELECTION (schema 22): w_dvl, the usage code, the residuals,
         # the escalation. See CSV_HEADER's 2026-10-16 note.
         row += self._dvl_sel_row(meas, health)
+        # THE DVL POSE (schema 23): the TAG FIX switch, the pose the
+        # controller flew on under control, and its drift against the tags.
+        # See CSV_HEADER's 2026-10-18 note.
+        row += self._dvp_row()
+        # THE STATE NOISE (schema 24): what this row added to the
+        # controller's state. See CSV_HEADER's 2026-10-19 note.
+        row += self._sn_row()
         try:
             self._csv.write(",".join(row) + "\n")
             self._rows += 1

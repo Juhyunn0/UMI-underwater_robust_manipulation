@@ -261,6 +261,27 @@ def soc_from_voltage(volt: float, cells: int) -> float:
 G = 9.80665
 SEA_LEVEL_HPA = 1013.25
 
+#: The longest RAW_IMU interval (vehicle clock, time_usec) the gyro integral
+#: bridges with one trapezoid (VehicleWorker._note_raw_imu). Past it, two
+#: endpoint rates cannot stand for the rotation in between — a whole turn can
+#: start and stop inside it — so the interval is counted as a gap and not
+#: integrated. 0.5 s = 10 records of the 20 Hz stream this station asks for
+#: [유도: rov_gui/mavlink_streams.py DEFAULT_HZ]; the state.VehicleImu contract
+#: (n_gyro_gaps) names the same bound.
+GYRO_MAX_DT_S = 0.5
+
+
+def _finite_or_none(v) -> float | None:
+    """A MAVLink field as a finite float, or None for anything else: absent,
+    a bool, a string, NaN / inf (a float field can carry them)."""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return f if math.isfinite(f) else None
+
 # BNO086 report accuracy, worst first. Reported per sample and carried on the
 # batch as the WORST in it, because this camera's accelerometer has read
 # UNRELIABLE/MEDIUM every time it has been looked at (KNOWN_ISSUES.md:452-468)
@@ -1701,6 +1722,18 @@ class VehicleWorker(TimerWorker):
     _streams: dict | None = None
     _streams_error: str | None = None
     _accel_msgs: tuple = ("SCALED_IMU2", "RAW_IMU")
+    # 2026-10-18 (--dvl_pose heading, _note_raw_imu): the RAW_IMU gyro
+    # integral VehicleImu.gyro_int carries, class defaults for the same
+    # reason. Immutable values, REBOUND on every update and never mutated in
+    # place, so a class default can never be shared between two workers.
+    _gyro_int: tuple = (0.0, 0.0, 0.0)  # rad, body FRD, since the reader started
+    _gyro_prev: tuple | None = None     # (time_usec, rates) of the newest record
+    _gyro_raw: tuple | None = None      # its rates, rad/s
+    _t_gyro: float | None = None        # its host arrival
+    _t_gyro_v: float | None = None      # its sample moment, vehicle clock
+    _n_gyro: int = 0                    # records taken
+    _n_gyro_gaps: int = 0               # intervals NOT integrated
+    _n_gyro_bad: int = 0                # records skipped (no usable stamp/gyro)
 
     def __init__(self, bus, opts):
         # With --mpc the tick doubles to 20 Hz: the control loop needs
@@ -1772,6 +1805,18 @@ class VehicleWorker(TimerWorker):
         self._banner_warned_t: float | None = None
         self._banner_warned_n = 0
         self._banner_text = ""
+        # 2026-10-18: the RAW_IMU gyro integral (_note_raw_imu; class
+        # defaults above too). Runs with or without --mpc — a few float
+        # operations per record — so it is already running whenever a
+        # consumer starts reading it.
+        self._gyro_int = (0.0, 0.0, 0.0)
+        self._gyro_prev = None
+        self._gyro_raw = None
+        self._t_gyro = None
+        self._t_gyro_v = None
+        self._n_gyro = 0
+        self._n_gyro_gaps = 0
+        self._n_gyro_bad = 0
 
     def setup(self) -> None:
         from c3_camera.mavlink_log import MavlinkLogger
@@ -1946,6 +1991,12 @@ class VehicleWorker(TimerWorker):
             # to arrive first. Every record is inspected on the way past.
             if rec["msg_type"] == "STATUSTEXT":
                 self._note_statustext(rec)
+            # RAW_IMU's gyro is integrated per RECORD, here — the snapshot
+            # below keeps only the newest of each message, and an integral
+            # that skips the records in between is not one (_note_raw_imu).
+            # The vehicle's only: another component's IMU is another body.
+            elif rec["msg_type"] == "RAW_IMU" and self._rec_from_vehicle(rec):
+                self._note_raw_imu(rec)
             self._latest[rec["msg_type"]] = rec
             if self._log is not None and rec["msg_type"] in self._log_msgs:
                 self._log.write(rec["msg_type"], rec)
@@ -1974,6 +2025,84 @@ class VehicleWorker(TimerWorker):
                     and (src_comp is None or int(src_comp) == self._aa_target[1]))
         except (TypeError, ValueError):
             return False
+
+    # ----------------------------------------------------------------- gyro
+    def _note_raw_imu(self, rec: dict) -> None:
+        """One RAW_IMU record of the vehicle into the gyro integral that
+        VehicleImu.gyro_int carries — the --dvl_pose heading (2026-10-18,
+        control/dvl_pose.py; why RAW_IMU and not ATTITUDE's rates is the
+        state.VehicleImu comment).
+
+        Cumulative trapezoid of (xgyro, ygyro, zgyro) over the records' OWN
+        sample clock (time_usec, the autopilot's microseconds): host arrival
+        times carry the link's jitter and a downlink queue's bursts, the
+        vehicle's stamps do not. An interval of 0 < dt <= GYRO_MAX_DT_S is
+        integrated; any other (a time_usec step back — a reboot —, a repeat,
+        a dropped stream) is counted in ``_n_gyro_gaps`` and NOT integrated,
+        and the integral resumes from that record. A record without a usable
+        stamp or gyro is skipped and counted apart (``_n_gyro_bad``, said on
+        the log once): it is not a gap in the stream, it is a record that
+        was never a reading.
+
+        Units: mrad/s. MAVLink common.xml leaves RAW_IMU's gyro "(raw)",
+        unitless [스펙: pymavlink dialects/v20/common.xml, message 27];
+        ArduPilot fills it in SCALED_IMU's units, gyro x 1000 [스펙: ArduPilot
+        GCS_Common.cpp send_raw_imu] — the accelerometer beside it reads mg
+        for the same reason (_publish_imu) — and the 1e-3 integral tracks
+        the tag yaw [측정: data/20261017/1017_dvl_pose_feasibility/sources/
+        heading_lens/out/s5_horizon_rawgyro.txt, the RAWG rows].
+        tools/thruster_probe.py reads the same fields the same way.
+
+        Never raises: it runs inside the drain loop, and the records after
+        this one are already out of the reader's buffer."""
+        tu = _finite_or_none(rec.get("time_usec"))
+        w = tuple(_finite_or_none(rec.get(k))
+                  for k in ("xgyro", "ygyro", "zgyro"))
+        if tu is None or any(x is None for x in w):
+            self._n_gyro_bad = int(self._n_gyro_bad) + 1
+            if self._n_gyro_bad == 1:
+                self.bus.log.emit(
+                    "warn", "mavlink: a RAW_IMU record without a usable "
+                            "time_usec / gyro — skipped, not integrated "
+                            "(the --dvl_pose heading); further ones are "
+                            "counted, not said")
+            return
+        rates = tuple(x * 1e-3 for x in w)              # mrad/s -> rad/s
+        prev = self._gyro_prev
+        if prev is not None:
+            dt = (tu - prev[0]) * 1e-6
+            if 0.0 < dt <= GYRO_MAX_DT_S:
+                gi, r0 = self._gyro_int, prev[1]
+                self._gyro_int = tuple(gi[i] + 0.5 * (rates[i] + r0[i]) * dt
+                                       for i in range(3))
+            else:
+                self._n_gyro_gaps = int(self._n_gyro_gaps) + 1
+        self._gyro_prev = (tu, rates)
+        self._n_gyro = int(self._n_gyro) + 1
+        self._t_gyro = rec.get("t_host")
+        self._t_gyro_v = self._gyro_vehicle_time(tu)
+        self._gyro_raw = rates
+
+    def _gyro_vehicle_time(self, tu: float) -> float | None:
+        """The RAW_IMU sample's own moment on the HOST clock, through the
+        clock map the reader keeps for ATTITUDE (its t_valid against its
+        time_boot_ms — the same vehicle boot clock as time_usec on
+        ArduPilot); None when there is no map or the result is not a
+        plausible recent time (a GPS-epoch time_usec, a map from before a
+        reboot). The --dvl_pose heading history is stamped with it: a queued
+        link delays ARRIVALS, not samples (review 2026-10-18)."""
+        att = self._latest.get("ATTITUDE")
+        if not att:
+            return None
+        tv = _finite_or_none(att.get("t_valid"))
+        tb = _finite_or_none(att.get("time_boot_ms"))
+        if tv is None or tb is None:
+            return None
+        t = float(tu) * 1e-6 + (tv - tb * 1e-3)
+        th = _finite_or_none(att.get("t_host"))
+        if th is None or abs(t - th) > 2.0:
+            return None
+        return t
 
     # ----------------------------------------------------------------- leak
     def _note_statustext(self, rec: dict) -> None:
@@ -2046,12 +2175,18 @@ class VehicleWorker(TimerWorker):
             return
         self._banner_warned_t = t
         self._banner_warned_n = self._n_banners
+        # RED (2026-10-18, the operator's ask): this is what made 10-13's
+        # link late — a banner every ~2 s through every evening recording
+        # [측정: data/20261013/1013_param_banner_scan/], read as a client
+        # re-asking the full parameter list [유도: the same README — the
+        # record cannot name the client].
         self.bus.log.emit(
-            "warn", f"{BANNER_LINE} ({self._banner_text[:40]!r}; {n_new} since "
-                    f"the last warning, {self._n_banners} this session) — the "
-                    f"MAVLink downlink queues behind it and the attitude goes "
-                    f"stale; find the client (BlueOS / Cockpit / QGC tab, an "
-                    f"extension) and close it")
+            "error", f"LINK DELAYED: {BANNER_LINE} ({self._banner_text[:40]!r}; "
+                     f"{n_new} since the last warning, {self._n_banners} this "
+                     f"session) — the MAVLink downlink queues behind it and the "
+                     f"attitude and gyro arrive late; find the client (QGC, "
+                     f"BlueOS / Cockpit parameter page, an extension) and "
+                     f"close it")
 
     def _internal_pressure_hpa(self) -> float | None:
         """The ENCLOSURE barometer, absolute hPa.
@@ -2288,6 +2423,11 @@ class VehicleWorker(TimerWorker):
         (--mavlink-scaled-imu2-rate 0, rov_gui/mavlink_streams.py): then
         RAW_IMU only, so a SCALED_IMU2 left in ``_latest`` from before the
         request can never be read as the current reading.
+
+        2026-10-18 (--dvl_pose): every snapshot also carries the RAW_IMU gyro
+        integral (``gyro_int`` .. ``gyro_raw``, kept per record by
+        _note_raw_imu) and the Bar30 as its own depth with its own stamp
+        (``depth_sp2_m`` / ``t_sp2``). ``depth_m`` / ``t_baro`` are untouched.
         """
         att = self._latest.get("ATTITUDE")
         imu = next((self._latest[m] for m in self._accel_msgs
@@ -2326,7 +2466,52 @@ class VehicleWorker(TimerWorker):
         v.depth_m = self._depth_m()
         if baro is not None:
             v.t_baro = baro.get("t_host")
+        # The gyro integral as _note_raw_imu holds it. None until a second
+        # record exists: one record is a starting point, not an integral.
+        if int(self._n_gyro) >= 2:
+            v.gyro_int = self._gyro_int
+        v.t_gyro = self._t_gyro
+        v.t_gyro_v = self._t_gyro_v
+        v.n_gyro = int(self._n_gyro)
+        v.n_gyro_gaps = int(self._n_gyro_gaps)
+        v.gyro_raw = self._gyro_raw
+        # The Bar30 ITSELF: SCALED_PRESSURE2 only (never id 29, the
+        # enclosure barometer — the _depth_m rule) and NOT clamped at the
+        # surface. depth_m is relative_alt first (zero-order held at its own
+        # rate, the state.VehicleImu comment) and its pressure fallback stops
+        # at 0, where a pose's z would sit still while the vehicle moves (a
+        # surface pressure below the 1013.25 hPa assumed reads a shallow
+        # vehicle above the surface). A press_abs that is no pressure at all
+        # (absent, NaN, <= 0) is no depth: None, never ~-10 m.
+        sp2 = self._latest.get("SCALED_PRESSURE2")
+        if sp2 is not None:
+            hpa = _finite_or_none(sp2.get("press_abs"))
+            if hpa is not None and hpa > 0.0:
+                v.depth_sp2_m = (hpa - SEA_LEVEL_HPA) * 100.0 / (self._rho * G)
+                v.t_sp2 = sp2.get("t_host")
+                v.t_sp2_v = self._sp2_vehicle_time(sp2)
         self.bus.vehicle_imu.emit(v)
+
+    def _sp2_vehicle_time(self, sp2: dict) -> float | None:
+        """The SCALED_PRESSURE2 sample's own moment on the HOST clock: its
+        time_boot_ms through the ATTITUDE clock map (as _gyro_vehicle_time
+        for RAW_IMU); None with no map, or outside [arrival - 2 s, arrival +
+        50 ms]. The --dvl_pose heave is differenced on it: records queued on
+        the downlink arrive ~1 ms apart, and a Bar30 count over 1 ms read as
+        a 0.6 m/s heave (fix verification 2026-10-18)."""
+        att = self._latest.get("ATTITUDE")
+        tb = _finite_or_none(sp2.get("time_boot_ms"))
+        th = _finite_or_none(sp2.get("t_host"))
+        if not att or tb is None or th is None:
+            return None
+        tv = _finite_or_none(att.get("t_valid"))
+        tba = _finite_or_none(att.get("time_boot_ms"))
+        if tv is None or tba is None:
+            return None
+        t = (tb - tba) * 1e-3 + tv
+        if not (th - 2.0 <= t <= th + 0.05):
+            return None
+        return t
 
     def _arm_state(self) -> tuple[bool | None, str]:
         """(armed, mode) from the autopilot's own heartbeat, or (None, "").
@@ -5707,6 +5892,12 @@ class HardwareBackend(Backend):
             bus.dvl_info.connect(self.mpc.on_dvl_info)
             bus.cmd_dvl_use.connect(self.mpc.set_dvl_use)
             bus.cmd_estimator.connect(self.mpc.set_estimator)
+            # --dvl_pose's TAG FIX switch (2026-10-18). Wired unconditionally
+            # too: without --dvl_pose the slot refuses it, in words.
+            bus.cmd_dvl_pose_tag.connect(self.mpc.set_dvl_pose_tag)
+            # --state-noise's NOISE switch (2026-10-19); without the flag the
+            # slot refuses it, in words.
+            bus.cmd_state_noise.connect(self.mpc.set_state_noise)
             bus.telemetry.connect(self.mpc.on_telemetry)
             bus.cmd_mode.connect(self.mpc.on_mode_request)
             bus.thrusters.connect(self.mpc.on_thrusters)

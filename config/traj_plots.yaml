@@ -11,6 +11,8 @@
 #     all | latest
 #
 # 그림은 figures/trajectories/<날짜>/<날짜>_<런>_<컨트롤러>_<시분초>.png 로 떨어진다.
+# 피드 녹화와 함께 열린 CSV(c3_*_mpc.csv)에 engage가 여러 번 들었으면 engage마다
+# 따로 그려 _e1, _e2 ... 가 붙는다(각자의 datum으로 — 2026-10-18).
 # 선은 시간에 따라 밝음→어두움으로 물든다(파랑=기체, 주황=추적 물체). 나머지
 # 손잡이(축 박스, segment, error, object 필터, time_color, theme, ...)는 전부
 # 코드의 기본값이고 필요하면 여기에 키를 더하거나 CLI로 덮으면 된다 —

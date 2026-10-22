@@ -233,6 +233,25 @@ class DataBus(QObject):
     # controller CSV is open, and "ekf" until the EKF is ready. The panel
     # button reflects MpcStatus.ekf_control, never its own click.
     cmd_estimator = Signal(str)
+    # The TAG FIX switch of --dvl_pose (2026-10-18, control/dvl_pose.py):
+    # True = AprilTag fixes set / correct the DVL pose (the state is the tag
+    # state while one is fresh, the DVL dead reckoning carries the gaps),
+    # False = DVL-only dead reckoning (tags are still detected and RECORDED,
+    # and still watched for divergence, but never move the state). Unlike
+    # cmd_dvl_use / cmd_estimator this one is accepted WHILE ENGAGED — a
+    # re-correction mid-run is its purpose; every row records it (CSV
+    # tagfix). OFF is refused until the dead reckoning can carry the vehicle.
+    # True while OFF is a ONE-SHOT (2026-10-18): one correction, then the
+    # worker turns it OFF again by itself (MpcStatus.dvp_oneshot meanwhile).
+    # The panel button reflects MpcStatus.dvp_tag_on, never its own click.
+    cmd_dvl_pose_tag = Signal(bool)
+    # The NOISE switch of --state-noise (2026-10-19, control/state_noise.py):
+    # True = Gaussian noise is added to the state the LOW controller is
+    # handed (plot, px/py and every interlock stay un-noised). Refused by
+    # MpcWorker without --state-noise, while engaged or while a controller
+    # CSV is open. The panel button reflects MpcStatus.sn_state, never its
+    # own click.
+    cmd_state_noise = Signal(bool)
     # MpcWorker -> the DVL worker: keep the verbatim reports beside this
     # controller CSV. (enabled, path stem), the cmd_log_raw_sensors shape —
     # its own signal so a DVL-only run does not also switch on 40 kB/s of

@@ -134,7 +134,7 @@ rl_pwm:
   # 전부 통과 [측정 RL_controller/logs/eval/PWM11_GATE.md], 수조 미검증 (rl_policies/pwm11k0.2_s0/README.md). 추진기별 부호 프로브
   # 아티팩트가 없으면 교전 거부(require_thruster_probe). 이전 pwm10_s1 은 수조 실패 원인 정책이라 비행 금지(RL_controller README §13.8).
   policy_dir: rov_gui/control/rl_policies/pwm11k0.2_s0   # was rov_gui/control/rl_policies/pwm10_s1 (2026-09-30 .. 10-10)
-  pwm_cap: 0.25            # = pwm11k0.2_s0 의 학습 캡 pwm_cap_trained (env.pwm_cap 0.5); 스케일 모드에서 추력 공간 균일 축소. 이력:
+  pwm_cap: 0.25         # = pwm11k0.2_s0 의 학습 캡 pwm_cap_trained (env.pwm_cap 0.5); 스케일 모드에서 추력 공간 균일 축소. 이력:
                           # 1.0 #0.25  # |throttle| ceiling on the wire (fraction of +-400 us). 0.25 (1400..1600 us) was the
                           # first-water value [예측]; the policy was trained at 1.0. [결정 2026-10-01 operator: 1.0 in one
                           # step] after the 0.25 run saturated and limit-cycled (data/20261001/1001_172910: thrusters
@@ -188,6 +188,42 @@ rl_pwm:
   leash_m: 0.8
   yaw_rate_ff: true
   yaw_rate_max: 0.6
+  # ---- 2026-10-18 heave trim (rov_gui/control/rl_pwm.py heave_trim_thrust / trim_and_cap; HwRlPwm.step) ----
+  # heave_trim_n: RL pwm LOW 의 상수 heave 트림 [N, 물리 단위, + = 세계 위쪽]. 추력 모델은 export 의 명목 모델(T200 ×
+  #   voltage_scale)로 obs_guard.hold_wrench_z_n 과 같지만 부호는 반대다: hold 는 NED(−4 = 4 N 위), 이 키는 +4 = 4 N 위.
+  #   hold 값을 그대로 베끼면 힘이 아래로 간다. 매 틱 세계-위 방향을 추정 roll/pitch 로 몸체에 돌리고 수직 추진기 4기에만
+  #   최소노름으로 할당한다(HOLD 와 같은 코드; 기울어진 성분은 버림). 그 추력을 정책 추력에 더한 뒤 캡을 합계에 건다
+  #   (scale = 합계 추력 벡터에 단일 배율). prev_action 은 같은 배율 뒤의 정책 자기 몫이고 트림은 빠진다.
+  #   정확도: 모멘트 0·몸체 heave N 은 수직 4기의 합계가 모두 데드밴드 가장자리(+1.44/−1.10 N curve) 밖일 때만 성립한다.
+  #   합계가 그 안에 떨어진 추진기는 가장자리로 나간다(HOLD·scale 과 같은 규약). 정책 수직기가 쉬고 있으면 위 2.51 N /
+  #   아래 2.58 N 미만의 트림은 값과 무관하게 같은 가장자리 패턴(5..8 = 1530/1470/1470/1530 µs ≈ 3.67 N 위, 기수-아래
+  #   0.11 N·m)으로 나간다 [유도: pwm10_s1·pwm11att14R_s1 export B_flu·t200]. 비행 영역에서는 이것이 예외가 아니라 보통이다:
+  #   10-17 실측 틱(data/20261017/1017_204524/mpc_204524.csv 파일 1500행, pwm5..8 1441/1546/1441/1540 µs)에 +3 N 을 걸면
+  #   2.45 N 과 roll −0.083 N·m 가 실리고, 같은 런의 att14 틱 400개(개루프 재생, cap 0.5)에서는 +3 N 이 378틱에서 가장자리에
+  #   걸려 평균 heave 가 요청의 85 %(2.52/2.96 N), 평균 K −0.04·M −0.06 N·m 였다 [유도: rov_gui/tests/
+  #   test_rl_pwm_heave_trim.py 의 pool 재생 테스트, 명목 모델]. 빌드 줄이 이 export·cap 의 정지 패턴을 찍고, info
+  #   trim_wrench_ned/trim_n_edge 와 meta controller.heave_trim(counts.ticks_edge, delivered)이 틱별·런별로 남긴다.
+  #   캡 예산: 캡은 정책+트림 합계에 걸리고 s<1 이면 정책 8기 전체가 줄어든다. 그래서 트림이 수직기 하나의 캡 범위(그 방향)를
+  #   50 % 넘게 쓰면 빌드 거부한다(rl_pwm.HEAVE_TRIM_MAX_CAP_FRACTION [예측: 50 %]). cap 0.25 에서 약 +5.4/−5.5 N, cap 0.5
+  #   에서 ±10 N 전부 허용 [유도: heave_trim_budget]. 50 % 이하라도 트림이 s<1 을 만들 수 있다: 같은 재생에서 cap 0.25·−4 N 은
+  #   400틱 중 51틱에서 정책 단독이면 없었을 s<1 을 만들었다 [유도: 같은 테스트] — meta counts.ticks_scaled_by_trim 이 런마다
+  #   센다. 그 밖에 |값| > 10 N, 숫자 아님, null 은 빌드 거부(LOW unavailable).
+  #   태그 게이트 HOLD 동안은 HOLD 펄스를 그대로 보낸다(트림을 더하지 않음 — payload 가 있으면 obs_guard.hold_wrench_z_n 도
+  #   맞출 것). 0 = 이전 코드 경로와 비트 단위로 같다. 이 값은 rl_pwm 에만 적용되고, rl_pwm_7d 는 자기 블록의 같은 키를
+  #   쓴다(두 값이 다르면 rl_pwm_7d 빌드가 NOTE 줄을 남긴다).
+  #   CSV: pwm1..8·uX..uN 은 정책+트림 합계다. 정책 몫·pwm_scale·트림 열은 없다(workers.py CSV 스키마 미지원, 미해결).
+  #   트림 ≠ 0 런의 pwm/u 열을 정책 행동으로 읽지 말고 트림 없는 런과 섞지 말 것(RECORD BOUNDARY; 런별 집계는 meta
+  #   controller.heave_trim.delivered/counts 뿐).
+  #   값 고르기: 이 키는 명목 모델 단위라 같은 모델의 hover 총 상향 추력(F_up_model)을 출발점으로 쓸 수 있다 [유도]. 단 위
+  #   재생처럼 가장자리 근사로 요청보다 덜 실린다(+3 N 에서 85 %). 2026-10-17 빈 턱 mpc_tuned hover 의 총 상향
+  #   추력은 −3.65..−4.12 N 이었다(아래로 밀어야 뜨지 않음 = 양성 부력). 2026-10-16 peg hover 는 +4.08..+4.83 N 이었다
+  #   [측정 data/20261017/1017_analysis_offline/heave_trim_jawempty_v2/report.txt:36-44]. 2026-10-10 분석의 "peg 장착 2.5–5.4 N
+  #   무겁고 미장착 0.8–1.6 N 무겁다" [측정 RL_controller/logs/eval/pwm_cocontraction_analysis_20261010/REPORT.md:47-48] 중
+  #   미장착 값은 10-17 측정과 부호가 반대다(그 사이 부력 구성이 바뀐 것으로 보이나 미확인). 실제 추력 이득은 명목보다 낮을
+  #   수 있어 실제 힘은 이 값보다 작다 [예측]. 2026-10-16 peg 를 든 rl_pwm 은 바닥에 머물렀고 같은 짐을 mpc_tuned 는 띄웠다
+  #   [측정 data/20261016/1016_193523_diag_offline/cross_low/cross_low_final_table.txt]. 실기 미비행 [예측].
+  #   RECORD BOUNDARY: meta controller.heave_trim_n.
+  heave_trim_n: 0.0
 
 # LOW mode rl_pwm_7d (panel RL_PWM_7D, 2026-10-03, operator request "RL_PWM 학습 … wave/current 없이"): the
 # PER-THRUSTER RL policy trained WITH a roll/pitch reference in q_des (RL_controller att7pwm_s*: dr preset traj10att,
@@ -206,11 +242,21 @@ rl_pwm_7d:
   # 수조 0런 [예측] — 전제·벤치 절차는 폴더의 README.md 와 KNOWN_ISSUES 'pwm11att7_s0 를 설치' 항목. 되돌리기 = null.
   # (이전) 2026-10-10 (operator): att7pwm_s0 은 수조 실패(수직+수평 공동수축 26~44 A, 침강) 정책이라 비행 금지 → null = LOW 꺼짐;
   # 계획은 pwm11 수조 래더 통과 뒤 pwm11att 재학습이었다 — pwm11k0.2_s0 는 10-13 에 7회 중 5회 트립(원인: 늦은 자세)으로 아직 미통과.
-  policy_dir: rov_gui/control/rl_policies/pwm11att9X_s0   # was null (2026-10-10); before that rov_gui/control/rl_policies/att7pwm_s0 (2026-10-03 operator request)
+  # 2026-10-17 (operator): pwm11att14R_s1 — pool_repro DR(실측 플랜트: 추진기 이득 0.55–1.5, 지연 1–2 step, roll 강성 0.25–1.6, 감쇠 1.0–3.5, 트림 −3~+15°,
+  # 자세 샘플 반복) + 정지 자세 시작 + RATE 인터록 종료조건/패널티(R 변형), cap 0.5 학습. 시뮬 pool 게이트 cap 0.5/0.25 둘 다 PASS·full gate PASS
+  # [측정 RL_controller/logs/eval/PWM11ATT14_POOL.md, PWM11ATT14_GATE.md]; 수조 0런 [예측]. velocity_source.trained true → dvl.selection primary +
+  # blend 상수 + vel_lp_alpha 0.6 이 맞아야 빌드(rl_policy.check_velocity_source). 첫 수조는 rl_pwm.pwm_cap 0.25(scale), 빈 턱 hold 통과 뒤 0.5(학습 cap).
+  policy_dir: rov_gui/control/rl_policies/pwm11att14R_s1   # was rov_gui/control/rl_policies/pwm11att9X_s0 (2026-10-15 .. 10-17); before that null (2026-10-10), att7pwm_s0 (2026-10-03)
   leash_m: 0.8
   yaw_rate_ff: true
   yaw_rate_max: 0.6
   allow_caps_below_trained: true
+  # heave_trim_n: 이 LOW 자기 heave 트림 [N, + = 세계 위쪽 — NED 인 obs_guard.hold_wrench_z_n 과 부호 반대]. 의미·정확도
+  #   (데드밴드 가장자리 근사)·캡 예산(50 % 넘으면 빌드 거부)·CSV 경계는 rl_pwm.heave_trim_n 과 같다(2026-10-18,
+  #   rov_gui/control/rl_pwm.py trim_and_cap). 이 LOW 는 rl_pwm.pwm_cap·rl_pwm.obs_guard 는 전송 블록 것을 쓰지만
+  #   rl_pwm.heave_trim_n 은 쓰지 않는다. 두 값이 다르면 빌드가 NOTE 줄을 남기고 meta controller.heave_trim.rl_pwm_block 에
+  #   적는다(동작은 그대로). 0 = 꺼짐(이전 코드 경로). 실기 미비행 [예측]. RECORD BOUNDARY: meta controller.heave_trim_n.
+  heave_trim_n: 0.0
 
 # LOW mode rl_7d (panel RL_7D, 2026-10-03): a 6-axis RL policy (axes6: x/y/z/r
 # + s/t) TRAINED WITH A ROLL/PITCH REFERENCE in its goal quaternion
@@ -818,6 +864,13 @@ policy:
                               # (was 0.4: zero margin against the measured
                               # chain, ~12–28 % of plans skipped as late)
   stale_s: 1.5                # [예측] no accepted plan this long -> "policy stale"
+  allow_dr_pose: false        # [결정: operator 2026-10-19] DP를 DVL 추측항법 위에서 돌린다.
+                              # true(= 명령줄 --policy-dr): --dvl_pose control에서 DR/HELD tick이
+                              # bridged가 아니라 앵커다 — 플랜은 그 tick에 난 DVL 포즈에 붙고,
+                              # 정책의 proprio 이력에 tick마다 한 행이 들어간다. false = A9
+                              # (DR tick = bridged: 플랜 생략, stale_s 뒤 미션 종료). 태그 dropout
+                              # 사다리(station bridge)와 --imu-dr control은 그대로 bridged.
+                              # 실기 0런. RECORD BOUNDARY: meta policy.dr_pose, 플랜의 dvp_state.
   max_run_s: 500.0            # [결정: operator 2026-09-11 — 120 -> 500 s]
                               # wall-clock completion of the mission (not a
                               # measurement). path_timeout_s = max_run_s x
@@ -1378,23 +1431,39 @@ dvl:
   #                  0.3 rad/s of yaw a 0.2 m arm is 6 cm/s of apparent
   #                  velocity [유도: v = omega x r].
   #
-  # MEASURED 2026-10-13 (operator, tape, reported in the Claude session):
+  # ORIENTATION — MEASURED 2026-10-13 (operator, reported in the Claude
+  # session); unchanged by the 2026-10-16 re-mount (operator: LED still aft):
   #   LED edge faces AFT, transducers down, bracket level. The device's own
   #   mounting_rotation_offset is 180 (data/20261011/1011_155235_dvl_probe/
   #   api/config.json), so the device already outputs the vehicle frame ->
   #   yaw 0 here (ONE place only). If the device offset is ever set back to
   #   0 for this mount, this becomes [0, 0, 180].
-  #   DVL vs the C3 centre lens (CAM_A): 498.23 mm aft, 0 lateral, 237 mm
-  #   below, taken to the TOP of the back plate (centre) [측정: 운영자 줄자,
-  #   2026-10-13]; + 28 mm back plate -> origin [스펙: axes page]; + the lens
-  #   position cam_t_flu [0.30584, 0.0, 0.10501] (hw_nav.yaml — x/z SUSPECT
-  #   since 2026-09-08, and this inherits that error) [유도]:
-  #     x = 0.30584 - 0.49823         = -0.192
-  #     z = 0.10501 - 0.237 + 0.028    = -0.104
-  #   (Had the 237 mm been taken to the transducer face instead, the origin
-  #   is 25 mm higher — A50 height [스펙: datasheet] — z = -0.079.)
+  # POSITION — RE-MOUNTED 2026-10-16 (the DVL moved ~39 mm aft):
+  #   DVL vs the C3 centre lens (CAM_A): 537.5 mm aft, 0 lateral, 238.21 mm
+  #   below [운영자 보고, 2026-10-16 Claude 세션 — 산출물 없음, 측정 방법
+  #   미기재; 0.01 mm 자리는 줄자 눈금보다 잘다], taken — as on 10-13, an
+  #   ASSUMPTION — to the TOP of the back plate (centre); + 28 mm back plate
+  #   -> origin, on the side AWAY from the transducers, where the beam axes
+  #   cross [스펙: docs.waterlinked.com/dvl/axes, sign re-checked 2026-10-16;
+  #   vendor wording before 2026-06 put the origin on the transducer side —
+  #   superseded]; + the lens position cam_t_flu [0.30584, 0.0, 0.10501]
+  #   (hw_nav.yaml — x/z SUSPECT since 2026-09-08, and this inherits that
+  #   error) [유도]:
+  #     x = 0.30584 - 0.5375             = -0.232
+  #     z = 0.10501 - 0.23821 + 0.028    = -0.105
+  #   (Had the 238.21 mm been taken to the transducer face instead, the
+  #   origin is 25 mm higher — A50 height [스펙: datasheet] — z = -0.080.)
+  #   SUPERSEDED: runs 2026-10-13..10-16 flew [-0.192, 0.0, -0.104] (498.23 mm
+  #   aft, 237 mm below, operator tape 2026-10-13); each run's meta
+  #   dvl.mount_t_flu says which. Do not pool dvl_u/v/w across the change
+  #   without reprocessing from <stem>_dvl.jsonl.
+  #   A tag fit on that old mount put r_frd at x -0.164..-0.167 (tape -0.192),
+  #   z +0.094..+0.102 (tape +0.104) [측정: data/20261013/
+  #   1013_dvl_compare_offline/foundation_selfcheck.txt:115-119]: z supports
+  #   the back-plate convention above; x is ~2.7 cm short, cause unresolved,
+  #   and this re-mount does not fix it.
   mount_rpy_deg: [0.0, 0.0, 0.0]
-  mount_t_flu: [-0.192, 0.0, -0.104]
+  mount_t_flu: [-0.232, 0.0, -0.105]
   # ---- per-sample gates (a sample failing any is not used that tick) ----
   # Oldest sample age still used. The vendor's own example report is 0.19 s
   # old when transmitted [스펙 예시 1건: time_of_transmission - time_of_validity
@@ -1428,6 +1497,16 @@ dvl:
   # alone do NOT catch every wrong mount (see the NOT-caught list below) —
   # the opt-out skips a proving pass, it is not a safety device.
   require_proven: true
+  # TRUST (`--dvl-trust`, 2026-10-19 운용자 결정 — "DVL 속도가 태그 유한차분보다 정확하다"; --dvl_pose trust 모드와 같은 전제):
+  # DVL을 장치가 보고하는 대로 믿는다(`DvlAid.trust`). IN·engage는 장착값과 데이터만 필요(proving pass 없음), tick 판정은 데이터
+  # 게이트·품질 플래그만(`usable_trusted`) — 태그 속도와의 불일치 hold(dis_diff/dis_align/dis_fit)가 샘플을 막지 않고, 에스컬레이션
+  # 래치는 기록·로그만 된다(TRIPPED 줄에 "recorded only"; 스위치는 그대로 IN; 다음 래치도 기록). 남는 것: 데이터 게이트(lock·fom·
+  # 고도·점프·stale), 품질 플래그, 장치 설정 변경 래치(이것만은 trust에서도 작동 — 안전 리뷰 2026-10-19). 0.5 m/s 미만에서는 태그와의
+  # 교차 검사가 전혀 없다(blend gross 한계 0.5 m/s는 이 기체의 0.1 m/s 운항에서 무의미): 부호가 뒤집힌 DVL도 w=1로 날고, 그 사이에
+  # 서는 것은 아래 mount_* 장착값뿐이다. primary 전용(legacy면 setup 거부). `--dvl-trust` / `--dvl-strict`가 이 값과
+  # dvl_pose.trust_dvl을 함께 덮는다. 비용: 틀린 DVL(장착·장치가 표시하지 않는 false lock)이 태그가 보여도 nu[0:2]에 그대로
+  # 들어간다 — 실기 0런 [예측]. false = 2026-10-16의 hold·래치 그대로.
+  trust: false
   # All [예측], from a SYNTHETIC prototype (tag noise 0.8 mm at 15 Hz, DVL
   # noise 3 mm/s — neither is this DVL): 8 s of 8-12 cm/s surge and sway
   # identified the map to +-0.01 and the mount yaw to +-0.3 deg.
@@ -1573,6 +1652,103 @@ ekf:
   control_max_velocity_divergence_m_s: 0.15 # [예측] |LP(nu_ekf - nu_tag)|, tau 0.5 s
   control_engage_max_divergence_m: 0.05     # [예측]
   control_engage_max_yaw_deg: 3.0           # [예측]
+
+# ---------------------------------------------------------------------------
+# THE DVL POSE (control/dvl_pose.py, 2026-10-18; HARDWARE-UNVERIFIED) — the
+# vehicle pose from DVL dead reckoning, with AprilTag fixes as optional
+# corrections: x, y = the DVL's body-origin velocity (dvl: mount + lever arm)
+# integrated in the map; yaw = the RAW_IMU gyro (its bias learnt from the
+# tags while TAG FIX is ON; ArduSub's yaw and ATTITUDE rates are
+# compass-coupled on this vehicle — module docstring); z = the Bar30 + an
+# offset to the map; roll/pitch/p,q,r = ArduSub. The trajectory panel's
+# TAG FIX button: ON = the pose is the tag state while a fix is fresh and the
+# DVL carries the dropouts; OFF = DVL only (tags recorded and watched).
+#
+#   ./c3 gui --source hw --allow-command --mpc --dvl_pose          # control
+#   ./c3 gui --source hw --allow-command --mpc --dvl_pose shadow   # measure
+#
+# `mode` is what the session runs with no --dvl_pose on the command line;
+# a `control` here is flown as SHADOW (only the command line arms a closed
+# loop on dead reckoning — the imu_dr rule). --dvl_pose implies --dvl, and a
+# control pose needs the DVL switch IN and the session's PROOF (dvl:
+# require_proven) — a wrong mount is a position feedback of the wrong sign.
+# What the numbers below rest on: the OPEN-LOOP replay of the 2026-10-13..17
+# pool logs (data/20261017/1017_dvl_pose_feasibility/REPORT.md, independently
+# re-computed in verify/VERIFY.md) — 10-17 (new mount): 60 s error p50/p90
+# 4.4/17.1 cm with the tag heading, the p90 above 10 cm after 15-19 s.
+dvl_pose:
+  mode: off
+  tag_on_at_start: true
+  heading: raw_gyro          # raw_gyro | att_rate (compass-coupled fallback)
+  gyro_stale_s: 0.5          # [예측]
+  gyro_late_deg: 3.0         # a queued (late) gyro: more heading lag than this past the 0.2 s extrapolation = no heading; < jump_yaw_deg 5 [예측]
+  gyro_late_max_s: 0.1       # ...or more than this past it at any rate (0.1 = 0.3 s late: a queued link has no dead reckoning; healthy days max 0.13 s, rules_replay/out_round8/evidence/gyro_lateness.json) [예측]
+  bias_window_s: 120.0       # the bias fit's window of TAG FIX ON fixes
+  bias_min_span_s: 60.0      # ...needed before the bias is "ok" [유도: verify/out/rawgyro_causal.txt]
+  bias_min_n: 200
+  bias_outlier_deg: 2.0      # [예측]
+  require_gyro_bias: true    # control: OFF refused until the bias is learnt (strict mode only)
+  # TRUST MODE (--dvl-trust, 2026-10-19): DVL을 장치가 보고하는 대로 믿는다 — proving pass 없이 첫 샘플에 스위치 자동 IN,
+  # DvlAid의 태그 속도 보류(dis_*)·래치가 DR을 막지 않음, DVL 공백이 구멍(START 거부)이 되지 않음(미적분 이동은 기록·경고),
+  # OFF가 자이로 바이어스를 기다리지 않음(ON 동안 학습, 지난 세션 저장값으로 시드). 남는 정지: DVL 자체 게이트(lock·고도·fom·빔·점프),
+  # 태그가 보일 때의 발산 정지, max_dr_speed_m_s, lost_s. 틀린 DVL은 태그가 보일 때만 잡힌다. false = 2026-10-18 리뷰의 strict 게이트
+  # (data/20261019/1019_211310: OFF까지 게이트 96 s, 그 뒤 dis_fit 보류가 런을 1.9 s에 끝냄). --dvl-trust / --dvl-strict가 덮는다
+  # (속도 blend의 `dvl.trust`도 함께).
+  trust_dvl: false
+  bias_seed_max_age_h: 12.0  # 지난 세션이 저장한 자이로 바이어스(data/dvl_pose_gyro_bias.json)를 이 시간 안이면 시드; 0 = 안 함 [예측]
+  hold_s: 0.45               # = dvl blend_hold_s (the RL exports' trained hold) [스펙]
+  max_interp_s: 0.6          # = dvl stale_s
+  lost_s: 1.5                # no usable DVL this long = no pose [예측]
+  min_tags: 1                # 1 = every fix the localizer accepted (hw_nav min_tags gates it)
+  anchor_n: 5                # fixes that must agree on a new level [예측]
+  agree_window_s: 10.0       # ...collected over at most this long; they (and the divergence evidence) survive a flickering view's gaps [예측]
+  oneshot_timeout_s: 10.0    # TAG FIX pressed while OFF = one correction, then OFF by itself; none accepted this long = back to OFF uncorrected [예측]
+  jump_m: 0.10               # [예측]
+  jump_yaw_deg: 5.0          # [예측]
+  jump_z_m: 0.10             # [예측] (map plane ~3 deg off gravity: tag z moves 43-57 mm per m of y, never between fixes)
+  corr_rate_m_s: 0.02        # engaged re-correction slew [예측]
+  corr_rate_deg_s: 1.0       # [예측]
+  max_corr_m: 0.25           # engaged, a correction AFTER dead reckoning (reacquire/blind) larger = control run ends; a held tag jump is slewed [예측]
+  max_corr_yaw_deg: 10.0     # [예측]
+  max_corr_z_m: 0.20         # a z correction larger is WARNED (slewed whatever its size: z never ends a run on a correction) and caps abort_err_z_m; NOT a bound of the z step at a tag dropout (that step is the bridging error) [예측]
+  warn_err_m: 0.10           # OFF: |pose - tag| warning [예측]
+  # each abort <= its max_corr_* (checked at load): else OFF flies on where pressing ON would end the run
+  abort_err_m: 0.25          # OFF: ...for abort_hold_s ends a control run; null = off [예측]
+  abort_err_yaw_deg: 10.0    # [예측]
+  abort_err_z_m: 0.20        # [예측]
+  abort_hold_s: 1.0          # [예측]
+  warn_unaided_s: 20.0       # panel warning [측정 basis: verify/out/agg_curves_perm_drift.txt]
+  max_unaided_s: null        # end a control run this long after the last correction; null = never
+  # BLIND = no fresh tag at all (neither used nor compared): control ends a run blind this long; null = never
+  # (2026-10-18 operator: long tagless runs re-fixed by a one-shot TAG FIX). A DVL faster than max_dr_speed_m_s still ends one.
+  max_blind_s: null          # [10-17 p90 > 10 cm after 15-19 s, verify/out/agg_curves_perm_drift.txt — the panel warns at warn_unaided_s]
+  max_dr_speed_m_s: 0.30     # [예측: = station_bridge dvl_max_speed_m_s; missions fly <= 0.15 m/s]
+  max_unobserved_m: 0.10     # unintegrated MOTION since the track's anchor (gap time beyond hold_s x the speed before it) before the track has a HOLE [예측]
+  unobserved_v_floor_m_s: 0.02  # ...the speed a gap is charged at never below this [예측]
+  depth_stale_s: 1.5
+  vz_lp_alpha: 0.3           # [예측]
+  alt_band_m: [0.10, 0.60]   # DVL altitude the replay found good; outside = warning [측정: out/concentration.json]
+
+# STATE NOISE (control/state_noise.py, 2026-10-19; HARDWARE-UNVERIFIED):
+# Gaussian noise added ONLY to the state the LOW controller is handed
+# (ctrl.step). The plot, CSV px/py/..., the DP proprio (unless the station runs
+# with --state-noise-policy) and every interlock stay on the un-noised state. Built only by `--state-noise [SCALE]` (SCALE
+# overrides `scale`); the panel's NOISE button switches it, OFF at start, and
+# only while disengaged with no CSV open. CSV sn_* = the noise each row added.
+# Every sigma here is a CHOICE, not a measurement. Effective sigma (scale x
+# sigma) over state_noise.LIMITS is refused at load.
+state_noise:
+  scale: 1.0
+  pos_m: 0.005               # x, y 1-sigma [예측: choice; tag noise 0.8 mm, see vel_lp_alpha]
+  z_m: 0.005                 # [예측: choice]
+  rp_deg: 0.5                # roll, pitch [예측: choice]
+  yaw_deg: 1.0               # [예측: choice]
+  vel_m_s: 0.01              # u, v, w [예측: choice]
+  rate_deg_s: 0.5            # p, q, r [예측: choice]
+  acc_m_s2: 0.0              # nudot u, v, w (EAOB only)
+  tau_s: 0.0                 # 0 = white per control tick; > 0 = Gauss-Markov correlation time
+  seed: null                 # null = fresh per engagement (meta state_noise.at_engage.seed)
+  # (no `policy:` key on purpose — the DP sees the noise only with --state-noise-policy; a yaml key is refused)
 
 # nudot for the EAOB: 'imu' = SCALED_IMU2 specific force (+gravity, -omega x v);
 # 'fd' = finite-difference of nu (the sim's definition — much noisier here

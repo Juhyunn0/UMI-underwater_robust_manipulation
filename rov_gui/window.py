@@ -785,6 +785,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._traj_panel.mpc_tune_requested.connect(b.cmd_mpc_tune)
             self._traj_panel.dvl_use_requested.connect(b.cmd_dvl_use)
             self._traj_panel.estimator_requested.connect(b.cmd_estimator)
+            # --dvl_pose's TAG FIX switch (2026-10-18): the same request /
+            # re-sync split; the worker takes it while engaged too.
+            self._traj_panel.dvl_pose_tag_requested.connect(
+                b.cmd_dvl_pose_tag)
+            # --state-noise's NOISE switch (2026-10-19): the EST split.
+            self._traj_panel.state_noise_requested.connect(
+                b.cmd_state_noise)
 
         # Explicit .connect rather than the `activated=` constructor keyword:
         # that keyword form is a PyQt convenience and is not portable to PySide.

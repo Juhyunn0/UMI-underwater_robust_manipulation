@@ -84,6 +84,9 @@ POLICY_PROVENANCE = {
                      "life at install ≥ 0.4 s ≥ blend_s (v2 A7; was 0.4: zero "
                      "margin against the measured chain)]",
     "stale_s": "[예측]",
+    "allow_dr_pose": "[결정: operator 2026-10-19 — the DP flies on the DVL "
+                     "dead-reckoned pose under --dvl_pose control "
+                     "(--policy-dr); false = A9, a DR tick is bridged]",
     "max_run_s": "[결정: operator 2026-09-11 — 120 -> 500 s]",
     "observe_max_run_s": "[예측] (POLICY OBSERVE / LOW level None only; "
                          "nothing is commanded)",
@@ -273,6 +276,12 @@ def default_policy_block() -> dict:
         "z_hold_above_floor_m": None,
         "obs_max_age_s": 0.6,               # == config/hw_mpc.yaml + backends/policy.py fallback
         "stale_s": 1.5,
+        # --policy-dr (2026-10-19, operator decision): under --dvl_pose
+        # control a dead-reckoned / held tick is a plan ANCHOR (the flown
+        # DVL pose, stamped with the tick) instead of "bridged" (A9: plans
+        # skipped, the run ends after stale_s). False = A9 as reviewed.
+        # The station bridge ladder and --imu-dr control stay bridged.
+        "allow_dr_pose": False,
         # [결정: operator 2026-09-11 — 120 -> 500 s] ("Policy 시간 120s에서
         # 500s으로 늘려줘"). Not a measurement. path_timeout_s (= max_run_s x
         # traj_timeout_factor, the generic wall-clock backstop) grows with it.
@@ -431,6 +440,8 @@ def validate_policy_block(pc: dict) -> dict:
             raise ValueError(f"policy.{k} must be finite and >= 0, "
                              f"got {pc[k]!r}")
         pc[k] = v
+    # a bool, never a truthy string ("false" would arm it)
+    pc["allow_dr_pose"] = bool(pc.get("allow_dr_pose", False))
     yf = pc.get("yaw_ref_filter")
     if yf is not None:
         if not isinstance(yf, dict):
@@ -1408,8 +1419,11 @@ def policy_rp_tracked(low, action_repr, attitude_track) -> bool:
 #: belongs to the pwm TRANSPORT (the command sink reads `rl_pwm.pwm_cap` once at
 #: launch and clamps every pulse with it) — a second value would either be
 #: ignored on the wire or make every engage fail the follower-vs-sink check.
+#: heave_trim_n (2026-10-18) is this LOW's OWN heave trim (rl_policy.HwRlPwm
+#: ._heave_trim_cfg; validated at the follower's build by
+#: rl_pwm.parse_heave_trim_n, |v| <= 10 N, + = up in the world).
 RL_PWM_7D_KEYS = ("policy_dir", "leash_m", "yaw_rate_ff", "yaw_rate_max",
-                  "allow_caps_below_trained")
+                  "allow_caps_below_trained", "heave_trim_n")
 
 
 def validate_rl_pwm_7d_block(b: dict) -> None:
@@ -1725,6 +1739,17 @@ class MpcConfig:
     # keys RAISE (the dvl rule); `--ekf off|shadow|control` overrides
     # `enabled`, and only the command line can start a session in control.
     ekf: dict = field(default_factory=dict)
+    # The DVL dead-reckoned POSE (control/dvl_pose.py, 2026-10-18,
+    # HARDWARE-UNVERIFIED). Empty = dvl_pose.DEFAULTS, i.e. OFF. Unknown keys
+    # RAISE (the dvl rule); `--dvl_pose [shadow|control]` overrides `mode`,
+    # and only the command line can start a session in control.
+    dvl_pose: dict = field(default_factory=dict)
+    # Deliberate Gaussian noise on the state the LOW controller is handed
+    # (control/state_noise.py, 2026-10-19, HARDWARE-UNVERIFIED). Empty =
+    # state_noise.DEFAULTS. Only `--state-noise [SCALE]` builds it (the
+    # panel's NOISE button then switches it, OFF at start); unknown keys and
+    # an effective sigma over state_noise.LIMITS RAISE at load.
+    state_noise: dict = field(default_factory=dict)
     # ROOT of the dated run tree (rov_gui/runstore.py), not the folder
     # written to: the CSV, its .meta.json and events.log land in
     # <log_dir>/YYYYMMDD/MMDD_HHMMSS/ beside the recordings of the same run.
@@ -1943,6 +1968,20 @@ class MpcConfig:
 
             _resolve_ekf(raw["ekf"])
             cfg.ekf = dict(raw["ekf"])
+        if "dvl_pose" in raw and raw["dvl_pose"]:
+            # The dvl rule: a typo in a safety number (`abort_err:` for
+            # `abort_err_m:`) RAISES at load instead of flying the default.
+            from .dvl_pose import resolve as _resolve_dvp
+
+            _resolve_dvp(raw["dvl_pose"])
+            cfg.dvl_pose = dict(raw["dvl_pose"])
+        if "state_noise" in raw and raw["state_noise"]:
+            # The dvl rule: a typo (`yaw_dg:`) or a sigma over the ceiling
+            # RAISES at load instead of flying the default.
+            from .state_noise import resolve as _resolve_sn
+
+            _resolve_sn(raw["state_noise"])
+            cfg.state_noise = dict(raw["state_noise"])
         if "replay" in raw and raw["replay"]:
             # Unknown keys RAISE, the imu_dr rule: `griper:` for `gripper:` or
             # `vmax:` for `v_max_m_s:` silently ignored means a replay flown

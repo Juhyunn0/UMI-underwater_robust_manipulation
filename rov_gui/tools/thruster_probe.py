@@ -48,7 +48,8 @@ SEQUENCES (``--seq``, letters in the order they are to run; default A):
   E  rest trim — 60 s of neutral pulses mid-water with the jaw EMPTY: mean/std of roll/pitch (NED, +pitch = nose UP),
      depth drift (net weight sign), battery current (hotel load).
 
-SAFETY. The vehicle must be ARMED in MANUAL with the propellers ON, mid-pool (COM >= 0.6 m above the floor), tether
+SAFETY. The vehicle must be ARMED (or --arm: armed by this tool after the preflight, disarmed at exit — the
+pilot-input failsafe FS_PILOT_INPUT 2 disarms it 3 s after QGC and the station stop sending) in MANUAL with the propellers ON, mid-pool (COM >= 0.6 m above the floor), tether
 slack, pack >= 15.5 V, the Lua override installed (rov_gui/tools/install_rl_pwm_lua.py) and every PwmGate item of
 control/rl_pwm.py read back from the vehicle and passing, the script's "RLPWM" heartbeat fresh and saying 1 within
 1.5 s of the first neutral frames. Nobody in the water. Checked EVERY tick (20 Hz) and aborting with a burst of five
@@ -105,6 +106,33 @@ MANUAL_MODE = 19                         # ArduSub custom_mode MANUAL [스펙 py
 MAV_MODE_FLAG_SAFETY_ARMED = 128
 MAV_TYPE_GCS, MAV_AUTOPILOT_INVALID = 6, 8
 MAV_CMD_SET_MESSAGE_INTERVAL, MAV_CMD_REQUEST_MESSAGE = 511, 512
+MAV_CMD_COMPONENT_ARM_DISARM = 400       # [스펙 MAVLink common] param1 1 = arm / 0 = disarm, param2 0 = no force
+MAV_RESULT_NAMES = {0: "ACCEPTED", 1: "TEMPORARILY_REJECTED", 2: "DENIED", 3: "UNSUPPORTED", 4: "FAILED",
+                    5: "IN_PROGRESS", 6: "CANCELLED"}
+#: --arm (2026-10-17, operator-approved; reviewed the same day — safety / MAVLink / tests lenses, 25 findings fixed).
+#: The vehicle's pilot-input failsafe disarms it FS_PILOT_TIMEOUT after the last MANUAL_CONTROL or RC override from
+#: SYSID_MYGCS (FS_PILOT_INPUT 2 = disarm [스펙 ArduSub Parameters.cpp default FS_PILOT_INPUT_DISARM, 3.0 s]; this
+#: vehicle's values are READ at every --arm preflight and written to probe_run.json["vehicle_failsafe"] — the artefact),
+#: and its GCS failsafe (FS_GCS_ENABLE 2) FS_GCS_TIMEOUT_S after the last GCS heartbeat [스펙 Sub-4.5 defines.h
+#: FS_GCS_TIMEOUT_MS 2500]. So with QGC and the station closed — as §3 requires — it is never found ARMED and every run
+#: ended "REFUSED: DISARMED" (data/20261017/1017_1916*_probe). With --arm the tool: (1) requires every other preflight
+#: item (MANUAL, tilt, depth band, pack, ages, gate, script heartbeat) and FS_PILOT_INPUT == 2 (the exit path's backstop);
+#: (2) refuses a vehicle found ARMED (a second sender, or a failsafe that is not what we rely on); (3) streams neutral
+#: MANUAL_CONTROL for ARM_PRELUDE_S, waits for the operator's ENTER (ARM_CONFIRM_S), re-checks, sends ONE
+#: COMPONENT_ARM_DISARM without force, and goes on only when the vehicle's own HEARTBEAT says armed within ARM_WAIT_S
+#: (the COMMAND_ACK is recorded, not believed) with the abort checks running every tick meanwhile; (4) never changes
+#: the flight mode; (5) at exit DISARMs whenever an ARM request was SENT (confirmed or not — a DISARM to a disarmed
+#: vehicle is an accepted no-op [스펙 Sub-4.5 GCS_Common handle_command_component_arm_disarm]), re-sending every
+#: DISARM_RETRY_S until the HEARTBEAT confirms or DISARM_WAIT_S passes, and records the outcome. Pool: 0 runs [예측].
+ARM_PRELUDE_S = 1.0
+ARM_CONFIRM_S = 30.0
+ARM_WAIT_S = 5.0
+DISARM_WAIT_S = 2.0
+DISARM_RETRY_S = 0.5
+FS_PILOT_INPUT_DISARM = 2
+FS_GCS_TIMEOUT_S = 2.5
+PROBE_PARAMS = ("FS_PILOT_INPUT", "FS_PILOT_TIMEOUT", "FS_GCS_ENABLE")   # read by this tool only, never by PwmGate
+PROBE_PARAM_RETRY_S = 1.0
 MSG_ID = {"SYS_STATUS": 1, "RAW_IMU": 27, "ATTITUDE": 30, "SERVO_OUTPUT_RAW": 36, "VFR_HUD": 74,
           "SCALED_PRESSURE2": 137, "BATTERY_STATUS": 147, "AUTOPILOT_VERSION": 148}
 #: Message rates asked for with MAV_CMD_SET_MESSAGE_INTERVAL (ArduSub's defaults are 2-4 Hz: useless for a 0.4 s window).
@@ -292,6 +320,8 @@ class Telemetry:
         self.batt_log: list = []          # (t, v, a)
         self.fw = ""
         self.texts: list = []
+        self.acks: list = []              # (t, command, result) of every COMMAND_ACK — the ARM/DISARM answers
+        self.params: dict = {}            # PROBE_PARAMS values (the failsafes --arm relies on); the gate keeps its own
         self.n_foreign = 0
         self.counts: dict = {}
 
@@ -355,7 +385,10 @@ class Telemetry:
             pid = getattr(msg, "param_id", "")
             if isinstance(pid, bytes):
                 pid = pid.decode("ascii", "ignore")
-            self.gate.note_param(str(pid).strip("\x00"), getattr(msg, "param_value", None), now)
+            name = str(pid).strip("\x00")
+            self.gate.note_param(name, getattr(msg, "param_value", None), now)
+            if name in PROBE_PARAMS and getattr(msg, "param_value", None) is not None:
+                self.params[name] = float(msg.param_value)
         elif mt == "NAMED_VALUE_FLOAT":
             name = getattr(msg, "name", "")
             if isinstance(name, bytes):
@@ -366,6 +399,10 @@ class Telemetry:
             self.fw = firmware_version_str(getattr(msg, "flight_sw_version", None)) or self.fw
         elif mt == "STATUSTEXT":
             self.texts.append((now, str(getattr(msg, "text", ""))))
+        elif mt == "COMMAND_ACK":
+            c = getattr(msg, "command", None)                  # MAV_RESULT_ACCEPTED is 0: never `or -1` here
+            r = getattr(msg, "result", None)
+            self.acks.append((now, -1 if c is None else int(c), -1 if r is None else int(r)))
 
     def _depth(self, now, d, src) -> None:
         self.t_depth, self.depth_m, self.depth_src = now, float(d), src
@@ -459,6 +496,12 @@ class Link:
         self.master.mav.command_long_send(self.target_sys, self.target_comp, MAV_CMD_REQUEST_MESSAGE, 0,
                                           MSG_ID["AUTOPILOT_VERSION"], 0, 0, 0, 0, 0, 0)
 
+    def arm_disarm(self, arm: bool) -> None:
+        """MAV_CMD_COMPONENT_ARM_DISARM with param2 0: never forced past the vehicle's own pre-arm checks. The ONE
+        call site in this tool that changes what the vehicle is (backends/hardware.py set_arm has the same rule)."""
+        self.master.mav.command_long_send(self.target_sys, self.target_comp, MAV_CMD_COMPONENT_ARM_DISARM, 0,
+                                          1.0 if arm else 0.0, 0.0, 0, 0, 0, 0, 0)
+
     def set_rates(self, rates: dict = RATES_HZ) -> None:
         for name, hz in rates.items():
             mid = MSG_ID.get(name)
@@ -502,7 +545,10 @@ class _SynthMav:
         self.v.on_override(int(target_sys), [int(c) for c in chans])
 
     def manual_control_send(self, *args):
+        self.v._advance(float(self.v.clock()))
         self.v.n_manual += 1
+        self.v.t_last_pilot = self.v.t                 # Sub-4.5 GCS_Mavlink.cpp: MANUAL_CONTROL feeds the pilot-input failsafe
+        self.v.manual_log.append((self.v.t, tuple(args)))
 
     def heartbeat_send(self, *args):
         self.v.n_gcs_hb += 1
@@ -540,7 +586,9 @@ class SyntheticVehicle:
                  disarm_at=None, mode_at=None, tilt_impulse=None, heave_mass_kg: float = 26.0,
                  heave_damping: float = D_HEAVE_NSM, heave_drag_quadratic: float = 2000.0,
                  mygcs: int = STATION_SYSID, script_enabled: bool = True, script_running: bool = True,
-                 thrust_gain: float = 1.0):
+                 thrust_gain: float = 1.0, armed0: bool = True, mode0: int = MANUAL_MODE, arm_refused: bool = False,
+                 arm_ack_only: bool = False, arm_no_ack: bool = False, arm_delay_s: float = 0.0,
+                 ignore_disarm: bool = False, drop_first_disarm: bool = False, fs_pilot_timeout_s: float | None = 3.0):
         self.ex, self.clock = export, clock
         self.sysid, self.mygcs = int(sysid), int(mygcs)
         self.k, self.I, self.zeta, self.c_yaw = float(k_nm_per_rad), tuple(float(i) for i in inertia), zeta, yaw_damping
@@ -566,12 +614,29 @@ class SyntheticVehicle:
         self.params.update({f"MOT_{n}_DIRECTION": float(md[n - 1]) for n in range(1, 9)})
         self.params.update({f"RC{c}_OPTION": 0.0 for c in range(9, 17)})
         self.params.update({"SCR_ENABLE": 1.0, "SCR_USER1": 1.0, "RC_OPTIONS": 0.0, "RC_OVERRIDE_TIME": 3.0,
-                            "SYSID_MYGCS": float(mygcs), "SYSID_THISMAV": float(sysid), "SCR_HEAP_SIZE": 100000.0})
+                            "SYSID_MYGCS": float(mygcs), "SYSID_THISMAV": float(sysid), "SCR_HEAP_SIZE": 100000.0,
+                            # the failsafes --arm reads: this vehicle's values (data/20261017 --arm probe_run.json)
+                            "FS_PILOT_INPUT": 2.0, "FS_PILOT_TIMEOUT": 3.0, "FS_GCS_ENABLE": 2.0})
         self.params.update(params or {})
         # state
         self.t = float(clock())
         self.t0 = self.t
-        self.armed, self.mode = True, MANUAL_MODE
+        #: armed0 False = the pool reality with QGC and the station closed (the pilot-input failsafe disarmed it);
+        #: arm_refused = a pre-arm check failing on the vehicle (COMMAND_ACK FAILED, HEARTBEAT stays disarmed)
+        self.armed, self.mode = bool(armed0), int(mode0)
+        self.arm_refused, self.arm_ack_only, self.arm_no_ack = bool(arm_refused), bool(arm_ack_only), bool(arm_no_ack)
+        self.arm_delay_s, self.ignore_disarm, self.drop_first_disarm = float(arm_delay_s), bool(ignore_disarm), bool(drop_first_disarm)
+        #: pilot-input failsafe as Sub-4.5 failsafe.cpp has it: armed and no MANUAL_CONTROL / accepted RC override from
+        #: SYSID_MYGCS for fs_pilot_timeout_s -> disarm (+ STATUSTEXT). None = off (the pre-2026-10-17 synthetic vehicle).
+        self.fs_pilot_timeout_s = None if fs_pilot_timeout_s is None else float(fs_pilot_timeout_s)
+        self.t_last_pilot = self.t
+        self.n_fs_disarms = 0
+        self.n_arm_cmds = self.n_disarm_cmds = 0
+        self._arm_pending_t = None
+        self.at_arm = None                        # snapshot when the ARM request arrived: t, n_manual, n_frames
+        self.at_disarm = None
+        self.manual_log: list = []                # (t, args) of every MANUAL_CONTROL — body and cadence
+        self.other_cmds: list = []                # COMMAND_LONGs this vehicle does not model (e.g. DO_SET_MODE)
         self.roll = self.pitch = self.yaw = 0.0
         self.p = self.q = self.r = 0.0
         self.depth, self.w = float(depth0_m), 0.0
@@ -624,6 +689,7 @@ class SyntheticVehicle:
                 any_ = True
         if any_:
             self.t_frame = self.t
+            self.t_last_pilot = self.t             # Sub-4.5: RC_CHANNELS_OVERRIDE from SYSID_MYGCS also feeds the failsafe
             self.frames_rx.append((self.t, tuple(self.frame_pulses)))
 
     def on_param_request(self, name: str) -> None:
@@ -638,6 +704,35 @@ class SyntheticVehicle:
             for name, mid in MSG_ID.items():
                 if mid == int(p1) and name in self.rates and p2 > 0:
                     self.rates[name] = 1e6 / float(p2)
+        elif cmd == MAV_CMD_COMPONENT_ARM_DISARM:
+            self._advance(float(self.clock()))
+            if int(p1) == 1:
+                self.n_arm_cmds += 1
+                self.at_arm = {"t": self.t, "n_manual": self.n_manual, "n_frames": len(self.frames_rx)}
+                if self.arm_refused:
+                    self._emit("COMMAND_ACK", command=cmd, result=4)
+                    self._emit("STATUSTEXT", severity=3, text="PreArm: synthetic refusal")
+                elif self.arm_ack_only:                               # says yes, does nothing (what an ACK-truster falls for)
+                    self._emit("COMMAND_ACK", command=cmd, result=0)
+                elif self.arm_delay_s > 0.0:                          # arms (and acks) only arm_delay_s later
+                    self._arm_pending_t = self.t + self.arm_delay_s
+                else:
+                    self.armed = True
+                    self.t_last_pilot = self.t
+                    if not self.arm_no_ack:
+                        self._emit("COMMAND_ACK", command=cmd, result=0)
+            else:
+                self.n_disarm_cmds += 1
+                self.at_disarm = {"t": self.t, "n_frames": len(self.frames_rx), "armed": self.armed}
+                if self.ignore_disarm:
+                    self._emit("COMMAND_ACK", command=cmd, result=1)
+                elif self.drop_first_disarm and self.n_disarm_cmds == 1:
+                    pass                                              # lost on the link: no ack, no effect
+                else:
+                    self.armed = False
+                    self._emit("COMMAND_ACK", command=cmd, result=0)
+        else:
+            self.other_cmds.append((int(cmd), float(p1), float(p2)))
 
     # ---- physics
     def _emit(self, mtype: str, **fields) -> None:
@@ -657,6 +752,15 @@ class SyntheticVehicle:
             self._impulsed = True
             self.roll += float(self.tilt_impulse[1]) / DEG
             self.pitch += float(self.tilt_impulse[2]) / DEG
+        if self._arm_pending_t is not None and t >= self._arm_pending_t:
+            self._arm_pending_t = None
+            self.armed = True
+            self.t_last_pilot = t
+            self._emit("COMMAND_ACK", command=MAV_CMD_COMPONENT_ARM_DISARM, result=0)
+        if self.fs_pilot_timeout_s is not None and self.armed and (t - self.t_last_pilot) >= self.fs_pilot_timeout_s:
+            self.armed = False                                        # pilot-input failsafe: Sub-4.5 failsafe.cpp
+            self.n_fs_disarms += 1
+            self._emit("STATUSTEXT", severity=2, text="Lost manual control")
         fresh = (t - self.t_frame) < 0.1
         ok = self.script_enabled and self.armed and self.mode == MANUAL_MODE and fresh
         self.engaged = ok
@@ -845,9 +949,18 @@ class ProbeRunner:
 
     def __init__(self, link: Link, export: ExportModel, out_dir, *, dry_run: bool, cmd_sysid: int = STATION_SYSID,
                  clock=time.monotonic, sleep=time.sleep, log=print, limits: dict | None = None,
-                 operator=None, gyro_source: str = "attitude", notes: str = ""):
+                 operator=None, gyro_source: str = "attitude", notes: str = "", arm: bool = False):
         self.link, self.ex, self.out = link, export, Path(out_dir)
         self.dry_run, self.cmd_sysid = bool(dry_run), int(cmd_sysid)
+        self.arm_requested = bool(arm)                # --arm: arm a disarmed MANUAL vehicle after the preflight
+        self.arm_sent = False                         # an ARM request LEFT (confirmed or not) -> DISARM at exit
+        self.armed_by_us = False                      # the vehicle's HEARTBEAT confirmed our ARM
+        self.t_arm_sent = None
+        self.t_armed_seen = None                      # when the HEARTBEAT first said armed after our request
+        self.n_disarm_sent = 0
+        self.disarm_confirmed = None
+        self.vehicle_failsafe: dict = {}              # PROBE_PARAMS as the vehicle reported them (probe_run.json)
+        self._probe_param_req: dict = {}
         self.clock, self.sleep, self.log = clock, sleep, log
         self.limits = dict(LIMITS, **(limits or {}))
         self.operator = operator                      # callable(prompt, timeout_s) -> bool, or None = stdin
@@ -884,12 +997,14 @@ class ProbeRunner:
         return p
 
     # ---- the tick
-    def _check(self, now: float) -> None:
+    def _check(self, now: float, require_armed: bool = True) -> None:
+        """Every abort condition, every tick. ``require_armed=False`` only inside _arm (--arm), where everything else
+        must already hold before the one ARM request goes out."""
         L = self.limits
         t = self.tel
         if t.t_hb is None or now - t.t_hb > L["hb_age_max_s"]:
             raise ProbeAbort("autopilot HEARTBEAT lost")
-        if not t.armed:
+        if require_armed and not t.armed:
             raise ProbeAbort("DISARMED")
         if t.mode_raw != MANUAL_MODE:
             raise ProbeAbort(f"flight mode is not MANUAL (custom_mode {t.mode_raw})")
@@ -1027,10 +1142,16 @@ class ProbeRunner:
                 self.t_last_hb = now
             for name in self.gate.next_requests(now):
                 self.link.request_param(name)
+            if self.arm_requested:                             # the failsafes the --arm exit path relies on
+                for name in PROBE_PARAMS:
+                    if name not in self.tel.params and now - self._probe_param_req.get(name, -1e9) >= PROBE_PARAM_RETRY_S:
+                        self.link.request_param(name)
+                        self._probe_param_req[name] = now
             have = (self.tel.t_hb is not None and self.tel.att is not None and self.tel.servo is not None
                     and self.tel.depth_m is not None and self.tel.batt_v is not None
                     and not self.gate.missing(now) and self.gate.t_hb is not None and (self.tel.fw or not asked_ver
-                                                                                        or now > t_end - 5.0))
+                                                                                        or now > t_end - 5.0)
+                    and (not self.arm_requested or all(k in self.tel.params for k in PROBE_PARAMS)))
             if have:
                 break
             self.sleep(TICK_S)
@@ -1052,10 +1173,24 @@ class ProbeRunner:
             missing.append(f"gate parameters {miss[:4]}{' ...' if len(miss) > 4 else ''}")
         if self.gate.t_hb is None:
             missing.append("the script's RLPWM heartbeat (rl_pwm_override.lua not running?)")
+        if self.arm_requested:
+            lost = [k for k in PROBE_PARAMS if k not in t.params]
+            if lost:
+                missing.append(f"failsafe parameters {lost} (--arm needs them)")
         if missing:
             raise ProbeAbort("vehicle did not say within %.0f s: %s" % (timeout_s, "; ".join(missing)))
+        self.vehicle_failsafe = {k: t.params[k] for k in PROBE_PARAMS if k in t.params}   # requested only with --arm
         if t.batt_v < self.limits["min_batt_v"]:
             raise ProbeAbort(f"pack {t.batt_v:.2f} V < {self.limits['min_batt_v']:.1f} V")
+        if self.arm_requested:
+            if t.armed:
+                raise ProbeAbort("--arm: found ARMED — with FS_PILOT_INPUT 2 that means a second sender is streaming "
+                                 "pilot input (QGC joystick / station GUI / another instance of this tool), or that "
+                                 "sender closed < 3 s ago, or the failsafe is not what --arm relies on — close it, wait "
+                                 "3 s, retry (or run without --arm on a vehicle you armed on purpose)")
+            self._check_failsafe_params()
+            self._arm(now)                             # --arm: everything else first, then ONE ARM request
+            now = self.clock()
         self._check(now)                               # armed, MANUAL, tilt, depth band, current, ages, gate
         roll, pitch = t.att[1] * DEG, t.att[2] * DEG
         if max(abs(roll), abs(pitch)) > 15.0:
@@ -1089,13 +1224,128 @@ class ProbeRunner:
             try:
                 self.link.send_pulses(NEUTRAL_PULSES, self.clock())
                 self.link.send_neutral_manual()
-            except Exception:                                    # noqa: BLE001
+            except (Exception, KeyboardInterrupt):               # noqa: BLE001 — a second Ctrl-C must not cut the burst
                 pass
             try:
                 self.sleep(TICK_S)
-            except Exception:                                    # noqa: BLE001
+            except (Exception, KeyboardInterrupt):               # noqa: BLE001
                 pass
         self.gate.note_stopped()
+
+    # ---- --arm
+    def _idle_tick(self) -> None:
+        """One 20 Hz tick with NOTHING on RC 9..16: telemetry in, the GCS heartbeat, the gate's parameter requests and
+        a neutral MANUAL_CONTROL (what the pilot-input failsafe needs to see)."""
+        now = self.clock()
+        self.link.drain(self.tel, now)
+        if now - self.t_last_hb >= 1.0:
+            self.link.heartbeat()
+            self.t_last_hb = now
+        for name in self.gate.next_requests(now):
+            self.link.request_param(name)
+        self.link.send_neutral_manual()
+        self.sleep(TICK_S)
+
+    def _check_failsafe_params(self) -> None:
+        """--arm relies on the vehicle's own failsafes as the second DISARM path once this tool stops sending: pilot
+        input (FS_PILOT_INPUT 2 = disarm FS_PILOT_TIMEOUT after the last MANUAL_CONTROL / RC override from SYSID_MYGCS)
+        and GCS (FS_GCS_ENABLE 2 = disarm FS_GCS_TIMEOUT_S after the last heartbeat). A vehicle whose pilot-input
+        failsafe would not disarm is refused — nothing of --arm is tested without that net."""
+        fs = self.vehicle_failsafe
+        if int(round(fs["FS_PILOT_INPUT"])) != FS_PILOT_INPUT_DISARM:
+            raise ProbeAbort(f"--arm needs FS_PILOT_INPUT {FS_PILOT_INPUT_DISARM} (disarm on lost pilot input) — the "
+                             f"vehicle says {fs['FS_PILOT_INPUT']:g}; the exit path relies on that failsafe")
+        gcs = (f"GCS failsafe disarms {FS_GCS_TIMEOUT_S:.1f} s after the last heartbeat" if int(round(fs["FS_GCS_ENABLE"])) == 2
+               else f"FS_GCS_ENABLE {fs['FS_GCS_ENABLE']:g}: the GCS failsafe does NOT disarm")
+        self.log(f"--arm: vehicle failsafes read: pilot input disarms {fs['FS_PILOT_TIMEOUT']:g} s after the last "
+                 f"MANUAL_CONTROL / RC override; {gcs} (probe_run.json vehicle_failsafe)")
+
+    def _arm(self, now: float) -> None:
+        """--arm on a vehicle the preflight found DISARMED. Order: the mode must already be MANUAL (this tool never
+        changes modes); every other abort condition must hold (_check without the armed item: tilt, depth band, current,
+        message ages, the rl_pwm gate); neutral MANUAL_CONTROL for ARM_PRELUDE_S; the operator's ENTER (ARM_CONFIRM_S —
+        the moment of arming is a human act, as the station's hold-to-confirm ARM is); one more _check; ONE
+        COMPONENT_ARM_DISARM without force; then, with the abort checks still running every tick, the vehicle's own
+        HEARTBEAT must say armed within ARM_WAIT_S — the COMMAND_ACK is recorded, not believed. Any failure before the
+        request is a refusal with the vehicle exactly as it was; any failure after it ends with a DISARM at exit."""
+        t = self.tel
+        if t.mode_raw != MANUAL_MODE:
+            raise ProbeAbort(f"--arm: flight mode is not MANUAL (custom_mode {t.mode_raw}) — set MANUAL first; this "
+                             f"tool never changes the mode")
+        self._check(now, require_armed=False)
+        self.log(f"--arm: the vehicle is disarmed; neutral MANUAL_CONTROL for {ARM_PRELUDE_S:.1f} s, then your ENTER, "
+                 f"then ONE ARM request (no force) ...")
+        t_end = self.clock() + ARM_PRELUDE_S
+        while self.clock() < t_end:
+            self._idle_tick()
+            self._check(self.clock(), require_armed=False)
+        ready = self.operator or _stdin_ready
+        prompt = "--arm: nobody in the water, hands clear of the propellers? press ENTER to ARM now"
+        self.log(f"\n>>> {prompt} (timeout {ARM_CONFIRM_S:.0f} s = refuse) ...")
+        t0 = self.clock()
+        confirmed = False
+        while self.clock() - t0 < ARM_CONFIRM_S:
+            self._idle_tick()
+            self._check(self.clock(), require_armed=False)
+            if ready(prompt, ARM_CONFIRM_S):
+                confirmed = True
+                break
+        if not confirmed:
+            raise ProbeAbort(f"--arm: no operator confirmation within {ARM_CONFIRM_S:.0f} s — not armed")
+        self._check(self.clock(), require_armed=False)
+        n_ack0 = len(t.acks)
+        self.arm_sent = True                                     # from here on a DISARM goes out at exit, whatever happens
+        self.t_arm_sent = self.clock()
+        self.link.arm_disarm(True)
+        while self.clock() < self.t_arm_sent + ARM_WAIT_S:
+            self._idle_tick()
+            self._check(self.clock(), require_armed=False)       # tilt / depth / ages / gate still watched while we wait
+            if t.armed:
+                self.t_armed_seen = self.clock()
+                break
+        acks = [a for a in t.acks[n_ack0:] if a[1] == MAV_CMD_COMPONENT_ARM_DISARM]
+        ack = (f"{MAV_RESULT_NAMES.get(acks[0][2], str(acks[0][2]))} after {acks[0][0] - self.t_arm_sent:.2f} s"
+               if acks else "none")
+        if not t.armed:
+            texts = "; ".join(s for _, s in t.texts[-3:]) or "-"
+            raise ProbeAbort(f"--arm: the vehicle did not report ARMED within {ARM_WAIT_S:.0f} s (COMMAND_ACK {ack}; "
+                             f"STATUSTEXT: {texts}) — pre-arm check? failsafe? A DISARM is sent at exit as a precaution")
+        self.armed_by_us = True
+        self.log(f"--arm: HEARTBEAT reported ARMED {self.t_armed_seen - self.t_arm_sent:.1f} s after the request "
+                 f"(1 Hz HEARTBEAT: quantised, not latency; COMMAND_ACK {ack}) — this tool will DISARM at exit")
+
+    def disarm_if_armed_by_tool(self) -> None:
+        """After the neutral burst: DISARM whenever this tool SENT an ARM request (confirmed by the HEARTBEAT or not —
+        an unconfirmed request may still have armed the vehicle; a DISARM to a disarmed vehicle is an accepted no-op
+        [스펙 Sub-4.5 GCS_Common handle_command_component_arm_disarm]), never for a vehicle found armed. Re-sent every
+        DISARM_RETRY_S until the HEARTBEAT says disarmed or DISARM_WAIT_S passes; no MANUAL_CONTROL meanwhile, so the
+        pilot-input failsafe stays the second path. Never raises — not even on a second Ctrl-C, which would otherwise
+        skip finish()."""
+        if not (self.armed_by_us or self.arm_sent):
+            return
+        try:
+            self.link.arm_disarm(False)
+            self.n_disarm_sent = 1
+            self.log(f"DISARM sent (this tool had requested ARM) — waiting for the HEARTBEAT to say disarmed "
+                     f"(<= {DISARM_WAIT_S:.0f} s, re-sent every {DISARM_RETRY_S:.1f} s) ...")
+            t0 = self.clock()
+            t_next = t0 + DISARM_RETRY_S
+            while self.clock() - t0 < DISARM_WAIT_S:
+                now = self.clock()
+                self.link.drain(self.tel, now)
+                if self.tel.armed is False:
+                    break
+                if now >= t_next:
+                    self.link.arm_disarm(False)
+                    self.n_disarm_sent += 1
+                    t_next = now + DISARM_RETRY_S
+                self.sleep(TICK_S)
+            self.disarm_confirmed = (self.tel.armed is False)
+            state = ("disarmed" if self.disarm_confirmed else
+                     "still ARMED — the pilot-input failsafe disarms it FS_PILOT_TIMEOUT after this stream stopped")
+            self.log(f"DISARM x{self.n_disarm_sent}: HEARTBEAT says {state}")
+        except (Exception, KeyboardInterrupt) as e:              # noqa: BLE001
+            self.log(f"DISARM path interrupted ({type(e).__name__}: {e}) — the pilot-input failsafe is the backstop")
 
     def finish(self, exit_code: int, argv_record: dict | None = None) -> Path:
         self._csv_fh.flush()
@@ -1106,6 +1356,14 @@ class ProbeRunner:
                     "n_ticks": self.n_ticks, "n_frames_sent": self.link.n_frames,
                     "steps": [s.as_dict() for s in self.steps], "results": self.results, "limits": self.limits,
                     "operator_notes": self.notes, "args": argv_record or {},
+                    "arm_requested": self.arm_requested, "armed_by_tool": self.armed_by_us, "arm_sent": self.arm_sent,
+                    "t_arm_sent_s": (None if self.t_arm_sent is None or self.t_run0 is None else self.t_arm_sent - self.t_run0),
+                    "t_armed_seen_s": (None if self.t_armed_seen is None or self.t_run0 is None
+                                       else self.t_armed_seen - self.t_run0),
+                    "n_disarm_sent": self.n_disarm_sent, "disarm_confirmed": self.disarm_confirmed,
+                    "armed_at_exit": self.tel.armed, "vehicle_failsafe": dict(self.vehicle_failsafe),
+                    "command_acks": [(None if self.t_run0 is None else round(a[0] - self.t_run0, 3), a[1], a[2])
+                                     for a in self.tel.acks],
                     "msg_counts": dict(self.tel.counts), "foreign_msgs_ignored": self.tel.n_foreign,
                     "vehicle_texts": self.tel.texts[-20:]})
         return self.write_json("probe_run.json", doc)
@@ -1666,10 +1924,11 @@ def run_all(pr: ProbeRunner, seqs: list, *, free_decay_s: float = 0.0, esc_motor
         raise
     finally:
         pr.neutral_burst()
+        pr.disarm_if_armed_by_tool()
         try:
             pr.finish(code if pr.abort_reason is None else (2 if str(pr.abort_reason).startswith("REFUSED") else 3),
                       argv_record)
-        except Exception as e:                                   # noqa: BLE001
+        except (Exception, KeyboardInterrupt) as e:              # noqa: BLE001
             pr.log(f"could not write probe_run.json: {e}")
         pr.link.close()
 
@@ -1704,7 +1963,15 @@ def main(argv=None) -> int:
     ap.add_argument("--rest-s", type=float, default=REST_S)
     for k, v in LIMITS.items():
         ap.add_argument(f"--{k.replace('_', '-')}", type=float, default=v, help=f"abort limit (default {v})")
+    ap.add_argument("--arm", action="store_true",
+                    help="ARM the vehicle after the preflight passes (MANUAL required, never changed; one request, no "
+                         "force; the vehicle's HEARTBEAT must confirm within %.0f s) and DISARM at exit. Needed because "
+                         "FS_PILOT_INPUT 2 disarms the vehicle 3 s after QGC / the station stop sending" % ARM_WAIT_S)
     ap.add_argument("--dry-run", action="store_true", help="synthetic vehicle, fast clock, no hardware")
+    ap.add_argument("--dry-disarmed", action="store_true",
+                    help="dry run: the synthetic vehicle starts DISARMED (the pool reality with QGC and the station closed)")
+    ap.add_argument("--dry-arm-refused", action="store_true",
+                    help="dry run: the synthetic vehicle refuses ARM (COMMAND_ACK FAILED, HEARTBEAT stays disarmed)")
     ap.add_argument("--dry-run-realtime", action="store_true", help="dry run at wall-clock speed")
     ap.add_argument("--swap", default="", help="dry run: miswire two motors, e.g. 5,8")
     ap.add_argument("--reverse", default="", help="dry run: reversed physical thrusters, e.g. 3")
@@ -1726,7 +1993,8 @@ def main(argv=None) -> int:
     if a.dry_run:
         clock = time.monotonic if a.dry_run_realtime else FakeClock()
         sleep = time.sleep if a.dry_run_realtime else clock.sleep
-        kw = {"sysid": a.target_sysid, "mygcs": a.cmd_sysid, "k_nm_per_rad": a.dry_k, "net_weight_n": a.dry_weight_n}
+        kw = {"sysid": a.target_sysid, "mygcs": a.cmd_sysid, "k_nm_per_rad": a.dry_k, "net_weight_n": a.dry_weight_n,
+              "armed0": not a.dry_disarmed, "arm_refused": a.dry_arm_refused}
         if a.swap:
             kw["swap"] = tuple(int(x) for x in a.swap.split(","))
         if a.reverse:
@@ -1735,9 +2003,11 @@ def main(argv=None) -> int:
         out = run_dir(a.out, kind="probedry", join=False)
         operator = lambda prompt, timeout: True                  # noqa: E731 — the dry-run operator is always ready
         print(f"DRY RUN: synthetic vehicle (k {a.dry_k} N*m/rad, lag 0.25 s, ESC start 0.12 s"
-              f"{', swap ' + a.swap if a.swap else ''}{', reverse ' + a.reverse if a.reverse else ''}) -> {out}")
+              f"{', swap ' + a.swap if a.swap else ''}{', reverse ' + a.reverse if a.reverse else ''}"
+              f"{', starts DISARMED' if a.dry_disarmed else ''}{', refuses ARM' if a.dry_arm_refused else ''}"
+              f"{', --arm' if a.arm else ''}) -> {out}")
         pr = ProbeRunner(link, export, out, dry_run=True, cmd_sysid=a.cmd_sysid, clock=clock, sleep=sleep,
-                         limits=limits, operator=operator, gyro_source=a.gyro, notes=a.note)
+                         limits=limits, operator=operator, gyro_source=a.gyro, notes=a.note, arm=a.arm)
         veh = link.master
 
         def free_decay_before():
@@ -1751,9 +2021,13 @@ def main(argv=None) -> int:
         link = Link(master, target_sys=a.target_sysid)
         out = run_dir(a.out, kind="probe", join=False)
         print(f"link {a.mav} (sysid {a.cmd_sysid} -> vehicle {a.target_sysid}); artefacts -> {out}")
-        print("the vehicle must be ARMED in MANUAL, props ON, mid-pool, tether slack, nobody in the water")
+        if a.arm:
+            print("--arm: the vehicle must be in MANUAL with props ON, mid-pool, tether slack, nobody in the water — "
+                  "this tool ARMS it after the preflight and DISARMS it at exit")
+        else:
+            print("the vehicle must be ARMED in MANUAL, props ON, mid-pool, tether slack, nobody in the water")
         pr = ProbeRunner(link, export, out, dry_run=False, cmd_sysid=a.cmd_sysid, limits=limits,
-                         gyro_source=a.gyro, notes=a.note)
+                         gyro_source=a.gyro, notes=a.note, arm=a.arm)
         free_decay_before = None
     code = run_all(pr, seqs, free_decay_s=a.free_decay, esc_motor=a.esc_motor, esc_levels=levels, esc_on_s=a.esc_on_s,
                    stiffness_nm=a.stiffness_nm, nv_passes=a.nv_passes, rest_s=a.rest_s, argv_record=argv_record,

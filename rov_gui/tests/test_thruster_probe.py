@@ -18,7 +18,13 @@ No vehicle. What is pinned:
    before any frame when the script is not running, exit codes;
 6. control/thruster_probe_artifact.load_and_check: the dry-run artefact is accepted only with allow_dry_run, and
    refused on a mismatching sigma / mot_direction / all_pass false / a WEAK verdict / a tampered PASS / age;
-7. sequences B, C (+ free decay), D, E produce their artefacts with the numbers the synthetic vehicle was built with.
+7. sequences B, C (+ free decay), D, E produce their artefacts with the numbers the synthetic vehicle was built with;
+8. --arm (2026-10-17): a vehicle found DISARMED is armed only after every other preflight item holds, FS_PILOT_INPUT
+   reads 2, a neutral MANUAL_CONTROL prelude and the operator's confirmation, by ONE unforced request that is believed
+   only on the vehicle's HEARTBEAT (an ACK alone is a refusal); a vehicle found ARMED with --arm is refused; a DISARM
+   goes out at exit whenever an ARM request left (re-sent until the HEARTBEAT confirms) and the outcome is recorded;
+   the synthetic vehicle models the pilot-input failsafe (MANUAL_CONTROL and accepted RC override both feed it), a
+   delayed ARM, an ACK-only ARM and a lost / ignored DISARM.
 
 The vehicle, the Lua script and the thrusters themselves are NOT covered: that is the pool.
 """
@@ -55,15 +61,16 @@ def export() -> TP.ExportModel:
     return TP.ExportModel(PWM10)
 
 
-def _run(tmp, seqs, veh_kw=None, *, free_decay_s=0.0, tilt=None, limits=None, **run_kw):
+def _run(tmp, seqs, veh_kw=None, *, free_decay_s=0.0, tilt=None, limits=None, arm=False, log=None, operator=None,
+         **run_kw):
     """A whole dry run on a FakeClock: (exit code, runner, synthetic vehicle, out dir)."""
     clock = TP.FakeClock()
     ex = TP.ExportModel(PWM10)
     veh = TP.SyntheticVehicle(ex, clock, **(veh_kw or {}))
     link = TP.Link(veh, target_sys=1)
     out = Path(tmp) / f"probe_{int(time.time() * 1e6) % 10 ** 9}"
-    pr = TP.ProbeRunner(link, ex, out, dry_run=True, clock=clock, sleep=clock.sleep, log=lambda *a: None,
-                        operator=lambda prompt, timeout: True, limits=limits)
+    pr = TP.ProbeRunner(link, ex, out, dry_run=True, clock=clock, sleep=clock.sleep, log=log or (lambda *a: None),
+                        operator=operator or (lambda prompt, timeout: True), limits=limits, arm=arm)
     def release_tilt():
         """The synthetic operator: a tilt released 2 s into the free-decay recording."""
         veh.tilt_impulse = (clock() + 2.0, tilt[0], tilt[1])
@@ -409,3 +416,225 @@ def test_nv_hold_calibration_interpolates_todays_ballast(tmp_path):
     code, pr, veh, out = _run(tmp_path, "B", {"net_weight_n": 0.5, "depth0_m": 0.4}, nv_passes=1, nv_hold_us="auto")
     nv = json.loads((out / "nv_leak.json").read_text())
     assert nv["passes"][0]["hold_us"] == 0 and "deadband" in nv["passes"][0]["hold_calibration"]["note"]
+
+
+# =============================================================================
+# 8. --arm (2026-10-17): the pool reality is a DISARMED vehicle (FS_PILOT_INPUT 2 disarms it 3 s after QGC / the
+#    station stop sending). With --arm the tool arms it after every other preflight item holds, and disarms at exit.
+#    The synthetic vehicle models that failsafe (MANUAL_CONTROL and accepted RC override both feed it), a delayed ARM,
+#    an ACK-only ARM, a lost / ignored DISARM.
+# =============================================================================
+ARM_CMD = TP.MAV_CMD_COMPONENT_ARM_DISARM
+
+
+def _acks(pr, cmd=ARM_CMD):
+    return [(c, r) for _, c, r in pr.tel.acks if c == cmd]
+
+
+def test_without_arm_a_disarmed_vehicle_is_refused_before_any_frame_as_before(tmp_path):
+    code, pr, veh, out = _run(tmp_path, "E", {"armed0": False}, rest_s=2.0)
+    assert code == 2 and "DISARMED" in pr.abort_reason
+    assert veh.frames_rx == [] and pr.link.n_frames == 0
+    assert veh.n_arm_cmds == 0 and veh.n_disarm_cmds == 0, "nothing arms the vehicle unless --arm is given"
+    assert veh.other_cmds == []
+    run = json.loads((out / "probe_run.json").read_text())
+    assert run["arm_requested"] is False and run["armed_by_tool"] is False and run["arm_sent"] is False
+    assert run["vehicle_failsafe"] == {}, "without --arm the failsafe parameters are not even requested"
+
+
+def test_arm_arms_a_disarmed_manual_vehicle_only_after_a_neutral_prelude_and_disarms_at_exit(tmp_path):
+    lines = []
+    code, pr, veh, out = _run(tmp_path, "E", {"armed0": False}, rest_s=2.0, arm=True, log=lambda m: lines.append(m))
+    assert code == 0, pr.abort_reason
+    assert veh.n_arm_cmds == 1, "exactly one ARM request"
+    assert veh.armed is False and veh.n_disarm_cmds == 1 and veh.at_disarm["armed"] is True, "the tool disarms what it armed"
+    assert pr.arm_sent and pr.armed_by_us and pr.disarm_confirmed is True
+    # the prelude: at the moment the ARM request arrived the vehicle had seen ~ARM_PRELUDE_S / TICK_S neutral
+    # MANUAL_CONTROLs and NO RC 9..16 frame
+    n_prelude = int(round(TP.ARM_PRELUDE_S / TP.TICK_S))
+    assert n_prelude <= veh.at_arm["n_manual"] <= n_prelude + 3, veh.at_arm
+    assert veh.at_arm["n_frames"] == 0
+    # the tool believed the HEARTBEAT (which the synthetic vehicle delivers report_lag_s after the fact), and the first
+    # RC 9..16 frame left only after that
+    assert pr.t_armed_seen is not None and pr.t_armed_seen - veh.at_arm["t"] >= veh.lag
+    # (the FakeClock only moves in sleep(), so the first frame may share the instant the HEARTBEAT was believed)
+    assert veh.frames_rx and veh.frames_rx[0][0] >= pr.t_armed_seen and pr.link.frames[0][0] >= pr.t_armed_seen
+    assert all(p == NEUTRAL_PULSES for _, p in veh.frames_rx), "E + the exit burst: only neutral frames"
+    assert _acks(pr) == [(ARM_CMD, 0), (ARM_CMD, 0)], "ARM and DISARM acks recorded as ACCEPTED (0), not -1"
+    assert any("HEARTBEAT reported ARMED" in m and "COMMAND_ACK ACCEPTED" in m for m in lines)
+    assert any("DISARM x1" in m and "says disarmed" in m for m in lines)
+    assert veh.n_fs_disarms == 0, "the 20 Hz pilot-input stream never starved the failsafe"
+    assert veh.other_cmds == [] and veh.mode == TP.MANUAL_MODE
+    run = json.loads((out / "probe_run.json").read_text())
+    assert run["arm_requested"] is True and run["armed_by_tool"] is True and run["arm_sent"] is True
+    assert run["n_disarm_sent"] == 1 and run["disarm_confirmed"] is True and run["armed_at_exit"] is False
+    assert run["vehicle_failsafe"] == {"FS_PILOT_INPUT": 2.0, "FS_PILOT_TIMEOUT": 3.0, "FS_GCS_ENABLE": 2.0}
+    assert run["t_arm_sent_s"] is not None and run["t_armed_seen_s"] > run["t_arm_sent_s"]
+    assert [(c, r) for _, c, r in run["command_acks"] if c == ARM_CMD] == [(ARM_CMD, 0), (ARM_CMD, 0)]
+
+
+def test_arm_streams_neutral_pilot_input_at_the_tick_rate_through_a_whole_run(tmp_path):
+    code, pr, veh, out = _run(tmp_path, "EADC", {"armed0": False}, rest_s=2.0, arm=True)
+    assert code == 0, pr.abort_reason
+    assert {a for _, a in veh.manual_log} == {(1, 0, 0, 500, 0, 0)}, "MANUAL_CONTROL body is the ArduSub neutral"
+    gaps = [b - a for (a, _), (b, _) in zip(veh.manual_log, veh.manual_log[1:])]
+    assert max(gaps) <= 0.5, f"longest MANUAL_CONTROL gap {max(gaps):.2f} s (failsafe at {veh.fs_pilot_timeout_s} s)"
+    assert veh.n_fs_disarms == 0 and veh.armed is False and veh.n_disarm_cmds == 1
+
+
+def test_arm_refuses_a_vehicle_it_finds_armed_instead_of_adopting_it(tmp_path):
+    code, pr, veh, out = _run(tmp_path, "E", {}, rest_s=2.0, arm=True)
+    assert code == 2 and "found ARMED" in pr.abort_reason and "second sender" in pr.abort_reason
+    assert veh.frames_rx == [] and veh.n_arm_cmds == 0 and veh.n_disarm_cmds == 0 and veh.armed is True
+    run = json.loads((out / "probe_run.json").read_text())
+    assert run["arm_requested"] is True and run["armed_by_tool"] is False and run["arm_sent"] is False
+    assert run["vehicle_failsafe"]["FS_PILOT_INPUT"] == 2.0, "the failsafe parameters were read before the refusal"
+
+
+def test_arm_refuses_a_vehicle_whose_pilot_input_failsafe_would_not_disarm(tmp_path):
+    for bad in (0.0, 1.0):
+        code, pr, veh, out = _run(tmp_path, "A", {"armed0": False, "params": {"FS_PILOT_INPUT": bad}}, arm=True)
+        assert code == 2 and "FS_PILOT_INPUT 2" in pr.abort_reason and f"says {bad:g}" in pr.abort_reason
+        assert veh.n_arm_cmds == 0 and veh.frames_rx == [] and veh.n_manual == 0, "refused before any pilot input"
+        run = json.loads((out / "probe_run.json").read_text())
+        assert run["vehicle_failsafe"]["FS_PILOT_INPUT"] == bad
+
+
+def test_arm_refused_by_the_vehicle_still_sends_a_precautionary_disarm_and_no_frame(tmp_path):
+    code, pr, veh, out = _run(tmp_path, "A", {"armed0": False, "arm_refused": True}, arm=True)
+    assert code == 2 and "did not report ARMED" in pr.abort_reason and "FAILED" in pr.abort_reason
+    assert "PreArm" in pr.abort_reason, "the vehicle's STATUSTEXT is quoted"
+    assert veh.frames_rx == [] and pr.link.n_frames == 0
+    assert veh.n_arm_cmds == 1 and veh.armed is False
+    assert veh.n_disarm_cmds >= 1, "an ARM request LEFT, so a DISARM goes out at exit whatever the vehicle said"
+    assert not (out / ART.FILENAME).exists()
+    run = json.loads((out / "probe_run.json").read_text())
+    assert run["arm_sent"] is True and run["armed_by_tool"] is False and run["armed_at_exit"] is False
+
+
+def test_an_accepted_ack_without_an_armed_heartbeat_is_a_refusal_the_ack_is_not_believed(tmp_path):
+    code, pr, veh, out = _run(tmp_path, "A", {"armed0": False, "arm_ack_only": True}, arm=True)
+    assert code == 2 and "did not report ARMED" in pr.abort_reason and "ACCEPTED" in pr.abort_reason
+    assert veh.frames_rx == [] and pr.link.n_frames == 0 and veh.n_arm_cmds == 1
+    assert veh.n_disarm_cmds >= 1, "precautionary DISARM"
+
+
+def test_an_armed_heartbeat_without_any_ack_is_enough(tmp_path):
+    lines = []
+    code, pr, veh, out = _run(tmp_path, "E", {"armed0": False, "arm_no_ack": True}, rest_s=2.0, arm=True,
+                              log=lambda m: lines.append(m))
+    assert code == 0 and pr.armed_by_us and veh.n_disarm_cmds == 1 and veh.armed is False
+    assert any("HEARTBEAT reported ARMED" in m and "COMMAND_ACK none" in m for m in lines)
+
+
+def test_a_late_arm_beyond_the_wait_is_refused_but_the_vehicle_is_disarmed_at_exit(tmp_path):
+    # the vehicle arms 5.5 s after the request: the tool gives up at ARM_WAIT_S, yet it SENT the request, so it DISARMs
+    code, pr, veh, out = _run(tmp_path, "A", {"armed0": False, "arm_delay_s": TP.ARM_WAIT_S + 0.5}, arm=True)
+    assert code == 2 and "did not report ARMED" in pr.abort_reason and "precaution" in pr.abort_reason
+    assert veh.frames_rx == [] and veh.n_arm_cmds == 1
+    assert veh.n_disarm_cmds >= 1 and veh.armed is False, "the late ARM did take effect; the exit DISARM undid it"
+    run = json.loads((out / "probe_run.json").read_text())
+    assert run["arm_sent"] is True and run["armed_by_tool"] is False and run["armed_at_exit"] is False
+
+
+def test_a_lost_disarm_is_resent_until_the_heartbeat_confirms(tmp_path):
+    code, pr, veh, out = _run(tmp_path, "E", {"armed0": False, "drop_first_disarm": True}, rest_s=2.0, arm=True)
+    assert code == 0 and veh.n_disarm_cmds >= 2 and veh.armed is False and pr.disarm_confirmed is True
+    run = json.loads((out / "probe_run.json").read_text())
+    assert run["n_disarm_sent"] >= 2 and run["disarm_confirmed"] is True and run["armed_at_exit"] is False
+
+
+def test_a_disarm_the_vehicle_ignores_is_reported_as_still_armed(tmp_path):
+    lines = []
+    code, pr, veh, out = _run(tmp_path, "E", {"armed0": False, "ignore_disarm": True}, rest_s=2.0, arm=True,
+                              log=lambda m: lines.append(m))
+    assert code == 0 and veh.armed is True
+    assert veh.n_disarm_cmds >= int(TP.DISARM_WAIT_S / TP.DISARM_RETRY_S), "re-sent through the whole window"
+    assert any("still ARMED" in m for m in lines) and not any("says disarmed" in m for m in lines)
+    run = json.loads((out / "probe_run.json").read_text())
+    assert run["disarm_confirmed"] is False and run["armed_at_exit"] is True
+    assert [(c, r) for _, c, r in run["command_acks"] if c == ARM_CMD][1:] and \
+        all(r == 1 for _, c, r in run["command_acks"] if c == ARM_CMD and r != 0)
+
+
+def test_arm_never_changes_the_flight_mode(tmp_path):
+    code, pr, veh, out = _run(tmp_path, "A", {"armed0": False, "mode0": 0}, arm=True)   # 0 = STABILIZE
+    assert code == 2 and "not MANUAL" in pr.abort_reason and "never changes the mode" in pr.abort_reason
+    assert veh.n_arm_cmds == 0 and veh.frames_rx == [] and veh.n_manual == 0
+    assert veh.mode == 0 and veh.armed is False and veh.other_cmds == [], "no mode command of any kind was sent"
+
+
+def test_arm_requires_every_other_preflight_item_before_any_pilot_input_or_request(tmp_path):
+    for kw, word in (({"batt_v0": 15.2}, "15.5"), ({"script_running": False}, "RLPWM"), ({"depth0_m": 1.2}, "depth"),
+                     ({"params": {"MOT_6_DIRECTION": -1.0}}, "spin reversed"),
+                     ({"k_nm_per_rad": 0.0, "tilt_impulse": (1000.0, 30.0, 0.0)}, "tilt")):
+        code, pr, veh, out = _run(tmp_path, "A", {"armed0": False, **kw}, arm=True)
+        assert code == 2 and word in pr.abort_reason, (kw, pr.abort_reason)
+        assert veh.n_arm_cmds == 0 and veh.frames_rx == [] and veh.n_manual == 0, "refused before the prelude"
+
+
+def test_arm_rechecks_during_the_prelude_and_refuses_before_the_request(tmp_path):
+    # a heavy vehicle starting just inside the depth band sinks out of it during the 1 s prelude
+    code, pr, veh, out = _run(tmp_path, "A", {"armed0": False, "depth0_m": 0.88, "net_weight_n": 3.0}, arm=True)
+    assert code == 2 and "depth" in pr.abort_reason
+    assert veh.n_arm_cmds == 0 and veh.frames_rx == [], "the re-check after the prelude caught it before the request"
+    assert veh.n_manual >= 1, "the prelude had started"
+
+
+def test_refused_after_the_arm_request_left_still_disarms_at_exit(tmp_path):
+    # the ARM request is out, then the vehicle (heavy, just inside the band) sinks out of the depth band while the tool
+    # waits for the HEARTBEAT or right after it believed it: exit 2, zero frames — and a DISARM, because a request LEFT
+    code, pr, veh, out = _run(tmp_path, "A", {"armed0": False, "depth0_m": 0.86, "net_weight_n": 3.0}, arm=True)
+    assert code == 2 and "depth" in pr.abort_reason, pr.abort_reason
+    assert veh.frames_rx == [] and veh.n_arm_cmds == 1 and veh.n_disarm_cmds >= 1 and veh.armed is False
+    run = json.loads((out / "probe_run.json").read_text())
+    assert run["arm_sent"] is True and run["armed_at_exit"] is False and run["disarm_confirmed"] is True
+
+
+def test_no_operator_confirmation_means_no_arm(tmp_path):
+    code, pr, veh, out = _run(tmp_path, "A", {"armed0": False}, arm=True, operator=lambda prompt, timeout: False)
+    assert code == 2 and "no operator confirmation" in pr.abort_reason
+    assert veh.n_arm_cmds == 0 and veh.frames_rx == [] and veh.n_disarm_cmds == 0
+    assert veh.n_manual >= int(TP.ARM_CONFIRM_S / TP.TICK_S) - 2, "neutral MANUAL_CONTROL kept flowing while waiting"
+    assert veh.n_fs_disarms == 0
+
+
+def test_arm_then_a_mid_run_disarm_by_the_vehicle_still_aborts_with_the_neutral_burst(tmp_path):
+    code, pr, veh, out = _run(tmp_path, "A", {"armed0": False, "disarm_at": 1000.0 + 40.0}, arm=True)
+    assert code == 3 and "DISARMED" in pr.abort_reason
+    frames = [p for _, p in veh.frames_rx]
+    assert len(frames) >= TP.NEUTRAL_BURST_FRAMES and all(p == NEUTRAL_PULSES for p in frames[-TP.NEUTRAL_BURST_FRAMES:])
+    assert veh.n_disarm_cmds >= 1, "it had armed the vehicle, so it sends its DISARM at exit anyway"
+
+
+def test_a_second_ctrl_c_during_the_disarm_wait_does_not_skip_the_record(tmp_path):
+    clock = TP.FakeClock()
+    state = {"armed": False, "fired": False}
+    ex = TP.ExportModel(PWM10)
+    veh = TP.SyntheticVehicle(ex, clock, armed0=False)
+    link = TP.Link(veh, target_sys=1)
+    out = Path(tmp_path) / "ctrlc"
+
+    def sleep(s):
+        clock.sleep(s)
+        if veh.n_disarm_cmds >= 1 and not state["fired"]:        # the operator's second Ctrl-C lands in the DISARM wait
+            state["fired"] = True
+            raise KeyboardInterrupt
+    pr = TP.ProbeRunner(link, ex, out, dry_run=True, clock=clock, sleep=sleep, log=lambda *a: None,
+                        operator=lambda prompt, timeout: True, arm=True)
+    code = TP.run_all(pr, ["E"], rest_s=2.0)
+    assert code == 0 and state["fired"], "run_all returned normally despite the interrupt in the exit path"
+    assert (out / "probe_run.json").exists()
+    assert veh.n_disarm_cmds >= 1
+
+
+def test_cli_dry_run_with_arm_exercises_the_arming_path(tmp_path):
+    code = TP.main(["--dry-run", "--arm", "--dry-disarmed", "--seq", "E", "--rest-s", "2", "--out", str(tmp_path)])
+    assert code == 0
+    runs = list(Path(tmp_path).glob("**/probe_run.json"))
+    assert len(runs) == 1
+    run = json.loads(runs[0].read_text())
+    assert run["dry_run"] is True and run["armed_by_tool"] is True and run["disarm_confirmed"] is True
+    code = TP.main(["--dry-run", "--arm", "--dry-disarmed", "--dry-arm-refused", "--seq", "E", "--rest-s", "2",
+                    "--out", str(tmp_path / "refused")])
+    assert code == 2

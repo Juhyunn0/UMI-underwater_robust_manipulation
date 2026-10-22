@@ -73,6 +73,24 @@ attitude's VEHICLE-clock age (state_assembler.att_age_v, c3_camera/mavlink_log.V
 or 0.25 s for 0.2 s trips, and an unknown age counts as over. The engage refusal that rides the same keys (clock map
 >= 30 s old, no 'ArduSub V' banner in 30 s, no unknown tick in the last 10 s, rolling 10-s p99 <= 0.12 s, the age at
 START <= age_s 0.15 s) is workers._att_age_refusal.
+
+2026-10-18 (the heave trim of the pwm LOWs, ``rl_pwm.heave_trim_n`` / ``rl_pwm_7d.heave_trim_n``): the model-based
+followers carry a constant net-buoyancy trim (hw_mpc.yaml vehicle_net_buoyancy_n); the per-thruster RL LOWs had none,
+and on 2026-10-16 a payload (the peg) left rl_pwm sitting on the floor while mpc_tuned lifted the same load
+[측정 data/20261016/1016_193523_diag_offline/cross_low/cross_low_final_table.txt]. ``heave_trim_thrust`` turns the trim
+(physical N, + = UP in the world; the nominal thrust model of obs_guard.hold_wrench_z_n — T200 x voltage_scale — with
+the OPPOSITE sign: hold_wrench_z_n is NED, -4 = 4 N up) into a per-thruster thrust: world-up rotated into the body
+frame by the estimated roll/pitch, then the HOLD's minimum-norm allocation over the four verticals
+(``vertical_allocation``, shared with ``hold_throttles``). ``trim_and_cap`` adds it to the policy's thrust and applies
+the LOW's cap to the TOTAL (scale: one scalar on the total thrust vector), and returns the policy's own component after
+the same scale — what the policy is fed back, never the trim. What the thrusters deliver of it is the requested pure
+heave (zero moment) ONLY where every vertical TOTAL clears its deadband edge: a total inside the gap is sent at the
+edge (the HOLD's and the scale's rule), and with the policy's verticals at rest a trim below ~2.5 N leaves as one fixed
+edge pattern, ~3.7 N and ~0.11 N*m of pitch whatever its value [유도: pwm10_s1 / pwm11att14R_s1 export B_flu, t200] —
+``heave_trim_at_rest`` computes it for the export and cap, the build line prints it, HwRlPwm counts the edge ticks
+(review D-R1). A trim that takes more than HEAVE_TRIM_MAX_CAP_FRACTION of one vertical's capped range is refused at
+build (``heave_trim_budget``, review D-R2). 0 N = the code path of before, bit for bit
+(rov_gui/tests/test_rl_pwm_heave_trim.py against a fixture recorded before the change). NEVER FLOWN [예측].
 """
 
 from __future__ import annotations
@@ -609,7 +627,39 @@ def parse_rl_pwm_block(raw: dict) -> dict:
 #: misspelt key must not fall back silently). NO pwm_channels (the order is fixed, _fixed_channels).
 RL_PWM_KEYS = ("policy_dir", "pwm_cap", "pwm_cap_mode", "allow_caps_below_trained", "require_thruster_probe",
                "thruster_probe_path", "thruster_probe_max_age_days", "leash_m", "yaw_rate_ff", "yaw_rate_max",
-               "obs_guard")
+               "obs_guard", "heave_trim_n")
+
+#: |heave_trim_n| ceiling [N] (2026-10-18): a larger value is REFUSED at the follower's build, never clipped. About twice
+#: the heaviest October net weight with the peg in the jaw (2.5-5.4 N heavy with it [측정
+#: RL_controller/logs/eval/pwm_cocontraction_analysis_20261010/REPORT.md:47-48]; the 2026-10-16 peg hovers needed
+#: +4.08..+4.83 N of up-thrust in the export model, and the 2026-10-17 jaw-empty hull -3.65..-4.12 N, i.e. it floats [측정
+#: data/20261017/1017_analysis_offline/heave_trim_jawempty_v2/report.txt:36-44]); beyond it the number is not a trim
+#: [예측]. The cap budget below (HEAVE_TRIM_MAX_CAP_FRACTION) is the tighter limit at a low wire cap.
+HEAVE_TRIM_MAX_N = 10.0
+
+#: The largest share of ONE vertical thruster's capped thrust range — in the direction the trim loads it, at level
+#: attitude (the worst case) — that the heave trim may take (2026-10-18, review D-R2). The cap acts on the TOTAL
+#: (trim_and_cap: one scalar s on policy + trim), so a trim that fills most of a vertical's capped range makes s < 1
+#: whenever the policy drives that thruster the same way, and s shrinks ALL EIGHT of the policy's thrusters
+#: (horizontals and attitude included): a state-dependent cut of its loop gain. 0.5 = the policy keeps at least half
+#: of every vertical's capped range before the trim alone binds the scale [예측: a judgement, no flight data]. With the
+#: shipped geometry that allows about +5.4 / -5.5 N at cap 0.25 and the full +-10 N at cap 0.5 [유도:
+#: heave_trim_budget on pwm11att14R_s1]. Refused at build, never clipped.
+HEAVE_TRIM_MAX_CAP_FRACTION = 0.5
+
+
+def parse_heave_trim_n(v, key: str = "rl_pwm.heave_trim_n") -> float:
+    """``<low>.heave_trim_n`` validated (2026-10-18): a finite number of Newtons, + = UP in the world, within
+    +-HEAVE_TRIM_MAX_N; 0 = off (the code path of before). A bool, a string, null, NaN / inf or a larger magnitude
+    RAISES — the value goes straight onto the vertical thrusters, so a typo must not fly. ``key`` names the block in
+    the message (rl_pwm.heave_trim_n | rl_pwm_7d.heave_trim_n)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise ValueError(f"{key} must be a number of Newtons (+ = up in the world, 0 = off), got {v!r}")
+    f = float(v)
+    if not math.isfinite(f) or abs(f) > HEAVE_TRIM_MAX_N:
+        raise ValueError(f"{key} must be finite and within +-{HEAVE_TRIM_MAX_N:g} N (+ = up in the world), got {v!r} "
+                         f"— refused, not clipped")
+    return f
 
 
 # ----------------------------------------------------------------------------- the per-thruster interlocks (2026-10-10 b)
@@ -942,6 +992,18 @@ def parse_obs_guard_block(raw) -> dict:
     return out
 
 
+def vertical_allocation(model: "PwmModel", tau_flu) -> np.ndarray:
+    """(4,) PHYSICAL thrust [N] of thrusters 5..8 for a body-FLU wrench [Fx, Fy, Fz, Mx, My, Mz]: the minimum-norm
+    least-squares solution over the FOUR VERTICALS ALONE, pinv(B_flu[:, 4:8]) — the horizontals are never used, and a
+    component the verticals cannot produce (Fx, Fy, Mz: zero rows of this vehicle's B_flu) is dropped by the least
+    squares, not handed to anyone. |F| < 1e-9 N is written as 0. The HOLD (hold_throttles) and the heave trim
+    (heave_trim_thrust) both allocate through this one function (2026-10-18; the arithmetic of the 2026-10-10 (b) HOLD,
+    unchanged)."""
+    Bv = np.asarray(model.B_flu, dtype=float)[:, 4:8]
+    F_v = np.linalg.pinv(Bv) @ np.asarray(tau_flu, dtype=float).reshape(6)   # physical thrust per vertical thruster [N]
+    return np.where(np.abs(F_v) < 1e-9, 0.0, F_v)
+
+
 def hold_throttles(model: "PwmModel", wrench_z_ned_n: float) -> np.ndarray:
     """The HOLD command (2026-10-10 b): a pure heave Z [N, NED] through the export's minimum-norm allocation on the
     FOUR VERTICAL thrusters (pinv of B_flu[:, 4:8] — the horizontals stay neutral by construction, never used to
@@ -958,12 +1020,201 @@ def hold_throttles(model: "PwmModel", wrench_z_ned_n: float) -> np.ndarray:
         return thr
     tau_flu = np.zeros(6)
     tau_flu[2] = z * FLU_TO_FRD[2]
-    Bv = np.asarray(model.B_flu, dtype=float)[:, 4:8]
-    F_v = np.linalg.pinv(Bv) @ tau_flu                       # physical thrust per vertical thruster [N]
-    F_v = np.where(np.abs(F_v) < 1e-9, 0.0, F_v)
+    F_v = vertical_allocation(model, tau_flu)               # physical thrust per vertical thruster [N]
     vs = float(model.voltage_scale) if float(model.voltage_scale) > 0.0 else 1.0
     thr[4:8] = model.curve.inverse(F_v / vs, below_edge="edge")
     return thr
+
+
+# ----------------------------------------------------------------------------- the heave trim (2026-10-18)
+def heave_trim_thrust(model: "PwmModel", heave_trim_n: float, roll_ned: float = 0.0, pitch_ned: float = 0.0) -> np.ndarray:
+    """(8,) PHYSICAL thrust [N] of the heave trim (rl_pwm.heave_trim_n / rl_pwm_7d.heave_trim_n, 2026-10-18): a force
+    of ``heave_trim_n`` UP in the world, rotated into the body frame with the estimated attitude (NED roll phi, pitch
+    theta; yaw does not enter),
+
+        up_b (FLU) = (sin theta, sin phi cos theta, cos phi cos theta)        (level: (0, 0, 1))
+
+    and allocated over the four verticals exactly as the HOLD allocates hold_wrench_z_n (vertical_allocation: minimum
+    norm, horizontals 0, zero roll / pitch / yaw moment AS A REQUEST — what the thrusters can deliver of it depends on
+    the deadband of the TOTAL each vertical is sent, see trim_and_cap). The verticals cannot push along the body x / y,
+    so the tilted part of world-up is dropped: the body force is heave_trim_n cos phi cos theta and its world-vertical
+    share heave_trim_n (cos phi cos theta)^2 — 0.94 x at a 14 deg nose-up rest pitch [유도]. Physical = the export's
+    nominal model (T200 curve x voltage_scale), the thrust model of obs_guard.hold_wrench_z_n and
+    wrench_ned_from_throttles — but + = UP here, where hold_wrench_z_n is NED (-4 = 4 N up); the caller divides by
+    voltage_scale for the curve. 0 N -> all zero."""
+    f = float(heave_trim_n)
+    phi, theta = float(roll_ned), float(pitch_ned)
+    if not (math.isfinite(f) and math.isfinite(phi) and math.isfinite(theta)):
+        raise ValueError("heave_trim_thrust: non-finite trim or attitude")
+    out = np.zeros(model.n)
+    if f == 0.0:
+        return out
+    tau_flu = np.zeros(6)
+    tau_flu[:3] = f * np.array([math.sin(theta), math.sin(phi) * math.cos(theta), math.cos(phi) * math.cos(theta)])
+    out[4:8] = vertical_allocation(model, tau_flu)
+    return out
+
+
+def _cap_scale(F, fp_cap: float, fn_cap: float) -> float:
+    """scale_throttles' s on a curve-unit thrust vector (before the s >= 1 test): min(1, T200(+cap) / max F[> 0],
+    |T200(-cap)| / max |F[< 0]|), each branch only if non-empty — the same float operations in the same order."""
+    s = 1.0
+    pos, neg = F > 0.0, F < 0.0
+    if np.any(pos):
+        s = min(s, fp_cap / float(np.max(F[pos])))
+    if np.any(neg):
+        s = min(s, fn_cap / float(np.min(F[neg])))          # both negative -> a positive ratio
+    return s
+
+
+def _in_deadband_gap(F, edge_p: float, edge_n: float) -> np.ndarray:
+    """(n,) bool: 0 < F < edge_p or edge_n < F < 0 — a thrust no thruster can produce (T200CurveNp.inverse sends it AT
+    the edge)."""
+    F = np.asarray(F, dtype=float)
+    return ((F > 0.0) & (F < edge_p)) | ((F < 0.0) & (F > edge_n))
+
+
+def trim_and_cap(thr_policy, trim_thrust_n, cap: float, model: "PwmModel", mode: str = PWM_CAP_MODE_DEFAULT,
+                 return_detail: bool = False) -> tuple:
+    """The heave trim added to the policy's command in THRUST space, then the LOW's cap on the TOTAL (2026-10-18)
+    -> (thr_total, thr_policy_part, s):
+
+        F_pol  = T200(thr_policy)                         per thruster, curve units (scale_throttles' convention)
+        F_trim = trim_thrust_n / voltage_scale            the trim's PHYSICAL thrust -> curve units (hold_throttles')
+        F_tot  = F_pol + F_trim
+      "scale" (the default): s = scale_throttles' s computed on F_tot — min(1, T200(+cap) / max F_tot[> 0],
+              |T200(-cap)| / max |F_tot[< 0]|) — so ONE scalar shrinks the total (trim included) and the binding
+              thruster of the TOTAL sits exactly at the cap;
+              thr_total       = T200^-1(s F_tot)   (below-edge -> edge, like scale_throttles), clipped to the cap
+                                                    (a numerical guard: <= 1e-12 by construction)
+              thr_policy_part = T200^-1(s F_pol)   — scale_throttles(thr_policy) with THIS s: the policy's OWN command
+                                                    after the same scale (s = 1: its own throttles, untouched);
+      "clip" (A/B only): thr_total = per-thruster clip of T200^-1(F_tot) at the cap; thr_policy_part = the policy's
+              clipped throttles (what the clip path feeds back); s = 1.
+
+    A thruster the trim does not touch (F_trim == 0: the four horizontals) gets EXACTLY what the trim-free path gives it
+    at the same s (s >= 1: its own throttle, the rpm-saturated zone at the cap; s < 1: T200^-1(s F_pol)), in the total
+    and in the policy part alike — a sub-deadband horizontal command is never rewritten by a round trip through the
+    curve. On a vertical the total is exact (B F_total = s B F_tot) wherever s F_tot is attainable; a total that lands
+    inside the deadband edge (0 < |F| < +1.44 / -1.10 N curve) is sent AT the edge, as every scaled frame and the HOLD
+    are [유도 obs_spec t200] — and THERE the trim's wrench is not the requested pure heave (review D-R1, [유도] on the
+    shipped export): with the policy's verticals at rest every |trim| < ~2.5 N sends the same edge pattern, ~3.7 N up
+    and ~0.11 N*m nose-down (heave_trim_at_rest); on the recorded 2026-10-17 tick with pwm5..8 1441/1546/1441/1540 us
+    (data/20261017/1017_204524/mpc_204524.csv, file line 1500) a +3 N trim delivers 2.45 N with a -0.083 N*m roll
+    moment, against the policy's own +0.09 N*m roll command. ``thr_policy_part`` is what HwRlPwm.note_applied_pwm feeds
+    back; it may exceed the wire cap only on a vertical where the trim opposes a policy command above it (a wire cap
+    below the trained cap — the recorded opt-out); it never exceeds the trained cap.
+
+    ``return_detail`` (2026-10-18, review D-R1 / D-R2) appends a dict: "edge" = (n,) bool, the trim-touched thrusters
+    whose total was sent AT the deadband edge instead of s F_tot (clip mode: of F_tot); "s_policy" = the scale the
+    policy's command alone would have had (scale_throttles' s; 1.0 in clip mode) — s < s_policy says the trim tightened
+    the cap. The three other values are unchanged by it."""
+    t = np.clip(np.asarray(thr_policy, dtype=float).reshape(-1), -1.0, 1.0)
+    if t.shape != (model.n,):
+        raise ValueError(f"trim_and_cap: need {model.n} throttles, got {t.shape}")
+    Ft = np.asarray(trim_thrust_n, dtype=float).reshape(-1)
+    if Ft.shape != (model.n,):
+        raise ValueError(f"trim_and_cap: need {model.n} trim thrusts, got {Ft.shape}")
+    if not (np.all(np.isfinite(t)) and np.all(np.isfinite(Ft))):
+        raise ValueError("trim_and_cap: non-finite throttle or trim")
+    c = float(cap)
+    if not (math.isfinite(c) and 0.0 < c <= 1.0):
+        raise ValueError(f"trim_and_cap: cap must be in (0, 1], got {cap!r}")
+    if mode not in PWM_CAP_MODES:
+        raise ValueError(f"trim_and_cap: mode must be one of {list(PWM_CAP_MODES)}, got {mode!r}")
+    vs = float(model.voltage_scale) if float(model.voltage_scale) > 0.0 else 1.0
+    F_trim = Ft / vs
+    touched = F_trim != 0.0
+    curve = model.curve
+    F_pol = curve.thrust(t)
+    F_tot = F_pol + F_trim
+    if mode == "clip":
+        base = np.clip(t, -c, c)
+        tot = np.where(touched, np.clip(curve.inverse(F_tot, below_edge="edge"), -c, c), base)
+        if return_detail:
+            ep, en = curve.edge_thrust()
+            return tot, base, 1.0, {"edge": touched & _in_deadband_gap(F_tot, ep, en), "s_policy": 1.0}
+        return tot, base, 1.0
+    fp_cap = float(curve.thrust(c))
+    fn_cap = float(curve.thrust(-c))
+    s = _cap_scale(F_tot, fp_cap, fn_cap)
+    if s >= 1.0:
+        s = 1.0
+        base = np.where(np.abs(t) > c, np.sign(t) * c, t)    # scale_throttles' s >= 1 rule (rpm-saturated zone only)
+        tot = np.where(touched, np.clip(curve.inverse(F_tot, below_edge="edge"), -c, c), base)
+        pol = np.where(touched, t, base)
+    else:
+        tot = np.clip(curve.inverse(s * F_tot, below_edge="edge"), -c, c)
+        pol = np.where(touched, curve.inverse(s * F_pol, below_edge="edge"), tot)
+    if return_detail:
+        ep, en = curve.edge_thrust()
+        return tot, pol, float(s), {"edge": touched & _in_deadband_gap(s * F_tot, ep, en),
+                                    "s_policy": float(min(1.0, _cap_scale(F_pol, fp_cap, fn_cap)))}
+    return tot, pol, float(s)
+
+
+def heave_trim_budget(model: "PwmModel", heave_trim_n: float, cap: float) -> dict:
+    """How much of each vertical's CAPPED thrust range the heave trim takes, at level attitude (2026-10-18, review
+    D-R2): fraction_i = F_i / T200(+cap) for a vertical the trim pushes forward, F_i / T200(-cap) for one it pushes in
+    reverse, F = heave_trim_thrust(level) / voltage_scale (curve units, as trim_and_cap), thrusters 5..8. Level is the
+    worst case: the per-tick allocation is the level one times cos(roll) cos(pitch) <= 1. -> {"fraction": 4 floats,
+    "max", "thruster" (the motor number of the max, None at 0 N), "cap", "limit" (HEAVE_TRIM_MAX_CAP_FRACTION)}; HwRlPwm
+    refuses the build when max > limit."""
+    c = float(cap)
+    if not (math.isfinite(c) and 0.0 < c <= 1.0):
+        raise ValueError(f"heave_trim_budget: cap must be in (0, 1], got {cap!r}")
+    vs = float(model.voltage_scale) if float(model.voltage_scale) > 0.0 else 1.0
+    F = heave_trim_thrust(model, heave_trim_n)[4:8] / vs
+    fp, fn = float(model.curve.thrust(c)), float(model.curve.thrust(-c))
+    frac = np.zeros(F.shape)
+    pos, neg = F > 0.0, F < 0.0                              # a cap inside the deadband has no range: inf (refused)
+    if np.any(pos):
+        frac[pos] = F[pos] / fp if fp > 0.0 else math.inf
+    if np.any(neg):
+        frac[neg] = F[neg] / fn if fn < 0.0 else math.inf
+    k = int(np.argmax(frac))
+    return {"fraction": [float(v) for v in frac], "max": float(frac[k]),
+            "thruster": (k + 5 if float(frac[k]) > 0.0 else None), "cap": c, "limit": float(HEAVE_TRIM_MAX_CAP_FRACTION)}
+
+
+def heave_trim_at_rest(model: "PwmModel", heave_trim_n: float, cap: float, mode: str = PWM_CAP_MODE_DEFAULT) -> dict:
+    """What the heave trim ALONE sends with the policy at rest (all eight throttles 0) at level attitude, through
+    trim_and_cap and the wire (2026-10-18, review D-R1) — the trim's worst case for the deadband, and the HOLD-like
+    pattern the build line prints:
+
+        "pulses_us"     thrusters 5..8 [us]
+        "wrench_ned"    the nominal wrench of those THROTTLES [X, Y, Z, K, M, N] NED/FRD (the CSV uX..uN convention;
+                        the pulse of an edge throttle, 1530 / 1470 us, reads 0 N on the model's strict deadband — the
+                        thruster does spin there [예측])
+        "requested_z_ned" -heave_trim_n (the pure heave asked for, zero moment)
+        "at_edge"       which of 5..8 were sent AT their deadband edge (their share is inside the gap)
+        "all_edge_below_n" {"up", "down"}: below this |trim| EVERY vertical's share is inside the gap — all four leave
+                        at their edge, the same pulses whatever the value
+        "edge_pattern"  {"up", "down"}: {"pulses_us", "wrench_ned"} of that all-edge pattern
+        "all_attainable_above_n" {"up", "down"}: above it every share clears its edge (the allocation is exact)
+
+    All [유도] from the export's B_flu and t200, nothing measured."""
+    vs = float(model.voltage_scale) if float(model.voltage_scale) > 0.0 else 1.0
+    f = float(heave_trim_n)
+    tot, _pol, _s, det = trim_and_cap(np.zeros(model.n), heave_trim_thrust(model, f), cap, model, mode,
+                                      return_detail=True)
+    ep, en = model.curve.edge_thrust()
+    a = heave_trim_thrust(model, 1.0)[4:8] / vs              # curve thrust per N of UP trim, thrusters 5..8
+    band, pattern = {}, {}
+    for name, sgn in (("up", 1.0), ("down", -1.0)):
+        sh = sgn * a                                         # the share's sign per N of |trim| in this direction
+        lim = [(ep if v > 0.0 else -en) / abs(v) for v in sh if v != 0.0]
+        band[name] = (min(lim), max(lim)) if lim else (None, None)       # None: no vertical takes a share (JSON-safe)
+        thr_e = np.zeros(model.n)                            # every share inside the gap -> each vertical AT its edge
+        thr_e[4:8] = model.curve.inverse(np.where(sh > 0.0, ep, np.where(sh < 0.0, en, 0.0)), below_edge="edge")
+        pattern[name] = {"pulses_us": [int(p) for p in throttles_to_pwm(thr_e, 1.0)[4:8]],
+                         "wrench_ned": [float(v) for v in model.wrench_ned_from_throttles(thr_e)]}
+    return {"pulses_us": [int(p) for p in throttles_to_pwm(tot, cap, strict=True)[4:8]],
+            "wrench_ned": [float(v) for v in model.wrench_ned_from_throttles(tot)],
+            "requested_z_ned": float(-f), "at_edge": [bool(v) for v in det["edge"][4:8]],
+            "all_edge_below_n": {k: (None if v[0] is None else float(v[0])) for k, v in band.items()},
+            "edge_pattern": pattern,
+            "all_attainable_above_n": {k: (None if v[1] is None else float(v[1])) for k, v in band.items()}}
 
 
 class PwmObsGuard:
@@ -1257,6 +1508,8 @@ __all__ = ["PwmModel", "PwmGate", "T200CurveNp", "ThrusterProbeCheck", "throttle
            "pack_rc_override", "scale_throttles", "pulses_within_cap", "cap_span_us", "null_space_us",
            "predicted_pack_current_a", "thrust_scale_at_voltage", "parse_rl_pwm_block", "RL_PWM_KEYS",
            "PwmInterlocks", "PwmObsGuard", "parse_per_thruster_block", "parse_obs_guard_block", "hold_throttles",
+           "vertical_allocation", "heave_trim_thrust", "trim_and_cap", "parse_heave_trim_n", "HEAVE_TRIM_MAX_N",
+           "heave_trim_budget", "heave_trim_at_rest", "HEAVE_TRIM_MAX_CAP_FRACTION",
            "PER_THRUSTER_DEFAULTS", "PER_THRUSTER_KEYS", "AGE_KEYS", "OBS_GUARD_DEFAULTS", "OBS_GUARD_KEYS",
            "PACK_V_CURVE",
            "GUARD_NONE", "GUARD_SLEW", "GUARD_JUMP", "GUARD_HOLD",

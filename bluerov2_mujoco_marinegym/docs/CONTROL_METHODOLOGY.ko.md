@@ -1807,3 +1807,610 @@ PASS_WITH_FIXES — 중간 1건 수정, 낮음 1건 문서화, DVL 없음/OUT의
   배선 검사일 뿐 성능 수치가 아니다 [예측/sim]. **실기 0런.** 남은 한계 [예측]: ±x 변에서 C3가 매트의 짧은 방향을 봐
   태그 수가 줄 수 있고(경로엔 dropout bridge 없음), 랩마다 테더가 한 바퀴 꼬이며, 보고 원점이 실제 yaw 피벗보다 뒤라
   제자리 회전 중 선체가 옮겨질 수 있고, START의 첫 회전은 램프 없는 yaw 계단이다(KNOWN_ISSUES "square `yaw = travel`").
+
+## 2026-10-18 — DVL이 위치까지 낸다: `--dvl_pose` (DVL 추측항법 포즈 + TAG FIX 스위치, 실기 0런)
+
+* **왜:** 스테이션의 상태는 태그 상태다. `StateAssembler.step`은 신선한 fix가 없으면 상태를 만들지 않고, DVL은
+  2026-10-01부터 속도원(`nu[0:2]`)일 뿐이다. 그래서 태그를 잃으면 `tag_stale_s` 0.7 + `tag_stale_hold_s` 0.4 뒤
+  disengage한다 — 2026-10-17 해제 54건 중 15건 [측정: data/20261017/*/events.log]. 운용자 요청(2026-10-17): 태그는
+  처음 위치와 재보정에만 쓰고, 버튼을 끄면 DVL만으로 위치를 내는 버전. DVL을 "처음부터 바로" 못 쓰는 이유(세션마다
+  태그로 장착을 증명해야 IN이 되고, IN이어도 x·y·yaw는 태그에서만 나옴)가 같은 질문이었다.
+* **무엇(이론):** 표준 AUV 항법 구조 — DVL 속도 + 자세 기준의 추측항법에 간헐적 절대 fix(여기서는 AprilTag)를 붙인다.
+  축 분리는 station bridge와 같다(절대: z = 압력계, roll/pitch = 오토파일럿; 적분: x, y, yaw). 데이터 없이 튜닝해야
+  하는 EKF 대신, TAG FIX ON에서는 **태그 상태를 그대로 통과**시키고(오늘의 추정기와 같은 관측 — A/B가 깨끗하고 RL
+  관측도 그대로) 추측항법은 매 tick 재앵커해 두었다가 태그가 끊기면 이어받는다. 헤딩은 나침반이 휘는 이 풀에서
+  RAW_IMU 자이로를 적분하고 바이어스는 태그로 배운다.
+
+  ```
+  v_o,k = R_mount v_dvl,k − ω(t_k) × r_dvl                          (body origin, FRD — DvlAid, 기존)
+  p(t_k) = p(t_k−1) + ½ [R(φ,θ,ψ(t_k−1)) v_o,k−1 + R(φ,θ,ψ(t_k)) v_o,k]_xy · (t_k − t_k−1)     (Δ ≤ 0.6 s)
+         = p(t_k−1) + [R v_o,k−1]_xy · 0.45 s                       (Δ > 0.6 s: 보여 준 그대로 커밋)
+  p(t)   = p(t_k) + [R v_o,k]_xy · min(t − t_k, 0.45 s)              (출력; > 0.45 s held, > 1.5 s lost)
+  ψ̇ = (q sinφ + r cosφ) / cosθ,      (q, r) = Δ∫ω_RAW_IMU / Δt        (r만 쓰면 θ 9–14°에서 1.3–3.1 % 덜 돈다 [유도])
+  ψ(t) = ψ_raw(t) + c − b̂ · (t − t_a)                               (c, t_a: 마지막 앵커; ψ_raw는 최신 샘플 뒤
+                                                                       0.2 s까지 그 각속도로 외삽 — 링크 지연)
+  b̂ = slope_t [ψ_raw(t_c) − ψ_tag(t_c)]   over 120 s of TAG FIX ON fixes (span ≥ 60 s, ≥ 200, |res| ≤ 2°)
+  z = d_Bar30 + z_off,  z_off = z_fix(t_c) + δ_z − d_Bar30(t_c)        (z_source tag: 외삽 안 된 fix와 그 시각의 Bar30)
+  w = [LP(clamp(ḋ_Bar30, ±0.5)) − R₂₀u − R₂₁v] / R₂₂                 (ḋ는 차량 시계 스탬프로, 0.02 s 미만 간격은 건너뜀)
+  ON, 신선한 태그:   η = η_tag + δ;   δ → 0 at 2 cm/s, 1°/s (engaged),  δ = 0 (disengaged)
+  e_k = η_tag,k − η_DR,k  (e_z = z_fix(t_c) − (d_Bar30(t_c) + z_off));   |e_k − e_ref| > 10 cm · 5° · z 10 cm  또는 DR 뒤
+        재획득  →  5개 fix가 같은 한계 안에서 일치해야 수락 (fix는 태그 공백을 넘어 10 s 창에 모은다)
+                            (e_ref = 마지막으로 받아들인 e, DR 없는 pass-through 뒤에는 −δ;  DR이 보여진 뒤 DR 없이 재획득하면
+                             e = η_tag − η_shown, 마지막으로 낸 포즈)
+  수락:  δ := −e  (그 tick의 포즈는 연속);   engaged에서 DR 뒤 재보정(재획득·blind)의 xy|yaw > 0.25 m · 10°  →  fault (control);
+         태그가 계속 보이던 수준 변화(jump)와 z 차이는 크기와 상관없이 슬루 + 경고;   δ는 DR tick에서도 트랙 위에서 슬루
+  OFF:   |e| ≥ 0.25 m · 10° · z 0.20 m 중 하나를 신선 fix 5개 이상이 1 s 넘게  →  fault (control);  태그 없는 tick은 그 증거를
+         지우지 않음(10 s 만료);   ≥ 0.10 m 경고      (abort_* ≤ max_corr_*)
+  구멍:  앵커 이후 단일 공백 > 1.5 s,  또는  Σ (공백 − 0.45 s) · max(|v|, 0.02 m/s) > 0.10 m (열린 공백 포함, 태그가 재앵커한
+         구간 제외)  →  재앵커 전까지 stale
+  control fault:  태그가 포즈를 보증하지 않은 채(포즈였거나 abort 한계 안에서 비교된 마지막 tick 뒤) > 20 s;
+                  DR 중 |v_DVL|의 1 s 평균 > 0.30 m/s;   OFF에서 DR 중 DVL 래치 OUT (즉시; ON이면 stale)
+  ```
+* **어떻게:** `rov_gui/control/dvl_pose.py`(`DvlPose`, `GyroHeading`; Qt 없음). 워커(`workers.py`): station bridge와
+  같은 이음매 — control 모드에서 `meas` := DVL 포즈(인터록·`ctrl.step`·`_eta`·경로 시계), `meas_truth` := 태그 상태
+  (플롯 hull·CSV px/py·EKF 비교·imu_dr·정책 proprio). bridge는 control에서 우회(fresh-fix 분기가 DR tick마다
+  재앵커하므로), follow는 포즈가 태그 상태가 아니면 station으로 강등, DP 정책은 DR tick을 bridged로 친다, RL_PWM
+  관측 가드에는 DR tick에서 (min_tags, DVL 샘플 나이)를 알린다. DVL 샘플은 control에서 `DvlAid.usable`(IN + proof),
+  shadow에서 새 `usable_for_pose(require_in=False)`. engage는 포즈로(거부: 포즈 없음 / 앵커 전 / DVL IN·proven 아님 / OFF면 OFF
+  조건 전부). `set_dvl_pose_tag`는 **engaged 중에도** 받는다(재보정이 목적; 행마다 `tagfix`). `--dvl_pose`는
+  `--dvl`을 켠다; YAML control만으로는 shadow; EKF/imu_dr control과 배타. 백엔드: `VehicleWorker._note_raw_imu`가
+  RAW_IMU를 **레코드마다** time_usec로 사다리꼴 적분(0.5 s 넘는 간격·재부팅은 gap으로 세고 적분 안 함), SCALED_PRESSURE2를
+  자기 스탬프의 수심으로(클램프 없음); demo는 합성 자이로·Bar30·`demo_tag_blackout`·장착점 기준 합성 DVL. 패널: row2의
+  `TAG FIX ON/OFF`(engaged 중 활성), 보라색 DVL 포즈 고스트, 칩 `· pose:DVL 12s`. 기록: CSV schema 23 끝 20열 `tagfix,
+  dvp_*`, meta `dvl_pose`(toggles, corrections = 재보정 때의 "N cm off after T s, D m", faults, bias).
+  결정과 이유: 헤딩 = RAW_IMU(아래 결과의 측정); ON = 통과(오늘과 같은 관측); 긴 공백은 "보여 준 대로" 커밋(속도 유지로
+  메우면 60–120 s 꼬리가 207–273 cm [측정: data/20261017/1017_dvl_pose_feasibility/out/summary.json sensitivity]);
+  v1에서 DVL 상실은 coast가 아니라 debounce 후 disengage(경로 미션의 coast는 미구현); control에는 DVL proof 필수(틀린
+  장착은 위치에서 부호가 틀린 피드백).
+* **리뷰(2026-10-18):** P2 — underwater·control-theory·hardware 어드바이저 3명 독립 리뷰 + 개루프 재생 측정과 독립 재계산
+  (아래 결과) + 구현 리뷰 워크플로(이 항목 아래 "리뷰 → 수정").
+* **기록(경계):** CSV schema 23(`tagfix, dvp_src, dvp_ok, dvp_px/py/pz, dvp_yaw_deg, dvp_u/v/w, dvp_err_m,
+  dvp_err_yaw_deg, dvp_since_fix_s, dvp_dist_m, dvp_gap_s, dvp_corr_m, dvp_bias_dps, dvp_unobs_m, dvp_blind_s, dvp_why`),
+  meta `dvl_pose`. `px…`는 계속 태그(진실, 없으면 nan — 이 모드에서는 그 행도 쓴다). control에서 `dvp_src` dr/held 행은 태그로 난 행이
+  아니다 — 추종 오차를 태그 런과 합산 금지.
+* **결과:** 개루프 재생(태그로 비행한 10-13..10-17 기록을 DVL만으로 재계산, 독립 재계산으로 확인) — 10-17(새 장착)
+  태그 yaw 기준 60 s p50/p90 4.4/17.1 cm, 120 s 5.7/20.1 cm, p90 > 10 cm는 15–19 s [측정: data/20261017/
+  1017_dvl_pose_feasibility/out/summary.json, verify/out/agg_curves_perm_drift.txt]. 헤딩 60 s p50/p95: ArduSub yaw
+  3.71/12.55°, ATTITUDE 각속도 적분 2.02/6.94°, RAW_IMU + 같은 날 바이어스 0.36/1.20° [측정: …/sources/heading_lens/
+  out/s5_horizon_rawgyro.txt]; ATTITUDE 각속도는 나침반 오차를 적분해 따라간다(상관 p50 +0.54 [측정: …/verify/out/
+  heading_checks.txt]). 실용 규칙 [유도]: station hold(순변위 < 0.3 m)는 수 분 가능, 이동 임무는 15–20 s마다 재보정
+  또는 1–2분에 10–25 cm 허용. 단위·워커·패널·백엔드 테스트 통과(아래 '리뷰 → 수정'). **실기 0런.** 남은 한계 [예측]:
+  폐루프 DR 오차 미측정, DVL 고도 0.10–0.60 m 밖 미검증, 경로 미션의 DVL 상실은 coast 없이 종료, Bar30 z와 태그 z가 태그
+  y 방향 1 m당 43–57 mm 갈림 [측정: …/sources/heading_lens/out/s6_depth_lever.txt] (맵 평면이 중력 대비 ~3° [유도]),
+  proof 허용치(14°/25 %)는 위치에는 느슨함.
+* **리뷰 → 수정 (2026-10-18, 같은 날 일곱 차례):**
+  - 구현 리뷰(workflow wf_d410d672-cf5, safety·estimator·integration·gui/backends·tests 5렌즈 + 렌즈별 반박 검증):
+    41건 중 40 확인(high 5·medium 10·low 25), safety FAIL. 고친 것: 태그 없는 DR의 유한 예산(blind 20 s, DR 속도
+    0.30 m/s), DVL 공백 구멍, z를 게이트·발산·보정 크기에 포함, DR 없이 돌아온 태그는 마지막 출력 포즈 기준으로 판단,
+    BLEND 중 OFF 거부, engaged 중 ON 거부, NaN 가드, step 안 한 행 센티넬, 정책 앵커는 비행 포즈, RAW_IMU < 5 Hz
+    launch 거부, 자이로 이력은 차량 시계 스탬프.
+  - 수정 검증(wf_e1708dfd-d7f): 15건 중 11 수정·4 일부, 안전 감사 FAIL. 확인된 문제는 셋이다. (HIGH) 깜빡이는
+    시야에서 재보정과 OFF 발산 정지가 둘 다 멈춤 — 일치 대기 fix를 tag-less tick마다 지웠고 발산 타이머도 매번 리셋했다.
+    (MEDIUM) 미관측 예산을 다음 샘플이 올 때만 판단. (HIGH) 자이로 이력(~60 s)보다 긴 DVL 공백은 구멍 규칙을 건너뜀.
+    고친 것: fix를 공백을 넘어 10 s 창(`agree_window_s`)에 모음, 발산 증거는 fix 5개·10 s 만료, 열린 공백의 실시간
+    예산, 이력과 무관한 구멍, ON에서 래치는 stale, DR이 보여지지 않은 드롭아웃은 태그 통과, e_ref = −δ, shadow도 모든
+    정지 기록, 포즈 fault는 포즈 없는 tick에도 즉시, START 순간 재검사, 수심 센서 고정, DR 행의 경로 오차, z_source
+    pressure의 START 재보정 추종(disengaged 때만), 슬루를 DR 트랙 위에서 계속.
+  - 재검증(wf_9e7cfed7-93e, 실측 재생 렌즈 포함): 위 규칙을 기록된 세션 120 세그먼트에 돌렸다. ON에서 `--dvl_pose`만
+    끝낸 control 런 18/111(그중 13이 z 보정 거부), OFF는 hole까지 KM 중앙값 73 s(초 단위 누적 예산)
+    [측정: data/20261017/1017_dvl_pose_feasibility/rules_replay/out_round3/]. 원인은 assembler가 fix 사이에서 태그
+    z를 **태그 유한차분 heave × age**로 외삽한 값에 DR z를 매 tick 앵커한 것이었다. 고친 것: z 오프셋과 z 차이는 fix
+    자체(캡처 시각)와 그 시각의 Bar30으로 판단, ON→DR 전환의 z 차이는 슬루, jump(태그가 계속 보이던 수준 변화)와 z
+    차이는 크기와 상관없이 슬루(런 종료는 DR 뒤 재보정의 xy·yaw만), 미관측 예산을 이동량(m)으로(앵커 이후, 태그가
+    메운 구간 제외), 태그가 포즈를 보증할 때만 blind 갱신, DR 속도는 1 s 평균, Bar30 heave는 차량 시계 스탬프로
+    재고 0.02 s 미만 간격은 건너뛰며 ±0.5 m/s로 클램프, 자이로 지연은 각속도로 외삽, 자이로 stale은 host 도착 기준,
+    재획득 중 START 거부, START마다 debounce 0, pressure 모드의 태그 없는 START는 오프셋 유지, blind가 진행 중이던
+    fix를 재사용, observe 런은 포즈 fault로 끝나지 않음.
+  - 결과: 같은 재생에서 ON 런을 `--dvl_pose`만 끝낸 경우가 4/111로 줄었다(미관측 이동 10–12 cm 2, DVL 1 s 평균
+    0.30 m/s 1, DVL이 죽은 뒤 xy 35 cm 1). `--dvl_pose` 없는 스테이션이 끝낸 16개 런은 이어 간다. OFF는 10-17
+    147.5 s / 10-15 25.3 s이고, 이제는 단일 DVL 끊김 > 1.5 s가 대부분이다(10-17 hole 186건 중 151건)
+    [측정: …/rules_replay/out_round4/on_summary.txt, off_summary.txt]. 테스트: test_dvl_pose 90, test_dvl_pose_worker 53,
+    test_dvl_pose_panel 10, test_vehicle_gyro 14 — 전부 통과. 돌연변이 검사: 2차 수정의 추정기 22개·워커 4개, 3차 수정의
+    추정기 20개를 모두 새 테스트가 잡는다. 3차 수정의 워커 테스트 11개는 수정 전 코드에서 실패한다(scratch). 전체 스위트(파일별, robust)는 1868 통과·14 실패. 실패는 이번 변경 전부터 있던 5건과,
+    다른 세션이 진행 중인 `test_rl_integral_obs` 9건이다.
+  - 5차 검증(wf_acf79996-110): 세 가지가 확인됐다.
+    - (HIGH) 4차의 ON→DR z 분리 슬루가 **래칫**이었다. 받아들인 jump마다 그 차이가 보정 오프셋에 쌓여 비행 z가
+      계속 멀어졌다. 게이트 아래 깜빡임은 깜빡임 자체와 비교돼, 끝날 때마다 '두 배 jump'로 붙잡혔다.
+    - (HIGH) 자이로 **늦음에 한계가 없었다**. stale을 도착 시각으로 재니, 큐가 쌓인 링크에서는 각속도 × 늦음만큼 틀린
+      헤딩을 그대로 날랐다(20°/s 피벗이면 20°/s × (L − 0.2 s), 10-13의 늦음 0.6–0.9 s면 8–14° [유도]; 4차 코드의 실측 재생에서
+      새로 난 tick의 헤딩 오차는 최대 49.6° [측정: data/20261017/1017_dvl_pose_feasibility/rules_replay/out_round6/evidence/
+      gyro_lag_real_round4code.out]). 1 ms 간격 몰림은 각속도를 수십 배로 만들었다.
+    - (MEDIUM) Bar30 스파이크가 DR z로 들어갔다. 속도 정지는 1 s 평균이라 false lock이 ~0.3 m를 적분한 뒤에야 말했다.
+      드문드문 보이는 시야는 START·OFF를 계속 거부했다. DR이 도중에 끊긴 jump는 blind로 바뀌어 거부됐다.
+    - 재생 엔진도 틀려 있었다. build2가 fix에 `p_ned`를 안 넣어, 4차 재생은 fix 기반 z를 한 번도 쓰지 않았다.
+  - 고친 것(5차):
+    ```
+    gyro lateness:  L = t_now − t_gyro(newest, vehicle clock)
+                    r = ψ̇ over Δt ≥ 20 ms, clamped |r| ≤ 2.5 rad/s
+                    stale ⇔ L − 0.2 s > 0 ∧ ( |r|·(L − 0.2 s) > gyro_late_deg 3° ∨ L − 0.2 s > gyro_late_max_s 1 s )
+    Bar30 spike:    |d_k − d_acc| > 0.5 m/s·(t_k − t_acc) + 0.02 m  ⇒  d_k refused (until the level has held 1 s)
+    DR z:           z_DR(t) = d(t) + z_off,   z_off = z_fix(t_c) − d(t_c) + off_z     (no ON→DR split carried)
+    accept (slew):  off ← −e_state  (the pose stays where it was);   agreement / jump judged on e_fix (z from the fix)
+    pass-through:   e_ref ← −off   (not the glitch)
+    speed stop:     mean_1s |v_xy| > v_max   ∨   |v_xy|_k > 2·v_max
+    ```
+    - 드롭아웃 tick에는 z가 DR z(Bar30 참값)로 계단을 탄다. station bridge가 압력 수심으로 넘어갈 때와 같다.
+    - 대기 fix의 START·OFF 거부는 마지막 대기 fix가 1 s 안일 때만 한다(일치 판단에는 10 s 창 그대로).
+    - jump가 blind로 넘어가도 kind는 jump로 남는다(슬루, 거부 아님).
+    - 문구: shadow의 disengaged 줄은 "a control START now would be refused"로, START 때 fault 기록 키를 비운다. 배너와
+      START 거부 문구도 고쳤다("n/5 agree" → "n fixes so far, 5 must agree").
+    - 재생 엔진: 캡처 시각이 맞는 NavFix의 `p_ned`를 넣는다. 직접 규칙은 m 단위다.
+    - `gyro_late_deg`는 1°로 시작했다. 그러자 10-13 OFF 23개 중 20개가 중앙값 3.6 s 만에 끝났다 — 18개는 2.4–5.9°/s
+      자세 보정(1.0–2.6°), 2개는 10·26°/s 회전이었고, 3개는 끝나지 않았다. 그래서 태그 게이트가 같은 수준으로 보는
+      `jump_yaw_deg` 5°보다 작은 3°로 올렸다 [측정: data/20261017/1017_dvl_pose_feasibility/rules_replay/out_round5/
+      off_pass_late1deg.json].
+  - 결과(5차): 같은 재생(fix z 경로가 이제 실제로 돈다)에서 ON 런을 `--dvl_pose`만 끝낸 경우는 2/111이다. 둘 다 10-13의
+    피벗이다(0.66 s 늦음에 34°/s, 0.79 s에 37°/s — 같은 두 런을 4차도 다른 이유로 끝냈다). 스테이션이 끝낸 16개 런은
+    이어 간다. 붙잡힌 jump는 날마다 54/391/26/260 → 28/161/6/27이다. (여기 적었던 "최대 슬루 z 0.437 → 0.189 m"의
+    0.189는 슬루가 아니라 판단에 쓴 fix 기준 z였다 — 6차 정정: 실제 슬루는 0.238 m.) OFF hole까지 KM 중앙값은 10-17
+    137.5 s, 10-15 21.4 s, 10-13 82.3 s이다. m 단위 직접 규칙과 중앙값이 0.06–5.1 s 안에서 맞는다. 모든 정지까지 치면
+    10-17 112.1 s, 10-13 15.1 s다(OFF 23개 중 13개가 자이로 늦음, 5–14°/s)
+    [측정: …/rules_replay/out_round5/on_summary.txt, off_summary.txt].
+  - 테스트: test_dvl_pose 102, test_dvl_pose_worker 53, 전부 통과. 5차 돌연변이 12개(늦음 한계 2, 각속도 하한·상한,
+    스파이크 거부·수용·사용, 2배 정지, 1 s 대기 한계, jump→blind, e_state, e_ref)를 모두 새 테스트가 잡는다. 1° 문턱에서는
+    느린 보정 테스트가 실패한다. 전체 스위트(파일별, robust)는 1929 통과·14 실패다. 실패는 이번 변경 전부터 있던 5건과
+    다른 세션의 `test_rl_integral_obs` 9건으로, 4차와 같은 목록이다.
+  - 6차 검증(wf_0e5903e0-a6d — estimator · safety-code-reviewer · 재생·문서 3렌즈 + 지적별 반박 12): 11건 확인, 1건 반박.
+    - (HIGH) **늦은 자이로로 잡은 헤딩 앵커.** t_now에서 외삽으로 앵커하니 아직 큐에 있던 회전이 오프셋에 굳었다. 백로그가
+      비면 늦음 규칙은 조용해지고, DR이 그 오차를 그대로 날았다(합성 6–10°). 5차 코드의 실측 재생에서 10-13 앵커의 굳은
+      오차는 p99 20.18°, 최대 52.97°였다 [측정: …/rules_replay/out_round6/evidence/anchor_err_round5code.txt]. 회전 시작
+      직후에는 큐에 있는 회전이 yaw 'jump'로 읽혀, 맞는 태그를 붙잡고 늦은 DR을 보여 줬다(10-13 engaged 2건, 13.4°
+      [측정: …/evidence/jump_causes_round5code.txt]).
+    - (MEDIUM) **늦음 규칙이 열린 채로 실패했다.** 리더의 2 s 창을 넘는 큐에서 차량 시계 스탬프가 빠지면 도착 시각으로
+      돌아가 '0.02 s 늦음'으로 읽었다. att_rate 헤딩은 파싱 시각으로 찍혀 규칙이 아예 걸리지 않았다.
+    - (MEDIUM) 5차의 1 s 대기 한계가 **보정 한계를 넘는 재획득** 중에도 START를 통과시켰다. 다음 fix가 런을 끝냈다(4차는
+      거부했고, 그 일치는 disengaged에서 snap됐다). 같은 지적의 다른 갈래는 반박됐다 — 그 정지 자체는 옳다(포즈가 정말 틀렸다).
+    - (MEDIUM) jump가 일치하는 동안 DR이 잠깐 끊겼다가 돌아오면 **재획득으로 바뀌어**, 25 cm 넘는 jump가 런을 끝냈다.
+    - (LOW) 다섯 가지였다. shadow START가 control이었다면 거부됐을 fault를 "would have ended"로 셌다. `_last_depth`가
+      거부된 스파이크였다. Bar30 수준 변화가 ON에서 z 'jump'로 날려졌다. disengage 직후 슬루 중이던 오프셋이 jump로 읽혔다.
+      재생 요약의 '슬루 z'가 판단값이었다. 그 밖에 문서 수치(13/101, 8–26°, 'every')가 틀렸다.
+  - 고친 것(6차):
+    ```
+    heading anchor:  on a tag tick, the newest queued fix whose capture the gyro history covers (t_c ≤ t_gyro,newest):
+                     ψ_DR(t_c) := ψ_fix(t_c) + off_ψ        (raw interpolated at t_c; never at t_now through the extrapolation)
+    yaw innovation:  e_ψ = ψ_fix(t_c) − ψ_DR(t_c)    if the history covers t_c
+                     e_ψ = e_ref,ψ   (not judged)    otherwise — x, y, z are still judged
+    one clock:       once a gyro record is on the vehicle clock (from the start with --source hw),
+                     a record the map cannot place  ⇒  lateness unknown  ⇒  stale
+    START / OFF:     refused while a kept re-acquisition (≤ agree_window_s) has |e_xy| > max_corr_m or |e_ψ| > max_corr_yaw
+    Bar30 level:     a refused level taken (1 s hold, or the elapsed-time bound) ⇒ history restarts;
+                     under ON the next fix captured on it re-takes z_off, the z jump test off until then
+    ```
+    - jump가 blind를 거쳐 DR이 돌아와도 jump로 남는다(그 사이 태그까지 끊기면 아니다). disengaged 통과 tick의 e_ref는 0이다.
+    - shadow START에 서 있던 fault는 "a control START would have been refused here"로 한 번 남기고, meta faults에도 그렇게
+      적는다. 그 런의 정지로 다시 세지 않는다.
+    - 보정 기록에 `slew_m / slew_yaw_deg / slew_z_m`(실제로 옮기는 양)과 `yaw_judged`가 붙는다.
+    - 재생 엔진: Bar30에 차량 시계 시각을 붙이고, 슬루 z는 실제 값을 쓰고, 검열 수를 기록하고, 캐시가 없으면 멈춘다.
+  - 결과(6차): ON에서 `--dvl_pose`만 끝낸 런은 2/111이다. 둘 다 10-13 큐 링크의 자이로 늦음이다(0.66 s·34°/s, 0.55 s·10°/s).
+    스테이션이 끝낸 16개 런은 이어 간다. 5° 넘는 yaw 보정은 날마다 3/3/0/0 → 0/0/0/0이 됐다. 실제로 슬루된 z는 최대 0.238 m
+    (10-15, 깊이를 clean tag z로 대체한 세그먼트)다. 기록된 Bar30이 있는 세그먼트만이면 0.108 m다. OFF hole까지 KM 중앙값은
+    10-17 137.5 s, 10-15 21.4 s, 10-13 82.3 s다. 모든 정지까지 치면 10-17 112.0 s, 10-13 12.0 s다(OFF 25개 중 15개가 자이로
+    늦음) [측정: …/rules_replay/out_round6/on_summary.txt, off_summary.txt].
+  - 테스트: test_dvl_pose 117, test_dvl_pose_worker 55, test_dvl_pose_panel 10, test_vehicle_gyro 14 — 두 환경 모두 전부 통과.
+    새 추정기 테스트 14개는 5차 코드에서 모두 실패한다. 6차 수정을 하나씩 되돌린 돌연변이 18개도 모두 잡는다(자체 검토에서
+    찾은 z_source pressure의 `_z_retake` 해제 포함). 전체 스위트(파일별): robust 1995 통과·5 실패, rovgui-pose 2002 통과·6
+    실패다. 실패는 이번 변경 전부터 있던 5건과(rovgui-pose는 `test_rl_goal_frame` 레거시 fixture 1건 더) 같고, 다른 세션의
+    `test_rl_integral_obs`는 이제 통과한다. demo e2e(`demo_e2e_dvl_pose.py`, `demo_e2e_dvl.py`) 통과.
+  - 7차 검증(wf_0a38afc8-48f — estimator · safety-code-reviewer(FAIL) · 재생·문서 3렌즈 + 지적별 반박): 확인 대부분, 반박 1(재생
+    엔진 need_vclk — 재생 데이터에서 영향 0).
+    - (HIGH) 6차의 "yaw 미판단 = 기대값" 대입이 **모든 yaw 판단을 껐다**. OFF 10° 정지, blind 보증, 보정 한계, ON 거부가 0을 읽어,
+      큐 링크에서 12–15° 틀린 헤딩이 아무 정지 없이 날 수 있었다 [유도: 7차 검증의 합성 시나리오](5차는 잡았다). 10-13 비교 tick의 53.3 %가 미판단이었다 [측정: …/
+      rules_replay/out_round7/evidence/yaw_unjudged_round6code.txt]. 판단된 fix와 미판단 fix가 섞인 일치는 실패한 채 DR을 날렸다.
+    - (HIGH) **z도 같은 구멍**: Bar30을 차량 시계로 찍자 큐 링크에서 fix 캡처가 최신 Bar30 스탬프보다 0.5 s 넘게 뒤라, 10-13 큐
+      세그먼트 fix의 15.5–47.6 %가 외삽 상태 z로 판단됐다 [측정: …/out_round7/evidence/fix_z_coverage.txt]. 그 z 'jump'가 재생의
+      mpc_212056 정지를 만들었다(자이로 늦음만이 아니었다). (그 "라운드 7: 0–2.5 %"는 뒤처짐 판단 전 사본의 값이었고, 최종 라운드 7
+      코드는 0–2.6 %다 — 8차 검증 [측정: …/rules_replay/out_round8/evidence/fix_z_coverage_pinned.txt].)
+    - (MEDIUM) 수락 tick에 수락 전 큐 fix를 수락 뒤 오프셋으로 앵커해, 그 수준 변화만큼의 계단을 만들었다(합성 J = 8°에서 8° [유도:
+      7차 검증의 합성 시나리오]; 실측 slew_yaw로는 1.5–2.8° 추정)(5차 대비 회귀). 첫 앵커가 원시 태그
+      포즈를 대기열에 남겨 141 cm 가짜 'jump' 기록을 만들었다. shadow START 때 포즈가 이미 LOST면 'would have ended'로 셌다.
+    - (LOW) blind 보정의 묵은 `yaw_judged`, 문서 수치(정확 값이 반올림 산출물에 인용됨, p99를 최대로 표기, 0.7 s 근거 없음,
+      10-15 yaw 보정 감소의 원인 오기, 기록 Bar30 없는 날의 0.0).
+  - 고친 것(7차):
+    ```
+    yaw judgment:   e_ψ = ψ_fix(t_c) − ψ_DR(t_c)   on the NEWEST fix whose capture the gyro history covers, captured
+                    within YAW_EVIDENCE_S (1.5 s) — this tick's on a healthy link, one L old on a queued one
+                    none ⇒ e_ψ = ψ_tag(t_now) − ψ_DR(t_now)   (measured, the queued rotation in it; yaw_judged false)
+                    — never e_ref,ψ ; every yaw check reads this one value
+    Bar30 past its newest stamp (the capture of a queued link):
+                    d(t_c) = d_newest + ẑ·(t_c − t_newest)   while the Bar30 still arrives, t_c − t_newest ≤ depth_stale_s
+    anchor:         ψ_DR(t_c) := ψ_fix(t_c) + off_ψ(when that fix was the pose)
+                    after a SNAP: no dead reckoning until an anchor at or after the new level's capture
+    ON held jump:   no OFF divergence stop (it is slewed when it agrees)
+    heading lag:    lag = |e_ψ,state(t_now) − e_ψ,judged|   (the rotation the gyro history has not delivered)
+                    lag > gyro_late_deg ∧ t_gyro,newest < t(lag) ∧ no agreement pending  ⇒  stale
+                    (a judged fix older than an accepted tag level reads that level change, not a lag: ignored)
+    ```
+    - 늦음 안에서 시작된 회전은 최신 각속도가 옛 값이라 늦음 규칙이 못 본다. 태그가 그 뒤처짐을 직접 잰다(위 식).
+      일치 대기 중에는 쓰지 않는다 — 태그 수준 변화도 L 동안 같은 값으로 읽혀, held jump를 blind로 보내 debounce를 넘겼다.
+    - 첫 앵커 때 대기열을 비우고, 원시 포즈 일치 뒤에는 더 넣지 않는다.
+    - shadow START는 control의 START 거부 사유를 모두 쓴다(fault, 포즈 없음, …). LOST로 시작한 구간은 그 런의 종료로 안 센다.
+    - 재생 엔진: need_vclk(스테이션과 같게), 기록 Bar30이 없는 날은 '–'.
+  - 결과(7차): ON에서 `--dvl_pose`만 끝낸 런 1/111(10-13 큐 링크, 0.66 s 늦음에 34°/s 피벗; 라운드 6의 두 번째 정지는 외삽 상태
+    z였고 사라졌다). 스테이션이 끝낸 16개 런은 이어 간다. 5° 넘는 yaw 보정 0건. 실제로 슬루된 z는 기록 Bar30 세그먼트에서 최대
+    0.036 m(10-13)·0.108 m(10-15)다. OFF hole까지 KM 중앙값은 10-17 137.5 s, 10-15 21.3 s, 10-13 82.3 s다. 모든 정지까지 치면
+    10-17 112.0 s, 10-13 4.8 s다(헤딩 판단이 OFF 25개 중 19개를 먼저 끝냄 — 큐 링크는 헤딩을 나를 수 없다)
+    [측정: …/rules_replay/out_round7/on_summary.txt, off_summary.txt]. 10-13 태그 tick 중 DR 헤딩이 3° 넘게 뒤처진 643개 가운데
+    639개를 헤딩 판단이 막는다고 적었다(뒤처짐 판단 전 640개 중 349개) [측정: …/out_round7/evidence/dropout_yaw_step.txt,
+    dropout_yaw_step_without_lag_guard.txt]. **8차 검증에서 이 수치는 끊김을 잰 값이 아님이 드러났다**: 그 tick의 fix를 쓴 뒤의
+    판단이었고, 실제 끊김 재생에서 라운드 7 코드는 3° 넘게 틀린 헤딩으로 이어 간 끊김이 142건이었다(아래 8차).
+  - 테스트: test_dvl_pose 130, test_dvl_pose_worker 56. 새 추정기 테스트 13개 중 11개는 라운드 6 코드에서 실패한다. 나머지
+    2개는 뒤처짐 판단의 한계(일치 대기 중에는 쓰지 않음, 수락 뒤 비움)를 고정한다 — 그 둘을 되돌린 돌연변이를 잡는다. 새 워커
+    테스트 1개도 라운드 6에서 실패한다. 7차 돌연변이 15개 중 14개를 잡는다(처음에 "16개 중 15개"로 잘못 셌다 — 8차 검증). 남은 1개(첫 앵커 때 대기열 비우기)는 원시 포즈를 더
+    넣지 않는 다른 방어와 겹쳐서 일부러 둔 이중 방어다. 전체 스위트(파일별): robust 2010 통과·5 실패, rovgui-pose 2016 통과·6
+    실패 — 이번 변경 전부터 있던 같은 목록이다. demo e2e 두 개 통과. 다만 `demo_e2e_dvl_pose.py`는 PASS를 찍은 뒤 종료 중에
+    가끔 죽었다(15번 중 4번, exit 134/139). 드라이버가 `win.shutdown()`을 안 불러서 워커 스레드가 산 채로 인터프리터가
+    내려갔기 때문이다. `aboutToQuit` 연결을 넣은 뒤 6번 모두 exit 0이다
+    [측정: data/20261017/1017_dvl_pose_feasibility/e2e_exit_race_20261018/README.md].
+  - 8차 검증(wf_21856d6c-69a — estimator · safety · 재생·문서 3렌즈 + 지적별 반박, 7차 코드 대상): 지적 10개 모두 확인, 반박 0.
+    큐 링크(자이로가 늦게 오는 링크)의 구멍이 대부분이었다.
+    - (HIGH, 7차 회귀) 태그 yaw 이상치 fix 하나가 덮이기 전에 포즈로 지나가고, 덮이면 **헤딩 앵커**가 됐다. 그 뒤 깨끗한 fix가 모두
+      jump로 읽혀 slew·재앵커가 되풀이됐고, 런은 끝나지 않았다. 실측 기록에 이상치를 넣은 시험에서 10-13 19/104, 10-17 5/276
+      [측정: 주입 시험, …/rules_replay/out_round8/evidence/wf_21856d6c-69a_result.json estimator F1].
+    - (HIGH) 헤딩 뒤처짐 기록이 stale 동안 다시 재지 않은 채 시간으로만 풀렸다. 회전이 잠깐 멈춘 틈에 드롭아웃이 오면 틀린
+      헤딩으로 이어 갔다(8차 docs F1의 사례들은 10–27°). 실제 끊김 재생에서 3° 넘게 틀린 채 이어 간 끊김이 142건(10° 초과 10건,
+      최대 30–32°)이었다 — "10–27°"를 재생의 범위로 읽지 말 것(9차 docs R8D-9)
+      [측정: …/out_round8/evidence/bridged_dropout_round7code.txt]. 7차 문서의 "643 중 639 차단"은 끊김을 잰 값이 아니었다.
+    - (HIGH) 짧은 재획득의 yaw를 드롭아웃 **전** fix로 판단했다. 그래서 보정 한계를 못 보고 12–27° 오차를 날았다(합성).
+      늦음이 섞인 상태 차이를 보정으로 흡수하면, 큐가 빠진 뒤 그만큼 틀어져 순환했다 [측정: 합성, 같은 json estimator F4].
+    - (MEDIUM) 이상치 하나가 헤딩 뒤처짐으로 읽혀 DR을 L 동안 stale로 뒀다(OFF 런 종료).
+    - (MEDIUM) jump 보류 중에는 DR 표류를 보는 장치가 `max_blind_s`뿐이었다(합성: 30개 중 blind로 멈춘 15개가 0.69–0.77 m. 같은
+      시드 30개 전체의 참 오차 p50/최대는 0.607/0.768 m다 — 9차 docs R8D-2).
+    - (MEDIUM, 기존) slew 도중 드롭아웃이 오면 남은 slew를 재획득의 표류로 읽어 런을 잘못 끝냈다.
+    - (LOW) 문서: 돌연변이 수 오기, fix z 근거의 이름표, 모듈을 고정하지 않은 증거 스크립트, 출처 없는 합성 수치.
+  - **운용자 결정(2026-10-18)**:
+    - TAG FIX 버튼은 OFF에서 누르면 **한 번만 보정하고 스스로 OFF로 돌아간다**(TAG FIX ONCE). 긴 DR 비행에서 드리프트를 이따금
+      초기화하는 쓰임이다.
+    - `max_blind_s`(태그 없이 20 s면 종료)를 없앴다(null).
+    - 큐의 원인(~2 s마다 온 배너 [측정: data/20261013/1013_param_banner_scan/] — 다른 클라이언트의 파라미터 목록 요청으로 읽는다
+      [유도: 같은 README], 9차 docs R8D-6)을 로그창에
+      **빨간** `LINK DELAYED` 줄로 띄운다.
+  - 고친 것(8차):
+    ```
+    lateness cap:   gyro_late_max_s 1.0 → 0.1   (late − min(t_now − t_hist, 0.2) > 0.1  ⇔  L > 0.3 s  ⇒  no heading)
+                    healthy days L_max 0.123 / 0.13 s;  10-13: 63 % of engaged ticks have L > 0.3 s
+    anchor judgment: anchor on a covered queued fix only if
+                    |wrap(ψ_fix(t_c) + off_ψ,queued − ψ_DR(t_c))| ≤ jump_yaw_deg
+                    (free: no anchor yet, a gyro hole since it, a snap's new level)
+    held-jump drift: e_hold,ref = median(first anchor_n held innovations)
+                    d = e_now − e_hold,ref ;  |d_xy| ≥ abort_err_m ∨ |d_ψ| ≥ abort_err_yaw ∨ |d_z| ≥ abort_err_z
+                    for abort_hold_s over anchor_n fresh fixes  ⇒  stop ("drifted from a held tag jump's level")
+                    accept: |median(pending) − e_hold,ref| > max_corr_*  (engaged)  ⇒  refused
+    re-acquisition as drift:  e_d = argmin_{e, e + off} score(·),
+                    score(x) = max(|x_xy| / max_corr_m, |x_ψ| / max_corr_yaw, |x_z| / max_corr_z)
+                    — the pose shown (e = 0) or the level the correction in flight slews to (e = −off);
+                    used by the accept limit, pending_too_big, the ON divergence watch and the vouching
+    one-shot:       OFF —press→ ON (oneshot) → [anchor_n agree → slew/snap] → off ≈ 0 ∧ no pending → OFF (through OFF's refusal)
+                    no correction in oneshot_timeout_s (10 s) → OFF, uncorrected
+    ```
+    - B·C(뒤처짐 가드 재설계, 늦음이 남은 수락 지연)는 넣지 않았다. 상한으로 큐 링크의 DR을 끄면 그 지적들의 시나리오(L 0.36–0.9 s)가
+      사라지기 때문이다. 상한 안(L ≤ 0.3 s)의 잔여는 각속도 × L이다 [유도].
+  - 결과(8차, 개루프 재생):
+    - **ON**: `--dvl_pose`만 끝낸 런 2/111(10-13 둘 다 늦음 상한)이다. 하나는 새로 생겼다: 붙잡힌 jump 뒤 상한이 DR을 껐고, blind
+      대기 8 tick 끝에 종료됐다. 정상 날(10-15·16·17)은 7차와 같다: 0 종료, 16개 런을 이어 감, 5° 넘는 yaw 보정 0
+      [측정: …/rules_replay/out_round8/on_summary.txt].
+    - **OFF**: 10-17 hole KM 137.5 s, 정지 전체 112.0 s(7차와 같다). 10-13 정지 전체는 1.25 s로, 20개 모두 상한이다
+      [측정: …/out_round8/off_summary.txt].
+    - **실제 끊김 재생**: 3° 넘게 틀린 채 이어 간 끊김 142 → 0건 [측정: …/out_round8/evidence/bridged_dropout_round8.txt].
+    - **이상치 주입**: 10-13 19/104 → 0/104, 10-17 5/276 → 0/276 [측정: 주입 시험, …/out_round8/evidence/scan_*_round8.txt].
+    - **jump 보류 표류(합성)**: 정지·수락 전 참 오차 p50/최대 0.28/0.38 m(7차 0.69–0.77 m) [측정: 합성, …/out_round8/evidence/
+      held_jump_drift_round8.txt]. (9차 정정: 시드 10개와, 7차 30개 중 blind로 멈춘 15개를 비교해 같은 통계가 아니었다. 같은 시드
+      30개로는 7차 0.607/0.768 → 8차 0.348/0.555 m — 아래 9차, R8D-2.)
+  - 테스트: test_dvl_pose 145, test_dvl_pose_worker 58, test_dvl_pose_panel 11, test_att_age 27(배너 레벨 error).
+    - 새 추정기 테스트 15개 중 12개는 라운드 7 코드에서 실패한다. 나머지 3개는 라운드 8이 지나치지 않는지를 고정한다: E가 실제
+      표류까지 덮지 않는지, 옛 수준으로 돌아온 태그를 그대로 슬루하는지, 앵커 판단이 자이로 공백 뒤 재앵커를 막지 않는지.
+    - 새 워커 테스트(한 번 보정의 시간 초과·OFF 거부 경로)는 라운드 7 코드에서 실패한다. 큐 링크 테스트 12개는 상한 1.0 s를
+      명시해 그 장치를 계속 고정한다.
+    - 8차 돌연변이 20개를 모두 잡는다 [측정: …/out_round8/evidence/mutants_round8.txt].
+    - 전체 스위트(파일별): robust 2032 통과·5 실패, rovgui-pose 2038 통과·6 실패 — 실패는 이번 변경 전부터 있던 같은 목록이다.
+    - demo e2e 두 개 통과(`demo_e2e_dvl_pose.py`: TAG FIX OFF → ONCE… → OFF, 타이머 경고 0줄).
+  - 9차 검증(wf_f143a3fa-24b — estimator · safety · 재생·문서 3렌즈 + 지적별 반박, 8차 코드 대상): 반박자에게 넘긴 12개 중 11개 확인,
+    1개 반박(safety R8-2: RAW_IMU 5 Hz 시작 하한이 늦음 여유를 없앤다는 지적). 반박자에게 넘기지 않은 8개(대부분 문서)도 함께 고쳤다
+    [측정: …/rules_replay/out_round9/evidence/wf_f143a3fa-24b_result.json].
+    - (HIGH, 8차 회귀) 재획득을 표류로 판단할 때 진행 중인 보정 **전체**를 목표 수준으로 쳤다. 재획득이 남긴 보정도 목표가 되어,
+      끊김이 이어질 때마다 앞 재획득의 남은 보정이 빠졌다. 그래서 25 cm 넘는 표류가 런을 끝내지 않고 슬루됐다(합성, estimator R8E-1).
+    - (MEDIUM) jump 보류 중 표류(e − 기준)가 추정기 자신의 슬루를 표류로 읽었다. 앞 보정이 슬루 중일 때 보류가 시작되면 슬루만으로
+      멈추거나(거짓 정지), 방향이 반대면 표류를 가렸다(estimator R8D-2, safety R8-1).
+    - (MEDIUM) jump → blind → jump 왕복에서 보류 기준을 버려, 표류를 처음부터 다시 셌다(estimator R8D-1).
+    - (MEDIUM) 문서는 "ON에서 z는 런을 끝내지 않는다"인데, 보류 표류 감시는 z 20 cm로 런을 끝낼 수 있었다(docs R8D-3).
+    - (LOW–MEDIUM) 한 번 보정이 OFF로 돌아갈 때 OFF의 거부 규칙을 그대로 썼다. 일치하지 않는 fix만 오는 시야나, 잠깐 보인 태그가
+      남긴 일치 대기 fix가 OFF를 막았다. 그래서 시간 제한을 넘겨 ON으로 남았다(estimator R8O-1, docs R8D-1).
+    - (LOW) disengaged에서 스스로 돌아간 OFF가 런이 끝난 이유를 덮었다(safety R8-3). 그 tick의 CSV `tagfix`가 포즈를 계산한 스위치와
+      달랐다(R8-4). 문서 쪽: 보류 표류의 비교 통계가 어긋났다(R8D-2). 보관 돌연변이 스크립트는 보관 위치에서 테스트 없이 KILLED로 셌다(R8D-4).
+      증거 스크립트가 scratch 캐시와 현재 모듈을 읽었다(R8D-5). 그 밖에 인용 정정(R8D-6·7·9·10).
+  - 고친 것(9차):
+    ```
+    jump part:       off_j ← off          at a jump accept
+                     off_j kept           at a re-acquisition judged on the slew target
+                     off_j ← 0            at a re-acquisition judged on the pose shown, a snap, while disengaged
+                     off_j ← k · off_j    in the decay, the same k per axis group as off
+    re-acquisition as drift:  e_d = argmin_{e, e + off_j} score(·)          (round 8: e + off)
+                     — only a jump's leftover is a level the tags may come back on; a re-acquisition's leftover is flown error
+    held-jump drift: h(e) = e + off                                          (the estimator's own slew is no drift)
+                     e_hold,ref = median(h over the first anchor_n held fixes)
+                     d = h(e_now) − e_hold,ref ;  |d_xy| ≥ abort_err_m ∨ |d_ψ| ≥ abort_err_yaw       (no z)
+                     accept: |median_i(e_i + off_i) − e_hold,ref| > max_corr_m / max_corr_yaw (engaged)  ⇒  refused
+                     e_hold,ref kept through jump → blind → jump (one hold, counted once); e_ref ← −off after each DR-tick slew
+    one-shot OFF:    due = 'done' (accepted ∧ |off_xy| ≤ 1 mm ∧ |off_z| ≤ 1 mm ∧ |off_ψ| ≤ 1e-4 rad)  or  'timeout'
+                     due ∧ anchored ∧ no slew left ∧ the DR can fly  ⇒  drop the pending fixes, OFF
+                     (round 8: through OFF's refusal, which a pending agreement also held)
+    ```
+  - 결과(9차, 개루프 재생·합성):
+    - **ON·OFF**: 8차와 같다 — `--dvl_pose`만 끝낸 런 2/111, 이어 간 런 16, 5° 넘는 yaw 보정 0. OFF 요약과 KM은 바이트까지 같다.
+      붙잡힌 jump는 10-13 20 → 17(한 보류를 한 번만 센다 — 그 변경만 되돌리면 20), 10-15 153 → 149다
+      [측정: …/rules_replay/out_round9/on_summary.txt, off_summary.txt, evidence/hold_count_check.txt].
+    - **실제 끊김 재생** 0건, **이상치 주입** 0/104·0/276, fix z 0–3.8 %, yaw 미판단 0 % — 8차와 같다 [측정: …/out_round9/evidence/].
+    - **jump 보류 표류(합성, 같은 시드 30개)**: 첫 수락·정지 전 참 오차 p50/최대가 7차 0.607/0.768 → 8차 0.348/0.555 → 9차 0.348/0.555 m다.
+      9차는 첫 jump를 받아들인 뒤의 다음 보류에서 4개가 더 멈추고, 1개는 수락이 거부된다 — 8차에서 슬루에 가려졌던 표류다
+      [측정: 합성, …/out_round9/evidence/held_jump_drift_round{7,8,9}_30seeds.txt].
+  - 테스트: test_dvl_pose 153, test_dvl_pose_worker 61, test_dvl_pose_panel 11.
+    - 새 테스트 11개(추정기 8, 워커 3)는 모두 라운드 8 코드에서 실패한다. 추정기 2개는 라운드 8에 없는 API로 실패하고, 그 동작은
+      돌연변이가 따로 확인한다 [측정: …/out_round9/evidence/new_tests_on_round8.txt].
+    - 9차 돌연변이 13개를 모두 잡는다(fail-closed: pytest가 실패를 보고한 것만 KILLED). 처음 돌렸을 때 R9M2(자세 판독으로 받아들인
+      재획득이 off_jump를 남김)가 살아남아, 그 경로 테스트를 더했다 [측정: …/out_round9/evidence/mutants_round9.txt].
+    - 전체 스위트(파일별): robust 2043 통과·5 실패, rovgui-pose 2049 통과·6 실패 — 실패는 이번 변경 전부터 있던 같은 목록이다.
+    - demo e2e 두 개 통과(`demo_e2e_dvl_pose.py`: TAG FIX OFF → ONCE… → OFF, 타이머 경고 0줄).
+  - 10차 검증(wf_ce59a697-8bd — estimator · safety-code-reviewer · 테스트·돌연변이 충분성 3렌즈 + 지적별 반박, 9차 코드 대상; 세션이
+    끊겨 반박 단계를 재개함): 반박자에게 넘긴 9개 모두 확인(반박 0). 넘기지 않은 낮은 지적 7개도 함께 고쳤다(테스트 공백 5, 문구 1,
+    점수 동률 1). 가장 큰 결함(R10E-1)은 주 세션도 리뷰와 따로 찾았다
+    [측정: …/rules_replay/out_round10/evidence/wf_ce59a697-8bd_result.json].
+    - (HIGH→MEDIUM, 9차 회귀) jump를 받아들일 때 진행 중인 보정 **전체**를 jump 몫(off_jump)으로 삼았다. 그래서 재획득이 남긴
+      보정과 보류 중 DR 표류가 '수준'으로 세탁됐다. 보기 창마다 태그 수준이 바뀌면 재획득이 매번 새 표류(~22 cm)만 읽어 120 s에
+      1.6–1.9 m를 정지 없이 날았다(합성; 한 번 보정도 OFF로 돌아가지 못함). 반박자는 매 창마다 수준 변화가 필요해 R8E-1보다 좁다며
+      medium으로 낮췄다(estimator R10E-1).
+    - (MEDIUM, 9차 회귀) jump → blind → jump 왕복의 DR이 옛 수준 tick에 돌아오면, 복원한 보류 기준이 지워지지 않고 남았다. 다음
+      jump는 언제든 그 죽은 기준으로 판단돼, 센서가 다 맞는데 깨끗한 30 cm jump가 '60 cm 표류'로 거부됐다(estimator R10D-1, safety R9-2).
+    - (MEDIUM, 9차 회귀) blind로 받아들인 jump가 jump가 떠난 수준으로 돌아온 태그까지 보류 표류로 묶었다. jump 전체가 표류로 읽혀
+      보정이 0인데 런이 끝났다(safety R9-1, 반박자 재현).
+    - (MEDIUM) ON의 재획득 발산 감시가 z로 런을 끝냈다. 앞 재획득이 남긴 z 슬루를 성긴 시야로 볼 때(9차 회귀), 또 25 cm 어긋난 지도
+      z를 처음 재획득에서 성긴 시야로 볼 때(7–9차)다. 문서의 "ON에서 z는 런을 끝내지 않는다"와 어긋났다(estimator R10Z-1).
+    - (MEDIUM) 한 번 보정이 disengaged에서 스스로 돌아간 OFF가 그 OFF의 기록 줄 대신 남아 있던 이유를 기록했다. 벤치 한 번 보정
+      뒤에는 칩에 'TAG FIX ONCE'가 남았고, E-STOP 뒤에는 'disengaged: E-STOP'이 한 번 더 기록됐다(tests R10-1, safety R9-3).
+    - (MEDIUM–LOW) 테스트 공백: 라운드 9 규칙 여럿을 되돌린 돌연변이가 살아남았다 — on-target 재획득의 off_jump 유지(N31), 보류
+      수락 한계의 진행 중 보정(N8·N16b), 옛 수준으로 돌아온 재개 보류(N19), blind jump 수락 한계(N17), 일치 대기와 무관한 'done'(N23),
+      off_jump yaw 감쇠(N3), ON 감시의 jump 몫만 할인(N12) (tests R10-2…R10-8).
+    - (LOW) 시작 안내 줄이 보류 감시에 z 20 cm가 있다고 말했고, 보류 표류 정지 문구는 판단하지 않은 '0 cm z'를 찍었다(safety R9-4).
+      재획득의 점수가 z와 동률이면 jump 수준 위의 재획득을 '포즈 기준'으로 판단해 jump 몫을 지웠다(estimator R10E-2).
+  - 고친 것(10차):
+    ```
+    jump part at a jump accept:  off_j ← off_j − e_hold,ref           (round 9: off_j ← off)
+                     e_hold,ref = median(e + off over the first anchor_n held fixes) = the jump's own level change
+                     (no hold reference: off_j ← off_j + (off − off_prev))
+                     — a re-acquisition's leftover and the hold's DR drift stay drift
+    restored hold:   DR back from jump → blind on a tick that is not a jump ⇒ unpend (the restored reference too);
+                     a fresh hold starts with no items
+    blind-from-jump: x = e + off;  |x_xy| ≤ jump_m ∧ |x_ψ| ≤ jump_yaw_deg  ⇒  kind blind (the jump is over), no hold bound
+                     else  hold = (|x_xy − ref_xy|, |x_ψ − ref_ψ|),  level = ref
+    ON watch:        _jerr under ON → (err_xy, err_ψ, None)       (z never ends an ON run; OFF keeps abort_err_z_m)
+    score:           s(x) = (max(|x_xy| / max_corr_m, |x_ψ| / max_corr_yaw), |x_z| / max_corr_z)   lexicographic
+    one-shot OFF:    record line = 'TAG FIX OFF (correction in | no correction)' always;
+                     reason kept only when auto ∧ disengaged ∧ reason starts 'disengaged:'
+    ```
+  - 결과(10차, 개루프 재생·합성):
+    - **ON·OFF**: 9차와 같다 — `--dvl_pose`만 끝낸 런 2/111, 이어 간 런 16, 5° 넘는 yaw 보정 0. OFF 요약과 KM은 바이트까지 같다. 바뀐
+      것은 jump 수락 2건이 같은 크기의 blind 수락이 된 것이다(10-13 3.3 cm, 10-15 7.6 cm — 태그가 jump가 떠난 수준의 게이트 안으로 돌아온
+      경우로, R9-1의 경로가 실제 기록에도 있다) [측정: …/rules_replay/out_round10/on_summary.txt, on_pass2.json].
+    - **실제 끊김 재생** 0건, **이상치 주입** 0/104·0/276, fix z 0–3.8 %, yaw 미판단 0 %, **보류 표류 합성** 0.348/0.555 m — 9차와
+      같다 [측정: …/out_round10/evidence/].
+  - 테스트: test_dvl_pose 168, test_dvl_pose_worker 63, test_dvl_pose_panel 11, test_att_age 27.
+    - 새 테스트 17개(추정기 15, 워커 2) 중 10개는 라운드 9 코드에서 실패한다(고친 결함마다 하나 이상). 7개는 라운드 9 규칙을 지키는
+      테스트라(살아남던 돌연변이를 잡으려는 것) 라운드 9에서도 통과한다 [측정: …/out_round10/evidence/new_tests_on_round9.txt].
+    - 10차 돌연변이 20개를 모두 잡는다. 라운드 10 변경을 되돌린 것 10개와, 10차 검증에서 살아남은 N3·N8·N12·N16b·N17·N19·N23·N31·W1·W2를
+      다시 건 것이다. 동등 돌연변이 1개(새 보류가 빈 기준으로 시작 — B가 그 경로를 이미 막는다)는 산다
+      [측정: …/out_round10/evidence/mutants_round10.txt].
+    - 전체 스위트(파일별): robust 2060 통과·5 실패, rovgui-pose 2066 통과·6 실패 — 실패는 이번 변경 전부터 있던 같은 목록이다.
+    - demo e2e: `demo_e2e_dvl_pose.py` 통과(TAG FIX OFF → ONCE… → OFF, 타이머 경고 0줄). `demo_e2e_dvl.py`는 검사를 모두 통과(OK)한 뒤 종료 중 abort(exit 134)했다 — `win.shutdown()`을 부르지 않는 드라이버의 알려진 종료 경합이다(KNOWN_ISSUES) [측정: data/20261017/1017_dvl_pose_feasibility/e2e_exit_race_20261018/observed/].
+  - 11차 검증(wf_1e670663-eb4 — estimator · safety-code-reviewer 2렌즈 + 지적별 반박, 10차 코드의 회귀만 대상): 반박자에게 넘긴 4개 모두
+    확인(medium 1, low 3). 넘기지 않은 low 1개도 고쳤다 [측정: …/rules_replay/out_round10b/evidence/wf_1e670663-eb4_result.json].
+    - (MEDIUM, 10차 회귀) jump 몫을 보류의 **처음** fix 5개 중앙값(보류 기준)으로 잡았다. 그래서 그 기준의 잡음(5–12 cm)이 진행 중 보정의
+      '표류'로 들어갔다. 다음 slew 목표 위 재획득을 양쪽으로 틀리게 판단했다 — 무작위 200회(성긴 단일 태그 σ 8 cm, 2 Hz)에서 놓침
+      12 → 18, 거짓 정지 0 → 2였다(estimator R11E-1, 합성).
+    - (LOW, 9–10차) 두 읽기가 함께 가진 yaw가 점수의 큰 쪽을 동률로 만들었다. 그래서 jump 위의 재획득을 '포즈 기준'으로 판단하고
+      jump 몫을 지웠다 — R10E-2의 yaw 판이다(estimator R11E-2).
+    - (LOW) 문구: 거부 문구가 판단하지 않는 z와 '0.2 m' z 한계를 찍었다(R11E-3). DEFAULTS 주석의 "142 real dropouts"는 실측 기록의
+      fix마다 카메라를 멈춰 본 모의 끊김 56,455번 가운데 142번이었다(safety R11-1 — 단서가 인용에서 떨어지는 실패). 시작 안내 줄과
+      클래스 docstring이 ON 재획득 발산 감시를 빠뜨렸다(R11-2).
+  - 고친 것(10b):
+    ```
+    jump part at a jump accept:  off_j ← off_j + (off − off_prev) + b(m − e_hold,ref)
+                     m = median_i(e_i + off_i) over the agreeing fixes;  e_hold,ref = median over the first anchor_n held fixes
+                     b(d)_xy = d_xy · max(0, |d_xy| − jump_m) / |d_xy|,   b(d)_ψ = sign(d_ψ) · max(0, |d_ψ| − jump_yaw),   b(d)_z = 0
+                     — what THIS accept changed; the leftover stays drift; the hold's shift beyond the jump gate is booked as drift
+    score:           s(x) = (max(a, b), a + b, |x_z| / max_corr_z),  a = |x_xy| / max_corr_m,  b = |x_ψ| / max_corr_yaw   (lexicographic)
+    ```
+  - 결과(10b, 개루프 재생·합성):
+    - 무작위 200회에서 판정이 라운드 9와 같다(놓침 12, 거짓 0). 남은 12개는 표류가 남은 슬루 방향과 겹치는 본래의 모호함으로, 라운드 9에도
+      있었다 [측정: 합성, …/rules_replay/out_round10b/evidence/noisy_hold_battery/summary.txt].
+    - 흔들리는 보류(±6 cm)에서 표류 0을 0.001로 읽는다(라운드 10은 0.04). 27.5 cm 표류는 거부하고 23.9 cm는 슬루한다(라운드 10은 둘을
+      뒤바꿨다) [측정: 합성, 같은 폴더 wobble_hold_r9_r10_r10b.txt].
+    - 실측 재생(ON·OFF)은 라운드 10과 세그먼트별로 같다 [측정: …/out_round10b/on_pass2.json, off_summary.txt].
+  - 테스트(10b): test_dvl_pose 172(새 4, 강화 1), test_dvl_pose_worker 63.
+    - 라운드 10b 테스트 5개는 모두 라운드 10 코드에서 실패한다 [측정: …/out_round10b/evidence/new_tests_on_round10.txt].
+    - 10b 돌연변이 27개 가운데 동등 1개(R10M4)를 뺀 26개를 모두 잡는다. 첫 실행에서는 보류의 yaw 이동을 장부에 안 남기는 R10bM5가 살아남아,
+      yaw 장부 테스트를 더한 뒤 그 하나를 다시 돌렸다 [측정: …/out_round10b/evidence/mutants_round10b.txt].
+    - 전체 스위트(파일별, yaw 장부 테스트 추가 전): robust 2063 통과·5 실패, rovgui-pose 2069 통과·6 실패 — 실패는 이번 변경 전부터 있던
+      같은 목록이다.
+    - demo e2e 두 개 통과(`demo_e2e_dvl_pose.py`: TAG FIX OFF → ONCE… → OFF, 타이머 경고 0줄; `demo_e2e_dvl.py`: OK, exit 0, 알려진 경고 6줄). 마지막 파일(테스트 172개)은 두 환경 모두 dvl_pose 관련 4개 파일 273개 통과.
+
+
+## 2026-10-18 — RL_PWM 재학습 pwm12 → pwm13: 학습 안의 평활화, 실측 플랜트·dropout·payload DR, 오차 적분 관측(+ station 이식), station heave trim (실기 0런)
+
+* **왜:** att14(`pwm11att14R_s1`)는 실측 DR로 학습 cap 0.5의 지터를 없앴다 — 10-17 cap 0.5 hold 165 s 트립 0, roll/pitch 대역 RMS
+  1.04–1.10 deg/s [측정: data/20261017/1017_204524/mpc_204524.csv; data/20261017/1017_analysis_offline/verify_att14-cap025-vs-05/]. 남은 것:
+  (1) pitch −9.0°(기수 위) 정상오차 — P형 응답이 상수 외란(정지 trim, payload, 부력)을 남긴다 [측정: 같은 폴더 att14_cap_compare_v2/report.txt];
+  (2) 운용자 요청(2026-10-18): 학습 안의 평활화와 출력 파라미터화, payload DR / heave trim, 괜찮은 결과까지 학습·평가 반복;
+  (3) 10-17에 새로 잰 플랜트 — 정지에서 첫 운동까지 0.16–0.20 s [유도], 추력 이득 0.3 s 평균 0.49–0.63(모델 대비) [측정], roll/pitch ωn² 비 0.87
+  (sim 0.57) [측정], Lua override 해제 2.3–8.0/min [측정] (data/20261017/1017_analysis_offline/{verify_joystick-pulse-id/v4/report.txt,
+  hydrostatic_id_poletilt_v2/axis_summary.csv, verify_att14-cap025-vs-05/report.txt}).
+* **무엇(이론):** (a) 평활화를 보상 밖 손실로 — CAPS 공간 평활(관측을 조금 흔들어도 평균 행동이 같아야), 행동 변화 제곱 벌점, 탐색 노이즈 하한.
+  (b) 출력 파라미터화 wrench6 — 8 throttle 대신 6-D 렌치를 고정 할당 A로 보내 null-space(공동수축)를 구조적으로 없앤다. (c) 오차 적분 관측 —
+  위치·roll/pitch 오차의 누설 적분을 **관측**에 넣어 정책이 PI처럼 상수 외란을 지울 수 있게 한다(구조가 아니라 정보; 이득은 학습이 정한다).
+  (d) DR — 명령 지연·추력 이득·축별 회전관성·actuation dropout·payload(턱의 점하중). (e) station heave trim — 정책 밖 상수 FF.
+  ```
+  CAPS     L = L_PPO + λ_s · mean_b ‖μ(s_b) − μ(s_b + ε_b)‖²,   ε_b ~ N(0, (0.05 · std_batch(s))²),   λ_s = 0.5
+  rate²    r_t ← r_t − 0.05 · ‖a_t − a_{t−1}‖²     (0 → 0.05 over 2400 env steps);   σ_explore ≥ 0.075
+  wrench6  thr = t_max · A a,  a ∈ [−1, 1]⁶,  A = colnorm(pinv(B_thr→wrench));   cap: thr ← s·thr,  s = min(1, cap / max|thr|)
+  I-obs    e_p = clip(p_goal − p_obs, ±1 m)                                     (world z-up)
+           e_a = 2·sign(w)·(x, y) of q_est⁻¹ ⊗ q_des                            (1차)
+               = (wrap(φ_des − φ_est), θ_des − θ_est)   ZYX                     (2차: heading 무관)
+           I ← clip(I·(1 − dt/τ) + m ⊙ dt·e, ±I_max),   τ = 4 s,  I_max = (0.4 m·s, 0.8 rad·s)
+           m = 1  (1차);   m_i = [|e_i| < c_i],  c = (0.15 m, 0.3 rad)  (2차: 조건부 적분)
+           slots = [R(q_est)ᵀ I_p / 0.4,  I_a / 0.8]                            (frame 29 → 34)
+  payload  F_b = R(q)ᵀ (0, 0, −W),   τ_b = r_b × F_b,   W ∈ [0.5, 3] N,   r_b,x ∈ [0.45, 0.55] (pwm12) / [0.30, 0.60] (pwm13) m
+  trim     thr = s · (thr_π + B_v⁺ R(φ, θ)ᵀ (0, 0, F_up)),   prev_action = s · thr_π       (cap은 합계에, 정책엔 자기 몫만)
+  vel-fine r_t ← r_t + k_z · exp(−(Δv_z / 0.025)²) + k_xy · exp(−(‖Δv_xy‖ / 0.03)²),   Δv = v_goal − v     (2차)
+  ```
+* **어떻게:** RL_controller — `rov_rl/algorithms/caps_ppo.py`(rsl_rl 2.3.3 `PPO.update` 사본 + CAPS 줄; λ = 0이면 stock과 비트 동일),
+  `rov_rl/obs_integral.py` + `deploy/obs_builder.py`(numpy 쌍둥이), `rov_rl/plant_dr.py`(dropout·payload·축별 관성), `rov_rl/rewards.py`(att_mid·vel_fine),
+  `configs/dr_presets.yaml`(pwm12, pwm13), `scripts/_launch_pwm12.sh`·`_launch_pwm13.sh`, 판정 `scripts/pwm12_gate.py`(null/cost·full gate·pool gate
+  0.5/0.25·강건성·square; 임계값 전부 [가정]). station — `rov_gui/control/rl_pwm.py`(heave trim, `trim_and_cap`), `rov_gui/control/rl_policy.py`
+  (`StationErrorIntegrator`, `check_obs_integral`; 기존 export 비트 동일, RL ObsBuilder와 관측 차이 0). 결정과 이유: 변형 P/PI/WI × 시드 2로
+  적분과 출력 파라미터화의 효과를 분리; 새 기능은 전부 기본 OFF; station은 학습에 없는 HOLD·coast 동안 적분에 더하지 않고 누설만 한다;
+  2차는 1차 승자 계열(PI)만, 좁은 속도 항 세기 2단계 × 시드 3.
+* **리뷰:** 구현 wf_6fbcaea3-398(패키지 5개, 각 리뷰 + 수정), station 이식 wf_f9c26d63-9b3 + 후속 wf_92ccfd50-e79(safety-code-reviewer 포함
+  3렌즈, 돌연변이 검사, numpy 두 버전), peg payload wf_3c8c8b7b-d80(verifier 2).
+* **기록(경계):** RL 런 `pwm12{P,PI,WI}_s{0,1}`(2026-10-18 05:01), `pwm13{A,B}_s{0,1,2}`(09:48); export `obs_spec.json obs_integral`(2차는
+  `att_error`·`cond_*` 키). station meta `controller.obs_integral`, `controller.heave_trim`. 적분 상태와 trim 몫은 CSV에 없다.
+* **결과(1차, 시뮬):** 6개 중 전 항목 PASS 0 [측정: RL_controller/logs/eval/PWM12_SUMMARY.md, PWM12_GATE.md, PWM12_POOL.json]. 최선 `pwm12PI_s0`:
+  정상 pitch pool17 1.34°(att14R_s1 6.39°), trim11 1.63°, peg 0.53°; 정상 z hwlike 2.9 cm; square xy 0.86×; pool gate cap 0.5·0.25 PASS; 실패는
+  pegstep 최악 회복 8.0 s 하나. 그 "느린 회복"은 2–3 s에 끝난 회복 뒤 0.2 Hz z 출렁임이 3 cm 경계를 늦게 넘은 것이다 — 'peg' 세계 z RMS
+  적분 변형 0.81–1.15 cm vs 비적분 0.45–0.70 cm [유도: RL_controller/logs/r2dev_20261018/round1_wobble/wobble_and_recovery_out.txt]. wrench6(WI)은
+  두 시드 모두 비용 게이트(예측 전류·수직 노력·포화·부호 반전) 실패 — null-space를 없애도 렌치 공간 출력이 더 바빴다. peg 분석: 점하중 부호
+  (기수 아래) 확인, W 0.4–2.4 N 약구속 → pwm13 payload x 범위 확장. 2차(pwm13: 좁은 속도 항 + heading 무관 적분 + 조건부 적분, 시드 3) 진행 중.
+  한계: 실기 0런; 판정 임계값 [가정]; 적분 상태가 CSV에 없음; Lua dropout(10-17 4.7/min)은 학습 DR로만 덮었다.
+
+
+## 2026-10-19 — RL_PWM 재학습 3–5차: 수조 외란(해류·테더·후류), 편향력 제거, 시드 탐색 → 첫 전 항목 통과 `pwm16N_s3` (실기 0런)
+
+* **왜:** 2차까지의 최선(`pwm12PI_s0`)은 판정 1개(늦은 z 출렁임에 걸린 회복 지표)만 남았고, 운용자가 "잔잔한 수조 위주로, 가끔 해류"를
+  요청했다. 앞 항목의 두 가설(추력 곡선 계단, 속도 보상 부족)은 z 출렁임을 설명하지 못했다.
+* **무엇(이론):** (a) 수조 외란을 DR로 — 약한 해류(25 %), 테더(부착점에 작용, OU 변동 + tug), 후류·순환(OU 외력). (b) 모든 에피소드에
+  걸리던 무게중심 편향력을 빼서 실제로 잔잔한 에피소드를 만든다. (c) 시드 편차가 성능을 좌우하므로 같은 레시피로 시드를 늘린다.
+  ```
+  current  v_w = (V̄ + Ṽ(t)) [cos θ_c, sin θ_c, 0],  V̄ ~ U[0.02, 0.10] m/s,  Ṽ = Gauss-Markov (τ 20 s),  P(current) = 0.25
+  tether   F(t) = max(0, F0 + x(t)) + tug(t),   x: OU(σ = 0.5 F0, τ ∈ [3, 10] s),   F0 ~ U[0, 2] N,  P = 0.4
+           tug(t) = A sin²(π s / T)  (Poisson 0–2 /min, A ∈ [0.5, 3] N, T ∈ [0.5, 2] s)
+           f_w = F [cos el cos az, cos el sin az, sin el],   f_b = Rᵀ f_w,   τ_b = r_b × f_b,   r_b ≈ (−0.25…−0.15, ±0.03, 0…0.10) m
+  wash     f_w ← a f_w + σ √(1 − a²) ξ,  a = e^(−dt/τ),  σ ∈ [0, 0.4] N (z × 0.5),  τ ∈ [0.3, 1.5] s,  P = 0.4
+  pwm15    bias_force_n [0, 4] N → [0, 0]   (the tether model carries that role)
+  ```
+* **어떻게:** `RL_controller/rov_rl/plant_dr.py`(`TetherModel`, `TurbulenceModel`; 끄면 이전 모듈과 비트 동일 — `tests/test_pwm14_dist.py`),
+  `configs/dr_presets.yaml`(pwm14, pwm15), 평가 shift 키 `tether_*`/`turb_*`와 `scripts/_pipeline_eval_dist.sh`·`dist_report.py`(외란 세계는
+  보고용), `scripts/_pipeline_pwm13_seed.sh`(변형별 preset·재개 인자). 결정: 잔잔한 물 판정을 1순위로 유지; 범위는 측정이 없어 전부 [가정].
+* **리뷰:** pwm14 외란 코드 독립 검토 PASS(high/medium 0, low 7 — `RL_controller/logs/r2dev_20261018/review_pwm14/`).
+* **결과(시뮬):** 3차 `pwm14B_s0` — 해류 0.05 m/s 속 square 2.90 cm(PI_s0 6.14), z 출렁임은 1.30 cm로 커짐. 4차 `pwm15N_s0`(편향력 제거) —
+  처음으로 강건성 항목 전부 통과, 실패는 square z 3.6 cm 하나; 적분 시정수 2 s는 출렁임 증가, B_s0 이어 학습은 비용 게이트 실패. 5차(N × 시드
+  2–7) — **`pwm16N_s3`가 전 항목 PASS**: 정상 pitch 0.78–0.96°, square z 1.6 cm, pegdrop 최악 5.45 s, pool gate 0.5/0.25 PASS
+  [측정: RL_controller/logs/eval/PWM14_SUMMARY.md, PWM15_SUMMARY.md, PWM16_SUMMARY.md, *_DIST.md]. z 출렁임의 원인은 센서 잡음이 흔드는 약감쇠
+  heave 모드다 — 잡음을 끄면 후반 ez 표준편차가 PI_s0 0.70→0.20, B_s0 1.10→0.42 cm [측정: RL_controller/logs/r2dev_20261018/zwobble/quiet/quiet_summary.txt].
+  한계: 실기 0런; 시드 편차가 지배적(같은 레시피 실패 0–3개); 다음 레버는 더 깨끗한 수직 상태(Bar30·DVL w, station 변경 필요).
+
+
+## 2026-10-19 — `--dvl_pose` TRUST 모드: DVL을 장치가 보고하는 대로 믿는다 (`--dvl-trust`, 실기 0런)
+
+* **왜:** 첫 수조 시도(data/20261019/1019_211310)에서 DVL만으로 날아 보려 했는데, OFF까지 게이트가 96 s 걸렸고(DVL proving pass
+  21:11:45–21:12:07 "0/60 moving pairs" → "motion along one body axis only" → "not decided yet", 그 뒤 자이로 바이어스 "34/60 s … 57/60 s"),
+  OFF 뒤 체크포인트를 고르는 동안 기체가 바닥에 내려가(고도 0.10 → 0.04 m) DVL lock을 잃어 "a DVL gap of 4.9 s after the anchor (position
+  unknown — TAG FIX ON to re-anchor)"로 START가 거부됐고, ONCE로 재앵커한 뒤 들어간 런은 DvlAid의 `dis_fit`(DVL 2–4 cm/s vs 태그 ~1 cm/s)이
+  샘플을 막아 1.9 s에 끝났다 [측정: 같은 폴더 mission_log.txt, events.log, mpc_211336.csv]. 운용자 판단: "DVL 속도가 태그 유한차분보다
+  정확하고, 사람들은 DVL만으로 DR을 한다 — 조건이 과하다. 편하게 만들어라."
+* **무엇(이론):** 태그는 DVL의 심판이 아니라 앵커·보정·발산 정지에만 쓴다. DR의 유효성은 장치 자신의 게이트가 정한다.
+  ```
+  strict (2026-10-18 리뷰 1–10b):   usable = switch ∧ ¬latch ∧ data ∧ proven ∧ ¬flag ∧ ¬dis_*
+                                    OFF needs  anchor ∧ bias ok (60 s) ;  gap > lost_s after the anchor ⇒ HOLE ⇒ no START
+  trust (2026-10-19):               usable = switch ∧ data ∧ ¬flag          (data: lock, fom, altitude ≥ 0.05 m, jump, stale)
+                                    switch IN ← first sample (mount measured);  OFF needs  anchor only
+                                    gap ⇒ no hole: p resumes, unobserved_m = Σ (gap − hold_s) · max(|v_last|, v_floor)  recorded + warned
+                                    bias: b ← saved fit (age ≤ bias_seed_max_age_h) until this session's fit is ok
+  what still ends an engaged run:   no sample for lost_s;  |pose − tags| > abort_err (xy 25 cm, 10°) for abort_hold_s with tags in view;
+                                    |v_DVL| > max_dr_speed_m_s;  the heading rules (late gyro, gyro hole);  a re-acquisition > max_corr
+  ```
+* **어떻게:** `dvl_pose.trust_dvl`(YAML, 기본 false) ← `--dvl-trust` / `--dvl-strict`(명령줄이 이김). `rov_gui/control/dvl.py`
+  `DvlAid.trust_refusal / usable_trusted / set_use(trust) / arm_refusal(trust)`; `dvl_pose.py` TRUST MODE 문단, 구멍 대신 `_gap_warn`
+  (`GAP_WARN_S` 6 s)·`n_gaps_trusted`, `GyroHeading.seed_bias`(state `saved`), meta `trust_dvl / gaps_trusted / bias_seed`; `workers.py`
+  `_dvp_auto_in`(첫 샘플에 IN, disengaged·CSV 닫힘일 때만), `_dvp_save_bias`(ok 뒤 10 s마다 `data/dvl_pose_gyro_bias.json` 원자적 쓰기),
+  `_dvp_seed_bias`(12 h 안이면 시드), 시작 안내 줄에 TRUST/strict 절. 결정: 저장소 기본은 strict 그대로(검토된 게이트), trust는 명령줄로
+  켠다; 바이어스 저장은 두 모드 모두(strict에서는 시드가 `ok`가 아니라 OFF를 열지 않고 앵커 헤딩만 좋아진다).
+* **리뷰:** safety-code-reviewer 1회 — FAIL(HIGH 2, MEDIUM 5, LOW 5) → 전부 수정. HIGH: (1) 자동 IN이 운용자의 OUT을 다음 샘플에 되돌림 → 한 번만, OUT 유지;
+  (2) `unobserved_m`이 무한 — 25 cm를 넘으면 ONCE가 런을 끝내므로 사실상 출구 없음 → `max_corr_m`에서 `unobserved` 정지(engaged 종료 / START 거부, ONCE snap으로 해제).
+  MEDIUM: 태그 tick(blend, strict 판정)과 DR tick(trust)의 속도원이 갈림 → `DvlAid.trust`로 한 판정; 공백 경고 6 s 만료 → 재앵커까지 유지; strict에도 시드가 들어감 → trust만;
+  시드 파일에 헤딩 소스·한계 없음 → `heading` 기록 + 같은 소스·±0.5°/s·세션 fit 기준 이상만; 임시 파일 이름 충돌 → mkstemp. LOW: 문구(YAML 기본값·`saved` 상태·lost_s + debounce), 경고 덮어쓰기, 저장 주기 60 s.
+* **기록(경계):** meta `dvl_pose.trust_dvl`이 모드다. trust 런의 `dvp_src`/`dvl_code` 열에서 `dis_*` 코드는 **참고 정보**다(DR은 그 샘플을
+  썼다). `gaps_trusted`가 0이 아니면 공백 중 이동이 포즈에 없다(`dvp_unobs_m`). `bias_seed`가 있으면 그 세션의 헤딩 바이어스는 다른
+  세션의 fit이었다.
+* **결과:** 합성·워커 테스트만: test_dvl_pose +4(OFF 즉시, 공백 → 경고·START 허용, 시드), test_dvl_pose_worker +5(자동 IN, 명령줄 우선,
+  DvlAid 보류 중 DR 유지 vs strict HELD/LOST, 바이어스 저장·시드·만료, CLI 플래그), test_dvl +1. demo e2e는 strict·trust(`DVP_TRUST=1`)
+  둘 다 통과(아래 갱신). **실기 0런.** 한계: 틀린 DVL은 태그가 보일 때만 잡힌다; 공백 중 이동은 추정만; 바닥(고도 < 5 cm)에서는 어느
+  모드든 DR이 없다; 10-19의 `dis_fit`이 장치 오류였는지 DvlAid 저속 판정 오류였는지는 가리지 못했다(KNOWN_ISSUES).
+
+### 같은 날 저녁 — 속도 경로(`--dvl` 단독)로 확장: `dvl.trust` (실기 0런)
+* **왜:** 21:50 수조 로그(운용자 제공, 런 폴더 미확인)에서 `--dvl`(pose 없음)로 날던 중 `dvl: HELD (not latched) — DVL disagrees with the tag
+  velocity: alignment (bearing -50 deg: alignment -0.06, the tags see 0.11 of it)` → 1 s 뒤 `hold released (slow residual 0.4 cm/s)` → 3 s 뒤
+  `velocity fading to the tag finite difference (DVL has no bottom lock)`. 운용자: "DVL 속도가 태그보다 정확한데 태그와 다르다고 빼나 — 그
+  조건을 빼 달라." 위 trust 모드는 `--dvl_pose` control에서만 `DvlAid.trust`를 켰고, 속도 blend 단독 경로는 10-16의 hold·래치 그대로였다.
+* **무엇(이론):** 태그는 속도 경로에서도 DVL의 심판이 아니다. 샘플의 유효성은 장치 자신의 게이트와 품질 플래그가 정하고, 태그와의 비교
+  (느린 차이·정렬·적합 반박·에스컬레이션)는 계속 계산·기록되지만 아무것도 결정하지 않는다.
+  ```
+  strict (2026-10-16):  usable = switch ∧ ¬latch ∧ mount ∧ data ∧ proven ∧ ¬flag ∧ ¬dis_*     dis_* ⇒ w: 1 → 0 over 0.5 s (tag FD)
+                        escalation ≥ 4 s, or 3 episodes / 60 s ⇒ latch (DVL out until a proof + OUT/IN)
+  trust (dvl.trust):    usable = switch ∧ mount ∧ data ∧ ¬flag                                 (data: lock, fom, altitude, jump, stale)
+                        IN / arm ← mount ∧ data (no proving pass);  dis_* and the latch are recorded only (w stays 1; the next engage arms)
+  still acting:         data gates, R3 flags, the device-configuration latch (latch_acts)
+                        blend gross |v_dvl − LP(v_tag)| > 0.5 m/s is inert at 0.1 m/s ⇒ NO tag cross-check below 0.5 m/s
+  ```
+* **어떻게:** `rov_gui/control/dvl.py` DEFAULTS `trust`(기본 false, primary 전용 — legacy면 resolve 거부), `DvlAid.__init__`의
+  `self.trust = cfg["trust"]`(`--dvl_pose` control + trust_dvl은 전처럼 워커가 True로 올림), `resolve_with_opts`가 `--dvl-trust` /
+  `--dvl-strict`를 `dvl.trust`에도 적용, meta `dvl.trust`; `workers.py` `_dvl_arm_run`의 trust에 `d.trust` OR, 설정 줄 `TRUST (dvl.trust)`,
+  TRIPPED·"one more latches it" 문구에 "recorded only"; `__main__.py` 도움말; `hw_mpc.yaml dvl.trust: false`; `command.md`의 `--dvl` 줄에
+  `--dvl-trust`. 결정: 저장소 기본은 strict 그대로, 운용자 런은 명령줄 `--dvl-trust`(오전의 pose 결정과 같은 방식).
+* **기록(경계):** meta `dvl.trust`와 설정 로그 줄. trust 런의 CSV `dvl_code`에 `dis_*`가 없는 것은 판정이 꺼져서다 — 모니터 값은
+  `dvl_res_slow_m_s`·`dvl_esc_s`·meta `disagreement.hold_onsets`·`escalation.latches`에 그대로 남고, 래치 횟수는 "기록된 would-be 래치"다.
+* **결과:** 워커 테스트만: test_dvl +2(YAML·CLI·legacy 거부·proof 없는 IN; 2 s 반전 → hold 없음, 장치 점프 게이트·재획득 플래그가 2 tick만;
+  15 s 반전 → TRIPPED 줄 "recorded only"·패널 tripped 없음·런 유지·다음 engage arm), pose trust 11개 통과. **실기 0런.** 비용: 틀린 DVL
+  속도가 태그가 보여도 nu[0:2]에 들어간다; 21:50 사건이 장치 오류였는지 판정 오류였는지는 여전히 모른다(KNOWN_ISSUES).
+* **리뷰:** safety-code-reviewer 1회 → FAIL(CRITICAL 1 수용·HIGH 1·MEDIUM 4·LOW 2) → 수정: (HIGH) 장치 설정 변경 래치는 trust에서도
+  작동(`DvlAid.latch_acts`, `CONFIG_TRIP`); (MEDIUM) 기록만 하는 래치가 proof·모니터·느린 잔차를 버리지 않고 에스컬레이션 버킷만 재시작해
+  다음 래치도 기록(첫 래치 뒤 영구 동결 해소, rung_admit 거부 유지); YAML 혼합(dvl.trust true + trust_dvl false control)은 setup 거부,
+  역방향(trust_dvl true)은 blend가 trusted가 되는 자리에서 로그; 패널 IN USE 노트에 "latched, recorded only"; (CRITICAL, 수용) 설정 줄·
+  YAML·README가 "gross 0.5 m/s가 남는 보호"라 하던 것을 "0.5 m/s 미만 교차 검사 없음, 장착값이 유일한 방어"로 고침. 남김(LOW): EKF
+  경로는 기록된 래치도 존중(보수적), shadow pose도 trusted 판정(meta `trust`가 경계). 테스트 +3(설정 변경 래치, 혼합 거부, 역방향 로그).
+
+## 2026-10-19 — `--policy-dr` / `policy.allow_dr_pose`: DP를 DVL 추측항법 포즈 위에서 (설계 결정 A9의 스위치; **실기 0런**)
+
+* **동기(운용자):** `--dvl_pose --dvl-trust`로 diffusion policy를 돌리자 1.5 s 만에 `POLICY flew on a bridged/DR state for more than
+  1.5 s — a policy conditioned on an estimated pose is not this run's purpose; holding HERE`로 멈췄다. A9(2026-09-02)는 DR/HELD tick을
+  bridged로 쳐 플랜을 건너뛰고(`skip_bridge`) `policy.stale_s` 뒤 미션을 끝낸다. 운용자: "DVL의 dead reckoning만으로 diffusion
+  policy가 성공하는지 보려는 것" → A9를 끄는 스위치를 요구.
+* **설계:** YAML `policy.allow_dr_pose`(기본 **false** = A9 그대로) = CLI `--policy-dr`(플래그가 YAML을 이긴다, `--dvl-trust`와 같은 규칙;
+  `--policy`·`--mpc`·`--dvl_pose`(control) 없이는 `check_policy`가 거부). `--dvl_pose` control에서만 작동(`MpcWorker._policy_dr_pose`):
+  - `_policy_bridged`: DR/HELD tick은 bridged 아님. station 태그 dropout 사다리(tier ≠ none)와 `--imu-dr` control은 그대로 bridged.
+  - `_emit_policy_state`: **DR tick은 태그 유무와 무관하게** `fix_fresh = True`, `t_fix = tick 시각`, eta = 그 tick에 난 DVL 포즈
+    (`_flown_meas`) — 정책 워커(`backends/policy.py`)가 proprio 이력에 tick마다 한 행을 넣고 추론한다. HELD tick(DVL 샘플 0.45 s 없음,
+    포즈 동결 u_v = 0)은 행을 넣지 않는다(정지도 아님). 포즈가 없는 tick(LOST/FAULT/blind 재획득)은 전과 같이 앵커가 아니다.
+  - 기록: run record `dr_ticks`(앵커가 된 DR tick), `dr_plans`(intake에서 dr/held 포즈를 만난 플랜), `dr_installed`(그중 설치),
+    ARM 시점 `dr_pose_active` 핀; 플랜 줄 `dvp_state`; meta `policy.dr_pose{allowed, active, pinned, ticks, plans, installed,
+    blind_bound_s}`, `gates_enforced.bridge_stop_dr_pose`(A9 정지), `bridge_stop`(station 사다리 — control에서는 사다리가 안 돌아
+    false, `bridge_stop_via: dvl_pose`). ARM 줄에 `ON THE DVL POSE (--policy-dr) … blind bound …`.
+  - setup: YAML true인데 포즈가 control이 아니면(`--dvl_pose` 없음·shadow·강등) `INERT` 오류 줄; control인데 `dvl_pose.max_unaided_s`·
+    `max_blind_s`가 둘 다 null이면 "NO blind-flight bound" 경고.
+* **리뷰:** safety-code-reviewer 1회 → **FAIL**(HIGH 1·MEDIUM 5·LOW 3). HIGH: A9 정지를 빼면 **태그가 안 보이는 DR 비행에 시간 한계가
+  없다**(`max_unaided_s`/`max_blind_s` null — 2026-10-18 운용자 "blind limit 없음"); `div_max_m`·작업공간 박스는 흘러가는 좌표계 안의
+  판정이라 드리프트를 못 잡고(10-17 개루프 p90 > 10 cm/15–19 s [측정: data/20261017/1017_dvl_pose_feasibility/verify/out/
+  agg_curves_perm_drift.txt]), 남는 것은 `max_run_s` 500 s·포즈 자체의 fault(속도 0.30·lost 1.5 s·unobserved 0.25 m)·운용자 STOP.
+  → **운용자 결정(10-18)대로 강제하지 않고 수용**: setup 경고 + ARM 줄 + meta `blind_bound_s`; `max_blind_s` 한 줄이 한계다.
+  MEDIUM 5 → 전부 수정: (#2) 태그가 보이는 DR tick이 `t_capture` stamp 분기로 가 tagless tick(tick stamp)과 stamp 규칙이 갈리고
+  `dr_ticks`가 덜 세어졌다 → 포즈 상태를 먼저 본다; (#3) HELD = 동결 포즈를 "fresh anchor"라 불렀다 → 행 없음; (#4) `dr_plans`가
+  게이트 전 intake 카운트였다 → `dr_installed` 추가; (#5) control에서 `gates_enforced.bridge_stop: true`는 공허(사다리가 안 돈다) →
+  false + `bridge_stop_via`; (#6) YAML true가 조용히 무력할 수 있었다 → setup `INERT`. LOW: (#7) 거부는 CLI 플래그만 본다(YAML
+  `dvl_pose.mode: control`만으로는 `--policy-dr`가 거부; 문서화), (#8) ARM 핀 추가, (#9) observe에서는 그려지는 플랜이 흘러가는 좌표계
+  위에 있다고 ARM 줄에 적음.
+* **결과(전부 합성):** `test_dvl_pose_worker` +4(DR/HELD bridged 양쪽, 앵커 분기: 태그 없음·있음·HELD·포즈 없음·사다리, 미션 통째로
+  — 3 s blackout에서 knob off는 `bridge`로 끝나고 on은 이어지며 `dr_ticks ≥ 40`·`skip_bridge 0`, setup INERT/무한계 경고, CLI
+  거부 3종). 리뷰 수정 후 묶음(`test_dvl_pose_worker/test_dvl_pose/test_dvl/test_policy/test_attitude_axes`) 554 통과 +
+  `test_control`/`test_replay` 151 통과(여섯 파일을 한 번에 돌리면 자식 프로세스의 glibc `corrupted size` 뒤 pytest가 futex에 멈춘다 —
+  이 변경과 무관, 나눠 돌리면 전부 통과). e2e `rov_gui/tests/demo_e2e_dvl_pose_policy.py`(stub 정책, OFF → START → 5 s 태그
+  blackout → STOP), 리뷰 수정 후: **knob on PASS** — 291 dr tick 전부 DR, 그중 242 tick이 앵커(태그 유무 무관; 나머지는 START 전·HELD 없음),
+  플랜 23/23 설치(전부 `dvp_state dr`), skip_bridge 0, end_reason `stop`, setup에 "NO blind-flight bound" 경고; **`DVP_POLICY_DR=0` PASS** —
+  START 1.5 s 뒤 `bridge`로 종료, skip_bridge 3, 설치 0(운용자가 본 그 정지).
+  첫 시도는 32 s 비행에서 stub의 직진 청크가 작업공간 박스를 넘어 `escalated`로 끝났다(박스 가드가 살아 있음) → 비행 12 s로 조정.
+* **실기 절차:** `./c3 gui --source hw --allow-command --mpc --fstereo --policy --fstereo-scale 0.5 --fstereo-process --dvl_pose --dvl-trust --policy-dr`
+  → 태그 보며 ~1 s → HIGH Diffusion Policy·ckpt → **TAG FIX OFF** → START. 고도 0.2–0.5 m(bottom lock). **실기 0런.**

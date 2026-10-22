@@ -1956,7 +1956,7 @@ def test_with_no_dvl_the_worker_is_what_it_was_and_says_so():
             w.set_dvl_use(True)               # nothing to switch
             assert "no DVL" in w.reason
             m = w._run_meta()
-            assert m["dvl"]["enabled"] is False and m["schema_version"] == 22
+            assert m["dvl"]["enabled"] is False and m["schema_version"] == 24
             rows = _rows(w)
             assert rows and all(r["vel_src"] == "tag_fd" for r in rows)
             assert all(r["dvl_u"] == "nan" and r["dvl_ok"] == "0"
@@ -4012,9 +4012,11 @@ def test_the_csv_header_carries_the_velocity_and_dvl_columns_at_the_end():
     # pwm_guard (2026-10-10 b, test_rl_pwm_interlocks pins it), schema 21's three attitude-age columns
     # (2026-10-15, test_att_age pins them) and schema 22's seven DVL-selection columns (2026-10-16): still
     # append-at-end
-    assert cols[i + 15] == "est" and len(cols) == i + 15 + 16 + 3 + 1 + 3 + 7
-    assert cols[-7:] == ["w_dvl", "dvl_code", "dvl_res_fast_m_s", "dvl_res_slow_m_s", "dvl_esc_s",
-                         "dvl_align", "dvl_scale"]
+    # (and schema 23's twenty DVL-pose columns, 2026-10-18, test_dvl_pose_worker pins them;
+    # schema 24's sixteen state-noise columns, 2026-10-19, test_state_noise pins them)
+    assert cols[i + 15] == "est" and len(cols) == i + 15 + 16 + 3 + 1 + 3 + 7 + 20 + 16
+    assert cols[-7 - 20 - 16:-20 - 16] == ["w_dvl", "dvl_code", "dvl_res_fast_m_s", "dvl_res_slow_m_s", "dvl_esc_s",
+                                 "dvl_align", "dvl_scale"]
     assert cols.index("vel_src") == cols.index("rp_track") + 1
     assert len(cols) == len(set(cols))
 
@@ -4841,7 +4843,7 @@ def test_the_csv_and_meta_record_the_selection():
     with tempfile.TemporaryDirectory() as tmp:
         w, rows, meta, _logs, _st = _fly_n15(tmp)
         m_all = w._run_meta()
-    assert m_all["schema_version"] == 22
+    assert m_all["schema_version"] == 24
     for r in rows:
         for k in ("w_dvl", "dvl_res_fast_m_s", "dvl_res_slow_m_s",
                   "dvl_esc_s", "dvl_align", "dvl_scale"):
@@ -5717,3 +5719,173 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# ======================================================= trust mode (--dvl_pose)
+def test_trust_puts_the_switch_in_without_a_proof_and_ignores_the_holds():
+    """--dvl_pose trust mode (2026-10-19): IN needs the mount and data, not
+    the proof; the pose's sample verdict is the device's own word (data
+    gates, R3 flags) — not the latch, the proof, or a disagreement hold."""
+    d = DV.DvlAid(dict(MOUNT))                     # require_proven: true
+    assert d.set_use(True) == "no DVL data yet" and not d.use
+    assert d.set_use(True, trust=True) == "no DVL data yet" and not d.use
+    d.note_sample(_sample((0.10, 0.0, 0.0), t=100.0))
+    assert "not proven" in d.set_use(True) and not d.use
+    assert d.set_use(True, trust=True) == "" and d.use
+    ok, why, code = d.usable(100.01)
+    assert not ok and code == "unproven", (why, code)
+    ok, why, code = d.usable_trusted(100.01)
+    assert ok and code == "ok", (why, code)
+    assert d.arm_refusal(trust=True) == "" and "not proven" in d.arm_refusal()
+    # the device's own gates still speak
+    ok, why, code = d.usable_trusted(100.0 + 5.0)
+    assert not ok and code == "stale", (why, code)
+    d.note_sample(_sample((0.10, 0.0, 0.0), t=106.0, valid=False))
+    ok, why, code = d.usable_trusted(106.01)
+    assert not ok and code == "no_lock", (why, code)
+    # ...and the switch (a shadow pose asks without it)
+    d.use = False
+    d.note_sample(_sample((0.10, 0.0, 0.0), t=107.0))
+    assert d.usable_trusted(107.01)[2] == "out"
+    assert d.usable_trusted(107.01, require_in=False)[2] == "ok"
+
+
+# ================================= trust on the velocity path (--dvl alone)
+def _raises(fn, text):
+    try:
+        fn()
+    except ValueError as e:
+        assert text in str(e), str(e)
+    else:
+        raise AssertionError(f"no ValueError ({text!r})")
+
+
+def test_dvl_trust_is_a_yaml_key_the_cli_overrides():
+    """dvl.trust (2026-10-19, the operator's "the DVL velocity is more
+    accurate than the tag finite difference — drop that condition"): a
+    bool, shipped false, primary only; --dvl-trust / --dvl-strict override
+    the YAML for the velocity path as they do dvl_pose.trust_dvl; the aid
+    takes it from its config, and then IN, the engagement and the per-tick
+    verdict are the device's word (trust_refusal / usable_trusted)."""
+    from types import SimpleNamespace as NS
+    assert DV.DEFAULTS["trust"] is False
+    assert "trust" in DV.KEYS and "trust" not in DV.KEYS_20261016
+    assert DV.resolve({**MOUNT, "trust": True})["trust"] is True
+    _raises(lambda: DV.resolve({**MOUNT, "trust": 1}),
+            "dvl.trust must be true or false")
+    _raises(lambda: DV.resolve({**MOUNT, "trust": True,
+                                "selection": "legacy"}),
+            "dvl.trust needs dvl.selection 'primary'")
+    ro = DV.resolve_with_opts
+    assert ro({"trust": False}, NS(dvl=True, dvl_trust=True))["trust"] is True
+    assert ro({"trust": True}, NS(dvl=True, dvl_trust=False))["trust"] is False
+    assert ro({"trust": True}, NS(dvl=True, dvl_trust=None))["trust"] is True
+    assert ro({"trust": True}, NS(dvl=True))["trust"] is True
+    assert ro({}, NS(dvl=True))["trust"] is False
+    assert DV.DvlAid(dict(MOUNT)).trust is False
+    d = DV.DvlAid({**MOUNT, "trust": True})          # require_proven: true
+    assert d.trust and d.meta()["trust"] is True
+    assert d.set_use(True) == "no DVL data yet" and not d.use
+    d.note_sample(_sample((0.10, 0.0, 0.0), t=100.0))
+    assert d.set_use(True) == "" and d.use           # the mount and data
+    assert d.arm_refusal() == "" and not d.proven
+    ok, why, code = d.usable(100.01)
+    assert ok and code == "ok", (why, code)
+    ok, why, code = d.usable(100.0 + 5.0)            # the device's gates
+    assert not ok and code == "stale", (why, code)
+
+
+def test_trust_keeps_the_device_configuration_latch():
+    """(review 2026-10-19) Under trust the one latch that still acts is the
+    device's own configuration changing — its output is no longer what the
+    mount describes: usable() refuses, latch_acts() says so, and OUT then
+    IN (no proof) clears it."""
+    d = DV.DvlAid({**MOUNT, "trust": True}, dt=0.05)
+    d.note_sample(_sample((0.10, 0.0, 0.0), t=100.0))
+    assert d.set_use(True) == "" and d.use
+    assert d.note_device_config({"mounting_rotation_offset": 180,
+                                 "speed_of_sound": 1475}) == ""
+    assert d.usable(100.01)[2] == "ok" and not d.latch_acts()
+    what = d.note_device_config({"mounting_rotation_offset": 0,
+                                 "speed_of_sound": 1475})
+    assert "mounting_rotation_offset" in what
+    assert d.tripped.startswith(DV.CONFIG_TRIP) and d.latch_acts()
+    d.note_sample(_sample((0.10, 0.0, 0.0), t=100.1))
+    ok, why, code = d.usable(100.11)
+    assert not ok and code == "latched", (why, code)
+    assert d.usable_for_pose(100.11, require_in=False)[2] == "latched"
+    # the operator's OUT then IN clears it, with no proving pass. (The first
+    # report after the stream change is flagged "re-acquired" — the
+    # device's own word, kept under trust; the one after it flies.)
+    assert d.set_use(False) == "" and d.set_use(True) == ""
+    assert not d.tripped and not d.latch_acts()
+    assert d.usable(100.12)[2] == "flag_reacq"
+    d.note_sample(_sample((0.10, 0.0, 0.0), t=100.2))
+    assert d.usable(100.21)[2] == "ok"
+
+
+def test_trust_keeps_the_velocity_on_the_dvl_through_a_disagreement():
+    """dvl.trust on the velocity path. N16's reversed reading is no hold —
+    w stays 1, vel_src dvl, no HELD line; N17's lasting one latches nothing
+    the controller feels: the TRIPPED line says "recorded only", the state
+    never reads tripped, the run stays armed on the DVL, and the next
+    engagement arms again without a proof."""
+    with tempfile.TemporaryDirectory() as tmp:
+        TC, w, bus, _pilots, logs = _dvl_worker(tmp, trust=True,
+                                                reentry_s=0.0,
+                                                agree_window_s=8.0)
+        sim = _Sim(w, TC)
+        try:
+            assert w.dvl.trust
+            built = [m for _l, m in logs if m.startswith("dvl: built")]
+            assert built and "TRUST (dvl.trust)" in built[0], built
+            sim.step(tick=False)
+            w.set_dvl_use(True)                  # the mount and data: IN
+            assert w.dvl.use and not w.dvl.proven, w.reason
+            sim.engage()
+            assert w._dvl_run_ok, w._dvl_run_why
+            st = []
+            bus.mpc_status.connect(st.append)
+            for _ in range(20):
+                sim.step(v=(0.10, 0.0, 0.0))
+            assert st[-1].vel_src == "dvl" and st[-1].dvl_w == 1.0, \
+                (st[-1].vel_src, st[-1].dvl_w, st[-1].dvl_code)
+            n0 = len(st)
+            for _ in range(40):                  # N16: 2 s reversed
+                sim.step(v=(0.10, 0.0, 0.0), dvl_v=(-0.10, 0.0, 0.0))
+            # The flip itself is the device's own business: the jump gate
+            # and the "lock re-acquired" flag hold the last sample for a
+            # tick or two (w stays 1) — a data gate, not a disagreement.
+            codes = {s.dvl_code for s in st[n0:] if s.vel_src != "dvl"}
+            assert codes <= {"jump", "flag_reacq"}, codes
+            assert all(s.dvl_w == 1.0 for s in st[n0:])
+            assert all(s.vel_src == "dvl" for s in st[n0 + 10:]), \
+                [(s.vel_src, s.dvl_w, s.dvl_code) for s in st[n0 + 10:]
+                 if s.vel_src != "dvl"][:3]
+            assert not any(s.dvl_code.startswith("dis_") for s in st)
+            assert not any(m.startswith("dvl: HELD") for _l, m in logs)
+            for _ in range(300):                 # N17: 15 s reversed
+                sim.step(v=(0.10, 0.0, 0.0), dvl_v=(-0.10, 0.0, 0.0))
+            assert w.engaged and w._dvl_run_ok
+            assert st[-1].vel_src == "dvl" and st[-1].dvl_w == 1.0, \
+                (st[-1].vel_src, st[-1].dvl_w, st[-1].dvl_code)
+            assert all(s.dvl_state != "tripped" for s in st)
+            trip = [m for _l, m in logs if "TRIPPED" in m]
+            assert trip and all("recorded only" in m for m in trip), trip
+            assert w.dvl.tripped                 # recorded...
+            m = w._run_meta()["dvl"]
+            assert m["trust"] is True and m["armed_at_engage"] is True
+            # ...and recorded AGAIN: a recorded latch neither freezes the
+            # escalation nor empties the slow residual (review 2026-10-19)
+            assert m["trips"] >= 2, m["trips"]
+            assert w.dvl.residual_slow_m_s is not None
+            assert any(s.dvl_state == "in_use" and "recorded only" in
+                       (s.dvl_note or "") for s in st), \
+                [(s.dvl_state, s.dvl_note) for s in st[-3:]]
+            # ...and the next engagement still arms, without a proof
+            w.set_engaged(False)
+            assert not w.dvl.proven
+            sim.engage()
+            assert w._dvl_run_ok, w._dvl_run_why
+        finally:
+            sim.close()

@@ -1,0 +1,2 @@
+/home/bdml/miniforge3/envs/robust/bin/python: can't open file '/home/bdml/Desktop/umi_underwater_robust_control/r9_2_exposure.py': [Errno 2] No such file or directory
+rc=2

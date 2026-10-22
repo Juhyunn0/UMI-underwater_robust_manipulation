@@ -104,6 +104,13 @@ class StateAssembler:
         anchoring, not of the IMU."""
         return self._z_off
 
+    def keep_z_offset(self, z_off) -> None:
+        """Put back an offset reset() cleared: --dvl_pose control's START
+        without a fresh fix under z_source pressure keeps the frame it had,
+        instead of self-anchoring on the first fresh fix mid-run (no new
+        offset is taken on a stale fix — workers.set_engaged)."""
+        self._z_off = None if z_off is None else float(z_off)
+
     def calibrate_z_offset(self, fix, imu) -> bool:
         """Anchor pressure depth to the tag world once (call at engage, at
         rest). z_world = depth_pressure + z_off thereafter."""

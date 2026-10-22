@@ -181,6 +181,9 @@ VEL_DVL = "dvl"
 #: ``dvl.selection`` values (2026-10-16): the DVL-primary blend, or the
 #: 2026-10-01..15 ladder kept for a rollback.
 SELECTIONS = ("primary", "legacy")
+#: The one trip text trust still acts on (latch_acts): the device's own
+#: configuration — mounting rotation offset, speed of sound — changing.
+CONFIG_TRIP = "the device's configuration changed"
 
 DEFAULTS = {
     "enabled": False,
@@ -258,6 +261,23 @@ DEFAULTS = {
     "innov_max_m_s": 0.15,
     # ---- the agreement with the tag finite difference -----------------------
     "require_proven": True,
+    # 2026-10-19 TRUST on the velocity path (operator decision: "the DVL
+    # velocity is more accurate than the tag finite difference" — the
+    # --dvl_pose TRUST mode's premise, now a key of its own so --dvl alone
+    # can fly on it). DvlAid.trust: the DVL is believed as the device
+    # reports it — IN and the engagement need the mount and data
+    # (trust_refusal), no proving pass; the per-tick verdict is
+    # usable_trusted — the data gates and the R3 flags; NO disagreement
+    # hold (dis_diff / dis_align / dis_fit) takes a sample away, and the
+    # escalation's latch is recorded only (the TRIPPED line says so; the
+    # switch stays IN, the next engagement arms again). Still held back:
+    # the data gates, the quality flags, the blend's gross check. Primary
+    # only (resolve refuses it under legacy). --dvl-trust / --dvl-strict
+    # override it (resolve_with_opts), as they do dvl_pose.trust_dvl; a
+    # control pose under trust_dvl sets it too (the worker). HARDWARE-
+    # UNVERIFIED: a wrong DVL (mount, a false lock the device does not
+    # flag) flies into nu[0:2] with the tags in view.
+    "trust": False,
     # Synthetic prototype 2026-10-01 (NOT a measurement; tag noise 0.8 mm at
     # 15 Hz, DVL noise 3 mm/s): 8 s of 8-12 cm/s surge AND sway identifies the
     # 2x2 map to +-0.01 and the mount yaw to +-0.3 deg; surge-only or a
@@ -620,13 +640,18 @@ def resolve(raw: dict | None) -> dict:
             raise ValueError(f"unknown dvl keys {sorted(unknown)}; "
                              f"known: {sorted(KEYS)}")
         cfg.update(raw)
-    for k in ("enabled", "use", "require_proven", "flag_reacquired"):
+    for k in ("enabled", "use", "require_proven", "flag_reacquired",
+              "trust"):
         if not isinstance(cfg[k], bool):
             raise ValueError(f"dvl.{k} must be true or false, got {cfg[k]!r}")
     sel = cfg["selection"]
     if not isinstance(sel, str) or sel not in SELECTIONS:
         raise ValueError(f"dvl.selection must be 'primary' or 'legacy', "
                          f"got {sel!r}")
+    if cfg["trust"] and sel != "primary":
+        raise ValueError("dvl.trust needs dvl.selection 'primary' (legacy's "
+                         "gates are the 2026-10-01..15 ladder, which trust "
+                         "does not reach)")
     cfg["host"] = str(cfg["host"])
     port = cfg["port"]
     if isinstance(port, bool) or not isinstance(port, int) \
@@ -695,7 +720,10 @@ def resolve_with_opts(raw: dict | None, opts) -> dict:
     estimator side) and the backend's TCP client — so they cannot disagree
     about whether a DVL exists or where it is."""
     r = dict(raw or {})
-    if bool(getattr(opts, "dvl", False)):
+    # --dvl_pose (2026-10-18, control/dvl_pose.py) flies on the DVL, so it
+    # builds one — here, so the TCP client and the estimator agree on it.
+    if bool(getattr(opts, "dvl", False)) or str(
+            getattr(opts, "dvl_pose", None) or "off") in ("shadow", "control"):
         r["enabled"] = True
     host = getattr(opts, "dvl_host", None)
     if host:
@@ -703,6 +731,11 @@ def resolve_with_opts(raw: dict | None, opts) -> dict:
     port = getattr(opts, "dvl_port", None)
     if port:
         r["port"] = int(port)
+    # --dvl-trust / --dvl-strict (2026-10-19) win over the YAML — for the
+    # velocity path here, for the pose in the worker's dvl_pose config.
+    cli_trust = getattr(opts, "dvl_trust", None)
+    if cli_trust is not None:
+        r["trust"] = bool(cli_trust)
     return resolve(r)
 
 
@@ -1296,6 +1329,17 @@ class DvlAid:
                                self.cfg["agree_window_s"])
         self.proven = False
         self.proof: dict | None = None      # the fit that proved it
+        #: --dvl_pose TRUST mode (2026-10-19; set by the worker under
+        #: dvl_pose control + trust_dvl): ``usable`` answers
+        #: ``usable_trusted`` — the blend's u, v on a tag tick, the panel's
+        #: state and the CSV's dvl_code are then the verdict the pose flies
+        #: (safety review 2026-10-19: with the strict verdict here the
+        #: controller's velocity source flipped tag-FD <-> DVL at every
+        #: tag <-> dead-reckoning transition). The monitors, trips and the
+        #: proof still run and are recorded; they decide nothing.
+        #: 2026-10-19 (later): also the YAML key ``dvl.trust`` / --dvl-trust
+        #: (DEFAULTS), so --dvl alone flies on the device's word.
+        self.trust = bool(self.cfg["trust"])
         #: WHY the DVL was taken out on evidence ("" = not tripped). Latched
         #: until the operator sets the switch IN again.
         self.tripped = ""
@@ -1379,10 +1423,53 @@ class DvlAid:
         self.t_first: float | None = None
 
     # ------------------------------------------------------------ the switch
-    def refusal(self, on: bool) -> str:
-        """Why the operator may NOT set the switch this way ("" = may)."""
+    def trust_refusal(self) -> str:
+        """(--dvl_pose trust mode, 2026-10-19) What IN and an engagement
+        still need when the tag velocity is not the DVL's judge: a measured
+        mount and data. No proof, no `against`, no latch — the pose's own
+        divergence abort is the check (dvl_pose.py, TRUST MODE)."""
+        if not self.mount_measured:
+            return ("DVL mount not measured — set dvl.mount_rpy_deg and "
+                    "dvl.mount_t_flu in hw_mpc.yaml")
+        if self._s is None:
+            return "no DVL data yet"
+        return ""
+
+    def latch_acts(self) -> bool:
+        """Does the current latch take the DVL out? Always — except under
+        trust, where only the device's OWN configuration changing does
+        (its output frame or scale is no longer what the mount describes;
+        safety review 2026-10-19). A tag-velocity verdict (the escalation)
+        is recorded under trust, never acted on."""
+        return bool(self.tripped) and (not self.trust
+                                       or self.tripped.startswith(CONFIG_TRIP))
+
+    def usable_trusted(self, t_now: float, require_in: bool = True) -> tuple:
+        """(trust mode) :meth:`usable_for_pose` minus the latch, the proof
+        and the disagreement holds: the switch (when ``require_in``), the
+        mount, the data gates and the R3 flags — the device's own word.
+        (The device-configuration latch is the device's word too: it still
+        refuses — review 2026-10-19.)"""
+        if require_in and not self.use:
+            return False, "DVL is OUT (shadow)", "out"
+        if self.latch_acts():
+            return False, f"DVL latched OUT ({self.tripped})", "latched"
+        if not self.mount_measured:
+            return False, "DVL mount not measured", "no_mount"
+        ok, why = self.data_ok(t_now)
+        if not ok:
+            return False, why, reason_code(why)
+        if self._s_flag:
+            return False, self._s_flag, self._s_flag_code
+        return True, "", "ok"
+
+    def refusal(self, on: bool, trust: bool = False) -> str:
+        """Why the operator may NOT set the switch this way ("" = may).
+        ``trust``: the trust-mode question (trust_refusal) instead."""
         if not on:
             return ""
+        if trust or self.trust:
+            return self.trust_refusal()
         if not self.mount_measured:
             return ("DVL mount not measured — set dvl.mount_rpy_deg and "
                     "dvl.mount_t_flu in hw_mpc.yaml")
@@ -1407,12 +1494,14 @@ class DvlAid:
                     + (f["why"] or "fly a short pass with tags in view"))
         return ""
 
-    def set_use(self, on: bool) -> str:
+    def set_use(self, on: bool, trust: bool = False) -> str:
         """The operator's switch. Setting it IN is also the one thing that
         clears a trip — and only if ``refusal`` lets it through. (primary:
-        an IN that clears a latch also starts a new escalation bucket.)"""
+        an IN that clears a latch also starts a new escalation bucket.)
+        ``trust``: trust mode's IN (the worker's auto-IN and the button under
+        --dvl_pose trust) — trust_refusal is the gate."""
         was = bool(self.tripped)
-        why = self.refusal(bool(on))
+        why = self.refusal(bool(on), trust=trust)
         if not why:
             self.use = bool(on)
             if on:
@@ -1421,13 +1510,16 @@ class DvlAid:
                     self._esc_reset()
         return why
 
-    def arm_refusal(self) -> str:
+    def arm_refusal(self, trust: bool = False) -> str:
         """(primary) May THIS engagement fly on the DVL? ``refusal(True)``
         without its refuted-fit branch: a refutation current at engage is
         the per-tick ``dis_fit`` hold's business, which releases by itself —
         it no longer unarms the whole run (the shipped verdicts lasted up to
         ~52 s after an episode; REFUTE_HOLD_S). The switch IN, no code fault
-        and not latched are the worker's questions, as before."""
+        and not latched are the worker's questions, as before. ``trust``:
+        trust_refusal instead (no proof, no `against`)."""
+        if trust or self.trust:
+            return self.trust_refusal()
         if not self.mount_measured:
             return ("DVL mount not measured — set dvl.mount_rpy_deg and "
                     "dvl.mount_t_flu in hw_mpc.yaml")
@@ -1614,8 +1706,10 @@ class DvlAid:
     def _armed(self) -> bool:
         """Is there something for a trip to take out? A proof — also one
         re-made while a trip is still latched, or it could never be undone
-        again — or the switch IN with nothing latched yet."""
-        return bool(self.proven or (self.use and not self.tripped))
+        again — or the switch IN with nothing latched yet. (trust: a latch
+        that does not act does not un-arm either — the next lasting
+        disagreement is recorded too; review 2026-10-19.)"""
+        return bool(self.proven or (self.use and not self.latch_acts()))
 
     def _judge(self, t: float | None = None) -> None:
         """One evaluation of the fit after new evidence (the newest pair's
@@ -1687,11 +1781,21 @@ class DvlAid:
                     and self.agree.fit()["verdict"] == "refuted")
 
     def _trip(self, why: str) -> None:
-        """Evidence that the DVL is wrong. Latched (see the module doc)."""
+        """Evidence that the DVL is wrong. Latched (see the module doc).
+        (trust, review 2026-10-19: a latch that does not act — a tag-velocity
+        verdict — is RECORDED, tripped / against / n_trips / last_trip, so
+        the worker's TRIPPED line and the meta say it, but it throws nothing
+        away: the proof, the monitors' memory and the slow residual stay,
+        and only the escalation bucket starts again, so the next lasting
+        disagreement is recorded too instead of the escalation freezing
+        after the first.)"""
         self.tripped = str(why)
         self.against = str(why)
         self.n_trips += 1
         self.last_trip = str(why)
+        if self.trust and not self.latch_acts():
+            self._esc_reset()
+            return
         self._invalidate()
 
     def _invalidate(self, stream_changed: bool = False) -> None:
@@ -2042,7 +2146,9 @@ class DvlAid:
         phrase, then the numbers in parentheses); ``code`` is the CSV's
         dvl_code. No side effect but disagree_hold's sticky code, which is a
         function of the aid's state: asking twice in one tick answers the
-        same."""
+        same. (``trust``: usable_trusted.)"""
+        if self.trust:
+            return self.usable_trusted(t_now, require_in=True)
         if not self.use:
             return False, "DVL is OUT (shadow)", "out"
         if self.tripped:
@@ -2054,6 +2160,32 @@ class DvlAid:
             return False, why, reason_code(why)
         if (self.cfg["require_proven"] or self.against) and not self.proven:
             return False, "DVL not proven against the tag velocity", "unproven"
+        if self._s_flag:
+            return False, self._s_flag, self._s_flag_code
+        why, code = self.disagree_hold(t_now)
+        if why:
+            return False, why, code
+        return True, "", "ok"
+
+    def usable_for_pose(self, t_now: float, require_in: bool = True) -> tuple:
+        """(2026-10-18, control/dvl_pose.py) :meth:`usable` for the DVL
+        pose's dead reckoning, asked once per sample. ``require_in`` True is
+        exactly :meth:`usable` (a pose the controller flies on needs the
+        switch IN and the session's proof); False — a SHADOW pose, which is
+        a measurement — skips those two and nothing else: the latch, the
+        mount, the data gates, the R3 flags and the disagreement holds all
+        still apply."""
+        if require_in:
+            return self.usable(t_now)
+        if self.trust:
+            return self.usable_trusted(t_now, require_in=False)
+        if self.tripped:
+            return False, f"DVL latched OUT ({self.tripped})", "latched"
+        if not self.mount_measured:
+            return False, "DVL mount not measured", "no_mount"
+        ok, why = self.data_ok(t_now)
+        if not ok:
+            return False, why, reason_code(why)
         if self._s_flag:
             return False, self._s_flag, self._s_flag_code
         why, code = self.disagree_hold(t_now)
@@ -2431,7 +2563,9 @@ class DvlAid:
         if c["esc_scale_ratio"] > 0.0 and k is not None \
                 and k > c["esc_scale_ratio"]:
             ev.append("scale")
-        live = bool(self._armed() and not self.tripped)
+        # (trust: a recorded latch does not freeze the escalation — only an
+        # acting one does; review 2026-10-19)
+        live = bool(self._armed() and not self.latch_acts())
         n_rep, win = int(c["esc_repeat_n"]), float(c["esc_repeat_window_s"])
         if live:
             if ev:
@@ -2640,31 +2774,44 @@ class DvlAid:
         if s is None or float(t_now) - float(s.t_rx) > max(
                 2.0, self.cfg["stale_s"]):
             return ST_NO_LINK, "no reports"
-        if self.tripped:
+        if self.latch_acts():
             f = self.agree.fit()
             return ST_TRIPPED, (
                 self.tripped
                 + (f"; now: {f['why']}" if f["verdict"] == "refuted" else "")
-                + " — latched: fly a proving pass in surge AND sway with tags "
-                  "in view, then set the switch OUT then IN")
+                + (" — latched: the device's own output changed; set the "
+                   "switch OUT then IN (trust mode: no proving pass)"
+                   if self.trust else
+                   " — latched: fly a proving pass in surge AND sway with "
+                   "tags in view, then set the switch OUT then IN"))
         ok, data_why = self.data_ok(t_now)
         if not ok:
-            back = bool(self.use and self.mount_measured and not (
-                (self.cfg["require_proven"] or self.against)
-                and not self.proven))
+            back = bool(self.use and self.mount_measured and (
+                self.trust or not ((self.cfg["require_proven"] or self.against)
+                                   and not self.proven)))
             return ST_NO_LOCK, (f"{data_why} — returns by itself" if back
                                 else data_why)
         if used:
-            return ST_IN_USE, ("" if w is None or w >= 1.0 else
-                               f"fading in ({w * 100:.0f} % DVL)")
+            note = ("" if w is None or w >= 1.0 else
+                    f"fading in ({w * 100:.0f} % DVL)")
+            if self.trust and self.tripped:
+                # (recorded only — the panel is the persistent notice that
+                # a latched DVL is being flown; review 2026-10-19)
+                note += (("; " if note else "")
+                         + f"latched, recorded only: {self.tripped}")
+            return ST_IN_USE, note
         if not self.use:
             f = self.agree.fit()
             return ST_SHADOW, (
+                ("trust mode: IN needs no proof"
+                 + (f" — shown wrong earlier: {self.against}"
+                    if self.against else "")) if self.trust else
                 "proven" if self.proven else
                 (f["why"] or "not proven yet")
                 + (f" — shown wrong earlier: {self.against}"
                    if self.against and f["verdict"] != "refuted" else ""))
-        if (self.cfg["require_proven"] or self.against) and not self.proven:
+        if ((self.cfg["require_proven"] or self.against) and not self.proven
+                and not self.trust):
             return ST_UNPROVEN, (self.agree.fit()["why"] or "not proven yet")
         if code is None:
             _ok, why2, code = self.usable(t_now)
@@ -2700,6 +2847,9 @@ class DvlAid:
             # 2026-10-16 (DTF SPEC.md §6.2). RECORD BOUNDARY: never pool
             # velocity statistics across `selection`.
             "selection": self.selection,
+            # 2026-10-19: the device's word is the verdict (holds and the
+            # latch are recorded, not acted on). RECORD BOUNDARY too.
+            "trust": bool(self.trust),
             # not inside `gates`: a replay rebuilds a dvl: block from gates +
             # agreement_cfg, and resolve() refuses an unknown key
             "reentry_s_used": not primary,

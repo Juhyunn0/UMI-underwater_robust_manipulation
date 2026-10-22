@@ -619,6 +619,43 @@ class VehicleImu:
     # the session count (VehicleWorker._note_banner; see BANNER_PREFIX below).
     t_banner: float | None = None
     n_banners: int = 0
+    # 2026-10-18 (--dvl_pose heading, control/dvl_pose.py): the RAW_IMU gyro,
+    # integrated by the vehicle reader on EVERY record (not this 20 Hz
+    # snapshot): the cumulative trapezoid integral of (xgyro, ygyro, zgyro)
+    # in rad, body FRD, over the records' own time_usec intervals, since the
+    # reader started. A consumer differences two snapshots to get the body
+    # rotation in between. RAW_IMU because ATTITUDE's rates carry EKF3's
+    # gyro-bias estimate, which this vehicle learns from a distorted compass
+    # (EK3_SRC1_YAW 1): 60 s heading error p95 6.94 deg integrating ATTITUDE
+    # rates vs 1.20 deg for RAW_IMU with a session bias [측정: data/20261017/
+    # 1017_dvl_pose_feasibility/sources/heading_lens/out/s5_horizon_rawgyro.txt].
+    # None until two RAW_IMU records have been integrated. `t_gyro` = host
+    # arrival time of the newest record in the integral; `n_gyro` = records
+    # integrated; `n_gyro_gaps` = intervals NOT integrated (time_usec step
+    # <= 0 or > 0.5 s — a reboot, a dropped stream); `gyro_raw` = the newest
+    # record's rates, rad/s.
+    gyro_int: tuple | None = None
+    t_gyro: float | None = None
+    # ...that record's own sample moment on the host clock (time_usec through
+    # the ATTITUDE clock map), or None when it cannot be placed — the heading
+    # history prefers it to the arrival time (2026-10-18)
+    t_gyro_v: float | None = None
+    n_gyro: int = 0
+    n_gyro_gaps: int = 0
+    gyro_raw: tuple | None = None
+    # ...and the Bar30 itself: SCALED_PRESSURE2.press_abs as a depth, m,
+    # positive down, (p - 1013.25 hPa) / (rho g), NOT clamped at 0, with that
+    # record's own host arrival time. `depth_m` above is GLOBAL_POSITION_INT
+    # relative_alt — 3 Hz, zero-order held, stamped by SCALED_PRESSURE2's
+    # arrival [측정: data/20261017/1017_dvl_pose_feasibility/sources/
+    # heading_lens/out/s3_rates_depth.txt (a)-(d)] — kept as it is for its
+    # consumers; the DVL pose's z wants the 10 Hz sensor with its own stamp.
+    depth_sp2_m: float | None = None
+    t_sp2: float | None = None
+    # ...that record's own sample moment (time_boot_ms through the ATTITUDE
+    # clock map), or None: the DVL pose differences the depth on it
+    # (2026-10-18)
+    t_sp2_v: float | None = None
     conn: Conn = Conn.OFFLINE
     stamp: float = field(default_factory=now)
 
@@ -916,6 +953,51 @@ class MpcStatus:
     ekf_sig_m: float | None = None
     ekf_tag_late_s: float | None = None
     p_ekf_flu: tuple | None = None
+    # ---- DVL POSE (--dvl_pose, control/dvl_pose.py, 2026-10-18;
+    # HARDWARE-UNVERIFIED) -------------------------------------------------
+    # The DVL dead-reckoned pose with AprilTag fixes as optional corrections.
+    # `dvp_mode` "" = not built (every run before this date); "shadow" = the
+    # controller flies on the tag state and this pose is drawn and recorded
+    # beside it; "control" = the controller AND the interlocks fly on this
+    # pose. `dvp_tag_on` is the TAG FIX switch as the WORKER holds it (the
+    # panel button reflects this and nothing else). `dvp_state`: no_anchor |
+    # tag (the tag state, as without --dvl_pose) | blend (the tag state plus
+    # a correction still being slewed in) | dr (DVL dead reckoning) | held
+    # (dead reckoning with no usable DVL for longer than the hold — position
+    # held) | lost | fault. `p_dvp_flu` / `yaw_dvp_flu_deg` = this pose in the
+    # p_flu convention (datum frame while engaged); p_flu itself stays the
+    # TAG solution, so the plot's hull and the CSV's px/py remain ground
+    # truth (the imu_dr / EKF rule). `dvp_err_m` / `dvp_err_yaw_deg` = this
+    # pose minus a FRESH tag state (None without one); `dvp_since_fix_s` /
+    # `dvp_dist_m` = time and horizontal distance since the last tag
+    # correction; `dvp_corr_m` = the part of a re-correction still being
+    # slewed in; `dvp_bias_dps` = the RAW_IMU yaw-rate bias in use, deg/s,
+    # `dvp_bias_state` "" | none | learning | saved | ok. `dvp_oneshot` = TAG FIX was
+    # pressed while OFF: ON until one correction is in, then OFF again by
+    # itself (2026-10-18).
+    dvp_mode: str = ""
+    dvp_tag_on: bool = True
+    dvp_oneshot: bool = False
+    dvp_state: str = ""
+    dvp_ok: bool = False
+    dvp_note: str = ""
+    p_dvp_flu: tuple | None = None
+    yaw_dvp_flu_deg: float | None = None
+    dvp_err_m: float | None = None
+    dvp_err_yaw_deg: float | None = None
+    dvp_since_fix_s: float | None = None
+    dvp_dist_m: float | None = None
+    dvp_corr_m: float | None = None
+    dvp_bias_dps: float | None = None
+    dvp_bias_state: str = ""
+    # ---- STATE NOISE (--state-noise, control/state_noise.py, 2026-10-19;
+    # HARDWARE-UNVERIFIED) ----------------------------------------------------
+    # `sn_state` "" = not built (the NOISE button stays hidden), "off" | "on"
+    # = the NOISE switch as the WORKER holds it; `sn_desc` = its sigmas;
+    # `sn_policy` = the DP policy sees the same draw (--state-noise-policy).
+    sn_state: str = ""
+    sn_desc: str = ""
+    sn_policy: bool = False
     # ---- MPC_Tuned PROFILE (control/mpc_tune.py, 2026-10-04) ---------------
     # What the worker HOLDS — the panel's tune row reflects these and nothing
     # else (honesty rule). `mpc_tune` "" = no profile (mpc_tuned flies

@@ -95,6 +95,14 @@ TRAIL_MAX = 4800          # hard cap on stored points (memory bound)
 #: The robot_localization EKF overlay (2026-10-02): teal, a colour no other
 #: series here uses (blue reference, viridis truth, amber DR, accent object).
 EKF_COLOR = "#2bb5a8"
+#: The --dvl_pose ghost (2026-10-18, control/dvl_pose.py): violet, a hue no
+#: other series here uses — HSV hue 270 against the reference's 213, the
+#: EKF's 174, the hull's 142 and the DR's 38 [유도: colorsys on the hex
+#: constants]. The viridis ramp's OLD end is a purple too, but near-black
+#: (#440154) and faded to a quarter alpha, so lightness tells the two apart;
+#: 7.95:1 on VIDEO_BG [유도: WCAG formula], so the readout row drawn in it
+#: reads like the others.
+DVP_COLOR = "#c084fc"
 #: How far back the trails go. 3 s, not the 90 s this shipped with
 #: (operator, 2026-09-03): at 90 s the vehicle's own history filled the plot
 #: and buried the thing the panel is currently FOR — the policy's proposal,
@@ -223,6 +231,15 @@ class TrajectoryView(QtWidgets.QWidget):
         # tag truth like the DR ghost.
         self.trail_ekf: deque = deque(maxlen=TRAIL_MAX)
         self.p_ekf = None
+        # The DVL dead-reckoned POSE (--dvl_pose, 2026-10-18, MpcStatus
+        # p_dvp_flu): a dotted violet trail and a ghost hull, built exactly
+        # like the imu_dr ghost and subordinate to the tag truth the same
+        # way. In CONTROL mode it is the state the vehicle is flown on, so
+        # unlike the DR overlay it has no button that could hide it: drawn
+        # whenever the worker reports one.
+        self.trail_dvp: deque = deque(maxlen=TRAIL_MAX)
+        self.p_dvp = None
+        self.yaw_dvp = None
         # ON whenever a dead reckoner is reporting. Running with --imu-dr IS
         # the request to see the estimate — the experiment is the two markers
         # side by side, and an overlay the operator has to discover and switch
@@ -400,7 +417,7 @@ class TrajectoryView(QtWidgets.QWidget):
     def _prune_trails(self) -> None:
         cut = time.monotonic() - TRAIL_AGE_S
         for trail in (self.trail_act, self.trail_ref, self.trail_dr,
-                      self.trail_obj, self.trail_ekf):
+                      self.trail_obj, self.trail_ekf, self.trail_dvp):
             while trail and trail[0][0] < cut:
                 trail.popleft()
 
@@ -457,6 +474,24 @@ class TrajectoryView(QtWidgets.QWidget):
             out.append(f"{label}  {r:4.2f}x  (+/-{spread:4.2f}){age}"
                        + ("  <- depth NOT metric" if bad else ""))
         return out
+
+    def _readout_dvp_line(self) -> str:
+        """The DVL-pose-vs-tag row, as drawn ("" = no row). One place, so a
+        test can call it.
+
+        |DVL pose - FRESH tag state| from MpcStatus.dvp_err_m — the worker's
+        number, never a distance measured between the two markers here (the
+        module rule: this window computes nothing). Only while BOTH markers
+        are on the plot: the worker leaves dvp_err_m None on a tick without a
+        fresh tag, and a number printed beside a hull that is not drawn would
+        be a comparison the picture cannot back."""
+        s = self.status
+        if s is None or self.p_dvp is None or not self._act_fresh():
+            return ""
+        err = getattr(s, "dvp_err_m", None)
+        if err is None:
+            return ""
+        return f"DVL-tag {float(err) * 100:.1f} cm"
 
     def set_object(self, fx: ObjectFix) -> None:
         """One object fix. STORE AND DRAW, nothing else.
@@ -627,6 +662,25 @@ class TrajectoryView(QtWidgets.QWidget):
             self.p_ekf = (ex, ey, ez)
         else:
             self.p_ekf = None
+        # The DVL pose, spelled EXACTLY like p_dr_flu above — same mirror,
+        # same datum, engaged or not (p_dvp_flu is in the p_flu convention,
+        # the datum frame only while engaged, like p_dr_flu) — because the
+        # gap between it and the hull is what the TAG FIX switch is judged
+        # on. dvp_ok False or no pose: no marker (the DR ghost's honesty
+        # rule — a dead reckoning that has stopped must not sit there
+        # looking like one that is tracking perfectly).
+        pv = getattr(s, "p_dvp_flu", None)
+        if pv is not None and getattr(s, "dvp_ok", False):
+            vx, vy = self._to_map(pv[0], -pv[1])
+            vz = self._to_map_z(-float(pv[2]))
+            self._trail_push(self.trail_dvp, vx, vy, 1e-3, vz)
+            self.p_dvp = (vx, vy, vz)
+            yv = getattr(s, "yaw_dvp_flu_deg", None)
+            if yv is not None:
+                self.yaw_dvp = (-math.radians(yv)
+                                + (self.datum[3] if self.datum else 0.0))
+        else:
+            self.p_dvp = None
         self.observe = bool(getattr(s, "observe", False))
         if s.ref_flu is not None:
             # FLU -> NED mirror for display (the map frame the pool is
@@ -727,6 +781,7 @@ class TrajectoryView(QtWidgets.QWidget):
         self.trail_ref.clear()
         self.trail_dr.clear()
         self.trail_ekf.clear()
+        self.trail_dvp.clear()
         self.trail_obj.clear()
         self.policy_plans.clear()
         # The gauge's window is a per-run latch, so a cleared plot gets a
@@ -805,6 +860,42 @@ class TrajectoryView(QtWidgets.QWidget):
         ca, sa = math.cos(yaw), math.sin(yaw)
         return [(p_ned[0] + ca * dx - sa * dy, p_ned[1] + sa * dx + ca * dy)
                 for dx, dy in ((hl, -hw), (hl, hw), (-hl, hw), (-hl, -hw))]
+
+    def _draw_ghost(self, painter, p_ned, yaw: float, base: str) -> None:
+        """An ESTIMATE of the vehicle: the truth marker's body as an outline
+        (dashed in ``base``, no nose, no heading line, no ray) and a small
+        centre dot. Moved out of paintEvent when the --dvl_pose ghost joined
+        the imu_dr one (2026-10-18), so the two estimates are the same
+        drawing in two colours — the rule `_hull` states, one level up. The
+        DR ghost's pixels are unchanged by the move.
+
+        Below a 10 px hull only the dot is drawn: at that zoom two
+        overlapping outlines are noise, and the readout still carries the
+        number."""
+        hull_px = abs(self._px(0.0, 0.0).x()
+                      - self._px(0.0, self.rov_size_m[1]).x())
+        z = float(p_ned[2])
+        if hull_px >= 10.0:
+            # The SAME body as the truth marker, outline only — the
+            # operator is judging the distance between the two, and two
+            # differently drawn vehicles would make that judgement about
+            # the drawing (the rule `_hull`'s docstring already states).
+            ghost = self._draw_rov(painter, (p_ned[0], p_ned[1], z), yaw,
+                                   base, ghost=True)
+            if not (ghost and self.three_d):
+                hull = self._hull(p_ned, yaw)
+                path = QtGui.QPainterPath()
+                path.moveTo(self._px(hull[0][0], hull[0][1], z))
+                for pt in hull[1:]:
+                    path.lineTo(self._px(pt[0], pt[1], z))
+                path.closeSubpath()
+                painter.setPen(QtGui.QPen(_c(base, 200), 1,
+                                          Qt.PenStyle.DashLine))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawPath(path)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(_c(base, 200))
+        painter.drawEllipse(self._px(p_ned[0], p_ned[1], z), 3, 3)
 
     # ---------------------------------------------------------- projection
     def _fit(self) -> tuple[float, float, float]:
@@ -1180,6 +1271,8 @@ class TrajectoryView(QtWidgets.QWidget):
             zs.append(float(self.p_ref[2]))
         if self.p_dr is not None and self._dr_visible():
             zs.append(float(self.p_dr[2]))
+        if self.p_dvp is not None:          # drawn whenever present
+            zs.append(float(self.p_dvp[2]))
         o = self.obj
         if o is not None and o.p_map is not None and getattr(o, "state", "") != "cold":
             zs.append(float(o.p_map[2]))
@@ -1623,6 +1716,13 @@ class TrajectoryView(QtWidgets.QWidget):
             for run in self._clip_runs(self.trail_ekf, xw0, xw1, yw0, yw1):
                 poly(run, QtGui.QPen(_c(EKF_COLOR, 170), 1,
                                      Qt.PenStyle.DotLine))
+        # The DVL pose's trail: dotted violet, under the truth too, and
+        # CLIPPED like the DR's — with TAG FIX OFF nothing pulls a drifting
+        # dead reckoning back, so it can leave the plot the same way.
+        if len(self.trail_dvp) >= 2:
+            for run in self._clip_runs(self.trail_dvp, xw0, xw1, yw0, yw1):
+                poly(run, QtGui.QPen(_c(DVP_COLOR, 170), 1,
+                                     Qt.PenStyle.DotLine))
         # The object's own track: a plain 1 px solid line. Deliberately NOT a
         # second viridis ramp — one age ramp per plot is enough, and a second
         # would make the two impossible to tell apart at a glance.
@@ -1655,6 +1755,17 @@ class TrajectoryView(QtWidgets.QWidget):
             p.setPen(QtGui.QPen(_c("#4d9dff"), 2))
             p.drawLine(q + QtCore.QPointF(-6, 0), q + QtCore.QPointF(6, 0))
             p.drawLine(q + QtCore.QPointF(0, -6), q + QtCore.QPointF(0, 6))
+
+        # Where the DVL dead reckoning puts the vehicle (--dvl_pose): the DR
+        # ghost's outline, in violet, its own heading when it has one (the
+        # RAW_IMU gyro integral), else the tag heading. Painted BEFORE the
+        # truth hull (review 2026-10-18): with TAG FIX ON the pose IS the tag
+        # state, the two coincide on every tick, and painted after it the
+        # ghost recoloured the green truth marker violet.
+        if self.p_dvp is not None:
+            yv = (self.yaw_dvp if self.yaw_dvp is not None
+                  else (self.yaw_ned or 0.0))
+            self._draw_ghost(p, self.p_dvp, float(yv), DVP_COLOR)
 
         # The vehicle: its actual FOOTPRINT, oriented by heading, with a dot
         # at the centre so it stays findable when zoomed out. NED yaw 0 = +x
@@ -1710,36 +1821,13 @@ class TrajectoryView(QtWidgets.QWidget):
             p.drawEllipse(q, 3, 3)
 
         # Where the IMU alone thinks the vehicle is: the same hull, outline
-        # only, no nose and no centre dot, so it reads as subordinate to the
-        # solid green truth. Suppressed when the hull is only a few pixels
-        # across — at that zoom two overlapping outlines are noise, and the
-        # numeric readout below still carries the answer.
+        # only, no nose and no heading line, so it reads as subordinate to
+        # the solid green truth (`_draw_ghost`, which also drops the outline
+        # when the hull is only a few pixels across).
         if self.p_dr is not None and self._dr_visible():
-            hull_px = abs(self._px(0.0, 0.0).x()
-                          - self._px(0.0, self.rov_size_m[1]).x())
-            zd = float(self.p_dr[2])
-            if hull_px >= 10.0:
-                yd = float(self.yaw_dr or self.yaw_ned or 0.0)
-                # The SAME body as the truth marker, outline only — the
-                # operator is judging the distance between the two, and two
-                # differently drawn vehicles would make that judgement about
-                # the drawing (the rule `_hull`'s docstring already states).
-                ghost = self._draw_rov(p, (self.p_dr[0], self.p_dr[1], zd),
-                                       yd, theme.WARN, ghost=True)
-                if not (ghost and self.three_d):
-                    hull = self._hull(self.p_dr, yd)
-                    path = QtGui.QPainterPath()
-                    path.moveTo(self._px(hull[0][0], hull[0][1], zd))
-                    for pt in hull[1:]:
-                        path.lineTo(self._px(pt[0], pt[1], zd))
-                    path.closeSubpath()
-                    p.setPen(QtGui.QPen(_c(theme.WARN, 200), 1,
-                                        Qt.PenStyle.DashLine))
-                    p.setBrush(Qt.BrushStyle.NoBrush)
-                    p.drawPath(path)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(_c(theme.WARN, 200))
-            p.drawEllipse(self._px(self.p_dr[0], self.p_dr[1], zd), 3, 3)
+            self._draw_ghost(p, self.p_dr,
+                             float(self.yaw_dr or self.yaw_ned or 0.0),
+                             theme.WARN)
         if self.p_ekf is not None:
             # A RING, not a hull: the EKF is a comparison overlay, and a
             # second ghost vehicle beside the DR's would be one too many.
@@ -2053,6 +2141,11 @@ class TrajectoryView(QtWidgets.QWidget):
             else:
                 why = (s.dr_note or "waiting").split(";")[0]
                 lines.append(f"DR --  {tag} {why[:34]}")
+        # ...and the DVL pose's (--dvl_pose): how far it sits from the tag
+        # state, the number the TAG FIX switch is judged on.
+        dvp_line = self._readout_dvp_line()
+        if dvp_line:
+            lines.append(dvp_line)
         # LIVE DEPTH, always — operator request 2026-09-03. Every other z on
         # this panel is conditional: the chip's `_hold_z_text` needs a
         # REFERENCE, and the 3-D ruler needs 3-D. But "how deep am I right
@@ -2078,6 +2171,8 @@ class TrajectoryView(QtWidgets.QWidget):
                 p.setPen(_c(theme.WARN))
             elif ln.startswith("DR "):
                 p.setPen(_c(theme.WARN, 230))
+            elif ln.startswith("DVL-tag"):
+                p.setPen(_c(DVP_COLOR, 230))      # its series' colour
             elif ln.startswith("follow lost") or ln.startswith("obj lost"):
                 p.setPen(_c(theme.FAIL))
             elif (ln.startswith("follow ") or ln.startswith("obj ")) and \
@@ -2110,18 +2205,7 @@ class TrajectoryView(QtWidgets.QWidget):
         # Two more swatches to the LEFT of the ramp, laid out right-to-left for
         # the same reason the ramp is: nothing may fall off a narrow widget.
         # Only drawn when there IS a second series to disambiguate.
-        swatches = []
-        if self.policy_plans:
-            # The one series whose colour is deliberately close to the trail
-            # ramp's "now" end, so it is the one that most needs naming.
-            swatches.append(("DP", QtGui.QPen(_c(POLICY_PLAN_COLOR, 230), 2,
-                                              Qt.PenStyle.DashLine)))
-        if (self.p_dr is not None or self.trail_dr) and self._dr_visible():
-            swatches += [("DR", QtGui.QPen(_c(theme.WARN, 200), 2,
-                                           Qt.PenStyle.DashLine)),
-                         ("tag", QtGui.QPen(_c(theme.OK, 220), 2))]
-        if self.obj is not None and self.obj.p_map is not None:
-            swatches.append(("obj", QtGui.QPen(_c(theme.ACCENT, 200), 2)))
+        swatches = self._legend_swatches()
         if swatches:
             x = bx - 4 - fm.horizontalAdvance(old_lbl) - 10
             for lbl, pen in swatches:
@@ -2133,6 +2217,32 @@ class TrajectoryView(QtWidgets.QWidget):
                 p.setPen(pen)
                 p.drawLine(x + 1, by + bar_h - 2, x + 11, by + bar_h - 2)
                 x -= 8
+
+    def _legend_swatches(self) -> list:
+        """The legend's (label, pen) pairs, nearest-the-ramp first. Its own
+        method since the --dvl_pose ghost joined (2026-10-18), so a test can
+        read what the legend names; paintEvent draws exactly this list."""
+        swatches = []
+        if self.policy_plans:
+            # The one series whose colour is deliberately close to the trail
+            # ramp's "now" end, so it is the one that most needs naming.
+            swatches.append(("DP", QtGui.QPen(_c(POLICY_PLAN_COLOR, 230), 2,
+                                              Qt.PenStyle.DashLine)))
+        dr = (self.p_dr is not None or self.trail_dr) and self._dr_visible()
+        if dr:
+            swatches.append(("DR", QtGui.QPen(_c(theme.WARN, 200), 2,
+                                              Qt.PenStyle.DashLine)))
+        dvp = self.p_dvp is not None or bool(self.trail_dvp)
+        if dvp:
+            swatches.append(("DVL", QtGui.QPen(_c(DVP_COLOR, 200), 2,
+                                               Qt.PenStyle.DotLine)))
+        # "tag" names the green hull whenever a ghost stands beside it —
+        # once, after the estimates (the DR-only legend is unchanged).
+        if dr or dvp:
+            swatches.append(("tag", QtGui.QPen(_c(theme.OK, 220), 2)))
+        if self.obj is not None and self.obj.p_map is not None:
+            swatches.append(("obj", QtGui.QPen(_c(theme.ACCENT, 200), 2)))
+        return swatches
 
 
 class ElidingLabel(QtWidgets.QLabel):
@@ -2263,6 +2373,21 @@ class TrajectoryWindow(QtWidgets.QWidget):
     # the state assembler's. Same request/re-sync rule as the DVL button
     # (2026-10-02).
     estimator_requested = Signal(str)
+    # The TAG FIX button -> bus.cmd_dvl_pose_tag -> MpcWorker.set_dvl_pose_tag
+    # (--dvl_pose, 2026-10-18): True = AprilTag fixes set / correct the DVL
+    # pose, False = DVL-only dead reckoning. Same request/re-sync rule as the
+    # DVL button — the face is MpcStatus.dvp_tag_on — but the one switch on
+    # the row the worker accepts WHILE ENGAGED (it refuses OFF until the dead
+    # reckoning can carry the vehicle). Pressed while OFF it is ONE correction
+    # ("TAG FIX ONCE…", then OFF again by itself — 2026-10-18). Not the
+    # per-feed TAG overlay toggle
+    # (bus.cmd_tag_enable), which switches tag DETECTION on a video panel.
+    dvl_pose_tag_requested = Signal(bool)
+    # The NOISE button -> bus.cmd_state_noise -> MpcWorker.set_state_noise
+    # (--state-noise, 2026-10-19): True = Gaussian noise on the state the
+    # LOW controller is handed. The EST button's request/re-sync rule; the
+    # face is MpcStatus.sn_state. Hidden without --state-noise.
+    state_noise_requested = Signal(bool)
 
     _BTN_CSS = "QPushButton{font-size:11px; padding:3px 8px;}"
     # The ckpt row's button: same face, one line tall — the row sits between
@@ -2272,7 +2397,7 @@ class TrajectoryWindow(QtWidgets.QWidget):
 
     @classmethod
     def _state_btn_css(cls, colour: str) -> str:
-        """The face of a switch whose colour IS a state (DVL, EST).
+        """The face of a switch whose colour IS a state (DVL, EST, TAG FIX).
 
         A widget sheet's ``color`` beats the app sheet's ``:checked`` rule, so
         a checked switch used to write its state colour on the ACCENT fill —
@@ -2582,6 +2707,33 @@ class TrajectoryWindow(QtWidgets.QWidget):
         self.btn_est.clicked.connect(self._est_clicked)
         self._ekf_control = False       # what the WORKER holds
         self._est_css = ""
+        # THE TAG FIX SWITCH (2026-10-18, --dvl_pose, control/dvl_pose.py):
+        # ON = AprilTag fixes set / correct the DVL dead-reckoned pose, OFF =
+        # DVL-only. Hidden until MpcStatus reports a DVL pose (dvp_mode), the
+        # DVL button's request / re-sync rule — but, unlike DVL and EST, live
+        # while engaged (`_set_tagfix`). On row2 and not a row of its own:
+        # the window's height budget is ~6 px (the _CKPT_BTN_CSS note).
+        self.btn_tagfix = QtWidgets.QPushButton("TAG FIX ON")
+        self.btn_tagfix.setCheckable(True)
+        self.btn_tagfix.setChecked(True)   # the face of _dvp_tag_on below
+        self.btn_tagfix.setStyleSheet(self._BTN_CSS)
+        self.btn_tagfix.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_tagfix.setVisible(False)
+        self.btn_tagfix.clicked.connect(self._tagfix_clicked)
+        self._dvp_tag_on = True         # what the WORKER holds
+        self._tagfix_css = ""
+        # THE NOISE SWITCH (2026-10-19, --state-noise, control/state_noise.py):
+        # ON = Gaussian noise on the controller's state. Hidden until
+        # MpcStatus reports one (sn_state); the EST button's rule (changes
+        # only while disengaged with no CSV open).
+        self.btn_noise = QtWidgets.QPushButton("NOISE OFF")
+        self.btn_noise.setCheckable(True)
+        self.btn_noise.setStyleSheet(self._BTN_CSS)
+        self.btn_noise.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_noise.setVisible(False)
+        self.btn_noise.clicked.connect(self._noise_clicked)
+        self._sn_on = False             # what the WORKER holds
+        self._noise_css = ""
         self.btn_3d = QtWidgets.QPushButton("3D")
         self.btn_3d.setCheckable(True)
         self.btn_3d.setStyleSheet(self._BTN_CSS)
@@ -2768,6 +2920,8 @@ class TrajectoryWindow(QtWidgets.QWidget):
         row2.addWidget(self.btn_dr)
         row2.addWidget(self.btn_dvl)
         row2.addWidget(self.btn_est)
+        row2.addWidget(self.btn_tagfix)
+        row2.addWidget(self.btn_noise)
         row2.addWidget(self.btn_rec)
         row2.addStretch(1)
         bottom = QtWidgets.QHBoxLayout()
@@ -3613,6 +3767,147 @@ class TrajectoryWindow(QtWidgets.QWidget):
             f"{f(s.ekf_sig_m, '.1f', ' cm', 100.0)} · last tag fused "
             f"{f(s.ekf_tag_late_s, '.0f', ' ms late', 1000.0)}")
 
+    def _noise_clicked(self, checked: bool) -> None:
+        """Ask for the other NOISE position; show the CURRENT one until the
+        worker answers (it may refuse, and says why in the chip)."""
+        self.btn_noise.setChecked(self._sn_on)
+        self.state_noise_requested.emit(bool(checked))
+
+    def _set_noise(self, s: MpcStatus) -> None:
+        """Reflect the worker's NOISE switch on the button."""
+        st = str(getattr(s, "sn_state", "") or "")
+        self.btn_noise.setVisible(bool(st))
+        if not st:
+            return
+        on = st == "on"
+        self._sn_on = on
+        if self.btn_noise.isChecked() != on:
+            self.btn_noise.setChecked(on)
+        dp = bool(getattr(s, "sn_policy", False))
+        self.btn_noise.setText(("NOISE ON +DP" if dp else "NOISE ON") if on
+                               else "NOISE OFF")
+        self.btn_noise.setEnabled(not s.engaged
+                                  and not getattr(s, "csv_open", False))
+        css = self._state_btn_css(theme.WARN if on else theme.TEXT_DIM)
+        if css != self._noise_css:
+            self._noise_css = css
+            self.btn_noise.setStyleSheet(css)
+        who = ("The DP policy sees the SAME draw (--state-noise-policy): "
+               "its proprio rows, plan anchor and START pose; plans.jsonl "
+               "sn_policy.\nThe plot, CSV px/py and every interlock stay on "
+               if dp else
+               "The plot, CSV px/py, the DP proprio and every interlock stay "
+               "on ")
+        self.btn_noise.setToolTip(
+            "STATE NOISE (--state-noise) — Gaussian noise added to the state "
+            "the LOW controller is handed. HARDWARE-UNVERIFIED.\n"
+            + who +
+            "the un-noised state; CSV sn_* = the noise each row added.\n"
+            "Changes only while disengaged and with no controller CSV open.\n"
+            f"\n{getattr(s, 'sn_desc', '')}")
+
+    def _tagfix_clicked(self, checked: bool) -> None:
+        """Ask for the other TAG FIX position; show the CURRENT one until the
+        worker answers (it may refuse OFF — the reason lands in the button's
+        tooltip note and in the mission log)."""
+        self.btn_tagfix.setChecked(self._dvp_tag_on)
+        self.dvl_pose_tag_requested.emit(bool(checked))
+
+    #: The chip's word per dvp_state (--dvl_pose, 2026-10-18). A fault reads
+    #: LOST too: either way there is no pose to fly on, and the button's red
+    #: face and its tooltip note say which of the two it was.
+    _DVP_WORDS = {"tag": "TAG", "blend": "TAG+corr", "dr": "DVL",
+                  "held": "HELD", "lost": "LOST", "fault": "LOST",
+                  "no_anchor": "NO ANCHOR"}
+
+    def _dvp_chip(self, s: MpcStatus) -> str:
+        """The chip's pose word under --dvl_pose ("" without one): what the
+        pose is resting on right now, and how long since a tag last set it
+        while it dead-reckons. A shadow pose says so — the controller is not
+        flying on it."""
+        mode = str(getattr(s, "dvp_mode", "") or "")
+        if not mode:
+            return ""
+        st = str(getattr(s, "dvp_state", "") or "")
+        word = self._DVP_WORDS.get(st, st.upper() or "--")
+        if st == "dr" and getattr(s, "dvp_since_fix_s", None) is not None:
+            word += f" {s.dvp_since_fix_s:.0f}s"
+        head = "pose" if mode == "control" else f"pose({mode})"
+        return f" · {head}:{word}"
+
+    def _set_tagfix(self, s: MpcStatus) -> None:
+        """Reflect the worker's TAG FIX truth on the button. ON/OFF is the
+        operator's switch as the WORKER holds it (dvp_tag_on); the colour is
+        the pose's state — whether what it reports right now is usable."""
+        mode = str(getattr(s, "dvp_mode", "") or "")
+        self.btn_tagfix.setVisible(bool(mode))
+        if not mode:
+            return
+        on = bool(s.dvp_tag_on)
+        once = bool(on and getattr(s, "dvp_oneshot", False))
+        self._dvp_tag_on = on
+        if self.btn_tagfix.isChecked() != on:
+            self.btn_tagfix.setChecked(on)
+        self.btn_tagfix.setText("TAG FIX ONCE…" if once else
+                                "TAG FIX ON" if on else "TAG FIX OFF")
+        # LIVE WHILE ENGAGED AND WHILE A CONTROLLER CSV IS OPEN — the
+        # opposite of the DVL and EST switches beside it, which `_set_dvl` /
+        # `_set_est` freeze there (one run = one estimator). Re-anchoring the
+        # dead reckoning on the tags, or taking them away to watch it carry
+        # the vehicle, is a MID-RUN act: the worker accepts it engaged and
+        # every CSV row records which way it stood (tagfix). Frozen like its
+        # neighbours, this button would be dead at the only moment it exists
+        # for.
+        self.btn_tagfix.setEnabled(True)
+        st = str(s.dvp_state or "")
+        ok = bool(s.dvp_ok)
+        colour = (theme.FAIL if st in ("lost", "fault") else
+                  theme.WARN if (st in ("no_anchor", "held", "blend")
+                                 or (st == "dr" and not ok)) else
+                  theme.OK if st in ("tag", "dr") and ok else
+                  theme.TEXT_DIM)
+        css = self._state_btn_css(colour)
+        if css != self._tagfix_css:
+            self._tagfix_css = css
+            self.btn_tagfix.setStyleSheet(css)
+
+        def f(v, fmt, unit, k=1.0):
+            return "--" if v is None else f"{v * k:{fmt}}{unit}"
+        flies = ("SHADOW: the controller flies on the tag state; this pose "
+                 "is drawn and recorded beside it."
+                 if mode == "shadow" else
+                 "CONTROL: the controller AND the interlocks fly on this "
+                 "pose." if mode == "control" else f"mode: {mode}")
+        bias_state = str(s.dvp_bias_state or "")
+        self.btn_tagfix.setToolTip(
+            "TAG FIX — the DVL dead-reckoned pose (--dvl_pose): x, y from the "
+            "DVL velocity, yaw from the RAW_IMU gyro, z from the Bar30, "
+            "roll/pitch from ATTITUDE. HARDWARE-UNVERIFIED.\n"
+            f"{flies}\n"
+            "ON: AprilTag fixes set / correct the pose — it IS the tag state "
+            "while a fix is fresh, and the DVL dead reckoning carries the "
+            "tag dropouts.\n"
+            "OFF: DVL-only dead reckoning — tags are still detected, recorded "
+            "and watched for divergence, but never move the pose.\n"
+            "Pressed while OFF: ONE correction (TAG FIX ONCE…) — the next "
+            "agreeing fixes correct the pose, then it is OFF again by itself "
+            "(or after the timeout with none). Engaged in control, a "
+            "correction past max_corr (25 cm / 10 deg) ends the run: press "
+            "before the drift gets there. The session's first ON stays "
+            "ON until pressed.\n"
+            "Switchable WHILE ENGAGED (every CSV row records it: tagfix); OFF "
+            "is refused until the dead reckoning can carry the vehicle.\n\n"
+            f"state: {st or '--'} · pose {'ok' if ok else 'NOT ok'}\n"
+            f"|pose - tag| {f(s.dvp_err_m, '.1f', ' cm', 100.0)}, yaw "
+            f"{f(s.dvp_err_yaw_deg, '+.1f', ' deg')} · since the last tag "
+            f"fix {f(s.dvp_since_fix_s, '.0f', ' s')}, "
+            f"{f(s.dvp_dist_m, '.2f', ' m')}\n"
+            f"correction still being slewed in "
+            f"{f(s.dvp_corr_m, '.1f', ' cm', 100.0)} · gyro yaw-rate bias "
+            f"{f(s.dvp_bias_dps, '+.3f', ' deg/s')}"
+            + (f" ({bias_state})" if bias_state else "")
+            + (f"\nnote: {s.dvp_note}" if s.dvp_note else ""))
+
     #: 2026-10-16 (dvl.selection primary): "held" = held back for a moment,
     #: returns BY ITSELF (a quality flag, a disagreement); primary never says
     #: "fallback" ("held back" is legacy's word), and TRIPPED is only a latch.
@@ -3778,6 +4073,8 @@ class TrajectoryWindow(QtWidgets.QWidget):
         self.btn_dr.setEnabled(live and s.dr_mode != "control")
         self._set_dvl(s)
         self._set_est(s)
+        self._set_tagfix(s)
+        self._set_noise(s)
         self._set_tune(s)
         self._engaged = s.engaged
         self._traj_on = s.traj_on
@@ -3877,6 +4174,14 @@ class TrajectoryWindow(QtWidgets.QWidget):
             # ...and which ESTIMATE, only when it is not the default.
             if getattr(s, "ekf_control", False):
                 err += " · est:EKF"
+            # ...and a deliberately noised state, always (--state-noise)
+            if getattr(s, "sn_state", "") == "on":
+                err += (" · NOISE+DP" if getattr(s, "sn_policy", False)
+                        else " · NOISE")
+            # ...and, under --dvl_pose, what the pose rests on right now
+            # ("pose:DVL 12s" = 12 s of dead reckoning since a tag last set
+            # it) — prefixed (shadow) when the controller is not flying it.
+            err += self._dvp_chip(s)
             # THE BRIDGE HAS TO BE LOUD. "still engaged" and "engaged but no
             # longer holding position" look identical otherwise, and the coast
             # tier is indefinite — the operator is the thing deciding when it
