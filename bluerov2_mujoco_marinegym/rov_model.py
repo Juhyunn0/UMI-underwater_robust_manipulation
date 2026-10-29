@@ -65,9 +65,9 @@ _MODELS = {
         # the user's Onshape assembly 2026-07-19 (front-bottom, lens forward level).
         xml="bluerov_heavy_gripper.xml",
         yaml="BlueROVHeavyGripper.yaml",
-        mass=13.7240,
+        mass=17.5,
         inertia=(0.38154, 0.77780, 0.70954),
-        volume=0.0131815,
+        volume=0.017653,
         n_thrusters=8,
         fully_actuated=True,
     ),
