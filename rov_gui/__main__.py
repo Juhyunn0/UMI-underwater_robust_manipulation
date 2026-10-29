@@ -215,10 +215,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "while ~28 Hz starts refusing healthy links "
                         "(rov_gui/mavlink_streams.py). Cannot be off.")
     g.add_argument("--mavlink-imu-rate", type=int, default=None, metavar="HZ",
-                   help="RAW_IMU request (default 20 Hz): the autopilot's live "
-                        "accelerometer — the *_rov.jsonl record, the IMU (ROV) "
-                        "health row (>= 10 Hz), and the accelerometer when "
-                        "SCALED_IMU2 is off. Cannot be off.")
+                   help="RAW_IMU request (default 100 Hz; 20 until "
+                        "2026-10-27): the --dvl_pose heading's gyro, the "
+                        "autopilot's live accelerometer — the *_rov.jsonl "
+                        "record, the IMU (ROV) health row (>= 10 Hz), and the "
+                        "accelerometer when SCALED_IMU2 is off. Cannot be off.")
     g.add_argument("--mavlink-scaled-imu2-rate", type=int, default=None,
                    metavar="HZ",
                    help="SCALED_IMU2 request (default 20 Hz). Its accel/gyro "
@@ -316,8 +317,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "pass (an OUT sticks), DvlAid's tag-velocity holds "
                         "and latch do not stop the dead reckoning, a DVL gap "
                         "makes no hole (its unintegrated motion is warned; "
-                        "past max_corr_m it ends an engaged run / refuses a "
-                        "START until a TAG FIX ONCE), and TAG FIX OFF does "
+                        "past max_corr_m it refuses a START until a TAG FIX "
+                        "ONCE, but never ends a run — the operator does, "
+                        "2026-10-29), and TAG FIX OFF does "
                         "not wait for the gyro bias (learnt under ON, seeded "
                         "from the last session's data/dvl_pose_gyro_bias.json). "
                         "The tags anchor, correct (TAG FIX ONCE) and end a "

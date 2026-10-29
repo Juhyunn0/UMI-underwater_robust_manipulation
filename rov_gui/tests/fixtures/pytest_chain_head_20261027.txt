@@ -1,0 +1,122 @@
+........................................................................ [  6%]
+........................................................................ [ 12%]
+........................................................................ [ 19%]
+........................................................................ [ 25%]
+........................................................................ [ 32%]
+.............F.......................................F.................. [ 38%]
+........................................................................ [ 45%]
+........................................................................ [ 51%]
+........................................................................ [ 58%]
+........................................................................ [ 64%]
+........................................................................ [ 71%]
+........................................................................ [ 77%]
+........................................................................ [ 84%]
+..................................................................F..... [ 90%]
+........................................................................ [ 96%]
+..................................                                       [100%]
+=================================== FAILURES ===================================
+_______________________ test_the_shipped_config_resolves _______________________
+
+    def test_the_shipped_config_resolves():
+        from rov_gui.control.geometry import MpcConfig
+    
+        cfg = MpcConfig.load(str(ROOT / "config" / "hw_mpc.yaml"))
+        r = ON.resolve(cfg.object_nav)
+        assert r["nav_source_required"] == "main"
+        assert 0.0 < r["pair_tol_s"] <= 0.2, r
+>       assert r["min_distance_m"] < r["max_distance_m"] <= 3.0
+E       assert 10.0 <= 3.0
+
+rov_gui/tests/test_object_nav.py:398: AssertionError
+______________________ test_hw_followers_check_the_export ______________________
+
+    def test_hw_followers_check_the_export():
+        """N25."""
+        from rov_gui.control.geometry import MpcConfig
+    
+        with tempfile.TemporaryDirectory() as tmp:
+            pdir = _export(tmp)
+            cfg = MpcConfig()
+            cfg.rl_pwm = {"policy_dir": pdir, "pwm_cap": 1.0, "require_thruster_probe": False}
+            r = RP.HwRlPwm(cfg, log=lambda m: None)              # primary (the default): builds
+            assert r.velocity_source["trained"] is True and r.obs_guard_trained["trained"] is True
+            m = r.meta()
+            assert m["velocity_source"]["export"]["hold_s"] == 0.45
+            assert m["velocity_source"]["station"]["selection"] == "primary"
+            assert m["obs_guard_trained"]["vel_slew_mps2"] == 2.0
+            cfg.dvl = {"selection": "legacy"}
+            with pytest.raises(ValueError, match="dvl.selection: legacy"):
+                RP.HwRlPwm(cfg, log=lambda m: None)
+            cfg.dvl = {}
+            cfg.rl_pwm["obs_guard"] = {"vel_slew_mps2": 3.0}
+            with pytest.raises(ValueError, match=r"obs_guard\.vel_slew_mps2"):
+                RP.HwRlPwm(cfg, log=lambda m: None)
+            # an axes LOW has no observation guard: an export trained behind one is refused there
+            adir = _export(tmp, "traj12_s2", obs_guard=ATT13["obs_guard"])
+            cfg = MpcConfig()
+            cfg.rl = {"policy_dir": adir}
+            with pytest.raises(ValueError, match="only rl_pwm / rl_pwm_7d"):
+                RP.HwRl(cfg, log=lambda m: None)
+        # every SHIPPED export carries neither block and builds as before
+        cfg = MpcConfig()
+        cfg.rl_pwm = {"allow_caps_below_trained": True, "require_thruster_probe": False}
+        r = RP.HwRlPwm(cfg, log=lambda m: None)
+        assert r.velocity_source is None and r.obs_guard_trained is None
+        assert r.meta()["velocity_source"] == {"export": None, "station": None}
+        assert RP.HwRl(MpcConfig(), log=lambda m: None).velocity_source is None
+        for d in sorted(POLICIES.iterdir()):
+            spec = json.loads((d / "obs_spec.json").read_text())
+>           assert "velocity_source" not in spec and "obs_guard" not in spec, d.name
+E           AssertionError: pwm11att14R_s1
+E           assert ('velocity_source' not in {'checkpoint': 'logs/rsl_rl/rov_posehold/2026-10-16_06-00-13_pwm11att14R_s1/model_2399.pt', 'obs_dim': 116, 'act_dim': 8, 'history_len': 4, ...})
+
+rov_gui/tests/test_rl_velocity_source.py:209: AssertionError
+__________________ test_cv2_cannot_hijack_the_qt_plugin_path ___________________
+
+    def test_cv2_cannot_hijack_the_qt_plugin_path():
+        """The 2026-08-06 crash, as a test.
+    
+        cv2 repoints QT_QPA_PLATFORM_PLUGIN_PATH at its own bundled Qt plugins the
+        moment it is imported — and on the hardware path something *does* import it
+        before the QApplication exists (preflight's python-env check reads the cv2
+        version). Qt then finds cv2's libqxcb.so, fails to load it into PyQt5's Qt,
+        and calls qFatal: "Aborted (core dumped)", with no window.
+    
+        This test cannot reproduce the abort — it runs offscreen, and cv2's plugin
+        directory has no libqoffscreen.so, so offscreen silently falls back and
+        survives. That asymmetry is exactly why the bug shipped. So the test asserts
+        the *invariant* instead: whatever ran before, sanitize_plugin_path() leaves
+        the variable pointing at our own binding's plugins.
+        """
+        from rov_gui.qt import binding_plugin_dir, import_cv2, sanitize_plugin_path
+    
+        ours = binding_plugin_dir()
+        if ours is None:
+            return                      # system Qt, nothing bundled, nothing to fix
+    
+        import_cv2()                    # the guarded import must not leave damage
+>       assert os.environ.get("QT_QPA_PLATFORM_PLUGIN_PATH") in (None, ours), \
+            "import_cv2() failed to restore the plugin path"
+E       AssertionError: import_cv2() failed to restore the plugin path
+E       assert '/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/cv2/qt/plugins' in (None, '/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/PyQt5/Qt5/plugins')
+E        +  where '/home/bdml/miniforge3/envs/rovgui-pose/lib/python3.12/site-packages/cv2/qt/plugins' = get('QT_QPA_PLATFORM_PLUGIN_PATH')
+E        +    where get = environ({'QT_QPA_PLATFORM': 'offscreen', 'SHELL': '/bin/bash', 'COREPACK_ENABLE_AUTO_PIN': '0', 'WM_COMPILER': 'Gcc', ...upilotmega', 'PYTEST_CURRENT_TEST': 'rov_gui/tests/test_offline.py::test_cv2_cannot_hijack_the_qt_plugin_path (call)'}).get
+E        +      where environ({'QT_QPA_PLATFORM': 'offscreen', 'SHELL': '/bin/bash', 'COREPACK_ENABLE_AUTO_PIN': '0', 'WM_COMPILER': 'Gcc', ...upilotmega', 'PYTEST_CURRENT_TEST': 'rov_gui/tests/test_offline.py::test_cv2_cannot_hijack_the_qt_plugin_path (call)'}) = os.environ
+
+rov_gui/tests/test_offline.py:293: AssertionError
+=============================== warnings summary ===============================
+rov_gui/tests/test_offline.py::test_default_video_config_fits_the_c3_link
+  /tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/115f7b8a-2a1b-4c16-8124-6cf0ea0c3413/scratchpad/wt_head/c3_camera/config.py:46: DeprecationWarning: HIGH_ACCURACY is deprecated, will be removed in future releases and replaced with DEFAULT.
+    "high_accuracy": dai.node.StereoDepth.PresetMode.HIGH_ACCURACY,
+
+rov_gui/tests/test_offline.py::test_default_video_config_fits_the_c3_link
+  /tmp/claude-1000/-home-bdml-Desktop-umi-underwater-robust-control/115f7b8a-2a1b-4c16-8124-6cf0ea0c3413/scratchpad/wt_head/c3_camera/config.py:47: DeprecationWarning: HIGH_DENSITY is deprecated, will be removed in future releases and replaced with DEFAULT.
+    "high_density":  dai.node.StereoDepth.PresetMode.HIGH_DENSITY,
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED rov_gui/tests/test_object_nav.py::test_the_shipped_config_resolves - a...
+FAILED rov_gui/tests/test_rl_velocity_source.py::test_hw_followers_check_the_export
+FAILED rov_gui/tests/test_offline.py::test_cv2_cannot_hijack_the_qt_plugin_path
+3 failed, 1111 passed, 2 warnings in 153.25s (0:02:33)
+HEAD rc=1

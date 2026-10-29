@@ -712,6 +712,13 @@ qdarkstyle), 스테이션은 `rovgui-pose`(torch, numpy 2)라 **env가 다르다
 **헤드리스 재생을 쓸 거면 패널을 먼저 닫는다** — 패널이 `.so`가 허용하는 유일한
 연결을 쥐고 있어서, 열어 둔 채 CLI를 돌리면 `addDevice`가 −5로 거절한다.
 
+같은 이유로 **`./c3 disturb`**(외란 발생 장치 패널: 갠트리 + 회전 모터 + T200,
+`src/disturbance_panel.py`, [docs/DISTURBANCE_RIG.md](docs/DISTURBANCE_RIG.md))와 이 패널은
+동시에 띄울 수 없다. 그 패널은 whisker_vision의 링크를 쓰며 좌표가 **컨트롤러 카운터 mm**(소프트
+리밋은 현장에서 가르친 `−X home`/`+X home`)라 이 패널의 사용자 프레임(home reference·axis_sign)과
+숫자가 호환되지 않는다. 같은 컨트롤러라 참고할 것: 2026-10-26 그 패널에서 whisker 정지 시퀀스(stop_run +
+mode 2)가 상대 조그를 멈추지 못했다(`data/20261026/1026_131512_disturb/`); 이 패널의 조그 정지는 mode 1이다.
+
 ---
 
 ## Tag Survey GUI — one-stop interactive surveying (`python -m src.survey_tags`)

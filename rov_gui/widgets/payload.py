@@ -270,9 +270,10 @@ class PayloadPanel(Panel):
             f"color: {theme.TEXT_DIM}; background: {theme.BG}; "
             f"border: 1px solid {theme.BORDER}; border-radius: 4px; "
             f"padding: 2px 3px; }}")
-        self.log_view.setToolTip("mission log — scroll back for older lines\n"
-                                 "saved to the run folder as mission_log.txt "
-                                 "when a recording stops")
+        self.log_view.setToolTip("mission log — only what needs you; every "
+                                 "line is in mission_log.txt\n"
+                                 "saved to the run folder when a recording "
+                                 "stops")
         # ~9 lines minimum, and that number is a LAYOUT budget, not a taste.
         # It was 28 px (two lines) until 2026-08-14, when the three device
         # sections above were compacted from five rows each to three: the log
@@ -296,6 +297,13 @@ class PayloadPanel(Panel):
         self._log_last: str | None = None
         self._log_repeat = 0
         self._log_stamp = ""
+        # ...and what the VIEW holds, which since 2026-10-28 is a subset
+        # (rov_gui/logfilter.py): whether the newest file line is also on
+        # screen (a repeat may only rewrite a block that is there), and the
+        # text of a FOLDED line last shown (one recording stop = several
+        # "saved" lines, one folder on screen).
+        self._log_last_shown = False
+        self._view_folded = ""
 
         self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred,
                            QtWidgets.QSizePolicy.Policy.Expanding)
@@ -471,11 +479,21 @@ class PayloadPanel(Panel):
     #             above it so it can be found by scanning rather than reading
     #   error     red      warn   amber      info   the old dim grey
     #   debug     NOT SHOWN — printed to stdout only (window.py routes it)
+    #
+    # WHICH lines are shown is no longer the level's call (2026-10-28,
+    # rov_gui/logfilter.py): a line with show=False is recorded — it is in
+    # mission_log.txt — but never drawn.
     _LEVEL_COLOR = {"mission": theme.ACCENT, "error": theme.FAIL,
                     "warn": theme.WARN, "info": theme.TEXT_DIM}
 
-    def add_event(self, text: str, level: str = "info") -> None:
+    def add_event(self, text: str, level: str = "info", show: bool = True,
+                  shown_as: str | None = None) -> None:
         """One short mission line, wall-clock stamped, appended to the scroll.
+
+        ``show=False`` records the line (``log_text`` -> mission_log.txt)
+        without drawing it. ``shown_as`` draws different text than the file
+        keeps — a folded line (logfilter.panel_text); the same folded text
+        twice in a row is drawn once.
 
         Sticks to the bottom ONLY when it was already at the bottom. That rule
         is the whole point of a scrollable log on a live station: an operator
@@ -495,6 +513,7 @@ class PayloadPanel(Panel):
         repeat = bool(self._log_lines) and text == self._log_last
         bar = self.log_view.verticalScrollBar()
         at_bottom = bar.value() >= bar.maximum() - 2
+        rewrite = repeat and self._log_last_shown
         if repeat:
             self._log_repeat += 1
             # The count goes at the FRONT, not the end: the panel does not
@@ -503,16 +522,29 @@ class PayloadPanel(Panel):
             # is the one thing it must not be.
             line = f"{self._log_stamp} (x{self._log_repeat})  {text}"
             self._log_lines[-1] = line
-            cur = self.log_view.textCursor()
-            cur.movePosition(QtGui.QTextCursor.MoveOperation.End)
-            cur.select(QtGui.QTextCursor.SelectionType.BlockUnderCursor)
-            cur.removeSelectedText()
         else:
             self._log_repeat = 1
             self._log_last = text
             self._log_stamp = time.strftime('%H:%M:%S')
             self._log_lines.append(line)
             del self._log_lines[:-LOG_MAX_LINES]
+        if shown_as is not None:
+            if show and not repeat and shown_as == self._view_folded:
+                show = False                 # (the folder is already said)
+            else:
+                line = (f"{self._log_stamp}"
+                        + (f" (x{self._log_repeat})" if repeat else "")
+                        + f"  {shown_as}")
+        if show:
+            self._view_folded = shown_as or ""
+        self._log_last_shown = show
+        if not show:
+            return
+        if rewrite:
+            cur = self.log_view.textCursor()
+            cur.movePosition(QtGui.QTextCursor.MoveOperation.End)
+            cur.select(QtGui.QTextCursor.SelectionType.BlockUnderCursor)
+            cur.removeSelectedText()
         col = self._LEVEL_COLOR.get(level, theme.TEXT_DIM)
         body = _html.escape(line).replace(" ", "&nbsp;")
         if level == "mission" and not repeat:

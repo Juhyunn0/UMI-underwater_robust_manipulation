@@ -4,15 +4,15 @@
 Source: RL_controller/logs/eval/pool_trips_1013_rootcause (fix-design station item 1; operator-approved fix 1c) and
 the consumer table in RL_controller/logs/eval/station_fix_20261015/impl-rates/NOTES.md. Until 2026-10-15 the
 station asked for RAW_IMU, SCALED_IMU2 and ATTITUDE all at --mavlink-rate (default 200): ~500 msg/s of IMU stream to
-every BlueOS endpoint, which a parameter download on 10-13 queued behind. Now ATTITUDE 50 / RAW_IMU 20 /
-SCALED_IMU2 20 Hz (rov_gui/mavlink_streams.py has why each), and --mavlink-rate N is the old request.
+every BlueOS endpoint, which a parameter download on 10-13 queued behind. Now ATTITUDE 50 / RAW_IMU 100 (20 until
+2026-10-27) / SCALED_IMU2 20 Hz (rov_gui/mavlink_streams.py has why each), and --mavlink-rate N is the old request.
 
     cd <repo> && QT_QPA_PLATFORM=offscreen ~/miniforge3/envs/robust/bin/python -m pytest \\
         rov_gui/tests/test_mavlink_rates.py -q -p no:cacheprovider
 
 What is pinned:
 
-1. rov_gui/mavlink_streams.resolve: the defaults (90 msg/s asked instead of 600), the legacy request (all three at N,
+1. rov_gui/mavlink_streams.resolve: the defaults (170 msg/s asked instead of 600; 90 until 2026-10-27), the legacy request (all three at N,
    accelerometer order unchanged), the refusals (legacy + a per-message flag; ATTITUDE or RAW_IMU off; a negative,
    boolean or non-finite value), and SCALED_IMU2 off (the accelerometer moves to RAW_IMU only).
 2. c3_camera/mavlink_log.MavlinkLogger: the per-message request leaves as these SET_MESSAGE_INTERVAL intervals
@@ -63,17 +63,17 @@ MG = 9.80665 / 1000.0
 # =============================================================================
 # 1. the request
 # =============================================================================
-def test_the_defaults_ask_for_90_msg_per_s_and_keep_the_accelerometer_where_it_was():
+def test_the_defaults_ask_for_170_msg_per_s_and_keep_the_accelerometer_where_it_was():
     res = MS.resolve()
     assert res == {"policy": "per_message", "legacy_hz": None,
-                   "rates_hz": {"ATTITUDE": 50, "RAW_IMU": 20, "SCALED_IMU2": 20}, "off": [],
+                   "rates_hz": {"ATTITUDE": 50, "RAW_IMU": 100, "SCALED_IMU2": 20}, "off": [],
                    "accel_source": ["SCALED_IMU2", "RAW_IMU"]}
     assert MS.DEFAULT_HZ == res["rates_hz"] and tuple(res["accel_source"]) == MS.ACCEL_SOURCE
-    # 600 asked (and ~500 delivered, 166.6 Hz each) before; 90 now
-    assert MS.requested_msg_per_s(res) == 90.0 and MS.requested_msg_per_s(MS.resolve(legacy_hz=200)) == 600.0
+    # 600 asked (and ~500 delivered, 166.6 Hz each) before; 90 from 10-15; 170 since RAW_IMU went to 100 (10-27)
+    assert MS.requested_msg_per_s(res) == 170.0 and MS.requested_msg_per_s(MS.resolve(legacy_hz=200)) == 600.0
     # an absent attribute is "not given": a bare namespace resolves to the defaults
     assert MS.resolve_opts(types.SimpleNamespace()) == res and MS.typed(types.SimpleNamespace()) == []
-    assert "ATTITUDE 50 Hz, RAW_IMU 20 Hz, SCALED_IMU2 20 Hz" in MS.describe(res)
+    assert "ATTITUDE 50 Hz, RAW_IMU 100 Hz, SCALED_IMU2 20 Hz" in MS.describe(res)
 
 
 def test_the_legacy_request_sets_all_three_and_changes_nothing_else():
@@ -106,7 +106,7 @@ def test_scaled_imu2_off_asks_the_vehicle_to_stop_it_and_moves_the_accelerometer
     res = MS.resolve(scaled_imu2_hz=0)
     assert res["rates_hz"]["SCALED_IMU2"] == 0 and res["off"] == ["SCALED_IMU2"]
     assert tuple(res["accel_source"]) == MS.ACCEL_SOURCE_SCALED_IMU2_OFF == ("RAW_IMU",)
-    assert MS.requested_msg_per_s(res) == 70.0 and "SCALED_IMU2 off" in MS.describe(res)
+    assert MS.requested_msg_per_s(res) == 150.0 and "SCALED_IMU2 off" in MS.describe(res)
     # a float rate is kept as given (argparse hands ints; an embedder may not)
     assert MS.resolve(attitude_hz=62.5)["rates_hz"]["ATTITUDE"] == 62.5
     assert MS.resolve(attitude_hz=100.0)["rates_hz"]["ATTITUDE"] == 100
@@ -155,7 +155,7 @@ def test_the_logger_asks_for_each_stream_at_its_own_rate():
     s0 = lg.summary()
     assert lg.rates_sent_t is None and s0["rates_sent"] is False and s0["requested_off"] == []
     iv = _sent(lg)
-    assert (iv["ATTITUDE"], iv["RAW_IMU"], iv["SCALED_IMU2"]) == (20_000, 50_000, 50_000), iv
+    assert (iv["ATTITUDE"], iv["RAW_IMU"], iv["SCALED_IMU2"]) == (20_000, 10_000, 50_000), iv
     for k, hz in ML.DEFAULT_RATES_HZ.items():          # the rest of the reader's request is untouched
         if k not in MS.STREAMS:
             assert iv[k] == int(1_000_000 / hz), (k, iv[k])
@@ -165,7 +165,7 @@ def test_the_logger_asks_for_each_stream_at_its_own_rate():
     # SCALED_IMU2 off goes out as interval -1 (MAVLink: stop sending)
     off = MavlinkLogger(set_rates=True, stream_rates_hz=MS.resolve(scaled_imu2_hz=0)["rates_hz"], verbose=False)
     iv = _sent(off)
-    assert iv["SCALED_IMU2"] == -1 and iv["ATTITUDE"] == 20_000 and iv["RAW_IMU"] == 50_000
+    assert iv["SCALED_IMU2"] == -1 and iv["ATTITUDE"] == 20_000 and iv["RAW_IMU"] == 10_000
     assert off.summary()["requested_off"] == ["SCALED_IMU2"]
     # not asked to set rates: requested_* say so, nothing was sent
     quiet = MavlinkLogger(set_rates=False, stream_rates_hz=MS.resolve()["rates_hz"], verbose=False)
@@ -265,7 +265,7 @@ def test_the_flags_default_to_the_module_and_the_launch_check(monkeypatch, capsy
         return M.check_mavlink_rates(p.parse_args(list(argv)))
 
     lvl, txt = check("--source", "hw", "--mavlink-rate", "200")
-    assert lvl == "warn" and "LEGACY" in txt and "600 msg/s asked" in txt and "against 90" in txt, txt
+    assert lvl == "warn" and "LEGACY" in txt and "600 msg/s asked" in txt and "against 170" in txt, txt
     lvl, txt = check("--source", "hw", "--mavlink-rate", "200", "--mavlink-scaled-imu2-rate", "20")
     assert lvl == "refuse" and "--mavlink-scaled-imu2-rate" in txt, txt
     for bad in (["--mavlink-att-rate", "0"], ["--mavlink-imu-rate", "0"], ["--mavlink-scaled-imu2-rate", "-1"],
@@ -363,7 +363,7 @@ def _setup(monkeypatch, **opts):
 
 def test_setup_hands_the_logger_the_request_and_says_it(monkeypatch):
     w, logs, kw = _setup(monkeypatch, mavlink_transport="udp", mavlink_set_rates=True)
-    assert kw["stream_rates_hz"] == {"ATTITUDE": 50, "RAW_IMU": 20, "SCALED_IMU2": 20} and kw["set_rates"] is True
+    assert kw["stream_rates_hz"] == {"ATTITUDE": 50, "RAW_IMU": 100, "SCALED_IMU2": 20} and kw["set_rates"] is True
     assert "default_rate_hz" not in kw and w._accel_msgs == MS.ACCEL_SOURCE and w._streams_error is None
     line = [m for lvl, m in logs if "IMU streams" in m]
     assert line == ["mavlink: IMU streams " + MS.describe(MS.resolve())], logs
@@ -474,7 +474,7 @@ def test_stream_meta_snapshots_the_request_the_ack_and_the_arrivals(monkeypatch)
     lg.rate_acks = {"last": "MAV_RESULT_ACCEPTED"}
     m = w.stream_meta()
     assert m["policy"] == "per_message" and m["requested_hz"] == MS.DEFAULT_HZ and m["off"] == []
-    assert m["sent"] is True and m["ack"] == "MAV_RESULT_ACCEPTED" and m["requested_msg_per_s"] == 90.0
+    assert m["sent"] is True and m["ack"] == "MAV_RESULT_ACCEPTED" and m["requested_msg_per_s"] == 170.0
     assert m["achieved_hz"]["ATTITUDE"] == pytest.approx(50.0, rel=1e-3) and m["achieved_hz"]["RAW_IMU"] is None
     assert m["last_arrival_age_s"]["ATTITUDE"] == pytest.approx(0.04, abs=0.05) and m["accel_source"] == list(
         MS.ACCEL_SOURCE)
@@ -504,7 +504,7 @@ def test_the_run_meta_records_the_request():
         snap = {"policy": "per_message", "requested_hz": dict(MS.DEFAULT_HZ), "sent": True}
         w.mavlink_streams_fn = lambda: snap
         m = w._run_meta()
-        assert m["mavlink_streams"] == snap and m["schema_version"] == 24
+        assert m["mavlink_streams"] == snap and m["schema_version"] == 25
         json.dumps(m["mavlink_streams"])
 
         def broken():

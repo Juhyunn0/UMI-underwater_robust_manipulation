@@ -126,7 +126,7 @@ def test_without_dvl_pose_the_worker_is_what_it_was():
             sim.close()
     import rov_gui.control.workers as W
     n = len(W.DVP_CSV_COLUMNS)
-    k = len(W.SN_CSV_COLUMNS)     # schema 24 (2026-10-19) appends the state noise's after them
+    k = len(W.SN_CSV_COLUMNS) + 1  # schema 24 (2026-10-19) appends the state noise's after them, schema 25 dvl_beams3
     assert W.CSV_HEADER.strip().split(",")[-n - k:-k] == list(W.DVP_CSV_COLUMNS)
 
 
@@ -2351,3 +2351,221 @@ def test_a_control_pose_under_trust_says_the_blend_is_trusted():
                 [m for _l, m in logs if m.startswith("dvl:")][:6]
         finally:
             w.teardown()
+
+
+def test_the_drift_warnings_stay_off_the_mission_log():
+    """(the operator, 2026-10-27) The OFF drift from the tags, the time since
+    the last correction and a gap flown across (trust mode) are not logged —
+    the wording of data/20261027/1027_193604/mission_log.txt — but the panel
+    note still carries them; another warning and a START refusal are
+    logged as before."""
+    with tempfile.TemporaryDirectory() as tmp:
+        TC, w, bus, logs, events = _worker(tmp, trust_dvl=True)
+        try:
+            quiet = [
+                "dvl pose 10 cm / 2.0 deg from the tags",
+                "93 s since the last tag correction (10.45 m)",
+                "93 s since the last tag correction (10.45 m) · dvl pose: 79 "
+                "cm of unintegrated motion — flown across (trust mode): "
+                "position may be off, TAG FIX ONCE with tags in view to "
+                "correct it",
+                "dvl pose: a DVL gap of 4.7 s — flown across (trust mode): "
+                "position may be off, TAG FIX ONCE with tags in view to "
+                "correct it"]
+            stop = ("dvl pose: 79 cm of unintegrated motion since the anchor "
+                    "(DVL gaps; > dvl_pose.max_corr_m 0.25 m, more than a "
+                    "correction may be while engaged) — TAG FIX ONCE with "
+                    "tags in view while disengaged")
+            n0 = len(logs)
+            for i, q in enumerate(quiet):
+                w._dvp_say({"state": DVP.ST_DR, "warn": q, "fault": ""},
+                           100.0 + i)
+            w._dvp_say({"state": DVP.ST_DR, "warn": quiet[0], "fault": stop},
+                       110.0)
+            w._dvp_say({"state": DVP.ST_DR, "warn": "anchoring: 1/3 fixes "
+                        "agree", "fault": ""}, 111.0)
+            said = [m for _l, m in logs[n0:]]
+            assert not [m for m in said if any(q in m for q in (
+                "deg from the tags", "since the last tag correction",
+                "flown across"))], said
+            assert any("a START now would be refused" in m
+                       and "unintegrated motion" in m for m in said), said
+            assert "dvl_pose: anchoring: 1/3 fixes agree" in said, said
+            w._dvp_last = (None, {"state": DVP.ST_DR, "warn": quiet[2]})
+            s = SimpleNamespace()
+            w._publish_dvp(s)
+            assert "flown across" in s.dvp_note, s.dvp_note
+        finally:
+            w.teardown()
+
+
+def test_trust_mode_flies_on_past_the_unintegrated_motion_not_a_new_start():
+    """(the operator, 2026-10-29: "I am always watching; I will stop it")
+    1.2-s DVL gaps (inside lost_s) while the vehicle moves 0.10 m/s with no
+    tag in view each hide ~7.5 cm. Past max_corr_m (25 cm) the `unobserved`
+    stop ended such a run (data/20261019/1019_232652/events.log 23:27:03,
+    11 s into a policy run); now the run flies on with the number in the
+    warning and nothing in the mission log or meta faults. Disengaged, the
+    next START is still refused on it (the operator asked only about the
+    run) until a ONCE with tags in view snaps the pose — then it starts."""
+    with tempfile.TemporaryDirectory() as tmp:
+        TC, w, bus, logs, events = _worker(tmp, trust_dvl=True)
+        sim = PoseSim(w, TC)
+        try:
+            _ready(sim, w)
+            w.set_dvl_pose_tag(False)
+            assert not w.dvp.tag_on, w.reason
+            sim.engage()
+            for _gap in range(6):
+                for k in range(44):      # 2.2 s, the DVL out the first 1.2 s
+                    sim.step(v=(0.10, 0.0, 0.0), fix=False, dvl=k >= 24)
+                    assert w.engaged, (w.reason, w._dvp_last[1])
+            h = w._dvp_last[1]
+            assert w.dvp.unobserved_m > 0.35, w.dvp.unobserved_m
+            assert h["state"] == DVP.ST_DR and not h.get("fault"), h
+            assert "unintegrated motion" in h.get("warn", ""), h
+            assert any("never ends a run" in m for _l, m in logs
+                       if m.startswith("dvl_pose: DVL dead-reckoned pose"))
+            # no FAULT: where the stop would have ended the run is said ONCE
+            # — the log file, the run's events, meta "(not a stop)"
+            said = [m for _l, m in logs if "unintegrated" in m
+                    and not m.startswith("dvl_pose: DVL dead-reckoned pose")]
+            assert len(said) == 1 and "not a stop" in said[0], said
+            ev = [" ".join(map(str, e)) for e in events]
+            assert sum("not a stop" in e for e in ev) == 1, ev
+            fs = [f["why"] for f in w._run_meta()["dvl_pose"]["faults"]
+                  if "unintegrated" in f["why"]]
+            assert len(fs) == 1 and fs[0].startswith("(not a stop)"), fs
+            # the operator stops it: the next START is refused on it — by
+            # the engage-instant step with no tick between...
+            w.set_engaged(False)
+            assert not w.engaged
+            w.set_engaged(True)
+            assert not w.engaged and "unintegrated motion" in w.reason, \
+                w.reason
+            # ...and by the last tick's pose
+            sim.step(fix=False)
+            w.set_engaged(True)
+            assert not w.engaged and "unintegrated motion" in w.reason, \
+                w.reason
+            # ...until a ONCE with tags in view, disengaged, snaps the pose
+            w.set_dvl_pose_tag(True)
+            assert w.dvp.tag_on and w.dvp.oneshot is not None, w.reason
+            for _ in range(200):
+                sim.step()
+                if not w.dvp.tag_on:
+                    break
+            assert not w.dvp.tag_on and w.dvp.unobserved_m == 0.0, \
+                (w.dvp.unobserved_m, w._dvp_last[1])
+            for _ in range(20):
+                sim.step()
+            sim.engage()
+            assert w.engaged
+        finally:
+            sim.close()
+
+
+# =============================================================================
+# the three-beam re-solve through the worker (2026-10-27, safety review: the
+# identity check in _dvp_note_dvl had no test on a re-solved copy)
+def _beamed(v, t, valid=True, long_beam=None):
+    """A DvlSample whose four transducers a velocity ``v`` (output frame)
+    gives at offset 180, all 0.6 m — or one read ``long_beam`` at 1.1 m."""
+    B = DV.beam_matrix(180)
+    bv = B @ np.asarray(v, float)
+    d = [0.6] * 4
+    if long_beam is not None:
+        d[long_beam] = 1.1
+    s = TD._sample(v, t=t, valid=valid)
+    s.beams = tuple((float(bv[i]), d[i], True) for i in range(4))
+    return s
+
+
+def test_a_three_beam_re_solve_reaches_the_dead_reckoning():
+    """1027_194851 in miniature: TAG FIX OFF, moving at 0.08 m/s, beam 1
+    reads long and the device calls the reports invalid. The re-solved copy
+    (not the bus's sample) is what the pose integrates — DR throughout, not
+    HELD — the CSV column says which beam was left out, and dvl_valid stays
+    the device's 0. Without the geometry check's clean moving reports it
+    re-solves nothing (and the pose is HELD as before)."""
+    for warm in (True, False):
+        with tempfile.TemporaryDirectory() as tmp:
+            TC, w, bus, logs, events = _worker(tmp, trust_dvl=True)
+            sim = PoseSim(w, TC)
+            try:
+                _ready(sim, w)
+                w.on_dvl_info({"mounting_rotation_offset": 180,
+                               "speed_of_sound": 1475})
+                v = (0.08, 0.0, 0.0)
+                # clean, moving, device-valid reports: the geometry check
+                # (both horizontal axes: the check needs each excited)
+                for i in range(80 if warm else 0):
+                    vv = v if (i // 20) % 2 == 0 else (0.0, 0.08, 0.0)
+                    sim.step(v=vv, dvl=False)
+                    w.on_dvl(_beamed(vv, sim.t))
+                w.set_dvl_pose_tag(False)
+                assert not w.dvp.tag_on, w.reason
+                for _ in range(5):
+                    sim.step(v=v, dvl=False)
+                    w.on_dvl(_beamed(v, sim.t))
+                n_use, n_un = w.dvp.n_usable, w.dvp.n_unusable
+                states = []
+                for _ in range(30):                     # 1.5 s
+                    sim.step(v=v, dvl=False, tick=False)
+                    s = _beamed(v, sim.t, valid=False, long_beam=1)
+                    w.on_dvl(s)
+                    w.tick()
+                    states.append(w._dvp_last[1].get("state"))
+                    if warm:
+                        assert w.dvl.sample_in is s and w.dvl.sample is not s
+                        assert w.dvl.sample.beams3 == 1
+                        assert np.allclose(w.dvp.v_last, w.dvl.v_body)
+                if warm:
+                    assert all(x == DVP.ST_DR for x in states), states
+                    assert w.dvp.n_usable == n_use + 30
+                    assert w.dvp.n_unusable == n_un
+                    assert w._b3_row(sim.t) == ["1"]
+                    assert w._dvl_cols(w.dvl, "dvl", {}, sim.t)[4] == "0"
+                    c = w.dvl.meta()["three_beam"]
+                    assert c["counts"]["passed_gates"] == 30 and c["geometry_check_now"]["ok"]
+                    # the shadow EKF is never given a report the aid
+                    # re-solved — not even a device-VALID one, whose own
+                    # velocity and altitude nothing judged (re-review)
+                    if w.ekf is None:
+                        w.opts.ekf = "shadow"
+                        w._setup_ekf()
+                    assert w.ekf is not None
+                    fed = []
+                    real = w.ekf.feed_dvl
+                    w.ekf.feed_dvl = lambda obj, t: (fed.append(obj),
+                                                     real(obj, t))
+                    long_valid = []
+                    for i in range(6):
+                        sim.step(v=v, dvl=False)
+                        s = (_beamed(v, sim.t, valid=True, long_beam=1)
+                             if i % 2 else _beamed(v, sim.t))
+                        if i % 2:
+                            long_valid.append(s)
+                        w.on_dvl(s)
+                    assert all(w.dvl.sample_in is not s
+                               or w.dvl.sample.beams3 == 1
+                               for s in long_valid[-1:])
+                    assert not any(s in fed for s in long_valid), len(fed)
+                    assert len(fed) == 3                 # the clean ones are
+                    assert w.dvl.sample.beams3 == 1
+                    # an out-of-order report was judged by nothing: not fed
+                    old = _beamed(v, sim.t - 0.5)
+                    w.on_dvl(old)
+                    assert old not in fed and w.dvl.sample_in is not old
+                    # the mission log heard the geometry check open, once
+                    on = [m for _l, m in logs
+                          if "three-beam re-solve ON" in m]
+                    assert len(on) == 1 and on[0].startswith("dvl: "), on
+                else:
+                    assert any(x in (DVP.ST_HELD, DVP.ST_LOST)
+                               for x in states), states
+                    assert w.dvl.meta()["three_beam"]["counts"].get(
+                        "refused_geometry", 0) == 30
+                    assert not [m for _l, m in logs if "re-solve ON" in m]
+            finally:
+                sim.close()

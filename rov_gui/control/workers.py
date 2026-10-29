@@ -720,6 +720,17 @@ def _dvp_key(text: str) -> str:
     return re.sub(r"[-+]?\d+(?:\.\d+)?", "#", str(text))[:64]
 
 
+#: --dvl_pose warnings kept OFF the mission log (the operator, 2026-10-27:
+#: on a TAG FIX OFF session they filled it, a line every second or two) —
+#: the OFF drift from the tags, the time since the last tag correction and
+#: a DVL gap flown across in trust mode. Still the panel's note and the
+#: CSV's dvp_why; faults and START refusals (the unobserved stop) are not
+#: warnings and are logged as before. Matched on dvl_pose._watch /
+#: _watch_divergence's wording.
+DVP_QUIET_WARN = ("deg from the tags", "since the last tag correction",
+                  "flown across (trust mode)")
+
+
 #: THE DVL POSE's columns (schema 23, 2026-10-18; the note below CSV_HEADER).
 #: --dvl_pose trust mode: a saved gyro bias (data/dvl_pose_gyro_bias.json)
 #: further from zero than this is not seeded — 10x the biases measured on
@@ -767,7 +778,8 @@ CSV_HEADER = ("t,px,py,pz,rx,ry,yaw_deg,pitch_deg,lap,"
               "w_dvl,dvl_code,dvl_res_fast_m_s,dvl_res_slow_m_s,dvl_esc_s,"
               "dvl_align,dvl_scale,"
               + ",".join(DVP_CSV_COLUMNS) + ","
-              + ",".join(SN_CSV_COLUMNS) + "\n")
+              + ",".join(SN_CSV_COLUMNS) + ","
+              + "dvl_beams3\n")
 # 2026-09-08: the eleven trailing columns. `pwm1..pwm8` are the vehicle's OWN
 # SERVO_OUTPUT_RAW microseconds per thruster (1500 = neutral; EMPTY when that
 # output is unconfigured or the vehicle has not reported yet), `pwm_age_s` is
@@ -1159,6 +1171,22 @@ CSV_HEADER = ("t,px,py,pz,rx,ry,yaw_deg,pitch_deg,lap,"
 # they are the controller's view; the true error is px/py vs rx/ry. sn_on 0
 # inside an ON run = a tick with no state (stale-fix debounce). RECORD BOUNDARY: never pool sn_on 1
 # rows with sn_on 0 rows as one condition (meta state_noise.at_engage).
+# 2026-10-27: one trailing column with schema 25, the three-beam re-solve
+# (dvl.three_beam; control/dvl.py DvlAid._three_beam). `dvl_beams3` = ""
+# (no DVL built), nan (no sample within stale_s), -1 (the newest sample is
+# the device's own solution), 0..3 (its velocity was re-solved WITHOUT that
+# beam, which read long). Like every dvl_* column it describes the NEWEST
+# sample: on a 0..3 row dvl_u/v/w and dvl_ok are the re-solve's, and so is
+# the flown velocity on a vel_src dvl row with dvl_code ok (a hold / blend
+# row, and a "rung" row whose station-bridge rung is holding, fly an older
+# sample — forward-fill dvl_beams3 from the last dvl_code ok row to name it;
+# the CSV cannot tell a holding rung from a fresh one); dvl_valid and
+# dvl_alt_m stay the DEVICE's (a device-invalid report re-solved reads
+# dvl_valid 0, dvl_beams3 k). Primary selection only.
+# RECORD BOUNDARY: runs before schema 25 never flew a re-solve; meta
+# dvl.three_beam.counts (SESSION-wide) says how many were made, passed or
+# were held by the data gates / flags, and why the rest were refused. A
+# re-solved report never reaches the shadow EKF (_ekf_inputs.jsonl `b3`).
 
 
 class MpcWorker(TimerWorker):
@@ -1405,6 +1433,7 @@ class MpcWorker(TimerWorker):
         self._dvp_at_engage: dict = {}
         self._dvp_shadow_lost_n = 0        # shadow: consecutive lost ticks
         self._dvp_shadow_lost_said = False
+        self._dvp_unobs_said = False       # trust: past max_corr, engaged
         self._dvp_asm_zoff = None          # the assembler z offset last seen
         # THE ROBOT_LOCALIZATION EKF (control/rl_ekf.py, 2026-10-02): the
         # paper's estimator, run beside the assembler on every tick and
@@ -1564,6 +1593,7 @@ class MpcWorker(TimerWorker):
         self._csv_started = ""             # wall clock at open, for meta.json
         self._csv_auto = False             # opened by engage, closed by release
         self._t0_csv = 0.0
+        self._t0_csv_epoch = 0.0           # time.time() at the same instant
         self._rows = 0
 
     # ------------------------------------------------------------------ setup
@@ -2596,6 +2626,12 @@ class MpcWorker(TimerWorker):
             self._log("warn", msg)
             if self.engaged:
                 self._event(msg)
+        # the three-beam re-solve's geometry check opening / closing (a
+        # session that starts hovering never opens it — re-review round 3)
+        for _t, level, text in d.take_three_beam_notes():
+            self._log(level, f"dvl: {text}")
+            if self.engaged:
+                self._event(f"dvl: {text}")
         if not d.use or meas is None:
             return
         tk = self._dvl_tick
@@ -2839,9 +2875,29 @@ class MpcWorker(TimerWorker):
                 # report is still LOGGED (fed = whether it went in), so
                 # `ekf_replay --dvl-all` can show the ungated EKF offline.
                 fed = self._ekf_dvl_may(t)
+                # (2026-10-27) the EKF — the paper's estimator — is given
+                # what a ROS DVL driver publishes: the DEVICE's report, never
+                # a three-beam re-solve. The aid's verdict above was on the
+                # re-solve when it made one, so such a report — whose own
+                # velocity and altitude nothing judged (a device-valid one
+                # with a long beam would have been held by flag_alt or the
+                # jump gate) — is not given at all (re-review 2026-10-27);
+                # rl_ekf drops a device-invalid one anyway. `b3` marks them.
+                d = self.dvl
+                b3 = (getattr(d.sample, "beams3", None)
+                      if d is not None and d.sample_in is obj
+                      and d.sample is not obj else None)
+                # ...and on primary only the report the aid just judged: an
+                # out-of-order one was judged by nothing, and with the newest
+                # (a re-solve) withheld the EKF's own stamp order would no
+                # longer drop it (re-review round 3)
+                judged = (not self._dvl_primary()
+                          or (d is not None and d.sample_in is obj))
+                fed = bool(fed and getattr(obj, "valid", False)
+                           and b3 is None and judged)
                 if fed:
                     self.ekf.feed_dvl(obj, t)
-                self._ekf_log_input(t, "dvl", obj, fed=fed)
+                self._ekf_log_input(t, "dvl", obj, fed=fed, b3=b3)
         except Exception as e:                                   # noqa: BLE001
             self._ekf_trip_fault(f"feed {kind}", e)
 
@@ -2880,8 +2936,8 @@ class MpcWorker(TimerWorker):
             self._ekf_dvl_ref = c = (t, why)
         return not c[1]
 
-    def _ekf_log_input(self, t: float, kind: str, obj, fed: bool = True
-                       ) -> None:
+    def _ekf_log_input(self, t: float, kind: str, obj, fed: bool = True,
+                       b3=None) -> None:
         """<stem>_ekf_inputs.jsonl: every input exactly as the node got it
         (arrival + payload), so `rov_gui.tools.ekf_replay` can re-run the
         EKF offline with another configuration on the same run. Repeated
@@ -2890,7 +2946,7 @@ class MpcWorker(TimerWorker):
         if f is None:
             return
         try:
-            self._ekf_log_write(f, t, kind, obj, fed)
+            self._ekf_log_write(f, t, kind, obj, fed, b3)
         except Exception as e:                                   # noqa: BLE001
             # A logging problem stops the LOG, once and loudly; it must never
             # trip the EKF (which would end a run flying on it).
@@ -2899,7 +2955,8 @@ class MpcWorker(TimerWorker):
                               f" {e}) — the EKF itself is unaffected")
 
     @staticmethod
-    def _ekf_log_write(f, t: float, kind: str, obj, fed: bool) -> None:
+    def _ekf_log_write(f, t: float, kind: str, obj, fed: bool,
+                       b3=None) -> None:
         if kind == "fix":
             rec = {"k": "fix", "ta": t, "tc": float(obj.t_capture),
                    "p": [float(v) for v in obj.p_ned],
@@ -2923,6 +2980,11 @@ class MpcWorker(TimerWorker):
                    "cov": (None if obj.covariance is None else
                            [float(v) for v in obj.covariance]),
                    "fed": bool(fed)}
+            if b3 is not None:
+                # the aid re-solved this report without beam b3 (flown or
+                # gated — the CSV's vel_src says); v / valid above are the
+                # device's, and such a report is never fed
+                rec["b3"] = int(b3)
         f.write(json.dumps(rec, separators=(",", ":")) + "\n")
 
     def _ekf_tick(self, t: float, meas, health) -> None:
@@ -3171,6 +3233,7 @@ class MpcWorker(TimerWorker):
         self._dvp_at_engage: dict = {}
         self._dvp_shadow_lost_n = 0
         self._dvp_shadow_lost_said = False
+        self._dvp_unobs_said = False
         self._dvp_oneshot_said = ""
         self._dvp_asm_zoff = None
         self._dvp_trust = False
@@ -3459,8 +3522,8 @@ class MpcWorker(TimerWorker):
                f"stop the dead reckoning (the blend, the panel and the CSV "
                f"show the same trusted verdict), a DVL gap makes no hole "
                f"(unintegrated motion warned until a re-anchor; past "
-               f"{c['max_corr_m'] * 100:.0f} cm it ends an engaged run / "
-               f"refuses a START), OFF does not wait for the gyro bias "
+               f"{c['max_corr_m'] * 100:.0f} cm it refuses a START but never "
+               f"ends a run — YOU do), OFF does not wait for the gyro bias "
                f"(learnt under ON, seeded from the last session's file); a "
                f"wrong DVL is caught only by the divergence abort with tags "
                f"in view"
@@ -3660,8 +3723,9 @@ class MpcWorker(TimerWorker):
             # the track — fix verification 2026-10-18)
             return
         try:
-            if d.sample is not sample:
+            if d.sample_in is not sample:
                 return                  # out of order: not the newest
+            # (d.sample: the sample as flown — a three-beam re-solve's copy)
             t = now()
             if self._dvp_trust:
                 # (trust mode: the device's own word; no tag-velocity hold,
@@ -3676,7 +3740,7 @@ class MpcWorker(TimerWorker):
                 ok, why, code = d.usable_for_pose(t, require_in=False)
             roll, pitch = self._rp_at(float(sample.t_valid))
             p.note_dvl(float(sample.t_valid), d.v_body, bool(ok), code,
-                       roll, pitch, getattr(sample, "altitude", None),
+                       roll, pitch, getattr(d.sample, "altitude", None),
                        t_rx=t)
         except Exception as e:                                   # noqa: BLE001
             self._dvp_trip_fault("sample", e)
@@ -3741,6 +3805,22 @@ class MpcWorker(TimerWorker):
                 self.dvp.note_fault(t, f"(shadow) the pose was lost: {why}")
         else:
             self._dvp_shadow_lost_n, self._dvp_shadow_lost_said = 0, False
+        # TRUST, CONTROL: past max_corr_m the unobserved stop no longer ends
+        # the run (the operator, 2026-10-29) — where it would have is said
+        # once per onset: the mission log FILE (the panel draws no dvl_pose
+        # warn), the run's events, meta faults as "(not a stop)"
+        u = h.get("unobserved_m")
+        lim = self.dvp.cfg["max_corr_m"]
+        over = bool(self._dvp_trust and self.dvp_control and self.engaged
+                    and not self.observe and u is not None and u > lim)
+        if over and not self._dvp_unobs_said:
+            why = (f"dvl pose: {u * 100:.0f} cm of unintegrated motion "
+                   f"since the anchor (> dvl_pose.max_corr_m {lim:g} m) — "
+                   f"not a stop since 2026-10-29: the run flies on")
+            self._log("warn", f"dvl_pose: {why}")
+            self._event(f"dvl_pose: {why}")
+            self.dvp.note_fault(t, f"(not a stop) {why}")
+        self._dvp_unobs_said = over
         if st != self._dvp_logged_state:
             if st in (DVP.ST_DR, DVP.ST_LOST) or self._dvp_logged_state in (
                     DVP.ST_DR, DVP.ST_HELD, DVP.ST_LOST):
@@ -3791,6 +3871,8 @@ class MpcWorker(TimerWorker):
         elif not f:
             self._dvp_fault_logged = ""
         w = str(h.get("warn", "") or "")
+        if any(q in w for q in DVP_QUIET_WARN):
+            w = ""                       # (panel + CSV only: DVP_QUIET_WARN)
         if w and _dvp_key(w) != self._dvp_warn_logged:
             self._log("warn", f"dvl_pose: {w}")
             self._dvp_warn_logged = _dvp_key(w)
@@ -9824,7 +9906,7 @@ class MpcWorker(TimerWorker):
                       "(dvl_pose.max_unaided_s and max_blind_s are null, "
                       "operator 2026-10-18): with no tag in view a dead-"
                       "reckoned policy run is bounded only by policy.max_run_s, "
-                      "the pose's own faults (speed / lost / unobserved) and "
+                      "the pose's own faults (speed / lost) and "
                       "YOU (STOP). The workspace box and div_max_m are judged "
                       "in the drifting frame. Set dvl_pose.max_blind_s for a "
                       "time bound.")
@@ -12278,9 +12360,18 @@ class MpcWorker(TimerWorker):
         sm = d.sample
         if sm is not None:
             s.dvl_age_s = max(0.0, t - float(sm.t_valid))
-            s.dvl_alt_m = sm.altitude
+            # the device's altitude, as the CSV's dvl_alt_m (re-review
+            # 2026-10-27); a flown re-solve says so in the DVL button's
+            # tooltip (MpcStatus.dvl_note)
+            dev = d.sample_in if d.sample_in is not None else sm
+            s.dvl_alt_m = dev.altitude
             s.dvl_fom = sm.fom
             s.dvl_hz = sm.hz
+            k = getattr(sm, "beams3", None)
+            # (code ok only: a "rung" row may fly an older held sample)
+            if used and code == "ok" and k is not None:
+                s.dvl_note = (f"{s.dvl_note} · " if s.dvl_note else "") \
+                    + f"3-beam (beam {int(k)} long)"
         s.dvl_res_m_s = d.residual_m_s
 
     def _dvl_row(self, meas, health, t) -> list:
@@ -12500,15 +12591,34 @@ class MpcWorker(TimerWorker):
                     else ["nan"] * 3)
         row = []
         sm = d.sample
+        # dvl_valid / dvl_alt_m are the DEVICE's word (the header note) —
+        # from the bus's sample, not a three-beam re-solve's copy (that one
+        # is marked in dvl_beams3; safety review 2026-10-27)
+        dev = d.sample_in if d.sample_in is not None else sm
         age = t - float(sm.t_valid)
         ok, _why = d.data_ok(t)
         fresh = age <= float(d.cfg["stale_s"])
         row += v3(d.v_body if fresh else None)
-        row += [str(int(bool(ok))), str(int(bool(sm.valid))),
+        row += [str(int(bool(ok))), str(int(bool(dev.valid))),
                 (f"{sm.fom:.5f}" if sm.fom is not None else "nan"),
-                (f"{sm.altitude:.4f}" if sm.altitude is not None else "nan"),
+                (f"{dev.altitude:.4f}" if dev.altitude is not None
+                 else "nan"),
                 f"{age:.3f}"]
         return row
+
+    def _b3_row(self, t) -> list:
+        """dvl_beams3 (schema 25; CSV_HEADER's 2026-10-27 note)."""
+        d = self.dvl
+        if d is None:
+            return [""]
+        try:
+            sm = d.sample
+            if sm is None or t - float(sm.t_valid) > float(d.cfg["stale_s"]):
+                return ["nan"]
+            k = getattr(sm, "beams3", None)
+            return ["-1" if k is None else str(int(k))]
+        except Exception:                                        # noqa: BLE001
+            return ["nan"]
 
     def _publish_dr(self, s: MpcStatus, meas) -> None:
         """Fill the dead-reckoning half of a status row.
@@ -12593,6 +12703,10 @@ class MpcWorker(TimerWorker):
             self._csv_path = path
             self._csv_auto = auto
             self._t0_csv = now()
+            # t=0 on both host clocks (2026-10-27): another process on this
+            # host (./c3 disturb samples.csv: host_epoch_s, t_monotonic_s)
+            # lines up to the row, where run.started only has whole seconds.
+            self._t0_csv_epoch = time.time()
             if not self.engaged:
                 # REC before START: the open-time meta must not show the
                 # PREVIOUS engagement's flight mode as this run's.
@@ -12714,7 +12828,7 @@ class MpcWorker(TimerWorker):
             except OSError:
                 pass
         return {
-            "schema_version": 24,         # 2: + plant, mission, meta_trigger
+            "schema_version": 25,         # 2: + plant, mission, meta_trigger
                                           # 3: + imu_dr, hardware.cam_tilt_deg
                                           # 4: + circle; `trajectory` is now
                                           #    PER-SHAPE (a circle carries
@@ -13181,6 +13295,11 @@ class MpcWorker(TimerWorker):
                                           #    RECORD BOUNDARY: sn_on 1 rows
                                           #    flew a deliberately noised
                                           #    controller state.
+                                          # 25 (2026-10-27): + CSV column
+                                          #    dvl_beams3 (CSV_HEADER's
+                                          #    2026-10-27 note) and meta
+                                          #    dvl.three_beam (re-solve
+                                          #    counts, geometry check).
             # `source` answers "was the plant real". A LAND DRY-RUN is the
             # third answer and needs saying out loud: the vehicle IS the real
             # one, but it could not move and could not be commanded, and the
@@ -13232,6 +13351,9 @@ class MpcWorker(TimerWorker):
             # and re-stamping here made every shipped meta.json claim the run
             # began at the moment it ENDED. Captured at _open_csv instead.
             "run": {"started": self._csv_started,
+                    # CSV t = 0 as time.monotonic() / time.time() (see _open_csv)
+                    "t0_monotonic_s": self._t0_csv or None,
+                    "t0_epoch_s": self._t0_csv_epoch or None,
                     "log_hz": self.cfg.ctrl_hz if self.cfg else None,
                     "csv": (str(self._csv_path) if self._csv_path else None),
                     "rows": self._rows,
@@ -14144,6 +14266,9 @@ class MpcWorker(TimerWorker):
         # THE STATE NOISE (schema 24): what this row added to the
         # controller's state. See CSV_HEADER's 2026-10-19 note.
         row += self._sn_row()
+        # THE THREE-BEAM RE-SOLVE (schema 25). See CSV_HEADER's 2026-10-27
+        # note.
+        row += self._b3_row(t)
         try:
             self._csv.write(",".join(row) + "\n")
             self._rows += 1

@@ -616,13 +616,512 @@ def test_the_gates_each_hold_a_sample_back_and_say_why():
                       # gates nothing, so it is not a pass
                       (_sample(fom=None, t=t), "DVL report lacks fom"),
                       (_sample(alt=None, t=t), "DVL report lacks fom")):
-        d = _proven_aid(reentry_s=0.0)
+        # (min_altitude_m spelled: the default is 0.0 since 2026-10-27)
+        d = _proven_aid(reentry_s=0.0, min_altitude_m=0.05)
         d.use = True
         d.note_sample(s)
         v, why = _vel(d, t)
         assert v is None and why.startswith(needle), (needle, why)
         # the run meta counts fallback rows by the phrase before " ("
         assert not any(ch.isdigit() for ch in why.split(" (")[0]), why
+
+
+BEAM1_LONG = (Path(__file__).resolve().parent / "fixtures"
+              / "dvl_a50_beam1_long_20261027.jsonl")
+
+
+def _beams_for(v, d, B):
+    """Four transducers that a velocity ``v`` (output frame) would give."""
+    bv = B @ np.asarray(v, float)
+    return tuple((float(bv[i]), float(d[i]), True) for i in range(4))
+
+
+def test_three_beam_solves_the_velocity_without_the_one_long_beam():
+    """2026-10-27: one beam reading LONG (a second echo, 1027_194851) is left
+    out and the other three solve the velocity; the altitude is the device's
+    own formula over those three."""
+    B = DV.beam_matrix(180)
+    v = (0.12, -0.07, 0.02)
+    for k in range(4):
+        d = [0.6] * 4
+        d[k] = 1.1
+        kk, v3, alt, why = DV.three_beam(_beams_for(v, d, B), B, 1.5, 1.4,
+                                         0.10)
+        assert kk == k and why == "", (k, why)
+        assert np.allclose(v3, v, atol=1e-9)
+        assert abs(alt - (math.cos(math.radians(22.5)) * 0.6 - 0.015)) < 1e-9
+    # not this case: nothing long, two long, a beam without an echo, a SHORT
+    # beam (the device's own 3-beam population — flag_min_beams)
+    for d, valid in (([0.6] * 4, True), ([1.1, 1.1, 0.6, 0.6], True),
+                     ([0.6, -1.0, 0.6, 0.6], True), ([0.6, 0.3, 0.6, 0.6], True),
+                     ([0.6, 1.1, 0.6, 0.6], False)):
+        b = list(_beams_for(v, d, B))
+        if not valid:
+            b[1] = (b[1][0], b[1][1], False)
+        assert DV.three_beam(tuple(b), B, 1.5, 1.4, 0.10) == (None, None,
+                                                               None, ""), d
+    # refused, and said why: the other three disagree, the geometry is not
+    # known, the solution climbs
+    assert DV.three_beam(_beams_for(v, [0.45, 2.0, 0.7, 0.6], B), B, 1.5,
+                         1.4, 0.10)[3] == "kept"
+    assert DV.three_beam(_beams_for(v, [0.6, 1.1, 0.6, 0.6], B), None, 1.5,
+                         1.4, 0.10)[3] == "offset"
+    assert DV.three_beam(_beams_for((0.1, 0.0, 0.3), [0.6, 1.1, 0.6, 0.6], B),
+                         B, 1.5, 1.4, 0.10)[3] == "vz"
+    # the geometry: 180 = the spec's azimuths turned half a turn (measured);
+    # 0 = the spec; anything else is not guessed
+    assert np.allclose(DV.beam_matrix(0)[:, :2], -B[:, :2])
+    assert DV.beam_matrix(90) is None and DV.beam_matrix(None) is None
+
+
+def _warm_aid(n=80, t0=90.0, B=None, motion=None, **over):
+    """An aid with the device's offset-180 answer and ``n`` clean, moving,
+    device-valid reports behind it (the runtime geometry check's windows) —
+    their beams made through ``B`` (default: the true geometry), the motion
+    ``motion(i)`` (default: a circle, both horizontal axes)."""
+    d = _proven_aid(reentry_s=0.0, **over)
+    d.note_device_config({"mounting_rotation_offset": 180,
+                          "speed_of_sound": 1475})
+    Bt = DV.beam_matrix(180) if B is None else B
+    for i in range(n):
+        v = (motion(i) if motion is not None else
+             (0.10 * math.cos(0.3 * i), 0.10 * math.sin(0.3 * i), 0.01))
+        s = _sample(v, t=t0 + 0.1 * i)
+        s.beams = _beams_for(v, [0.6] * 4, Bt)
+        d.note_sample(s, (0.0, 0.0, 0.0))
+    return d
+
+
+def test_three_beam_fills_the_1027_194851_gap_from_the_real_reports():
+    """The recorded reports at the start of 1027_194851's 1.65 s pose stop:
+    beam 1 reads ~1.0-1.2 m over a 0.5-0.6 m floor and the device calls the
+    report invalid. The aid now flies the other three beams' velocity and the
+    bus's sample is still recognised as the newest (the worker's identity
+    check). Against the tag reference these re-solves were 0.8-3.3 cm/s off
+    where the device's own velocity was 4.3-15.1 (the vehicle was turning at
+    ~21 deg/s, so the velocity really moved between reports) [측정 data/
+    20261027/1027_194851/analysis/three_beam/fixture_vs_tag_reference.txt]."""
+    reps = [json.loads(x) for x in BEAM1_LONG.read_text().splitlines() if x]
+    d = _warm_aid()
+    d.use = True
+    for i, r in enumerate(reps):
+        f = DV.sample_fields(r, t_rx=100.0 + 0.1 * i)
+        s = DvlSample(**f)
+        assert s.beams is not None and len(s.beams) == 4
+        d.note_sample(s, (0.0, 0.0, 0.0))
+        assert d.sample_in is s
+        dd = [b[1] for b in s.beams]
+        if i == 0:
+            assert s.valid and d.sample is s and d.sample.beams3 is None
+        elif i == 1:
+            # invalid, beam 1 long: re-solved, valid, the three's altitude
+            assert not s.valid and dd[1] > 1.5 * 0.6
+            assert d.sample is not s and d.sample.valid
+            assert d.sample.beams3 == 1 and d.sample.v_dvl != s.v_dvl
+            assert abs(d.sample.altitude - (math.cos(math.radians(22.5))
+                       * np.mean([dd[0], dd[2], dd[3]]) - 0.015)) < 1e-9
+            # it reproduces the three kept beams exactly, and does not climb
+            B = DV.beam_matrix(180)
+            bv = B @ np.asarray(d.sample.v_dvl)
+            assert all(abs(bv[j] - s.beams[j][0]) < 1e-9 for j in (0, 2, 3))
+            assert abs(d.sample.v_dvl[2]) < 0.10
+            assert d.v_body is not None and d.sample_in is s
+        elif i == 2:
+            # beams 1 AND 3 long: not this case, the device's word stands
+            assert d.sample is s and not d.sample.valid
+    counts = d.meta()["three_beam"]["counts"]
+    assert counts.get("beam1_invalid", 0) >= 3 and counts.get(
+        "beam1_valid", 0) == 1, counts
+    assert d.meta()["three_beam"]["geometry_known"] is True
+    # a trip on this stretch says it was re-solved (safety review: not a
+    # mount problem by default)
+    d._trip("DVL disagreed with the tag velocity persistently (test)")
+    assert "were three-beam re-solves]" in d.last_trip, d.last_trip
+
+
+def test_a_three_beam_re_solve_only_extends_a_good_stream():
+    """Safety review 2026-10-27 (HIGH): a re-solve has no redundancy, and
+    the jump gate stops judging after stale_s — so a wrong stream could fly
+    on its own. A re-solve now needs the last good sample within stale_s
+    AND the device's own last good 4-beam solution within
+    THREE_BEAM_CHAIN_MAX_S; it never starts or resumes a stream."""
+    B = DV.beam_matrix(180)
+    v = (0.10, 0.02, 0.0)
+
+    def long1(t, valid=False):
+        s = _sample(v, t=t, valid=valid)
+        s.beams = _beams_for(v, [0.6, 1.1, 0.6, 0.6], B)
+        return s
+
+    def clean(t):
+        s = _sample(v, t=t)
+        s.beams = _beams_for(v, [0.6] * 4, B)
+        return s
+    # resumes nothing: a gap past stale_s since the last good sample
+    d = _warm_aid()
+    t = 100.0
+    d.note_sample(clean(t), (0.0, 0.0, 0.0))
+    d.note_sample(long1(t + 0.7), (0.0, 0.0, 0.0))
+    assert d.sample.beams3 is None and not d.sample.valid
+    assert d.meta()["three_beam"]["counts"]["refused_gap"] == 1
+    # extends one, at the report rate, up to the chain cap from the device's
+    # own last good solution — then refuses until a clean one arrives
+    d = _warm_aid()
+    d.note_sample(clean(t), (0.0, 0.0, 0.0))
+    n = 0
+    tt = t
+    while tt < t + DV.THREE_BEAM_CHAIN_MAX_S + 1.0:
+        tt += 0.1
+        d.note_sample(long1(tt), (0.0, 0.0, 0.0))
+        if d.sample.beams3 is not None:
+            n += 1
+            assert tt - t <= DV.THREE_BEAM_CHAIN_MAX_S + 1e-9
+    assert n == int(round(DV.THREE_BEAM_CHAIN_MAX_S / 0.1))
+    c = d.meta()["three_beam"]["counts"]
+    assert c["passed_gates"] == n and c["refused_chain"] >= 5, c
+    # the device's own solution again: the first one after the refused
+    # reports is held by the re-acquisition flag (not flown, not an anchor),
+    # the second flies and re-solves may extend it again
+    d.note_sample(clean(tt + 0.1), (0.0, 0.0, 0.0))
+    d.note_sample(long1(tt + 0.2), (0.0, 0.0, 0.0))
+    assert d.sample.beams3 is None
+    d.note_sample(clean(tt + 0.3), (0.0, 0.0, 0.0))
+    d.note_sample(clean(tt + 0.4), (0.0, 0.0, 0.0))
+    d.note_sample(long1(tt + 0.5), (0.0, 0.0, 0.0))
+    assert d.sample.beams3 == 1
+    # a warm geometry but no good sample yet: nothing to extend
+    d = _warm_aid(t0=0.0)
+    d.note_sample(long1(t), (0.0, 0.0, 0.0))
+    assert d.sample.beams3 is None
+    assert d.meta()["three_beam"]["counts"]["refused_gap"] == 1
+
+
+def test_the_runtime_geometry_check_refuses_beams_it_cannot_reproduce():
+    """Safety review 2026-10-27 (LOW): nothing else notices a firmware that
+    reorders the beams. Clean moving reports whose beams the offset-180
+    geometry does not reproduce (here: made through the beam order shifted
+    by one) keep the check failed — no re-solve; too few reports, the same.
+    Re-review round 3: per-report residuals are blind in some direction for
+    some wrong geometry (an ADJACENT swap on a surge leg, an OPPOSITE-pair
+    swap on a diagonal), so the check fits the beam map over the window and
+    judges it only on motion spanning two horizontal directions; heave is
+    out of the fit (a dive with drift through a wrong geometry stays shut)."""
+    B = DV.beam_matrix(180)
+    v = (0.10, 0.02, 0.0)
+    surge = (lambda i: (0.10, 0.0, 0.0))
+    diag = (lambda i: (0.07, 0.07, 0.0) if i % 2 else (-0.07, -0.07, 0.0))
+    dive = (lambda i: ((0.05, 0.0, 0.20) if i % 2 else (0.0, 0.05, 0.20)))
+    for d, why in ((_warm_aid(B=np.roll(B, 1, axis=0)), "geometry"),
+                   (_warm_aid(n=DV.GEO_MIN_N - 2), "geometry"),
+                   (_warm_aid(B=B[[1, 0, 2, 3]], motion=surge), "geometry"),
+                   (_warm_aid(B=B[[0, 3, 2, 1]], motion=diag), "geometry"),
+                   (_warm_aid(B=B[[0, 3, 2, 1]]), "geometry"),
+                   (_warm_aid(B=np.roll(B, 1, axis=0), motion=dive),
+                    "geometry")):
+        s = _sample(v, t=100.0)
+        s.beams = _beams_for(v, [0.6] * 4, B)
+        d.note_sample(s, (0.0, 0.0, 0.0))
+        s = _sample(v, t=100.1, valid=False)
+        s.beams = _beams_for(v, [0.6, 1.1, 0.6, 0.6], B)
+        d.note_sample(s, (0.0, 0.0, 0.0))
+        g = d.meta()["three_beam"]["geometry_check_now"]
+        assert d.sample is s and not g["ok"], g
+        assert d.meta()["three_beam"]["counts"][f"refused_{why}"] == 1
+    # the right geometry on a single straight line stays shut too (the fit
+    # needs two directions), and opens through a dive with drift (heave out)
+    d = _warm_aid(motion=surge)
+    g = d.meta()["three_beam"]["geometry_check_now"]
+    assert not g["ok"] and g["dev"] is None
+    assert g["excitation_m_s"] < DV.GEO_EXC_M_S <= 0.10
+    assert d.meta()["three_beam"]["geometry_check_now"]["n"] >= DV.GEO_MIN_N
+    assert _warm_aid(motion=dive).meta()["three_beam"]["geometry_check_now"]["ok"]
+    d = _warm_aid()
+    g = d.meta()["three_beam"]["geometry_check_now"]
+    assert g["ok"] and g["dev"] < 1e-9
+    # the worker's log hears it open, and close when the check restarts
+    notes = d.take_three_beam_notes()
+    assert len(notes) == 1 and notes[0][1] == "info"
+    assert notes[0][2].startswith("three-beam re-solve ON")
+    d.note_device_config({"mounting_rotation_offset": 0,
+                          "speed_of_sound": 1475})
+    g = d.meta()["three_beam"]["geometry_check_now"]
+    assert g["n"] == 0 and not g["ok"]
+    notes = [x for _t, _lv, x in d.take_three_beam_notes()]
+    assert len(notes) == 1 and notes[0].startswith("three-beam re-solve OFF")
+    assert d.meta()["three_beam"]["counts"]["geometry_off"] == 1
+
+
+def test_a_wrong_beam_map_after_a_reconnect_is_warned_about():
+    """Re-review round 5: the beam-geometry warning was reachable only after
+    an announced ON on the same connection — which a firmware that reorders
+    the beams cannot produce (the transport stamps every connection, and a
+    new one restarts the check). A judged window that stays a mismatch for
+    GEO_NOTE_DWELL_S is warned about now, once; the right map is not; an
+    offset the station has no geometry for is warned about from the first
+    get_config answer, once per value."""
+    B = DV.beam_matrix(180)
+
+    def circle(d, t0, Bt, conn, n=DV.GEO_N):
+        for i in range(n):
+            v = (0.10 * math.cos(0.3 * i), 0.10 * math.sin(0.3 * i), 0.0)
+            s = _sample(v, t=t0 + 0.1 * i)
+            s.beams = _beams_for(v, [0.6] * 4, Bt)
+            s.conn_id = conn
+            d.note_sample(s, (0.0, 0.0, 0.0))
+    d = _proven_aid(reentry_s=0.0)
+    d.note_device_config({"mounting_rotation_offset": 180})
+    circle(d, 100.0, B, 1)
+    circle(d, 200.0, B[[1, 0, 2, 3]], 2)          # rebooted, beams 0/1 swapped
+    notes = d.take_three_beam_notes()
+    warns = [x for _t, lv, x in notes if lv == "warn"]
+    assert len(warns) == 1 and "do not fit the expected map" in warns[0], notes
+    assert d.meta()["three_beam"]["counts"]["geometry_mismatch"] == 1
+    # the right map after a reconnect: no warning
+    d = _proven_aid(reentry_s=0.0)
+    d.note_device_config({"mounting_rotation_offset": 180})
+    circle(d, 100.0, B, 1)
+    circle(d, 200.0, B, 2)
+    assert not [x for _t, lv, x in d.take_three_beam_notes() if lv == "warn"]
+    # an offset with no known geometry, from the first answer, once per
+    # stretch of that value (re-armed by a known one)
+    d = _proven_aid(reentry_s=0.0)
+    d.note_device_config({"mounting_rotation_offset": 90})
+    d.note_device_config({"mounting_rotation_offset": 90})
+    notes = d.take_three_beam_notes()
+    assert len(notes) == 1 and notes[0][1] == "warn"
+    assert "not 0 or 180" in notes[0][2]
+    d.note_device_config({"mounting_rotation_offset": 180})
+    d.note_device_config({"mounting_rotation_offset": 90})
+    assert [lv for _t, lv, x in d.take_three_beam_notes()
+            if "not 0 or 180" in x].count("warn") == 1
+
+
+def test_the_geometry_check_says_why_it_closed_once_the_state_held():
+    """Re-review round 4: an OFF says WHY (the motion no longer spans two
+    directions / the beams do not fit — a warning / an offset it cannot
+    use), and a state that flips back within GEO_NOTE_DWELL_S says nothing
+    (near a threshold it flipped several times a second)."""
+    B = DV.beam_matrix(180)
+    # excitation lost: a long straight surge after the circle
+    d = _warm_aid()
+    d.take_three_beam_notes()
+    for i in range(DV.GEO_N + 30):
+        v = (0.10, 0.0, 0.0)
+        s = _sample(v, t=200.0 + 0.1 * i)
+        s.beams = _beams_for(v, [0.6] * 4, B)
+        d.note_sample(s, (0.0, 0.0, 0.0))
+    notes = d.take_three_beam_notes()
+    assert len(notes) == 1 and notes[0][1] == "info", notes
+    assert "no longer spans two horizontal directions" in notes[0][2]
+    # the beams stop fitting: first a PAUSE (info — the right geometry
+    # crosses 0.15 now and then), then, once the mismatch has held past
+    # GEO_WARN_DEV, the one calibrated warning (re-review round 6)
+    d = _warm_aid()
+    d.take_three_beam_notes()
+    sw = B[[1, 0, 2, 3]]
+    for i in range(DV.GEO_N):
+        v = (0.10 * math.cos(0.3 * i), 0.10 * math.sin(0.3 * i), 0.0)
+        s = _sample(v, t=200.0 + 0.1 * i)
+        s.beams = _beams_for(v, [0.6] * 4, sw)
+        d.note_sample(s, (0.0, 0.0, 0.0))
+    notes = d.take_three_beam_notes()
+    assert [lv for _t, lv, _x in notes] == ["info", "warn"], notes
+    assert "re-solve paused" in notes[0][2]
+    assert "check the beam geometry" in notes[1][2]
+    # (shown ceiled / floored: never "0.15 (> 0.15)")
+    shown = float(notes[0][2].split("within ")[1].split(" ")[0])
+    assert shown > DV.GEO_DEV_MAX
+    assert d.meta()["three_beam"]["counts"]["geometry_mismatch"] == 1
+    # an offset it cannot use: a warning (once), then the OFF, no promise of
+    # re-confirmation
+    d = _warm_aid()
+    d.take_three_beam_notes()
+    d.note_device_config({"mounting_rotation_offset": 90,
+                          "speed_of_sound": 1475})
+    notes = d.take_three_beam_notes()
+    assert [lv for _t, lv, _x in notes] == ["warn", "info"], notes
+    assert "not 0 or 180" in notes[0][2] and "OFF" in notes[1][2]
+    assert "re-confirmed" not in notes[1][2]
+    # dwell: a flip that reverts within GEO_NOTE_DWELL_S is not said
+    d = _proven_aid(reentry_s=0.0)
+    state = {"ok": False}
+    d._geo_fit = lambda: (DV.GEO_MIN_N, 0.05, 0.0 if state["ok"] else 0.2)
+    for t, ok in ((0.0, True), (1.0, True), (1.5, False), (2.0, True),
+                  (4.1, True), (4.6, False), (5.0, False), (6.7, False)):
+        state["ok"] = ok
+        d._b3_geo_transition(t)
+    said = [(t, x.split(" — ")[0]) for t, _lv, x in d.take_three_beam_notes()]
+    assert said == [(4.1, "three-beam re-solve ON"),
+                    (6.7, "three-beam re-solve OFF")], said
+    # ...while every open / close is counted, said or not
+    c = d.meta()["three_beam"]["counts"]
+    assert c["geometry_opened"] == 2 and c["geometry_closed"] == 2, c
+    assert c["geometry_on"] == 1 and c["geometry_off"] == 1, c
+
+
+def test_beams_are_taken_by_id_not_by_list_position():
+    reps = [json.loads(x) for x in BEAM1_LONG.read_text().splitlines() if x]
+    r = json.loads(json.dumps(reps[1]))
+    a = DV.sample_fields(r, 1.0)["beams"]
+    r["transducers"] = list(reversed(r["transducers"]))
+    assert DV.sample_fields(r, 1.0)["beams"] == a
+    r["transducers"][0]["id"] = 7
+    assert DV.sample_fields(r, 1.0)["beams"] is None
+    # only the JSON integers 0..3 (re-review: _int would truncate 0.2 to 0)
+    for bad in (0.2, "0", True, None):
+        rr = json.loads(json.dumps(reps[1]))
+        rr["transducers"][0]["id"] = bad
+        assert DV.sample_fields(rr, 1.0)["beams"] is None, bad
+    del r["transducers"][0]["id"]
+    assert DV.sample_fields(r, 1.0)["beams"] is None
+
+
+def _b3(v, d, t, valid=True, conn_id=None):
+    s = _sample(v, t=t, valid=valid)
+    s.beams = _beams_for(v, d, DV.beam_matrix(180))
+    s.conn_id = conn_id
+    return s
+
+
+LONG1 = [0.6, 1.1, 0.6, 0.6]
+
+
+def test_a_device_valid_long_beam_report_does_not_renew_the_chain():
+    """Re-review 2026-10-27: a device-VALID report with a long beam flew and
+    re-anchored the chain, so the 3 s cap renewed itself for as long as the
+    beam stayed long. Only a CLEAN device report (four agreeing beams)
+    anchors now."""
+    v = (0.10, 0.02, 0.0)
+    d = _warm_aid()
+    t = 100.0
+    d.note_sample(_b3(v, [0.6] * 4, t), (0.0, 0.0, 0.0))        # the anchor
+    tt, last = t, None
+    for _ in range(80):                                           # 8 s
+        tt += 0.1
+        # the device mostly invalid, valid PAIRS now and then — both with
+        # the long beam
+        valid = int(round((tt - t) * 10)) % 20 in (0, 1)
+        d.note_sample(_b3(v, LONG1, tt, valid=valid), (0.0, 0.0, 0.0))
+        if d.sample.beams3 is not None:
+            last = tt
+    assert last is not None and last - t <= DV.THREE_BEAM_CHAIN_MAX_S + 1e-9
+    # after the cap: refused for the chain, or for the gap once the device's
+    # own long-beam reports (not anchors) are the last good ones and age
+    c = d.meta()["three_beam"]["counts"]
+    assert c.get("refused_chain", 0) + c.get("refused_gap", 0) > 40, c
+
+
+def test_a_three_beam_re_solve_is_never_left_unjudged():
+    """Re-review 2026-10-27: the jump gate judges 0 < dtv <= stale_s only, so
+    a re-solve with the last good sample's own stamp (the t_rx fallback
+    stamps a TCP chunk alike) is refused, not flown unjudged."""
+    d = _warm_aid()
+    d.note_sample(_b3((0.10, 0.0, 0.0), [0.6] * 4, 100.0), (0.0, 0.0, 0.0))
+    s = _b3((0.80, 0.0, 0.0), LONG1, 100.0, valid=False)
+    d.note_sample(s, (0.0, 0.0, 0.0))
+    assert d.sample.beams3 is None
+    assert d.meta()["three_beam"]["counts"]["refused_gap"] == 1
+
+
+def test_heave_alone_never_confirms_the_beam_geometry():
+    """Re-review 2026-10-27: every beam has the same z, so a dive reproduces
+    its beams through ANY azimuth error. The check admits a report on its
+    HORIZONTAL speed: 60 reports of pure heave leave it empty."""
+    B = DV.beam_matrix(180)
+    d = _proven_aid(reentry_s=0.0)
+    d.note_device_config({"mounting_rotation_offset": 180})
+    for i in range(60):
+        s = _sample((0.0, 0.0, 0.08), t=90.0 + 0.1 * i)
+        s.beams = _beams_for((0.0, 0.0, 0.08), [0.6] * 4, np.roll(B, 1, 0))
+        d.note_sample(s, (0.0, 0.0, 0.0))
+    g = d.meta()["three_beam"]["geometry_check_now"]
+    assert g["n"] == 0 and not g["ok"], g
+
+
+def test_a_new_connection_re_confirms_the_geometry_and_the_anchor():
+    """Re-review 2026-10-27: a rebooted device (a new firmware may map the
+    beams differently) answers get_config identically, so the window is
+    cleared on the transport's new connection instead."""
+    v = (0.10, 0.02, 0.0)
+    d = _warm_aid()
+    d.note_sample(_b3(v, [0.6] * 4, 100.0, conn_id=1), (0.0, 0.0, 0.0))
+    d.note_sample(_b3(v, LONG1, 100.1, valid=False, conn_id=1),
+                  (0.0, 0.0, 0.0))
+    assert d.sample.beams3 == 1
+    d.note_sample(_b3(v, LONG1, 100.2, valid=False, conn_id=2),
+                  (0.0, 0.0, 0.0))
+    m = d.meta()["three_beam"]
+    assert d.sample.beams3 is None and m["geometry_check_now"]["n"] == 0
+    # a reset that closes an open check is counted like any close
+    assert m["counts"]["geometry_closed"] == m["counts"]["geometry_opened"]
+    # ...and said once, at once
+    off = [x for _t, _lv, x in d.take_three_beam_notes() if "OFF" in x]
+    assert len(off) == 1 and "a new DVL connection" in off[0], off
+    assert m["counts"]["reset_reconnect"] == 1
+    assert m["counts"]["refused_geometry"] == 1
+
+
+def test_three_beam_is_primary_only_and_ignores_out_of_order_reports():
+    """Legacy is the rollback ladder, bit for bit; an out-of-order report
+    books nothing (re-review 2026-10-27)."""
+    v = (0.10, 0.02, 0.0)
+    d = _warm_aid(selection="legacy")
+    d.note_sample(_b3(v, [0.6] * 4, 100.0), (0.0, 0.0, 0.0))
+    d.note_sample(_b3(v, LONG1, 100.1, valid=False), (0.0, 0.0, 0.0))
+    assert d.sample.beams3 is None and not d.sample.valid
+    assert d.meta()["three_beam"]["on"] is False
+    d = _warm_aid()
+    d.note_sample(_b3(v, [0.6] * 4, 100.0), (0.0, 0.0, 0.0))
+    before = dict(d.n_beams3)
+    d.note_sample(_b3(v, LONG1, 99.0, valid=False), (0.0, 0.0, 0.0))
+    assert dict(d.n_beams3) == before and d.n_out_of_order == 1
+
+
+def test_three_beam_needs_the_device_geometry_and_can_be_switched_off():
+    reps = [json.loads(x) for x in BEAM1_LONG.read_text().splitlines() if x]
+    s = DvlSample(**DV.sample_fields(reps[1], t_rx=1.0))
+    # no get_config answer yet: the offset is unknown -> the device's word
+    d = _proven_aid(reentry_s=0.0)
+    d.note_sample(s, (0.0, 0.0, 0.0))
+    assert d.sample is s and d.meta()["three_beam"]["counts"] == {
+        "refused_offset": 1}
+    # three_beam: false
+    d = _proven_aid(reentry_s=0.0, three_beam=False)
+    d.note_device_config({"mounting_rotation_offset": 180})
+    d.note_sample(s, (0.0, 0.0, 0.0))
+    assert d.sample is s and d.meta()["three_beam"]["counts"] == {}
+    # a report without transducers (the demo backend's) passes untouched
+    d = _proven_aid(reentry_s=0.0)
+    d.note_device_config({"mounting_rotation_offset": 180})
+    plain = _sample(valid=False)
+    d.note_sample(plain, (0.0, 0.0, 0.0))
+    assert d.sample is plain and d.sample_in is plain
+    for bad in ({"three_beam": 1}, {"three_beam_ratio": 0.9},
+                {"three_beam_kept_max": 0.0}, {"three_beam_vz_max_m_s": -1}):
+        try:
+            DV.resolve(bad)
+        except ValueError:
+            continue
+        raise AssertionError(bad)
+
+
+def test_a_valid_report_close_to_the_floor_is_used_by_default():
+    """Operator 2026-10-27 (1027_191909: the pose LOST 3 times on valid
+    reports at 0.03-0.04 m): the device's velocity_valid judges the lock,
+    not the vendor's 5 cm range — only the no-lock -1 is held back."""
+    assert DV.DEFAULTS["min_altitude_m"] == 0.0
+    t = 10.0
+    for alt in (0.03, 0.0):
+        d = _proven_aid(reentry_s=0.0)
+        d.use = True
+        d.note_sample(_sample(alt=alt, t=t))
+        v, why = _vel(d, t)
+        assert v is not None and why == "", (alt, why)
+    d = _proven_aid(reentry_s=0.0)
+    d.use = True
+    d.note_sample(_sample(alt=-1.0, t=t))
+    v, why = _vel(d, t)
+    assert v is None and why.startswith("DVL altitude too low ("), why
 
 
 def test_a_spike_is_not_a_manoeuvre():
@@ -1956,7 +2455,7 @@ def test_with_no_dvl_the_worker_is_what_it_was_and_says_so():
             w.set_dvl_use(True)               # nothing to switch
             assert "no DVL" in w.reason
             m = w._run_meta()
-            assert m["dvl"]["enabled"] is False and m["schema_version"] == 24
+            assert m["dvl"]["enabled"] is False and m["schema_version"] == 25
             rows = _rows(w)
             assert rows and all(r["vel_src"] == "tag_fd" for r in rows)
             assert all(r["dvl_u"] == "nan" and r["dvl_ok"] == "0"
@@ -4013,10 +4512,12 @@ def test_the_csv_header_carries_the_velocity_and_dvl_columns_at_the_end():
     # (2026-10-15, test_att_age pins them) and schema 22's seven DVL-selection columns (2026-10-16): still
     # append-at-end
     # (and schema 23's twenty DVL-pose columns, 2026-10-18, test_dvl_pose_worker pins them;
-    # schema 24's sixteen state-noise columns, 2026-10-19, test_state_noise pins them)
-    assert cols[i + 15] == "est" and len(cols) == i + 15 + 16 + 3 + 1 + 3 + 7 + 20 + 16
-    assert cols[-7 - 20 - 16:-20 - 16] == ["w_dvl", "dvl_code", "dvl_res_fast_m_s", "dvl_res_slow_m_s", "dvl_esc_s",
-                                 "dvl_align", "dvl_scale"]
+    # schema 24's sixteen state-noise columns, 2026-10-19, test_state_noise pins them;
+    # schema 25's dvl_beams3, 2026-10-27, the three-beam re-solve)
+    assert cols[i + 15] == "est" and len(cols) == i + 15 + 16 + 3 + 1 + 3 + 7 + 20 + 16 + 1
+    assert cols[-7 - 20 - 16 - 1:-20 - 16 - 1] == ["w_dvl", "dvl_code", "dvl_res_fast_m_s", "dvl_res_slow_m_s",
+                                         "dvl_esc_s", "dvl_align", "dvl_scale"]
+    assert cols[-1] == "dvl_beams3"
     assert cols.index("vel_src") == cols.index("rp_track") + 1
     assert len(cols) == len(set(cols))
 
@@ -4843,7 +5344,7 @@ def test_the_csv_and_meta_record_the_selection():
     with tempfile.TemporaryDirectory() as tmp:
         w, rows, meta, _logs, _st = _fly_n15(tmp)
         m_all = w._run_meta()
-    assert m_all["schema_version"] == 24
+    assert m_all["schema_version"] == 25
     for r in rows:
         for k in ("w_dvl", "dvl_res_fast_m_s", "dvl_res_slow_m_s",
                   "dvl_esc_s", "dvl_align", "dvl_scale"):

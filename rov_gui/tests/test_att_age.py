@@ -787,10 +787,11 @@ def test_the_csv_columns_and_the_meta(monkeypatch):
     assert cols[i:i + 3] == ["att_age_v_s", "att_tb_ms", "banner_age_s"] and len(cols) == len(set(cols))
     # schema 22 (2026-10-16): the DVL selection's seven follow them (test_dvl pins their meaning), and
     # schema 23 (2026-10-18) the DVL pose's 20 after those (test_dvl_pose_worker pins their meaning),
-    # schema 24 (2026-10-19) the state noise's 16 after those (test_state_noise pins their meaning)
-    assert cols[-7 - 20 - 16:-20 - 16] == ["w_dvl", "dvl_code", "dvl_res_fast_m_s", "dvl_res_slow_m_s", "dvl_esc_s",
+    # schema 24 (2026-10-19) the state noise's 16 after those (test_state_noise pins their meaning),
+    # schema 25 (2026-10-27) dvl_beams3 last (test_dvl pins its meaning)
+    assert cols[-7 - 20 - 16 - 1:-20 - 16 - 1] == ["w_dvl", "dvl_code", "dvl_res_fast_m_s", "dvl_res_slow_m_s", "dvl_esc_s",
                                  "dvl_align", "dvl_scale"]
-    assert cols[-20 - 16:-16] == ["tagfix", "dvp_src", "dvp_ok", "dvp_px", "dvp_py", "dvp_pz", "dvp_yaw_deg", "dvp_u", "dvp_v", "dvp_w", "dvp_err_m", "dvp_err_yaw_deg", "dvp_since_fix_s", "dvp_dist_m", "dvp_gap_s", "dvp_corr_m", "dvp_bias_dps", "dvp_unobs_m", "dvp_blind_s", "dvp_why"]
+    assert cols[-20 - 16 - 1:-16 - 1] == ["tagfix", "dvp_src", "dvp_ok", "dvp_px", "dvp_py", "dvp_pz", "dvp_yaw_deg", "dvp_u", "dvp_v", "dvp_w", "dvp_err_m", "dvp_err_yaw_deg", "dvp_since_fix_s", "dvp_dist_m", "dvp_gap_s", "dvp_corr_m", "dvp_bias_dps", "dvp_unobs_m", "dvp_blind_s", "dvp_why"]
     with tempfile.TemporaryDirectory() as tmp:
         w, bus, pwms, logs, events = _pwm(tmp, "rl_pwm", monkeypatch)
         _engage_healthy(w)
@@ -800,7 +801,7 @@ def test_the_csv_columns_and_the_meta(monkeypatch):
         assert len(row) == len(cols) and float(row["att_age_v_s"]) == pytest.approx(0.05, abs=0.03)
         assert row["att_tb_ms"] == "4242000" and float(row["banner_age_s"]) == pytest.approx(40.0, abs=0.5)
         m = w._run_meta()
-        assert m["schema_version"] == 24
+        assert m["schema_version"] == 25
         a = m["att_age"]
         assert a["estimator"]["drift_ppm"] == 300.0 and a["estimator"]["reboot_gap_s"] == 2.0
         assert a["pwm_gate"]["thresholds"]["age_engage_p99_s"] == 0.12 and a["pwm_gate"]["lows"] == ["rl_pwm",

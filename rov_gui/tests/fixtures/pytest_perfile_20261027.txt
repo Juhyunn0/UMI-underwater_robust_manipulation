@@ -1,0 +1,24 @@
+test_dvl_legacy_replay rc=0 1 passed in 0.76s
+test_dvl_pose_panel rc=0 11 passed in 1.07s
+test_imu_dr rc=0 27 passed in 1.50s
+test_mavlink_rates rc=0 24 passed in 0.17s
+test_att_age rc=0 27 passed in 0.50s
+test_replay rc=0 10 passed in 10.36s
+test_run_scene rc=0 27 passed in 1.78s
+test_rl_pwm_interlocks rc=0 13 passed in 0.48s
+test_plot_runs rc=0 36 passed in 0.57s
+test_dvl_pose_worker rc=0 79 passed in 14.58s
+test_policy rc=0 107 passed in 8.23s
+test_object_nav rc=1 1 failed, 35 passed in 0.59s
+test_station_bridge rc=0 15 passed in 0.21s
+test_rl_velocity_source rc=1 1 failed, 3 passed in 0.15s
+test_vehicle_gyro rc=0 14 passed in 0.18s
+test_dvl rc=0 173 passed in 22.90s
+test_rl_ekf rc=0 41 passed in 1.05s
+test_control rc=0 142 passed in 8.34s
+test_state_noise rc=0 23 passed in 0.76s
+test_rl_pwm_scale rc=0 16 passed in 2.35s
+test_dvl_pose rc=0 177 passed in 61.07s (0:01:01)
+test_offline rc=0 126 passed, 2 warnings in 15.92s
+
+[exited with code 0]

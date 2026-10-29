@@ -89,15 +89,15 @@ data/20261019/1019_211310: 96 s of gates before OFF was allowed, then a
 DvlAid fit hold ended the engaged run in 1.9 s with the vehicle on the
 floor): the DVL is believed as the device reports it, the way a dead
 reckoning on a DVL alone is flown elsewhere. The tags are used to ANCHOR
-(the first position and heading, ``anchor_n`` fixes) and to CORRECT (TAG
-FIX ONCE) — and, since the operator's second decision that evening ("the
-diffusion policy must run even when the DVL and the tags differ a lot"),
-NEVER to end a run or refuse a press: the OFF divergence past abort_* is
-the warning "— TRUST: recorded, not a stop" and one fault record "(trust)
-would have ended: ..." per onset; a correction past max_corr_* while
-engaged is slewed in at corr_rate_* with the record "(trust) would have
-refused: ..."; the ON press and a START are not refused for it
-(tag_refusal, pending_too_big). What strict mode had, trust mode drops:
+(the first position and heading, ``anchor_n`` fixes), to CORRECT (TAG FIX
+ONCE) and to END a run they contradict (What stays, below). (Until
+2026-10-29 this paragraph said that a second decision that evening — "the
+diffusion policy must run even when the DVL and the tags differ a lot" —
+made the divergence abort and the correction limit records, never stops;
+no code ever did: _watch_divergence, _accept, tag_refusal and
+pending_too_big have no trust branch, and a trust test pins the engaged
+correction refusal.)
+What strict mode had, trust mode drops:
   * the DVL switch needs no proving pass — it goes IN by itself when the
     first sample arrives (the worker; the mount from hw_mpc.yaml is taken
     as measured);
@@ -108,19 +108,32 @@ refused: ..."; the ON press and a START are not refused for it
   * a DVL gap makes no HOLE — the pose resumes from where the gap found
     it, and the motion the gap may have hidden (``unobserved_m``: gap time
     beyond hold_s x the speed before it, never below
-    unobserved_v_floor_m_s) is warned until the tags re-anchor. It is
-    bounded once: past max_corr_m it is more than a correction may be while
-    engaged — the ONCE the warning asks for would end the run — so it ends
-    an engaged run / refuses a START there (the ``unobserved`` stop,
-    _watch; safety review 2026-10-19), and a TAG FIX ONCE with tags in
-    view, disengaged, snaps it away;
+    unobserved_v_floor_m_s) is warned until the tags re-anchor (TAG FIX
+    ONCE with tags in view). It NEVER ENDS A RUN: the ``unobserved`` stop
+    of the 2026-10-19 safety review ended an engaged run past max_corr_m
+    (data/20261019/1019_232652/events.log 23:27:03, 11 s into a policy
+    run) until the operator, 2026-10-29: "I am always watching — no need
+    to end it automatically; I will stop it". Disengaged it still refuses
+    a START past max_corr_m (the operator asked only about the run; an
+    outage while disengaged leaves the pose where the gap found it) until
+    a ONCE with tags in view snaps it away. Engaged, crossing max_corr_m
+    is said once (the worker: log file, events, meta "(not a stop)"). The
+    estimate errs one way, high: on the 10-27/28 TAG FIX OFF rows (those
+    past the line all disengaged) it never read <= 25 cm where the tags
+    measured more (0 of 918 rows), and read > 25 cm where they measured
+    <= 25 cm in 1262 of 2180 (1028_152309: up to 147 cm, the tags <= 19.1
+    cm) [측정: data/20261029/1029_unobserved_vs_tag_offline/
+    unobs_vs_err.txt]. With tags in view the divergence abort judges the real
+    error, and an engaged correction past max_corr_* still ends the run
+    (an ON press the tags already show past it is refused in words);
   * OFF does not wait for the gyro bias: it is learnt whenever TAG FIX is
     ON with tags in view, used from the moment it is "ok", and seeded from
     the last session's saved fit (the worker, ``bias_seed_max_age_h``).
 What stays: lost_s (no sample for 1.5 s — plus the worker's 0.4 s stale
 debounce — ends an engaged run: nothing to fly on; a gap that closes
 inside that is flown across), max_dr_speed_m_s, the OFF divergence abort,
-the correction limit (max_corr_*), the heading rules (a gyro late past the
+the correction limit (max_corr_*), the ``unobserved`` START refusal
+(disengaged only), the heading rules (a gyro late past the
 cap, a gyro hole). The worker sets DvlAid.trust with it, so the blend's
 verdict (the assembler's u, v on a tag tick), the panel's DVL state and
 the CSV's dvl_code are the same trusted verdict the pose flies — one
@@ -2710,8 +2723,8 @@ class DvlPose:
     def pending_too_big(self) -> bool:
         """A re-acquisition pending whose newest innovation is past
         max_corr_m / max_corr_yaw_deg (x, y, yaw — what would end a run).
-        Never under trust: such a correction is slewed in there, so it ends
-        nothing and refuses nothing."""
+        Under trust too: the correction limit stays there (module doc, TRUST
+        MODE)."""
         if self._pending_kind != "reacquire" or not self._pending:
             return False
         e = np.asarray(self._pending[-1], float).reshape(-1)
@@ -2866,12 +2879,16 @@ class DvlPose:
             # beside the unaided warning, never over it)
             h["warn"] = ((h["warn"] + " · ") if h["warn"] else "") \
                 + self._gap_warn
-        if c["trust_dvl"] and self._unobs_now > c["max_corr_m"]:
-            # (the one bound trust mode keeps on a gap: more motion may be
-            # hidden than a correction may take in while engaged — the ONCE
-            # the warning asks for would end the run; safety review
-            # 2026-10-19. Disengaged it is a START refusal that a ONCE with
-            # tags in view, which snaps, takes away.)
+        if (c["trust_dvl"] and not engaged
+                and self._unobs_now > c["max_corr_m"]):
+            # (DISENGAGED only — a START refusal: more motion may be hidden
+            # than a correction may take in once engaged, and an outage
+            # while disengaged leaves the pose where the gap found it;
+            # safety review 2026-10-19. A ONCE with tags in view, which
+            # snaps, takes it away. Engaged it ended the run until
+            # 2026-10-29 — the operator, who watches every run, ends it;
+            # module doc, TRUST MODE. The engage-instant step is disengaged,
+            # so a START is still judged on it.)
             stops["unobserved"] = (
                 f"dvl pose: {self._unobs_now * 100:.0f} cm of unintegrated "
                 f"motion since the anchor (DVL gaps; > dvl_pose.max_corr_m "

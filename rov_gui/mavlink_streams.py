@@ -24,9 +24,17 @@ in impl-rates/NOTES.md; in short:
       0 trips, 0 p99 refusals; at ~28 Hz healthy links start being refused (16 checks), at 20 Hz 122
       [유도: impl-rates/out/age_at_rates.json, the station's own VehicleClockMap + PwmInterlocks]. Higher buys
       little: 100 Hz tops out at 0.106 s — the link's transit jitter, not the sample age, dominates.
-  RAW_IMU 20 Hz — the autopilot's LIVE accelerometer (|a| p50 999-1001 mg [측정: rov_stream_scan.json]):
-      the recording beside a depth/controller run (sensorlog *_rov.jsonl), the IMU (ROV) health row (>= 10 Hz),
-      and VehicleImu.ax..az only when SCALED_IMU2 is off. 20 Hz = the snapshot that would read it.
+  RAW_IMU 100 Hz (20 until 2026-10-27) — the autopilot's LIVE accelerometer (|a| p50 999-1001 mg [측정:
+      rov_stream_scan.json]): the recording beside a depth/controller run (sensorlog *_rov.jsonl), the IMU (ROV)
+      health row (>= 10 Hz), and VehicleImu.ax..az only when SCALED_IMU2 is off — and, since 2026-10-18, the
+      --dvl_pose HEADING, which integrates its gyro per RECORD (backends/hardware.py _note_raw_imu). 20 Hz was the
+      snapshot rate, chosen before that consumer existed: a turn that starts inside one 50 ms interval is not in
+      the integral yet, and the pose drops its heading ("the heading lags the tags by 3 deg", gyro_late_deg) —
+      three times in 95 s of manual yaw turns on data/20261027/1027_193604 (mission_log.txt; tag yaw 40-100 deg/s,
+      nav_193604/fixes.csv). 100 Hz = the operator's choice (2026-10-27) over 50 or the ~166-208 Hz ceiling: the
+      interval goes 50 -> 10 ms, the request total 90 -> 170 msg/s, still a third of the ~500 of 10-13. That it
+      makes fewer of those drops is [예측] — 0 pool runs; a 100 Hz request measured 125 Hz on 2026-08-06
+      (rov_gui/README.md).
   SCALED_IMU2 20 Hz — its accel AND gyro are ZERO in every record on this vehicle (27/27 recordings) [측정:
       rov_stream_scan.json], yet it is what VehicleImu.ax..az have always been read from (``ACCEL_SOURCE`` below):
       the EKF's accelerometer, the dobmpc EAOB's nudot and the station bridge's DVL rung. Turning it off — the fix
@@ -40,7 +48,8 @@ in impl-rates/NOTES.md; in short:
       ON at the snapshot rate; ``--mavlink-scaled-imu2-rate 0`` is the deliberate switch (it moves the
       accelerometer to RAW_IMU, see ``ACCEL_SOURCE``).
 
-Requested total: 90 msg/s of IMU stream instead of 600 requested / ~500 delivered. The vehicle sends about what is
+Requested total: 170 msg/s of IMU stream (90 until RAW_IMU went to 100 Hz on 2026-10-27) instead of 600 requested /
+~500 delivered. The vehicle sends about what is
 asked at these rates: the 10 Hz requests arrive 100 ms apart on the vehicle clock on a healthy link [측정:
 impl-rates/out/send_spacing.json], and a 50 Hz request measured 62 Hz on 2026-08-06 (rov_gui/README.md). [예측] ~5x
 less stream traffic keeps one parameter download from filling the vehicle-side queue; pool procedure step 0c
@@ -62,7 +71,7 @@ import math
 STREAMS = ("ATTITUDE", "RAW_IMU", "SCALED_IMU2")
 
 #: Hz per message when its flag is not given (the reasons are the module docstring).
-DEFAULT_HZ = {"ATTITUDE": 50, "RAW_IMU": 20, "SCALED_IMU2": 20}
+DEFAULT_HZ = {"ATTITUDE": 50, "RAW_IMU": 100, "SCALED_IMU2": 20}
 
 #: The lowest value each flag accepts. ATTITUDE never off (every LOW flies on it); RAW_IMU never off (the live
 #: accelerometer, and the only one once SCALED_IMU2 is off); SCALED_IMU2 0 = ask the vehicle to stop sending it.

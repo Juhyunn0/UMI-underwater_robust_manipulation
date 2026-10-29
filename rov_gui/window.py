@@ -76,7 +76,7 @@ import time
 
 import numpy as np
 
-from . import runstore, theme
+from . import logfilter, runstore, theme
 from .bus import DataBus, FrameMailbox, Freshness
 from .imaging import legend_labels
 from .joystick import JoystickReader, apply_deadzone, default_axis_spec
@@ -854,6 +854,9 @@ class MainWindow(QtWidgets.QMainWindow):
                             f"want that.")
             else:
                 self.bus.log.emit("warn", f"ARMED ({t.mode or 'mode unknown'})")
+        elif t.armed is False and self._armed is True:
+            # (the vehicle's own failsafe disarms too — the panel says either)
+            self.bus.log.emit("info", f"DISARMED ({t.mode or 'mode unknown'})")
         self._armed = t.armed
         self._mode = t.mode or ""
 
@@ -1304,8 +1307,9 @@ class MainWindow(QtWidgets.QMainWindow):
             p.mkdir(parents=True, exist_ok=True)
             (p / "mission_log.txt").write_text(
                 f"# rov_gui mission log — {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"# wall-clock stamps; the same lines the MISSION LOG panel "
-                f"showed\n{text}\n", encoding="utf-8")
+                f"# wall-clock stamps; every line of the session — the "
+                f"MISSION LOG panel drew only rov_gui/logfilter.py's "
+                f"whitelist of them\n{text}\n", encoding="utf-8")
         except OSError as e:
             self.bus.log.emit("error", f"mission log not saved: {e}")
 
@@ -1540,15 +1544,20 @@ class MainWindow(QtWidgets.QMainWindow):
         # where a developer can still read it, and out of the operator's log.
         if level == "debug":
             return
-        self.status.showMessage(f"[{level}] {message}", 8000 if level == "info" else 0)
-        # ...and into the MISSION LOG, which is now the only place these
-        # survive on screen. The status bar shows one line for 8 seconds and
-        # then it is gone; stdout is behind whatever terminal launched the
-        # station, and a pool session is usually launched from a desktop icon.
-        # Since the log scrolls (widgets/payload.py), "gone" is no longer an
-        # acceptable place for a warning to go.
-        self.payload.add_event(message if level == "info"
-                               else f"[{level.upper()}] {message}", level)
+        # ...and into the MISSION LOG's record (mission_log.txt) — EVERY line:
+        # stdout is behind whatever terminal launched the station, and a pool
+        # session is usually launched from a desktop icon. What is DRAWN, here
+        # and in the status bar, is logfilter's whitelist (2026-10-28: 86
+        # startup lines buried the DVL temperature the operator was after —
+        # data/20261028/1028_152309/mission_log.txt).
+        tag = "" if level == "info" else f"[{level.upper()}] "
+        shown = logfilter.panel_text(level, message)
+        if shown is not None:
+            self.status.showMessage(f"[{level}] {shown}",
+                                    8000 if level == "info" else 0)
+        self.payload.add_event(
+            tag + message, level, show=shown is not None,
+            shown_as=None if shown in (None, message) else tag + shown)
 
     def _on_mission_event(self, message: str) -> None:
         """A MISSION lifecycle line — engage, start, refuse, follow, stop.
@@ -1556,8 +1565,10 @@ class MainWindow(QtWidgets.QMainWindow):
         Routed apart from `_on_log` so the panel can set it in bold under a
         rule: these are the handful of lines that say what the RUN did, and on
         2026-08-23 the operator could not find them in the wall of pose and
-        device chatter they were mixed into."""
-        self.payload.add_event(message, "mission")
+        device chatter they were mixed into. Session headers and estimator
+        state flips are recorded, not drawn (logfilter.MISSION_QUIET)."""
+        self.payload.add_event(message, "mission",
+                               show=logfilter.mission_shown(message))
 
     # ================================================================== ticks
     def _tick(self) -> None:

@@ -265,8 +265,9 @@ SEA_LEVEL_HPA = 1013.25
 #: bridges with one trapezoid (VehicleWorker._note_raw_imu). Past it, two
 #: endpoint rates cannot stand for the rotation in between — a whole turn can
 #: start and stop inside it — so the interval is counted as a gap and not
-#: integrated. 0.5 s = 10 records of the 20 Hz stream this station asks for
-#: [유도: rov_gui/mavlink_streams.py DEFAULT_HZ]; the state.VehicleImu contract
+#: integrated. 0.5 s = 50 records of the 100 Hz stream this station asks for
+#: (10 at the 20 Hz it asked for until 2026-10-27) [유도: rov_gui/
+#: mavlink_streams.py DEFAULT_HZ]; the state.VehicleImu contract
 #: (n_gyro_gaps) names the same bound.
 GYRO_MAX_DT_S = 0.5
 
@@ -1836,7 +1837,8 @@ class VehicleWorker(TimerWorker):
             return
 
         # WHICH IMU streams, how fast (2026-10-15, rov_gui/mavlink_streams.py):
-        # ATTITUDE 50 / RAW_IMU 20 / SCALED_IMU2 20 Hz by default, where this
+        # ATTITUDE 50 / RAW_IMU 100 (20 until 10-27) / SCALED_IMU2 20 Hz by
+        # default, where this
         # used to ask for all three at --mavlink-rate (200) — ~500 msg/s that
         # a parameter download on 10-13 queued behind. --mavlink-rate N is
         # still that old request. A combination the launch check refuses

@@ -1615,8 +1615,27 @@ SENSORS는 3열 SYSTEM HEALTH 아래에 **나란히** 들어간다(세로로 쌓
   태그 번호를 치고 곧바로 W를 눌러도 기체가 움직인다. 이게 없으면 필드가 W를
   삼켜서 "아무 이유 없이 조종이 안 되는" 상태가 된다. Enter는 확정+포커스 해제.
 * **MISSION LOG**(PAYLOAD 패널 CAMERA TILT 아래): 미션 사건과 **모든 로그 줄**을
-  **벽시계 시각**과 함께 남긴다(`18:29:06  going to tag 79 (1.24 m)`). 나중에
+  **벽시계 시각**과 함께 **기록**한다(`18:29:06  going to tag 79 (1.24 m)`). 나중에
   영상·메모와 맞춰 보라고 monotonic이 아니라 벽시계를 쓴다.
+  * **화면에는 화이트리스트만 그린다**(2026-10-28, 조종사 요청). 시작 한 번에
+    패널이 86줄 — 게인·정책 경로·버튼 매핑·solver probe 같은 설정 기록과, 고른
+    모드를 매번 다시 설명하는 문단 길이의 `[WARN]` 5개 — 이라 정작 보려던 DVL 온도를
+    못 찾았다. 이제 **기록(`mission_log.txt`·stdout)은 전부, 화면은
+    [`logfilter.py`](logfilter.py)가 고른 것만**이다. 화면에 뜨는 것:
+    `error` 전부 · 조종사 동작 거부(`engage refused`, `START TRAJ refused`,
+    `... switch refused`, `ARM ignored`) · ARMED / DISARMED · 차량 STATUSTEXT
+    (`vehicle:`, 누수 경보 경로) · DVL 온도의 **변화**(HOT / back to / status bit 0 /
+    cleared — 현재 값은 SENSORS DVL 행) · DVL IN/OUT · `policy: READY` · 녹화 저장
+    (**런 폴더 한 줄**로 접힘). 미션 줄은 전부 뜨되 세션 머리말(`_event(defer=True)`:
+    `ready:` / `station_bridge ON` / `POSE:` / `ESTIMATOR` / `imu_dr`)과 런 중
+    추정기 상태 깜빡임(`dvl_pose` HELD↔DR, `station_bridge:` fix back, `dvl:`)은
+    기록만 한다. 상태 표시줄도 같은 필터를 따른다. 그날 세션을 이 필터로 다시 보면
+    시작 86줄 중 11줄, 세션 전체 150줄 중 12줄이 그려진다
+    (`data/20261028/1028_152309/mission_log.txt`, 15:10:59까지가 시작 구간).
+  * **대가**: 새로 추가한 `warn`은 `logfilter.PANEL_LOG`에 넣기 전까지 화면에 안
+    뜬다. `error`는 항상 뜬다. 문구로 매칭하므로(`DVP_QUIET_WARN`과 같은 방식)
+    emitter 문구를 바꾸면 화면에서 빠질 수 있다 — `tests/test_logfilter.py`가 그날
+    줄들을 고정한다.
   * **스크롤된다**(2026-08-14, 조종사 요청 "예전 것도 볼 수 있게"). 예전에는
     QLabel이 마지막 12줄만 들고 나머지를 버려서, 2분 전 거부 사유 — 런이
     틀어졌을 때 가장 보고 싶은 그 줄 — 가 그냥 사라졌다. 지금은 세션 전체를
@@ -1646,7 +1665,7 @@ SENSORS는 3열 SYSTEM HEALTH 아래에 **나란히** 들어간다(세로로 쌓
     단계 단어를 되풀이하면 그 부분을 잘라낸다(`pose: lost the object —
     lost — reacquiring` → `pose: lost the object — reacquiring`).
   * **파일로도 저장된다**: 녹화(REC UI / REC NAV)가 멈추거나 창이 닫힐 때
-    그 런 폴더에 `mission_log.txt`로 세션 전체가 쓰인다. 멈춘 시점이 서로 달라도
+    그 런 폴더에 `mission_log.txt`로 세션 전체(화면에 안 그린 줄 포함)가 쓰인다. 멈춘 시점이 서로 달라도
     항상 **그 시점까지 전부**를 다시 쓰므로 조각으로 나뉘지 않는다.
   * 미션 사건은 `events.log`에도 들어가므로 화면과 파일이 다른 이야기를 못 한다.
   * **2026-08-14: 두 배 가까이 커졌다**(조종사 요청 "공간 좀 줄이고 로그 더 크게").
@@ -2404,6 +2423,18 @@ FoundationPose 지연, 드롭아웃 통계, depth 노이즈는 하나도 안 나
 자세한 것은 [README_fisheye_gantry.md](../README_fisheye_gantry.md)의
 "ROV와 나란히 운용 — 태그맵 프레임 위치"와 KNOWN_ISSUES.
 
+### 갠트리로 외란을 만든다면 — `./c3 disturb` (2026-10-22)
+
+갠트리에 Damiao 회전 모터와 외부 T200을 달아 **제트 외란을 만드는** 실험이라면
+`./c3 gantry`가 아니라 `./c3 disturb`를 띄운다(`src/disturbance_panel.py`,
+[docs/DISTURBANCE_RIG.md](../docs/DISTURBANCE_RIG.md)). 갠트리·모터·스러스터를 한 창에서
+수동 조작하고 `data/YYYYMMDD/MMDD_HHMMSS_disturb/`에 기록한다. 둘은 같은 FMC4030 연결을
+두고 **배타적**이고(동시에 못 띄움), 좌표계도 다르다(disturb = 컨트롤러 카운터 mm, 축 끝에서
+가르친 `−X home`/`+X home`이 소프트 리밋; gantry = home reference·axis_sign 사용자 프레임). 장치 코드는 동료의 `~/Desktop/whisker_vision`
+링크를 경로로 import하므로 그 폴더가 있어야 하고 `whisker` conda env로 돈다(`./c3 env`가 둘 다
+보여 준다). 여기서 "disturbance"는 외란 **발생 장치**이고, 이 README 다른 곳의 disturbance는
+DOB/EAOB **추정** 외란이다.
+
 ## IMU만으로 얼마나 가나 — `--imu-dr` (2026-08-17)
 
 **질문**: 태그를 끊고 C3의 BNO086만으로 state를 갱신하면 얼마나 오래 쓸 만한가.
@@ -2766,11 +2797,51 @@ DVL 가속도가 2점 차분이라 잡음이 커서 추정이 **0 쪽으로 치�
 |---|---|---|
 | `stale_s` | 0.6 s | [예측] 벤더 예시 리포트 1건이 전송 시점에 이미 0.19 s 묵은 것 [스펙 예시], 0.6 m 이하 15 Hz·3 m 이하 10 Hz [스펙], periodic cycling이 10 s마다 몇 개를 버림 [스펙] |
 | `fom_max` | 0.05 m/s | [예측] 장치가 주는 속도 정확도. 이 풀에서 얼마가 나오는지 모른다 |
-| `min_altitude_m` | 0.05 m | [스펙] A50 고도 범위 5 cm~. **착저하면 lock을 잃는다** |
+| `min_altitude_m` | 0.0 m | 2026-10-27 운용자 결정: 장치가 valid라고 보낸 샘플은 고도와 무관하게 쓴다(음수 = lock 상실 −1만 거부). 1027_191909에서 valid 리포트(0.03–0.04 m)를 이 게이트가 3번 거부해 pose LOST. 옛 값 0.05 = [스펙] A50 고도 범위 5 cm~ |
 | `v_max_m_s` | 1.5 m/s | [예측] sanity. 원시값과 lever-arm 보정 후 값 둘 다에 적용 |
 | `reentry_s` | 0.5 s | [예측] 이만큼 연속으로 좋아야 (다시) 쓴다. `stale_s`보다 긴 침묵 뒤에도 다시 센다 |
 
 lock을 주장하는 리포트에 fom이나 altitude가 **없으면 실패**로 본다(fail-closed).
+
+**3빔 재계산 (`three_beam`, 2026-10-27, 기본 켬, primary 전용):** 빔 하나만 **길게** 튀면(거리 > `three_beam_ratio`
+1.5 × 나머지 셋의 중앙값 — 바닥의 ~2배를 읽는 두 번째 반향 등) `DvlAid`가 그 빔을 빼고 나머지 세 빔의 빔속도로 속도를
+다시 푼다 — 장치가 invalid라 했든 valid라 했든. 사본 샘플이 `valid`, 세 빔의 고도(`cos22.5°·mean − 0.015 m`, 장치 공식),
+`beams3` = 뺀 빔을 갖고, 위 게이트와 품질 플래그는 그 사본을 판정한다(전송 계층의 `DvlSample`은 장치 값 그대로). 하지
+않는 경우: 반향 없는 빔(−1)·`beam_valid` false(장치 자신의 3빔 — `flag_min_beams`가 막는 그 집단)·짧은 빔·긴 빔 둘 이상,
+남은 셋이 `three_beam_kept_max` 1.4 넘게 어긋남(사실상 ~22–30° 넘는 기울기 컷), 해의 |v_z| > `three_beam_vz_max_m_s`
+0.10(사실상 상하 이동 컷), 장치 `mounting_rotation_offset`이 0/180이 아님(180 실측, 0은 [유도]), `dvl.selection: legacy`
+(롤백 사다리는 그대로). 3빔 해는 미지수 3개에 식 3개라 **한 리포트 안에서는 맞는지 알 길이 없다**(kept_max·vz_max는
+자기검증이 아니다 — 뺀 빔의 맞은편 빔 오차는 v_z에 안 보인다). 그래서 **이어 붙이기만** 한다(안전 리뷰·재검증
+2026-10-27): 직전 좋은 샘플이 `stale_s` 안이고 같은 시각이 아님(점프 게이트가 판정할 수 있게), 장치 자신의 **깨끗한**
+(네 빔이 바닥에 대해 일치하는) 좋은 4빔 해가 `THREE_BEAM_CHAIN_MAX_S` 3 s 안 — 끊긴 스트림을 3빔으로 시작·재개하지 않고,
+긴 빔이 섞인 장치 해는 기준점이 못 된다. 또 **빔 기하가 이번 연결에서 확인돼야** 한다(`GEO_*`): 깨끗한 장치 valid
+리포트 중 수평으로 3 cm/s 이상 움직이는 것 최근 200개로 "장치 수평 속도 → 빔 속도의 수평 성분" 4×2 사상 H를 최소제곱으로
+맞추고, 30개 이상이며 그 운동이 **두 수평 방향에 퍼져** 있을 때(약한 주축 rms ≥ 1.5 cm/s)만 판정해 max|H − B| ≤ 0.15면
+연다. 리포트별 잔차 중앙값(앞의 두 규칙)은 어떤 틀린 기하에는 어떤 방향이 보이지 않는다 — 인접 빔 교환은 축 방향 직선,
+마주 보는 쌍 교환은 대각선(3차 재검증). 상하 이동은 사상에서 빠진다(Janus에서 빔 평균 = cos22.5°·v_z). 새 TCP 연결·
+offset·음속 변경 때마다 다시 확인한다(재부팅한 장치의 새 펌웨어가 빔 순서를 바꿀 수 있다; 빔은 JSON 정수 `id` 0–3으로
+정렬). **제자리 유지만 하거나 직선 한 줄만 다니는 세션에서는 열리지 않는다** — 그때는 예전처럼 장치 값(긴 빔이면 포즈
+HELD)이고, 미션 로그에는 상태가 2 s 유지된 뒤 `dvl: three-beam re-solve ON/OFF …` 한 줄이 남는다(재연결·설정 변경은 즉시;
+OFF는 원인을 말한다 — 운동 부족이나 0.15를 넘은 일시 중지는 info; 그래서 3빔이 ON 줄보다 최대 2 s 먼저 날 수 있고, 2 s가 안
+되는 짧은 열림은 줄 없이 CSV `dvl_beams3`와 집계 `geometry_opened/closed`에만 남는다). warn은 둘뿐이다: 창이 판정된
+채 맞춘 사상이 기대 기하에서 0.40 넘게 2 s 벗어나 있으면 ON이 있었든 없든 한 번 **warn**("check the beam geometry")을 남기고
+(재부팅한 펌웨어가 빔 순서를 바꾼 경우), offset이 0/180이 아니면 첫 설정 응답부터 한 번 warn — 맞는 기하는 로그 136개·임의
+시작 창 898개에서 0번 경고했고, 빔 0/1 교환은 판정된 시작 창 749개 중 719개에서 경고했다 [측정: data/20261027/1027_194851/
+analysis/three_beam/geometry_notes_check.txt, geometry_notes_anystart.txt]. 근거: 태그 기준 속도와 비교,
+10-15/19/27 136런 — 장치 invalid + 긴 빔 하나 3빔 p50/p90 1.23/7.50 cm/s vs 0으로 멈춤 7.28/12.24; 틀린 빔 순열 23개
+(offset 0 포함)는 136개 로그의 창 시작점 898곳(×23 순열)·로그 시작·하루 단위 어디서도 검증을 못 열었다 — 다만 재연결을
+닮은 "임의 시작 창"에서는 틀린 기하의 최소 편차 0.268(임계값 0.15의 1.8배 [유도])인데 맞는 기하도 p99 0.157·최대 0.588까지
+가서 두 분포가 겹치고, 0.15에서 맞는 기하가 판정된 162 808걸음 중 1 787걸음 닫힌다(로그마다 새 창이면
+0.453 vs 0.245); 임계값 0.25까지 0건, 0.30에서 3건, 0.40에서 20건이 열리니 0.25 넘게 올리지 말 것; 맞는 기하가 열려 있던
+비율은 3빔 가능 리포트의 59.7 %(로그마다 새 창)–99.7 %(하루 한 창);
+실제 `DvlAid` 재생(위 규칙 전부 포함)에서 1027_194851의 1.65 s 포즈 정지 오차 30.0 → 9.0 cm [측정: data/20261027/
+1027_194851/analysis/three_beam/, README.md가 파일 목록; 기하는 geometry_check_v4_dev_sweep.txt·_dev_wide.txt·_margin.txt]. 기록: CSV `dvl_beams3`(schema 25; −1 = 장치 해, 0–3 = 그 빔을 빼고 다시 품 — 다른 dvl_* 열처럼
+**최신 샘플**을 말한다, 그 행의 `dvl_valid`·`dvl_alt_m`은 장치 값), meta `dvl.three_beam`(**세션 전체** 집계: 만듦 `beam<k>_*`,
+게이트 통과 `passed_gates`/보류 `held_by_gates` — 실제로 날았는지는 CSV `vel_src`, 거부 사유 `refused_*`, 기하 검증 열림/닫힘
+`geometry_opened`/`geometry_closed`(모든 전환)·`geometry_on`/`geometry_off`(로그에 말한 것)·`geometry_mismatch`(경고);
+`geometry_check_now`는 meta를 쓴 순간(engage·CSV 닫힘)의 창 상태일 뿐 런 전체가 아니다),
+궤적 패널 DVL 버튼 툴팁 "3-beam (beam k long)"(그 틱에 3빔이 실제로 쓰일 때, dvl_code ok). shadow EKF는 3빔으로 대체된 리포트를 아예 받지 않는다(장치 원본은 아무도 판정하지
+않았으므로; `_ekf_inputs.jsonl`의 `b3`). 바닥 근처에서 네 빔이 다 반향을 잃는 경우는 못 메운다.
 
 지연은 **줄어든다고 가정하지 말 것**. 장치 문서의 예시 한 건은 `time_of_transmission −
 time_of_validity = 189 ms`다. 태그 경로의 지연(≈130 ms + LPF 44 ms)과 같은 크기라, DVL의 이득은
@@ -3026,7 +3097,7 @@ replay 재현 / panel). 실기 런 0회.
 `dvl_pose.mode: control`만으로는 shadow로 뜬다 — 추측항법 폐루프는 명령줄로만 켠다(imu_dr 규칙).
 `--source hw`에서 RAW_IMU 요청이 5 Hz 미만이면 시작을 거부한다(`DVL_POSE_MIN_RAW_IMU_HZ`).
 
-### TRUST 모드 — `--dvl-trust` (2026-10-19, 운용자 결정; **실기 0런**)
+### TRUST 모드 — `--dvl-trust` (2026-10-19, 운용자 결정; 실기 engaged 35런 — 10-19 24·10-27 11, 최장 627.8 s [측정: data/20261029/1029_unobserved_vs_tag_offline/trust_runs.txt]; 폐루프 DR 오차는 CSV `dvp_err_m`에 기록됐지만 분석 산출물은 없다)
 
 ```
 ./c3 gui --source hw --allow-command --mpc --dvl_pose --dvl-trust    # DVL을 장치가 보고하는 대로 믿는다
@@ -3043,18 +3114,20 @@ replay 재현 / panel). 실기 런 0회.
 | DVL 스위치 IN | proving pass(전진+측면 60쌍, 축별 2.5 cm/s) 뒤 버튼 | 첫 샘플에 **한 번 자동 IN**. 장착(`dvl.mount_*`)은 잰 값으로 친다. 운용자가 OUT으로 내리면 그대로 OUT(틀린 DVL을 손으로 빼는 유일한 길) |
 | TAG FIX OFF | 앵커 + 자이로 바이어스 60 s(`bias ok`) | 앵커(fix 5개, ~0.3 s)만. 바이어스는 ON 동안 계속 배우고, 지난 세션 저장값(`data/dvl_pose_gyro_bias.json`, 12 h 안)으로 시드 |
 | DvlAid 보류(dis_diff/align/fit)·래치 | 샘플 거부 → 0.45 s HELD → 1.5 s LOST → 런 종료 | DR에 영향 없음. 판정은 기록만 된다(TRIPPED 로그 줄에 "recorded only"). blend·패널·CSV `dvl_code`도 같은 trust 판정을 보여 준다(`DvlAid.trust`) — 태그 tick과 DR tick의 속도원이 갈리지 않게 |
-| DVL 공백 > 1.5 s(앵커 뒤) | 구멍: 태그 재앵커 전 START 거부 | 구멍 없음. 공백이 끝나면 그 자리에서 이어 가고, 태그가 재앵커할 때까지 "flown across" 경고 + `dvp_unobs_m` 기록. 단 하나 남는 한계: 공백 동안 숨은 이동의 추정치(`unobserved_m`)가 **25 cm(`max_corr_m`)를 넘으면** engaged 런은 끝나고 START는 거부된다 — 그만큼은 engaged 중 보정으로 받아들일 수 없어 ONCE를 눌러도 런이 끝나기 때문. disengaged에서 태그를 보며 ONCE(snap)를 누르면 풀린다 |
+| DVL 공백 > 1.5 s(앵커 뒤) | 구멍: 태그 재앵커 전 START 거부 | 구멍 없음. 공백이 끝나면 그 자리에서 이어 가고, 태그가 재앵커할 때까지 "flown across" 경고 + `dvp_unobs_m` 기록. 공백 동안 숨은 이동의 추정치(`unobserved_m`)는 **engaged 런을 끝내지 않는다**(2026-10-29 운용자 결정 — "어차피 내가 항상 관찰하고 있으니까 굳이 자동으로 끝낼 필요없어 내가 멈출거야"; 그 전에는 25 cm(`max_corr_m`)에서 끝냈다 — 10-19 policy 런 하나가 engage 11 s 만에 이것으로 끝났다 [측정: data/20261019/1019_232652/events.log 23:27:03]). **disengaged에서는 25 cm를 넘으면 지금도 START를 거부한다** — 태그를 보며 ONCE(snap) 한 번이면 풀린다(운용자는 런 종료만 말했고, disengaged 중 긴 공백 — 들어 올리거나 손으로 옮김 — 뒤의 포즈는 공백 전 자리 그대로다). 추정치는 한쪽(과대)으로만 틀린다: 10-27/28 TAG FIX OFF 행(25 cm를 넘은 행은 전부 disengaged)에서 태그 대비 오차가 25 cm를 넘은 918행은 추정도 모두 25 cm를 넘었고, 추정이 25 cm를 넘은 2180행 가운데 1262행은 실제 오차가 25 cm 이하였다(1028_152309: 추정 147 cm까지, 오차 ≤ 19.1 cm) [측정: data/20261029/1029_unobserved_vs_tag_offline/unobs_vs_err.txt]. engaged 중 25 cm를 넘는 순간은 한 번 기록된다(미션 로그 파일·events·meta `(not a stop)` — 패널에는 안 뜬다). 태그가 보이면 발산 정지가 실제 오차를 본다. engaged 중 25 cm 넘는 보정(ONCE의 재획득)은 지금도 런을 끝낸다 — 큰 보정은 disengaged에서(snap) |
 | 남는 정지 | 전부 | 태그가 보일 때 포즈–태그 25 cm·10° 발산 정지, DR 중 DVL 0.30 m/s, engaged 중 샘플 1.5 s 없음(`lost_s`), 헤딩 규칙 |
 | 속도 blend `nu[0:2]` — `--dvl` 단독도 (`dvl.trust`, 2026-10-19 저녁) | 불일치 hold(dis_diff/align/fit)가 샘플을 빼고 0.5 s에 걸쳐 태그 FD로 페이드; 에스컬레이션 래치 = 그 런의 DVL 끝 | hold 없음 — 데이터 게이트·품질 플래그·장치 설정 변경 래치만(0.5 m/s 미만에서는 태그 교차 검사 없음); 래치는 기록만(스위치 IN 유지, 다음 래치도 기록, 다음 engage도 arm; IN USE 노트에 "latched, recorded only"). `--dvl-trust`가 `dvl.trust`와 `dvl_pose.trust_dvl`을 함께 덮는다; IN은 버튼(자동 IN은 pose control에서만) |
 
 **trust의 비용**: 틀린 DVL(장착·배율·장치가 표시하지 않는 false lock)은 **태그가 보일 때만** 잡힌다. 태그 없이 나는 동안은 어느
-DR과 같다. 바닥에 닿으면(고도 < 5 cm) lock이 없어 DR이 없는 것은 두 모드가 같다 — 10-19 런이 선 자리다. 정지한 채 DVL이 13 s 넘게
-끊기면(바닥) 추정 이동이 2 cm/s × 공백으로 25 cm를 넘어 START가 거부된다 — 태그를 보며 ONCE 한 번이면 풀린다.
+DR과 같다. 바닥에 닿으면(고도 < 5 cm) lock이 없어 DR이 없는 것은 두 모드가 같다 — 10-19 런이 선 자리다. engaged 중 DVL 공백 동안의
+이동은 경고(TAG FIX 버튼 툴팁의 note, CSV `dvp_why`·`dvp_unobs_m`)로만 남고 런을 끝내지 않는다(2026-10-29) — 태그가 안 보이면 그 이동은
+운용자의 눈 말고는 아무것도 못 잡는다. 런이 끝난 뒤 추정이 25 cm를 넘어 있으면(정지한 채 DVL이 13 s 넘게 끊겨도 2 cm/s × 공백으로 넘는다)
+다음 START가 거부된다 — 태그를 보며 ONCE 한 번이면 경고와 함께 풀린다.
 저장된 바이어스는 같은 헤딩 소스·±0.5°/s 안·세션 기준(60 s·200 fix) 이상의 fit일 때만 시드한다.
 meta `dvl_pose.trust_dvl`, `gaps_trusted`, `bias_seed`가 어느 모드였는지 말한다. safety-code-reviewer 1회(HIGH 2 → 수정: 자동 IN은
-한 번뿐·OUT 유지, `unobserved` 정지; MEDIUM 5 → 수정: 한 속도 판정, 경고 유지, strict에는 시드 없음, 시드 한계, 파일 쓰기).
+한 번뿐·OUT 유지, `unobserved` 정지(2026-10-29부터 START 거부만 — engaged 런은 끝내지 않는다); MEDIUM 5 → 수정: 한 속도 판정, 경고 유지, strict에는 시드 없음, 시드 한계, 파일 쓰기).
 
-### DP를 DVL 추측항법 위에서 — `--policy-dr` (2026-10-19, 운용자 결정; **실기 0런**)
+### DP를 DVL 추측항법 위에서 — `--policy-dr` (2026-10-19, 운용자 결정; 실기 engaged 29런 — 10-19 18·10-27 11, 플랜이 나온 런 24 [측정: data/20261029/1029_unobserved_vs_tag_offline/trust_runs.txt]; 폐루프 결과는 분석 안 됨)
 
 ```
 ./c3 gui --source hw --allow-command --mpc --fstereo --policy --fstereo-scale 0.5 --fstereo-process --dvl_pose --dvl-trust --policy-dr
@@ -3070,7 +3143,7 @@ meta `dvl_pose.trust_dvl`, `gaps_trusted`, `bias_seed`가 어느 모드였는지
 | `--dvl_pose` control의 DR/HELD tick | bridged: 플랜 `skip_bridge`, 1.5 s 뒤 "POLICY bridged too long — stopped" | bridged 아님. **DR tick = 앵커**: 태그가 보이든 말든 정책에 `fix_fresh`(stamp = **tick 시각**, eta = 그 tick에 난 DVL 포즈)로 알려 proprio 이력에 tick마다 한 행 — 태그 유무에 따라 stamp 규칙이 갈리지 않는다(리뷰 #2). **HELD tick(DVL 샘플 0.45 s 없음, 포즈 동결)은 행을 넣지 않는다**(리뷰 #3: "정지" 가짜 운동 단서) — 정지도 아니고 앵커도 아니다; `lost_s` 1.5 s면 런이 끝난다. ARM 줄에 `ON THE DVL POSE (--policy-dr) … blind bound …` |
 | 태그 dropout 사다리(station bridge)·`--imu-dr` control | bridged 그대로 | bridged 그대로(1.5 s 정지도 그대로) |
 | 포즈가 없는 tick(LOST/FAULT, blind 재획득 대기) | 이력에 안 넣음 | 같음(앵커 아님). 포즈 fault는 `lost_s` 1.5 s 디바운스로 런을 끝낸다 |
-| 남는 정지 | 전부 | DVL 포즈 자체의 정지(태그가 보일 때 25 cm·10° 발산, DR 중 0.30 m/s, engaged 중 샘플 1.5 s 없음, trust의 `unobserved` 25 cm)·`max_run_s`·워커 침묵 — 그대로. **태그가 안 보이는 DR 비행의 시간 한계는 없다**(`dvl_pose.max_unaided_s`/`max_blind_s` null, 운용자 2026-10-18): `div_max_m`과 작업공간 박스는 흘러가는 좌표계 안에서 판정되므로 드리프트를 못 잡는다(안전 리뷰 HIGH, 운용자 결정으로 수용 — setup에 경고, meta `policy.dr_pose.blind_bound_s`). 시간 한계를 원하면 `dvl_pose.max_blind_s`(초) 한 줄 |
+| 남는 정지 | 전부 | DVL 포즈 자체의 정지(태그가 보일 때 25 cm·10° 발산, DR 중 0.30 m/s, engaged 중 샘플 1.5 s 없음; trust의 `unobserved` 25 cm는 2026-10-29부터 START 거부만)·`max_run_s`·워커 침묵 — 그대로. **태그가 안 보이는 DR 비행의 시간 한계는 없다**(`dvl_pose.max_unaided_s`/`max_blind_s` null, 운용자 2026-10-18): `div_max_m`과 작업공간 박스는 흘러가는 좌표계 안에서 판정되므로 드리프트를 못 잡는다(안전 리뷰 HIGH, 운용자 결정으로 수용 — setup에 경고, meta `policy.dr_pose.blind_bound_s`). 시간 한계를 원하면 `dvl_pose.max_blind_s`(초) 한 줄 |
 
 **절차**(수조): ① 태그를 보며 ~1 s(앵커 fix 5개; trust면 바이어스 대기 없음) → ② HIGH = Diffusion Policy, ckpt 선택, LOW = 추종자 →
 ③ **TAG FIX OFF**(버튼 `TAG FIX OFF`, 상태 칩 `pose:DVL`; 보정 슬루 중엔 거부) → ④ START. 이제 x·y·yaw는 DVL+자이로만이고 태그는
@@ -3222,6 +3295,11 @@ e2e: `rov_gui/tests/demo_e2e_dvl_pose_policy.py`(stub 정책, OFF → START → 
   하나의 진동은 넘기지 않는다; square 패널의 기본 속도가 0.10 m/s다). 단 **샘플 하나라도 두 배(0.60 m/s)**를
   넘으면 그 tick에 종료한다 — 평균이 말하기 전에 false lock이 ~0.3 m를 적분한다.
 - 태그 없이 20 s(`warn_unaided_s`)면 경고만, `max_unaided_s`(기본 null)를 주면 그 시간에 종료.
+- **미션 로그에 안 쓰는 경고 3종**(2026-10-27 운용자 요청 — TAG FIX OFF 세션에서 1–2 s마다 한 줄씩 로그를 채웠다):
+  `… deg from the tags`(OFF 발산 경고), `… since the last tag correction`, `… flown across (trust mode)`.
+  패널 note와 CSV `dvp_why`에는 그대로 남는다. fault와 START 거부(`unintegrated motion … > max_corr_m`)는
+  경고가 아니라 지금도 로그에 쓴다(`workers.DVP_QUIET_WARN`). 그 `unintegrated motion` 정지는 2026-10-29부터 disengaged에서만
+  난다(START 거부) — engaged 런은 그것으로 끝나지 않는다.
 - 포즈 fault는 그 tick에 포즈가 없어도 즉시 종료한다(stale debounce가 삼키지 않게). POLICY OBSERVE(LOW
   None)는 명령을 안 내므로 포즈 fault로 끝나지 않는다(EKF와 같은 규칙).
 - 기존 인터록(무장·모드·자세 천장·pwm 인터록)은 그대로. station bridge는 control 모드에서 돌지 않는다
@@ -3513,7 +3591,7 @@ ArduSub은 `BATT_CAPACITY`와 전류 모니터가 설정돼 있지 않으면 `ba
 | 장치 | 오토파일럿(Navigator) | C3 온보드 BNO086 |
 | 경로 | MAVLink `RAW_IMU` / `SCALED_IMU2` | DepthAI IMU 큐 |
 | 시계 | 기체 `time_boot_ms` | **이미지와 같은 시계** (`dai.Clock`) |
-| 기본 요청 | 메시지별: `ATTITUDE` 50 · `RAW_IMU` 20 · `SCALED_IMU2` 20 Hz (2026-10-15; 그 전엔 셋 다 200 Hz) | 200 Hz (`--c3-imu-rate`) |
+| 기본 요청 | 메시지별: `ATTITUDE` 50 · `RAW_IMU` **100** · `SCALED_IMU2` 20 Hz (2026-10-27 RAW_IMU 20→100; 2026-10-15 메시지별; 그 전엔 셋 다 200 Hz) | 200 Hz (`--c3-imu-rate`) |
 | 실측 천장 | **~208 Hz** | **~486 Hz** (스탠드얼론) |
 
 * **ROV IMU**(실측 2026-08-06, `SET_MESSAGE_INTERVAL`): 기본 2-3 Hz · 요청 50 → 62 ·
@@ -3524,8 +3602,8 @@ ArduSub은 `BATT_CAPACITY`와 전류 모니터가 설정돼 있지 않으면 `ba
 * **2026-10-15부터 메시지별 요청**(`rov_gui/mavlink_streams.py`, 운용자 승인 1c): 예전 요청(셋 다
   `--mavlink-rate` 200)은 기체가 각 ~166.6 Hz 로 보내 **모든** BlueOS 엔드포인트에 ~552 msg/s 중 ~500 이 IMU 스트림이었고
   [측정 기록 27개(2026-08-09..10-13), `RL_controller/logs/eval/station_fix_20261015/impl-rates/out/rov_stream_scan.json`], 10-13 에는 다른
-  클라이언트의 파라미터 다운로드 때마다 그 위로 차량 쪽 큐가 섰다. 지금은 `--mavlink-att-rate` 50 · `--mavlink-imu-rate` 20 ·
-  `--mavlink-scaled-imu2-rate` 20 Hz(요청 합 90 msg/s), `--mavlink-rate N` 은 **예전 요청 그대로**(셋 다 N; 메시지별 플래그와
+  클라이언트의 파라미터 다운로드 때마다 그 위로 차량 쪽 큐가 섰다. 지금은 `--mavlink-att-rate` 50 · `--mavlink-imu-rate` **100**(2026-10-27까지 20) ·
+  `--mavlink-scaled-imu2-rate` 20 Hz(요청 합 170 msg/s; 10-27까지 90), `--mavlink-rate N` 은 **예전 요청 그대로**(셋 다 N; 메시지별 플래그와
   같이 주면 시작 거부). ATTITUDE 50 Hz 근거: 모든 LOW 가 20 Hz 틱마다 한 번 읽고, pwm LOW 의 나이 게이트는 샘플 자체의 나이도
   센다 — 건강한 기록 21개를 ~47–50 Hz 로 솎아 재생하면 틱 나이 p99 0.069–0.086 s(166 Hz 그대로는 0.058–0.078 s), 10 s 이동
   p99 최대 0.110 s < 거부 0.12 s, 트립 0; ~28 Hz 부터 건강한 링크도 거부(6355회 중 16회) [유도 `…/impl-rates/out/
@@ -4029,7 +4107,7 @@ z는 CAD 수직 [유도], y=0 [예측])이고 렌즈에서 0.338 m / 광축 아�
   행이 fresh fix가 아니면 추론하지 않는다. **예외(2026-10-19): `--policy-dr` / `policy.allow_dr_pose`** —
   `--dvl_pose` control의 DR/HELD tick은 bridged가 아니라 앵커(그 tick에 난 DVL 포즈, stamp = tick 시각);
   태그 dropout 사다리와 `--imu-dr` control은 그대로 bridged. meta `policy.dr_pose`·
-  `gates_enforced.bridge_stop_dr_pose`, 플랜 줄 `dvp_state`가 경계. 실기 0런("DP를 DVL 추측항법 위에서").
+  `gates_enforced.bridge_stop_dr_pose`, 플랜 줄 `dvp_state`가 경계. 실기 engaged 29런, 폐루프 결과 미분석("DP를 DVL 추측항법 위에서").
 * **hold tail = cost mask(A10)**: 플랜 끝 너머 stage는 위치/선속도 가중치 0
   (`policy.hold_tail: mask`; heading·레벨은 유지). v=0 홀드를 추종하면 매 플랜 끝
   0.3–0.4 s 전에 브레이크를 밟는다 [유도].

@@ -1,0 +1,14 @@
+/bin/bash: line 1: 19377 Segmentation fault      QT_QPA_PLATFORM=offscreen timeout 3000 /home/bdml/miniforge3/envs/rovgui-pose/bin/python -m pytest -q -p no:cacheprovider rov_gui/tests/test_dvl_legacy_replay.py rov_gui/tests/test_dvl_pose_panel.py rov_gui/tests/test_imu_dr.py rov_gui/tests/test_mavlink_rates.py rov_gui/tests/test_att_age.py rov_gui/tests/test_replay.py rov_gui/tests/test_run_scene.py rov_gui/tests/test_rl_pwm_interlocks.py rov_gui/tests/test_plot_runs.py rov_gui/tests/test_dvl_pose_worker.py rov_gui/tests/test_policy.py rov_gui/tests/test_object_nav.py rov_gui/tests/test_station_bridge.py rov_gui/tests/test_rl_velocity_source.py rov_gui/tests/test_vehicle_gyro.py rov_gui/tests/test_dvl.py rov_gui/tests/test_rl_ekf.py rov_gui/tests/test_control.py rov_gui/tests/test_state_noise.py rov_gui/tests/test_rl_pwm_scale.py rov_gui/tests/test_dvl_pose.py rov_gui/tests/test_offline.py > $OUT 2>&1
+rc=139
+........................................................................ [  6%]
+........................................................................ [ 12%]
+........................................................................ [ 19%]
+........................................................................ [ 25%]
+........................................................................ [ 31%]
+...............F.......................................F................ [ 38%]
+........................................................................ [ 44%]
+........................................................................ [ 51%]
+........................................................................ [ 57%]
+.....................timeout: the monitored command dumped core
+
+[exited with code 0]

@@ -716,6 +716,16 @@ class DvlSample:
     tov_us: int | None = None        # device stamps, verbatim (Unix us)
     tot_us: int | None = None
     kind: str = "velocity"           # "velocity" | "velocity_water"
+    #: the four transducers verbatim, id order: ((velocity m/s, distance m,
+    #: beam_valid), ...); None = the report carried none
+    beams: tuple | None = None
+    #: set by DvlAid ONLY (never the transport): the beam it re-solved the
+    #: velocity without (dvl.three_beam) — v_dvl/valid/altitude are then
+    #: that solution's, the device's are on the sample it was copied from
+    beams3: int | None = None
+    #: the transport's connection count (a new one may be a rebooted device:
+    #: DvlAid re-confirms the beam geometry); None = not known
+    conn_id: int | None = None
     hz: float | None = None          # measured arrival rate
     source: str = "a50"              # "a50" | "demo"
     conn: Conn = Conn.OFFLINE

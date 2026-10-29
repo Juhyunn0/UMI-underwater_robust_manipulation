@@ -1472,7 +1472,8 @@ dvl:
   # [스펙: configuration page]. 0.6 s = [예측].
   stale_s: 0.6
   fom_max: 0.05          # m/s, the device's own accuracy figure [예측]
-  min_altitude_m: 0.05   # [스펙: A50 고도 범위 5 cm ~ 50 m] — 착저하면 lock을 잃는다
+  min_altitude_m: 0.0    # 0 = 장치가 valid라고 보낸 샘플은 고도와 무관하게 쓴다(음수 = lock 상실 −1만 거부). 2026-10-27 운용자 결정:
+                         # 1027_191909에서 valid 리포트(고도 0.03–0.04 m)를 이 게이트가 3번 거부해 pose LOST. 옛 값 0.05 = [스펙: A50 고도 범위 5 cm ~ 50 m]
   v_max_m_s: 1.5         # sanity only, raw AND lever-arm-corrected [예측]
   reentry_s: 0.5         # good this long before it is used (again) — also
                          # after a silence longer than stale_s [예측]
@@ -1566,6 +1567,24 @@ dvl:
   agree_trip_s: 1.0
   agree_ratio_min: 0.5
   agree_ratio_v_min_m_s: 0.02
+  # 3빔 재계산 (2026-10-27 운용자 요청): 빔 하나만 길게 튀면(거리 > three_beam_ratio x 나머지 셋의 중앙값) 나머지 세 빔으로
+  # 속도를 다시 푼다 — 장치가 invalid든 valid든. 1027_194851은 빔 1이 바닥의 ~2배를 읽어 1.65 s 동안 pose가 멈췄고 그 사이
+  # 이동 30.8 cm가 오차로 남았다 — 실제 DvlAid 재생(아래 규칙 전부)으로 30.0 → 9.0 cm [측정: data/20261027/1027_194851/analysis/three_beam/aid_replay.txt]. 태그 기준 속도 오차, 10-15/19/27 136런: 장치 invalid + 긴 빔 하나
+  # 3빔 p50/p90 1.23/7.50 cm/s vs 0으로 멈춤 7.28/12.24; 장치 valid + 긴 빔 하나 3빔 0.68/3.11 vs 장치 1.48/4.93
+  # [측정: data/20261027/1027_194851/analysis/three_beam/all_days/three_beam_study.json]. 반향 없는 빔(−1)·짧은 빔은
+  # 하지 않는다(3빔이 0보다 나쁘거나 표본 부족). kept_max·vz_max가 나쁜 채움 37건 중 16건을 거른다(data/20261027/1027_194851/analysis/three_beam/beam3_cases.py) —
+  # 자기검증은 아니다(3빔 = 미지수 3개, 잔차 없음; 뺀 빔의 맞은편 빔 오차는 v_z에 안 보인다) — 사실상 kept_max는 기울기 컷,
+  # vz_max는 상하 이동 컷이다. 안전 리뷰·재검증(2026-10-27) 뒤 규칙: 좋은 스트림을 **이어 붙이기만** — 직전 좋은 샘플이
+  # stale_s 안(같은 시각 아님), 장치 자신의 **깨끗한**(네 빔 일치) 좋은 4빔 해가 3 s 안(코드 상수 THREE_BEAM_CHAIN_MAX_S),
+  # 이번 연결의 깨끗한 수평 이동 리포트로 빔 사상을 최소제곱으로 맞춰 기대 기하와 일치(GEO_*: 30개 이상, 두 수평 방향에 퍼진
+  # 운동, max|H − B| ≤ 0.15 — 제자리 유지·직선 한 줄만으로는 안 열리고, 열고 닫힐 때 2 s 유지 뒤 미션 로그에 한 줄; 0.40 넘게
+  # 어긋나면 warn 한 번, offset이 0/180이 아니면 첫 응답부터 warn). selection primary
+  # 전용, 장치 offset 0/180에서만(180 실측, 0은 [유도]). 3빔으로 대체한 리포트는 shadow EKF에 안 들어간다. CSV `dvl_beams3`
+  # (schema 25)가 행마다, meta dvl.three_beam.counts(세션 전체)가 만듦/게이트 통과·보류/거부 사유를 기록. false = 장치 값만.
+  three_beam: true
+  three_beam_ratio: 1.5
+  three_beam_kept_max: 1.4
+  three_beam_vz_max_m_s: 0.10
 
 # ---------------------------------------------------------------------------
 # THE ROBOT_LOCALIZATION EKF (control/rl_ekf.py, 2026-10-02; HARDWARE-
@@ -1690,7 +1709,7 @@ dvl_pose:
   require_gyro_bias: true    # control: OFF refused until the bias is learnt (strict mode only)
   # TRUST MODE (--dvl-trust, 2026-10-19): DVL을 장치가 보고하는 대로 믿는다 — proving pass 없이 첫 샘플에 스위치 자동 IN,
   # DvlAid의 태그 속도 보류(dis_*)·래치가 DR을 막지 않음, DVL 공백이 구멍(START 거부)이 되지 않음(미적분 이동은 기록·경고),
-  # OFF가 자이로 바이어스를 기다리지 않음(ON 동안 학습, 지난 세션 저장값으로 시드). 남는 정지: DVL 자체 게이트(lock·고도·fom·빔·점프),
+  # OFF가 자이로 바이어스를 기다리지 않음(ON 동안 학습, 지난 세션 저장값으로 시드). 남는 정지: DVL 자체 게이트(lock·fom·빔·점프; 고도 게이트는 2026-10-27부터 0 = 끔),
   # 태그가 보일 때의 발산 정지, max_dr_speed_m_s, lost_s. 틀린 DVL은 태그가 보일 때만 잡힌다. false = 2026-10-18 리뷰의 strict 게이트
   # (data/20261019/1019_211310: OFF까지 게이트 96 s, 그 뒤 dis_fit 보류가 런을 1.9 s에 끝냄). --dvl-trust / --dvl-strict가 덮는다
   # (속도 blend의 `dvl.trust`도 함께).

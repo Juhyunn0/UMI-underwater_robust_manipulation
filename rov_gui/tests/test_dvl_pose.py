@@ -4250,13 +4250,14 @@ def test_a_seeded_bias_is_in_force_until_the_sessions_own_fit():
     assert abs(pose.head.bias_info()["dps"]) < 0.02   # the feed's gyro: none
 
 
-def test_trust_mode_bounds_the_unintegrated_motion_at_the_correction_limit():
-    """The one bound trust mode keeps on gaps: short DVL gaps (inside
-    lost_s) at 0.10 m/s each hide ~7.5 cm of motion; past max_corr_m the
-    pose may be further off than a correction may take in while engaged —
-    the ONCE the warning asks for would end the run — so an engaged run
-    ends there and a START is refused, until a ONCE with tags in view
-    snaps it away (safety review 2026-10-19 #2, #3)."""
+def test_trust_mode_never_ends_a_run_on_the_unintegrated_motion():
+    """Short DVL gaps (inside lost_s) at 0.10 m/s each hide ~7.5 cm of
+    motion. Past max_corr_m the `unobserved` stop (safety review 2026-10-19
+    #2, #3) ended an engaged run — until the operator, 2026-10-29: "I am
+    always watching; I will stop it". Engaged it is now the gap warning
+    only, the estimate growing past the line with nothing stopped;
+    disengaged it is still the START refusal, until a ONCE with tags in
+    view snaps it away."""
     for engaged in (True, False):
         T = Truth(v_b=(0.10, 0.0, 0.0), T=300.0)
         pose = _pose(trust_dvl=True, require_gyro_bias=False)
@@ -4270,17 +4271,29 @@ def test_trust_mode_bounds_the_unintegrated_motion_at_the_correction_limit():
             f.dvl_on = lambda t, t0=t0: not (t0 < t < t0 + 1.2)
             out = f.run(2.2, tags=False, engaged=engaged)
             faults += [h["fault"] for _t, _m, h, _tm in out if h["fault"]]
-            if faults:
+            if pose.unobserved_m > 0.35:
                 break
-        assert faults and "unintegrated motion" in faults[0], faults[:1]
-        assert pose.n_xy_holes == 0 and pose.unobserved_m > 0.25
+        assert pose.n_xy_holes == 0 and pose.unobserved_m > 0.35, \
+            pose.unobserved_m
+        h = out[-1][2]
+        assert h["ok"] and h["state"] == DP.ST_DR, h
+        # the warning carries the number (the operator's live cue)
+        assert (f"{pose.unobserved_m * 100:.0f} cm of unintegrated motion"
+                in h["warn"]) and "flown across" in h["warn"], h["warn"]
+        assert not [w for _t, w in pose.faults if "unintegrated" in w], \
+            pose.faults
         if engaged:
-            assert pose.faults and "unintegrated" in pose.faults[-1][1]
-        # the tags back, ON. Disengaged: a snap re-anchors, and the stop and
-        # the gap warning go with the unobserved budget. Engaged: the pose
-        # really lags the truth by that much, so the re-acquisition is past
-        # max_corr and refused — the run ends either way (the reviewer's
-        # point: the stop above only says so earlier)
+            assert not faults, faults[:1]
+        else:
+            assert faults and "unintegrated motion" in faults[0] \
+                and "while disengaged" in faults[0], faults[:1]
+            assert "unintegrated motion" in h["fault"], h
+        # the tags back, ON. Disengaged: a snap re-anchors, and the gap
+        # warning goes with the unobserved budget. Engaged: the pose really
+        # lags the truth by that much, so the re-acquisition is past
+        # max_corr and refused — the correction limit, which stays, ends
+        # that run (an ON press with the tags already in view is refused in
+        # words first: tag_refusal)
         pose.set_tag_on(True, f.t, engaged)
         f.dvl_on = lambda t: True
         n0 = len(pose.corrections)

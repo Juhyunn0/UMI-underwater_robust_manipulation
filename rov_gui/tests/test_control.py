@@ -677,7 +677,9 @@ def test_tick_emits_pilot_and_csv_superset():
             # schema 24 (2026-10-19): the state noise (test_state_noise)
             "sn_on,sn_dx,sn_dy,sn_dz,sn_droll_deg,sn_dpitch_deg,sn_dyaw_deg,"
             "sn_du,sn_dv,sn_dw,sn_dp_dps,sn_dq_dps,sn_dr_dps,sn_dax,sn_day,"
-            "sn_daz")
+            "sn_daz,"
+            # schema 25 (2026-10-27): the three-beam re-solve (test_dvl)
+            "dvl_beams3")
         # the ASKED-for command still ends where it did; the REPORTED block
         # was appended after it rather than interleaved
         assert ",hold_frac,observe,pwm1," in text[0]
@@ -689,7 +691,7 @@ def test_tick_emits_pilot_and_csv_superset():
         assert abs(float(first[1])) < 0.05              # px (FLU x = NED x)
         assert abs(float(first[2])) < 0.05
         meta = json.loads(Path(path).with_suffix(".meta.json").read_text())
-        assert meta["schema_version"] == 24     # 24: + sn_on/sn_* (--state-noise, 2026-10-19); 23: + tagfix/dvp_* (--dvl_pose, 2026-10-18); 22: + w_dvl/dvl_code/dvl_res_fast_m_s/dvl_res_slow_m_s/dvl_esc_s/dvl_align/dvl_scale (2026-10-16); 21: + att_age_v_s/att_tb_ms/banner_age_s (2026-10-15); 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
+        assert meta["schema_version"] == 25     # 25: + dvl_beams3 (three-beam re-solve, 2026-10-27); 24: + sn_on/sn_* (--state-noise, 2026-10-19); 23: + tagfix/dvp_* (--dvl_pose, 2026-10-18); 22: + w_dvl/dvl_code/dvl_res_fast_m_s/dvl_res_slow_m_s/dvl_esc_s/dvl_align/dvl_scale (2026-10-16); 21: + att_age_v_s/att_tb_ms/banner_age_s (2026-10-15); 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
         # Written even with no replay flown, the imu_dr rule.
         assert meta["plan_stream"]["enabled"] is False
         # Written even when the estimator is off: an absent key cannot tell
@@ -717,6 +719,32 @@ def test_tick_emits_pilot_and_csv_superset():
         assert plant["D"]["check_max_abs_err"] < 1e-9, plant["D"]
         # the mission as the PANEL had it, which survives even before START
         assert meta["mission"]["config_square"]["shape"]
+        w.teardown()
+
+
+def test_run_meta_pins_csv_t0_on_both_host_clocks():
+    """meta run.t0_monotonic_s / t0_epoch_s = the instant CSV t = 0, so a run
+    lines up with another process on the same host (the disturbance rig's
+    samples.csv, 2026-10-27) to the row — run.started has whole seconds."""
+    with tempfile.TemporaryDirectory() as tmp:
+        w, bus, pilots, logs = _worker(tmp)
+        w.on_enable(True)
+        _feed_good_state(w)
+        m0, e0 = time.monotonic(), time.time()
+        w.set_engaged(True)
+        m1, e1 = time.monotonic(), time.time()
+        assert w.engaged
+        for _ in range(3):
+            _feed_good_state(w)
+            w.tick()
+        path = w._csv_path
+        w.disengage("test over")
+        run = json.loads(Path(path).with_suffix(".meta.json").read_text())["run"]
+        assert m0 <= run["t0_monotonic_s"] <= m1
+        assert e0 <= run["t0_epoch_s"] <= e1
+        # the CSV's own t counts from that same monotonic instant
+        first = Path(path).read_text().splitlines()[1].split(",")
+        assert 0.0 <= float(first[0]) < time.monotonic() - run["t0_monotonic_s"]
         w.teardown()
 
 
@@ -3261,7 +3289,7 @@ def test_run_meta_records_the_estimator_as_a_record_boundary():
     # and the CSV plan_id/ref_src/grip_cmd columns. 7 added tick_ms and the
     # follow boundary; 6 added object_nav and the ten obj_*/follow_* columns;
     # 5 added station_bridge (bridge_s / bridge_tier).
-    assert m["schema_version"] == 24     # 24: + sn_on/sn_* (--state-noise, 2026-10-19); 23: + tagfix/dvp_* (--dvl_pose, 2026-10-18); 22: + w_dvl/dvl_code/dvl_res_fast_m_s/dvl_res_slow_m_s/dvl_esc_s/dvl_align/dvl_scale (2026-10-16); 21: + att_age_v_s/att_tb_ms/banner_age_s (2026-10-15); 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
+    assert m["schema_version"] == 25     # 25: + dvl_beams3 (three-beam re-solve, 2026-10-27); 24: + sn_on/sn_* (--state-noise, 2026-10-19); 23: + tagfix/dvp_* (--dvl_pose, 2026-10-18); 22: + w_dvl/dvl_code/dvl_res_fast_m_s/dvl_res_slow_m_s/dvl_esc_s/dvl_align/dvl_scale (2026-10-16); 21: + att_age_v_s/att_tb_ms/banner_age_s (2026-10-15); 20: + pwm_guard (pwm-LOW obs-guard code, 2026-10-10 b); 19: + pwm-LOW CSV columns i_pred_a/null_v_us/null_h_us (2026-10-10); 18: + robot_localization EKF (2026-10-02); 17: + DVL / body-velocity columns (2026-10-01); 16: + 6-DoF attitude axes (2026-09-26); 15: + mode / LOW None holder (2026-09-11)
     # Written even with no --pose, for the imu_dr reason: an absent key cannot
     # tell "this build had no object nav" from "it was switched off".
     assert m["object_nav"]["enabled"] is False
@@ -4845,7 +4873,7 @@ def test_attitude_axes_off_is_byte_identical_on_the_4dof_path():
         assert aa["enabled_extensions_sent"] is False
         assert aa["transport"] == "manual_control_ext"
         assert m["run"]["stabilize"]["rp_axis"] == "hold"
-        assert m["schema_version"] == 24
+        assert m["schema_version"] == 25
         json.dumps(m)
         w.teardown()
 

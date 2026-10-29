@@ -556,7 +556,7 @@ class DvlWorker(TimerWorker):
         self._arrivals.append(t_rx)
         s = DvlSample(hz=self._hz(t_rx), source="a50",
                       conn=(Conn.ONLINE if f["valid"] else Conn.DEGRADED),
-                      stamp=t_rx, **f)
+                      stamp=t_rx, conn_id=conn_id, **f)
         self._last = s
         self.bus.dvl.emit(s)
 

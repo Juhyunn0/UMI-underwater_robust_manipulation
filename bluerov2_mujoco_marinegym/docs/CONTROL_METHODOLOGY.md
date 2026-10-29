@@ -2831,3 +2831,196 @@ LEVEL q_des, so a 7-dim policy's roll/pitch were out of its distribution.
   attempt flew 32 s and the stub's straight-ahead chunk left the workspace box (`escalated` — that guard is alive) → the flight is 12 s.
 * **Pool procedure:** `./c3 gui --source hw --allow-command --mpc --fstereo --policy --fstereo-scale 0.5 --fstereo-process --dvl_pose --dvl-trust --policy-dr`
   → tags in view ~1 s → HIGH Diffusion Policy + ckpt → **TAG FIX OFF** → START. Altitude 0.2–0.5 m (bottom lock). **Zero water runs.**
+
+## 2026-10-27 — DVL three-beam re-solve: when exactly one beam reads long, the velocity is solved from the other three (`dvl.three_beam`, zero water runs)
+
+* **Why:** in 1027_194851 (`--dvl_pose --dvl-trust`, wandering without tags) the vehicle was mid-water (altitude 0.52–0.62 m) yet beam id 1
+  alone read 1.01–1.19 m (the others 0.4–0.6 m); the device called the reports invalid and the pose stopped HELD→LOST for 1.65 s while the
+  vehicle moved 30.8 cm — which stayed as error [measured: data/20261027/1027_194851/analysis/dvp_vs_tag.txt, three_beam/ in the same folder].
+  The device throws a whole report away when one of four beams is wrong, though the other three are fine. Operator request: "when only one
+  beam jumps, recompute the velocity from the other three" — offline reproduction first.
+* **What (theory):** the A50 is a 4-beam Janus. Each beam measures one component of the velocity along itself. Three unknowns, four equations:
+  leaving one beam out still solves exactly — but with no redundancy, so nothing inside the report says it is right. Hence it may only EXTEND
+  a good stream, never start one.
+  ```
+  beam unit vectors (output frame):  b_i = ( sinθ·cosα_i , sinθ·sinα_i , cosθ ),  θ = 22.5°,
+                                     α = (+135, −135, −45, +45)° + mounting_rotation_offset   (id 0..3)
+  beam velocity:                     u_i = b_i · v
+  device altitude:                   h = cosθ · mean(d_i) − 0.015 m                (exact on 14 256 reports)
+  one long beam k:                   d_k > 1.5 · median(d_j, j≠k)   and   max/min(d_j, j≠k) ≤ 1.4
+  re-solve:                          v₃ = [b_j]⁻¹ · u_j   (j ≠ k; 3×3, exact — no residual)
+                                     h₃ = cosθ · mean(d_j) − 0.015
+  v_z blind spot:                    v₃,z = (u_{k+1} + u_{k+3}) / (2·cosθ)    — the opposite beam k+2 never enters it
+  accepted only if:                  |v₃,z| ≤ 0.10 m/s
+                                     t − t_good ≤ stale_s (0.6 s)                (extend-only: the jump gate can judge it)
+                                     t − t_own4 ≤ 3.0 s                          (chain cap from the device's own good 4-beam)
+                                     median_200( ‖B·v_dev − u‖ / ‖u‖ ) ≤ 0.10, n ≥ 50 clean moving reports   (geometry)
+  then the usual gates:              lock (now true), fom (device's), jump |v − v_good| ≤ 2.0·dt + 0.05, v_max, R3 flags
+  ```
+* **How:** `rov_gui/control/dvl.py` — `beam_matrix(offset)` (0/180 only; 180 measured, 0 [derived]), `three_beam(beams, B, ratio, kept_max,
+  vz_max)`, `DvlAid._three_beam` (a COPY of the sample: `v_dvl` = v₃, `valid` True, the three beams' altitude, `beams3` = k; the device's fom and
+  n_beams kept), `_geo_note/_geo_ok` (runtime geometry check), `_b3_share_text` (trip text says "n of m … three-beam re-solves"), `sample_in`
+  (the bus's sample — the worker's identity check), `sample_fields` carries the transducers as `beams`, sorted by `id`. `rov_gui/state.py`
+  `DvlSample.beams / beams3`. `workers.py`: `_dvp_note_dvl` compares `d.sample_in` and hands the pose the copy's altitude; CSV `dvl_beams3`
+  (schema 25) — `dvl_valid` / `dvl_alt_m` stay the device's; the shadow EKF gets the device's report only (ROS-driver semantics, `b3` marked
+  in `_ekf_inputs.jsonl`). YAML `dvl.three_beam / _ratio / _kept_max / _vz_max_m_s`. Decisions: no re-solve for a beam without an echo (−1),
+  `beam_valid` false, or a SHORT beam — against the tags the re-solve was worse than zero there (no echo p90 21.76 vs 15.57 cm/s) or too rare
+  (short, n 37). Device-VALID reports with one long beam are re-solved too (v₃ 0.68/3.11 vs the device's 1.48/4.93 cm/s).
+* **Offline evidence:** reference = the non-causal local slope of the tag positions (W 0.5 s), rotated to body. 136 runs of 10-15/19/27
+  [measured: data/20261027/1027_194851/analysis/three_beam/all_days/three_beam_study.json]: the fitted beam vectors are within 1.5° of nominal +
+  180° (61 068 reports, per-beam rms 0.29–0.43 cm/s); device-invalid with one long beam, v₃ p50/p90 1.23/7.50 cm/s vs held at zero 7.28/12.24
+  (n 432); 37 of them > 10 cm/s, kept/vz drop 16 (beam3_cases.py). Re-solve chains p99 1.36 s, max 5.38 s (chain_lengths.txt); the geometry
+  threshold from geometry_check.txt (right geometry 200-median ≤ 0.094, offset 0 ≥ 0.152, beam order shifted ≥ 0.113).
+* **Review:** safety-code-reviewer once — WARN (FAIL for trust / blind control): HIGH 2, MEDIUM 5, LOW 3. HIGH: (1) no gate judges the copy as a
+  re-solve and the jump gate stops judging after stale_s, so a wrong re-solve stream passes everything after ~0.7 s (13 recorded fills > 15 cm/s
+  off passed kept/vz) → **extend-only** (stale_s + 3 s chain cap) + the runtime geometry check; (2) CSV `dvl_valid` silently became the copy's →
+  restored to the device's + a `dvl_beams3` column + schema 25. MEDIUM: vz is no self-check (the opposite beam) → documented; EKF gate vs
+  payload mismatch → device report + honest `fed` + `b3`; RL_controller replay_lib cannot reproduce it → KNOWN_ISSUES; no worker-level test →
+  added; a latch would read as a mount problem → re-solve share in the trip text. LOW: beams taken by list position → sorted by `id`;
+  offset 0 is [derived], not the spec; outside the RL velocity_source contract → recorded only.
+* **Result:** the station's own `DvlAid` (working tree, the reviewed rules, gates and flags) replayed [measured: three_beam/aid_replay.txt]:
+  1027_194851's 14.53–16.18 s stop 30.0 → **9.0 cm**, 22.73–23.08 s 3.6 → 0.6 cm; 1027_194256's near-floor gaps (52 cm etc.) unchanged (all four
+  beams lost the echo), 53.11–53.66 s 16.2 → 6.7 cm. The flown velocity's error against the tags unchanged (p50 2.0 / p90 5.0 cm/s), flown
+  samples 429 → 442. Tests: test_dvl +6, test_dvl_pose_worker +1 (the copy reaches the dead reckoning; geometry unconfirmed → HELD as before),
+  schema 25 updated. **Zero water runs.** Limits: a wrong re-solve or two inside a chain still fly if under the jump limit (≈ 0.25 m/s — the
+  29 cm/s fill at 194851 t15.8 is inside the 9 cm above); beam 3 long is the weakest; offset 0 never measured.
+
+### Later the same night — fixes after an independent re-verification (workflow: four-angle review + a refutation attempt per finding; zero water runs)
+
+* **Why:** every fix round of the DVL monitors/gates has turned up a defect in the previous fix (six reviews on 10-02). The post-review fixes were
+  read separately for gating, records, lifecycle/identity and geometry/numerics, with a skeptic per HIGH/MEDIUM: HIGH 0, MEDIUM 5 → all lowered
+  to LOW by the skeptics, 2 refuted, 12 LOW.
+* **What:** real defects — (1) the chain anchor was renewed by device-valid reports WITH the long beam, so occasional device-valid pairs kept the
+  3 s cap running for ever (repro: 231 of 300 re-solved over 30 s); (2) the EKF gate judged the re-solved copy while the EKF was fed the unjudged
+  device report (device-valid + long beam slipped past flag_alt / the jump gate); (3) the geometry check admitted heave — every beam has the same
+  z, so heave reproduces under any azimuth error (on the 3-D speed adjacent swaps opened it in 10-16 of 136 logs); (4) six header-layout tests
+  failed on the new CSV column. LOW: the geometry window survived a reconnect; a re-solve with the last good stamp was never judged by the jump
+  gate; out-of-order reports booked counts; legacy re-solved too (the rollback ladder no longer bit-identical); the panel altitude was the copy's;
+  `flown` did not mean flown; evidence scripts not saved and the altitude sample count mis-stated (14 256 → really 73 604).
+  ```
+  chain anchor:      t_own4 ← t  only if  device valid ∧ passed ∧ beams_clean(beams, 1.5)   (four agreeing beams)
+  extend-only:       0 < t − t_good ≤ stale_s                     (equal stamps refused: the jump gate judges 0 < dt only)
+  geometry window:   admit  ⇔  device valid ∧ beams_clean ∧ ‖v_xy‖ ≥ 0.03 m/s   (heave reproduces under ANY azimuth: b_i,z = cosθ ∀i)
+                     cleared on a new TCP connection (conn_id) or a changed offset / speed of sound
+  EKF:               fed = may ∧ device valid ∧ (report not re-solved)
+  ```
+* **How:** `dvl.py` `beams_clean()` (one definition for the geometry check and the anchor); `note_sample` checks the order before the re-solve,
+  resets on a `conn_id` change, anchors on clean reports only, counts `passed_gates` / `held_by_gates`; `_three_beam` primary-only with
+  `0 < dt`; `_geo_note` on the horizontal speed; `sample_fields` takes JSON-integer beam ids only. `state.py` `DvlSample.conn_id`, carried by
+  `backends/dvl.py`. `workers.py`: the EKF never gets a re-solved report; the status altitude is the device's; DVL button tooltip "3-beam (beam k long)".
+  Tests: six header slices fixed, test_dvl +5, an EKF assertion in the worker test.
+* **Result:** evidence scripts saved [measured: data/20261027/1027_194851/analysis/three_beam/geometry_check.py → geometry_check_v2.txt,
+  chain_lengths.py → chain_lengths_v2.txt, alt_formula_check.py → alt_formula_check.txt]: on the horizontal speed with MIN_N 50 none of eight wrong
+  geometries opens the check in any of 136 logs (lowest medians 0.110 adjacent swap, 0.327 shifted order, 0.464 offset 0); the right one covers
+  7 275 / 7 301 re-solvable reports in day-long sessions; re-solvable reports arrive p50 0.25 / p90 1.36 / p99 5.74 s after a clean anchor, the
+  3 s cap refuses 2.8 %; the altitude formula holds within 1.2e-7 m on 73 604 four-beam and 6 818 three-beam reports. The station's own `DvlAid`
+  with every new rule still gives 1027_194851 30.0 → 9.0 cm, with no new refusals [measured: aid_replay.txt]. Remaining limits: a wrong re-solve or
+  two inside a chain (under the jump limit); the adjacent-swap margin is thin (0.110 vs 0.10).
+
+### Around midnight — after a third re-verification (delta only, three angles + refutation): the geometry check becomes a least-squares fit of the beam map (zero water runs)
+
+* **Why:** HIGH 0, MEDIUM 2 (lowered to LOW by the skeptics), LOW 13. Two real defects in the geometry check: (1) admitted on the horizontal
+  speed, the relative residual's denominator rms(u) still carried cos22.5°·v_z, so a dive with drift could open it for a wrong geometry;
+  (2) **a per-report residual is blind in some motion direction for some wrong geometry** — an adjacent swap on an axis-aligned leg, an
+  opposite-pair swap on a diagonal — so a straight leg right after a reconnect opened it (53 of 898 window starts × 23 permutations
+  [measured: data/20261027/1027_194851/analysis/three_beam/geometry_check_v3.txt, rule v2]). Also: an out-of-order
+  report could reach the EKF unjudged, the 3-beam mark is a tooltip not a chip, unsourced numbers (~2.1 s etc.), 1.75 s / 6.0 cm mis-stated,
+  stale comments.
+* **What:** fit the horizontal map over the window and judge it only when the motion spans two directions — then no direction is blind.
+  ```
+  window:      last 200 clean, device-valid reports with ‖v_xy‖ ≥ 0.03 m/s;   u_h = u − mean(u)   (mean(u) = cosθ·v_z, heave out)
+  fit:         H = (Σ u_h v_hᵀ)(Σ v_h v_hᵀ)⁻¹                        (4 × 2, least squares)
+  judged iff:  n ≥ 30  ∧  λ_min(Σ v_h v_hᵀ / n) ≥ (0.015 m/s)²         (motion spans two horizontal directions)
+  open iff:    judged ∧ max |H − B_h| ≤ 0.15     (wrong permutation: H ≈ P·B_h, noise-free max|P·B_h − B_h| = 2·sin22.5°·cos45° ≈ 0.54 for every P [derived])
+  ```
+* **How:** `dvl.py` `_geo_note` (the window holds (v_h, u_h)), `_geo_fit` (sums recomputed each time — no drift), `_geo_ok`, open/close notes
+  `take_three_beam_notes` → the worker logs `dvl: three-beam re-solve ON/OFF …`; constants `GEO_N 200 / GEO_MIN_N 30 / GEO_V_MIN_M_S 0.03 /
+  GEO_EXC_M_S 0.015 / GEO_DEV_MAX 0.15`. `workers.py`: on primary the EKF gets only the report the aid just judged; the 3-beam tooltip only on
+  dvl_code ok; the CSV note explains rung rows. New evidence scripts: `geometry_check_v3.py` (residual-rule alternatives — a two-axis split
+  is still blind on diagonals), `geometry_check_v4.py` (the fit), `refusal_quality.py`, `chain_lengths_v3.py` (the code's anchor, a DvlAid
+  replay), `repro/repro_chain_renewal.py`.
+* **Result:** [measured: data/20261027/1027_194851/analysis/three_beam/geometry_check_v4_dev_sweep.txt, _dev_wide.txt, _margin.txt] none of the
+  23 wrong beam permutations (offset 0 among them) opened the check from any of 898 window starts (× 23), 136 log starts or 3 days; on judged
+  windows the wrong geometries' smallest dev was 0.453 with a fresh window per log (right max 0.245) but 0.268 in the reconnect-like
+  any-start windows (right p99 0.157, max 0.588) — the closest wrong geometry is 1.8x the threshold 0.15 [derived] and the two populations
+  overlap (0.15 closes the right one on 1 787 of 162 808 judged steps); DEV 0.30 opens 3 and 0.40 opens 20, so never past 0.25 (round 4); the right geometry was open over
+  59.7 % (fresh window per log) to 99.7 % (one per day) of the re-solvable reports — no lower than the residual-median rule (54.7-99.6 %).
+  Chains against the code's anchor p50 0.32 / p99 6.31 s, 3.2 % beyond 3 s [chain_lengths_v3.txt]; of the 47 kept/vz refusals, 20 were good
+  fills within 3 cm/s [refusal_quality.txt]. The station's own `DvlAid` still gives 1027_194851 30.0 → 9.0 cm [aid_replay.txt]. Limits: a
+  session that only hovers or flies one straight line never opens it (the old behaviour); no wrong geometry has ever been seen for real.
+
+### 10-28 early morning — after rounds 4 and 5: margins per window schedule, notes with a 2 s dwell + a cause + warnings from a fresh start too (zero water runs)
+
+* **Why:** round 4 (code + docs + refutation) HIGH 0, MEDIUM 1: the 0.453 margin was measured with a fresh window per log, but the docs
+  applied it to the reconnect-like any-start windows too (really wrong min 0.268, right max 0.588 — the populations overlap). Round 5 (the
+  note state + refutation): **the beam-geometry warning could never fire after a fresh start (reconnect, config change)** — it was reachable
+  only after an announced ON, and a firmware that reorders the beams arrives with a reconnect, so exactly that case went unreported (the check
+  stayed safely shut). LOW also: opens shorter than 2 s were not counted, a "1.5 < 1.5 cm/s" text, the "~1.8x" wording, an unsourced
+  "5 lines a log".
+* **What:**
+  ```
+  notes:     state change said after it held 2 s (sample time); a reset (new conn_id / changed config) said at once
+  mismatch:  judged (n ≥ 30, 2-D motion) ∧ max|H − B_h| > 0.40 for 2 s  →  one warn per window, ON or not
+  offset:    mounting_rotation_offset ∉ {0, 180}  →  one warn per value, from the first get_config answer
+  counts:    geometry_opened / geometry_closed (every change), geometry_on / geometry_off (said), geometry_mismatch
+  ```
+* **How:** `dvl.py` `_b3_geo_transition` (one fit for the state, the counts, the notes and the mismatch warning), `_b3_geo_say` (OFF cause and
+  level), `_b3_offset_note` (first thing in note_device_config), `GEO_NOTE_DWELL_S 2.0`, `GEO_WARN_DEV 0.40`, meta `geometry_check_now`; the
+  worker logs each note at its level (info / warn). Tests: a wrong map after a reconnect warns, the right one does not, an unknown offset warns
+  from the first answer, the 2 s dwell (a reverted flip is counted but not said), three OFF causes.
+* **Result:** [measured: data/20261027/1027_194851/analysis/three_beam/geometry_notes_check.txt, geometry_notes_anystart.txt,
+  geometry_check_v4_margin.txt, _dev_wide.txt] of the right geometry's 96 opens/closes, 13 reverted within 2 s (7 within 0.5 s); the warning
+  bound 0.40 never warned on the right geometry over 136 logs nor 898 any-start windows (0.30 warned twice, 0.25 twelve times), while a wrong beam
+  order warned in 1 610 of 1 656 judged (log, permutation) pairs ~2.1 s after the window was first judged and beams 0/1 swapped in 719 of 749
+  judged fresh starts. The 0.15 check threshold's margins: per log 0.453 vs the right max 0.245; any start 0.268 (1.8x the threshold [derived]) vs 0.588
+  — wrong geometries stay shut up to 0.25 and open 3 times at 0.30, so do not raise it.
+* **After round 6 (same day):** the OFF on crossing 0.15 was a warn ("check the beam geometry") and fired on the right geometry once in 898
+  fresh starts → that OFF is info ("re-solve paused …"); the only warnings are the calibrated mismatch (0.40 held 2 s) and an unknown offset.
+  Shown values round toward the verdict (14.9 < 15.0 mm/s, 0.16 > 0.15), a reset that closes the check counts in `geometry_closed`, the offset
+  warning re-arms on a known offset. An open shorter than 2 s is never announced — only `dvl_beams3` and `geometry_opened/closed` show it.
+
+## 2026-10-29 — trust mode's `unobserved` stop no longer ends a run: engaged, the DVL-gap motion is a warning and the operator ends the run (no new water runs)
+
+* **Why:** In trust mode a DVL gap is flown across and the motion it may have hidden is estimated (`unobserved_m`). Since the 2026-10-19
+  safety review (HIGH #2, above) an estimate past `max_corr_m` 25 cm was a stop — the ONCE the warning asks for would end the run anyway.
+  It ended an engaged run (a `--policy-dr` peg run, 11 s after engage) and then refused 19 START presses in 15 s, 27 that day
+  [측정: data/20261019/1019_232652/events.log 23:26:52–23:27:25; 1019_230824 and 1019_232345 events.log]. The estimate errs one way,
+  high: on the 10-27/28 TAG FIX OFF rows (those past the line all disengaged) it never read ≤ 25 cm where the tags measured more (0 of 918
+  rows), and read > 25 cm where they measured ≤ 25 cm in 1262 of 2180 (1028_152309: up to 147 cm against ≤ 19.1 cm) [측정: data/20261029/
+  1029_unobserved_vs_tag_offline/unobs_vs_err.txt]. The operator: "I am always watching — there is no need to end it automatically;
+  I will stop it."
+* **What (theory):** engaged, the estimate is shown and stops nothing — the error is judged by the tags where they are in view and by the
+  operator where they are not. Disengaged it is still a START refusal: the operator asked only about the run, and an outage while
+  disengaged (the vehicle lifted or moved by hand) leaves the pose where the gap found it; a ONCE with tags in view snaps it away.
+  ```
+  unobserved_m = Σ_gaps (gap − hold_s) · max(|v_last|, v_floor)       recorded (dvp_unobs_m) + warned until a re-anchor
+  before:  unobserved_m > max_corr_m  ⇒  fault  ⇒  engaged: the run ends;  disengaged: START refused
+  now:     unobserved_m > max_corr_m  ⇒  engaged: said once, "(not a stop)";  disengaged: START refused (unchanged)
+  what still ends an engaged run (trust):  no sample for lost_s;  |pose − tags| ≥ abort_err (25 cm, 10°, z 20 cm) for abort_hold_s
+                                           with tags in view;  |v_DVL| > max_dr_speed_m_s;  the heading rules;
+                                           a correction after dead reckoning > max_corr (25 cm, 10°)
+  ```
+* **How:** `dvl_pose.py` `_watch` — the `unobserved` stop is raised only when `not engaged` (the engage-instant step runs disengaged, before
+  `engaged = True`, so a START is still judged on it, also with no tick between a disengage and the next START). `workers.py` `_dvp_say`
+  says the engaged crossing once per onset — the mission log file (the panel draws no dvl_pose warn), the run's events, meta faults as
+  `(not a stop)` — the pattern shadow mode uses for "a control run would have ended here". The TRUST MODE paragraph says so; its sentence
+  claiming a second 10-19 decision that made the divergence abort and the correction limit records only — which no code ever did
+  (`_watch_divergence`, `_accept`, `tag_refusal`, `pending_too_big` have no trust branch) — is corrected, as is `pending_too_big`'s "never
+  under trust". The launch line and the `--dvl-trust` help say "refuses a START but never ends a run". Strict mode is untouched (its
+  hole: `max_unobserved_m` 0.10, or one gap past `lost_s`).
+* **Review:** two workflows — four angles (safety, leftovers, tests, what still stops by itself) with a refutation pass per finding, then a
+  delta check of the result. The first version removed the START refusal too — beyond the request (a tagless START after a long disengaged
+  outage would take its datum on a pose metres off) → restored for the disengaged case only; the engaged crossing had become silent on every
+  record → the once-per-onset record. Corrected claims: that no engaged run had ended on the stop (one had, above); that the estimate errs
+  both ways (it errs high only); trust mode's and `--policy-dr`'s stale "zero water runs" (35 engaged trust runs — 10-19 24, 10-27 11, the
+  longest 627.8 s — of which 29 with `--policy-dr` [측정: data/20261029/1029_unobserved_vs_tag_offline/trust_runs.txt]). Found, not fixed
+  (KNOWN_ISSUES): meta `gaps_trusted` counts samples once the budget is past 0.10 m; a new mission started inside a live engagement is not
+  gated by the estimate (only an engage is); shadow's "control START would have been refused" record misses a disengage → engage with no
+  tick between.
+* **Result:** tests only. `test_dvl_pose::test_trust_mode_never_ends_a_run_on_the_unintegrated_motion` (engaged: past 35 cm, no fault, the
+  warning with its number; disengaged: the START refusal; the tags back — disengaged a snap clears it, engaged the re-acquisition past
+  max_corr is still refused) and `test_dvl_pose_worker::test_trust_mode_flies_on_past_the_unintegrated_motion_not_a_new_start` (the worker,
+  engaged, six 1.2-s gaps at 0.10 m/s with no tag: still engaged, one `(not a stop)` record in the log, events and meta; then START refused
+  at the engage instant and on the next tick, a ONCE with tags in view, and START goes through) — they fail on HEAD, on the version without
+  the START refusal, without the record, and with the engage-instant check bypassed. The remaining limit: engaged with no tag in view, the
+  motion a gap hid is caught by nothing but the operator.

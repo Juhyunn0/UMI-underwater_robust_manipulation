@@ -458,7 +458,7 @@ def test_a_run_on_the_ekf_flies_on_it_and_records_that_it_did():
             assert st[-1].ekf_control and st[-1].ekf_flew
             assert st[-1].ekf_state == "ready" and st[-1].p_ekf_flu
             m = w._run_meta()
-            assert m["schema_version"] == 24
+            assert m["schema_version"] == 25
             assert m["ekf"]["estimator_at_engage"] == "ekf"
             assert m["ekf"]["ready_at_engage"] is True
             assert m["ekf"]["node"]["source"] == EK.RL_SOURCE
@@ -1015,7 +1015,9 @@ def test_the_csv_header_ends_with_the_ekf_columns():
                              # schema 23 (2026-10-18): the DVL pose
                              *["tagfix", "dvp_src", "dvp_ok", "dvp_px", "dvp_py", "dvp_pz", "dvp_yaw_deg", "dvp_u", "dvp_v", "dvp_w", "dvp_err_m", "dvp_err_yaw_deg", "dvp_since_fix_s", "dvp_dist_m", "dvp_gap_s", "dvp_corr_m", "dvp_bias_dps", "dvp_unobs_m", "dvp_blind_s", "dvp_why"],
                              # schema 24 (2026-10-19): the state noise
-                             *["sn_on", "sn_dx", "sn_dy", "sn_dz", "sn_droll_deg", "sn_dpitch_deg", "sn_dyaw_deg", "sn_du", "sn_dv", "sn_dw", "sn_dp_dps", "sn_dq_dps", "sn_dr_dps", "sn_dax", "sn_day", "sn_daz"]]
+                             *["sn_on", "sn_dx", "sn_dy", "sn_dz", "sn_droll_deg", "sn_dpitch_deg", "sn_dyaw_deg", "sn_du", "sn_dv", "sn_dw", "sn_dp_dps", "sn_dq_dps", "sn_dr_dps", "sn_dax", "sn_day", "sn_daz"],
+                             # schema 25 (2026-10-27): the three-beam re-solve
+                             "dvl_beams3"]
     assert len(cols) == len(set(cols))
 
 

@@ -135,11 +135,13 @@ def test_columns_are_appended_last_and_the_schema_is_24():
 
     cols = W.CSV_HEADER.strip().split(",")
     n = len(W.SN_CSV_COLUMNS)
-    assert cols[-n:] == list(W.SN_CSV_COLUMNS) and len(cols) == len(set(cols))
+    # schema 25 (2026-10-27) appends dvl_beams3 after them (test_dvl)
+    assert cols[-1] == "dvl_beams3"
+    assert cols[-n - 1:-1] == list(W.SN_CSV_COLUMNS) and len(cols) == len(set(cols))
     with tempfile.TemporaryDirectory() as tmp:
         w, _b, _l = _worker(tmp)
         try:
-            assert w._run_meta()["schema_version"] == 24
+            assert w._run_meta()["schema_version"] == 25
         finally:
             w.teardown()
 

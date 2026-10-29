@@ -2,6 +2,10 @@
 
 ./c3 gui --source hw --allow-command --mpc --fstereo --policy --mpc-mode rl_pwm
 
+gantry command : `./c3 disturb`
+
+./c3 gui --source hw --allow-command --mpc --fstereo --policy --fstereo-scale 0.5 --fstereo-process --dvl_pose --dvl-trust --policy-dr
+
 # 방법 1a: 정책이 추론하는 순간에만 FoundationStereo가 새 프레임을 시작하지 않음
 
 ./c3 gui --source hw --allow-command --mpc --fstereo --policy --mpc-mode rl_pwm --policy-fs-schedule yield
@@ -22,18 +26,20 @@
 
 ./c3 gui --source hw --allow-command --mpc --fstereo --policycd /home/bdml/Desktop/RL_controller && DISPLAY=:1 /home/bdml/miniforge3/envs/env_isaaclab/bin/python -u scripts/play.py --task ROV-PoseHold-v0 --num_envs 64 --checkpoint logs/rsl_rl/rov_posehold/2026-09-21_16-53-50_traj5_s2/model_1199.p
 
-
-Noisy state 
+Noisy state
 
 ./c3 gui --source hw --allow-command --mpc --fstereo --policy --fstereo-scale 0.5 --fstereo-process --state-noise --dvl --dvl-trust
+
 # --dvl-trust (2026-10-19): DVL을 장치 보고대로 믿는다 — 태그 속도와의 불일치 hold·래치가 DVL을 빼지 않고, proving pass 없이 IN. 빼면 strict(기본, 2026-10-16 hold·래치).
 
-Only DVL 
+Only DVL
 
 ./c3 gui --source hw --allow-command --mpc --fstereo --policy --fstereo-scale 0.5 --fstereo-process --state-noise --dvl_pose
 
 # DP를 DVL 추측항법만으로 (2026-10-19): --policy-dr이 없으면 1.5 s 뒤 "POLICY flew on a bridged/DR state"로 멈춘다(A9).
+
 # 절차: 태그 보며 ~1 s → HIGH Diffusion Policy·ckpt → TAG FIX OFF(칩 pose:DVL) → START. 고도 0.2–0.5 m(bottom lock).
+
 ./c3 gui --source hw --allow-command --mpc --fstereo --policy --fstereo-scale 0.5 --fstereo-process --state-noise --dvl_pose --dvl-trust --policy-dr
 
 # → 패널: HIGH = Diffusion Policy, ckpt 칸의 "…"로 체크포인트 선택 (hw_mpc.yaml policy.ckpt는

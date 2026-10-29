@@ -1,0 +1,68 @@
+# disturbance_rig.yaml — the pool DISTURBANCE RIG (gantry + rotation motor + T200)
+# driven by ./c3 disturb (src/disturbance_panel.py). This is the external
+# disturbance SOURCE, not the DOB/EAOB estimated disturbance in rov_gui.
+#
+# Every value here is passed EXPLICITLY into whisker_vision's MotionSettings so
+# the panel does not silently inherit whisker_vision's branch-dependent defaults.
+# CLI flags override these; the values in force land in the run folder's
+# meta.json.
+#
+# Gantry limits are NOT configured here (since 2026-10-26). The controller's
+# firmware limit pair is invalid (200/200 units) and there is no switch homing:
+# the operator TEACHES each axis's soft limits on the rig — jog to one end,
+# press "−X home"; jog to the other, press "+X home". They are in the
+# controller's counter frame (0 = where the axes stood at power-up), saved to
+# data/disturbance_rig_limits.json, and valid until the controller is powered
+# off ("Restore saved" offers them to the next session). Firmware hard stops
+# still apply on the + side: X 1650 / Y 500 (unless rewritten with
+# whisker_vision/gantry_soft_limits.py) / Z 100 mm counter
+# [스펙: whisker_vision/gantry_soft_limits.py:7-13].
+gantry:
+  ip: 192.168.0.30
+  port: 8088
+  # default move/jog speed; UI/link range 0.1..100 (whisker's own links cap 50;
+  # the panel's RigGantryLink allows 100 = ./c3 gantry's default 10 cm/s,
+  # src/gantry_panel.py:3131) — but Z and Send stay <= 50 (disturbance_core
+  # AXIS_MAX_SPEED_MM_S / SEND_MAX_SPEED_MM_S; nothing has run above 50 on this
+  # rig yet). A jog release decelerates
+  # at acc 50 mm/s^2 (whisker motion_config.py:73), so the run-on grows with v^2:
+  # 3.0-4.6 mm at 20 mm/s (data/20261026/1026_165630_disturb/events.csv) and
+  # 5.5-27.2 mm at 50 mm/s (data/20261026/1026_140909_disturb/events.csv),
+  # jog_stopped rows; ~100 mm at 100 mm/s [유도: v^2/2a]. Lower SPEED to position.
+  speed_mm_s: 50
+  # Hold-jog toward a side WITHOUT a taught home: one continuous move of at most
+  # this length, and while the button is still held the next one follows (a
+  # brief stop at each boundary). This is also how far that axis can run on if
+  # the release stop is not taken or the panel process dies mid-hold — the
+  # 2026-10-26 run did exactly that, one full 300 mm piece per press
+  # (data/20261026/1026_131512_disturb/). Toward a taught home the move ends at
+  # the home instead, whatever this says.
+  jog_piece_mm: 300
+
+motor:
+  can_channel: can0
+  vel_deg_s: 30           # default Go-theta speed; also the STOP ALL hold speed
+  # UI cap. STOP ALL commands a hold at the CACHED angle (0.1-0.3 s old), so a
+  # fast move stopped mid-way swings back by speed x lag [유도]. whisker's own
+  # aim used 10 deg/s; the link allows up to 180.
+  vel_max_deg_s: 90
+
+thruster:
+  port: /dev/serial/by-id/usb-Arduino__www.arduino.cc__0043_75330303934351903171-if00
+  max_pct: 100            # session cap on |throttle|; --thruster-max overrides
+  # staircase: the ESC/supply misbehaves on abrupt power changes (whisker
+  # motion_config.py:93-95). Fixed in the panel (no UI); STOP ALL bypasses it.
+  ramp_step_pct: 10
+  ramp_interval_s: 3.0
+
+# Gantry patterns (panel "Pattern" box): X stays put, the pattern is centred on
+# where the gantry stands at Start. The controller runs straight single-axis
+# moves only, so a circle is a chain of ~segment_mm chords (brief slow-down at
+# each vertex). Every target stays inside the box start ± size; a taught home
+# or the + firmware stop that cuts into it refuses the Start.
+pattern:
+  speed_mm_s: 10          # along the path; UI range 1..100. On the 8 mm circle
+                          # chords the 50 mm/s^2 acceleration caps it at ~20 [유도]
+  circle_radius_mm: 30    # Y-Z circle; UI range 5..50
+  line_range_mm: 100      # Y back-and-forth, peak to peak (±50); UI range 5..100
+  segment_mm: 8           # circle chord length

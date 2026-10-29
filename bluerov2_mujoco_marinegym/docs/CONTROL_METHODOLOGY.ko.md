@@ -2414,3 +2414,176 @@ PASS_WITH_FIXES — 중간 1건 수정, 낮음 1건 문서화, DVL 없음/OUT의
   첫 시도는 32 s 비행에서 stub의 직진 청크가 작업공간 박스를 넘어 `escalated`로 끝났다(박스 가드가 살아 있음) → 비행 12 s로 조정.
 * **실기 절차:** `./c3 gui --source hw --allow-command --mpc --fstereo --policy --fstereo-scale 0.5 --fstereo-process --dvl_pose --dvl-trust --policy-dr`
   → 태그 보며 ~1 s → HIGH Diffusion Policy·ckpt → **TAG FIX OFF** → START. 고도 0.2–0.5 m(bottom lock). **실기 0런.**
+
+## 2026-10-27 — DVL 3빔 재계산: 빔 하나만 길게 튀면 나머지 세 빔으로 속도를 다시 푼다 (`dvl.three_beam`, 실기 0런)
+
+* **왜:** `--dvl_pose --dvl-trust`로 태그 없이 돌아다닌 1027_194851에서, 중층(고도 0.52–0.62 m)인데도 빔 id 1만 1.01–1.19 m(나머지
+  0.4–0.6 m)를 읽어 장치가 리포트를 invalid로 냈고, 포즈가 1.65 s 동안 HELD→LOST로 멈춘 사이 실제 이동 30.8 cm가 오차로 남았다
+  [측정: data/20261027/1027_194851/analysis/dvp_vs_tag.txt, 같은 폴더 three_beam/]. 장치는 빔 넷 중 하나가 틀리면 그 리포트를 통째로 버린다 —
+  남은 세 빔은 멀쩡한데. 운용자 요청: "빔 하나만 튈 때 나머지 3빔으로 속도를 다시 계산", 오프라인 재현 먼저.
+* **무엇(이론):** A50은 Janus 4빔이다. 각 빔은 자기 방향의 속도 성분 하나를 잰다. 미지수 3개(속도)에 식 4개라, 한 빔을 빼도 식 3개로
+  정확히 풀린다 — 대신 중복이 없어 그 리포트 안에서는 맞는지 알 길이 없다. 그래서 "끊긴 스트림의 시작"이 아니라 "좋은 스트림의
+  연장"에만 쓴다.
+  ```
+  beam unit vectors (output frame):  b_i = ( sinθ·cosα_i , sinθ·sinα_i , cosθ ),  θ = 22.5°,
+                                     α = (+135, −135, −45, +45)° + mounting_rotation_offset   (id 0..3)
+  beam velocity:                     u_i = b_i · v
+  device altitude:                   h = cosθ · mean(d_i) − 0.015 m                (exact on 14 256 reports)
+  one long beam k:                   d_k > 1.5 · median(d_j, j≠k)   and   max/min(d_j, j≠k) ≤ 1.4
+  re-solve:                          v₃ = [b_j]⁻¹ · u_j   (j ≠ k; 3×3, exact — no residual)
+                                     h₃ = cosθ · mean(d_j) − 0.015
+  v_z blind spot:                    v₃,z = (u_{k+1} + u_{k+3}) / (2·cosθ)    — the opposite beam k+2 never enters it
+  accepted only if:                  |v₃,z| ≤ 0.10 m/s
+                                     t − t_good ≤ stale_s (0.6 s)                (extend-only: the jump gate can judge it)
+                                     t − t_own4 ≤ 3.0 s                          (chain cap from the device's own good 4-beam)
+                                     median_200( ‖B·v_dev − u‖ / ‖u‖ ) ≤ 0.10, n ≥ 50 clean moving reports   (geometry)
+  then the usual gates:              lock (now true), fom (device's), jump |v − v_good| ≤ 2.0·dt + 0.05, v_max, R3 flags
+  ```
+* **어떻게:** `rov_gui/control/dvl.py` — `beam_matrix(offset)`(0/180만; 180 실측, 0 [유도]), `three_beam(beams, B, ratio, kept_max,
+  vz_max)`, `DvlAid._three_beam`(사본 샘플: `v_dvl` = v₃, `valid` True, 세 빔 고도, `beams3` = k; 장치 fom·n_beams 유지), `_geo_note/_geo_ok`
+  (런타임 기하 검증), `_b3_share_text`(트립 문구에 "n of m … three-beam re-solves"), `sample_in`(버스 샘플 — 워커의 동일성 검사용),
+  `sample_fields`가 빔을 `id`로 정렬해 `beams`로 실음. `rov_gui/state.py` `DvlSample.beams / beams3`. `workers.py`: `_dvp_note_dvl`이
+  `d.sample_in`으로 비교하고 사본의 고도를 포즈에 넘김, CSV `dvl_beams3`(schema 25) — `dvl_valid`·`dvl_alt_m`은 장치 값 그대로,
+  shadow EKF는 장치 원본만(ROS 드라이버 의미, `_ekf_inputs.jsonl`의 `b3` 표시). YAML `dvl.three_beam / _ratio / _kept_max /
+  _vz_max_m_s`. 결정: 반향 없는 빔(−1)·`beam_valid` false·짧은 빔은 하지 않는다 — 태그 기준 3빔이 0보다 나쁘거나(반향 없음 p90
+  21.76 vs 15.57 cm/s) 표본이 적다(짧은 빔 n 37). 장치 valid + 긴 빔 하나도 대체한다(3빔 0.68/3.11 vs 장치 1.48/4.93 cm/s).
+* **오프라인 근거:** 기준 = 태그 위치의 비인과 국소 기울기(W 0.5 s)를 body로. 10-15/19/27 136런 [측정: data/20261027/1027_194851/analysis/
+  three_beam/all_days/three_beam_study.json]: 빔 기하 회귀가 명목값 + 180°와 1.5° 안(61 068 리포트, 빔별 rms 0.29–0.43 cm/s); 장치 invalid +
+  긴 빔 하나 3빔 p50/p90 1.23/7.50 cm/s vs 0으로 멈춤 7.28/12.24 (n 432); 그중 10 cm/s 넘는 37건, kept·vz가 16건을 거름(beam3_cases.py).
+  3빔 연쇄 p99 1.36 s, 최대 5.38 s(chain_lengths.txt); 기하 검증 임계값은 geometry_check.txt(옳은 기하 200개 중앙값 ≤ 0.094, offset 0 ≥ 0.152,
+  빔 순서 밀림 ≥ 0.113).
+* **리뷰:** safety-code-reviewer 1회 — WARN(trust·태그 없는 control에서는 FAIL): HIGH 2, MEDIUM 5, LOW 3. HIGH: (1) 3빔 사본을 따로 판정하는
+  게이트가 없고 점프 게이트는 stale_s 뒤 꺼져, 틀린 3빔 스트림이 ~0.7 s 뒤 모든 게이트를 지나 난다(kept·vz를 통과하고도 15 cm/s 넘게 틀린
+  채움 13건 실재) → **이어 붙이기만**(stale_s + 3 s 연쇄 상한) + 런타임 기하 검증; (2) CSV `dvl_valid`가 사본 값으로 바뀜 → 장치 값 복구 +
+  `dvl_beams3` 열 + schema 25. MEDIUM: vz는 자기검증이 아님(맞은편 빔) → 문서; EKF 게이트/페이로드 불일치 → 장치 원본 + `fed` 정직 + `b3`;
+  RL_controller replay_lib가 재현 못 함 → KNOWN_ISSUES; 워커 수준 테스트 없음 → 추가; 래치가 장착 문제로 보임 → 트립 문구에 3빔 비율.
+  LOW: 빔을 목록 순서로 받음 → `id` 정렬; offset 0은 스펙이 아니라 [유도]; RL 계약 밖 → 기록만.
+* **결과:** 스테이션의 실제 `DvlAid`(작업 트리, 리뷰 반영 규칙·게이트·플래그 포함)로 재생 [측정: three_beam/aid_replay.txt]: 1027_194851의
+  14.53–16.18 s 정지 30.0 → **9.0 cm**, 22.73–23.08 s 3.6 → 0.6 cm; 1027_194256의 바닥 근처 공백(52 cm 등)은 그대로(네 빔이 다 반향을 잃음),
+  53.11–53.66 s 16.2 → 6.7 cm. 비행한 속도 전체의 태그 기준 오차는 그대로(p50 2.0/p90 5.0 cm/s), 비행 샘플 429 → 442. 테스트: test_dvl +6,
+  test_dvl_pose_worker +1(사본이 DR까지 감, 기하 미확인이면 HELD), 스키마 25 반영. **실기 0런.** 한계: 연쇄 안의 틀린 한두 개는 점프 게이트
+  한도(≈ 0.25 m/s) 안이면 난다(194851 t15.8의 29 cm/s도 위 9 cm에 포함); 빔 3이 긴 경우가 가장 약하다; offset 0은 실측 안 됨.
+
+### 같은 날 밤 — 독립 재검증(워크플로: 4개 관점 리뷰 + 지적마다 반박 검증) 뒤 수정 (실기 0런)
+
+* **왜:** DVL 감시·게이트 로직은 고칠 때마다 직전 수정에서 결함이 나왔다(10-02 리뷰 6회). 리뷰 반영분을 게이트·기록·수명/동일성·기하/수치
+  네 관점이 따로 읽고, HIGH/MEDIUM마다 반박 검증을 붙였다: HIGH 0, MEDIUM 5 → 전부 반박자가 LOW로 낮춤, 반박 2, LOW 12.
+* **무엇:** 실제 결함 — (1) 연쇄 상한의 기준점을 **긴 빔이 섞인** 장치 valid 리포트도 갱신해, 장치가 이따금 valid 두 개를 내면 3 s 상한이
+  무한히 이어졌다(재현: 30 s 동안 300개 중 231개 3빔); (2) EKF 게이트는 3빔 사본을 판정하고 EKF에는 판정 안 된 장치 원본을 넣었다(장치 valid
+  + 긴 빔 → flag_alt·점프 게이트를 비켜 감); (3) 기하 검증이 상하 이동 리포트를 받았다 — 모든 빔의 z가 같아 상하 이동은 어떤 방위 오류로도
+  재현된다(3D 기준에서 인접 빔 교환이 136개 로그 중 10–16개에서 검증을 엶); (4) 새 CSV 열 때문에 헤더를 끝에서 세는 테스트 6개 실패.
+  LOW: 재연결 뒤 기하 창 유지, 같은 t_valid의 3빔은 점프 게이트가 판정 안 함, 순서가 뒤바뀐 샘플이 집계를 올림, legacy에서도 3빔(롤백 사다리가
+  비트 동일하지 않게 됨), 패널 고도가 사본 값, `flown` 집계 이름이 실제와 다름, 근거 스크립트 미저장·고도 표본 수 오기(14 256 → 실제 73 604).
+  ```
+  chain anchor:      t_own4 ← t  only if  device valid ∧ passed ∧ beams_clean(beams, 1.5)   (four agreeing beams)
+  extend-only:       0 < t − t_good ≤ stale_s                     (equal stamps refused: the jump gate judges 0 < dt only)
+  geometry window:   admit  ⇔  device valid ∧ beams_clean ∧ ‖v_xy‖ ≥ 0.03 m/s   (heave reproduces under ANY azimuth: b_i,z = cosθ ∀i)
+                     cleared on a new TCP connection (conn_id) or a changed offset / speed of sound
+  EKF:               fed = may ∧ device valid ∧ (report not re-solved)
+  ```
+* **어떻게:** `dvl.py` `beams_clean()`(기하 검증과 기준점이 같은 정의), `note_sample` 순서 검사를 3빔 앞으로·`conn_id` 변화 시 초기화·
+  기준점은 깨끗한 리포트만·집계 `passed_gates`/`held_by_gates`, `_three_beam` primary 전용·`0 < dt` 조건, `_geo_note` 수평 속도,
+  `sample_fields` 빔 `id`는 JSON 정수만; `state.py` `DvlSample.conn_id`, `backends/dvl.py`가 연결 번호를 실음; `workers.py` EKF는 3빔 리포트
+  안 받음, 상태 고도는 장치 값, DVL 버튼 툴팁 "3-beam (beam k long)"(dvl_code ok일 때만); 테스트 헤더 슬라이스 6개 수정 + test_dvl +5, 워커 테스트에 EKF 단언.
+* **결과:** 근거 스크립트를 저장했다 [측정: data/20261027/1027_194851/analysis/three_beam/geometry_check.py → geometry_check_v2.txt,
+  chain_lengths.py → chain_lengths_v2.txt, alt_formula_check.py → alt_formula_check.txt]: 수평 기준·MIN_N 50에서 틀린 기하 8종 모두 136개 로그
+  어디서도 검증을 못 연다(최소 중앙값 0.110 인접 교환, 0.327 순서 밀림, 0.464 offset 0), 맞는 기하는 하루 단위 세션에서 3빔 가능 리포트
+  7 275/7 301을 덮는다; 깨끗한 기준점 이후 3빔 가능 리포트 도착 p50 0.25 / p90 1.36 / p99 5.74 s, 3 s 상한이 2.8 % 거부; 고도 공식은
+  73 604개(4빔)·6 818개(3빔)에서 1.2e-7 m 안. 실제 `DvlAid` 재생(새 규칙 전부)에서 1027_194851 30.0 → 9.0 cm 그대로, 새 거부 0건
+  [측정: aid_replay.txt]. 남는 한계: 연쇄 안의 틀린 한두 개(점프 한도 안), 인접 빔 교환과 임계값의 여유가 얇다(0.110 vs 0.10).
+
+### 같은 날 자정 무렵 — 3차 재검증(바뀐 부분만, 3개 관점 + 반박) 뒤: 기하 검증을 "빔 사상 최소제곱"으로 (실기 0런)
+
+* **왜:** HIGH 0, MEDIUM 2(반박자가 LOW로), LOW 13. 실제 결함 둘이 기하 검증에 있었다: (1) 수평 기준으로 받아도 상대 잔차의 분모
+  rms(u)에 cos22.5°·v_z가 남아 표류 있는 하강이 틀린 기하를 열 수 있었다; (2) **리포트별 잔차는 어떤 틀린 기하에는 어떤 운동 방향이 안
+  보인다** — 인접 빔 교환은 축 방향 직선에서, 마주 보는 쌍 교환은 대각선에서 잔차 0. 재연결 직후 그런 직선이면 열린다(창 시작점
+  898곳 × 순열 23개 중 53번 [측정: data/20261027/1027_194851/analysis/three_beam/geometry_check_v3.txt, rule v2]). 그 밖에: EKF가 순서 뒤바뀐 리포트를 판정 없이 받는 경로, 3빔 표시는 칩이 아니라 툴팁, 근거 없는 숫자(~2.1 s 등),
+  1.75 s/6.0 cm 오기, 오래된 주석.
+* **무엇:** 창의 리포트로 수평 사상을 맞추고, 운동이 두 방향에 퍼졌을 때만 판정한다 — 그러면 어느 방향의 맹점도 없다.
+  ```
+  window:      last 200 clean, device-valid reports with ‖v_xy‖ ≥ 0.03 m/s;   u_h = u − mean(u)   (mean(u) = cosθ·v_z, heave out)
+  fit:         H = (Σ u_h v_hᵀ)(Σ v_h v_hᵀ)⁻¹                        (4 × 2, least squares)
+  judged iff:  n ≥ 30  ∧  λ_min(Σ v_h v_hᵀ / n) ≥ (0.015 m/s)²         (motion spans two horizontal directions)
+  open iff:    judged ∧ max |H − B_h| ≤ 0.15     (wrong permutation: H ≈ P·B_h, noise-free max|P·B_h − B_h| = 2·sin22.5°·cos45° ≈ 0.54 for every P [유도])
+  ```
+* **어떻게:** `dvl.py` `_geo_note`(창에 (v_h, u_h)), `_geo_fit`(창 합을 매번 다시 계산 — 누적 오차 없음), `_geo_ok`, 열림/닫힘 알림
+  `take_three_beam_notes` → 워커가 미션 로그에 `dvl: three-beam re-solve ON/OFF …`; 상수 `GEO_N 200 / GEO_MIN_N 30 / GEO_V_MIN_M_S 0.03 /
+  GEO_EXC_M_S 0.015 / GEO_DEV_MAX 0.15`. `workers.py`: EKF는 primary에서 aid가 방금 판정한 리포트만, 3빔 툴팁은 dvl_code ok일 때만,
+  CSV 주석에 rung 행 설명. 근거 스크립트 추가: `geometry_check_v3.py`(잔차 규칙 대안들 — 두 축 창도 대각선 맹점), `geometry_check_v4.py`
+  (사상 규칙), `refusal_quality.py`, `chain_lengths_v3.py`(코드의 기준점 그대로 DvlAid 재생), `repro/repro_chain_renewal.py`.
+* **결과:** [측정: data/20261027/1027_194851/analysis/three_beam/geometry_check_v4_dev_sweep.txt, _dev_wide.txt, _margin.txt] 틀린 빔
+  순열 23개(offset 0 포함)는 136개 로그의 창 시작점 898곳(×23)·로그 시작 136곳·하루 3개 어디서도 열지 못했다; 판정된 창에서 틀린 기하의
+  최소 편차는 로그마다 새 창 0.453(맞는 기하 최대 0.245)이지만 재연결을 닮은 임의 시작 창에서는 0.268(맞는 기하 p99 0.157, 최대
+  0.588) — 가장 가까운 틀린 기하가 임계값 0.15의 1.8배 [유도]이고 두 분포는 겹친다(0.15에서 맞는 기하가 1 787/162 808 판정 걸음
+  닫힘); 임계값 0.30이면 3건·0.40이면 20건이 열리므로 0.25를 넘기지 말 것(4차 검증); 맞는 기하가 열린 동안은 3빔 가능 리포트의 59.7 %(로그마다 새 창)–99.7 %
+  (하루 한 창) — 잔차 중앙값 규칙(54.7–99.6 %)보다 낮지 않다. 연쇄 길이는 코드 기준점으로 p50 0.32 / p99 6.31 s, 3 s 초과 3.2 %
+  [chain_lengths_v3.txt]; kept·vz 거부 47건 중 20건이 3 cm/s 이내의 좋은 채움 [refusal_quality.txt]. 실제 `DvlAid` 재생에서 1027_194851
+  30.0 → 9.0 cm 그대로 [aid_replay.txt]. 한계: 제자리 유지·직선 한 줄 세션에서는 열리지 않는다(예전 동작); 실제 틀린 기하는 본 적이 없다.
+
+### 10-28 새벽 — 4·5차 검증 뒤: 여유는 창 방식별로, 알림은 2 s 유지 + 원인 + 새 시작에서도 경고 (실기 0런)
+
+* **왜:** 4차(코드·문서 + 반박) HIGH 0·MEDIUM 1: 여유 0.453은 로그마다 새 창에서만 잰 값인데 문서가 재연결을 닮은 임의 시작 창에도
+  붙였다(실제는 틀린 최소 0.268, 맞는 최대 0.588 — 분포가 겹친다). 5차(알림 상태 + 반박): **기하 불일치 warn이 새 시작(재연결·설정 변경)
+  뒤에는 절대 나오지 않았다** — ON이 말해진 뒤에만 가능했는데, 펌웨어가 빔 순서를 바꾸는 경우는 재연결과 함께 오므로 바로 그 경우를 못
+  알렸다(동작은 닫힌 채 안전). 그 밖에 LOW: 2 s 안의 열림이 집계되지 않음, "1.5 < 1.5 cm/s" 문구, "약 1.8배" 표현, 근거 없는 "로그당 5줄".
+* **무엇:**
+  ```
+  notes:     state change said after it held 2 s (sample time); a reset (new conn_id / changed config) said at once
+  mismatch:  judged (n ≥ 30, 2-D motion) ∧ max|H − B_h| > 0.40 for 2 s  →  one warn per window, ON or not
+  offset:    mounting_rotation_offset ∉ {0, 180}  →  one warn per value, from the first get_config answer
+  counts:    geometry_opened / geometry_closed (every change), geometry_on / geometry_off (said), geometry_mismatch
+  ```
+* **어떻게:** `dvl.py` `_b3_geo_transition`(적합 한 번으로 상태·전환 집계·말하기·불일치 경고), `_b3_geo_say`(OFF 원인·수준),
+  `_b3_offset_note`(note_device_config 첫 줄), `GEO_NOTE_DWELL_S 2.0`, `GEO_WARN_DEV 0.40`, meta `geometry_check_now`; 워커는 노트를 그
+  수준(info/warn)으로 기록. 테스트: 재연결 뒤 틀린 기하 경고·맞는 기하 무경고·첫 응답 offset 경고, 2 s 유지(되돌아간 전환은 말하지 않되
+  집계함), OFF 원인 3종.
+* **결과:** [측정: data/20261027/1027_194851/analysis/three_beam/geometry_notes_check.txt, geometry_notes_anystart.txt,
+  geometry_check_v4_margin.txt, _dev_wide.txt] 맞는 기하의 열림/닫힘 96번 중 13번이 2 s 안에(7번은 0.5 s 안에) 되돌아갔다; 경고 기준 0.40은
+  맞는 기하에서 로그 136개·임의 시작 창 898개 모두 0번 경고(0.30이면 2번, 0.25면 12번), 틀린 빔 순서는 판정된 (로그, 순열) 1 656쌍 중
+  1 610쌍에서 처음 판정 뒤 ~2.1 s에, 빔 0/1 교환은 판정된 시작 창 749개 중 719개에서 경고. 기하 검증 임계값 0.15의 여유: 로그마다 새 창
+  0.453 vs 맞는 기하 최대 0.245, 임의 시작 창 0.268(임계값의 1.8배 [유도]) vs 0.588 — 0.25까지는 틀린 기하 0번, 0.30이면 3번 열리므로 올리지 말 것.
+* **6차 검증 뒤(같은 날):** 0.15를 넘어 닫힐 때의 OFF가 warn("check the beam geometry")이어서 맞는 기하에서 임의 시작 창 898개 중 1번 났다 →
+  그 OFF는 info("re-solve paused …")로, warn은 보정된 불일치(0.40을 2 s)와 offset 미지원 둘뿐. 표시값은 판정 쪽으로 반올림(14.9 < 15.0 mm/s,
+  0.16 > 0.15), 리셋으로 닫힌 것도 `geometry_closed`에 셈, offset 경고는 아는 값이 오면 다시 무장. 2 s 미만의 열림은 줄 없이 `dvl_beams3`와
+  `geometry_opened/closed`에만 남는다.
+
+## 2026-10-29 — trust 모드의 `unobserved` 정지가 더 이상 런을 끝내지 않는다: engaged 중 DVL 공백 이동은 경고, 런은 운용자가 끝낸다 (새 실기 런 0)
+
+* **왜:** trust 모드는 DVL 공백을 그대로 지나가고, 공백에 숨었을 수 있는 이동을 추정한다(`unobserved_m`). 2026-10-19 안전 리뷰(HIGH #2, 위)
+  이후 이 추정이 `max_corr_m` 25 cm를 넘으면 정지였다 — 경고가 시키는 ONCE가 어차피 런을 끝내기 때문. 실제로 engaged 런 하나(`--policy-dr`
+  peg 런, engage 11 s 뒤)를 끝냈고, 이어 15 s 동안 START를 19번 거부했다(그날 모두 27번) [측정: data/20261019/1019_232652/events.log
+  23:26:52–23:27:25; 1019_230824·1019_232345 events.log]. 이 추정은 과대 쪽으로만 틀린다: 10-27/28 TAG FIX OFF 행(25 cm를 넘은 행은 전부
+  disengaged)에서 태그가 25 cm 넘게 잰 918행은 추정도 모두 25 cm를 넘었고, 추정이 25 cm를 넘은 2180행 가운데 1262행은 태그가 25 cm 이하로
+  쟀다(1028_152309: 추정 147 cm까지, 태그 ≤ 19.1 cm) [측정: data/20261029/1029_unobserved_vs_tag_offline/unobs_vs_err.txt]. 운용자:
+  "어차피 내가 항상 관찰하고 있으니까 굳이 자동으로 끝낼 필요없어 내가 멈출거야."
+* **무엇(이론):** engaged 중에는 추정을 보여 주기만 하고 아무것도 멈추지 않는다 — 오차는 태그가 보이면 태그가, 안 보이면 운용자가 판단한다.
+  disengaged에서는 지금도 START 거부다: 운용자는 런 종료만 말했고, disengaged 중의 공백(들어 올리거나 손으로 옮김)은 포즈를 공백 전 자리에
+  남긴다. 태그를 보며 ONCE를 누르면 snap으로 풀린다.
+  ```
+  unobserved_m = Σ_gaps (gap − hold_s) · max(|v_last|, v_floor)       recorded (dvp_unobs_m) + warned until a re-anchor
+  before:  unobserved_m > max_corr_m  ⇒  fault  ⇒  engaged: the run ends;  disengaged: START refused
+  now:     unobserved_m > max_corr_m  ⇒  engaged: said once, "(not a stop)";  disengaged: START refused (unchanged)
+  what still ends an engaged run (trust):  no sample for lost_s;  |pose − tags| ≥ abort_err (25 cm, 10°, z 20 cm) for abort_hold_s
+                                           with tags in view;  |v_DVL| > max_dr_speed_m_s;  the heading rules;
+                                           a correction after dead reckoning > max_corr (25 cm, 10°)
+  ```
+* **어떻게:** `dvl_pose.py` `_watch` — `unobserved` 정지는 `not engaged`일 때만 낸다(engage 순간의 step은 `engaged = True` 전에 disengaged로
+  돌기 때문에, disengage 직후 tick 없이 START해도 이것으로 판정된다). `workers.py` `_dvp_say`는 engaged 중 25 cm를 넘는 순간을 onset마다 한 번
+  남긴다 — 미션 로그 파일(패널은 dvl_pose warn을 안 그린다), 런의 events, meta faults의 `(not a stop)` — shadow 모드가 "control 런이 여기서
+  끝났을 것"을 남기는 방식 그대로다. TRUST MODE 문단도 그렇게 고쳤고, 같은 문단에 있던 "10-19 저녁 두 번째 결정으로 발산 정지·보정 한계는 기록만
+  한다"는 문장 — 어느 코드도 그렇게 한 적이 없다(`_watch_divergence`·`_accept`·`tag_refusal`·`pending_too_big`에 trust 분기 없음) — 과
+  `pending_too_big`의 "trust에서는 안 함"도 코드에 맞게 고쳤다. 실행 배너와 `--dvl-trust` 도움말: "refuses a START but never ends a run".
+  strict 모드는 그대로다(구멍: `max_unobserved_m` 0.10, 또는 `lost_s`를 넘는 공백 하나).
+* **리뷰:** 워크플로 두 번 — 4개 관점(안전·남은 흔적·테스트·아직 저절로 서는 것) + 지적마다 반박 검증, 그다음 결과의 델타 검증. 첫 버전은 START
+  거부까지 뺐다 — 요청 범위 밖(disengaged 중 긴 공백 뒤 태그 없이 START하면 몇 m 틀린 포즈에서 datum을 잡는다) → disengaged에서만 되살렸고,
+  engaged 중 25 cm를 넘는 순간이 어디에도 안 남게 된 것 → onset마다 한 번 기록. 바로잡은 주장: "이 정지로 끝난 engaged 런은 없다"(위처럼 하나
+  있었다), "추정이 양쪽으로 틀린다"(과대 쪽으로만 틀린다), trust 모드와 `--policy-dr`의 낡은 "실기 0런"(trust engaged 런 35개 — 10-19 24·10-27
+  11, 최장 627.8 s — 그중 `--policy-dr` 29개 [측정: data/20261029/1029_unobserved_vs_tag_offline/trust_runs.txt]). 발견만 하고 안 고친 것
+  (KNOWN_ISSUES): meta `gaps_trusted`가 예산 0.10 m를 넘은 뒤로 샘플을 센다; engaged가 이어지는 동안 새 미션 START는 이 추정으로 막히지 않는다
+  (게이트는 engage에만); shadow의 "control START would have been refused" 기록은 disengage 직후 tick 없이 engage하면 빠진다.
+* **결과:** 테스트만. `test_dvl_pose::test_trust_mode_never_ends_a_run_on_the_unintegrated_motion`(engaged: 35 cm를 넘어도 fault 없음, 숫자가
+  든 경고; disengaged: START 거부; 태그가 돌아오면 disengaged는 snap으로 풀리고, engaged 재획득은 max_corr를 넘으면 여전히 거부)과
+  `test_dvl_pose_worker::test_trust_mode_flies_on_past_the_unintegrated_motion_not_a_new_start`(워커 engaged, 태그 없이 0.10 m/s로 1.2 s 공백
+  6번: engaged 유지, 로그·events·meta에 `(not a stop)` 한 번; 이어 START가 engage 순간과 다음 tick 모두에서 거부되고, 태그를 보며 ONCE를 누른
+  뒤에는 시작된다) — HEAD, START 거부를 뺀 버전, 기록을 뺀 버전, engage 순간 판정을 우회한 버전에서 모두 실패한다. 남는 한계: engaged 중
+  태그가 안 보이면 공백이 숨긴 이동은 운용자 말고는 아무것도 못 잡는다.

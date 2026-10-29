@@ -9,6 +9,7 @@
 #     ./c3 scene      --run <RUN_DIR>           # the same scene as an mp4
 #     ./c3 gantry                   # FMC4030 gantry panel (jog, move, tag-map position)
 #     ./c3 gantry --connect-test    # is the controller reachable? (no motion)
+#     ./c3 disturb [--sim]          # pool DISTURBANCE RIG: gantry + rotation motor + T200 (one manual panel)
 #     ./c3 test                     # the no-camera regression suite
 #     ./c3 env                      # which interpreter, which versions
 #
@@ -69,6 +70,10 @@
 #   2. The panel's optional deps (pyqtgraph, qdarkstyle, qtawesome) live in
 #      `robust`; the station needs `rovgui-pose` (torch, numpy 2.x). Two
 #      processes means neither env has to grow toward the other.
+# `./c3 disturb` (the disturbance rig panel, src/disturbance_panel.py) holds the
+# SAME single FMC4030 connection, so it and `./c3 gantry` are mutually exclusive;
+# it runs in the `whisker` conda env (python-can + pyserial live there, and
+# python-can pins wrapt~=1.10 which would downgrade robust's wrapt 2.2.1).
 # Nothing collides at run time either: the gantry is 192.168.0.30:8088 over
 # wlan, the C3 and the ROV are 192.168.2.x over the tether, and a Ctrl-C in the
 # gantry process reaches its own SIGINT handler (stop_axis(mode=2) on all three
@@ -145,6 +150,8 @@ tools:
   scene-html       a run as an interactive 3-D page + the depth it saw
   scene            the same scene as an mp4
   gantry           FMC4030 gantry: panel (no args) or CLI (src/gantry_runner.py)
+  disturb          pool DISTURBANCE RIG: gantry + rotation motor + T200 in ONE manual
+                   panel (src/disturbance_panel.py; whisker env; --sim; --preflight-only)
   cctv             the pool-corner cameras ALONE (no ROV/C3): 4-slot window +
                    REC (rov_gui/cctv.py; with the vehicle: ./c3 gui --pool-cams)
   poolcam          pool-corner cameras, low level: --list, OpenCV set-up window,
@@ -314,6 +321,26 @@ case "$tool" in
       *)                            exec "$PY" src/gantry_runner.py "$@" ;;
     esac
     ;;
+  disturb)
+    # Pool DISTURBANCE RIG in one manual panel: FMC4030 gantry + Damiao rotation
+    # motor + external T200, on whisker_vision's motion links (imported by path
+    # from $WHISKER_VISION_DIR, default ~/Desktop/whisker_vision; never modified).
+    # Exclusive with ./c3 gantry (one FMC4030 client). Real devices need
+    # python-can + pyserial, which live in the `whisker` env; --sim runs anywhere.
+    # LD_LIBRARY_PATH (OpenFOAM/CUDA) is dropped: it makes PyQt5's xcb plugin bind
+    # the system Qt (rov_gui/qt.py explains).
+    cd "$REPO"
+    DPY="${DISTURB_PY:-${CONDA_PREFIX_ROOT:-$HOME/miniforge3}/envs/whisker/bin/python}"
+    if [[ ! -x "$DPY" ]] && command -v "$DPY" >/dev/null 2>&1; then
+      DPY="$(command -v "$DPY")"          # DISTURB_PY=python3 style
+    fi
+    if [[ ! -x "$DPY" ]]; then
+      echo "c3 disturb: $DPY missing — falling back to $PY (no python-can/pyserial: --sim only;" >&2
+      echo "            real motor/thruster Connect WILL fail there)" >&2
+      DPY="$PY"
+    fi
+    exec env -u LD_LIBRARY_PATH "$DPY" src/disturbance_panel.py "$@"
+    ;;
   env)
     cd "$REPO"
     echo "interpreter : $PY"
@@ -335,6 +362,20 @@ case "$tool" in
       echo "gantry lib  : $GANTRY_SO"
     else
       echo "gantry lib  : MISSING — ./c3 gantry cannot connect (vendor/ is gitignored)"
+    fi
+    # ./c3 disturb imports whisker_vision by path and runs in the whisker env.
+    WV_DIR="${WHISKER_VISION_DIR:-$HOME/Desktop/whisker_vision}"
+    if [[ -f "$WV_DIR/motion_control.py" ]]; then
+      WV_SO="$WV_DIR/motion/vendor/ubuntu/lib/64/libFMC4030-Lib.so"
+      echo "whisker_vis : $WV_DIR  ($(git -C "$WV_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null) $(git -C "$WV_DIR" rev-parse --short HEAD 2>/dev/null)) $([[ -f "$WV_SO" ]] && echo 'lib ok' || echo 'lib MISSING')"
+    else
+      echo "whisker_vis : MISSING at $WV_DIR — ./c3 disturb cannot run (export WHISKER_VISION_DIR)"
+    fi
+    DPY="${DISTURB_PY:-${CONDA_PREFIX_ROOT:-$HOME/miniforge3}/envs/whisker/bin/python}"
+    if [[ -x "$DPY" ]]; then
+      echo "disturb     : $DPY  $(env -u LD_LIBRARY_PATH "$DPY" -c 'import can, serial' 2>/dev/null && echo '(python-can + pyserial ok)' || echo '(no python-can/pyserial: --sim only)')"
+    else
+      echo "disturb     : $DPY missing — ./c3 disturb falls back to $PY (sim only)"
     fi
     "$PY" - <<'PY'
 import sys

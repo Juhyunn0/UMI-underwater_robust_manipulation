@@ -148,6 +148,7 @@ No Qt, no sockets, no dobmpc: plain numpy, so it is tested bare
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 from collections import Counter, deque
@@ -228,8 +229,12 @@ DEFAULTS = {
     # fom is the device's own velocity accuracy in m/s (docs example at rest:
     # 0.00016). What it reads in THIS pool is unknown. [예측]
     "fom_max": 0.05,
-    # [스펙: overview page — A50 altitude range starts at 5 cm]
-    "min_altitude_m": 0.05,
+    # [스펙: overview page — A50 altitude range starts at 5 cm] — but the
+    # device's own velocity_valid judges a lock: 0.0 = a valid report is
+    # used at any altitude, only a negative one (the no-lock -1) is held
+    # back (operator 2026-10-27: 1027_191909 lost the pose 3 times on valid
+    # reports at 0.03-0.04 m). 0.05 = the old vendor-range gate.
+    "min_altitude_m": 0.0,
     # Sanity only. [스펙] the A50 tracks to 3.75 m/s; this vehicle has never
     # exceeded 0.5 m/s. [예측]
     "v_max_m_s": 1.5,
@@ -412,13 +417,47 @@ DEFAULTS = {
     "esc_scale_v_min_m_s": 0.05,  # recordings [측정 DTF design/out/scale_rules.json]
     "esc_repeat_n": 3,           # 0 = off
     "esc_repeat_window_s": 60.0,  # = agree_window_s, the fit's own [가정]
+    # ==== 2026-10-27: THREE-BEAM RE-SOLVE (operator request, after
+    # 1027_194851 lost the pose 1.65 s while ONE beam read ~2x the floor).
+    # A report where exactly one beam reads LONG (distance > ratio x the
+    # median of the other three) gets its velocity re-solved from the other
+    # three (DvlAid._three_beam) — device-invalid AND device-valid ones.
+    # Against the tag reference, 136 runs of 10-15/19/27 [측정 data/20261027/
+    # 1027_194851/analysis/three_beam/all_days/three_beam_study.json]:
+    # invalid long, v3 p50/p90 1.23/7.50 cm/s vs 7.28/12.24 held at zero;
+    # valid long, v3 0.68/3.11 vs the device's 1.48/4.93. NOT for a beam
+    # with no echo (v3 5.67/21.76 vs 9.12/15.57) or a SHORT one (12.51 p90,
+    # n 37) — the 10-15 flag_min_beams measurement is that population.
+    # kept_max / vz_max drop 16 of the 37 > 10 cm/s fills, keep 385 of 432
+    # (p90 7.50 -> 4.40) [측정 data/20261027/1027_194851/analysis/three_beam/
+    # beam3_cases.py, long_invalid_cases.json]; beam 3 long stays
+    # the weak one (p90 13.8 after them). NEITHER IS A SELF-CHECK: three
+    # beams, three unknowns — no residual, and v_z comes from the two beams
+    # adjacent to the one left out only, so an error on the OPPOSITE beam
+    # never shows in it (safety review 2026-10-27). In effect kept_max is a
+    # TILT cut-off (the three kept beams always fit a plane; past ~22-30 deg
+    # of tilt they differ by > 1.4) and vz_max a HEAVE cut-off: of the 47
+    # refusals 20 would have been within 3 cm/s of the tag reference, 16 over
+    # 10 cm/s [측정 data/20261027/1027_194851/analysis/three_beam/
+    # refusal_quality.txt]. What stops a wrong
+    # stream is DvlAid._three_beam's EXTEND-ONLY rule (a good sample within
+    # stale_s, the device's own CLEAN one within THREE_BEAM_CHAIN_MAX_S) +
+    # the jump gate, and the runtime geometry check (GEO_*). Primary
+    # selection only (legacy is the rollback ladder). false = the device's
+    # word only.
+    "three_beam": True,
+    "three_beam_ratio": 1.5,
+    "three_beam_kept_max": 1.4,     # the other three's max/min distance
+    "three_beam_vz_max_m_s": 0.10,  # |v_z| of the re-solved velocity
 }
 
 KEYS = tuple(DEFAULTS)
 #: The keys that arrived on 2026-10-16 (selection primary): the shipped
 #: hw_mpc.yaml spells out the 27 before them and none of these until the
 #: operator applies DTF hw_mpc_dvl_patch.diff (test_dvl's config test).
-KEYS_20261016 = KEYS[KEYS.index("selection"):]
+KEYS_20261016 = KEYS[KEYS.index("selection"):KEYS.index("three_beam")]
+#: The 2026-10-27 three-beam keys (spelled in the shipped hw_mpc.yaml).
+KEYS_20261027 = KEYS[KEYS.index("three_beam"):]
 #: The shipped keys `primary` does not use, and what governs instead — named
 #: in the setup log (with a warning when one is not its default: tuning it at
 #: the pool would change nothing) and in the meta. innov_max_m_s is NOT here:
@@ -431,6 +470,88 @@ INACTIVE_IN_PRIMARY = {
 #: Margin of the jump gate on top of a_max*dt (m/s): two samples' worth of
 #: noise at the [예측] 3 mm/s plus room for the lever-arm term.
 JUMP_MARGIN_M_S = 0.05
+
+#: A50 beams, id order: 22.5 deg off the device z axis, at these azimuths
+#: from +x (the LED edge) toward +y [스펙]; a beam's ``velocity`` = b . v in
+#: the OUTPUT frame, which the device rotates by its mounting_rotation_offset.
+#: With the offset 180 the fitted beam vectors are within 1.5 deg of these
+#: + 180 (rms 0.29-0.43 cm/s, 61 068 clean reports) [측정 data/20261027/
+#: 1027_194851/analysis/three_beam/all_days/three_beam_study.json geometry].
+BEAM_TILT_DEG = 22.5
+BEAM_AZ_DEG = (135.0, -135.0, -45.0, 45.0)
+#: Offsets whose output-frame geometry is known: 180 measured; 0 [유도] from
+#: it (a pure rotation about z — at 0 or 180 its sense does not matter),
+#: never measured on this device. Any other re-solves nothing.
+BEAM_OFFSETS_KNOWN = (0.0, 180.0)
+#: The device's altitude = cos(tilt) x mean(the valid beams' distances) -
+#: this: within 1.2e-7 m on all 73 604 four-beam and 6 818 three-beam
+#: device-valid reports of 10-15/19/27 [측정 data/20261027/1027_194851/
+#: analysis/three_beam/alt_formula_check.txt].
+ALT_OFFSET_M = 0.015
+#: The RUNTIME geometry check (safety review 2026-10-27: nothing else would
+#: notice a firmware that reorders the beams or a B that is not the
+#: device's). Over the last GEO_N clean (beams_clean), device-valid reports
+#: moving HORIZONTALLY >= GEO_V_MIN_M_S, fit the 4 x 2 map H from the
+#: device's horizontal velocity to the beams' horizontal parts (u - mean(u);
+#: mean(u) = cos(tilt) v_z for the Janus, so heave is out) by least squares;
+#: open when >= GEO_MIN_N reports, their motion spans two horizontal
+#: directions (rms speed along the weaker principal direction >=
+#: GEO_EXC_M_S) and max |H - B_h| <= GEO_DEV_MAX. Cleared on a new
+#: connection or a changed offset / speed of sound. Re-review round 3: a
+#: per-report residual median (the first two rules) is blind in some motion
+#: direction for some wrong geometry — an adjacent swap on an axis-aligned
+#: leg, an opposite-pair swap on a diagonal — and opened for adjacent swaps
+#: in 53 of 898 window starts x 23 permutations [geometry_check_v3.txt, rule
+#: v2]. The fit opened for NONE of the 23 wrong beam permutations (offset 0
+#: is one) from 898 window starts (a fresh window every 25th admitted
+#: report: the reconnect case), 136 log starts or 3 days of the 136 raw logs
+#: of 10-15/19/27; the right one was open over 59.7 % of the re-solvable
+#: reports with a fresh window per log, 99.7 % with one per day. Margins:
+#: after a fresh start the smallest dev a wrong permutation reached was
+#: 0.268 while the right one ran p99 0.157 / max 0.588 (per log 0.453 vs max
+#: 0.245); DEV 0.25 still opened none, 0.30 opened 3, 0.40 opened 20 — do not
+#: raise GEO_DEV_MAX past 0.25 for availability (0.15 -> 0.25 gains 7 of 7 301
+#: reports) [측정 data/20261027/1027_194851/analysis/three_beam/
+#: geometry_check_v4.py → geometry_check_v4_dev_sweep.txt, _dev_wide.txt,
+#: _margin.txt]. Noise-free, every wrong permutation sits at max|P B_h - B_h|
+#: = 2 sin(22.5 deg) cos(45 deg) ~ 0.54 [유도]. A session that only hovers or
+#: flies one straight line never opens it: the device's word (pose HELD on a
+#: long beam, as before). Failing it = no re-solve.
+GEO_N = 200
+GEO_MIN_N = 30
+GEO_V_MIN_M_S = 0.03
+GEO_EXC_M_S = 0.015
+GEO_DEV_MAX = 0.15
+#: An open/close of the geometry check is said in the mission log once it has
+#: held this long (sample time); an explicit reset (a new connection, a
+#: changed device config) is said at once. Re-solves may lead the ON line by
+#: up to this much, and fly within an open stretch shorter than this that
+#: is never announced (CSV dvl_beams3 and the counts show it). Near a threshold the state flips back quickly:
+#: of the right geometry's 96 opens/closes over the 136 raw logs (fresh aid
+#: per log), 13 reverted within 2 s, 7 within 0.5 s [측정 data/20261027/
+#: 1027_194851/analysis/three_beam/geometry_notes_check.txt]. Every open/close
+#: is still counted (counts geometry_opened / geometry_closed). [예측: 2 s]
+GEO_NOTE_DWELL_S = 2.0
+#: A judged window whose fitted map stays this far from the expected one
+#: for GEO_NOTE_DWELL_S is a beam-geometry MISMATCH: said as a warning once
+#: per window, whether or not the check had been open (re-review round 5:
+#: after a reconnect — the firmware-reorder case — the warning was
+#: unreachable, because only an announced ON could be followed by it). The
+#: right geometry never warned at 0.40, from a fresh aid per log (136) nor
+#: from 898 reconnect-like fresh starts (0.30 warned in 2, 0.25 in 12); a
+#: wrong beam order warned in 1 610 of 1 656 judged (log, permutation) pairs
+#: ~2.1 s after the window was first judged, beams 0/1 swapped in 719 of 749
+#: judged fresh starts [측정 data/20261027/1027_194851/analysis/three_beam/
+#: geometry_notes_check.txt, geometry_notes_anystart.txt]. Noise-free a
+#: wrong order sits at 0.54 [유도].
+GEO_WARN_DEV = 0.40
+#: A re-solve extends the device's own last good CLEAN 4-beam solution
+#: (beams_clean, passed gates and flags) by at most this. With the station's
+#: own DvlAid replayed per run (omega 0), re-solvable reports came p50 0.32
+#: / p90 1.52 / p99 6.31 s after that anchor, 234 of 7 212 (3.2 %) beyond
+#: 3 s; 1027_194851's stop at most 1.14 s [측정 same dir,
+#: chain_lengths_v3.txt, chain_lengths_v3.py]. [예측: the cap itself]
+THREE_BEAM_CHAIN_MAX_S = 3.0
 #: The tag velocity is "current" for the innovation gate up to this fix age.
 FD_FRESH_S = 0.25
 #: ...and the gate's reference (the tag velocity of the newest tick that had
@@ -641,7 +762,7 @@ def resolve(raw: dict | None) -> dict:
                              f"known: {sorted(KEYS)}")
         cfg.update(raw)
     for k in ("enabled", "use", "require_proven", "flag_reacquired",
-              "trust"):
+              "trust", "three_beam"):
         if not isinstance(cfg[k], bool):
             raise ValueError(f"dvl.{k} must be true or false, got {cfg[k]!r}")
     sel = cfg["selection"]
@@ -699,6 +820,13 @@ def resolve(raw: dict | None) -> dict:
         raise ValueError(f"dvl.esc_scale_ratio must be 0 (off) or above 1 (the "
                          f"DVL reading MORE motion than the tags), got "
                          f"{cfg['esc_scale_ratio']!r}")
+    for k in ("three_beam_ratio", "three_beam_kept_max",
+              "three_beam_vz_max_m_s"):
+        cfg[k] = _pos(k, cfg[k])
+    for k in ("three_beam_ratio", "three_beam_kept_max"):
+        if cfg[k] < 1.0:
+            raise ValueError(f"dvl.{k} is a distance ratio, >= 1, got "
+                             f"{cfg[k]!r}")
     for k, what in (("mount_rpy_deg", "[roll, pitch, yaw] degrees"),
                     ("mount_t_flu", "[x, y, z] metres, body FLU")):
         v = cfg[k]
@@ -901,10 +1029,23 @@ def sample_fields(rep: dict, t_rx: float, clock: DeviceClock | None = None
     except (TypeError, ValueError, OverflowError):
         cov_t = None
     n_beams = 0
+    per_beam = None
     beams = rep.get("transducers")
     if isinstance(beams, (list, tuple)):
         n_beams = sum(1 for b in beams
                       if isinstance(b, dict) and b.get("beam_valid") is True)
+        ids = ([b.get("id") for b in beams]
+               if all(isinstance(b, dict) for b in beams) else [])
+        if len(beams) == 4 and all(
+                isinstance(i, int) and not isinstance(i, bool) for i in ids) \
+                and sorted(ids) == [0, 1, 2, 3]:
+            # BY ID, not list position (a firmware that reordered them would
+            # put every beam on another's direction); ids not exactly the
+            # JSON integers 0..3 = no per-beam data at all
+            per_beam = tuple((_finite(b.get("velocity")),
+                              _finite(b.get("distance")),
+                              b.get("beam_valid") is True)
+                             for b in sorted(beams, key=lambda b: b["id"]))
     status = _int(rep.get("status")) or 0
     return {
         "t_valid": t_valid, "t_rx": float(t_rx),
@@ -913,6 +1054,7 @@ def sample_fields(rep: dict, t_rx: float, clock: DeviceClock | None = None
         "fom": _finite(rep.get("fom")),
         "altitude": _finite(rep.get("altitude")),
         "covariance": cov_t, "status": status, "n_beams": int(n_beams),
+        "beams": per_beam,
         "dt_ms": _finite(rep.get("time")),
         "tov_us": tov, "tot_us": tot,
         "kind": kind, "note": note,
@@ -934,6 +1076,89 @@ def mount_from_cfg(cfg: dict) -> tuple:
                                                 for a in rpy))
     r = np.zeros(3) if t is None else S_FLU_FRD @ np.asarray(t, float)
     return R, r, measured
+
+
+def beam_matrix(offset_deg) -> np.ndarray | None:
+    """The 4 x 3 beam unit vectors in the device's OUTPUT frame for its
+    ``mounting_rotation_offset`` (deg), or None when the offset is unknown
+    or not one of BEAM_OFFSETS_KNOWN."""
+    off = _finite(offset_deg)
+    if off is None:
+        return None
+    off %= 360.0
+    if not any(abs(off - o) < 1e-6 for o in BEAM_OFFSETS_KNOWN):
+        return None
+    th = math.radians(BEAM_TILT_DEG)
+    az = np.radians(np.asarray(BEAM_AZ_DEG, float) + off)
+    return np.stack([math.sin(th) * np.cos(az), math.sin(th) * np.sin(az),
+                     np.full(4, math.cos(th))], 1)
+
+
+def beams_clean(beams, ratio: float) -> bool:
+    """Four beam_valid beams, all finite with a positive distance, none LONG
+    or SHORT against the median of the other three by ``ratio``: a report
+    whose solution the device made from four beams that agree on the floor —
+    what the runtime geometry check learns from and what a three-beam chain
+    may be anchored on (re-review 2026-10-27: a device-valid report WITH a
+    long beam renewed the chain cap)."""
+    if beams is None or len(beams) != 4:
+        return False
+    try:
+        bv = np.array([float(b[0]) for b in beams])
+        d = np.array([float(b[1]) for b in beams])
+        ok = all(bool(b[2]) for b in beams)
+    except (TypeError, ValueError, IndexError):
+        return False
+    if not ok or not np.all(np.isfinite(bv)) or not np.all(np.isfinite(d)) \
+            or np.any(d <= 0.0):
+        return False
+    for i in range(4):
+        med = float(np.median(np.delete(d, i)))
+        if d[i] > ratio * med or d[i] < med / ratio:
+            return False
+    return True
+
+
+def three_beam(beams, B, ratio: float, kept_max: float,
+               vz_max: float) -> tuple:
+    """One report's transducers -> (k, v_out, altitude, "") when exactly one
+    beam reads LONG and the other three make a usable solution: ``k`` the
+    beam left out, ``v_out`` (3,) the velocity in the device's output frame
+    from the other three, ``altitude`` the device's formula over the three.
+    Otherwise (None, None, None, why): why "" = not this case at all (no
+    beam long, more than one, a beam without an echo — the device's own
+    3-beam population, flag_min_beams), else a short code of what refused
+    it. ``B`` None = the geometry is unknown ("offset")."""
+    if beams is None or len(beams) != 4:
+        return None, None, None, ""
+    try:
+        bv = np.array([float(b[0]) for b in beams])
+        d = np.array([float(b[1]) for b in beams])
+        ok = [bool(b[2]) for b in beams]
+    except (TypeError, ValueError, IndexError):
+        return None, None, None, ""
+    if not all(ok) or not np.all(np.isfinite(bv)) \
+            or not np.all(np.isfinite(d)) or np.any(d <= 0.0):
+        return None, None, None, ""
+    long_ = [i for i in range(4)
+             if d[i] > ratio * float(np.median(np.delete(d, i)))]
+    if len(long_) != 1:
+        return None, None, None, ""
+    k = long_[0]
+    keep = [i for i in range(4) if i != k]
+    if float(d[keep].max() / d[keep].min()) > kept_max:
+        return None, None, None, "kept"
+    if B is None:
+        return None, None, None, "offset"
+    try:
+        v = np.linalg.solve(B[keep], bv[keep])
+    except np.linalg.LinAlgError:
+        return None, None, None, "solve"
+    if not np.all(np.isfinite(v)) or abs(float(v[2])) > vz_max:
+        return None, None, None, "vz"
+    alt = math.cos(math.radians(BEAM_TILT_DEG)) * float(d[keep].mean()) \
+        - ALT_OFFSET_M
+    return k, v, alt, ""
 
 
 def body_velocity(v_dvl, R_frd_dvl, r_frd, omega) -> np.ndarray:
@@ -1354,6 +1579,43 @@ class DvlAid:
         self.device_config_changes: list = []    # what changed, and to what
         self.source = ""
         self._s = None                      # newest state.DvlSample
+        #: ...the object note_sample was GIVEN for it (``_s`` is a re-solved
+        #: copy when dvl.three_beam replaced its velocity)
+        self._s_in = None
+        #: three-beam re-solves (SESSION-wide): "beam<k>_valid|invalid" made,
+        #: "passed_gates" / "held_by_gates" after the data gates and flags
+        #: (not whether the controller used it), "refused_<why>",
+        #: "reset_reconnect" (a new TCP connection restarted the checks), and
+        #: the geometry check's "geometry_opened" / "geometry_closed" (every
+        #: change), "geometry_on" / "geometry_off" (said in the mission log)
+        #: and "geometry_mismatch" (warned)
+        self.n_beams3 = Counter()
+        #: t_valid of the device's own last report that PASSED the data gates
+        #: and the R3 flags with four agreeing beams (beams_clean) — the only
+        #: thing a re-solve may extend (THREE_BEAM_CHAIN_MAX_S)
+        self._b3_anchor_t: float | None = None
+        #: the runtime geometry check's window (_geo_note): (v_h (2,), the
+        #: beams' horizontal parts u - mean(u) (4,)) of clean moving reports
+        self._b3_geo: deque = deque(maxlen=GEO_N)
+        #: ...its state at the last look and since when (sample time), the
+        #: state last SAID in the mission log, and the notes the worker has
+        #: not logged yet (take_three_beam_notes: (t, level, text))
+        self._b3_geo_state = False
+        self._b3_geo_state_t: float | None = None
+        self._b3_geo_said = False
+        self._b3_notes_new: list = []
+        #: since when the judged window has been a mismatch (dev >
+        #: GEO_WARN_DEV), and whether this window's mismatch was said
+        self._b3_geo_bad_t: float | None = None
+        self._b3_geo_warned = False
+        #: the device offset an "unknown geometry" warning was said for
+        self._b3_offset_warned = object()
+        #: the transport's connection count of the newest sample (a change
+        #: clears the geometry window and the anchor)
+        self._b3_conn = None
+        #: (t_valid, re-solved?) of the recent data-good samples, for the
+        #: trip text (_b3_share_text)
+        self._b3_recent: deque = deque(maxlen=256)
         self._s_ok = False                  # ...did it pass the data gates
         self._s_why = "no DVL data"
         self._v_body = None                 # ...its body-origin velocity
@@ -1540,11 +1802,295 @@ class DvlAid:
     def note_sample(self, s, omega=None) -> None:
         """One ``state.DvlSample``. ``omega`` = the body rates (p, q, r) at
         the sample's ``t_valid``, for the lever arm. (primary: then the R3
-        quality flags, :meth:`_flag_sample`.)"""
+        quality flags, :meth:`_flag_sample`.) (2026-10-27: first
+        :meth:`_three_beam` — the gates and flags judge what flies.)"""
+        if self._s is not None and float(s.t_valid) < float(self._s.t_valid):
+            # out of order: counted there, judged by nothing — and no
+            # three-beam bookkeeping (re-review 2026-10-27)
+            self._note_sample(s, omega)
+            return
+        cid = getattr(s, "conn_id", None)
+        if cid is not None and cid != self._b3_conn:
+            if self._b3_conn is not None:
+                # a new connection may be a rebooted device (a new firmware
+                # may map the beams differently): re-confirm the geometry
+                # and re-anchor before re-solving again
+                self._b3_geo_clear()
+                self._b3_anchor_t = None
+                self.n_beams3["reset_reconnect"] += 1
+                self._b3_geo_transition(float(s.t_valid),
+                                        "a new DVL connection")
+            self._b3_conn = cid
+        given = s
+        s = self._three_beam(s)
+        if self.cfg["three_beam"] and self.selection == "primary":
+            self._b3_geo_transition(float(given.t_valid))
         lg_before = self._last_good
         self._note_sample(s, omega)
-        if self.selection == "primary" and self._s is s:
+        if self._s is not s:
+            return                              # (not reached: in order)
+        self._s_in = given
+        if self.selection == "primary":
             self._flag_sample(s, lg_before)
+        passed = self._s_ok and not self._s_flag_code
+        if self._s_ok:
+            self._b3_recent.append((float(s.t_valid),
+                                    getattr(s, "beams3", None) is not None))
+        if getattr(s, "beams3", None) is not None:
+            self.n_beams3["passed_gates" if passed
+                          else "held_by_gates"] += 1
+        elif passed and beams_clean(getattr(s, "beams", None),
+                                    self.cfg["three_beam_ratio"]):
+            # the device's own solution from four agreeing beams, good: the
+            # only thing a re-solve may extend (a device-valid report WITH a
+            # long beam renewed the chain cap — re-review 2026-10-27)
+            self._b3_anchor_t = float(s.t_valid)
+
+    def _three_beam(self, s):
+        """dvl.three_beam: a copy of ``s`` flying on the velocity of the
+        three beams other than ONE that reads long (:func:`three_beam`), or
+        ``s`` itself. The copy is device-valid by construction (the other
+        three were all beam_valid), keeps the device's fom and n_beams (all
+        four beam_valid) and gets the three beams' altitude — the device's
+        mixes the long beam in, which the altitude-jump flag would hold.
+
+        A re-solve has NO redundancy (three beams, three unknowns): nothing in
+        one report says it is right, and vz_max is blind to an error on the
+        beam opposite the one left out (it sets v_z from the two adjacent
+        beams only — safety review 2026-10-27). So it may only EXTEND a good
+        stream, never start or resume one: the last good sample within
+        0 < dt <= stale_s (else the jump gate, which needs one, would not
+        judge it), and the device's own last good CLEAN 4-beam solution
+        (beams_clean — a device-valid report carrying the long beam is no
+        anchor) within THREE_BEAM_CHAIN_MAX_S. And only while the geometry is
+        confirmed on this connection's clean reports (:meth:`_geo_ok`)."""
+        c = self.cfg
+        # primary only: legacy is the rollback, the shipped ladder bit for bit
+        # (test_dvl_legacy_replay), and feeds the EKF before the aid
+        if not c["three_beam"] or self.selection != "primary" \
+                or getattr(s, "kind", "velocity") != "velocity":
+            return s
+        beams = getattr(s, "beams", None)
+        if not beams:
+            return s
+        B = beam_matrix((self.device_config or {}).get(
+            "mounting_rotation_offset"))
+        if B is not None and s.valid and s.v_dvl is not None:
+            self._geo_note(beams, s.v_dvl)
+        k, v, alt, why = three_beam(beams, B, c["three_beam_ratio"],
+                                    c["three_beam_kept_max"],
+                                    c["three_beam_vz_max_m_s"])
+        if k is None:
+            if why:
+                self.n_beams3[f"refused_{why}"] += 1
+            return s
+        tv = float(s.t_valid)
+        lg = self._last_good
+        if not self._geo_ok():
+            why = "geometry"
+        elif lg is None or not 0.0 < tv - float(lg[0]) <= c["stale_s"]:
+            # (the jump gate judges 0 < dtv <= stale_s only: a re-solve with
+            # the last good sample's own stamp — the t_rx fallback stamps a
+            # whole TCP chunk alike — would fly unjudged; re-review)
+            why = "gap"
+        elif self._b3_anchor_t is None \
+                or tv - self._b3_anchor_t > THREE_BEAM_CHAIN_MAX_S:
+            why = "chain"
+        if why:
+            self.n_beams3[f"refused_{why}"] += 1
+            return s
+        self.n_beams3[f"beam{k}_{'valid' if s.valid else 'invalid'}"] += 1
+        r = copy.copy(s)
+        r.v_dvl = tuple(float(x) for x in v)
+        r.valid = True
+        r.altitude = float(alt)
+        r.beams3 = int(k)
+        return r
+
+    def _geo_note(self, beams, v_dvl) -> None:
+        """Admit one device-valid report into the geometry check's window
+        (the caller knows the geometry): a CLEAN one (:func:`beams_clean`)
+        moving HORIZONTALLY >= GEO_V_MIN_M_S, as (its horizontal velocity,
+        the beams' horizontal parts). Nothing is judged here — _geo_fit fits
+        the window. Horizontally: every beam has the same z (cos 22.5 deg),
+        so heave says nothing about the azimuths."""
+        if not beams_clean(beams, self.cfg["three_beam_ratio"]):
+            return
+        try:
+            bv = np.array([float(b[0]) for b in beams])
+            v = np.asarray(v_dvl, float).reshape(3)
+        except (TypeError, ValueError, IndexError):
+            return
+        if not np.all(np.isfinite(v)) \
+                or math.hypot(float(v[0]), float(v[1])) < GEO_V_MIN_M_S:
+            return
+        # the beams' HORIZONTAL part: mean(u) = cos(tilt) v_z exactly for the
+        # Janus, so heave neither enters the fit nor dilutes it (re-review
+        # round 3)
+        self._b3_geo.append((v[:2].copy(), bv - float(bv.mean())))
+
+    def _b3_geo_clear(self) -> None:
+        self._b3_geo.clear()
+        self._b3_geo_bad_t = None
+        self._b3_geo_warned = False
+
+    def _geo_fit(self):
+        """-> (n, excitation m/s, dev) of the window: the 4 x 2 map H from the
+        device's horizontal velocity to the beams' horizontal parts, least
+        squares, against the expected geometry's horizontal columns; dev =
+        max |H - B_h|, None while the window's motion does not span two
+        horizontal directions (excitation = rms speed along the weaker
+        principal direction) or the geometry is unknown."""
+        n = len(self._b3_geo)
+        if n < 2:
+            return n, 0.0, None
+        V = np.array([e[0] for e in self._b3_geo])
+        U = np.array([e[1] for e in self._b3_geo])
+        svv = V.T @ V
+        exc = math.sqrt(max(float(np.linalg.eigvalsh(svv / n)[0]), 0.0))
+        B = beam_matrix((self.device_config or {}).get(
+            "mounting_rotation_offset"))
+        if B is None or exc < GEO_EXC_M_S:
+            return n, exc, None
+        H = (U.T @ V) @ np.linalg.inv(svv)
+        return n, exc, float(np.max(np.abs(H - B[:, :2])))
+
+    def _b3_geo_transition(self, t, why: str = "") -> None:
+        """Say an open/close of the geometry check in the worker's log, once
+        the new state has held GEO_NOTE_DWELL_S (re-review round 3: a session
+        that starts hovering never opens it, and nothing said so; round 4: no
+        chatter, and an OFF says why). ``why`` = an explicit reset (a new
+        connection, a changed device configuration): said at once. Every
+        open/close is COUNTED (geometry_opened / geometry_closed), said or
+        not; and a judged window that stays a mismatch is warned about once
+        (GEO_WARN_DEV), opened before or not."""
+        n, _exc, dev = self._geo_fit()
+        ok = n >= GEO_MIN_N and dev is not None and dev <= GEO_DEV_MAX
+        if why:
+            if self._b3_geo_state and not ok:
+                self.n_beams3["geometry_closed"] += 1
+            self._b3_geo_state, self._b3_geo_state_t = ok, t
+            if self._b3_geo_said and not ok:
+                self._b3_geo_say(t, False, why)
+            return
+        if ok != self._b3_geo_state or self._b3_geo_state_t is None:
+            if self._b3_geo_state_t is not None or ok:
+                self.n_beams3["geometry_opened" if ok
+                              else "geometry_closed"] += 1
+            self._b3_geo_state, self._b3_geo_state_t = ok, t
+        if (ok != self._b3_geo_said and t is not None
+                and self._b3_geo_state_t is not None
+                and t - self._b3_geo_state_t >= GEO_NOTE_DWELL_S):
+            self._b3_geo_say(t, ok, "")
+        # the mismatch warning
+        if n >= GEO_MIN_N and dev is not None and dev > GEO_WARN_DEV \
+                and t is not None:
+            if self._b3_geo_bad_t is None:
+                self._b3_geo_bad_t = t
+            elif not self._b3_geo_warned \
+                    and t - self._b3_geo_bad_t >= GEO_NOTE_DWELL_S:
+                self._b3_geo_warned = True
+                self.n_beams3["geometry_mismatch"] += 1
+                self._b3_notes_new.append((t, "warn", (
+                    f"three-beam re-solve OFF — the device's beams do not "
+                    f"fit the expected map (off by "
+                    f"{math.floor(dev * 100) / 100:.2f} over {n} clean "
+                    f"reports moving in two directions): check the beam "
+                    f"geometry — the firmware's beam order, "
+                    f"mounting_rotation_offset")))
+        else:
+            self._b3_geo_bad_t = None
+
+    def _b3_geo_say(self, t, ok: bool, why: str) -> None:
+        self._b3_geo_said = ok
+        self.n_beams3["geometry_on" if ok else "geometry_off"] += 1
+        n, exc, dev = self._geo_fit()
+        if ok:
+            fit = f"within {dev:.2f} " if dev is not None else ""
+            self._b3_notes_new.append((t, "info", (
+                f"three-beam re-solve ON — beam geometry confirmed: the "
+                f"device's beams fit the expected map {fit}over {n} clean "
+                f"reports moving in two directions")))
+            return
+        off = (self.device_config or {}).get("mounting_rotation_offset")
+        known = beam_matrix(off) is not None
+        level = "info"
+        if not known:
+            # (the warning itself was said by _b3_offset_note, which
+            # note_device_config runs before this reset)
+            cause = ("the device's mounting_rotation_offset is not 0 or "
+                     "180: no three-beam re-solve on this stream")
+        elif why:
+            cause = (f"{why}: the beam geometry is re-confirmed after "
+                     f"{GEO_MIN_N} clean reports moving >= "
+                     f"{GEO_V_MIN_M_S * 100:.0f} cm/s in two horizontal "
+                     f"directions")
+        elif dev is None:
+            # (shown floored: "14.9 < 15.0", never "15.0 < 15")
+            cause = (f"the motion no longer spans two horizontal directions "
+                     f"(weaker direction {math.floor(exc * 1e4) / 10:.1f} < "
+                     f"{GEO_EXC_M_S * 1000:.1f} mm/s rms over the last {n})"
+                     if n >= GEO_MIN_N else
+                     f"fewer than {GEO_MIN_N} clean moving reports")
+        else:
+            # info, not a warning: the right geometry crosses 0.15 now and
+            # then (1 787 of 162 808 judged steps after a fresh start); the
+            # one calibrated warning is the mismatch block of
+            # _b3_geo_transition (GEO_WARN_DEV held GEO_NOTE_DWELL_S) —
+            # re-review round 6: this OFF said "check the beam geometry" on
+            # the right geometry once in 898 fresh starts. (shown ceiled)
+            cause = (f"re-solve paused: the beams fit the expected map "
+                     f"within {math.ceil(dev * 100) / 100:.2f} "
+                     f"(> {GEO_DEV_MAX:.2f})")
+        self._b3_notes_new.append((t, level,
+                                   f"three-beam re-solve OFF — {cause}"))
+
+    def _b3_offset_note(self, info: dict) -> None:
+        """An offset whose beam geometry is not known (not 0 / 180) means no
+        re-solve at all on this stream: said once per value, from the first
+        get_config answer on (re-review round 5: it was only reachable after
+        an announced ON)."""
+        if not self.cfg["three_beam"] or self.selection != "primary":
+            return
+        off = info.get("mounting_rotation_offset")
+        if beam_matrix(off) is not None:
+            self._b3_offset_warned = object()   # re-armed: once per stretch
+            return
+        if _finite(off) == self._b3_offset_warned:
+            return
+        self._b3_offset_warned = _finite(off)
+        self._b3_notes_new.append((None, "warn", (
+            f"three-beam re-solve unavailable — the device's "
+            f"mounting_rotation_offset {off!r} is not 0 or 180 (the only "
+            f"beam geometries known)")))
+
+    def take_three_beam_notes(self) -> list:
+        """The geometry check's open/close notes since the last call
+        [(t, level, text)], for the worker's log."""
+        out, self._b3_notes_new = list(self._b3_notes_new), []
+        return out
+
+    def _b3_share_text(self) -> str:
+        """" [n of the last m data-good samples (agree_slow_s) were three-
+        beam re-solves]" for a trip / latch text, "" when none were."""
+        if not self._b3_recent:
+            return ""
+        t1 = self._b3_recent[-1][0]
+        win = float(self.cfg["agree_slow_s"])
+        rec = [b for (t, b) in self._b3_recent if t1 - t <= win]
+        n3 = sum(1 for b in rec if b)
+        if not n3:
+            return ""
+        return (f" [{n3} of the last {len(rec)} DVL samples ({win:g} s) were "
+                f"three-beam re-solves]")
+
+    def _geo_ok(self) -> bool:
+        """The window's fitted beam map is the expected one, judged only on
+        motion that spans two horizontal directions (re-review round 3: any
+        per-report residual is blind in some direction — an adjacent swap on
+        an axis-aligned leg, an opposite-pair swap on a diagonal)."""
+        n, _exc, dev = self._geo_fit()
+        return n >= GEO_MIN_N and dev is not None and dev <= GEO_DEV_MAX
 
     def _flag_sample(self, s, lg_before) -> None:
         """R3 (primary): the report's OWN word that it may be a false lock,
@@ -1789,6 +2335,9 @@ class DvlAid:
         and only the escalation bucket starts again, so the next lasting
         disagreement is recorded too instead of the escalation freezing
         after the first.)"""
+        # (2026-10-27) a trip on a stretch the three-beam re-solve filled is
+        # not a mount problem by default: say how much of it was re-solved
+        why = str(why) + self._b3_share_text()
         self.tripped = str(why)
         self.against = str(why)
         self.n_trips += 1
@@ -1871,6 +2420,7 @@ class DvlAid:
         the switch IN that is a trip. Returns what changed ("" = nothing)."""
         prev = self.device_config
         self.device_config = dict(info)
+        self._b3_offset_note(info)
         if prev is None:
             return ""
         diff = []
@@ -1882,6 +2432,8 @@ class DvlAid:
             return ""
         what = "; ".join(diff)
         self.device_config_changes.append(what)
+        self._b3_geo_clear()           # the geometry check starts over too
+        self._b3_geo_transition(None, "the device's configuration changed")
         # The evidence so far describes a stream that no longer exists —
         # in EVERY state: in shadow and not yet proven, 59 old pairs plus
         # one new one would otherwise complete a proof of the old stream;
@@ -2715,6 +3267,13 @@ class DvlAid:
         return self._s
 
     @property
+    def sample_in(self):
+        """The object note_sample was given for :attr:`sample` (the same one
+        unless dvl.three_beam re-solved it) — what a caller holding the bus's
+        sample compares against to ask "is mine the newest?"."""
+        return self._s_in
+
+    @property
     def v_body(self):
         """Body-origin velocity of the newest sample, or None."""
         return None if self._v_body is None else self._v_body.copy()
@@ -2865,6 +3424,34 @@ class DvlAid:
                       "counts": {k: int(self.n_flag.get(k, 0)) for k in (
                           "flag_fom", "flag_alt", "flag_beams", "flag_reacq",
                           "flagged")}},
+            # 2026-10-27. RECORD BOUNDARY: velocities of runs before this
+            # key (or with on: false) never carry a re-solved sample.
+            # (counts are SESSION-wide — the aid lives for the process — and
+            # passed_gates is not "flown": the switch, the arm decision and
+            # the holds decide that; the CSV's vel_src / dvl_beams3 rows say
+            # what flew)
+            "three_beam": {"on": bool(c["three_beam"]) and primary,
+                           "scope": "session",
+                           "ratio": c["three_beam_ratio"],
+                           "kept_max": c["three_beam_kept_max"],
+                           "vz_max_m_s": c["three_beam_vz_max_m_s"],
+                           "geometry_known": beam_matrix(
+                               (self.device_config or {}).get(
+                                   "mounting_rotation_offset")) is not None,
+                           # the window's state WHEN THE META WAS WRITTEN
+                           # (engage / CSV close), not over the run: the
+                           # session's opens/closes are counts geometry_on /
+                           # geometry_off, the times the mission log's lines
+                           "geometry_check_now": dict(zip(
+                               ("n", "excitation_m_s", "dev"),
+                               self._geo_fit()),
+                               ok=self._geo_ok(), window=GEO_N,
+                               min_n=GEO_MIN_N, v_min_m_s=GEO_V_MIN_M_S,
+                               excitation_min_m_s=GEO_EXC_M_S,
+                               dev_max=GEO_DEV_MAX),
+                           "chain_max_s": THREE_BEAM_CHAIN_MAX_S,
+                           "extend_only": True,
+                           "counts": dict(sorted(self.n_beams3.items()))},
             "disagreement": {
                 "slow_s": c["agree_slow_s"], "clip_m_s": c["agree_slow_clip_m_s"],
                 "hold_m_s": c["agree_hold_m_s"],

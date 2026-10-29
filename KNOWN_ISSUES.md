@@ -6,6 +6,71 @@
 
 ## ⚠️ 운용 안전
 
+### 외란 발생 장치(`./c3 disturb`): 호스트가 죽으면 T200이 마지막 추력으로 계속 돈다 — 펌웨어 failsafe 없음, 실기 0런 (2026-10-22)
+- **무엇**: 갠트리에 단 외부 T200의 아두이노 펌웨어(`~/Desktop/whisker_vision/thruster_firmware/src/main.cpp:49-64`)는
+  수신 라인이 올 때만 동작하고 타임아웃·워치독이 없다. PC 크래시(이 PC는 2026-09-10 3회 하드 크래시), SIGKILL,
+  USB 분리 모두 마지막 추력을 그대로 둔다. 패널(`src/disturbance_panel.py`)은 STOP ALL/Esc, 창 닫기, SIGINT/SIGTERM,
+  슬롯 예외(`rov_gui/qt.py install_slot_guard` → STOP ALL)까지는 0을 보내지만 프로세스 밖은 못 막는다.
+- **임시 대응**: ESC 전원 **킬스위치**를 손 닿는 곳에 두고 운용한다(`docs/DISTURBANCE_RIG.md` 체크리스트 1번).
+- **제대로 고치는 법**: whisker_vision 소유자에게 펌웨어 워치독(N초 수신 없으면 1500 µs)과 상태 조회 명령을 제안.
+  펌웨어는 그 레포 소유라 여기서 고치지 않는다.
+
+### 외란 발생 장치: 추력은 **명령값**만 기록된다 — 보드가 리셋되면 ESC는 0인데 패널·로그는 옛 %를 보인다 (2026-10-22)
+- **무엇**: 펌웨어에 readback이 없고 링크(`motion_control.py ThrusterLink`)는 명령 후 포트를 읽지 않는다. USB 글리치로
+  아두이노가 리셋되면 ESC는 1500 µs로 재아밍하지만 `samples.csv`의 `thr_pct_cmd`·`thruster.csv`는 옛 값이 이어진다.
+- **임시 대응**: meta.json `notes.thrust_is_commanded_not_measured=true`; 분석에서 추력을 측정값으로 인용하지 않는다.
+  의심되면 Disconnect→Connect thruster(리셋·재아밍 ~3 s).
+- **제대로 고치는 법**: 위 펌웨어 상태 조회 + 링크의 주기적 재전송/검증 — whisker_vision 쪽.
+
+### 외란 발생 장치: 갠트리 50 mm/s 초과가 실측 0회 — X/Y 조그·패턴은 100까지 열림 (2026-10-27)
+- **무엇**: 사용자 요청으로 상한을 100 mm/s로 올렸다(`disturbance_core.RIG_MAX_SPEED_MM_S`; whisker는 50). 이 리그의 실측은
+  50 mm/s까지(`data/20261026/1026_140909_disturb/events.csv`). 가속도 50 mm/s² 그대로라 100에서 뗀 뒤 약 10 cm [유도],
+  카운터 뒤 엔코더가 없어 급정지·고속 펄스로 스텝을 잃으면 홈이 실제 끝 너머가 될 수 있다(감지 불가).
+- **임시 대응**: Z·Send는 50 상한; 떼기 감속 확인(느려지지 않으면 STOP ALL); 50 초과 중 STOP ALL이면 그 축 홈 SUSPECT.
+- **제대로 확인하는 법**: 축마다 50 → 75 → 100 mm/s, 테이프 표시 전후 확인, 움직이는 중 Esc 1회 — 런 폴더 경로와 함께 기록한
+  뒤 Z·Send 상한을 다시 정한다.
+
+### 외란 발생 장치: 갠트리 패턴·Send(절대 이동)·움직이는 중의 STOP ALL이 이 FMC4030에서 실측 0회 (2026-10-26)
+- **무엇**: 패턴(`RigGantryLink.request_path`)과 Send는 `Jog_Single_Axis` mode 2(절대)를 쓰고, 패턴은 두 축을 동시에 보낸다.
+  안전은 ⓐ mode 2가 카운터 프레임 절대 목표(음수 영역 포함) ⓑ 두 축 동시 진행 ⓒ 절대 이동에서 `Check_Axis_Is_Stop` 정상
+  ⓓ mode 1이 절대 이동을 멈춤 ⓔ 움직이는 중 STOP ALL(mode 1→2)이 멈춤에 기대는데, 10-26까지의 런에 `move`/`pattern`
+  이벤트가 없고 STOP ALL은 정지 상태에서만 눌렸다(`data/20261026/*_disturb/events.csv`). 시뮬레이터는 이를 증명하지 못함.
+- **임시 대응**: 패턴 목표점은 상자(시작 ∪ 꼭짓점) 안 절대 좌표만, 링크 3 mm·패널 5 mm 이탈 감시 → STOP ALL, 비정상 종료는
+  래치, "정지"했는데 꼭짓점에서 1 mm 넘게 떨어지면 오류. Send는 이동 중 "시작..목표 ± 5 mm" 이탈 → STOP ALL. 단 그 STOP ALL(ⓔ)도 미검증.
+- **2026-10-27 실기 근거**(`data/20261027/1027_163355_disturb/`): 원 r 30 @ 10 mm/s 한 바퀴 — 반지름 29.46–30.17 mm,
+  X 변화 0, Y·Z 동시 이동(samples.csv) → ⓐ(패턴의 절대 목표, 카운터 0 부근)·ⓑ·ⓒ 근거. Y 왕복 100 mm @ 20 mm/s(상자
+  −34.9..65.1, 음수 영역 포함) 2바퀴, 움직이는 중 Stop → 4.4 mm / 0.78 s에 정지(events.csv `pattern_stopped`) → ⓓ 근거.
+  **남은 것**: 그 런에 Send(`move`)와 STOP ALL이 없다 → **ⓔ(움직이는 중 STOP ALL)와 Send 경로는 여전히 미실측**.
+- **제대로 확인하는 법**: 저속 Send 한 번, 그리고 움직이는 중(조그 또는 패턴) Esc 한 번을 런 폴더 경로와 함께 기록하고
+  이 항목을 정리.
+
+### 외란 발생 장치: whisker 링크의 결함 5건을 패널이 우회하고 있다 (2026-10-22)
+- **무엇**(`~/Desktop/whisker_vision/motion_control.py`, 2026-10-22 탐색·심사에서 확인): ⓐ `ThrusterLink.stop_all(latch=False)`가
+  진행 중 램프를 끊지 못해 0에서 옛 타깃으로 다시 올라감(:1038-1042, :1054 vs :1119-1121) ⓑ 램프 워커가 래치를
+  `_sdk_lock` 밖에서 검사하고 전송은 안에서 해 STOP의 0 뒤에 비0 스텝이 물리적으로 나갈 수 있음(:1119-1129 vs :1040,
+  :1047-1049) ⓒ `MotorLink._enabled`가 드라이브 실제 상태를 읽지 않아(:583) 이전 세션의 홀드를 "disabled"로 보임
+  ⓓ 갠트리 이동 완료에 타임아웃·위치 검증 없음(:448-461; 2026-09-05 43 mm 미달·영구 busy 사례) ⓔ STOP 홀드가 캐시 각도로
+  명령됨(:756-771).
+- **임시 대응**(패널): 인터록 자동 0 = `stop_all()`+자동 `reset_stop()`(Cut 버튼은 2026-10-26 사용자 요청으로 제거, 즉시 0은
+  STOP ALL); STOP ALL 뒤 +0.3/+1.5 s 0 재전송; 모터 연결 시 Disable → Zero → Enable을 패널이 차례로(Disable로 ⓒ의 미지 상태를
+  확정); 이동 데드라인·60 s busy 워치독 + Recover 버튼; 모터 속도 UI 상한 90 °/s.
+- **제대로 고치는 법**: whisker_vision에 보고(SAMXIE34/whisker_vision, 브랜치 demo-panel-20260907). 수정되면 우회 코드를 줄인다.
+
+### 외란 발생 장치: whisker `GantryLink.stop_all()`이 이 FMC4030에서 상대 조그를 멈추지 못했다 — 패널은 mode 1로 우회(떼기 실측 OK, STOP ALL 안의 mode 1은 미실측) (2026-10-26)
+- **무엇**: `motion_control.py:289-314`의 정지 시퀀스(stop_run → 축마다 `Stop_Single_Axis` mode 2)를 떼기·STOP ALL·
+  재연결 때 보냈는데, 300 mm 상대 조그 세 번이 모두 끝까지 갔다(X −90→−390, −390→−690, −690→−990 mm, 20 mm/s;
+  `data/20261026/1026_131512_disturb/samples.csv`, `events.csv`의 `stuck` 행). 원인(stop_run이 뒤 명령을 막는지, mode 2가
+  조그에 안 듣는지)은 미분리.
+- **임시 대응**(패널, 2026-10-26): `disturbance_core.RigGantryLink`가 떼기에 래치 없는 `Stop_Single_Axis` **mode 1**(벤더 Qt
+  데모·`./c3 gantry`와 같은 방식), STOP 시퀀스는 세 축 mode 1 → mode 2(stop_run은 뺌). 떼기 뒤 축이 기한 안에 서지 않으면
+  STOP ALL + "CUT THE GANTRY POWER". 가르친 홈이 있으면 조그 이동 자체가 그 홈에서 끝나므로 정지가 안 먹어도 홈에서 선다.
+  다음 명령·Reset은 세 축이 실제로 정지했을 때만.
+  **실측(14:09 런)**: 떼기 18/18 정지 — 20 mm/s 3.1 mm, 30 mm/s 0.4–6.8 mm, 50 mm/s X 5.5–16.9 / Y 8.6–27.2 /
+  Z 5.7–22.5 mm, 모두 1.43 s 이내(`data/20261026/1026_140909_disturb/events.csv` `jog_stopped`; 거리 = 뗄 때의 캐시 위치(≤0.1 s 묵음)에서 정지까지 카운터 이동).
+  STOP ALL(mode 1 → mode 2)은 그 런에서 눌리지 않아 **미실측**.
+- **남은 일**: 저속에서 조그 중 STOP ALL(Esc) 한 번으로 STOP 시퀀스를 실측해 이 항목을 정리. whisker_vision 소유자에게
+  보고(그쪽 `motion_panel.py`의 STOP·조그 정지도 같은 시퀀스라 같은 문제가 있을 것).
+
 ### `--state-noise-policy`(DP에도 LOW와 같은 노이즈)가 **실기 0런** — DP 채널은 같은 σ에서 훨씬 민감한데 LIMITS는 LOW 기준이다 (2026-10-19)
 - **무엇**: `--state-noise --state-noise-policy`로 띄우고 NOISE ON이면, 그 틱 LOW와 **같은 draw**가 DP의 proprio 행, 앵커
   히스토리, START 포즈에 들어간다(`rov_gui/README.md` "DP 정책에도 같은 노이즈"). 검증은 stub 제어기 단위 테스트
@@ -127,7 +192,7 @@
     존중해 blend와 갈린다(보수적, meta `dvl.trust`가 경계). 운용자가 붙여 넣은 같은 날 21:50:12 로그의
     `dis_align`(bearing −50°, 태그는 운동의 0.11만 봄; 런 폴더 미확인)이 장치 오류였는지 저속 판정 오류였는지도 미해결이라 trust에서는
     그런 샘플이 그대로 난다. 끄려면 `--dvl-strict` 또는 YAML `dvl.trust: false`(저장소 기본).
-  - **`--policy-dr` / `policy.allow_dr_pose`(2026-10-19 저녁)로 DP가 DVL 추측항법 위에서 난다 — 실기 0런, 폐루프 결과 없음**:
+  - **`--policy-dr` / `policy.allow_dr_pose`(2026-10-19 저녁)로 DP가 DVL 추측항법 위에서 난다 — 실기 engaged 29런(10-19 18·10-27 11, 플랜이 나온 런 24 [측정: data/20261029/1029_unobserved_vs_tag_offline/trust_runs.txt]; 2026-10-29 정정, 전에는 "0런"), 폐루프 결과는 분석 안 됨**:
     `--dvl_pose` control의 DR/HELD tick을 bridged(A9: 플랜 생략, 1.5 s 뒤 정지) 대신 앵커로 쓴다(stamp = tick 시각, eta = 그 tick의
     DVL 포즈; HELD는 행 없음). 플랜 좌표계가 DR 오차만큼 태그 좌표계에서 흘러가고(앵커·proprio 동반), 그 오차를 폐루프로 잰 적이
     없다. **태그가 안 보이는 DR 비행의 시간 한계가 없다**(`dvl_pose.max_unaided_s`/`max_blind_s` null, 운용자 2026-10-18 결정):
@@ -135,13 +200,62 @@
     STOP뿐 — safety-code-reviewer HIGH, 운용자 결정으로 수용(setup 경고 + meta `policy.dr_pose.blind_bound_s`); `max_blind_s`가 한 줄
     한계다. 태그 재앵커(ON) 때 태그 행 stamp(`t_capture`)가 DR 행(tick)보다 과거라 이력 몇 행이 거부된다 [유도, 미실측].
     e2e(stub 정책)만: `rov_gui/tests/demo_e2e_dvl_pose_policy.py`(knob on/off 둘 다 PASS, 2026-10-19).
-  - **trust 모드(`--dvl-trust`, 2026-10-19)는 0런이고, 틀린 DVL을 태그가 보일 때만 잡는다**: proving pass·DvlAid 보류·래치·공백 구멍·
+  - **trust 모드(`--dvl-trust`, 2026-10-19)는 폐루프 오차가 분석되지 않았고, 틀린 DVL을 태그가 보일 때만 잡는다**: (2026-10-29 정정 — 전에는
+    "0런"이라 적혀 있었지만 trust·control engaged 런이 35개다: 10-19 24·10-27 11, 최장 627.8 s [측정: data/20261029/
+    1029_unobserved_vs_tag_offline/trust_runs.txt]. 폐루프 DR 오차는 그 CSV의 `dvp_err_m`에 기록돼 있지만 분석 산출물은 없다) proving pass·DvlAid 보류·래치·공백 구멍·
     바이어스 대기를 뺐다(README "TRUST 모드"). 장착 yaw가 틀리거나(10-19 proof는 +2.5° 보정을 권했다 [측정: data/20261019/1019_211310/
     mission_log.txt 21:12:07]) 장치가 표시하지 않는 false lock이면 포즈가 그만큼 흐르고, 태그 없이 나는 동안은 아무것도 못 잡는다.
-    DVL 공백 뒤에는 포즈가 공백 전 자리에서 이어 간다 — 공백 중 이동은 `dvp_unobs_m`으로 추정만 한다(그 추정이 25 cm를 넘으면 engaged
-    런은 끝나고 START는 거부된다: 정지 상태로 13 s 넘게 DVL이 끊기면(바닥) 그렇게 된다 — 태그를 보며 ONCE 한 번이면 풀린다). 운용자가
+    DVL 공백 뒤에는 포즈가 공백 전 자리에서 이어 간다 — 공백 중 이동은 `dvp_unobs_m`으로 추정해 경고만 한다. 2026-10-29부터 그 추정은
+    engaged 런을 끝내지 않는다(운용자: "어차피 내가 항상 관찰하고 있으니까 굳이 자동으로 끝낼 필요없어 내가 멈출거야" — 그 전에는 25 cm에서
+    끝냈다; disengaged에서 25 cm를 넘으면 START 거부는 남아 있고 ONCE 한 번이면 풀린다). 그래서 engaged 중 태그가 안 보이는 동안 공백에 숨은
+    이동은 운용자 눈 말고는 못 잡는다(25 cm를 넘는 순간은 미션 로그 파일·events·meta `(not a stop)`에 한 번 남을 뿐, 패널에는 안 뜬다). 추정치는
+    과대 쪽으로만 틀렸다: 10-27/28 TAG FIX OFF 행(25 cm를 넘은 행은 전부 disengaged)에서 실제 오차가 25 cm를 넘은 918행은 추정도 모두 넘었고,
+    추정이 25 cm를 넘은 2180행 가운데 1262행은 실제 오차가 25 cm 이하였다 [측정: data/20261029/1029_unobserved_vs_tag_offline/unobs_vs_err.txt].
+    같은 이유로 생긴 빈틈 둘(안 고침): engaged가 이어지는 동안에는 새 미션 START(STOP TRAJ 뒤 DP hold에서 다시 START 등)가 이 추정으로
+    막히지 않는다 — 게이트는 engage에만 있다(`_dvp_engage_refusal`·`_dvp_engage_state`); shadow 모드의 "control START would have been
+    refused" 기록은 disengage 직후 tick 없이 바로 engage하면 빠진다(직전 tick의 health만 본다). 운용자가
     DVL 버튼을 OUT으로 내리면 그대로 OUT이다(자동 IN은 첫 샘플에 한 번뿐). 10-19 런의 `dis_fit`(DVL 2–4 cm/s
     vs 태그 ~1 cm/s, 고도 0.22–0.28 m에 한 빔만 0.47 m)이 장치 오류였는지 DvlAid의 저속 판정 오류였는지는 가리지 못했다.
+  - **trust 모드 meta `dvl_pose.gaps_trusted`는 공백이 아니라 샘플을 센다** (2026-10-29 리뷰에서 발견, 안 고침): `note_dvl`의 trust
+    분기(`dvl_pose.py` "TRUST MODE: no hole")는 샘플마다 hole을 다시 판정하는데, 누적 `unobserved_m`이 `max_unobserved_m` 0.10을 넘은 뒤에는
+    모든 샘플이 hole이 되어 `n_gaps_trusted += 1` — strict의 `_hole_live()` 같은 "구멍 하나에 한 번" 가드가 없다. 실데이터: 1027_194851
+    meta `gaps_trusted` 6040 / `n_dvl_usable` 7057 [측정: data/20261027/1027_194851/c3_fs_depth_20261027_194851_mpc.meta.json]. 제어엔
+    영향 없음(meta만). 공백 수가 필요하면 CSV `dvp_unobs_m`의 계단으로 센다. 고치는 법: 그 분기에서 이번 샘플이 공백을 닫았을 때만 센다.
+  - **3빔 재계산(`dvl.three_beam`, 2026-10-27, 기본 켬, primary 전용, 실기 0런)은 연쇄 안의 틀린 채움을 다 거르지 못한다**: 빔 하나가
+    길게 튈 때 나머지 세 빔으로 속도를 다시 푼다. 3빔 해는 잔차가 없고(미지수 3), v_z는 뺀 빔에 이웃한 두 빔으로만 정해져 맞은편 빔
+    오차를 못 본다 — kept_max·vz_max는 자기검증이 아니라 사실상 기울기(~22–30° 이상)·상하 이동(> 0.10 m/s) 컷이고, 그 거부 47건 중 20건은
+    좋은 채움이었다. 오프라인에서 긴 빔 하나 + 장치 invalid 432건 중 37건이 태그 기준과 10 cm/s 넘게 어긋났고(최악 ~118 cm/s, 10-19
+    mpc_214121), kept·vz가 16건만 거른다(남는 채움 385건 p90 4.40 cm/s); kept·vz를 통과하고도 15 cm/s 넘게 틀린 채움이 13건(10-15
+    mpc_200453 41 cm/s, 1027_194851 t15.8 29 cm/s — 194851의 30 → 9 cm는 이것을 포함한 순효과). **빔 3이 긴 경우가 가장 약하다**(거른
+    뒤 p90 13.8 cm/s, n 33) [측정: data/20261027/1027_194851/analysis/three_beam/beam3_cases.py, long_invalid_cases.json]. 안전 리뷰·재검증
+    (2026-10-27) 뒤 규칙: **이어 붙이기만**(직전 좋은 샘플 stale_s 안·같은 시각 아님 + 장치 자신의 **깨끗한** 4빔 해 3 s 안) + 이번 연결의
+    수평 이동 리포트로 빔 사상을 맞추는 런타임 기하 검증(두 방향에 퍼진 운동에서만 판정) — 그래서 틀린 3빔 스트림이 혼자
+    시작·재개·자기 갱신하지는 못하지만, 연쇄 안의 틀린 한두 개는
+    점프 게이트(a_max·dt + 5 cm/s ≈ 0.25 m/s) 한도 안이면 난다. 3빔 해에는 중복이 없어 장치 fom(4빔 해의 것)을 그대로 쓰고 `n_beams`도 4로
+    둔다(fom은 3빔 해를 보증하지 않는다 — 장치 fom ≤ 3 mm/s에서도 |v_dev − v3| 32 cm/s가 있었다). 3빔으로 대체한 리포트는 shadow EKF에
+    아예 안 들어간다(장치 원본은 아무도 판정하지 않았으므로) — 그만큼 EKF의 DVL 갱신이 줄어든다. RL 수출(velocity_source 계약)은 invalid →
+    hold/fade로 학습됐고 3빔 채움은 본 적이 없다(기록만, 거부하지 않음). RL_controller의 `vel_source_20261015/pipeline/replay_lib.py`는
+    3빔을 재현하지 않는다(ekf_inputs의 장치 원본, 빔·장치 설정 없음) — 10-27 이후 런을 그걸로 재생하면 실제로 난 채움이 "no lock"으로
+    보인다; meta `dvl.three_beam`과 CSV `dvl_beams3`로 가를 것. meta 집계는 세션 전체이고 `passed_gates`는 "날았다"가 아니다(스위치·arm·보류가
+    정함). 빔 방향은 장치 offset 180에서만 실측(0은 [유도], 그 밖의 offset은 안 함). **기하 검증은 연결마다 두 방향 운동을 기다린다**:
+    TCP 재연결·스테이션 시작 뒤 제자리 유지만 하거나 직선 한 줄만 다니면 열리지 않아 3빔이 하나도 안 난다(예전처럼 포즈 HELD) — 로그마다
+    새 창이면 3빔 가능 리포트의 59.7 %, 하루 한 창이면 99.7 %가 열린 동안이었다(실제 세션은 그 사이일 것 [유도]; 런 도중 TCP가 다시 붙으면
+    더 낮을 수 있다). 열고 닫힐 때(2 s 유지 뒤; 재연결·설정 변경은 즉시) 미션 로그에 `dvl: three-beam re-solve ON/OFF …` 한 줄(OFF는
+    원인 — 운동 부족·0.15를 넘은 일시 중지는 info; 2 s 안에 되돌아간 열림은 줄 없이 `dvl_beams3`·`geometry_opened/closed`에만).
+    warn은 둘뿐: 판정된 창이 0.40 넘게 2 s 어긋나면 ON 여부와 무관하게 한 번(6차 검증: 0.15 OFF가 warn이던 때 맞는 기하에서 898개 중 1번
+    "check the beam geometry"가 났다), offset이
+    0/180이 아니면 첫 응답부터 warn 한 번(5차 검증: 전에는 ON 뒤에만 가능해서 재부팅 뒤 빔 순서가 바뀐 경우를 못 알렸다). 틀린 빔 순열 23개는 창 시작점 898곳(×23)·로그 시작·하루 어디서도 못
+    열었지만, 재연결을 닮은 임의 시작 창에서는 틀린 기하 최소 편차 0.268이 임계값 0.15의 1.8배 [유도]일 뿐이고 맞는 기하도 최대
+    0.588까지 가서 두 분포가 겹친다(0.15에서 맞는 기하가 판정 162 808걸음 중 1 787걸음 닫힘; 임계값 0.30이면
+    3건, 0.40이면 20건이 열린다 — `GEO_DEV_MAX`를 0.25 넘게 올리지 말 것). 실제 틀린 기하는 한 번도 본 적이 없다 [측정:
+    data/20261027/1027_194851/analysis/three_beam/geometry_check_v4.py → geometry_check_v4_dev_sweep.txt, _dev_wide.txt, _margin.txt;
+    리포트별 잔차 중앙값 규칙의 맹점은 geometry_check_v3*.txt].
+  - **DVL 고도 게이트를 껐다(`dvl.min_altitude_m` 0.05 → 0.0, 2026-10-27 운용자 결정, strict·trust 공통, 실기 0런)**: 장치가
+    valid라고 보낸 샘플은 A50 스펙 범위(5 cm~) 밑에서도 속도 blend와 `--dvl_pose` 추측항법에 들어간다(음수 고도 = lock 상실 −1만 거부).
+    계기: 1027_191909에서 valid 리포트(고도 0.03–0.04 m)를 이 게이트가 3번 거부해 pose LOST [측정: data/20261027/1027_191909/
+    mission_log.txt]. 5 cm 밑 valid 속도가 맞는지는 아무도 안 쟀다. 같은 세션 보고 고도가 2 s 만에 1.67 → 0.03 m로 튀어서, 그 0.03 m가
+    진짜 근접인지 가짜 짧은 반향인지도 모른다. 남는 방어는 장치 valid·fom·점프·v_max·품질 플래그(고도 점프·빔 수)다. 되돌리려면 YAML과
+    코드 기본값(`rov_gui/control/dvl.py` DEFAULTS)을 같이 0.05로(테스트가 둘이 같은지 검사한다).
   - **태그 1개 fix로도 앵커·재보정한다**(`min_tags` 1 — 2면 demo e2e에서 앵커가 아예 안 잡혀 바꿨다). 단일 태그 PnP의 거울
     해·튐에 대한 방어는 5개 fix 일치(`anchor_n`)와 점프 게이트뿐이다. 그 5개는 이제 **연속이 아니라 10 s 창 안**에서
     모은다(깜빡이는 시야 수리 2026-10-18) — 서로 일치하는 단발 오검출 5개가 10 s 안에 오면 수준으로 받아들여진다.
@@ -556,7 +670,12 @@
   미커밋.
 
 ### MAVLink IMU 스트림 요청을 **메시지별로 낮췄다**(ATTITUDE 50 · RAW_IMU 20 · SCALED_IMU2 20 Hz) — 수조 미검증, 그리고 **SCALED_IMU2 는 이 기체에서 0 만 보낸다**(가속도 소비자 셋이 0 을 먹어 왔다) (2026-10-15)
-- **운용 요약**: 2026-10-15부터 스테이션(`--source hw`)은 ATTITUDE 50 · RAW_IMU 20 · SCALED_IMU2 20 Hz 를 요청한다(합 90 msg/s, 예전 600 요청 /
+- **2026-10-27 RAW_IMU 기본 20 → 100 Hz**(운용자 결정): `--dvl_pose` 헤딩이 RAW_IMU 자이로를 레코드마다 적분하는데, 20 Hz(50 ms 간격)면 그 안에서 시작한
+  회전이 아직 적분에 없어 `heading lags the tags by 3 deg` LOST 가 난다 — 1027_193604 수동 yaw 회전(태그 yaw 40–100 deg/s) 95 s 동안 3회
+  [측정: data/20261027/1027_193604/mission_log.txt, nav_193604/fixes.csv]. 요청 합 90 → 170 msg/s(10-13 의 ~500 의 1/3). 줄어드는지는 [예측]·수조 0런;
+  100 Hz 요청은 08-06 에 125 Hz 로 왔다(rov_gui/README.md). 확인할 것: meta `mavlink_streams.achieved_hz` RAW_IMU, `LINK DELAYED` 배너,
+  빠른 yaw 에서 `heading lags` 횟수. 되돌리기 = `--mavlink-imu-rate 20`.
+- **운용 요약**: 2026-10-15부터 스테이션(`--source hw`)은 ATTITUDE 50 · RAW_IMU 20(10-27부터 100) · SCALED_IMU2 20 Hz 를 요청한다(합 90 msg/s, 10-27부터 170; 예전 600 요청 /
   ~500 수신 [측정 IR/out/rov_stream_scan.json]). **예전 동작 = `--mavlink-rate 200`**(셋 다 200, 시작 때 LEGACY 경고 한 줄; 메시지별 플래그와
   같이 주면 시작 거부 exit 2). `--mavlink-rate N` 은 **N ≥ 1 일 때만** 예전 요청과 같다 — 0·음수는 시작 거부(예전 스테이션은 0 을 50 Hz 로,
   음수를 'IMU 셋 요청 안 함'으로 바꿨다 [측정 RL_controller/logs/eval/station_backup_20261015/rov_gui/backends/hardware.py:1776
@@ -3571,7 +3690,7 @@ AprilTag PnP → EAOB+acados NMPC → MANUAL_CONTROL 폐루프(`rov_gui/control/
   VFOV ±19.3° 밖으로 빠지고 ROV 턱(약 11.5°)은 보이는 비대칭이 생긴다 [유도].
 
 ---
-*마지막 갱신: 2026-10-18*
+*마지막 갱신: 2026-10-29*
 
 ### 정책+GUI 테스트를 한 pytest 프로세스로 길게 이어 돌리면 `pupil_apriltags`에서 멈춘다(힙 손상) — HEAD에서도 재현 (2026-10-03)
 - **증상**: `test_policy_*`·`test_plan_stream`·`test_replay` 묶음 뒤에 `test_control.py`를 같은 프로세스로 돌리면 `test_control` 초반
@@ -3583,6 +3702,11 @@ AprilTag PnP → EAOB+acados NMPC → MANUAL_CONTROL 폐루프(`rov_gui/control/
 - **아닌 것**: 2026-10-03의 RGB obs 변경 탓이 아니다(HEAD에서 재현). 파일별·두 파일 조합(`test_policy_worker`+`test_control` 등)은 통과.
 - **우회**: 스위트를 파일 단위로 돌린다. 원인 라이브러리(acados·cv2·pupil_apriltags 중 무엇이 힙을 망가뜨리는지)는 미확정 —
   `PYTHONMALLOC=malloc_debug` 또는 `MALLOC_CHECK_=3`으로 첫 손상 지점을 잡는 것이 다음 단계.
+- **2026-10-27 다시 봄(이번엔 멈춤이 아니라 죽음)**: DVL·CSV 관련 22개 파일을 한 프로세스로 돌리면 `test_control` 초반에 segfault 139
+  또는 같은 `malloc(): mismatching next->prev_size (unsorted)`로 죽었다 — 작업 트리 5번 중 3번(캡처 끈 `-s` 실행과 마지막 1번은 통과),
+  같은 묶음의 HEAD 7517584 worktree는 2번 중 0번이었지만 위 10-03 기록이 HEAD 재현을 이미 보였다. 파일 단위로는 22개 모두 통과(실패 2는
+  HEAD에서도 나는 기존 실패) [측정: rov_gui/tests/fixtures/pytest_chain_crash_20261027_22files_segv.txt,
+  …_13files_malloc.txt, pytest_perfile_20261027.txt, pytest_chain_head_20261027.txt].
 
 ---
 *마지막 갱신: 2026-10-03*

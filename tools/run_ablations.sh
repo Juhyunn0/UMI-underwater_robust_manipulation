@@ -32,6 +32,8 @@
 #   run 시작 전 여유가 MIN_FREE_GB 미만이면 그 run 은 건너뛴다(조용히 꽉 채워 죽는 것보다 낫다).
 # 재시도: train.py 가 0 이 아닌 코드로 끝났고 <run>/checkpoints/latest.ckpt 가 있으면 같은 폴더에서
 #   training.resume=True 로 한 번 더 이어 돈다(2026-09-14 D run 의 수동 resume 을 자동화).
+# 추가 override: EXTRA_OVERRIDES="logging.mode=disabled" 처럼 env 로 모든 run 에 덧붙인다
+#   (2026-10-22: 이 박스에서 wandb online init 이 CommError 로 학습 전에 죽어서 추가).
 # 병렬: 기본은 train.py 가 이미 돌면 시작하지 않는다. 두 번째 러너를 일부러 띄울 때만 ALLOW_PARALLEL=1.
 set -u
 
@@ -121,6 +123,8 @@ for NAME in "${RUNS[@]}"; do
       "hydra.run.dir=$RUN_DIR" "multi_run.run_dir=$RUN_DIR")
   # shellcheck disable=SC2206  # EXTRA is a deliberate space-separated override list
   [ -n "$EXTRA" ] && ARGS+=($EXTRA)
+  # shellcheck disable=SC2206
+  [ -n "${EXTRA_OVERRIDES:-}" ] && ARGS+=($EXTRA_OVERRIDES)
   echo "    overrides: ${ARGS[*]:2}"
   "$PY" "${ARGS[@]}" > "$LOG" 2>&1
   RC=$?
