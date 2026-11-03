@@ -483,7 +483,8 @@ def test_a_tuned_run_records_the_cost_it_actually_flew():
 
 
 # ------------------------------------------------------------- heave trim
-# 2026-09-07: the solver's plant sinks at 5.71 N (heavy_gripper), the pool
+# 2026-09-07: the solver's plant sank at 5.71 N (heavy_gripper, composed; since
+# the 2026-10-29 weighing the model floats +0.98 N), the pool
 # vehicle floated, and a nominal NMPC cancels its own model's gravity — so
 # mpc/mpc_tuned pushed UP 5.7 N at zero depth error and the policy follower
 # rose under a plan that pointed down (0907_180038). hw_mpc.yaml
@@ -511,13 +512,16 @@ def test_heave_trim_turns_the_models_gravity_into_the_real_one():
     HwDobMpc, fossen, P = d
     eta0, nu0, tau0 = np.zeros(6), np.zeros(6), np.zeros(6)
     a_model = fossen.nu_dot(eta0, nu0, tau0, np.zeros(6))[2]
-    assert a_model > 0.1, "the untrimmed heavy_gripper plant must sink (NED +z)"
+    # the untrimmed plant accelerates at its OWN B - W: NED +z (down) when it
+    # sinks, -z when it floats (the weighed model of 2026-10-29: +0.98 N)
+    assert abs(P.NET_BUOYANCY) > 0.1, P.NET_BUOYANCY
+    assert np.sign(a_model) == -np.sign(P.NET_BUOYANCY), (a_model, P.NET_BUOYANCY)
     a_neutral = fossen.nu_dot(eta0, nu0, tau0,
                               HwDobMpc.heave_trim_wrench(P.NET_BUOYANCY, 0.0))[2]
     assert abs(a_neutral) < 1e-12, a_neutral
     a_float = fossen.nu_dot(eta0, nu0, tau0,
                             HwDobMpc.heave_trim_wrench(P.NET_BUOYANCY, 2.0))[2]
-    # same M^-1 row, force -2 N instead of +5.71 N
+    # same M^-1 row, force -2 N instead of -NET_BUOYANCY
     assert abs(a_float / a_model - (-2.0 / -P.NET_BUOYANCY)) < 1e-9, \
         (a_float, a_model)
     assert a_float < 0.0, "a floating vehicle accelerates UP (NED -z)"
@@ -569,15 +573,20 @@ def test_heave_trim_reaches_the_solver_only_in_the_nominal_modes():
 
 def test_a_neutral_vehicle_holds_depth_only_with_the_trim():
     """The hardware failure on the model plant: a NEUTRAL vehicle (the plant
-    plus the up-force that cancels its modelled sinking) under a station
-    hold. Without the trim the nominal NMPC parks it ABOVE the setpoint by
-    about 5.71 N / 60 N/m; with it the offset vanishes. No deadband here, so
-    the real vehicle does worse than the untrimmed number, not better."""
+    plus the force that cancels its modelled B - W) under a station hold.
+    Without the trim the nominal NMPC parks it off the setpoint by about
+    |B - W|_model / 60 N/m — ABOVE when the model sinks (the composed -5.71 N
+    plant before 2026-10-29: +12.2 cm), BELOW when it floats (the weighed
+    +0.98 N plant since); with it the offset vanishes. A neutral vehicle needs
+    no steady thrust, so the u_ref = 0 effort penalty leaves no offset of its
+    own. No deadband here, so the real vehicle does worse than the untrimmed
+    number, not better."""
     H = _acados_or_skip()
     if H is None:
         return
     c = _controller(H)
-    neutral = H.heave_trim_wrench(c.P.NET_BUOYANCY, 0.0)   # what the pool did
+    net = float(c.P.NET_BUOYANCY)
+    neutral = H.heave_trim_wrench(net, 0.0)   # what the pool did
     rk4 = _plant(w_ext=neutral)
 
     def hold(trim_on: bool, T=20.0):
@@ -603,9 +612,11 @@ def test_a_neutral_vehicle_holds_depth_only_with_the_trim():
     z_on = hold(True)
     high_off = 0.5 - z_off[-100:].mean()      # + = parked ABOVE the setpoint
     high_on = 0.5 - z_on[-100:].mean()
-    print(f"    neutral vehicle, station hold: untrimmed parks {high_off * 100:+.1f} cm "
-          f"high, trimmed {high_on * 100:+.2f} cm")
-    assert high_off > 0.05, high_off
+    print(f"    neutral vehicle on the {net:+.2f} N model, station hold: untrimmed "
+          f"parks {high_off * 100:+.1f} cm high, trimmed {high_on * 100:+.2f} cm")
+    # a sinking model parks the neutral vehicle HIGH, a floating one LOW
+    assert np.sign(high_off) == -np.sign(net), (high_off, net)
+    assert abs(high_off) > 0.01, high_off
     assert abs(high_on) < 0.005, high_on
     assert abs(z_on[-100:].std()) < 1e-3, "trimmed hold must be still"
 
@@ -783,7 +794,8 @@ def test_the_acados_rebuild_key_carries_the_damping():
         MODEL="pytest_dragkey", MPC_N=60, DT_CTRL=0.05, NU=6,
         U_MAX=np.array([30.0] * 3 + [8.0, 8.0, 10.0]),
         DL=-np.array([86.7, 133.8, 5.18, 0.07, 0.07, 0.07]),
-        DNL=-np.array([18.18, 21.66, 36.99, 1.55, 1.55, 1.55]))
+        DNL=-np.array([18.18, 21.66, 36.99, 1.55, 1.55, 1.55]),
+        MASS=17.5, IX=0.38352, IY=0.78337, IZ=0.71314, VOLUME=0.017653)
     gen = MB._MARINEGYM / "dobmpc" / "_acados_gen" / f"{P.MODEL}_rti"
     try:
         MB._guard_stale_solver(P)
@@ -791,6 +803,9 @@ def test_the_acados_rebuild_key_carries_the_damping():
         assert "dl" in want and "dnl" in want, sorted(want)
         assert abs(abs(want["dl"][0]) - 86.7) < 1e-9, want["dl"]
         assert abs(abs(want["dnl"][0]) - 18.18) < 1e-9, want["dnl"]
+        # mass / inertia / volume are in f_expl too (2026-10-29 weighing)
+        assert want["mass"] == 17.5 and want["volume"] == 0.017653, want
+        assert want["inertia"] == [0.38352, 0.78337, 0.71314], want["inertia"]
     finally:
         shutil.rmtree(gen, ignore_errors=True)
 

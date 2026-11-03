@@ -106,8 +106,10 @@ JOG_MIN_TRAVEL_MM = 0.5
 #: a jog toward a taught home stops this short of it: the worker re-reads the
 #: position under the SDK lock and refuses an endpoint 0.001 mm outside
 LIMIT_EDGE_MM = 0.1
-#: one jog toward a taught home is a single move; longer than any axis's travel,
-#: so this only catches a nonsense distance
+#: the link's cap on one jog move toward a home. NOT longer than every axis: X's
+#: valid firmware limits span 2838 mm [유도: −33.0..2805.0 in
+#: data/20261101/1101_190552_disturb/meta.json] — JOG_PRESS_MAX_MM (<= this)
+#: shortens such a move, so this only catches a nonsense distance
 JOG_MAX_MOVE_MM = 2000.0
 #: the two homes of an axis must be at least this far apart
 MIN_SPAN_MM = 1.0
@@ -120,7 +122,10 @@ REST_FRESH_S = 0.5
 #: a reconnect / Restore must find every axis within this of where the panel
 #: last saw it, or the homes are not applied (a power cycle restarts the counter)
 FRAME_TOL_MM = 1.0
-#: one press moves at most this far in total (backstop for a lost release)
+#: one press moves at most this far in total (backstop for a lost release). A move
+#: that would pass it is SHORTENED to it, never refused: a home further away is
+#: reached by pressing again (2026-11-01: refusing it left +X dead below X 805
+#: [유도: 2805 − 2000], data/20261101/1101_190552_disturb/events.csv)
 JOG_PRESS_MAX_MM = 2000.0
 #: slowest jog/Send: below ~0.4 mm/s a run-on looks like rest to the watches
 MIN_SPEED_MM_S = 1.0
@@ -251,7 +256,7 @@ class DisturbanceWindow(QtWidgets.QMainWindow):
         self._post_stop_warned = False
         self._watch_ref_at: "float | None" = None     # when to take the drift reference
         # hold-to-jog
-        self._jog: "dict | None" = None      # {axis, sign, btn, t0, speed, chunk_from, end}
+        self._jog: "dict | None" = None      # {axis, sign, btn, t0, speed, chunk_from, end, cut_at, cmd}
         self._jog_release: "dict | None" = None   # a release stop settling
         self._jog_watch_until = 0.0          # drift watch after a release settled
         # taught homes = soft limits, counter mm: {"X": {"lo", "hi", "*_epoch_s"}}.
@@ -724,8 +729,10 @@ class DisturbanceWindow(QtWidgets.QMainWindow):
 
     def _effective_limits(self, axis) -> "tuple[float | None, float | None]":
         """The taught homes intersected with whatever limits the link had at
-        connect (valid firmware limits — the sim has them; this rig's
-        controller does not). Either side may be None = no software limit."""
+        connect (valid firmware limits, labelled "(fw)" — the sim has them; this
+        rig's controller had none (200/200) through 10-27 and X/Y on 2026-11-01,
+        data/20261101/1101_190552_disturb/meta.json). Either side may be None =
+        no software limit."""
         lo, hi = self._taught_pair(axis)
         if self._link_limits0 is not None:
             l_lo = self._link_limits0[0][int(axis)]
@@ -1490,9 +1497,10 @@ class DisturbanceWindow(QtWidgets.QMainWindow):
 
     def _start_jog(self, axis, sign: int) -> None:
         """Press: ONE continuous controller-relative move toward the pressed
-        side, stopped on release. Toward a home it ends AT the home; with no
-        home on that side it is at most jog_piece_mm and the next follows
-        while the button is held."""
+        side, stopped on release. Toward a home it ends AT the home (or
+        JOG_PRESS_MAX_MM on, when the home is further); with no home on that
+        side it is at most jog_piece_mm and the next follows while the button
+        is held."""
         gantry = self._gantry
         if (gantry is None or not gantry.is_ready or not self._motion_allowed()
                 or self._jog is not None or self._pattern is not None or gantry.busy):
@@ -1516,22 +1524,26 @@ class DisturbanceWindow(QtWidgets.QMainWindow):
         self._jog = {"axis": axis, "sign": sign, "btn": self._jog_buttons[(axis, sign)],
                      "t0": time.monotonic(),
                      "speed": min(float(self.speed_spin.value()), core.axis_max_speed(axis)),
-                     "sent_mm": 0.0}
+                     "sent_mm": 0.0, "cut_at": None}
         why = self._jog_segment()
         if why:
             self._jog = None
             self._say(why, "warning")
             return
         label = f"{_sign_txt(sign)}{axis.name}"
-        end = self._jog["end"]
+        end, cut = self._jog["end"], self._jog["cut_at"]
         speed = self._jog["speed"]
-        if end is not None:
+        if end is not None and cut is not None:
+            self._say(f"JOG {label} (hold) at {speed:g} mm/s — stops at {cut:.1f} mm at most "
+                      f"({JOG_PRESS_MAX_MM:.0f} mm per press)")
+        elif end is not None:
             self._say(f"JOG {label} (hold) at {speed:g} mm/s — stops at {end:.1f} mm at most")
         else:
             self._say(f"JOG {label} (hold) at {speed:g} mm/s — no {label} home: NO software "
                       "limit on this side, watch the axis", "warning")
         self._log_event("jog_start", f"{label} {'to home' if end is not None else 'free'} "
-                                     f"@ {speed:g} mm/s from {pos[int(axis)]:.1f} mm")
+                                     f"@ {speed:g} mm/s from {pos[int(axis)]:.1f} mm · "
+                                     f"{self._jog['cmd']}")
         self._update_buttons()
 
     def _jog_segment(self) -> "str | None":
@@ -1563,9 +1575,13 @@ class DisturbanceWindow(QtWidgets.QMainWindow):
             if end is not None:             # a firmware stop only shortens the piece
                 piece = min(piece, sign * (end - cur) - LIMIT_EDGE_MM)
             delta, cap = sign * piece, float(self._options.jog_piece_mm)
-        if j["sent_mm"] + abs(delta) > JOG_PRESS_MAX_MM + 1e-6:
+        budget = JOG_PRESS_MAX_MM - j["sent_mm"]
+        if budget < JOG_MIN_TRAVEL_MM:
             return (f"one press moves at most {JOG_PRESS_MAX_MM:.0f} mm — release and press "
                     "again to go on")
+        cut = abs(delta) > budget                 # shortened, never refused
+        if cut:
+            delta = math.copysign(budget, delta)
         why = self._endpoint_refused(axis, cur + delta)
         if why:
             return why
@@ -1578,6 +1594,10 @@ class DisturbanceWindow(QtWidgets.QMainWindow):
         self._arm_gantry_deadline({axis: abs(delta)}, speed=j["speed"])
         j["chunk_from"] = cur
         j["end"] = home if home is None else end      # None = no home on this side
+        j["cut_at"] = cur + delta if cut else None    # where the press budget ends it
+        # for events.csv: after a cut, 'to home' alone no longer gives the end
+        j["cmd"] = (f"cmd {delta:+.1f} mm → {cur + delta:.1f} mm"
+                    + (" (press budget)" if cut else ""))
         j["sent_mm"] += abs(delta)
         j["rest_pos"] = j["rest_since"] = None
         return None
@@ -1622,6 +1642,8 @@ class DisturbanceWindow(QtWidgets.QMainWindow):
         why = self._jog_segment()
         if why:
             self._end_jog(why)
+        else:
+            self._log_event("jog_cmd", f"{_sign_txt(j['sign'])}{j['axis'].name} {j['cmd']}")
 
     def _end_jog(self, reason: str) -> None:
         """Release (or a lost release): ALWAYS stop — 'busy' means "the worker

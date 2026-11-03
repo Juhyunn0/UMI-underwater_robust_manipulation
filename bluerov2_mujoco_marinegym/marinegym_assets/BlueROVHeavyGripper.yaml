@@ -1,11 +1,15 @@
 # BlueROV2 Heavy + Newton Subsea Gripper + MarineSitu C3 stereo camera (heavy_gripper).
 #
 # Derived from BlueROVHeavy.yaml (2026-07-12). ONLY volume and coBM change:
-#   volume: 0.0116499 + gripper 2.578e-4 (524-267 g / rho 997) + C3 1.274e-3
-#           (1700-430 g / rho) = 0.0131815 m^3   -> net buoyancy ~ -5.7 N (SINKS;
-#           the real payload is negatively buoyant and no trim foam is modeled,
-#           per the 2026-07-12 decision).
-#   coBM:   volume-weighted CB_z minus TOTAL-COM_z = +0.01625 m
+#   volume: 17.6 kgf / rho 997 = 0.0176530 m^3 — the MEASURED buoyancy of the real vehicle
+#           (2026-10-29: 17.5 kg in air, 17.6 kgf buoyancy [측정: data/20261029/
+#           1029_mass_buoyancy/README.md, operator-reported]) -> net buoyancy +0.98 N
+#           (floats slightly). = 0.0116499 + gripper 2.578e-4 (524-267 g / rho 997) + C3
+#           1.274e-3 (1700-430 g / rho) + 4.4715e-3 unitemized residual (ballast, foam, DVL,
+#           tether ...; placed at the vehicle CB [예측]). Before 2026-10-29 the residual was
+#           absent: 0.0131815 m^3 at 13.724 kg -> -5.7 N (SINKS, the 2026-07-12 no-foam model).
+#   coBM:   volume-weighted CB_z minus TOTAL-COM_z = +0.01563 m (was +0.01625 before the
+#           measured residual; compute_payload_inertia.py)
 #           (compute_payload_inertia.py; the generated MJCF re-origins the body frame
 #           at the total COM. Updated 2026-07-19: C3 moved to its measured front-
 #           BOTTOM mount (Onshape assembly), which lowers the COM and raises coBM.
@@ -29,8 +33,8 @@
 name: BlueROVHeavyGripper
 
 drag_coef: 0.3
-volume: 0.0131815
-coBM: 0.01625
+volume: 0.0176530
+coBM: 0.01563
 hydro_coef:
   added_mass:
   - 5.5

@@ -88,8 +88,8 @@ ROV_MODEL=heavy_gripper python teleop.py --observe                          # + 
 | | heavy | heavy_c3 | heavy_gripper |
 |---|---|---|---|
 | thrusters | 8 (rank 6, **fully actuated**) | 8 (rank 6) | 8 (rank 6) + gripper servo (ctrl 8) |
-| mass / inertia | 11.5 kg / [0.3291, 0.6347, 0.6109]† | 13.2 kg / [0.37014, 0.73153, 0.67460]§ | 13.724 kg / [0.38154, 0.77780, 0.70954]‡ |
-| net buoyancy | ~+1.1 N | **−3.1 N (sinks)** | **−5.7 N (sinks)** |
+| mass / inertia | 11.5 kg / [0.3291, 0.6347, 0.6109]† | 13.2 kg / [0.37014, 0.73153, 0.67460]§ | **17.5 kg** (weighed 2026-10-29) / [0.38352, 0.78337, 0.71314]‡ |
+| net buoyancy | ~+1.1 N | **−3.1 N (sinks)** | **+0.98 N** (weighed 17.6 kgf; was −5.7 N composed) |
 | NMPC input | `u=[X,Y,Z,K,M,N]` (NU 6) | same as heavy | same as heavy |
 | pitch | passive restoring only (no rp loop) | passive (heavy gains, no rp loop) | actively leveled — **rp-PID** (2026-07-21) |
 
@@ -126,9 +126,12 @@ GENERATED from `bluerov_heavy.xml` by [tools/gen_gripper_variant.py](tools/gen_g
   mesh registration; the C3-BR bracket straddles the gripper tube with mm clearance).
   They see the gripper jaws dead ahead (render with
   `mujoco.Renderer(...).update_scene(d, camera="c3_center")`).
-- **Negative buoyancy** (−5.7 N, no trim foam — deliberate): controllers hold depth with
-  sustained upward thrust; PID gains re-derived (`GAINS_HEAVY_GRIPPER`, same pole
-  placement at the payload masses + roll/pitch leveling PD `rp_kp/rp_kd`).
+- **Measured mass and buoyancy** (2026-10-29): the real vehicle weighed 17.5 kg with 17.6 kgf
+  buoyancy [측정: data/20261029/1029_mass_buoyancy/README.md, operator-reported] -> net +0.98 N
+  (floats slightly). The itemized parts compose 13.724 kg / −5.7 N (the model before that date);
+  the 3.776 kg / 4.4715 L residual sits at the vehicle COM/CB [예측], so the inertia is still
+  essentially composed. PID gains (`GAINS_HEAVY_GRIPPER`, pole placement at the 13.724 kg
+  payload masses + roll/pitch leveling PD `rp_kp/rp_kd`) were NOT re-derived for 17.5 kg.
 - Hydro added-mass/damping stay the heavy set (payload increments ≪ published-set spread;
   DNV build-up estimates documented in
   [marinegym_assets/BlueROVHeavyGripper.yaml](marinegym_assets/BlueROVHeavyGripper.yaml) —

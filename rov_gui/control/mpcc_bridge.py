@@ -75,7 +75,8 @@ class HwMpcc:
         self.w_clip = np.asarray(cfg.w_hat_clip, float)
         # hw_mpc.yaml vehicle_net_buoyancy_n (the HwDobMpc heave trim,
         # 2026-09-07) is NOT wired into this solver: under `mpcc` it flies the
-        # plant's own -5.71 N sinking assumption as an up-force feedforward,
+        # plant's own B - W as a heave feedforward (-5.71 N sinking -> an up-force
+        # until 2026-10-29; the weighed +0.98 N floating -> a ~1 N down-force since),
         # exactly the defect the trim fixes for mpc / mpc_tuned. Say so, and
         # record it, rather than let a session trim look applied.
         self.vehicle_net_buoyancy_n = float(getattr(cfg, "vehicle_net_buoyancy_n", 0.0))

@@ -1020,6 +1020,47 @@ class MpcStatus:
     mpc_tune_path: str = ""
     mpc_tune_state: str = ""
     mpc_tune_note: str = ""
+    # ---- RL POLICY per RL LOW (control/rl_library.py, 2026-11-01) ----------
+    # What the worker HOLDS for each RL LOW slot ("rl" | "rl_pwm" | "rl_7d" |
+    # "rl_pwm_7d") — the LOW row's policy widgets and the picker dialog show
+    # this and nothing else (honesty rule). Per slot: {"name", "path"
+    # (absolute export dir), "rel" (repo-relative, else absolute), "id"
+    # (rl_library.export_id, 12 hex), "source" ("hw_mpc.yaml" | "panel"),
+    # "state" ("ok" | "warn" | "error" | "refused"), "note", "no_fly" (""
+    # or the HELD export's flight-ban reason, rl_library.NO_FLY — in every
+    # state, so a refusal note never hides it; 2026-11-02)}. "error" = the
+    # LOW has no follower (its launch build failed, or a cap change dropped
+    # it; note = why — for a pwm slot whose failure a cap change cures, it
+    # ends with workers._rl_cap_hint's " — the cap ▾ on the <row> row sets
+    # rl_pwm.pwm_cap for this session", 2026-11-02); "refused" =
+    # the last pick for that slot, for ~6 s (the other keys still describe
+    # the HELD export); "warn" = held, but it flies below its trained cap
+    # (allow_caps_below_trained) — the note says so — OR hw_mpc.yaml named
+    # an export on the flight-ban list at launch (the ban is enforced at
+    # the pick only, so launch still builds it): the note then LEADS with
+    # "no-fly — <reason>" and adds "; <cap note>" when it also flies below
+    # its trained cap (workers._rl_policy_status, review F1 2026-11-02).
+    # The two pwm slots ("rl_pwm", "rl_pwm_7d") also carry "cap" (the HELD
+    # follower's pwm_cap = what it flies) and "cap_trained" (its export's
+    # trained cap) — None when the slot holds no follower (2026-11-02).
+    rl_policy: dict = field(default_factory=dict)
+    # ---- THE PWM TRANSPORT CAP (rl_pwm.pwm_cap, 2026-11-02) ----------------
+    # The LOW row's cap ▾ shows this and nothing else (honesty rule); built
+    # fresh on every publish by workers.MpcWorker._rl_pwm_cap_status, {} when
+    # the worker has no config yet (or cannot read its own cap). Keys:
+    # "cap" (the transport cap in force = the live rl_pwm.pwm_cap; the code
+    # default rl_pwm.PWM_CAP_FIRST_WATER when the key is absent), "source"
+    # ("hw_mpc.yaml" | "panel"), "at" (ISO wall time of the last panel
+    # change, None = the launch value), "choices" (what the combo offers,
+    # ascending, worker-computed: workers.RL_PWM_CAP_CHOICES up to the
+    # thruster sink's export's trained cap, plus the cap in force),
+    # "ceiling" (the sink's export's trained cap from a FRESH configured
+    # gate snapshot, else None), "sink_cap" (the sink's window from that
+    # snapshot, else None), "allow_below" ({"rl_pwm": bool, "rl_pwm_7d":
+    # bool}, each LOW's live allow_caps_below_trained), "state" ("ok" |
+    # "refused" — for ~6 s after a refused change) and "note" (that
+    # refusal, else ""). Session only: hw_mpc.yaml is never written.
+    rl_pwm_cap: dict = field(default_factory=dict)
     conn: Conn = Conn.OFFLINE
     stamp: float = field(default_factory=now)
 

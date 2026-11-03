@@ -2587,3 +2587,40 @@ PASS_WITH_FIXES — 중간 1건 수정, 낮음 1건 문서화, DVL 없음/OUT의
   6번: engaged 유지, 로그·events·meta에 `(not a stop)` 한 번; 이어 START가 engage 순간과 다음 tick 모두에서 거부되고, 태그를 보며 ONCE를 누른
   뒤에는 시작된다) — HEAD, START 거부를 뺀 버전, 기록을 뺀 버전, engage 순간 판정을 우회한 버전에서 모두 실패한다. 남는 한계: engaged 중
   태그가 안 보이면 공백이 숨긴 이동은 운용자 말고는 아무것도 못 잡는다.
+
+## 2026-10-29 — heavy_gripper 플랜트를 실측 질량·부력으로: 17.5 kg, 17.6 kgf → B−W +0.98 N (실기 런 0)
+
+* **왜:** heavy_gripper의 질량·부피는 벤더 질량과 CAD 부피의 합성(13.724 kg, 0.0131815 m³ → B−W −5.71 N, 가라앉음)이었고 이 기체에서
+  잰 적이 없었다. NMPC는 이 값으로 생성되고(M⁻¹, C_RB, g(η)), 히브 트림(2026-09-07)은 (모델 − 실기) B−W 차이를 상수 렌치로 메운다.
+  2026-10-29 운용자가 실기를 쟀다: 공기 중 17.5 kg, 부력 17.6 kgf [측정: data/20261029/1029_mass_buoyancy/README.md, 운용자 보고
+  저울값]. 합성값보다 질량 3.776 kg(+28 %), 부피 4.4715 L가 더 있다 — 밸러스트·폼·DVL·테더 등 항목화되지 않은 것.
+* **무엇(이론):** 총 질량과 총 부피를 측정값으로 맞추고, 차이를 위치를 모르는 잔여 부품 하나로 둔다: 잔여 질량은 기체 COM의 점질량,
+  잔여 부피는 기체 CB [예측]. 부피는 측정 부력을 모델의 ρ로 나눠서, 수조 물 밀도와 상관없이 모델 부력이 측정 힘과 같다.
+  ```
+  V       = B_meas / ρ = 17.6 kgf / 997 kg/m³ = 0.017653 m³
+  B − W   = (17.6 − 17.5) · 9.81 = +0.98 N          (±~1 N: difference of two 0.1 kg readings)
+  m_res   = 17.5 − 13.724 = 3.776 kg   at r_COM,veh        V_res = 0.017653 − 0.0131815 = 0.0044715 m³   at r_CB,veh
+  COM'    = (Σ m_i r_i + m_res r_COM,veh) / 17.5
+  I'      = Σ_i [ I_i + m_i (|d_i|² 1 − d_i d_iᵀ) ],   d_i = r_i − COM'          diag (0.38154, 0.77780, 0.70954) → (0.38352, 0.78337, 0.71314)
+  M       = diag(m + X_u̇, m + Y_v̇, m + Z_ẇ, I_x + K_ṗ, I_y + M_q̇, I_z + N_ṙ)   M_11 19.22 → 23.0,  M_22 26.42 → 30.2,  M_33 28.29 → 32.07
+  g(η)    = [ (W−B) sθ, −(W−B) cθ sφ, −(W−B) cθ cφ, zg W cθ sφ, zg W sθ, 0 ]      W − B: +5.71 → −0.98 N
+  w_trim  = (B − W)_model − (B − W)_vehicle            hw −12 N (peg): +6.29 → +12.98 N;  jaw-empty profile +1.5 N: −7.21 → −0.52 N
+  RL:  k = B · arm   →   arm = 6.7 / 172.7 = 0.039 m   (keeps the pool-measured nominal k)
+  ```
+* **어떻게:** `compute_payload_inertia.py`에 측정 총량 `M_MEASURED`·`B_MEASURED_KGF`·`VOL_MEASURED`와 `residual()`을 두고 `compose()`·`buoyancy()`에
+  잔여 부품을 더했다(heavy_c3의 `compose_c3`·`buoyancy_c3`는 그대로). `tools/gen_gripper_variant.py`로 `bluerov_heavy_gripper.xml` 재생성 —
+  원점(합성 COM)이 헤비 원점에서 (0.0349, 0.0010, −0.0258) → (0.0274, 0.0008, −0.0202) m, 헤더 순부력은 이제 계산값. `BlueROVHeavyGripper.yaml`
+  volume 0.0176530, coBM 0.01625 → 0.01563. `rov_model.py` heavy_gripper: mass 17.5, inertia (0.38352, 0.78337, 0.71314), volume 0.0176530
+  (질량·부피는 운용자가 먼저 커밋 f5d640258). `mpc_bridge._guard_stale_solver`의 재빌드 키에 mass·inertia·volume을 넣었다 — 이 셋도 f_expl
+  안이라 `DOBMPC_ACADOS_BUILD=0`이면 옛 .so가 남을 수 있었다. RL_controller `configs/rov_params.yaml`: 헐 11.5 → 15.276 kg, 0.0116499 → 0.0161214 m³
+  (잔여를 헐 COM/CB에), `net_buoyancy_n` 1.0 → 0.981, `cob_arm_effective_m` 0.05 → 0.039(수조에서 잰 것은 팔이 아니라 k); `assets/rov/rov.urdf`
+  관성 블록·시각 원점 재생성, `scripts/build_asset.sh`로 USD 재빌드(USD 질량 17.5 확인).
+  일부러 안 바꾼 것(KNOWN_ISSUES 2026-10-29): PID `SIM_GAINS`/`GAINS_HEAVY_GRIPPER`·pid_7d `rp_inertia`/`rp_k_ff`(13.7 kg 설계, 실기가 이
+  이득으로 날았다), `vehicle_net_buoyancy_n` −12(페그 경험값), MPC_Tuned 프로파일(sha1 고정, `compare:`에 질량 없음), 배포된 RL 정책.
+* **결과:** 시뮬·테스트만, 실기 0런. `test_heavy_gripper` 전부 통과 — subtree 17.5000 kg, 부력 = 17.6 kgf(YAML 7자리 반올림 ~2 ppm), 정지
+  해제 2 s에 +0.054 m 떠오름, PID가 원점 유지; `test_heavy_c3` 통과(손대지 않음). `test_path_cost`의 트림 테스트는 모델 부호에 무관하게 고쳤다:
+  중립 기체는 +0.98 N 모델에서 무보정 −2.2 cm(아래), 보정 +0.00 cm [예측: 데드밴드 없는 모델 플랜트]. rov_gui 테스트 16개 파일은 기준선과 같은
+  실패만 남았다(`test_net_buoyancy_is_validated_and_recorded`: hw −12 vs land 0.1, 오늘 이전부터). RL_controller 276개 통과.
+  남는 한계: 관성은 실측이 아니다(잔여 3.8 kg 위치를 모름, 실제로는 더 클 것); PID 병진 ωn이 6–9 % 낮다 [유도]; 배포된 RL 정책은 13.7 kg ±10 %로만
+  학습됐다; mpcc는 트림을 안 쓰므로 이제 모델의 +0.98 N(아래로 ~1 N)을 피드포워드로 난다(전에는 위로 5.7 N); 수평 근사 잔차 δ·sinθ는 −12 N
+  설정에서 두 배(10°에서 2.3 N).

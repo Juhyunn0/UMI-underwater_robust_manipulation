@@ -10,6 +10,8 @@
 #     ./c3 gantry                   # FMC4030 gantry panel (jog, move, tag-map position)
 #     ./c3 gantry --connect-test    # is the controller reachable? (no motion)
 #     ./c3 disturb [--sim]          # pool DISTURBANCE RIG: gantry + rotation motor + T200 (one manual panel)
+#     ./c3 rl-policies sync --dry-run          # RL policy library: what RL_controller would add (writes nothing)
+#     ./c3 rl-policies list --low rl_pwm_7d    # what the LOW row's RL policy picker offers that LOW
 #     ./c3 test                     # the no-camera regression suite
 #     ./c3 env                      # which interpreter, which versions
 #
@@ -141,6 +143,9 @@ tools:
   madrona          start/stop the RPi video service
   gui              topside control-station dashboard    (python -m rov_gui)
   plots            trajectory figures from a run date   (rov_gui/tools/plot_runs.py)
+  rl-policies      RL policy library: sync copies new RL_controller exports into
+                   data/rl_policies (never overwrites; --dry-run), list [--low LOW]
+                   shows what the RL picker offers (rov_gui/tools/rl_policy_library.py)
   depth-live       LIVE two-pane depth viewer, ONE colour rule, scale knob
   twocam           OAK-D-W vs C3 depth, same scene, ONE colour rule
   umicap           live depth from the OAK-D-W through the land training chain
@@ -300,6 +305,19 @@ case "$tool" in
     # session tree are all repo-relative.
     cd "$REPO"
     exec "$PY" -m rov_gui.tools.plot_runs "$@"
+    ;;
+  rl-policies)
+    # The RL POLICY LIBRARY (rov_gui/tools/rl_policy_library.py, 2026-11-01):
+    # `sync` copies new RL_controller exports into data/rl_policies/ (never
+    # overwrites or deletes an entry; --dry-run writes nothing), `list` shows
+    # what the LOW row's RL policy picker offers. No Qt, so $PY (robust).
+    # PATH form on purpose, never `-m rov_gui.tools...`: RL_controller's GPU
+    # guard (scripts/_gpu_guard.sh:13) SIGSTOPs guarded training while any
+    # `python ... -m rov_gui` process runs, and a sync is exactly what you run
+    # WHILE training. The script resolves relative --dst/--station/--rl-root
+    # against the repo root itself; the cd keeps this arm like the others.
+    cd "$REPO"
+    exec "$PY" rov_gui/tools/rl_policy_library.py "$@"
     ;;
   gantry)
     # No args -> gantry_runner.py dispatches to the PyQt5 panel itself

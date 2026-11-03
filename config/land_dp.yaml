@@ -192,8 +192,9 @@ path_turn_radius_m: 0.0
 # (2026-08-17): they were raised to 0.30/0.15 to chase speed, and the hardware
 # audit says the best full mission on record flew 0.05/0.05
 # (0817_110145, cross-track p95 6.6 cm over 5/5 laps). For scale the vehicle's
-# own lateral limit is axis_cap*axis_gain/m_eff_sway = 0.5*60/26.42 = 1.14
-# m/s^2 [예측 — axis_gain is unmeasured], so 0.05 is very conservative; raise
+# own lateral limit is axis_cap*axis_gain/m_eff_sway = 0.5*60/30.2 = 0.99
+# m/s^2 [예측 — axis_gain is unmeasured; m_eff_sway = the weighed 17.5 kg + 12.7
+# added mass since 2026-10-29, was 26.42 -> 1.14], so 0.05 is very conservative; raise
 # it only with a run to compare against.
 path_lat_accel_m_s2: 0.05
 path_long_accel_m_s2: 0.05
@@ -249,9 +250,13 @@ mpc_tuned:
 w_hat_clip: [15, 45, 45, 5, 5, 8]
 
 # NET BUOYANCY OF THE VEHICLE ACTUALLY FLOWN, B - W [N] (+ floats, - sinks).
-# The NMPC's plant assumes heavy_gripper SINKS at 5.71 N (dobmpc/params.py
-# NET_BUOYANCY, composed from vendor masses + CAD volume, never measured on
-# this vehicle) and that number is baked into the generated solver. A nominal
+# Until 2026-10-29 the NMPC's plant assumed heavy_gripper SINKS at 5.71 N
+# (dobmpc/params.py NET_BUOYANCY, composed from vendor masses + CAD volume,
+# never measured on this vehicle). Since 2026-10-29 the plant is the WEIGHED
+# vehicle: 17.5 kg in air, 17.6 kgf buoyancy -> B - W = +0.98 N (+-~1 N)
+# [측정: data/20261029/1029_mass_buoyancy/README.md, operator-reported] —
+# consistent with the 09-08 free-rise fit below. The plant's number is
+# baked into the generated solver; this line is the VEHICLE's. A nominal
 # NMPC cancels its own model's gravity, so at zero depth error mpc/mpc_tuned
 # pushed UP 5.7 N — a wrong-signed feedforward whenever the real trim differs.
 # 2026-09-07 18:00 the vehicle floated: every mpc_tuned policy mission rose
@@ -287,8 +292,9 @@ vehicle_net_buoyancy_n: 0.1
 # THE PROBLEM. A disturbance kick blurs the camera or swings the tags out of
 # frame; the localizer stops producing a fix; ~1.1 s later (tag_stale_s 0.7 +
 # tag_stale_hold_s 0.4) the loop DISENGAGES. That drops DEPTH hold too, and
-# this vehicle drifts wherever its trim of the day takes it (the MODEL says
-# -5.7 N sinking; on 2026-09-07 it floated — see vehicle_net_buoyancy_n), so it
+# this vehicle drifts wherever its trim of the day takes it (the MODEL said
+# -5.7 N sinking until 2026-10-29, the weighed +0.98 N since; on 2026-09-07 it
+# floated — see vehicle_net_buoyancy_n), so it
 # starts moving away from where the tags were —
 # which changes the view and makes re-acquisition LESS likely. Turning on
 # imu_dr does not help: MpcWorker._runtime_fault reads `meas` (the tag

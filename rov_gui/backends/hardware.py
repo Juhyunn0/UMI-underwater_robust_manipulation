@@ -2717,6 +2717,13 @@ class NullCommandSink(TimerWorker):
         pass
 
     @Slot(float)
+    def set_pwm_cap(self, cap: float) -> None:
+        """The pwm transport cap changed (bus.cmd_pwm_cap, 2026-11-02, the LOW
+        row's cap ▾): accepted and dropped, like set_pwm — this sink transmits
+        nothing and has no gate whose window could change."""
+        pass
+
+    @Slot(float)
     def set_gripper(self, v: float) -> None:
         self.grip = v
 
@@ -2952,6 +2959,12 @@ class MavlinkCommandSink(TimerWorker):
         self._pwm_gate_error = ""
         self._pwm_last_rx = 0.0              # when the controller's last frame arrived
         self._pwm_active = False             # policy pulses are flowing
+        # 2026-11-02 (review hwsafe-3): an ENGAGEMENT is open — set by the
+        # first policy frame sent, cleared only by _pwm_halt(end=True) (the
+        # follower's stop / idle, E-STOP, ENABLE off, teardown). _pwm_active
+        # alone drops on every pause (coast neutrals, a stale or latched
+        # halt) while the engagement goes on; set_pwm_cap refuses on this.
+        self._pwm_open = False
         self._pwm_neutral_left = 0           # neutral frames owed once they stop
         self._pwm_ever_sent = False          # did an RC override leave this session
         self._pwm_sent = 0
@@ -2964,8 +2977,20 @@ class MavlinkCommandSink(TimerWorker):
         # never told (safety review 2026-09-30).
         self._pwm_latch = ""
         self._pwm_late_run = 0               # consecutive policy frames that arrived old
-        self._pwm_cap = 0.0                  # |throttle| ceiling THIS sink enforces (setup)
+        self._pwm_cap = 0.0                  # |throttle| ceiling THIS sink enforces (setup; set_pwm_cap)
         self._pwm_cap_mode = ""              # rl_pwm.pwm_cap_mode as configured (snapshot / meta only; setup)
+        # 2026-11-02 (the LOW row's cap ▾): the gate export's trained cap —
+        # the ceiling of every window this sink will enforce (set_pwm_cap
+        # takes min(cap, this); 0.0 = no gate) — and who set the window in
+        # force: "hw_mpc.yaml" (setup) | "panel" (set_pwm_cap).
+        self._pwm_cap_trained = 0.0
+        self._pwm_cap_source = "hw_mpc.yaml"
+        # WHICH export the gate was built from (2026-11-01, the RL policy
+        # picker): {"export" rel, "export_id", "sigma", "cap_trained"} once
+        # _setup_pwm_gate succeeded, else None. Published in the snapshot so
+        # the worker can refuse a pwm pick this gate would judge differently
+        # (MpcWorker._sink_gate_mismatch) and name the export in the reason.
+        self._pwm_gate_export: dict | None = None
         self._pwm_tick_failed = ""
 
     def setup(self) -> None:
@@ -3060,6 +3085,10 @@ class MavlinkCommandSink(TimerWorker):
             blk = parse_rl_pwm_block(raw)
             self._pwm_cap = min(blk["pwm_cap"], float(model.cap_trained))
             self._pwm_cap_mode = str(blk["pwm_cap_mode"])
+            # 2026-11-02: kept for set_pwm_cap (the LOW row's cap ▾ re-windows
+            # this sink at runtime to min(cap, the export's trained cap))
+            self._pwm_cap_trained = float(model.cap_trained)
+            self._pwm_cap_source = "hw_mpc.yaml"
             probe = None
             if blk["require_thruster_probe"]:
                 probe = ThrusterProbeCheck(
@@ -3069,14 +3098,54 @@ class MavlinkCommandSink(TimerWorker):
             self._pwm_gate = PwmGate(model.motor_direction, self.sysid,
                                      thruster_probe=probe)
             self._pwm_gate_error = ""
+            # 2026-11-01 (RL policy picker): keep the gate's export identity
+            # for the snapshot, and say it once (file only — logfilter). The
+            # gate itself is unchanged: built once, here, never rebuilt (a
+            # GUI pick the gate would judge differently is refused by the
+            # worker, never followed by a rebuild). Its own guard: an
+            # identity that cannot be read costs its keys (None — the worker
+            # then has nothing to compare at the pick, and its engage check
+            # still compares motor_direction / pwm_cap), NEVER the gate.
+            try:
+                self._pwm_gate_export = self._gate_export_identity(pdir, model)
+                ident = self._pwm_gate_export
+                self.bus.log.emit(
+                    "info", f"rl_pwm transport gate: export {ident['export']} "
+                            f"(id {(ident['export_id'] or '?')[:8]}), cap "
+                            f"{self._pwm_cap:g}")
+            except Exception:                                    # noqa: BLE001
+                self._pwm_gate_export = None
         except Exception as e:                                   # noqa: BLE001
             self._pwm_gate = None
             self._pwm_cap = 0.0
             self._pwm_cap_mode = ""
+            self._pwm_cap_trained = 0.0
+            self._pwm_gate_export = None
             self._pwm_gate_error = f"{type(e).__name__}: {e}"
             self.bus.log.emit("warn", f"rl_pwm transport unavailable "
                                       f"({self._pwm_gate_error}) — LOW mode "
                                       f"RL_PWM will refuse")
+
+    @staticmethod
+    def _gate_export_identity(pdir: str, model) -> dict:
+        """{"export", "export_id", "sigma", "cap_trained"} of the export the gate
+        was just built from (2026-11-01): ``export`` repo-relative (absolute
+        outside the repo — rl_library.rel_to_repo, never '../..'),
+        ``export_id`` rl_library.export_id of its obs_spec.json +
+        policy_weights.npz (None when they cannot be hashed: the gate reads
+        only obs_spec.json), ``sigma`` the export's thruster signs (the ones
+        its sign-probe check was built for; None in an export older than the
+        key), ``cap_trained`` its pwm_cap_trained."""
+        from ..control.rl_library import export_hashes, export_id, rel_to_repo
+
+        try:
+            eid = export_id(*export_hashes(pdir))
+        except (OSError, ValueError, TypeError):
+            eid = None
+        sg = getattr(model, "sigma", None)
+        return {"export": rel_to_repo(pdir), "export_id": eid,
+                "sigma": None if sg is None else [float(v) for v in sg],
+                "cap_trained": float(model.cap_trained)}
 
     def _pwm_ready(self, t: float) -> tuple[bool, str]:
         """May a policy pulse leave right now? Every refusal names itself."""
@@ -3144,6 +3213,8 @@ class MavlinkCommandSink(TimerWorker):
         Never raises: the callers' own neutral MANUAL_CONTROL comes after."""
         was = self._pwm_active
         self._pwm_active = False
+        if end:
+            self._pwm_open = False
         if latch and not self._pwm_latch:
             self._pwm_latch = why
         try:
@@ -3245,8 +3316,57 @@ class MavlinkCommandSink(TimerWorker):
                 self.bus.log.emit("warn", "rl_pwm: policy pulses are going "
                                           "out on RC 9..16 (mixer bypassed)")
             self._pwm_active = True
+            self._pwm_open = True
             self._pwm_neutral_left = self.PWM_NEUTRAL_FRAMES
             self._pwm_gate.note_pulses(t)
+
+    @Slot(float)
+    def set_pwm_cap(self, cap: float) -> None:
+        """The transport cap changed at runtime (bus.cmd_pwm_cap, 2026-11-02 —
+        the LOW row's cap ▾; MpcWorker.set_rl_pwm_cap emits it only after it
+        committed the change and rebuilt both pwm followers at that cap).
+        This sink's window becomes min(cap, the gate export's trained cap) —
+        exactly what _setup_pwm_gate computes from hw_mpc.yaml at launch, so
+        the worker's follower-vs-sink check (cap included) agrees again.
+
+        It changes the WINDOW and nothing else: the gate (built once from
+        rl_pwm.policy_dir's export) and a latched fault stay as they are, no
+        pulse is clamped (one outside the new window is refused + latched by
+        set_pwm, as always), and the next _pwm_tick snapshot carries the new
+        pwm_cap with its pwm_cap_source. Refused — said, never raised — for
+        a value outside (0, 1], without a gate, and while an rl_pwm
+        ENGAGEMENT is open or a fault is latched (defence in depth: the
+        worker refuses a change while engaged; `_pwm_open` mirrors that —
+        `_pwm_active` alone would let a change through a coast pause)."""
+        try:
+            c = float(cap)
+            ok = (not isinstance(cap, (bool, str, bytes))
+                  and math.isfinite(c) and 0.0 < c <= 1.0)
+        except (TypeError, ValueError, OverflowError):
+            ok = False
+        if not ok:
+            self.bus.log.emit("error", f"rl_pwm: transport cap NOT changed — "
+                                       f"{cap!r} is not a number in (0, 1]")
+            return
+        if self._pwm_gate is None:
+            self.bus.log.emit("warn", f"rl_pwm: transport cap NOT changed — no "
+                                      f"rl_pwm gate ({self._pwm_gate_error or 'rl_pwm is not configured'})")
+            return
+        if self._pwm_active or self._pwm_open:
+            self.bus.log.emit("error", "rl_pwm: transport cap NOT changed while "
+                                       "an rl_pwm engagement is open")
+            return
+        if self._pwm_latch:
+            self.bus.log.emit("error", f"rl_pwm: transport cap NOT changed while a gate "
+                                       f"fault is latched ({self._pwm_latch}) — the "
+                                       f"follower's stop / idle clears it")
+            return
+        old = self._pwm_cap
+        self._pwm_cap = min(c, float(self._pwm_cap_trained))
+        self._pwm_cap_source = "panel"
+        self.bus.log.emit("info", f"rl_pwm transport cap {old:g} → {self._pwm_cap:g} "
+                                  f"(panel {c:g}; the gate's export trained "
+                                  f"{float(self._pwm_cap_trained):g})")
 
     def _pwm_tick(self, t: float) -> None:
         """Per sink tick: ask the vehicle for what the gate lacks (only while
@@ -3283,19 +3403,32 @@ class MavlinkCommandSink(TimerWorker):
                 self._pwm_ever_sent = False
         # the snapshot Telemetry carries: built HERE, on the sink's thread,
         # and handed over as one reference (pwm_gate_state reads no dict that
-        # this thread is mutating).
+        # this thread is mutating). 2026-11-01: + the gate's export identity
+        # (export / export_id / sigma / cap_trained; None without a gate) —
+        # the worker compares sigma too and names this export in a refusal.
+        ident = getattr(self, "_pwm_gate_export", None) if g is not None else None
+        ident = ident if isinstance(ident, dict) else {}
+        exp_keys = {"export": ident.get("export"),
+                    "export_id": ident.get("export_id"),
+                    "sigma": (None if ident.get("sigma") is None
+                              else list(ident["sigma"])),
+                    "cap_trained": ident.get("cap_trained")}
         if g is None:
             self._pwm_state = {"configured": False, "ok": False,
                                "why": self._pwm_gate_error
-                               or "rl_pwm is not configured", "stamp": now()}
+                               or "rl_pwm is not configured", "stamp": now(),
+                               **exp_keys}
         else:
             d = g.state(t, self._link_v2())
             if self._pwm_latch:
                 d["ok"], d["why"] = False, self._pwm_latch
+            # (2026-11-02) + pwm_cap_source: "hw_mpc.yaml" | "panel" — who set
+            # the window in force (set_pwm_cap)
             d.update(active=bool(self._pwm_active), n_sent=int(self._pwm_sent),
                      enabled=bool(self.enabled), latched=bool(self._pwm_latch),
                      pwm_cap=float(self._pwm_cap), pwm_cap_mode=self._pwm_cap_mode,
-                     stamp=now())
+                     pwm_cap_source=str(getattr(self, "_pwm_cap_source", "hw_mpc.yaml")),
+                     stamp=now(), **exp_keys)
             self._pwm_state = d
 
     def pwm_gate_state(self) -> dict | None:
@@ -5831,6 +5964,11 @@ class HardwareBackend(Backend):
         # test reads these connections by name); only MavlinkCommandSink
         # speaks the Lua override transport, the null sink drops the frame.
         bus.cmd_pwm.connect(self.sink.set_pwm)
+        # ...and its cap (2026-11-02, the LOW row's cap ▾): MpcWorker ->
+        # sink, only after the worker committed a change. Both sinks have the
+        # slot; the null sink drops it. TimerWorker -> TimerWorker: queued,
+        # delivered on the sink's own thread between its ticks.
+        bus.cmd_pwm_cap.connect(self.sink.set_pwm_cap)
         bus.cmd_gripper.connect(self.sink.set_gripper)
         bus.cmd_lights.connect(self.sink.set_lights)
         bus.cmd_enable.connect(self.sink.set_enabled)
@@ -5919,6 +6057,10 @@ class HardwareBackend(Backend):
             bus.cmd_mpc_start.connect(self.mpc.start_mission)
             bus.cmd_mpc_mode.connect(self.mpc.set_mode)
             bus.cmd_mpc_tune.connect(self.mpc.set_mpc_tune)
+            # the LOW row's RL policy picker (2026-11-01): (LOW, export dir)
+            bus.cmd_rl_policy.connect(self.mpc.set_rl_policy)
+            # ...and its pwm transport cap ▾ (2026-11-02): (LOW, cap)
+            bus.cmd_rl_pwm_cap.connect(self.mpc.set_rl_pwm_cap)
             bus.cmd_mpc_scenario.connect(self.mpc.set_scenario)
             bus.cmd_mpc_dump_meta.connect(self.mpc.dump_run_meta)
             bus.cmd_enable.connect(self.mpc.on_enable)

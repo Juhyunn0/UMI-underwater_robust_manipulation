@@ -3024,3 +3024,47 @@ LEVEL q_des, so a 7-dim policy's roll/pitch were out of its distribution.
   at the engage instant and on the next tick, a ONCE with tags in view, and START goes through) — they fail on HEAD, on the version without
   the START refusal, without the record, and with the engage-instant check bypassed. The remaining limit: engaged with no tag in view, the
   motion a gap hid is caught by nothing but the operator.
+
+## 2026-10-29 — heavy_gripper plant from the weighed vehicle: 17.5 kg, 17.6 kgf → B−W +0.98 N (no water runs)
+
+* **Why:** heavy_gripper's mass and volume were a composition of vendor masses and CAD volume (13.724 kg, 0.0131815 m³ → B−W −5.71 N, sinks),
+  never measured on this vehicle. The NMPC is generated from them (M⁻¹, C_RB, g(η)), and the heave trim (2026-09-07) fills the
+  (model − vehicle) B−W gap with a constant wrench. On 2026-10-29 the operator weighed the real vehicle: 17.5 kg in air, 17.6 kgf buoyancy
+  [측정: data/20261029/1029_mass_buoyancy/README.md, operator-reported scale readings]. That is 3.776 kg (+28 %) and 4.4715 L beyond the
+  composition — ballast, foam, DVL, tether and the like, not itemized.
+* **What (theory):** match total mass and total volume to the measurement and carry the difference as ONE residual part of unknown
+  location: its mass a point mass at the vehicle COM, its volume at the vehicle CB [예측]. The volume is the measured buoyancy divided by the
+  model's own ρ, so the model's buoyancy equals the measured force whatever the pool water's density.
+  ```
+  V       = B_meas / ρ = 17.6 kgf / 997 kg/m³ = 0.017653 m³
+  B − W   = (17.6 − 17.5) · 9.81 = +0.98 N          (±~1 N: difference of two 0.1 kg readings)
+  m_res   = 17.5 − 13.724 = 3.776 kg   at r_COM,veh        V_res = 0.017653 − 0.0131815 = 0.0044715 m³   at r_CB,veh
+  COM'    = (Σ m_i r_i + m_res r_COM,veh) / 17.5
+  I'      = Σ_i [ I_i + m_i (|d_i|² 1 − d_i d_iᵀ) ],   d_i = r_i − COM'          diag (0.38154, 0.77780, 0.70954) → (0.38352, 0.78337, 0.71314)
+  M       = diag(m + X_u̇, m + Y_v̇, m + Z_ẇ, I_x + K_ṗ, I_y + M_q̇, I_z + N_ṙ)   M_11 19.22 → 23.0,  M_22 26.42 → 30.2,  M_33 28.29 → 32.07
+  g(η)    = [ (W−B) sθ, −(W−B) cθ sφ, −(W−B) cθ cφ, zg W cθ sφ, zg W sθ, 0 ]      W − B: +5.71 → −0.98 N
+  w_trim  = (B − W)_model − (B − W)_vehicle            hw −12 N (peg): +6.29 → +12.98 N;  jaw-empty profile +1.5 N: −7.21 → −0.52 N
+  RL:  k = B · arm   →   arm = 6.7 / 172.7 = 0.039 m   (keeps the pool-measured nominal k)
+  ```
+* **How:** `compute_payload_inertia.py` holds the measured totals `M_MEASURED`, `B_MEASURED_KGF`, `VOL_MEASURED` and `residual()`, and
+  `compose()` / `buoyancy()` add the residual part (heavy_c3's `compose_c3` / `buoyancy_c3` untouched). `tools/gen_gripper_variant.py`
+  regenerated `bluerov_heavy_gripper.xml` — the origin (composite COM) moves from (0.0349, 0.0010, −0.0258) to (0.0274, 0.0008, −0.0202) m in
+  the heavy frame, and the header's net buoyancy is now computed. `BlueROVHeavyGripper.yaml` volume 0.0176530, coBM 0.01625 → 0.01563.
+  `rov_model.py` heavy_gripper: mass 17.5, inertia (0.38352, 0.78337, 0.71314), volume 0.0176530 (mass and volume first committed by the
+  operator, f5d640258). `mpc_bridge._guard_stale_solver`'s rebuild key now carries mass, inertia and volume — they sit in f_expl too, so
+  under `DOBMPC_ACADOS_BUILD=0` a stale .so could have survived. RL_controller `configs/rov_params.yaml`: hull 11.5 → 15.276 kg,
+  0.0116499 → 0.0161214 m³ (residual at the hull COM/CB), `net_buoyancy_n` 1.0 → 0.981, `cob_arm_effective_m` 0.05 → 0.039 (the pool
+  measured k, not the arm); `assets/rov/rov.urdf` inertial block and visual origins regenerated, USD rebuilt with `scripts/build_asset.sh`
+  (USD mass 17.5 checked).
+  Deliberately unchanged (KNOWN_ISSUES 2026-10-29): PID `SIM_GAINS` / `GAINS_HEAVY_GRIPPER` and pid_7d `rp_inertia` / `rp_k_ff` (designed
+  at 13.7 kg; the vehicle has flown these gains), `vehicle_net_buoyancy_n` −12 (peg, empirical), MPC_Tuned profiles (sha1-pinned; `compare:`
+  carries no mass), deployed RL policies.
+* **Result:** sim and tests only, no water runs. `test_heavy_gripper` all pass — subtree 17.5000 kg, buoyancy = 17.6 kgf (~2 ppm from the
+  YAML's 7-digit volume), released from rest it rises +0.054 m in 2 s, the PID holds the origin; `test_heavy_c3` passes (untouched).
+  `test_path_cost`'s trim tests were made independent of the model's sign: a neutral vehicle on the +0.98 N model parks −2.2 cm (below)
+  untrimmed and +0.00 cm trimmed [예측: model plant without deadband]. The 16 rov_gui test files keep only their baseline failures
+  (`test_net_buoyancy_is_validated_and_recorded`: hw −12 vs land 0.1, predates today). RL_controller: 276 passed.
+  Remaining limits: the inertia is not measured (the residual 3.8 kg's location is unknown; the real inertia is likely larger); PID
+  translational ωn is 6–9 % low [유도]; deployed RL policies were trained only at 13.7 kg ±10 %; mpcc ignores the trim, so it now flies the
+  model's +0.98 N (~1 N down) as feedforward instead of 5.7 N up; the level-approximation residual δ·sinθ doubles at the −12 N setting
+  (2.3 N at 10°).

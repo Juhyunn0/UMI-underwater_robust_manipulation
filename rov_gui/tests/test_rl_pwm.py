@@ -815,14 +815,17 @@ def test_worker_has_the_mode_and_refuses_it_without_a_gate_or_outside_manual():
         _feed(w, gate=_gate(True, age=5.0))
         w.set_engaged(True)
         assert not w.engaged and "stale" in w.reason
-        # the sink's gate was built for another export's motor directions
+        # the sink's gate was built for another export's motor directions (2026-11-01: the reason names the sink's
+        # export and the real remedies — never "restart the station", which rebuilds the gate from the same file)
         _feed(w, gate=_gate(True, mot=[1] * 8))
         w.set_engaged(True)
-        assert not w.engaged and "motor directions" in w.reason
+        assert not w.engaged and "motor_direction [1, 1, 1, 1, 1, 1, 1, 1] ≠ this export's" in w.reason, w.reason
+        assert "restart the station" not in w.reason and "set rl_pwm.policy_dir in hw_mpc.yaml" in w.reason
         # ...or clamps at another cap than this follower believes
         _feed(w, gate=_gate(True, cap=0.5))
         w.set_engaged(True)
-        assert not w.engaged and "caps |throttle|" in w.reason
+        assert not w.engaged and "pwm_cap 0.5 ≠ this export's 0.25" in w.reason, w.reason
+        assert "restart the station" not in w.reason
         # STABILIZE is admitted by engage.require_mode for the axes followers — never for raw pulses
         _feed(w, mode="STABILIZE", gate=_gate(True))
         w.set_engaged(True)

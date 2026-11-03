@@ -142,6 +142,116 @@ def test_mission_lines_hide_the_session_and_the_estimator_state():
         assert mission_shown(msg), msg
 
 
+def test_the_rl_policy_pick_lines_are_split_as_agreed():
+    """The RL policy picker (2026-11-01, MpcWorker.set_rl_policy / setup / the command sink's _setup_pwm_gate). Not a
+    recorded session: the emitters' formats, literally (test_rl_policy_pick.py runs the real emitters through the
+    same filter). A REFUSED pick is an operator action refused — shown; the pick itself is a mission event the LOW
+    row already shows (MISSION_QUIET "RL policy "); the launch provenance and the sink gate's export are
+    configuration — file only."""
+    for level, msg in (
+            ("warn", "ctrl[rl_pwm_7d]: RL policy refused: RL_PWM_7D: not while engaged"),
+            ("warn", "ctrl[dobmpc]: RL policy refused: RL_PWM: pwm10_s1 is no-fly — flight ban — the pwm "
+                     "pool-failure policy (RL_controller README §13.8 'Never fly again, at any cap'; "
+                     "config/hw_mpc.yaml rl_pwm comment)"),
+            ("warn", "ctrl[rl_pwm_7d]: RL policy refused: RL_PWM_7D: the thruster sink's gate was built at launch "
+                     "from rl_pwm.policy_dir rov_gui/control/rl_policies/pwm11k0.2_s0 (pwm_cap 0.25 ≠ this export's "
+                     "0.5) — pick an export with the same pwm_cap, or set rl_pwm.policy_dir in hw_mpc.yaml and "
+                     "restart")):
+        assert panel_text(level, msg) == msg, (level, msg)
+    for level, msg in (
+            ("info", "ctrl[dobmpc]: RL policy RL_PWM_7D pwm11att14Rw_s1 (hw_mpc.yaml rl_pwm_7d.policy_dir, id "
+                     "d04fb269)"),
+            ("info", "rl_pwm transport gate: export rov_gui/control/rl_policies/pwm11k0.2_s0 (id 7e054a14), cap "
+                     "0.25"),
+            ("info", "ctrl[rl_pwm_7d]: RL policy RL_PWM_7D: pwm16N_s3 (id 98f42c43)"),
+            ("warn", "ctrl[rl_pwm_7d]: RL policy RL_PWM_7D: pwm11att9X_s0 (id 777761e2) — WARN: flies at cap 0.25 "
+                     "below trained 0.5 (allow_caps_below_trained)")):
+        assert panel_text(level, msg) is None, (level, msg)
+    assert not mission_shown("RL policy RL_PWM_7D ← pwm16N_s3 (panel pick, id 98f42c43, "
+                             "rov_gui/control/rl_policies/pwm16N_s3)")
+    assert mission_shown("RL_PWM gate lost — disengaged"), "the transport's own run events stay on the panel"
+
+
+def test_a_launch_export_on_the_flight_ban_list_reaches_the_panel():
+    """Review F1 (2026-11-02): the ban is enforced at the pick only, so a hw_mpc.yaml that names a banned export still
+    builds at launch, and its provenance line then ends "— WARN: no-fly — <reason>" (workers._rl_launch_prov). That
+    WARN is shown (PANEL_LOG, matched from the line's head) — the id may read "? — not hashed: …" when launch hashing
+    failed; while the ordinary launch provenance line, the sink gate's info line, a pick's success lines and the pick
+    event stay off the panel. Not a recorded session: the emitter's format, literally (test_rl_policy_pick.py runs
+    the real emitter through the same filter); ids are the station copies' rl_library.export_id."""
+    for level, msg in (
+            ("warn", "ctrl[dobmpc]: RL policy RL_PWM_7D att7pwm_s0 (hw_mpc.yaml rl_pwm_7d.policy_dir, id 3d324330) — "
+                     "WARN: no-fly — flight ban — two pool runs failed (co-contraction 26–44 A, sink) (RL_controller "
+                     "README §13.8; config/hw_mpc.yaml rl_pwm_7d comment)"),
+            ("warn", "ctrl: RL policy RL_PWM pwm10_s1 (hw_mpc.yaml rl_pwm.policy_dir, id ? — not hashed: "
+                     "PermissionError: [Errno 13] Permission denied: '/x/obs_spec.json') — WARN: no-fly — flight ban "
+                     "— the pwm pool-failure policy (RL_controller README §13.8 'Never fly again, at any cap'; "
+                     "config/hw_mpc.yaml rl_pwm comment)")):
+        assert panel_text(level, msg) == msg, (level, msg)
+    for level, msg in (
+            ("info", "ctrl[dobmpc]: RL policy RL_PWM_7D pwm11att14Rw_s1 (hw_mpc.yaml rl_pwm_7d.policy_dir, id "
+                     "d04fb269)"),
+            ("info", "ctrl[dobmpc]: RL policy RL traj5_s2 (hw_mpc.yaml rl.policy_dir, id ? — not hashed: "
+                     "PermissionError: [Errno 13] Permission denied: '/x/obs_spec.json')"),
+            ("info", "rl_pwm transport gate: export rov_gui/control/rl_policies/pwm11k0.2_s0 (id 7e054a14), cap "
+                     "0.25"),
+            ("info", "ctrl[rl_pwm_7d]: RL policy RL_PWM_7D: pwm16N_s3 (id 98f42c43)"),
+            ("warn", "ctrl[rl_pwm_7d]: RL policy RL_PWM_7D: pwm11att9X_s0 (id 777761e2) — WARN: flies at cap 0.25 "
+                     "below trained 0.5 (allow_caps_below_trained)")):
+        assert panel_text(level, msg) is None, (level, msg)
+    assert not mission_shown("RL policy RL_PWM_7D ← pwm16N_s3 (panel pick, id 98f42c43, "
+                             "rov_gui/control/rl_policies/pwm16N_s3)")
+
+
+def test_the_rl_pwm_cap_lines_are_split_as_agreed():
+    """The LOW row's cap ▾ (2026-11-02, MpcWorker.set_rl_pwm_cap; the cap SPEC's C9). Not a recorded session: the
+    emitters' formats, literally (test_rl_pwm_cap.py runs the real emitters through the same filter). A REFUSED change
+    is an operator action refused — its head says so ("ctrl[…]: RL_PWM cap refused: …"), PANEL_LOG's refusal pattern
+    shows it with no pattern of its own. The change itself is a mission event the combo already shows — MISSION_QUIET
+    "RL_PWM cap " — and its summary line is configuration. A pwm LOW the change DROPPED ("ctrl[…]: <LOW> unavailable at
+    cap …") is file only: the LOW row shows its ERROR. The quiet prefix is "RL_PWM cap ", NOT "RL_PWM ": the
+    transport's own run event "RL_PWM gate lost — disengaged" stays on the panel."""
+    for level, msg in (
+            ("warn", "ctrl[rl_pwm_7d]: RL_PWM cap refused: not while engaged"),
+            ("warn", "ctrl: RL_PWM cap refused: controller still building — pick again when READY"),
+            ("warn", "ctrl[dobmpc]: RL_PWM cap refused: the cap applies to RL_PWM / RL_PWM_7D only (asked for 'rl')"),
+            ("warn", "ctrl[dobmpc]: RL_PWM cap refused: cap must be a number in (0, 1], got nan"),
+            ("warn", "ctrl[rl_pwm_7d]: RL_PWM cap refused: the thruster sink's export "
+                     "rov_gui/control/rl_policies/pwm11k0.2_s0 is trained at cap 0.5: the transport cannot exceed "
+                     "it"),
+            ("warn", "ctrl[dobmpc]: RL_PWM cap refused: RL_PWM cannot fly pwm11k0.2_s0 at cap 0.25: ValueError: "
+                     "rl_pwm: the config cap rl_pwm.pwm_cap 0.25 is below the policy's trained cap 0.50 "
+                     "(rov_gui/control/rl_policies/pwm11k0.2_s0) — a policy capped below its training is fed back a "
+                     "previous action it never saw and limit-cycles (rl_pwm 2026-10-01: cap 0.25 on a cap-1.0 "
+                     "policy); raise rl_pwm.pwm_cap to >= 0.50, or set rl_pwm.allow_caps_below_trained: true "
+                     "(recorded in meta)"),
+            ("warn", "ctrl[rl_pwm_7d]: RL_PWM cap refused: the thruster sink's gate was built at launch from "
+                     "rl_pwm.policy_dir rov_gui/control/rl_policies/pwm11k0.2_s0 (motor_direction [1, 1, 1, 1, 1, 1, "
+                     "1, 1] ≠ this export's [-1, -1, 1, 1, -1, 1, 1, -1]) — pick an export with the same "
+                     "motor_direction, or set rl_pwm.policy_dir in hw_mpc.yaml and restart")):
+        assert panel_text(level, msg) == msg, (level, msg)
+    for level, msg in (
+            ("warn", "ctrl[rl_pwm_7d]: RL_PWM unavailable at cap 0.25 — ValueError: rl_pwm: the config cap "
+                     "rl_pwm.pwm_cap 0.25 is below the policy's trained cap 0.50 "
+                     "(rov_gui/control/rl_policies/pwm11k0.2_s0) — a policy capped below its training is fed back a "
+                     "previous action it never saw and limit-cycles (rl_pwm 2026-10-01: cap 0.25 on a cap-1.0 "
+                     "policy); raise rl_pwm.pwm_cap to >= 0.50, or set rl_pwm.allow_caps_below_trained: true "
+                     "(recorded in meta)"),
+            ("warn", "ctrl[dobmpc]: RL_PWM_7D unavailable at cap 0.5 — export files changed while loading"),
+            ("info", "ctrl[dobmpc]: RL_PWM cap 0.25 → 0.5 (panel): RL_PWM pwm11k0.2_s0 flies 0.5 (trained 0.5); "
+                     "RL_PWM_7D pwm11att14Rw_s1 flies 0.5 (trained 0.5)"),
+            ("warn", "ctrl[rl_pwm_7d]: RL_PWM cap 0.5 → 0.25 (panel): RL_PWM → ERROR (ValueError: rl_pwm: the "
+                     "config cap rl_pwm.pwm_cap 0.25 is below the policy's trained cap 0.50 "
+                     "(rov_gui/control/rl_policies/pwm11k0.2_s0) — ...); RL_PWM_7D pwm11att14Rw_s1 flies 0.25 "
+                     "(trained 0.5)")):
+        assert panel_text(level, msg) is None, (level, msg)
+    for ev in ("RL_PWM cap 0.25 → 0.5 (panel; RL_PWM 0.5, RL_PWM_7D 0.5)",
+               "RL_PWM cap 0.5 → 0.25 (panel; RL_PWM ERROR, RL_PWM_7D 0.25)",
+               "RL_PWM cap 0.25 → 1 (panel; RL_PWM_7D 0.5)"):
+        assert not mission_shown(ev), ev
+    assert mission_shown("RL_PWM gate lost — disengaged"), "NOT 'RL_PWM ' alone: the transport's run events stay"
+
+
 def test_the_panel_records_every_line_but_draws_the_shown_ones():
     from rov_gui.tests.test_offline import _app
     from rov_gui.widgets.payload import PayloadPanel

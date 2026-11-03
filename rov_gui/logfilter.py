@@ -68,6 +68,18 @@ PANEL_LOG = tuple(re.compile(p) for p in (
     # START now would be refused" is a forecast, not a refusal, and the
     # startup "... — rl_pwm mode will refuse" lines are configuration.
     _CTRL + r"[^:—(]*\brefused\b",
+    # a LAUNCH export on the flight-ban list (2026-11-02, review F1). The ban
+    # is enforced at the pick only (MpcWorker.set_rl_policy), so a
+    # hw_mpc.yaml that names a banned export still builds, and this WARN
+    # (workers._rl_launch_prov: "RL policy <LOW> <name> (hw_mpc.yaml
+    # <low>.policy_dir, id <id>) — WARN: no-fly — <reason>"; the id may read
+    # "? — not hashed: …") is the panel's word of it. Matched from the line's
+    # HEAD through the no-fly tail: the same line without that tail is
+    # configuration (file only), and so is a pick's own line ("RL policy
+    # <LOW>: <name> (id …)", whose only WARN is the cap; a banned pick is
+    # refused — the pattern above).
+    _CTRL + r"RL policy \S+ .+ \(hw_mpc\.yaml \S+\.policy_dir, id .*\) — "
+            r"WARN: no-fly — ",
     # a recording stopped (REC UI, the feeds, REC NAV) — shown as its folder,
     # see panel_text
     r"^[^:]*recording saved: ",
@@ -89,6 +101,19 @@ MISSION_QUIET = (
     BANNER_LINE,
     # a profile pick — the LOW row shows it
     "MPC_Tuned profile",
+    # an RL export pick (2026-11-01, MpcWorker.set_rl_policy: "RL policy
+    # <LOW> ← <name> (panel pick, ...)") — the LOW row's policy widgets show
+    # it; a REFUSED pick is a bus.log WARN whose head says "refused", which
+    # PANEL_LOG shows
+    "RL policy ",
+    # a pwm transport cap change (2026-11-02, MpcWorker.set_rl_pwm_cap:
+    # "RL_PWM cap <old> → <new> (panel; …)") — the LOW row's cap ▾ shows it.
+    # A REFUSED change is the bus.log WARN "ctrl: RL_PWM cap refused: …",
+    # shown by PANEL_LOG's refusal pattern; a pwm LOW dropped by a change
+    # ("ctrl: <LOW> unavailable at cap …") is file only — the LOW row shows
+    # its ERROR. NOT "RL_PWM " alone: "RL_PWM gate lost — disengaged" is a
+    # run event the panel keeps.
+    "RL_PWM cap ",
 )
 
 

@@ -32,6 +32,15 @@ Composition model:
     volume-weighted CB is computed and coBM (= CB_z - COM_z, the only offset hydro.py
     models) reported. The CB_x - COM_x mismatch (hydro applies buoyancy directly above
     the COM) is reported as an unmodeled static pitch moment.
+  * MEASURED TOTALS (2026-10-29): the real heavy_gripper vehicle was weighed — 17.5 kg in
+    air, buoyancy 17.6 kgf [측정: data/20261029/1029_mass_buoyancy/README.md, operator-
+    reported scale readings]. The parts above compose only 13.724 kg / 0.0131815 m^3; the
+    difference (ballast, foam, DVL, tether, fasteners — not itemized) is ONE residual part:
+    its mass a point mass at the vehicle COM, its volume at the vehicle CB [예측: real
+    location unknown]. So total mass and volume equal the measurement exactly, while the
+    inertia stays essentially the composed one (the point mass adds only its parallel-axis
+    term about the shifted composite COM, < 1 %); the real inertia is likely larger.
+    heavy_c3 (compose_c3 / buoyancy_c3) is a different build and does NOT get the residual.
 
 Run in `robust`:  python compute_payload_inertia.py
 """
@@ -95,14 +104,36 @@ def parallel_axis(I_com, m, r):
 JAW_POS = np.array([0.4165, 0.0, -0.17])   # jaw-pair centre at closed position (see
                                             # gen_gripper_variant.JAW_X); y cancels.
 
+# ---- measured whole-vehicle totals (heavy_gripper as flown, 2026-10-29) ---------------
+M_MEASURED = 17.5                # kg in air [측정: data/20261029/1029_mass_buoyancy/README.md]
+B_MEASURED_KGF = 17.6            # kgf buoyancy, fully submerged [측정: same note]
+VOL_MEASURED = B_MEASURED_KGF / RHO   # m^3 — divided by the model's own RHO, so the model's
+                                      # buoyancy RHO*G*VOL equals the measured force exactly
+RESID_POS = COM_VEH              # residual mass at the vehicle COM [예측: location unknown]
+RESID_CB = np.array([0.0, 0.0, COBM_VEH])   # residual volume at the vehicle CB [예측]
+
+
+def _composed_mass_and_volume():
+    """Vehicle + gripper (incl. jaws) + C3, before the measured residual."""
+    m = M_VEH + M_GRIP_TOTAL + M_C3
+    v = VOL_VEH + (M_GRIP_TOTAL - M_GRIP_WATER) / RHO + (M_C3 - M_C3_WATER) / RHO
+    return m, v
+
+
+def residual():
+    """(mass, volume) the measured totals carry beyond the itemized parts."""
+    m, v = _composed_mass_and_volume()
+    return M_MEASURED - m, VOL_MEASURED - v
+
 
 def compose():
-    """Baked rigid part only (vehicle + gripper body + C3; jaws excluded)."""
+    """Baked rigid part only (vehicle + gripper body + C3 + measured residual; jaws excluded)."""
     parts = [
         ("vehicle", M_VEH, COM_VEH, I_VEH),
         ("gripper", M_GRIP, GRIP_POS, cylinder_inertia(M_GRIP, GRIP_R, GRIP_L)),
         ("C3", M_C3, C3_POS, rot_y(C3_PITCH_DEG) @ box_inertia(M_C3, C3_DIMS)
                              @ rot_y(C3_PITCH_DEG).T),
+        ("residual", residual()[0], RESID_POS, np.zeros((3, 3))),
     ]
     M = sum(p[1] for p in parts)
     com = sum(p[1] * p[2] for p in parts) / M
@@ -159,8 +190,10 @@ def buoyancy_c3():
 def buoyancy():
     v_grip = (M_GRIP_TOTAL - M_GRIP_WATER) / RHO
     v_c3 = (M_C3 - M_C3_WATER) / RHO
-    vol = VOL_VEH + v_grip + v_c3
-    cb = (VOL_VEH * np.array([0, 0, COBM_VEH]) + v_grip * GRIP_POS + v_c3 * C3_POS) / vol
+    v_res = residual()[1]
+    vol = VOL_VEH + v_grip + v_c3 + v_res
+    cb = (VOL_VEH * np.array([0, 0, COBM_VEH]) + v_grip * GRIP_POS + v_c3 * C3_POS
+          + v_res * RESID_CB) / vol
     return vol, cb, v_grip, v_c3
 
 
@@ -185,8 +218,11 @@ if __name__ == "__main__":
     print(f"\ndisplaced volume = {vol:.7f} m^3   (grip {v_grip*1e3:.3f} L + C3 {v_c3*1e3:.3f} L)")
     print(f"CB               = ({cb[0]:+.5f}, {cb[1]:+.5f}, {cb[2]:+.5f}) m")
     print(f"coBM (CB_z-COM_z)= {cb[2]-com_total[2]:+.5f} m")
+    m_res, v_res = residual()
+    print(f"residual (measured - itemized) = {m_res:.4f} kg, {v_res*1e3:.4f} L  "
+          f"(measured {M_MEASURED} kg / {B_MEASURED_KGF} kgf, 2026-10-29)")
     print(f"net buoyancy     = {buoy - weight:+.2f} N  (B {buoy:.1f} - W {weight:.1f}; "
-          f"negative = sinks, per the no-foam decision)")
+          f"+ = floats)")
     print(f"unmodeled static pitch moment |B*(CB_x-COM_x)| = "
           f"{abs(buoy*(cb[0]-com_total[0])):.2f} N*m  (hydro.py applies B above the COM)")
     print("\n--- rov_model.py registry numbers (about the TOTAL COM = new origin) ---")

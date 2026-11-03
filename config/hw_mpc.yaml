@@ -104,6 +104,7 @@ rl:
   # 0.55 vs 0.41) and flips heave at z +1.0 m (never trained beyond ~0.3 m offsets) [measured RL_controller/logs/eval/
   # start_dist_review_20261005/{static_probe,zprobe}_traj12.out]. Fly it in DP policy missions only (references start at
   # the robot). NOT pool-tested. Revert: policy_dir -> rov_gui/control/rl_policies/traj10_s1 (flew 0930-1003 DP missions).
+  # policy_dir = 기동 기본값. 실행 중에는 LOW 줄 `policy … […]`로 바꾼다(세션 한정, 이 파일은 고치지 않음 — rov_gui/README.md 'RL 정책 고르기', 2026-11-01).
   policy_dir: rov_gui/control/rl_policies/traj12_s2
   axis_slew_per_s: 0.0
   axis_cap: 0.3           # |axis| ceiling in RL mode = min(axis_cap above, this). The policy has no speed target of its
@@ -133,7 +134,13 @@ rl_pwm:
   # 2026-10-10 (operator): pwm11k0.2_s0 = 보정된 세계(기수-위 정지각, 팔 0.05 m) + null-space 벌점으로 재학습한 후보, 시뮬 게이트
   # 전부 통과 [측정 RL_controller/logs/eval/PWM11_GATE.md], 수조 미검증 (rl_policies/pwm11k0.2_s0/README.md). 추진기별 부호 프로브
   # 아티팩트가 없으면 교전 거부(require_thruster_probe). 이전 pwm10_s1 은 수조 실패 원인 정책이라 비행 금지(RL_controller README §13.8).
+  # policy_dir = 기동 기본값. 실행 중에는 LOW 줄 `policy … […]`로 바꾼다(세션 한정, 이 파일은 고치지 않음 — rov_gui/README.md 'RL 정책 고르기', 2026-11-01).
   policy_dir: rov_gui/control/rl_policies/pwm11k0.2_s0   # was rov_gui/control/rl_policies/pwm10_s1 (2026-09-30 .. 10-10)
+  # pwm_cap = 기동 기본값. 실행 중에는 RL_PWM / RL_PWM_7D LOW 줄의 `cap ▾`로 바꾼다(두 LOW 공유, 세션 한정, 이 파일은 고치지
+  #   않음 — rov_gui/README.md 'RL 정책 고르기' 안의 'cap 바꾸기', 2026-11-02). 오른쪽 "= 학습 캡" 주석은 값이 0.5이던 때의
+  #   것이다: pwm11k0.2_s0 의 pwm_cap_trained 는 0.5 [rov_gui/control/rl_policies/pwm11k0.2_s0/obs_spec.json
+  #   output.pwm_model.pwm_cap_trained]라서 0.25 에서는 allow_caps_below_trained: false 인 LOW RL_PWM 이 기동 때 빌드되지 않는다.
+  #   RL_PWM_7D 줄의 cap ▾ 를 0.5 로 올리면 살아난다(RL_PWM 줄은 추종기가 없는 동안 고를 수 없다).
   pwm_cap: 0.25         # = pwm11k0.2_s0 의 학습 캡 pwm_cap_trained (env.pwm_cap 0.5); 스케일 모드에서 추력 공간 균일 축소. 이력:
                           # 1.0 #0.25  # |throttle| ceiling on the wire (fraction of +-400 us). 0.25 (1400..1600 us) was the
                           # first-water value [예측]; the policy was trained at 1.0. [결정 2026-10-01 operator: 1.0 in one
@@ -246,7 +253,9 @@ rl_pwm_7d:
   # 자세 샘플 반복) + 정지 자세 시작 + RATE 인터록 종료조건/패널티(R 변형), cap 0.5 학습. 시뮬 pool 게이트 cap 0.5/0.25 둘 다 PASS·full gate PASS
   # [측정 RL_controller/logs/eval/PWM11ATT14_POOL.md, PWM11ATT14_GATE.md]; 수조 0런 [예측]. velocity_source.trained true → dvl.selection primary +
   # blend 상수 + vel_lp_alpha 0.6 이 맞아야 빌드(rl_policy.check_velocity_source). 첫 수조는 rl_pwm.pwm_cap 0.25(scale), 빈 턱 hold 통과 뒤 0.5(학습 cap).
-  policy_dir: rov_gui/control/rl_policies/pwm11att14R_s1   # was rov_gui/control/rl_policies/pwm11att9X_s0 (2026-10-15 .. 10-17); before that null (2026-10-10), att7pwm_s0 (2026-10-03)
+  # 0.25 → 0.5 는 재기동 없이 LOW 줄 `cap ▾`로 바꾼다(2026-11-02, 위 rl_pwm.pwm_cap 주석).
+  # policy_dir = 기동 기본값. 실행 중에는 LOW 줄 `policy … […]`로 바꾼다(세션 한정, 이 파일은 고치지 않음 — rov_gui/README.md 'RL 정책 고르기', 2026-11-01).
+  policy_dir: rov_gui/control/rl_policies/pwm11att14Rw_s1   # was rov_gui/control/rl_policies/pwm11att9X_s0 (2026-10-15 .. 10-17); before that null (2026-10-10), att7pwm_s0 (2026-10-03)
   leash_m: 0.8
   yaw_rate_ff: true
   yaw_rate_max: 0.6
@@ -270,6 +279,7 @@ rl_pwm_7d:
 # allow_caps_below_trained (recorded) — a clipped RL policy limit-cycled on
 # 2026-10-01 (rl_pwm cap 0.25, data/20261001/1001_172910). Unknown keys RAISE.
 rl_7d:
+  # policy_dir = 기동 기본값. 실행 중에는 LOW 줄 `policy … […]`로 바꾼다(세션 한정, 이 파일은 고치지 않음 — rov_gui/README.md 'RL 정책 고르기', 2026-11-01).
   policy_dir: null
   axis_cap: 0.3
   leash_m: 0.8
@@ -524,8 +534,9 @@ path_turn_radius_m: 0.0
 # (2026-08-17): they were raised to 0.30/0.15 to chase speed, and the hardware
 # audit says the best full mission on record flew 0.05/0.05
 # (0817_110145, cross-track p95 6.6 cm over 5/5 laps). For scale the vehicle's
-# own lateral limit is axis_cap*axis_gain/m_eff_sway = 0.5*60/26.42 = 1.14
-# m/s^2 [예측 — axis_gain is unmeasured], so 0.05 is very conservative; raise
+# own lateral limit is axis_cap*axis_gain/m_eff_sway = 0.5*60/30.2 = 0.99
+# m/s^2 [예측 — axis_gain is unmeasured; m_eff_sway = the weighed 17.5 kg + 12.7
+# added mass since 2026-10-29, was 26.42 -> 1.14], so 0.05 is very conservative; raise
 # it only with a run to compare against.
 path_lat_accel_m_s2: 0.05
 path_long_accel_m_s2: 0.05
@@ -606,9 +617,13 @@ mpc_tuned_profile: 20261004_default
 w_hat_clip: [15, 45, 45, 5, 5, 8]
 
 # NET BUOYANCY OF THE VEHICLE ACTUALLY FLOWN, B - W [N] (+ floats, - sinks).
-# The NMPC's plant assumes heavy_gripper SINKS at 5.71 N (dobmpc/params.py
-# NET_BUOYANCY, composed from vendor masses + CAD volume, never measured on
-# this vehicle) and that number is baked into the generated solver. A nominal
+# Until 2026-10-29 the NMPC's plant assumed heavy_gripper SINKS at 5.71 N
+# (dobmpc/params.py NET_BUOYANCY, composed from vendor masses + CAD volume,
+# never measured on this vehicle). Since 2026-10-29 the plant is the WEIGHED
+# vehicle: 17.5 kg in air, 17.6 kgf buoyancy -> B - W = +0.98 N (+-~1 N)
+# [측정: data/20261029/1029_mass_buoyancy/README.md, operator-reported] —
+# consistent with the 09-08 free-rise fit below. The plant's number is
+# baked into the generated solver; this line is the VEHICLE's. A nominal
 # NMPC cancels its own model's gravity, so at zero depth error mpc/mpc_tuned
 # pushed UP 5.7 N — a wrong-signed feedforward whenever the real trim differs.
 # 2026-09-07 18:00 the vehicle floated: every mpc_tuned policy mission rose
@@ -654,8 +669,9 @@ vehicle_net_buoyancy_n: -12.0 #0.1
 # THE PROBLEM. A disturbance kick blurs the camera or swings the tags out of
 # frame; the localizer stops producing a fix; ~1.1 s later (tag_stale_s 0.7 +
 # tag_stale_hold_s 0.4) the loop DISENGAGES. That drops DEPTH hold too, and
-# this vehicle drifts wherever its trim of the day takes it (the MODEL says
-# -5.7 N sinking; on 2026-09-07 it floated — see vehicle_net_buoyancy_n), so it
+# this vehicle drifts wherever its trim of the day takes it (the MODEL said
+# -5.7 N sinking until 2026-10-29, the weighed +0.98 N since; on 2026-09-07 it
+# floated — see vehicle_net_buoyancy_n), so it
 # starts moving away from where the tags were —
 # which changes the view and makes re-acquisition LESS likely. Turning on
 # imu_dr does not help: MpcWorker._runtime_fault reads `meas` (the tag
@@ -1480,7 +1496,8 @@ dvl:
   # A fom or altitude MISSING from a report that claims a lock is a failed
   # gate, not a passed one.
   # The fastest this vehicle can change velocity: 30 N (axis_cap 0.5 x 60 N)
-  # over ~19 kg with added mass = 1.6 m/s^2 [유도], rounded up. A sample
+  # over ~23 kg with added mass (the weighed 17.5 kg + 5.5 surge, 2026-10-29;
+  # ~19 kg / 1.6 m/s^2 before) = 1.3 m/s^2 [유도], rounded up. A sample
   # further than a_max*dt + 5 cm/s from the last good one is a spike. [예측]
   a_max_m_s2: 2.0
   # With a current tag velocity to compare against, a sample this far from it

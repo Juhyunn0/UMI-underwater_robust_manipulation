@@ -29,6 +29,8 @@
 - **임시 대응**: Z·Send는 50 상한; 떼기 감속 확인(느려지지 않으면 STOP ALL); 50 초과 중 STOP ALL이면 그 축 홈 SUSPECT.
 - **제대로 확인하는 법**: 축마다 50 → 75 → 100 mm/s, 테이프 표시 전후 확인, 움직이는 중 Esc 1회 — 런 폴더 경로와 함께 기록한
   뒤 Z·Send 상한을 다시 정한다.
+- **2026-11-01 실기 근거**(`data/20261101/1101_191405_disturb/events.csv` `jog_stopped`): 80 mm/s 조그 떼기 — X 3회
+  40.7–42.1 mm·≤ 1.43 s, Y 1회 65.3 mm·1.91 s에 정지. 100 mm/s, 테이프 전후 확인, 움직이는 중 Esc는 여전히 0회 → 항목 유지.
 
 ### 외란 발생 장치: 갠트리 패턴·Send(절대 이동)·움직이는 중의 STOP ALL이 이 FMC4030에서 실측 0회 (2026-10-26)
 - **무엇**: 패턴(`RigGantryLink.request_path`)과 Send는 `Jog_Single_Axis` mode 2(절대)를 쓰고, 패턴은 두 축을 동시에 보낸다.
@@ -367,6 +369,29 @@
   `info = {}`가 그대로 나가 **"0 명령, solver_status 0"으로 읽힌다**. `--dvl_pose`는 이 경우 `uX…`·`wX…` nan, `solver_status` −1
   (observe 규칙)로 막았고 imu_dr에는 손대지 않았다. 고치는 법: `_write_row`의 dvp 센티넬 조건을 `self.dr is not None`으로도
   넓히기(`self._stepped`는 `ctrl.step` 호출 지점 한 곳에서만 선다).
+- **TAG FIX ON을 끝까지 켜고 나는 운용의 빈틈 3개** (2026-11-01, 코드 검토 workflow wf_8090b2ef-710에서 발견, 안 고침). 이 운용에서는
+  flown 포즈가 거의 늘 태그 상태다 — 11-01 같은 명령의 ON engaged 22,778행 중 tag 99.0 %·blend 0.9 %·dr 0.1 %
+  [측정: data/20261101/1101_tagfix_on_breakdown_offline/breakdown.txt, 스냅샷]:
+  - **ON START는 DVL이 지금 쓸 만한지 안 본다**: `_dvp_engage_refusal`(`rov_gui/control/workers.py:3939-3967`)은 포즈가 tag/blend면
+    `_dvp_dvl_ok`(스위치 IN + trust_refusal = 장착값 + 샘플 1개 이상)·anchored·헤딩·xy hole만 묻는다. `_dvp_dr_start_refusal`(hold_s 안의
+    usable 샘플)은 TAG FIX OFF이거나 포즈가 dr/held일 때만 묻는다. 그래서 DVL no_lock(바닥 근처 등)인 채 START하면 정상으로 출발하고,
+    첫 태그 끊김에서 포즈가 LOST가 된다. 8틱 디바운스 뒤 마지막 fix 캡처로부터 약 1.05 s에 해제된다 [유도]. 고치는 법: ON 경로에도
+    DR START 검사(또는 usable 샘플 나이 검사)를 넣는다. 다만 태그가 보이면 DVL 없이도 날고 싶을 수 있으니 운용자가 정할 일이다.
+  - **HELD + 태그 보임 tick이 DP 이력에 행을 넣는다**: `_emit_policy_state`(`workers.py:10626-10719`) branch 1은 `ST_DR`만 잡는다. 포즈가
+    HELD인데 태그 상태가 있으면 branch 2가 fix_fresh True, t_fix = fix 캡처, eta = HELD 포즈(xy 고정·u=v=0, z·자세·yaw는 살아 있음)로
+    두 이력(MpcWorker 앵커, PolicyWorker proprio)에 모두 넣는다. 안전 리뷰 2026-10-19 #3("HELD는 행 없음")과 모순이다. 이 규칙은
+    `_policy_dvp_dr` docstring, ARM 로그, 위 `--policy-dr` 항목에 적혀 있다. branch 3(태그 상태는 있는데 포즈가 없음 = blind 재획득)은
+    마지막 flown 포즈를 새 캡처 stamp로 PolicyWorker 이력에만 넣어 `skip_fresh`를 만든다(주석은 "stays out"이라고 하지만 그건
+    MpcWorker 이력만 해당). 이 조건(HELD + 태그 상태 있음, engaged·traj_on)이 실제로 났다: TAG FIX OFF 런
+    `data/20261101/1101_193724/mpc_193955.csv` t 3.06–3.21 s HELD 4행, `n_tags` 9 — 행이 실제로 이력에 들어갔는지는 stamp가 전진했는지에
+    달려 있어 확인하지 않았다. ON에서는 재획득·jump 합의 중에 DVL 공백이 0.45 s를 넘을 때 생긴다. 고치는 법: branch 2에서 `ST_HELD`면 fix_fresh False로
+    둔다. 테스트에 `w.fix`가 있는 HELD 케이스를 추가한다(지금 테스트는 `w.fix=None`만 본다).
+  - **주석·도움말이 코드와 다르다**: `workers.py:11514-11516`·`9920-9922`·`rov_gui/state.py:1097-1108`(PolicyState docstring)은
+    "policy proprio는 태그 상태 그대로" / "dead-reckoning control이면 fix_fresh False"라고 한다. 코드는 flown 포즈(slew off 포함,
+    `--policy-dr`면 DR 포즈를 tick stamp로 fresh)를 준다. `--policy-dr` 도움말(`rov_gui/__main__.py:1056-1062`)과 `config/hw_mpc.yaml:873-878`
+    `allow_dr_pose` 주석은 "DR/HELD tick이 행 추가"라고 하지만 코드는 DR만 넣는다. `workers.py:11563-11568`·`12128-12132`는 "`meas`는
+    태그 상태, 인터록은 ground truth"라고 하지만, `--dvl_pose` control에서는 교체(:11517) 뒤 `meas`가 포즈다. CSV `est` 열은
+    `--dvl_pose` control에서도 늘 `tag`(`workers.py:12428-12444`)라서, 실제로 난 포즈는 `dvp_src`·`tagfix`·`dvp_*` 열로 판단해야 한다.
 - **임시 대응 / 첫 수조 절차**: README "DVL로 위치까지 — `--dvl_pose`"의 "풀에서 처음 켤 때" — shadow로 시작, TAG FIX ON 60 s로
   바이어스, shadow에서 OFF로 station hold → square, 이따금 TAG FIX ONCE로 보정하며 meta `dvl_pose.corrections`("N cm off after
   T s")로 드리프트를 본 뒤 control. 로그창에 빨간 `LINK DELAYED`가 뜨면 그 클라이언트를 닫는다.
@@ -724,6 +749,61 @@
   `hz_measured` 합 ~140 msg/s [예측: IMU 셋 ~90 + 나머지 ~52, 예전 ~552]; 0c (a) 새 레이트에서 파라미터 다운로드 1회, (b) `--mavlink-rate 200`
   로 같은 것. 테스트: 신규
   `rov_gui/tests/test_mavlink_rates.py`. 미커밋.
+
+### LOW 줄 RL 정책 피커(`policy … […]`, 2026-11-01)와 `cap ▾`(2026-11-02)가 **실기 0런** — hw_mpc.yaml이 비행 금지 export를 가리키면 교전은 막지 않는다 (2026-11-02)
+- **무엇**: 피커, 워커 재빌드, sink 사전 비교, `./c3 rl-policies sync`는 두 가지로만 확인했다.
+  - 오프라인 테스트: `rov_gui/tests/test_rl_library.py`·`test_rl_policy_pick.py`·`test_rl_policy_dialog.py`·`test_rl_policy_library.py`.
+  - 실제 hw_mpc.yaml을 읽는 프로브.
+
+  LOW 줄 `cap ▾`(실행 중 `rl_pwm.pwm_cap` 변경, rov_gui/README.md 'cap 바꾸기')도 같다. 오프라인 테스트
+  `test_rl_pwm_cap.py`·`test_rl_pwm_cap_panel.py`와 demo 소스로 띄운 실제 앱에서만 확인했다
+  [측정: `data/20261102/1102_124935_rlcap_gui_demo_offline/README.md`]. **sink의 `set_pwm_cap`이 기체에
+  붙은 MavlinkCommandSink에서 돈 적은 없다**(교전 중·래치 중 거부, 창 = `min(cap, sink export의 학습 cap)`).
+
+  학습이 도는 중이라(GPU guard) 스테이션 GUI는 띄우지 않았다. 수조·벤치는 0런이다. 그 밖에 남은 것:
+  - **비행 금지 export의 교전**: hw_mpc.yaml `<low>.policy_dir`이 비행 금지 export(`pwm10_s1`·`pwm10_s2`·`att7pwm_s*`,
+    RL_controller README §13.8)를 가리키면 그 LOW는 빌드된다. LOW 줄은 `NO-FLY`(빨강)를, 미션 패널은 warn 줄을 보이지만
+    **교전 거부는 없다**. 거부되는 것은 피커로 고르는 것뿐이다. `rl_pwm.policy_dir` 키를 지우면 클래스 기본값
+    `pwm10_s1`(`rov_gui/control/rl_policy.py` `HwRlPwm.DEFAULT_DIR`)로 난다.
+  - **sink 에러 줄 안내**: sink의 틱 실패 에러 줄은 세션 동안 예외 타입별로 1회만 찍힌다. `backends/hardware.py`
+    `MavlinkCommandSink.tick`의 `_pwm_tick_failed`가 성공 틱 뒤에 리셋되지 않기 때문이다. 그래서 피커 거부 문구의
+    "see the sink's error line"이 이전 에피소드의 줄을 가리킬 수 있다. 거부 문구 괄호 안의 원인은 현재 것이다.
+  - **건너뛴 테스트**: 2026-11-02 회귀에서 `test_fstereo_proc.py`의 자식 프로세스 테스트 16개는 GPU guard 때문에 건너뛰었다.
+    피커와는 무관한 FS 경로다.
+  - **`cap ▾`가 안 보이는 경우**: 두 pwm LOW가 모두 기동 때 빌드에 실패하면 LOW 콤보로 고를 수 없으므로 `cap ▾`도 볼 수
+    없다. 그때는 hw_mpc.yaml을 고쳐 재기동해야 한다(워커는 그 상태에서도 변경을 받지만 패널에 길이 없다).
+  - **안내가 서로를 가리키는 경우**(지금 설정은 해당 없음, 2026-11-02 최종 회귀에서 발견): `RL_PWM`(`allow_caps_below_trained:
+    false`)이 학습 0.25 export를 쥐고 `RL_PWM_7D`가 비어 있을 때, `RL_PWM` 줄에서 cap을 올리면 "학습 0.5 이상 export를 먼저
+    고르라"고 거부되고, 그 export를 0.25에서 고르면 "`RL_PWM` 줄의 cap ▾로 올리라"고 거부된다. 빠져나가는 길은 대화상자의
+    `Slot`으로 `RL_PWM_7D`에 추종기를 넣고 그 줄에서 cap을 올린 뒤(`RL_PWM`은 ERROR로 내려감) 고르는 것인데, 어느 문구도
+    이를 말하지 않는다(프로브: 세션 scratch `review2/final/probe/p_ui3_loop.py`, 코드 미변경).
+  - **콤보 목록이 열린 동안 Space(ALL STOP)가 창에 닿지 않는다**(2026-11-02 리뷰에서 발견, 기존 문제). LOW 줄의 콤보 전부
+    (`shape`·LOW·yaw·`cap ▾`)가 같다. Esc는 E-STOP으로 잡힌다.
+  - **MPC_Tuned 프로필 줄도 같은 자리 이동이 있다**(기존 문제). `tune_name`·`tune_state`가 글자 길이만큼 넓어져서, 몇 초짜리
+    거부 문구가 사라질 때 `btn_tune`과 START 왼쪽 끝이 움직인다. RL 정책 줄은 2026-11-02에 `…`·`cap ▾`를 문구 **앞으로**
+    옮겨 고쳤다(`test_rl_pwm_cap_panel.py` `test_the_low_row_controls_never_move_with_the_policy_texts`). 그래도 START의
+    왼쪽 끝은 문구 길이를 따라 움직인다. 상태 문구에 마우스를 올려 둔 채 긴 문구가 사라지면 그 자리가 START가 되고, 정책
+    세션의 START에는 hold가 없다. 고정 폭 라벨은 이것까지 막지만 1920에서 거부 이유와 export 이름의 가져온 시각을 잘라서
+    채택하지 않았다.
+- **임시 대응**: 교전 전에 LOW 줄 상태가 `NO-FLY`가 아닌지 본다. YAML에 비행 금지 export를 적지 않는다.
+- **제대로 고치는 법**:
+  - (a) 운용자가 정한다: 쥔 export의 `no_fly`가 있으면 `_engage_refusal`이 교전을 거부할지.
+  - (b) 성공 틱 뒤에 `_pwm_tick_failed = ""`로 되돌린다.
+  - (c) 학습이 돌지 않을 때 `test_fstereo_proc.py` 전체를 1회 돌린다.
+  - (d) `cap ▾`: 첫 수조에서 RL_PWM_7D 줄 0.25 → 0.5를 교전 사이에 바꾸고, sink의 `rl_pwm transport cap 0.25 → 0.5` 줄과 run
+    meta `controller.pwm_cap_origin`을 확인한다.
+  - (e) MPC_Tuned 줄도 `…`를 `tune_name`·`tune_state` 앞으로 옮긴다(test_mpc_tune의 배치 고정 확인 뒤).
+
+### `--policy` 앱을 `app.quit`로 끝내면 종료 중 segfault 139 — 워커 스레드가 torch 텐서를 놓다가 (2026-11-02 발견)
+- **무엇**: demo 소스 + 운용자 플래그(`--mpc --fstereo --policy --fstereo-scale 0.5 --fstereo-process --dvl_pose --dvl-trust
+  --policy-dr`)로 띄운 실제 앱을 드라이버가 `app.quit`로 끝내자, 할 일을 다 마친 **뒤** 종료 중에 죽었다. 스택은 워커 스레드의
+  queued 이벤트(`QObject::event` → Python setattr) → `c10::TensorImpl::~TensorImpl` ← `_PyThreadState_DeleteCurrent`,
+  "Invalid permissions for mapped object" [측정: `data/20261102/1102_124935_rlcap_gui_demo_offline/stdout.txt` 끝]. 같은 날 앞선
+  실행(live2)도 같았다(2/2). `build_and_run`의 `aboutToQuit → win.shutdown` 연결은 있다(위 e2e 드라이버 항목과 다른 경우).
+- **영향**: 확인한 범위에서는 종료 코드뿐이다(기록·화면은 끝까지 정상). 실제 스테이션을 창 닫기로 끝낼 때도 나는지, 녹화
+  파일 마무리 전에 나는 경우가 있는지는 **확인하지 않았다**.
+- **제대로 고치는 법(미조사)**: shutdown에서 DP 정책 워커 스레드가 torch 객체를 놓고 끝난 뒤 앱을 내리게 하거나, 그
+  스레드의 남은 queued 이벤트를 비운다. 먼저 창 닫기 종료에서 재현되는지 본다.
 
 ### RL_PWM 펄스 경로의 **기체측 Lua 해제(actuation dropout)** — 10-17 att14 전 engagement에서 분당 2.3–8.0회, 매번 50–100 ms 전 추진기 중립 → 기수 −3° 튐 (2026-10-18 발견)
 - **무엇**: `rl_pwm_override.lua`(STALE_MS 100)는 RC_CHANNELS_OVERRIDE 프레임이 100 ms 안 오지 않으면 8기를 1500 µs로 한 프레임 강제하고
@@ -1215,6 +1295,13 @@
   `p += v·age`(속도 브리징, :200-204)가 한 tick에 상태를 미터 단위로 옮긴다. 소스 전환/1-tag에서만 발생.
 - **임시 대응**: 없음 — 정책 런 중 C3가 태그를 못 보는 구간(202610/202718에서 틱의 56/64 %가 폴백)이 길수록 노출. 폴백 구간의
   `tag_age_s` 0.03 s는 host 도착시각 기준이라 신선도 지표로 믿지 말 것.
+- **재관측 2026-11-01 (10-28 기록, `--dvl_pose` TAG FIX ON 경로, Δt가 작지 않아도 된다)**: 단일 태그 RGB 폴백 fix 둘(54 ms 간격) 사이에
+  z가 7.5 cm 계단으로 움직였다. 그래서 tag FD heave(`fd_w` = `nu_w`)가 −0.93 m/s가 됐고, 그다음 fix가 0.65 s 동안 얼어 있는 사이
+  `p += R·nu·age` 브리지가 상태를 pz 0.58 m, px·py 약 0.11·0.12 m 옮겼다. 그동안 `dvp_src`는 계속 `tag`였고 DVL 포즈가 그대로 따라갔다
+  (disengaged 기록) [측정: data/20261028/1028_154858/c3_fs_depth_20261028_154858_mpc.csv t 82.43–83.08, nav_154858/fixes.csv
+  3494.3582→3494.4123]. DvlPose의 jump 검사는 fix z(캡처 시점 Bar30 대비)와 tick당 innovation(약 1.3 cm < `jump_m` 0.10)만 보기 때문에
+  이걸 못 잡는다. fix가 0.7 s를 넘자 DR이 z를 Bar30 기준(0.653)으로 되돌렸다. 아래 (3)(4)가 이 경우도 막는다. 더해서 브리지
+  나이 상한이나 |nu_w| 상한도 후보다.
 - **제대로 고치는 법**: (1) 소스가 바뀐 첫 fix에서 `_v_ned` 리셋(또는 prev_p를 새 소스 기준으로 재시딩), (2) dtc 하한(예: 0.5·공칭
   프레임 간격) 아래면 속도 갱신 생략, (3) |v_new| 물리 상한(예: 0.5 m/s) 클램프 + 이벤트 로그, (4) 1-tag fix는 속도 갱신에 안 쓰기.
   회귀 테스트: second→main 전환 Δt 1 ms + 4 cm 오프셋을 넣어 상태 점프 < 5 cm 확인.
@@ -1462,7 +1549,7 @@
   (모델 − 실기) = −5.71 N을 **상수 히브 렌치**로 acados 파라미터 p(= w)에 넣는다(런타임 입력, 재빌드 없음, 관측기 아님; mpc/mpc_tuned만 —
   dobmpc는 EAOB가 같은 잔차를 추정하므로 미적용). meta `controller.heave_trim` 블록이 기록 경계(없는 런 = −5.7 N 상향 FF를 날린 런);
   CSV `w2`는 EAOB 열로 유지. 모델 플랜트 예측: 중립 기체 station hold에서 무보정 +12.2 cm 위에 정지, 보정 0.00 cm
-  [예측: rov_gui/tests/test_path_cost.py::test_a_neutral_vehicle_holds_depth_only_with_the_trim, 데드밴드 없는 플랜트]. 검증은 CSV
+  [예측: rov_gui/tests/test_path_cost.py::test_a_neutral_vehicle_holds_depth_only_with_the_trim, 데드밴드 없는 플랜트; 2026-10-29 이전 모델(−5.71 N) 기준; 무게 측정 뒤 모델(+0.98 N)에서 같은 테스트는 무보정 −2.2 cm(아래), 보정 +0.00 cm]. 검증은 CSV
   `uZ`의 절편(정지 틱 평균)이 0 근처인지와 policy 미션의 pz 드리프트로.
 - **실측(2026-09-08)**: 히브 지령이 데드밴드 안인 자유 상승 창(0908_105822/mpc_110419.csv 0–11 s, pwm_dev ≤ 22 µs)을 플랜트 히브 모델로
   적합하면 B−W = **+0.12 N**(모델 항력), +0.04 N(항력 0), +0.28 N(항력 3배) [측정+유도: 0908_105822/buoyancy_fit_20260908.txt] → 기체는
@@ -3182,6 +3269,25 @@ SAM2 추적(1단계), 메시 기반 6-DoF(2단계), 현장 재구성(3단계)을
 
 ## 📌 알려진 한계 (당장 고칠 계획 없음, 잊지 말 것)
 
+### heavy_gripper 실측 질량·부력 반영 뒤 남은 것: 관성·PID 이득·RL 정책은 13.7 kg 기준 (2026-10-29)
+- **무엇**: 플랜트 질량·부피를 실측값으로 바꿨다 — 17.5 kg, 부력 17.6 kgf → B−W +0.98 N
+  [측정: data/20261029/1029_mass_buoyancy/README.md, 운용자 보고 저울값]. NMPC 예측 모델(mpc·mpc_tuned·dobmpc·mpcc), MuJoCo
+  heavy_gripper, RL_controller 학습 환경이 이 값을 쓴다. 남은 것:
+  (a) **관성**: 합성값보다 무거운 3.776 kg의 위치를 몰라 기체 COM의 점질량으로 넣었다 → 관성은 +0.5–0.7 %만 늘었고, 밸러스트가
+  프레임 바깥에 있다면 실제로는 더 크다 [예측].
+  (b) **PID 이득**: `rov_gui/control/pid.py` `SIM_GAINS`(= sim `GAINS_HEAVY_GRIPPER`)와 pid_7d `rp_inertia`·`rp_k_ff`(1.35 = ZG·W at
+  13.7 kg)는 13.7 kg 설계 그대로다. 같은 이득에서 병진 ωn은 6–9 % 낮다 [유도: m_eff 19.2/26.4/28.3 → 23.0/30.2/32.1 kg].
+  (c) **배포된 RL 정책**(`rl_policies/*`, RL_PWM 계열)은 13.7 kg ±10 %(12.4–15.1 kg)로만 학습됐다 — 17.5 kg은 범위 밖
+  [유도: RL_controller configs/dr_presets.yaml mass_scale 0.9–1.1].
+  (d) RL legacy 평가 월드(`scripts/_pipeline_eval_pwm11.sh` `W[legacy]` cob_x −0.029 m)는 복원 팔이 0.039 m가 되어 13.9°에서 쉰다
+  (전 10.9°) [유도]. trim_pitch_deg로 정한 월드는 영향 없음.
+  (e) 측정 조건이 기록되지 않았다: 저울 분해능, 부력 측정 방법, 페그·테더·DVL 포함 여부.
+- **임시 대응**: PID와 RL 정책의 실기 동작은 그대로다. NMPC 계열은 실측 질량·부력으로 예측하므로 동작이 바뀐다(실기 0런).
+  run meta `plant.mass_kg`·`controller.heave_trim.model_net_buoyancy_n`이 기록 경계다.
+- **제대로 고치는 법**: (a) 자유 감쇠·펄스 시험으로 회전 관성을 식별하거나 밸러스트·폼 위치를 재서 composition에 항목으로 넣는다;
+  (b) 같은 극배치를 17.5 kg으로 재유도하고 수조 A/B; (c) mass_scale을 17.5 kg 중심으로 재학습; (d) legacy cob_x를 −0.0226으로;
+  (e) data 노트의 빈칸을 채운다.
+
 ### 풀장 CCTV 카메라(`--pool-cams` / `./c3 cctv`): 4대 실기 확인, **`--source hw` 스테이션 런·허브 연결은 미확인** (2026-10-01)
 - **확인된 것**: 재부팅 후 4대(`SPCA2650` 1 + `USB RGB Camera` 3)를 컨트롤러 `0000:13:00.0`의 PC 포트 1·2·9·10에 한 대씩
   꽂아 1080p30 동시 녹화 15 s — 4파일 `complete: true`, dropped 0, 29.5–30.1 fps; 녹화 중 카메라 프로세스+ffmpeg 0.87 코어,
@@ -3690,7 +3796,7 @@ AprilTag PnP → EAOB+acados NMPC → MANUAL_CONTROL 폐루프(`rov_gui/control/
   VFOV ±19.3° 밖으로 빠지고 ROV 턱(약 11.5°)은 보이는 비대칭이 생긴다 [유도].
 
 ---
-*마지막 갱신: 2026-10-29*
+*마지막 갱신: 2026-11-01*
 
 ### 정책+GUI 테스트를 한 pytest 프로세스로 길게 이어 돌리면 `pupil_apriltags`에서 멈춘다(힙 손상) — HEAD에서도 재현 (2026-10-03)
 - **증상**: `test_policy_*`·`test_plan_stream`·`test_replay` 묶음 뒤에 `test_control.py`를 같은 프로세스로 돌리면 `test_control` 초반

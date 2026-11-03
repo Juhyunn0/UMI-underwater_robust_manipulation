@@ -7,13 +7,14 @@ Contracts pinned down:
      parallel-axis build-up in compute_payload_inertia.py (no hand-tuned literals).
   2. HEAVY BASELINE UNTOUCHED — the thruster sites/actuators are byte-identical to
      bluerov_heavy.xml (same allocation), and the heavy XML itself is not modified.
-  3. BUOYANCY — net ~ -5.7 N (payload sinks, no trim foam): hydro numbers + an actual
-     free-sink rollout.
+  3. BUOYANCY — total mass and buoyancy equal the 2026-10-29 weighing (17.5 kg, 17.6 kgf
+     -> net +0.98 N, floats slightly): hydro numbers + an actual free-rise rollout.
+     (Before 2026-10-29: composed parts only, net ~ -5.7 N, sank.)
   4. GRIPPER — actuator named "gripper" at ctrl index 8 (invisible to the name-based
      thruster code), jaws open to the 62 mm spec and mirror each other, dynamics
      stable at dt=2 ms.
   5. CONTROL — allocation still rank 6 from the 8 thrusters; PID gains selected for
-     the variant; short station-keep run holds depth against the negative buoyancy.
+     the variant; short station-keep run holds the origin against the net buoyancy.
 """
 import os
 os.environ.setdefault("ROV_MODEL", "heavy_gripper")
@@ -93,18 +94,24 @@ def test_thrusters_identical_to_heavy():
           "actuators identical; heavy untouched")
 
 
-def test_buoyancy_sinks():
+def test_buoyancy_matches_the_weighing():
     m, d = _load()
     hy = H.Hydrodynamics(m).install()
-    net = hy.buoyancy - RM.MASS * H.G if hasattr(H, "G") else hy.buoyancy - RM.MASS * 9.81
-    assert -6.2 < net < -5.2, f"net buoyancy {net:.2f} N (expected ~ -5.7)"
-    # free release from rest, thrust 0 -> it must SINK
+    g = H.G if hasattr(H, "G") else 9.81
+    # the 2026-10-29 weighing: model mass and buoyancy ARE the measured ones
+    bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "base_link")
+    assert abs(float(m.body_subtreemass[bid]) - CP.M_MEASURED) < 1e-6
+    # the YAML stores the volume to 7 decimals (0.0176530 vs 17.6/997) -> ~2 ppm
+    assert abs(hy.buoyancy - CP.B_MEASURED_KGF * g) < 1e-5 * hy.buoyancy, hy.buoyancy
+    net = hy.buoyancy - RM.MASS * g
+    assert 0.5 < net < 1.5, f"net buoyancy {net:.2f} N (expected ~ +0.98, floats)"
+    # free release from rest, thrust 0 -> it must RISE (slowly: ~0.98 N on ~32 kg heave)
     for _ in range(int(2.0 / m.opt.timestep)):
         mujoco.mj_step(m, d)
     H.Hydrodynamics.uninstall()
-    assert d.qpos[2] < -0.05 and d.qvel[2] < 0, \
-        f"payload vehicle should sink (z={d.qpos[2]:.3f}, vz={d.qvel[2]:.3f})"
-    print(f"[ok] negative buoyancy: net {net:+.2f} N, sank to z={d.qpos[2]:.3f} m in 2 s")
+    assert d.qpos[2] > 0.01 and d.qvel[2] > 0, \
+        f"weighed vehicle should rise slowly (z={d.qpos[2]:.3f}, vz={d.qvel[2]:.3f})"
+    print(f"[ok] weighed buoyancy: net {net:+.2f} N, rose to z={d.qpos[2]:.3f} m in 2 s")
 
 
 def test_gripper_actuation():
@@ -141,15 +148,15 @@ def test_allocation_and_pid_hold():
         mujoco.mj_step(m, d)
     H.Hydrodynamics.uninstall()
     err = float(np.linalg.norm(d.qpos[:3]))
-    assert err < 0.08, f"PID failed to hold origin against -5.7 N (err {err:.3f} m)"
+    assert err < 0.08, f"PID failed to hold origin against the net buoyancy (err {err:.3f} m)"
     print(f"[ok] allocation rank 6 (8 thrusters); PID holds origin at {err*100:.1f} cm "
-          f"despite the sinking payload")
+          f"against the net buoyancy")
 
 
 if __name__ == "__main__":
     test_composition()
     test_thrusters_identical_to_heavy()
-    test_buoyancy_sinks()
+    test_buoyancy_matches_the_weighing()
     test_gripper_actuation()
     test_allocation_and_pid_hold()
     print("ALL HEAVY_GRIPPER TESTS PASSED")

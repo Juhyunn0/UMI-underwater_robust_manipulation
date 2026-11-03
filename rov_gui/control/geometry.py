@@ -1526,7 +1526,8 @@ class MpcConfig:
     w_hat_clip: tuple = (15.0, 45.0, 45.0, 5.0, 5.0, 8.0)
     # NET BUOYANCY OF THE VEHICLE ACTUALLY FLOWN, B - W in newtons (+ floats,
     # - sinks). The NMPC's plant (dobmpc/params.py NET_BUOYANCY: -5.71 N for
-    # heavy_gripper, a CAD/vendor composition never measured on this vehicle)
+    # heavy_gripper until 2026-10-29, a CAD/vendor composition never measured on
+    # this vehicle; +0.98 N since, from the weighed 17.5 kg / 17.6 kgf)
     # is baked into the generated solver, and the solver cancels ITS OWN
     # model's gravity with a constant up-force at zero depth error. On
     # 2026-09-07 the pool vehicle floated instead, so every mpc / mpc_tuned

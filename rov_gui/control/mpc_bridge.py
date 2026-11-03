@@ -237,9 +237,19 @@ def apply_plant_overrides(P, plant: dict) -> dict:
     return applied
 
 
+def _key_num(v):
+    """JSON-stable number(s) for the rebuild key; None when the params lack it."""
+    if v is None:
+        return None
+    if isinstance(v, (list, tuple)):
+        return None if any(x is None for x in v) else [float(x) for x in v]
+    return float(v)
+
+
 def _guard_stale_solver(P) -> None:
-    """The acados codegen cache is keyed only on (model, rti): N/dt/U_MAX or
-    DAMPING changes load a STALE .so under DOBMPC_ACADOS_BUILD=0. A meta
+    """The acados codegen cache is keyed only on (model, rti): N/dt/U_MAX,
+    DAMPING or MASS/INERTIA/VOLUME changes load a STALE .so under
+    DOBMPC_ACADOS_BUILD=0. A meta
     sidecar makes that combination loud: on mismatch the fast-load flag is
     dropped so the solver regenerates this once."""
     variant = f"{P.MODEL}_rti"
@@ -250,7 +260,12 @@ def _guard_stale_solver(P) -> None:
             # damping is IN the generated f_expl (mpc_acados._build_model),
             # so a plant: override that is not in this key would be silently
             # dropped by a cached build
-            "dl": [float(v) for v in P.DL], "dnl": [float(v) for v in P.DNL]}
+            "dl": [float(v) for v in P.DL], "dnl": [float(v) for v in P.DNL],
+            # so are mass, inertia and volume (M^-1, C_RB, g(eta)) — 2026-10-29
+            # the heavy_gripper registry took the weighed 17.5 kg / 17.6 kgf
+            "mass": _key_num(getattr(P, "MASS", None)),
+            "inertia": _key_num([getattr(P, k, None) for k in ("IX", "IY", "IZ")]),
+            "volume": _key_num(getattr(P, "VOLUME", None))}
     if os.environ.get("DOBMPC_ACADOS_BUILD") == "0":
         have = None
         if meta_p.exists():
@@ -301,7 +316,8 @@ class HwDobMpc:
         vertical force is ``w_z + (W - B)_model``; matching the real one,
         ``(W - B)_real``, needs ``w_z = (W - B)_real - (W - B)_model``
         ``= (B - W)_model - (B - W)_real``. A neutral vehicle on the -5.71 N
-        heavy_gripper plant therefore gets w_z = -5.71 N.
+        composed heavy_gripper plant (before 2026-10-29) got w_z = -5.71 N; on
+        the weighed plant (+0.98 N since 2026-10-29) it gets w_z = +0.98 N.
 
         LEVEL APPROXIMATION: the exact correction rotates with attitude,
         ``delta * [sin(theta), -cos(theta) sin(phi), -cos(theta) cos(phi), 0, 0, 0]``;
@@ -375,7 +391,8 @@ class HwDobMpc:
                 "the previous wrench; 3 in a row disengage")
         self.w_clip = np.asarray(mpc_cfg.w_hat_clip, float)
         # HEAVE TRIM (2026-09-07). The plant this solver was generated with
-        # sinks at P.NET_BUOYANCY (B - W = -5.71 N for heavy_gripper); the
+        # has its own B - W = P.NET_BUOYANCY (heavy_gripper: -5.71 N composed
+        # until 2026-10-29, +0.98 N from the 2026-10-29 weighing since); the
         # vehicle in the pool does not (mpc_cfg.vehicle_net_buoyancy_n, B - W of the
         # real vehicle, default 0). A nominal NMPC cancels its own model's
         # gravity, so the mismatch was a constant wrong-signed 5.7 N

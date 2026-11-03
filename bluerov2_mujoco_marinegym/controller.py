@@ -85,8 +85,12 @@ GAINS_HEAVY = dict(
 #   sway  m_eff = 13.724+12.7  = 26.42 kg -> kp=143.7 kd=99.5  ki=42.3 (isotropic hor.)
 #   heave m_eff = 13.724+14.57 = 28.29 kg -> kp=153.9 kd=108.0 ki=45.3
 #   yaw   I_eff = 0.6906+0.12  = 0.811    -> kp=9.92  kd=4.79  ki=4.38
-# The static -5.7 N net buoyancy (payload sinks) is carried by the buoyancy_ff term
-# in compute(), not by these gains.
+# The static net buoyancy is carried by the buoyancy_ff term in compute(), not by these
+# gains (-5.7 N when this was designed; +0.98 N since the 2026-10-29 weighing).
+# 2026-10-29: the plant now weighs 17.5 kg (measured), so m_eff is 23.0 / 30.2 / 32.1 kg
+# (surge / sway / heave) [유도]. These gains were NOT re-derived: at the same gains the
+# translational ωn is ~6-9 % lower than the 2.0 design point [유도]; the hardware PID
+# (rov_gui/control/pid.py SIM_GAINS) copies them, so a re-derivation changes flown gains.
 GAINS_HEAVY_GRIPPER = dict(
     kp=(143.7, 143.7, 153.9),   # surge, sway, heave  [N/m]
     kd=(99.5, 99.5, 108.0),     #                     [N·s/m]

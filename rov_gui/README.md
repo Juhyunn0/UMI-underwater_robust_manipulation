@@ -1730,7 +1730,8 @@ SENSORS는 3열 SYSTEM HEALTH 아래에 **나란히** 들어간다(세로로 쌓
   강제; `SERVO1..8` 은 Motor1..8 그대로 — RCIN passthrough 는 ARM/failsafe 를 우회해 **폐기**, RL_controller README §10.3; station 의 예약된
   `rc_override`(ch 1..6 조종축)와는 다른 것); `meta()["action_mode"]` 가 런 meta 에 남는다.
 * **RL_PWM 모드 (2026-09-30, 실기 미검증)**: LOW 콤보 `RL_PWM`(키 `rl_pwm`, `--mpc-mode rl_pwm`, `hw_mpc.yaml: rl_pwm:`). 추진기
-  8개에 펄스를 직접 내는 RL 정책(`action_mode: pwm`, 기본 `rl_policies/pwm10_s1`)을 station에서 난다 — ArduSub 믹서를
+  8개에 펄스를 직접 내는 RL 정책(`action_mode: pwm`, 당시 기본 `rl_policies/pwm10_s1` — 2026-10-10부터 비행 금지; 고르는 법은
+  아래 'RL 정책 고르기')을 station에서 난다 — ArduSub 믹서를
   **우회**한다. 관측·기준 궤적 API는 `RL`과 같고(`rl_policy.py` `HwRlPwm(HwRl)`, 관측 116 = 29×4) 출력만 다르다: 제어기는
   `info["pwm_us"]`에 펄스 8개를 싣고, 워커는 그것을 `bus.cmd_pwm`(`state.PwmCommand`)으로 보내며 MANUAL_CONTROL은 **중립**으로
   보낸다. sink(`backends/hardware.py`)는 RC_CHANNELS_OVERRIDE 채널 9..16에 펄스를 싣고(1..8·17·18은 65535 = 그대로), 기체의 Lua
@@ -1753,6 +1754,7 @@ SENSORS는 3열 SYSTEM HEALTH 아래에 **나란히** 들어간다(세로로 쌓
   **출력 상한** `rl_pwm.pwm_cap` — 첫 입수값은 0.25(1400..1600 µs)였고 그 런이 포화·한계진동해서
   (`data/20261001/1001_172910`) 2026-10-01 운용자 결정으로 **1.0**(학습값) — 제어기와 sink 가 각각 건다. 이 값은 **pwm 전송의
   유일한 상한**이라 `rl_pwm_7d`도 같은 키를 읽는다(2026-10-03). 상한 뒤의 펄스가 다음 관측의 "직전 명령"으로 되먹는다.
+  **2026-11-02**: 실행 중에는 LOW 줄 `cap ▾`로 바꾼다(세션 한정, 아래 'cap 바꾸기').
   **2026-10-10**: 상한은 추진기별 클립이 아니라 **추력 공간의 단일 배율**이다(`rl_pwm.pwm_cap_mode: scale`,
   `rov_gui/control/rl_pwm.py scale_throttles` — 할당 방향 유지, 가장 큰 |throttle| 이 정확히 cap; `clip` 은 A/B 용). 캡을 넘는
   펄스는 어디서도 클립되지 않고 거부된다(추종자 중립 + n_fail, sink 거부 + 래치). `pwm_cap` 이 export 의 학습 캡보다 낮으면
@@ -1983,6 +1985,149 @@ python -m rov_gui.tools.mpc_tune diff A B
 mpc_tuned가 **날지 않은 값**이라서다.
 테스트: `python -m pytest -q rov_gui/tests/test_mpc_tune.py`.
 
+### RL 정책 고르기 — LOW 줄의 `policy … 이름 상태` (2026-11-01, 실기 미검증)
+
+RL LOW 4종(`RL`·`RL_PWM`·`RL_7D`·`RL_PWM_7D`)이 어떤 export로 날지 정하려면 그동안 GUI를 켜기 **전에** hw_mpc.yaml
+`<low>.policy_dir`를 고쳐야 했다. 이제 LOW가 RL 계열이면 LOW 줄에 `policy … 이름 상태`가 뜨고, `…`로 목록을 열어
+**실행 중에** 바꾼다(운용자 요청 2026-11-01). 방식은 MPC_Tuned 프로필 줄과 같다.
+
+* **목록에 나오는 곳**: 두 폴더를 함께 읽는다. 대화상자를 열 때마다 다시 읽으므로 동기화한 뒤 재기동할 필요가 없다.
+  * `rov_gui/control/rl_policies/`: where = `station`. git이 추적하고, 지금까지 손으로 복사해 넣던 곳이다.
+  * `data/rl_policies/`: where = `library`. git이 무시하고, 아래 `./c3 rl-policies sync`가 채운다.
+  * `obs_spec.json`과 `policy_weights.npz`의 내용이 같으면 한 줄로 합치고 station 쪽을 보여 준다.
+* **대화상자**:
+  * 열: 이름·학습 시각(런 폴더 스탬프)·DR preset·학습 cap·iteration·속도 출처(`DVL blend`/`tag fd`)·where·id(내용 해시 12자리).
+  * `●`는 워커가 지금 쥐고 있는 export다.
+  * 위의 `Slot` 콤보로 **다른 RL LOW의 칸**도 고칠 수 있다. 기동 때 빌드가 실패해 LOW 콤보로 고를 수 없는 칸을 살릴 때 쓴다.
+  * 그 LOW가 받지 않는 export, 비행 금지 export, 학습이 50 iteration 미만인 smoke 길이 export는 기본으로 숨긴다.
+    `show refused / no-fly`를 켜면 보이지만(맞지 않는 것은 회색, 비행 금지·읽기 실패는 빨강) 고를 수는 없고, 거부 이유는
+    아래 줄에 나온다. smoke export를 손으로 복사해 넣어도 마찬가지다.
+  * Esc는 다른 대화상자와 같이 E-STOP이다. 단, 대화상자가 열리는 중(포커스를 잡기 전)에 누른 Esc는 Qt가 버리므로 한 번 더 누른다.
+* **고르면 워커가 그 LOW의 추종기를 그 export로 새로 빌드한다.** 기동 때와 같은 생성자를 쓰므로 빌드 게이트가 전부 다시 돈다:
+  action mode·레이아웃·velocity_source·obs_guard·적분 관측·자세 envelope·`rl_pwm.pwm_cap` 대 학습 cap.
+  실패하면 **이전 것을 그대로 쥐고** 이유를 6 초간 빨간색으로 보인다.
+* **거부되는 경우**:
+  * READY 전, 교전 중(LOW None observe 포함), REC CSV가 열린 동안(한 런 = 한 정책).
+  * export 폴더가 아님, 읽는 도중 파일이 바뀜.
+  * **비행 금지** export: `pwm10_s1`·`pwm10_s2`·`att7pwm_s*`(RL_controller README §13.8). 이름, 가중치 해시, 학습 런으로 판별한다.
+  * 빌드 게이트 실패.
+  * (pwm LOW만) **추진기 sink 게이트와 불일치**. sink(`backends/hardware.py`)의 게이트는 기동 때 hw_mpc.yaml
+    `rl_pwm.policy_dir`의 export로 **한 번** 만들어지고 런타임에 다시 만들지 않는다. 그래서 그 export와 motor_direction·sigma·
+    유효 cap(`min(rl_pwm.pwm_cap, 학습 cap)`)이 다른 export는 고를 때 거부된다(2026-11-02부터 cap은 아래 `cap ▾`로 바꿀 수 있고
+    sink 창도 함께 바뀐다). 교전할 때와 교전 중 매 틱에도 같은 비교를 한다
+    (이번에 sigma 비교를 추가했다). sink가 틱에 실패해 게이트 사실이 없는 동안에는 sink 자신의 이유로 거부한다.
+* **세션 한정**: 재기동하면 다시 hw_mpc.yaml `<low>.policy_dir`로 난다(MPC_Tuned 프로필·DP ckpt와 같은 규칙). YAML은 고치지 않는다.
+* **상태 표시**:
+  * `OK`
+  * `WARN`: 학습 cap보다 낮은 cap으로 난다(그 LOW의 `allow_caps_below_trained`).
+  * `NO-FLY`(빨강): hw_mpc.yaml이 비행 금지 export를 가리킨다. 기동 줄이 미션 로그 패널에도 뜬다. 피커에서는 고를 수 없지만
+    **교전은 막지 않는다**. 막을지는 운용자가 정한다.
+  * `ERROR: …`: 그 LOW의 추종기가 없다(기동 빌드 실패).
+  * 거부 사유(6 초).
+  * DP 예보의 "`RL_PWM_7D` tracks" 힌트는 ERROR이거나 비행 금지 export를 쥔 칸을 가리키지 않는다.
+* **지금 설정에서 주의할 점** [유도: hw_mpc.yaml `rl_pwm.pwm_cap 0.25`·`allow_caps_below_trained` + 각 export의 학습 cap]:
+  * LOW `RL_PWM`은 `allow_caps_below_trained: false`라서 cap 0.25에서는 학습 cap이 0.5/1.0인 export를 **전부 거부**한다. cap
+    규칙이며 피커 고장이 아니다. 기동 기본값 `pwm11k0.2_s0`(학습 cap 0.5)도 같은 이유로 빌드되지 않아 `RL_PWM` 칸은 `ERROR`로
+    시작한다. 0.25에서 고를 수 있는 것은 학습 cap이 0.25인 export(2026-11-02 라이브러리 기준 `pwm11att12Q_s*`·
+    `pwm11att13Q_s*`; `./c3 rl-policies list --low rl_pwm`의 CAP 열)뿐이다. 학습 0.5짜리로 날리려면 `RL_PWM_7D` 줄의 `cap ▾`를
+    0.5로 올린다. 그러면 `RL_PWM` 칸이 살아난다(아래 'cap 바꾸기').
+  * `RL_PWM_7D`는 `allow_caps_below_trained: true`라서 `WARN`으로 난다.
+  * `RL_7D`에 맞는 export는 smoke 런뿐이라(동기화가 건너뜀) 목록이 비어 있다.
+* **기록**:
+  * run meta `controller.rl_policy` = {low, name, path, rel, obs_sha1, npz_sha1, id, source(`hw_mpc.yaml`|`panel`), at}.
+    pwm LOW면 `sink_gate`(sink가 게이트를 만든 export와 id)도 남긴다.
+  * REC NAV·REC UI가 도는 중에 고르면 그 폴더의 `controller.json`을 고른 뒤 상태로 다시 쓴다.
+  * 고른 사실은 다음 런 폴더의 events.log에 `RL policy <LOW> ← <이름> (panel pick, id …)`로 남는다. 미션 패널에는 보이지 않고
+    (LOW 줄이 보여 준다) 거부만 보인다.
+  * 이름만으로는 같은 이름의 다른 export를 가를 수 없으므로 **id(내용 해시)가 기준**이다.
+
+#### cap 바꾸기 — LOW 줄의 `cap ▾` (2026-11-02, 실기 미검증)
+
+`./c3 gui --source hw --allow-command --mpc …`로 띄운 스테이션에서 LOW를 `RL_PWM`이나 `RL_PWM_7D`로 고르면
+`policy …` 바로 오른쪽(정책 이름·상태 앞)에 `cap ▾`가 뜬다. 값은 hw_mpc.yaml `rl_pwm.pwm_cap`(pwm 전송의 유일한 |throttle| 상한)이다.
+그동안은 GUI를 켜기 전에 YAML을 고쳐야 했다(운용자 요청 2026-11-02, "그리고 캡도"). `--mpc`만 있으면 되고
+`--policy`·`--fstereo…`·`--dvl_pose`·`--dvl-trust`·`--policy-dr` 같은 다른 플래그와는 상관없다.
+
+* **두 LOW가 같이 쓴다**: `RL_PWM`과 `RL_PWM_7D`는 같은 `rl_pwm.pwm_cap`을 읽고, 추진기 sink도 이 값으로 창을 건다.
+  한쪽 줄에서 바꾸면 다른 쪽도 바뀐다.
+* **고를 수 있는 값**: 0.10–0.50(0.05 간격)과 0.60–1.00(0.1 간격) 가운데 **sink 천장 이하**만 보인다. 천장은 sink 게이트를
+  만든 export(기동 때 `rl_pwm.policy_dir`, 지금 `pwm11k0.2_s0`)의 학습 cap이다. 그래서 지금 설정에서는 0.10–0.50이다
+  [유도: 그 export의 obs_spec.json `output.pwm_model.pwm_cap_trained` 0.5]. `--source demo`에는 sink가 없어 1.00까지 보인다.
+* **바꾸면** 워커가 두 pwm 추종기를 새 cap으로 **기동 때와 같은 생성자로 다시 빌드**한다. 학습 cap 대비, 그 LOW의
+  `allow_caps_below_trained`, heave 트림 cap 예산 같은 빌드 게이트가 전부 다시 돈다.
+  * 지금 고른 LOW(그리고 날고 있는 LOW)가 새 cap으로 빌드되지 않으면 **거부**하고 아무것도 바꾸지 않는다.
+  * 다른 pwm LOW는 "이 cap으로 기동했을 때"와 같아진다. 빌드되면 새것으로 바뀌고, 안 되면 `ERROR`가 된다. 예를 들어
+    `RL_PWM_7D` 줄에서 0.5로 올리면 기동 때 `ERROR`였던 `RL_PWM`(`pwm11k0.2_s0`, 학습 0.5)이 살아나 LOW 콤보에서 고를 수 있게
+    되고, 다시 0.25로 내리면 `ERROR`로 돌아간다.
+  * 새 sink 창 `min(cap, sink export의 학습 cap)`으로 날 수 없는 추종기, 즉 학습 cap이 새 창보다 낮은 추종기는 쓰지 않는다.
+    고른 LOW면 거부하고, 다른 LOW면 `ERROR`로 둔다(교전 때 어차피 거부될 것을 `OK`로 보이지 않게).
+  * **네트워크는 바꾸지 않는다.** export 파일이 불러온 뒤에 바뀌었거나(내용 해시가 다름) 기동 때 해시하지 못한 추종기는
+    다시 빌드하지 않는다. 고른 LOW면 거부, 다른 LOW면 `ERROR`다. 새 파일로 날리려면 `…`로 다시 고른다.
+  * 그다음 sink의 창이 바뀐다. 창 밖 펄스는 지금처럼 클립하지 않고 거부·래치한다. sink도 교전이 열려 있거나 래치가 걸린
+    동안의 변경은 스스로 거부한다.
+* **거부되는 경우**: READY 전, 교전 중(콤보가 회색), REC CSV가 열린 동안(한 런 = 한 cap), sink 천장 초과, 그리고 위의
+  빌드·창·파일 조건. 거부되면 LOW 줄에 `cap refused: …`가 6 초간 빨갛게 뜨고(전체 문장은 툴팁) 미션 로그 패널에도 줄이
+  뜬다. 콤보는 워커가 쥔 값으로 돌아간다.
+* **cap별로 고를 수 있는 export** [유도: 위 규칙 + 각 export의 학습 cap; sink export 학습 0.5 기준]:
+
+  | cap | `RL_PWM` (`allow_caps_below_trained: false`) | `RL_PWM_7D` (`allow_caps_below_trained: true`) |
+  |---|---|---|
+  | 0.25 | 학습 0.25인 것만 | 학습 0.5인 것은 0.25로 난다(`WARN`). 학습 0.25인 것은 그대로 |
+  | 0.5 | 학습 0.5인 것만 | 학습 0.5인 것만(학습 0.25인 것은 sink 창 0.5와 달라 거부) |
+
+  대화상자(`…`)도 지금 cap으로 판정하고, 개수 줄 끝에 ` · cap 0.25`를 붙인다.
+* **바꾼 직후의 START**: sink가 새 창을 보고하기 전(sink 한 틱 + 텔레메트리 한 번)에 누른 START는 "the thruster sink has
+  not confirmed the new cap … yet — try again in a moment"로 거부된다. 다시 누르면 된다. sink가 변경을 거부했다면(이유는
+  sink의 `transport cap NOT changed` 줄) "the sink has not applied that cap"으로 거부된다. 그때는 다른 cap으로 갔다 돌아오거나
+  재기동한다.
+* **세션 한정**: 재기동하면 다시 hw_mpc.yaml `rl_pwm.pwm_cap`(지금 0.25)로 난다. YAML은 고치지 않는다.
+* **표시**:
+  * 콤보는 워커가 쥔 값만 보인다. 툴팁에는 지금 cap, sink 창, 이 LOW가 실제로 나는 cap(학습 cap)이 나온다.
+  * 마우스 휠로는 바뀌지 않는다. 목록이 열린 동안 Esc는 다른 콤보처럼 E-STOP이다.
+  * `…`와 `cap ▾`는 정책 이름·상태 문구보다 **앞에** 있어서, 문구 길이와 상관없이 자리가 고정이다. 문구에 따라 움직이는
+    것은 START의 왼쪽 끝뿐이다. 거부 문구(6 초)가 사라질 때 START가 `…`나 `cap ▾`를 누르려던 자리로 오지 않게 하려는
+    배치다(`test_rl_pwm_cap_panel.py` `test_the_low_row_controls_never_move_with_the_policy_texts`). 단, 상태 문구 위에
+    마우스를 올려 둔 채 긴 문구가 사라지면 그 자리가 START가 될 수 있다. 정책 세션의 START에는 hold가 없다.
+* **안 보일 때**: 두 pwm LOW가 모두 기동 때 빌드에 실패하면 LOW 콤보로 고를 수 없어 `cap ▾`도 보이지 않는다. 그때는
+  hw_mpc.yaml을 고쳐 재기동한다. 한쪽만 실패했다면, 그 LOW를 고를 때의 거부 문구와 그 칸의 `ERROR` 툴팁이 "the cap ▾ on
+  the <LOW> row sets rl_pwm.pwm_cap for this session"으로 갈 수 있는 줄을 알려 준다.
+* **기록**:
+  * run meta `controller.pwm_cap_origin` = {source(`hw_mpc.yaml`|`panel`), at, cap}. 추종기 자신의 `pwm_cap_source`
+    문자열은 그대로 남는다.
+  * `controller.rl_policy.sink_gate.pwm_cap`. sink가 바뀐 창을 보고하기 전에 쓴 meta에는 `pwm_cap_stale: true`가 붙는다.
+  * 바꾼 사실은 다음 런 폴더의 events.log에 `RL_PWM cap 0.25 → 0.5 (panel; …)`로 남는다. 미션 패널에는 거부만 보인다.
+* **테스트**: `rov_gui/tests/test_rl_pwm_cap.py`(워커·sink), `test_rl_pwm_cap_panel.py`(패널).
+* **실제 앱 확인(demo 소스)**: 위 운용자 명령에서 `--source hw --allow-command`만 `--source demo`로 바꿔 띄우고 피커 →
+  `cap` 0.5 → `RL_PWM` 부활 → `RL_PWM` 줄 0.25 거부 → `RL_PWM_7D` 줄 0.25 → `RL_PWM` 선택 거부(cap ▾ 힌트)까지 화면대로
+  동작했다 [측정: `data/20261102/1102_124935_rlcap_gui_demo_offline/README.md`, 스크린샷·`live_result.json`]. 실기 0런.
+
+```bash
+./c3 rl-policies sync --dry-run   # RL_controller → data/rl_policies: 무엇을 가져오고 무엇을 왜 건너뛰는지만 출력
+./c3 rl-policies sync             # 실제 복사 (RL_controller는 읽기만)
+./c3 rl-policies list             # 두 폴더의 export (어느 LOW에 맞는지·cap·preset·id)
+./c3 rl-policies list --low rl_pwm_7d   # 그 LOW의 목록 = 대화상자에 나오는 것
+./c3 rl-policies list --all       # 비행 금지·맞는 LOW 없음·smoke 길이·읽기 실패까지 이유와 함께
+```
+
+**동기화 규칙** (`rov_gui/tools/rl_policy_library.py`):
+
+* **원본**: `RL_controller/logs/rsl_rl/rov_posehold/<스탬프>_<태그>/exported/`와 `RL_controller/Policies/<이름>/`.
+  `--rl-root` 또는 `RL_CONTROLLER_ROOT`로 바꿀 수 있다. 이름은 런 태그다.
+* **건너뛰는 것**:
+  * smoke 런, 이름 없는 런, `_`나 `.`로 시작하는 폴더.
+  * export가 없거나 파일이 빠진 것, obs_spec/npz를 읽지 못하는 것, 차원 불일치, 비유한 가중치.
+  * `rsl_rl_iteration` < 50.
+  * **120 s 안에 바뀐 파일**(아직 쓰는 중).
+  * 런 폴더 export 중 `obs_spec.json`이 `policy_weights.npz`보다 오래된 것: 중단됐거나 다시 export하는 중이다(exporter는
+    obs_spec.json을 마지막에 쓴다).
+* **이름 충돌**: 같은 이름에 내용이 다르면 `<태그>@<YYYYMMDD-HHMMSS>`(런 스탬프)로 들어간다(예: 같은 태그로 다시 돌린 학습).
+  같은 내용이 그 이름 계열(`<태그>`, `<태그>@*`) 어디에든 이미 있으면 "up to date"다. **덮어쓰기·삭제는 하지 않는다.**
+* **가져온 폴더**: 각 폴더에 출처 `LIBRARY.json`(원본 경로·런·스탬프·파일별 sha1·iteration·checkpoint)을 쓰고, 파일은 읽기
+  전용(0444)으로 둔다.
+* **대상 폴더**: `--dst`는 repo의 `data/` 아래여야 한다. station 폴더나 RL_controller 안은 심볼릭 링크를 거쳐도 거부한다.
+* **실행 형태**: `./c3 rl-policies`는 경로 형태로 실행된다. `python -m rov_gui…` 형태로 실행하면 GPU guard가 학습을 SIGSTOP한다.
+* **테스트**: `rov_gui/tests/test_rl_library.py`, `test_rl_policy_pick.py`, `test_rl_policy_dialog.py`, `test_rl_policy_library.py`.
+
 ### 기체가 실제로 낸 추력 — 스러스터별 PWM (schema 14, 2026-09-08)
 
 런 CSV의 왼쪽 절반은 **스테이션이 요청한 것**(`uX..uN`, `ax_*`)이고, 기체가 **실제로 한
@@ -2121,7 +2266,7 @@ station에서는 settle을 건너뛰면서 leash가 일찍 풀리므로 그 구�
 
 **증상**: 외란 한 방에 카메라가 태그를 놓치면 약 1.1 s 뒤(`tag_stale_s` 0.7 +
 `tag_stale_hold_s` 0.4) 루프가 **disengage**한다. 들리는 것보다 나쁘다 — 같이
-**깊이 유지도 꺼지고**, 이 기체는 중립이 아니라(모델은 −5.7 N 침강, 2026-09-07 실기는 떠올랐다 — `vehicle_net_buoyancy_n`) 그날의 트림대로 흘러가기 시작한다. 자세와
+**깊이 유지도 꺼지고**, 이 기체는 중립이 아니라(모델은 2026-10-29까지 −5.7 N 침강, 이후 실측 +0.98 N; 2026-09-07 실기는 떠올랐다 — `vehicle_net_buoyancy_n`) 그날의 트림대로 흘러가기 시작한다. 자세와
 시야가 바뀌니 재획득 확률은 오히려 **떨어진다**. 그리고 조종사는 다시 ARM해야 한다.
 
 **`imu_dr`를 켜도 안 풀린다**, 그게 핵심이다. `MpcWorker._runtime_fault`가 먹는
@@ -2278,7 +2423,7 @@ dyaw  = wrap_pi(yaw_veh_map - yaw_obj)
 잡는다.**
 
 **disengage가 아니라 강등**인 이유는 `station_bridge.py`가 이미 길게 논증했다 —
-disengage는 중립이 아닌 기체(모델 −5.7 N, 실기는 날마다 다름)의 깊이 유지를 같이 끄고, 흘러가는 기체는 시야가 바뀌어
+disengage는 중립이 아닌 기체(모델 −5.7 N, 2026-10-29부터 실측 +0.98 N; 실기는 날마다 다름)의 깊이 유지를 같이 끄고, 흘러가는 기체는 시야가 바뀌어
 재획득 확률이 **떨어진다**.
 
 **태그를 놓치면 먼저 강등, 그 다음 bridge.** 세 가지 이유: (1) bridge의 전제가
@@ -4291,7 +4436,7 @@ p(= w)에 넣는다(런타임 입력, 재빌드 없음, 관측기 아님; **mpc/
 추정하므로 미적용, `reset()`은 설정 상수라 지우지 않음). 기록 경계는 meta `controller.heave_trim`(없는 런 =
 −5.7 N 상향 FF를 날린 런); CSV `w0..w5`는 EAOB 열 그대로. 모델 플랜트 예측: 중립 기체 hold에서 무보정
 +12.2 cm 위 정지 → 보정 0.00 cm [예측: `rov_gui/tests/test_path_cost.py::test_a_neutral_vehicle_holds_depth_only_with_the_trim`,
-데드밴드 없는 플랜트]. 상수라 하루 ±8 N 움직이는 실기 부력은 못 따라가므로 세션마다 값을 재고(PID depth
+데드밴드 없는 플랜트; 2026-10-29 이전 모델(−5.71 N) 기준; 무게 측정 뒤 모델(+0.98 N)에서 같은 테스트는 무보정 −2.2 cm(아래), 보정 +0.00 cm]. 상수라 하루 ±8 N 움직이는 실기 부력은 못 따라가므로 세션마다 값을 재고(PID depth
 hold의 정상 `uZ`가 데드밴드 밖이면 그 값), 데드밴드 안의 잔여 오차 ~0.1 m는 `policy.q_scale`로만 줄어든다
 [유도]. 같은 런의 `hold_tail: track` 1차 A/B: uX p50 0.4–0.6 → 2.5–3.6 N이지만 아직 데드밴드 아래
 (>0.096 틱 0–2 %) → 다음 레버 `q_scale` 2–3. **실기 미검증**. 테스트: test_path_cost 21/21.

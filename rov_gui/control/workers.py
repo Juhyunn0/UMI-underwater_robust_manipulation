@@ -713,6 +713,18 @@ class TagNavWorker(TimerWorker):
 #: must not be able to pass for.
 OBSERVE_SOLVER_STATUS = -1
 
+#: The LOW row's cap ▾ (2026-11-02, operator request "캡도" — change the pwm
+#: transport cap rl_pwm.pwm_cap in the running GUI, as the RL policy): the
+#: values MpcStatus.rl_pwm_cap["choices"] offers, ascending — cut at the
+#: thruster sink's export's trained cap when a fresh gate snapshot says it,
+#: and the cap in force always added (MpcWorker._rl_pwm_cap_choices). A
+#: MENU, not the rule: set_rl_pwm_cap takes any number in (0, 1]; what
+#: judges a value is every pwm follower's own build (cap vs trained cap and
+#: the LOW's allow_caps_below_trained, the heave-trim cap budget) and the
+#: sink, which enforces min(cap, its export's trained cap).
+RL_PWM_CAP_CHOICES = (0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50,
+                      0.60, 0.70, 0.80, 0.90, 1.00)
+
 
 def _dvp_key(text: str) -> str:
     """A DVL-pose fault / warning minus its numbers: what the mission log
@@ -1251,6 +1263,35 @@ class MpcWorker(TimerWorker):
         self._tune_error = ""
         self._tune_note = ""
         self._tune_note_t = 0.0
+        # RL POLICY per RL LOW (2026-11-01, control/rl_library.py; operator
+        # request: pick the RL export on the LOW row instead of editing
+        # hw_mpc.yaml before launch). The four followers are built in setup()
+        # and swapped only by set_rl_policy (_RL_SLOTS). `_rl_prov[low]` says
+        # WHICH export the slot holds — both content sha1s, the id, where it
+        # came from (hw_mpc.yaml | panel) — for the run meta (controller.
+        # rl_policy) and MpcStatus.rl_policy; `_rl_prov_obj[low]` is the
+        # follower object that record describes (a follower installed any
+        # other way — tests do — never borrows another object's hashes);
+        # `_rl_pick_note[low]` = (why, stamp) of the last refused pick, shown
+        # ~6 s like `_tune_note`.
+        self._rl_prov: dict = {}
+        self._rl_prov_obj: dict = {}
+        self._rl_pick_note: dict = {}
+        # THE PWM TRANSPORT CAP at runtime (2026-11-02, set_rl_pwm_cap; the
+        # LOW row's cap ▾). The cap itself lives where every pwm follower and
+        # the meta already read it — the live cfg.rl_pwm["pwm_cap"] — so
+        # nothing here can disagree with what was built. `_pwm_cap_src` =
+        # (who set it, ISO wall time | None): ("hw_mpc.yaml", None) until a
+        # panel change commits. `_rl_pwm_cap_note` = (why, stamp) of the last
+        # REFUSED change, shown ~RL_PICK_NOTE_S like `_rl_pick_note` (NOT
+        # `_rl_cap_note`: that name is the staticmethod that words a
+        # follower's below-trained WARN, which the panel parses).
+        self._pwm_cap_src: tuple = ("hw_mpc.yaml", None)
+        self._rl_pwm_cap_note = None
+        # (cap, now()) of the last COMMITTED change, None before one: a sink
+        # snapshot stamped earlier predates it (review hwsafe-2 / worker-3 —
+        # the sink re-windows on its own thread; _sink_cap_unconfirmed).
+        self._pwm_cap_commit = None
         self.asm: StateAssembler | None = None
         # IMU dead reckoning, built in setup() only when it is enabled. None
         # is the off state and every call site checks it, so a build with the
@@ -1699,10 +1740,19 @@ class MpcWorker(TimerWorker):
             self._log("warn", f"ctrl: PID_7D unavailable ({self._pid7d_error}) — pid_7d mode will refuse")
         # RL follower (2026-09-21): numpy-only, built up front like the PID; a missing/mismatched policy file only
         # costs the ``rl`` mode (set_mode refuses it with the error), never the session.
+        # 2026-11-01 (RL policy picker): each of the four RL builds below is also HASHED — the export dir the class
+        # reads, before and after the build (_rl_launch_read / _rl_launch_prov): files that changed in between fail
+        # that build like any other export defect, and a good build records WHICH bytes it holds (`_rl_prov`, one
+        # file-only line). `_rl_error` is now None up front like the other three (it used to exist only after a
+        # failure; every reader already used getattr with a None default).
         self._rl = None
+        self._rl_error = None
+        _pre = self._rl_launch_read("rl")
         try:
             from .rl_policy import HwRl
-            self._rl = HwRl(self.cfg, log=lambda m: self._log("info", m))
+            _obj = HwRl(self.cfg, log=lambda m: self._log("info", m))
+            self._rl_launch_prov("rl", _obj, _pre)
+            self._rl = _obj
         except Exception as e:                                   # noqa: BLE001
             self._rl_error = f"{type(e).__name__}: {e}"
             self._log("warn", f"ctrl: RL controller unavailable ({self._rl_error}) — rl mode will refuse")
@@ -1710,9 +1760,12 @@ class MpcWorker(TimerWorker):
         # shipped config this build fails with that sentence and only the rl_7d mode refuses.
         self._rl7d = None
         self._rl7d_error = None
+        _pre = self._rl_launch_read("rl_7d")
         try:
             from .rl_policy import HwRl7d
-            self._rl7d = HwRl7d(self.cfg, log=lambda m: self._log("info", m))
+            _obj = HwRl7d(self.cfg, log=lambda m: self._log("info", m))
+            self._rl_launch_prov("rl_7d", _obj, _pre)
+            self._rl7d = _obj
         except Exception as e:                                   # noqa: BLE001
             self._rl7d_error = f"{type(e).__name__}: {e}"
             # (2026-10-16: an export refused for what it was trained on — rl_policy.ExportRefused — is a warning)
@@ -1724,9 +1777,12 @@ class MpcWorker(TimerWorker):
         self._rl_pwm = None
         self._rl_pwm_error = None
         self._pwm_gate_bad_since = None
+        _pre = self._rl_launch_read("rl_pwm")
         try:
             from .rl_policy import HwRlPwm
-            self._rl_pwm = HwRlPwm(self.cfg, log=lambda m: self._log("info", m))
+            _obj = HwRlPwm(self.cfg, log=lambda m: self._log("info", m))
+            self._rl_launch_prov("rl_pwm", _obj, _pre)
+            self._rl_pwm = _obj
         except Exception as e:                                   # noqa: BLE001
             self._rl_pwm_error = f"{type(e).__name__}: {e}"
             self._log("warn" if getattr(e, "export_refused", False) else "info",
@@ -1735,9 +1791,12 @@ class MpcWorker(TimerWorker):
         # (rl_pwm.pwm_cap) as rl_pwm; a missing or level-trained export only costs this mode.
         self._rl_pwm7d = None
         self._rl_pwm7d_error = None
+        _pre = self._rl_launch_read("rl_pwm_7d")
         try:
             from .rl_policy import HwRlPwm7d
-            self._rl_pwm7d = HwRlPwm7d(self.cfg, log=lambda m: self._log("info", m))
+            _obj = HwRlPwm7d(self.cfg, log=lambda m: self._log("info", m))
+            self._rl_launch_prov("rl_pwm_7d", _obj, _pre)
+            self._rl_pwm7d = _obj
         except Exception as e:                                   # noqa: BLE001
             self._rl_pwm7d_error = f"{type(e).__name__}: {e}"
             self._log("warn" if getattr(e, "export_refused", False) else "info",
@@ -5963,6 +6022,1257 @@ class MpcWorker(TimerWorker):
         warns = list(getattr(ctrl, "tune_warnings", []) or [])
         return (name, path, "warn" if warns else "ok", "; ".join(warns))
 
+    # ---------------------------------------- RL POLICY per RL LOW (2026-11-01)
+    # Operator request 2026-11-01 ("rl_7d_pwm 여러 개를 훈련해 왔다. GUI 켜기
+    # 전에 hw_mpc.yaml 에서 policy_dir 을 정하는 대신 GUI 에서 바로 바꾸고
+    # 싶다"): the LOW row's picker asks for an export per RL LOW over
+    # bus.cmd_rl_policy, and set_rl_policy rebuilds that LOW's follower with
+    # the class's OWN constructor — every build-time gate runs again — and
+    # commits only on success. SESSION ONLY: hw_mpc.yaml <low>.policy_dir
+    # stays the launch default (the MPC_Tuned profile / DP checkpoint
+    # convention) and is never written. The command sink's PwmGate stays what
+    # it was built from at launch (rl_pwm.policy_dir, hardware.py
+    # _setup_pwm_gate): a pwm pick it would judge differently is REFUSED here
+    # (_sink_gate_mismatch) — there is no runtime sink rebuild. Only its
+    # WINDOW follows the transport cap since 2026-11-02 (the LOW row's cap ▾:
+    # set_rl_pwm_cap below -> bus.cmd_pwm_cap -> the sink's set_pwm_cap).
+
+    #: RL LOW -> (follower attribute, its error attribute). _ctrl_for, set_mode
+    #: and _engage_refusal read these SAME attributes by name, so a swapped
+    #: object is what they select, report and engage; nothing else in the
+    #: worker keeps a follower (every use goes through self.ctrl at call time).
+    _RL_SLOTS = {"rl": ("_rl", "_rl_error"), "rl_7d": ("_rl7d", "_rl7d_error"),
+                 "rl_pwm": ("_rl_pwm", "_rl_pwm_error"),
+                 "rl_pwm_7d": ("_rl_pwm7d", "_rl_pwm7d_error")}
+    #: the RL LOWs on the per-thruster transport (the command sink's gate)
+    _RL_PWM_SLOTS = ("rl_pwm", "rl_pwm_7d")
+    #: how long a refused pick's note outranks the held state (_tune_status's 6 s)
+    RL_PICK_NOTE_S = 6.0
+
+    @staticmethod
+    def _rl_class(low: str):
+        """The follower class of an RL LOW. rl_policy is imported lazily, as
+        setup() always did (it pulls numpy + the PID)."""
+        from . import rl_policy as RP
+
+        return {"rl": RP.HwRl, "rl_7d": RP.HwRl7d, "rl_pwm": RP.HwRlPwm,
+                "rl_pwm_7d": RP.HwRlPwm7d}[low]
+
+    def _rl_slot_of(self, obj):
+        """The RL LOW whose slot holds ``obj`` (identity), else None."""
+        if obj is None:
+            return None
+        for low, (attr, _err) in self._RL_SLOTS.items():
+            if getattr(self, attr, None) is obj:
+                return low
+        return None
+
+    @staticmethod
+    def _rl_wall() -> str:
+        """ISO wall time with the UTC offset (provenance ``at``)."""
+        return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+    def _rl_launch_dir(self, low: str):
+        """The export dir LOW ``low``'s class reads at launch, resolved EXACTLY
+        as rl_policy does (HwRl.__init__, the HwRl7d / HwRlPwm7d pre-checks):
+        cfg.<low>.policy_dir — for rl / rl_pwm an ABSENT key is the class
+        DEFAULT_DIR (a YAML null the string 'None'); the 7d classes refuse a
+        missing / empty one themselves (None here) — kept when absolute, else
+        joined to the repo root (never the cwd; no '~', no normalisation)."""
+        from .rl_policy import REPO_ROOT
+
+        cls = self._rl_class(low)
+        raw = dict(getattr(self.cfg, low, None) or {})
+        pdir = raw.get("policy_dir", cls.DEFAULT_DIR)
+        if cls.DEFAULT_DIR is None and not pdir:
+            return None
+        pdir = str(pdir)
+        return pdir if os.path.isabs(pdir) else os.path.join(REPO_ROOT, pdir)
+
+    @staticmethod
+    def _rl_read_export(d) -> tuple:
+        """(obs_sha1, npz_sha1, checkpoint) of export dir ``d`` — the very files
+        the follower opens (os.path.join(d, ...)): obs_spec.json's bytes hashed
+        AND parsed once (checkpoint = its string ``checkpoint``, else None; the
+        build stays the judge of the JSON), policy_weights.npz hashed. OSError
+        when either cannot be read."""
+        from .rl_library import REQUIRED_FILES, file_sha1
+
+        with open(os.path.join(str(d), REQUIRED_FILES[0]), "rb") as f:
+            raw = f.read()
+        npz = file_sha1(os.path.join(str(d), REQUIRED_FILES[1]))
+        ck = None
+        try:
+            spec = json.loads(raw.decode("utf-8"))
+            ck = spec.get("checkpoint") if isinstance(spec, dict) else None
+        except Exception:                                        # noqa: BLE001
+            ck = None
+        return (hashlib.sha1(raw).hexdigest(), npz,
+                ck if isinstance(ck, str) else None)
+
+    def _rl_launch_read(self, low: str) -> tuple:
+        """(dir, facts | None, why) BEFORE a launch build: the dir the class will
+        read (None: it refuses a missing policy_dir itself) and its
+        _rl_read_export facts, or why they could not be read. NEVER raises —
+        provenance must not cost a launch build (a missing npz is the build's
+        own failure, said in its own words)."""
+        try:
+            d = self._rl_launch_dir(low)
+        except Exception as e:                                   # noqa: BLE001
+            return None, None, f"{type(e).__name__}: {e}"
+        if d is None:
+            return None, None, "no policy_dir"
+        try:
+            return d, self._rl_read_export(d), ""
+        except Exception as e:                                   # noqa: BLE001
+            return d, None, f"{type(e).__name__}: {e}"
+
+    def _rl_launch_prov(self, low: str, obj, pre: tuple) -> None:
+        """After a SUCCESSFUL launch build of ``obj`` for ``low``: hash the export
+        again and record it (`_rl_prov`, one file-only mission-log line).
+
+        RAISES ValueError("export files changed while loading") when the bytes
+        changed (or vanished) between the two hashes — setup()'s except then
+        fails this LOW exactly like any other export defect, with its usual
+        'unavailable' line: the session never flies a network it did not hash
+        (the 7d classes read obs_spec.json twice; RL_controller rewrites its
+        exports in place — rl_library's module docstring). Bytes that could
+        not be hashed BEFORE a build that then succeeded fail nothing: the
+        record says so (`hash_error`, no id)."""
+        from .rl_library import (LOW_LABELS, export_id, export_name,
+                                 no_fly_reason, rel_to_repo, resolve_dir)
+
+        d, before, why = pre
+        if before is not None:
+            try:
+                after = self._rl_read_export(d)
+            except OSError:
+                after = None
+            if after is None or after[:2] != before[:2]:
+                raise ValueError("export files changed while loading")
+        read = str(getattr(obj, "policy_dir", "") or "")
+        if read and d and os.path.abspath(read) != os.path.abspath(str(d)):
+            # the class read another dir than the one hashed (no class does
+            # today): record what it read, unhashed — never borrowed hashes
+            d, before, why = read, None, "the follower read another dir than the one hashed"
+        d = d or read
+        if not d:
+            return
+        name = export_name(d)
+        obs, npz, ck = before if before is not None else (None, None, None)
+        prov = {"name": name, "path": resolve_dir(d), "rel": rel_to_repo(d),
+                "obs_sha1": obs, "npz_sha1": npz,
+                "id": export_id(obs, npz) if (obs and npz) else None,
+                "source": "hw_mpc.yaml", "at": self._rl_wall()}
+        if before is None:
+            prov["hash_error"] = why
+        nf = no_fly_reason(name, npz, ck)
+        if nf:
+            # The flight ban is enforced at the PICK (set_rl_policy); a launch
+            # config that names a banned export still builds as it always did
+            # — this line, the record and the LOW row's WARN say so. 2026-11-02
+            # (review F1): until then this WARN was file-only (no PANEL_LOG
+            # pattern named it) and the row showed the cap note instead of the
+            # ban; logfilter.PANEL_LOG now names this line's head, and
+            # _rl_policy_status tests the ban BEFORE the cap.
+            prov["no_fly"] = nf
+        self._rl_prov[low] = prov
+        self._rl_prov_obj[low] = obj
+        idt = prov["id"][:8] if prov["id"] else f"? — not hashed: {why}"
+        self._log("warn" if nf else "info",
+                  f"ctrl: RL policy {LOW_LABELS.get(low, low)} {name} (hw_mpc.yaml "
+                  f"{low}.policy_dir, id {idt})"
+                  + (f" — WARN: no-fly — {nf}" if nf else ""))
+
+    def _rl_held(self, low: str, obj) -> dict:
+        """A fresh copy of the record of what slot ``low`` HOLDS: `_rl_prov[low]`
+        when it describes ``obj`` (identity), else one built from the object
+        alone — name / path from its policy_dir, no hashes, source "unknown"
+        (tests install followers directly): a follower never borrows another
+        object's hashes."""
+        prov = self._rl_prov.get(low)
+        if obj is not None and prov is not None and self._rl_prov_obj.get(low) is obj:
+            return dict(prov)
+        from .rl_library import export_name, rel_to_repo, resolve_dir
+
+        pdir = str(getattr(obj, "policy_dir", "") or "") if obj is not None else ""
+        return {"name": export_name(pdir) if pdir else "",
+                "path": resolve_dir(pdir) if pdir else "",
+                "rel": rel_to_repo(pdir) if pdir else "",
+                "obs_sha1": None, "npz_sha1": None, "id": None,
+                "source": "unknown", "at": None}
+
+    @staticmethod
+    def _rl_cap_note(obj) -> str:
+        """Why a held pwm follower is WARN: it flies below its trained cap
+        (the LOW's recorded allow_caps_below_trained admitted it)."""
+        try:
+            return (f"flies at cap {float(getattr(obj, 'pwm_cap')):g} below trained "
+                    f"{float(getattr(getattr(obj, 'model', None), 'cap_trained')):g} "
+                    f"(allow_caps_below_trained)")
+        except (AttributeError, TypeError, ValueError):
+            return "flies below its trained cap (allow_caps_below_trained)"
+
+    #: build-error texts a HIGHER transport cap cures (rl_policy.HwRlPwm /
+    #: HwRlPwm7d: a cap below the trained one; the heave-trim cap budget)
+    _RL_CAP_CURABLE = ("below the policy's trained cap", "fly a higher rl_pwm.pwm_cap")
+
+    def _rl_cap_hint(self, slot: str, why, revive: bool = True) -> str:
+        """"" or " — the cap ▾ on the <row> row sets rl_pwm.pwm_cap for this
+        session": the running-GUI remedy for a pwm slot whose build failed
+        (``why``) for a reason a higher transport cap cures — the follower's
+        own text names hw_mpc.yaml. One helper for set_mode's refusal (review
+        D3), set_rl_policy's and the status note of a slot in ERROR (ui-4).
+        Offered ONLY when that control can be reached (reviews worker-1 /
+        tests-5): a pwm LOW holding a follower (its row shows the cap ▾; the
+        LOW combo refuses an empty one), the trained cap it needs not above
+        the sink's ceiling (step 7 refuses those), and — ``revive``: the
+        slot's own export would be rebuilt by the change — an EMPTY slot's
+        launch export not no-fly by name (a cap change never builds a banned
+        one). Never raises; no file IO (it runs in _publish too)."""
+        try:
+            why = str(why or "")
+            if slot not in self._RL_PWM_SLOTS or \
+                    not any(k in why for k in self._RL_CAP_CURABLE):
+                return ""
+            from .rl_library import LOW_LABELS, export_name, no_fly_reason
+
+            rows = [s for s in self._RL_PWM_SLOTS
+                    if getattr(self, self._RL_SLOTS[s][0], None) is not None]
+            if not rows:
+                return ""
+            m = re.search(r"below the policy's trained cap ([0-9.]+)", why)
+            need = self._cap_num(float(m.group(1))) if m else None
+            ceiling = self._rl_pwm_sink_ceiling(self._pwm_gate_fresh())
+            if need is not None and ceiling is not None and need > ceiling + 1e-9:
+                return ""
+            if revive and getattr(self, self._RL_SLOTS[slot][0], None) is None:
+                d = self._rl_launch_dir(slot)
+                if d and no_fly_reason(export_name(d)):
+                    return ""
+            return (" — the cap ▾ on the " + " / ".join(LOW_LABELS.get(s, s) for s in rows)
+                    + " row sets rl_pwm.pwm_cap for this session")
+        except Exception:                                        # noqa: BLE001
+            return ""
+
+    def _rl_policy_status(self) -> dict:
+        """MpcStatus.rl_policy (state.py): per RL LOW what the worker HOLDS —
+        the LOW row's policy widgets and the picker show this and nothing else
+        (honesty rule). A FRESH dict (and inner dicts) on every call. state:
+        "refused" for RL_PICK_NOTE_S after a refused pick (name / path / id
+        still the HELD export; the note says why — _tune_status's order) |
+        "error" no follower: its launch build failed (note = its *_error —
+        on a pwm slot + _rl_cap_hint's " — the cap ▾ on the … row …" when a
+        higher cap cures it, review ui-4; name / path / id from `_rl_prov`
+        if any) | "warn" held, but the
+        launch config named a no-fly export — the note LEADS with "no-fly —
+        <reason>" and adds "; <cap note>" when it also flies below its
+        trained cap — or (not banned) it flies below its trained cap, the
+        cap note alone | "ok". Every slot also carries "no_fly": "" or the
+        held record's ban reason, in EVERY state (2026-11-02, review F1: a
+        refusal note must not hide the ban either). Reads attributes only —
+        it runs in _publish on every tick."""
+        from .rl_library import RL_LOWS
+
+        t = now()
+        out = {}
+        for low in RL_LOWS:
+            attr, err_attr = self._RL_SLOTS[low]
+            obj = getattr(self, attr, None)
+            held = (dict(self._rl_prov.get(low) or {}) if obj is None
+                    else self._rl_held(low, obj))
+            note = self._rl_pick_note.get(low)
+            below = obj is not None and bool(getattr(obj, "caps_below_trained", False))
+            if note is not None and t - float(note[1]) < self.RL_PICK_NOTE_S:
+                state, text = "refused", str(note[0])
+            elif obj is None:
+                state, text = "error", str(getattr(self, err_attr, None) or "not built")
+                text += self._rl_cap_hint(low, text)
+            elif held.get("no_fly"):
+                # 2026-11-02 (review F1): the BAN is tested before the cap and
+                # the cap fact rides behind it. Until then the cap branch came
+                # first, and it always won for a banned export at the
+                # station's cap: every banned export is trained at pwm_cap 1.0
+                # (output.pwm_model.pwm_cap_trained in rov_gui/control/
+                # rl_policies/{pwm10_s1,att7pwm_s0}/obs_spec.json and the
+                # RL_controller originals of pwm10_s2 / att7pwm_s1 / s2) while
+                # config/hw_mpc.yaml flies rl_pwm.pwm_cap 0.25 with
+                # rl_pwm_7d.allow_caps_below_trained true — so a banned
+                # export named for RL_PWM_7D read as the routine cap WARN.
+                state, text = "warn", f"no-fly — {held['no_fly']}"
+                if below:
+                    text += f"; {self._rl_cap_note(obj)}"
+            elif below:
+                state, text = "warn", self._rl_cap_note(obj)
+            else:
+                state = "ok"
+                text = (f"not hashed at launch ({held['hash_error']})"
+                        if held.get("hash_error") else "")
+            out[low] = {"name": str(held.get("name") or ""),
+                        "path": str(held.get("path") or ""),
+                        "rel": str(held.get("rel") or ""),
+                        "id": str(held.get("id") or ""),
+                        "source": str(held.get("source") or ""),
+                        "state": state, "note": text,
+                        "no_fly": str(held.get("no_fly") or "")}
+            if low in self._RL_PWM_SLOTS:
+                # 2026-11-02 (the LOW row's cap ▾): what the HELD follower
+                # flies and was trained at — read off the object, never the
+                # config (a follower is built at ONE cap; None = no follower)
+                out[low]["cap"] = (None if obj is None
+                                   else self._cap_num(getattr(obj, "pwm_cap", None)))
+                out[low]["cap_trained"] = (
+                    None if obj is None else self._cap_num(
+                        getattr(getattr(obj, "model", None), "cap_trained", None)))
+        return out
+
+    def _rl_policy_meta(self, low: str) -> dict:
+        """Run meta controller.rl_policy (2026-11-01): the export the follower
+        flying RL LOW ``low`` was built from — name, path, rel, both content
+        sha1s, the id, source (hw_mpc.yaml | panel | unknown) and when — and,
+        on the pwm transport, the export the command sink's gate was built
+        from (its last snapshot, when it says). The follower's own meta()
+        (policy_dir relpath + the obs_spec checkpoint string) is unchanged;
+        THIS is what tells two exports under one folder name apart."""
+        obj = getattr(self, self._RL_SLOTS[low][0], None)
+        d = self._rl_held(low, obj)
+        d["low"] = low
+        if low in self._RL_PWM_SLOTS:
+            tel = self.tel
+            g = getattr(tel, "pwm_gate", None) if tel is not None else None
+            if isinstance(g, dict) and g.get("export"):
+                d["sink_gate"] = {"export": g.get("export"),
+                                  "export_id": g.get("export_id")}
+                # 2026-11-02: the window the sink last SAID it enforces (the
+                # LOW row's cap ▾ changes it at runtime) — when it says one
+                if "pwm_cap" in g:
+                    d["sink_gate"]["pwm_cap"] = g.get("pwm_cap")
+                    # review worker-3: a snapshot older than the last
+                    # committed change shows the PREVIOUS window (a REC
+                    # re-dump right after a change) — say so, never imply a
+                    # follower-vs-sink mismatch that never flew
+                    pend = getattr(self, "_pwm_cap_commit", None)
+                    try:
+                        stale = pend is not None and \
+                            float(g.get("stamp", 0.0) or 0.0) < float(pend[1])
+                    except (TypeError, ValueError):
+                        stale = False
+                    if stale:
+                        d["sink_gate"]["pwm_cap_stale"] = True
+        return d
+
+    def _refuse_rl_policy(self, low: str, why: str) -> None:
+        """One refused pick: `reason`, the slot's note (RL_PICK_NOTE_S on the
+        LOW row, like _refuse_tune) and a WARN line whose HEAD says 'refused'
+        — the mission-log panel shows it (logfilter PANEL_LOG). The held
+        follower, its *_error, cfg.<low>.policy_dir and `_rl_prov` are NOT
+        touched. On a pwm slot an older refused CAP change's note is retired
+        (review worker-5, 2026-11-02): the panel's cap face outranks every
+        face on both pwm rows, so for up to RL_PICK_NOTE_S it would hide this
+        newer refusal — the newest answer owns the row, the rule both ways:
+        set_rl_pwm_cap's commit clears the pick notes (D2), set_rl_policy's
+        commit the cap note."""
+        from .rl_library import LOW_LABELS, RL_LOWS
+
+        self.reason = f"RL policy refused: {LOW_LABELS.get(low, low)}: {why}"
+        if low in RL_LOWS:
+            self._rl_pick_note[low] = (why, now())
+        if low in self._RL_PWM_SLOTS:
+            self._rl_pwm_cap_note = None
+        self._log("warn", f"ctrl: {self.reason}")
+
+    @staticmethod
+    def _fmt_vec(v) -> str:
+        try:
+            return "[" + ", ".join(f"{float(x):g}" for x in v) + "]"
+        except (TypeError, ValueError):
+            return str(v)
+
+    @staticmethod
+    def _sink_gate_sentence(g: dict, field: str, sink_val, new_val,
+                            cap_to=None) -> str:
+        """The one remedy sentence for a follower the command sink's gate would
+        judge differently — at the pick (set_rl_policy), at a cap change
+        (set_rl_pwm_cap) and at engage / every engaged tick (_pwm_gate_now)
+        alike. Never a bare restart (the texts before 2026-11-01): a restart
+        rebuilds the gate from the same file.
+
+        2026-11-02 (the LOW row's cap ▾): a pwm_cap mismatch has a RUNTIME
+        remedy now — the transport cap is set on the LOW row, the worker
+        rebuilds both pwm followers at it and the sink re-windows to
+        min(cap, its export's trained cap). ``cap_to`` is the value to name
+        (_sink_gate_compare: the smaller of the two trained caps, the largest
+        cap at which both sides fly the same window); without one the
+        sentence names the follower's trained cap in words. The
+        motor_direction / sigma remedies are unchanged."""
+        exp = g.get("export") if isinstance(g, dict) else None
+        src = f"rl_pwm.policy_dir {exp}" if exp else "rl_pwm.policy_dir's export"
+        if field == "pwm_cap":
+            to = (f"{float(cap_to):g}" if cap_to is not None
+                  else "this export's trained cap")
+            return (f"the thruster sink's gate was built at launch from {src} "
+                    f"({field} {sink_val} ≠ this export's {new_val}) — pick an "
+                    f"export with the same pwm_cap, or set the LOW row's cap to "
+                    f"{to} (rl_pwm.pwm_cap for this session), or set "
+                    f"rl_pwm.policy_dir in hw_mpc.yaml and restart; pwm_cap = "
+                    f"min(rl_pwm.pwm_cap, the export's pwm_cap_trained)")
+        return (f"the thruster sink's gate was built at launch from {src} "
+                f"({field} {sink_val} ≠ this export's {new_val}) — pick an "
+                f"export with the same {field}, or set rl_pwm.policy_dir in "
+                f"hw_mpc.yaml and restart")
+
+    def _sink_gate_mismatch(self, g: dict, ctrl) -> str:
+        """"" or the sentence for the FIRST fact the command sink's gate and
+        follower ``ctrl`` disagree on, in this order:
+          motor_direction — the gate checks MOT_n_DIRECTION against its own
+            export's; a follower expecting others flies the wrong vehicle;
+          sigma (2026-11-01; the snapshot carries it) — the sink's sign-probe
+            check and the follower's judge different artefacts; compared only
+            when BOTH sides know it (an export older than the key has none);
+          pwm_cap — a sink window tighter than the follower's cap refuses every
+            frame (2026-10-10: it refuses, never clamps), a wider one would
+            let a bug through.
+        A value that cannot be compared counts as different (fail-closed), and
+        a snapshot this cannot read at all is a refusal, never an exception —
+        it runs in a queued slot and on every engaged pwm tick."""
+        try:
+            return self._sink_gate_compare(g, ctrl)
+        except Exception as e:                                   # noqa: BLE001
+            return (f"the thruster sink's gate snapshot cannot be compared with "
+                    f"this export ({type(e).__name__}: {e}) — refused")
+
+    def _sink_gate_compare(self, g: dict, ctrl) -> str:
+        """_sink_gate_mismatch's comparisons (it catches what this raises)."""
+        model = getattr(ctrl, "model", None)
+        want = list(getattr(model, "motor_direction", []) or [])
+        have = list(g.get("motor_direction") or [])
+        if want and have != want:
+            return self._sink_gate_sentence(g, "motor_direction",
+                                            self._fmt_vec(have), self._fmt_vec(want))
+        mine, theirs = getattr(model, "sigma", None), g.get("sigma")
+        if mine is not None and theirs is not None:
+            try:
+                same = (len(list(theirs)) == len(list(mine))
+                        and all(abs(float(a) - float(b)) <= 1e-9
+                                for a, b in zip(theirs, mine)))
+            except (TypeError, ValueError):
+                same = False
+            if not same:
+                return self._sink_gate_sentence(g, "sigma", self._fmt_vec(theirs),
+                                                self._fmt_vec(mine))
+        cap = getattr(ctrl, "pwm_cap", None)
+        if cap is not None and "pwm_cap" in g:
+            try:
+                # (not <=: a NaN on either side is a mismatch, never a pass)
+                differ = not (abs(float(g["pwm_cap"]) - float(cap)) <= 1e-9)
+                sv, nv = f"{float(g['pwm_cap']):g}", f"{float(cap):g}"
+            except (TypeError, ValueError):
+                differ, sv, nv = True, repr(g.get("pwm_cap")), repr(cap)
+            if differ:
+                # 2026-11-02: the LOW-row cap that makes both windows one —
+                # min(this export's trained cap, the sink export's), the
+                # largest transport cap at which min(cap, T_follower) ==
+                # min(cap, T_sink); one side unknown: the other; neither: the
+                # sentence words it. (A follower trained above the sink's
+                # export then flies below its trained cap — its LOW's
+                # allow_caps_below_trained decides, at the rebuild.)
+                tr = [v for v in (self._cap_num(getattr(model, "cap_trained", None)),
+                                  self._cap_num(g.get("cap_trained")))
+                      if v is not None and v > 0.0]
+                cap_to = min(tr) if tr else None
+                cur = self._rl_pwm_cap_in_force()
+                sink_v = self._cap_num(g.get("pwm_cap"))
+                t_s = self._cap_num(g.get("cap_trained"))
+                t_f = self._cap_num(getattr(model, "cap_trained", None))
+                fly = self._cap_num(cap)
+                if (cur is not None and sink_v is not None and fly is not None
+                        and t_s is not None and t_s > 0.0
+                        and abs(sink_v - min(cur, t_s)) > 1e-9
+                        and abs(fly - min(cur, t_s)) <= 1e-9
+                        and (t_f is None or abs(fly - min(cur, t_f)) <= 1e-9)):
+                    # review ui-3 / hwsafe-2: the follower flies what the
+                    # cap in force gives it — exactly the window the sink
+                    # should enforce at it, min(cap in force, its export's
+                    # trained cap) — and the sink does NOT: the sink has not
+                    # applied the cap in force. Re-picking that cap on the
+                    # LOW row is a no-op: never name a cap here. (A follower
+                    # that would not fit that window either gets the remedy
+                    # sentence below: its cap_to is never the cap in force.)
+                    return (f"the thruster sink enforces pwm_cap {sv} but this export "
+                            f"flies {nv} at the cap in force {cur:g} — the sink has not "
+                            f"applied that cap (its 'transport cap NOT changed' line "
+                            f"says why if it refused): pick another cap and back, or "
+                            f"restart the station")
+                return self._sink_gate_sentence(g, "pwm_cap", sv, nv, cap_to=cap_to)
+        return ""
+
+    def _sink_cap_unconfirmed(self, g: dict, ctrl) -> str:
+        """"" or the refusal for a follower that disagrees with the sink's
+        snapshot on the CAP alone while that snapshot PREDATES the last
+        committed cap change (review hwsafe-2 / worker-3, 2026-11-02): the
+        sink re-windows on its own thread and the snapshot reaches this
+        worker one sink tick + one telemetry hop later, so a START (or a
+        pick) right after a change would otherwise get a remedy naming the
+        cap already in force. Still a refusal — only the words change. Said
+        only when the follower flies the window the sink WILL enforce,
+        min(the new cap, its export's trained cap) when the snapshot says
+        that trained cap (review hwsafe-2's condition): a follower that
+        would disagree with the new window too gets the remedy sentence —
+        waiting would not help it."""
+        pend = getattr(self, "_pwm_cap_commit", None)
+        if pend is None or not isinstance(g, dict):
+            return ""
+        try:
+            if not float(g.get("stamp", 0.0) or 0.0) < float(pend[1]):
+                return ""
+        except (TypeError, ValueError):
+            return ""
+        fly = self._cap_num(getattr(ctrl, "pwm_cap", None))
+        if fly is None or self._sink_gate_mismatch(dict(g, pwm_cap=fly), ctrl):
+            return ""
+        t_s = self._rl_pwm_sink_ceiling(g)
+        try:
+            if t_s is not None and abs(fly - min(float(pend[0]), t_s)) > 1e-9:
+                return ""
+        except (TypeError, ValueError):
+            return ""
+        return (f"the thruster sink has not confirmed the new cap {float(pend[0]):g} yet "
+                f"(its last report predates the change) — try again in a moment")
+
+    def _rl_sink_precheck(self, new) -> str:
+        """pwm LOWs, AT THE PICK: "" or why the command sink's gate — built ONCE
+        at launch from hw_mpc.yaml rl_pwm.policy_dir (hardware.py
+        _setup_pwm_gate) and never rebuilt — would not carry ``new``'s pulses
+        (motor_direction / sigma / pwm_cap, _sink_gate_mismatch). Judged on
+        the snapshot _pwm_gate_now reads (Telemetry.pwm_gate) when it is FRESH
+        and CONFIGURED. No snapshot (the demo, NullCommandSink, before the
+        sink's first tick), an unconfigured gate or a stale snapshot: no
+        verdict here — the engage check (_pwm_refusal -> _pwm_gate_now) still
+        applies the same comparisons and refuses a missing / stale / not-ok
+        gate itself, so nothing flies against a sink that disagrees.
+
+        A fresh, configured snapshot that carries NO gate facts (no
+        "motor_direction" key) is refused with the SINK's own reason
+        (2026-11-02, review F2). That is the command sink's tick-failure
+        fallback (hardware.py MavlinkCommandSink.tick, the except around
+        _pwm_tick: {configured, ok False, latched, why "rl_pwm tick failed:
+        …"}, re-stamped every tick while the tick keeps failing): compared,
+        its empty motor_direction refused EVERY pwm export as a
+        motor_direction mismatch — the wrong cause, and a remedy (another
+        export) no export can meet. Keyed on the missing facts, not on
+        `latched` / `ok`: a normal latched snapshot still carries the gate's
+        identity and is compared as before (the follower's stop clears a
+        latch; _pwm_gate_now refuses a not-ok gate at engage). The shared
+        _sink_gate_compare is unchanged (it also runs on every engaged
+        tick)."""
+        g = self._pwm_gate_fresh()
+        if g is None:
+            return ""
+        if "motor_direction" not in g:
+            return self._sink_no_facts_sentence(g)
+        why = self._sink_gate_mismatch(g, new)
+        return (self._sink_cap_unconfirmed(g, new) or why) if why else ""
+
+    def _pwm_gate_fresh(self):
+        """The command sink's last pwm-gate snapshot (Telemetry.pwm_gate) when
+        it is CONFIGURED and FRESH (PWM_GATE_STALE_S), else None — the one
+        rule _rl_sink_precheck, set_rl_pwm_cap and _rl_pwm_cap_status judge
+        the sink by (factored out 2026-11-02; the pick's rule is unchanged).
+        Never raises: a stamp that is not a number counts as no snapshot."""
+        tel = self.tel
+        g = getattr(tel, "pwm_gate", None) if tel is not None else None
+        if not isinstance(g, dict) or not bool(g.get("configured", False)):
+            return None
+        try:
+            if now() - float(g.get("stamp", 0.0) or 0.0) > self.PWM_GATE_STALE_S:
+                return None
+        except (TypeError, ValueError):
+            return None
+        return g
+
+    @staticmethod
+    def _sink_no_facts_sentence(g: dict) -> str:
+        """Why a fresh, configured snapshot WITHOUT gate facts (the sink's
+        tick-failure fallback, review F2 2026-11-02) is a refusal — the
+        sink's own reason; one wording for a pick and a cap change."""
+        return (f"the thruster sink's gate cannot be judged right now "
+                f"({g.get('why') or 'its snapshot carries no gate facts'}) "
+                f"— see the sink's error line")
+
+    @Slot(str, str)
+    def set_rl_policy(self, low: str, path: str) -> None:
+        """The LOW row's RL policy picker (bus.cmd_rl_policy, 2026-11-01): fly
+        export dir ``path`` on RL LOW ``low`` for the rest of the SESSION
+        (hw_mpc.yaml <low>.policy_dir stays the launch default, never written).
+        Checked in this order — every refusal through _refuse_rl_policy, the
+        previous follower, its *_error, cfg.<low>.policy_dir and `_rl_prov`
+        kept whole:
+          1 an RL LOW (never a silent return: set_mode's unknown-key return
+            reads as a picker that snapped back for no reason);
+          2 READY; 3 not engaged (a LOW None observe engagement too); 4 no
+            controller CSV open (one record = one network: the CSV's meta
+            names ONE export, and a REC-opened CSV survives DISENG) —
+            set_mpc_tune's three, worded the same;
+          5 an export dir (the two files the station reads);
+          6 not NO-FLY (rl_library.no_fly_reason: by name, by the weights'
+            sha1 — a renamed copy — and by the training run its obs_spec
+            checkpoint names, as the picker greys it);
+          7 the LOW's OWN constructor on a COPY of the live config with only
+            <low>.policy_dir replaced — every build-time gate (action mode,
+            layout, velocity source vs the DVL blend in force, obs guard,
+            integral, control_dt, the cap vs the trained cap and the LOW's
+            opt-out, heave-trim budget, the 7d attitude reference). Never
+            MpcConfig.load() again: it would drop the resolved dvl block, the
+            --rec-dir log_dir and the opts overrides setup() applied. Its build
+            lines are held and logged only if the pick commits;
+          8 the export's bytes unchanged across the build (an export being
+            written must not fly; the id recorded is of the bytes built);
+          9 pwm LOWs: the command sink's gate agrees (_rl_sink_precheck).
+        Then the commit — plain assignments that cannot fail half-way — and,
+        when the swapped LOW is the selected one, `self.ctrl` re-pointed and
+        reset as set_mode does (otherwise the OLD network would keep flying
+        under a status and a meta that name the new one).
+
+        No armed mission is lost: picks are refused while engaged, missions
+        start only from an engagement, and set_engaged resets the follower
+        before anything is installed on it."""
+        from .rl_library import (LOW_LABELS, RL_LOWS, export_id, export_name,
+                                 is_export_dir, no_fly_reason, rel_to_repo,
+                                 resolve_dir)
+
+        low = low if isinstance(low, str) else str(low)
+        if low not in RL_LOWS:
+            self._refuse_rl_policy(low, f"unknown RL LOW {low!r}")
+            return
+        if self.cfg is None or not self._ready:
+            self._refuse_rl_policy(low, "controller still building — pick again when READY")
+            return
+        if self.engaged:
+            self._refuse_rl_policy(low, "not while engaged")
+            return
+        if self._csv is not None:
+            self._refuse_rl_policy(low, "not while a controller CSV is open (REC) — "
+                                        "stop the recording first")
+            return
+        path = "" if path is None else str(path)
+        try:
+            abs_dir = resolve_dir(path) if path.strip() else ""
+        except (TypeError, ValueError):
+            abs_dir = ""
+        if not abs_dir or not is_export_dir(abs_dir):
+            self._refuse_rl_policy(low, f"not an RL export (needs obs_spec.json + "
+                                        f"policy_weights.npz): {path}")
+            return
+        name = export_name(abs_dir)
+        try:
+            before = self._rl_read_export(abs_dir)
+        except OSError as e:
+            self._refuse_rl_policy(low, f"the export cannot be read ({type(e).__name__}: {e})")
+            return
+        nf = no_fly_reason(name, before[1], before[2])
+        if nf:
+            self._refuse_rl_policy(low, f"{name} is no-fly — {nf}")
+            return
+        lines: list = []
+        try:
+            blk = dict(getattr(self.cfg, low, None) or {})
+            blk["policy_dir"] = abs_dir
+            new = self._rl_class(low)(dataclasses.replace(self.cfg, **{low: blk}),
+                                      log=lines.append)
+        except Exception as e:                                   # noqa: BLE001
+            why = f"{type(e).__name__}: {e}"
+            # 2026-11-02: the follower's own text says "raise rl_pwm.pwm_cap"
+            # (hw_mpc.yaml) — in a running GUI that is the cap ▾ on a pwm
+            # row (set_rl_pwm_cap), no restart needed, when one is reachable
+            why += self._rl_cap_hint(low, why, revive=False)
+            self._refuse_rl_policy(low, why)
+            return
+        try:
+            after = self._rl_read_export(abs_dir)
+        except OSError:
+            after = None
+        if after is None or after[:2] != before[:2]:
+            self._refuse_rl_policy(low, "export files changed while loading — pick again")
+            return
+        if low in self._RL_PWM_SLOTS:
+            why = self._rl_sink_precheck(new)
+            if why:
+                self._refuse_rl_policy(low, why)
+                return
+        attr, err_attr = self._RL_SLOTS[low]
+        old = getattr(self, attr, None)
+        selected = str(self.cfg.mode) == low or (old is not None and self.ctrl is old)
+        if selected:
+            # set_mode's reset of the follower it selects — done BEFORE the
+            # commit, so a reset that raised would leave nothing half-swapped
+            try:
+                new.reset()
+            except Exception as e:                               # noqa: BLE001
+                self._refuse_rl_policy(low, f"{type(e).__name__}: {e}")
+                return
+        pid = export_id(before[0], before[1])
+        rel = rel_to_repo(abs_dir)
+        prov = {"name": name, "path": abs_dir, "rel": rel,
+                "obs_sha1": before[0], "npz_sha1": before[1], "id": pid,
+                "source": "panel", "at": self._rl_wall()}
+        # ---- COMMIT: plain assignments from here on ---------------------------
+        setattr(self, attr, new)
+        setattr(self, err_attr, None)
+        live = getattr(self.cfg, low, None)
+        if isinstance(live, dict):
+            live["policy_dir"] = abs_dir
+        else:
+            setattr(self.cfg, low, {"policy_dir": abs_dir})
+        self._rl_prov[low] = prov
+        self._rl_prov_obj[low] = new
+        self._rl_pick_note.pop(low, None)
+        if low in self._RL_PWM_SLOTS:
+            # review worker-5 (D2's mirror): a refused CAP change's note
+            # outranks every face on both pwm rows — it must not keep
+            # naming an export this slot no longer holds
+            self._rl_pwm_cap_note = None
+            # The per-follower pwm records that would otherwise describe the
+            # PREVIOUS follower — all safe to drop while disengaged: the
+            # interlocks object outlives a disengage only for the closing
+            # meta, which that run's CSV already wrote (a pick is refused
+            # while any CSV is open), and _controller_meta would attach it to
+            # ANY pwm follower's next meta (REC NAV's controller.json); the
+            # last-sent pulses / guard code / gate-grace clock are engaged-
+            # only state (cleared at disengage, re-armed at engage).
+            self._pwm_ilk = None
+            self._pwm_last_sent_us = None
+            self._pwm_guard = 0
+            self._pwm_gate_bad_since = None
+        if selected:
+            # set_mode's selection steps for a follower that keeps its LOW (no
+            # ctrl.mode for an RL key; the outgoing follower is discarded
+            # whole, so it has no plan scale to forget)
+            self.ctrl = new
+            self._path_cursor = None
+            self._path_err = (None, None)
+            self._path_depth = 0.0
+            self._path_yaw_fixed = 0.0
+            self._path_heading_follow = False
+        for m in lines:
+            self._log("info", m)
+        label = LOW_LABELS.get(low, low)
+        warn = (f" — WARN: {self._rl_cap_note(new)}"
+                if bool(getattr(new, "caps_below_trained", False)) else "")
+        self.reason = f"RL policy {label}: {name} (id {pid[:8]})" + warn
+        self._log("warn" if warn else "info", f"ctrl: {self.reason}")
+        # "RL policy " heads it: logfilter.MISSION_QUIET (the LOW row shows the
+        # pick); the file half waits for the next run folder (pending), so a
+        # pick at the bench opens no folder of its own
+        self._event(f"RL policy {label} ← {name} (panel pick, id {pid[:8]}, {rel})",
+                    pending=True)
+
+    # ------------------------------------ THE PWM TRANSPORT CAP (2026-11-02)
+    # Operator request 2026-11-02 ("./c3 gui … 이렇게 gui를 열면 거기서 바꿀
+    # 수 있게 해달라는 소리였어. 그리고 캡도"): in the running GUI, the RL
+    # policy AND the cap. The cap is rl_pwm.pwm_cap, the pwm TRANSPORT's one
+    # |throttle| ceiling: RL_PWM and RL_PWM_7D both read it (rl_policy.HwRlPwm
+    # PWM_CAP_KEY; geometry refuses a pwm_cap in rl_pwm_7d:) and the command
+    # sink enforces it. The operator flies RL_PWM_7D at 0.25 first and moves
+    # to 0.5 after an empty-jaw hold passes (config/hw_mpc.yaml's rl_pwm_7d
+    # comment). The LOW row's cap ▾ asks over bus.cmd_rl_pwm_cap;
+    # set_rl_pwm_cap rebuilds BOTH pwm followers with their own constructors
+    # at the new cap — every build-time gate judges the value (the cap vs
+    # the trained cap and each LOW's allow_caps_below_trained, the heave-trim
+    # cap budget) — commits only when the requested LOW (and the flying one)
+    # build, then tells the sink (bus.cmd_pwm_cap), which re-windows to
+    # min(cap, its export's trained cap). SESSION ONLY: hw_mpc.yaml is never
+    # written; a restart flies its value again.
+
+    @staticmethod
+    def _cap_num(v):
+        """float(v) for a finite real number — never a bool / str / None —
+        else None. Never raises (it runs in _publish)."""
+        if v is None or isinstance(v, (bool, str, bytes)):
+            return None
+        try:
+            f = float(v)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return f if math.isfinite(f) else None
+
+    def _rl_pwm_block_in_force(self):
+        """The live transport block cfg.rl_pwm parsed exactly as both pwm
+        followers and the command sink parse it (rl_pwm.parse_rl_pwm_block:
+        pwm_cap = PWM_CAP_FIRST_WATER when the key / block is absent), or
+        None — no config yet, or a block that does not parse (then no pwm
+        follower was built from it either). Never raises; no file IO (it
+        runs in _publish)."""
+        if self.cfg is None:
+            return None
+        try:
+            from .rl_pwm import parse_rl_pwm_block
+
+            return parse_rl_pwm_block(dict(getattr(self.cfg, "rl_pwm", None) or {}))
+        except Exception:                                        # noqa: BLE001
+            return None
+
+    def _rl_pwm_cap_in_force(self):
+        """The transport cap in force (float), or None (_rl_pwm_block_in_force)."""
+        blk = self._rl_pwm_block_in_force()
+        return None if blk is None else float(blk["pwm_cap"])
+
+    def _rl_pwm_sink_ceiling(self, g):
+        """The trained cap of the export the sink's gate was built from — the
+        snapshot's "cap_trained", finite and > 0 — else None. The sink's
+        window is min(transport cap, this): above it the transport cap would
+        only be a number on the panel (set_pwm_cap takes the min)."""
+        if not isinstance(g, dict):
+            return None
+        v = self._cap_num(g.get("cap_trained"))
+        return v if (v is not None and v > 0.0) else None
+
+    @staticmethod
+    def _rl_pwm_cap_choices(cap: float, ceiling) -> list:
+        """MpcStatus.rl_pwm_cap["choices"]: RL_PWM_CAP_CHOICES up to the
+        sink's ceiling (when known) plus the cap in force — EXACTLY its value
+        (a menu value within 1e-9 of it gives way, so the combo can always
+        select the truth), ascending, a fresh list."""
+        c = float(cap)
+        out = [float(v) for v in RL_PWM_CAP_CHOICES
+               if (ceiling is None or float(v) <= float(ceiling) + 1e-9)
+               and abs(float(v) - c) > 1e-9]
+        out.append(c)
+        out.sort()
+        return out
+
+    def _rl_pwm_cap_status(self) -> dict:
+        """MpcStatus.rl_pwm_cap (state.py): the transport cap as the worker
+        HOLDS it — the LOW row's cap ▾ shows this and nothing else (honesty
+        rule). A FRESH dict on every call. Runs in _publish on every tick,
+        engaged too: attributes, dict reads and parse_rl_pwm_block only (no
+        file IO, no hashing), and it never raises — {} on any fault (the
+        combo then hides rather than show something false)."""
+        try:
+            return self._rl_pwm_cap_status_build()
+        except Exception:                                        # noqa: BLE001
+            return {}
+
+    def _rl_pwm_cap_status_build(self) -> dict:
+        """_rl_pwm_cap_status's body (it catches what this raises)."""
+        blk = self._rl_pwm_block_in_force()
+        if blk is None:
+            return {}
+        cap = float(blk["pwm_cap"])
+        src, at = self._pwm_cap_src
+        g = self._pwm_gate_fresh()
+        ceiling = self._rl_pwm_sink_ceiling(g)
+        sink_cap = self._cap_num(g.get("pwm_cap")) if g is not None else None
+        # each LOW's opt-out read EXACTLY as its follower reads it: rl_pwm
+        # from the parsed transport block (HwRlPwm._caps_below_trained_
+        # opt_out), rl_pwm_7d from its OWN raw block (HwRlPwm7d's override)
+        allow7 = bool(dict(getattr(self.cfg, "rl_pwm_7d", None) or {})
+                      .get("allow_caps_below_trained", False))
+        note = self._rl_pwm_cap_note
+        refused = note is not None and now() - float(note[1]) < self.RL_PICK_NOTE_S
+        return {"cap": cap, "source": str(src), "at": at,
+                "choices": self._rl_pwm_cap_choices(cap, ceiling),
+                "ceiling": ceiling, "sink_cap": sink_cap,
+                "allow_below": {"rl_pwm": bool(blk["allow_caps_below_trained"]),
+                                "rl_pwm_7d": allow7},
+                "state": "refused" if refused else "ok",
+                "note": str(note[0]) if refused else ""}
+
+    def _pwm_cap_origin_meta(self) -> dict:
+        """Run meta controller.pwm_cap_origin (pwm transport only): who set
+        the transport cap the follower was built at, when, and its value —
+        {"source": "hw_mpc.yaml" | "panel", "at": ISO | None, "cap"}. Never
+        raises (the meta is written at engage and by REC)."""
+        try:
+            src, at = self._pwm_cap_src
+        except (TypeError, ValueError):
+            src, at = "unknown", None
+        return {"source": str(src), "at": at, "cap": self._rl_pwm_cap_in_force()}
+
+    def _refuse_rl_pwm_cap(self, why: str) -> None:
+        """One refused cap change: `reason`, the cap's note (RL_PICK_NOTE_S;
+        MpcStatus.rl_pwm_cap state "refused") and a WARN whose HEAD says
+        'refused' ("ctrl: RL_PWM cap refused: …" — logfilter PANEL_LOG shows
+        it). Nothing else changes: the cap, both pwm followers, their
+        *_error and records, the sink."""
+        self.reason = f"RL_PWM cap refused: {why}"
+        self._rl_pwm_cap_note = (why, now())
+        self._log("warn", f"ctrl: {self.reason}")
+
+    @staticmethod
+    def _rl_pwm_cap_unbuilt(slot: str, r: dict, c: float) -> str:
+        """The refusal for a slot that had to build at cap ``c`` (the
+        requested LOW, or the one flying) and did not (_rl_pwm_cap_build)."""
+        from .rl_library import LOW_LABELS
+
+        label = LOW_LABELS.get(slot, slot)
+        if r["kind"] == "skip":
+            return (f"{label} cannot fly at cap {c:g}: it holds no follower and "
+                    f"names no export to build ({r['why']})")
+        if r["kind"] == "banned":
+            return (f"{label} cannot fly {r['name']} at cap {c:g}: {r['why']} — a "
+                    f"cap change never makes a banned export newly available")
+        return f"{label} cannot fly {r['name']} at cap {c:g}: {r['why']}"
+
+    def _rl_pwm_cap_build(self, slot: str, c: float, cfg2, wall: str) -> dict:
+        """ONE pwm slot built at transport cap ``c`` for set_rl_pwm_cap —
+        nothing committed, nothing logged (the build's own lines come back in
+        "lines"). The export: the HELD follower's policy_dir, else the live
+        cfg.<slot>.policy_dir (_rl_launch_dir). Returns one of
+          {"kind": "ok", "name", "new", "lines", "prov"}
+          {"kind": "fail", "name", "why"}   — the build raised, the bytes
+              changed across it (set_rl_policy's TOCTOU rule) or could not be
+              read, a held follower names no dir, a held follower whose
+              record carries no ban now hashes as banned, or (review D4,
+              2026-11-02) the slot's export cannot be PROVEN to be the
+              network it holds: the bytes hash differently from the id
+              recorded when it was loaded / picked, or a held follower's
+              record has no id (not hashed at launch) — a cap change NEVER
+              swaps the network; picking it again (…) flies new files;
+          {"kind": "banned", "name", "why"} — an EMPTY slot whose export is
+              on the flight ban: never built (a cap change never makes a
+              banned export newly available; a HELD launch-named banned
+              follower IS rebuilt — the status quo — and keeps its record's
+              "no_fly");
+          {"kind": "skip", "why"}           — an empty slot with no export
+              (rl_pwm_7d without policy_dir): it stays as it is.
+        "prov" is the slot's next `_rl_prov` record: the same hashes / id /
+        path, the previous "source" / "at" kept (the export was chosen
+        then), + "rebuilt_at" / "rebuilt_for_cap". An EMPTY slot with no
+        record (its launch build failed: nothing was ever loaded) is built
+        from the live config's dir as a launch would — source
+        "hw_mpc.yaml"."""
+        from .rl_library import (export_id, export_name, no_fly_reason,
+                                 rel_to_repo, resolve_dir)
+
+        attr, _err = self._RL_SLOTS[slot]
+        obj = getattr(self, attr, None)
+        if obj is not None:
+            d = str(getattr(obj, "policy_dir", "") or "")
+            if not d:
+                return {"kind": "fail", "name": "?",
+                        "why": "the held follower names no export dir — it cannot "
+                               "be rebuilt at another cap"}
+            held = self._rl_held(slot, obj)
+        else:
+            try:
+                d = self._rl_launch_dir(slot)
+            except Exception as e:                               # noqa: BLE001
+                return {"kind": "skip", "why": f"{type(e).__name__}: {e}"}
+            if not d:
+                return {"kind": "skip", "why": f"no {slot}.policy_dir"}
+            held = dict(self._rl_prov.get(slot) or {})
+        name = export_name(d)
+        try:
+            before = self._rl_read_export(d)
+        except OSError as e:
+            return {"kind": "fail", "name": name,
+                    "why": f"the export cannot be read ({type(e).__name__}: {e})"}
+        nf = no_fly_reason(name, before[1], before[2])
+        if nf and obj is None:
+            return {"kind": "banned", "name": name, "why": f"{name} is no-fly — {nf}"}
+        if nf and not held.get("no_fly"):
+            return {"kind": "fail", "name": name,
+                    "why": f"{name} is no-fly — {nf} (only a banned LAUNCH export "
+                           f"is rebuilt)"}
+        path = resolve_dir(d)
+        pid = export_id(before[0], before[1])
+        same = bool(held.get("path")) and \
+            os.path.abspath(str(held["path"])) == os.path.abspath(path)
+        if obj is not None or same:
+            # review D4 (2026-11-02): a cap change NEVER swaps the network.
+            # The slot holds (or last held) a follower loaded from these
+            # files; the rebuild reads them again, so they must be the bytes
+            # recorded then — else the new cap would fly a network nobody
+            # loaded or picked (RL_controller rewrites exports in place).
+            old_id = held.get("id") if same else None
+            if not old_id:
+                why = held.get("hash_error") or "no record of its bytes"
+                return {"kind": "fail", "name": name,
+                        "why": f"{name} was not hashed when it was loaded ({why}) — a "
+                               f"cap change cannot prove it rebuilds the same network; "
+                               f"pick it again with … to fly it at this cap"}
+            if str(old_id) != pid:
+                return {"kind": "fail", "name": name,
+                        "why": f"{name}'s files changed since it was loaded (id "
+                               f"{str(old_id)[:8]} → {pid[:8]}) — a cap change never "
+                               f"swaps the network; pick it again with … to fly the "
+                               f"new files"}
+        lines: list = []
+        try:
+            blk = dict((cfg2.rl_pwm if slot == "rl_pwm"
+                        else getattr(cfg2, slot, None)) or {})
+            blk["policy_dir"] = d
+            new = self._rl_class(slot)(dataclasses.replace(cfg2, **{slot: blk}),
+                                       log=lines.append)
+        except Exception as e:                                   # noqa: BLE001
+            return {"kind": "fail", "name": name, "why": f"{type(e).__name__}: {e}"}
+        try:
+            after = self._rl_read_export(d)
+        except OSError:
+            after = None
+        if after is None or after[:2] != before[:2]:
+            return {"kind": "fail", "name": name,
+                    "why": "export files changed while loading"}
+        if same:
+            src, at = held.get("source") or "unknown", held.get("at")
+        else:
+            # an empty slot named only by the live config (its launch build
+            # failed, so no record was ever made): hw_mpc.yaml named it
+            src, at = "hw_mpc.yaml", wall
+        prov = {"name": name, "path": path, "rel": rel_to_repo(d),
+                "obs_sha1": before[0], "npz_sha1": before[1], "id": pid,
+                "source": src, "at": at, "rebuilt_at": wall,
+                "rebuilt_for_cap": float(c)}
+        if same and held.get("no_fly"):
+            prov["no_fly"] = held["no_fly"]
+        return {"kind": "ok", "name": name, "new": new, "lines": lines,
+                "prov": prov}
+
+    def _rl_pwm_cap_mismatch(self, slot: str, r: dict, gw: dict, c: float) -> str:
+        """"" or why slot ``slot``'s follower rebuilt at cap ``c`` (r["new"])
+        would not fly through the window the sink WILL enforce (``gw`` = the
+        snapshot with pwm_cap = min(c, its trained cap)) — set_rl_pwm_cap's
+        step 9. A disagreement on the CAP alone is worded for a cap change
+        (review ui-3): the follower is trained below the new window, so it
+        would fly its trained cap while the sink enforces the window; the
+        remedies are a cap at most that trained cap or another export —
+        never "set the cap to X" (that can be the cap already in force).
+        motor_direction / sigma keep _sink_gate_mismatch's sentence."""
+        from .rl_library import LOW_LABELS
+
+        new = r["new"]
+        why = self._sink_gate_mismatch(gw, new)
+        if not why:
+            return ""
+        fly = self._cap_num(getattr(new, "pwm_cap", None))
+        if fly is None or self._sink_gate_mismatch(dict(gw, pwm_cap=fly), new):
+            return why                    # not (only) the cap: the generic sentence
+        label = LOW_LABELS.get(slot, slot)
+        tr = self._cap_num(getattr(getattr(new, "model", None), "cap_trained", None))
+        w = self._cap_num(gw.get("pwm_cap"))
+        tt = f"{tr:g}" if tr is not None else "?"
+        wt = f"{w:g}" if w is not None else "?"
+        return (f"{label} holds {r['name']}, trained at cap {tt}: at cap {c:g} it would "
+                f"fly {fly:g} while the thruster sink enforces {wt} — keep the cap at "
+                f"{tt} or below, or first pick (…) an export trained at {wt} or above "
+                f"for {label}")
+
+    @Slot(str, float)
+    def set_rl_pwm_cap(self, low: str, cap: float) -> None:
+        """The LOW row's cap ▾ (bus.cmd_rl_pwm_cap, 2026-11-02): fly the pwm
+        transport at |throttle| cap ``cap`` (rl_pwm.pwm_cap) for the rest of
+        the SESSION; ``low`` is the LOW the panel showed. Checked in this
+        order — every refusal through _refuse_rl_pwm_cap, nothing changed:
+          1 an RL_PWM LOW (the cap is the pwm transport's);
+          2 READY; 3 not engaged; 4 no controller CSV open (one record = one
+            cap: the CSV's meta names the follower's) — set_rl_policy's
+            words;
+          5 a finite number in (0, 1] (parse_rl_pwm_block's range);
+          6 EQUAL to the cap in force: a silent no-op (no refusal, no line,
+            no rebuild — the combo re-syncs from the status anyway);
+          7 not above the trained cap of the sink's gate export, when a
+            fresh configured snapshot says it (the sink's window is
+            min(cap, that): a higher number would fly nowhere);
+          8 BOTH pwm slots rebuilt at the new cap on a dataclasses.replace
+            COPY of the live config with a COPIED rl_pwm block (the live cfg
+            is untouched until the commit; _rl_pwm_cap_build). The REQUESTED
+            LOW must build, and so must the LOW whose follower is flying
+            (self.ctrl) — else refused with the build's reason. The OTHER
+            slot: built -> swapped in; failed -> a held follower is DROPPED
+            (exactly what a launch at this cap gives; its *_error says so),
+            an empty one gets the new error; an empty slot naming a banned
+            export is never built. A cap change NEVER swaps the network
+            (review D4): a slot whose files hash differently from the id
+            recorded when it was loaded / picked — or a held follower never
+            hashed — counts as a failed build, so the requested / flying LOW
+            refuses and the other slot drops; picking it again (…) flies
+            new files;
+          9 EVERY rebuilt follower against the sink's snapshot with its
+            window replaced by the one the sink WILL enforce (min(cap, its
+            trained cap)) — _rl_pwm_cap_mismatch: the requested / flying LOW
+            refuses the change, the other slot is dropped like a failed
+            build (review ui-2: its row must never say OK for a follower
+            the sink would refuse at engage); a fresh snapshot without gate
+            facts is refused with the sink's own reason; no snapshot /
+            stale / no trained cap: no verdict (the engage check compares
+            again; never against the OLD window — that would refuse every
+            change).
+        Then the commit — plain assignments: the live cfg.rl_pwm["pwm_cap"],
+        `_pwm_cap_src`, the swapped / dropped followers and records, the
+        per-follower pwm records dropped, `self.ctrl` re-pointed and reset
+        when its slot was swapped (set_rl_policy's steps), both pwm slots'
+        refused-pick notes cleared (review D2: they described followers
+        that are gone), `_pwm_cap_commit` stamped — and only then
+        bus.cmd_pwm_cap to the sink, the held build lines, one line and one
+        (pending) event. No armed mission is lost: refused while engaged."""
+        from .rl_library import LOW_LABELS
+
+        low = low if isinstance(low, str) else str(low)
+        if low not in self._RL_PWM_SLOTS:
+            self._refuse_rl_pwm_cap(f"the cap applies to RL_PWM / RL_PWM_7D only "
+                                    f"(asked for {low!r})")
+            return
+        if self.cfg is None or not self._ready:
+            self._refuse_rl_pwm_cap("controller still building — pick again when READY")
+            return
+        if self.engaged:
+            self._refuse_rl_pwm_cap("not while engaged")
+            return
+        if self._csv is not None:
+            self._refuse_rl_pwm_cap("not while a controller CSV is open (REC) — "
+                                    "stop the recording first")
+            return
+        c = self._cap_num(cap)
+        if c is None or not (0.0 < c <= 1.0):
+            self._refuse_rl_pwm_cap(f"cap must be a number in (0, 1], got {cap!r}")
+            return
+        old = self._rl_pwm_cap_in_force()
+        if old is not None and abs(c - old) <= 1e-9:
+            return
+        g = self._pwm_gate_fresh()
+        ceiling = self._rl_pwm_sink_ceiling(g)
+        if ceiling is not None and c > ceiling + 1e-9:
+            exp = g.get("export") or "(rl_pwm.policy_dir's export)"
+            self._refuse_rl_pwm_cap(f"the thruster sink's export {exp} is trained at "
+                                    f"cap {ceiling:g}: the transport cannot exceed it")
+            return
+        wall = self._rl_wall()
+        try:
+            tblk = dict(getattr(self.cfg, "rl_pwm", None) or {})
+            tblk["pwm_cap"] = c
+            cfg2 = dataclasses.replace(self.cfg, rl_pwm=tblk)
+        except Exception as e:                                   # noqa: BLE001
+            self._refuse_rl_pwm_cap(f"the live config cannot be copied "
+                                    f"({type(e).__name__}: {e})")
+            return
+        res = {slot: self._rl_pwm_cap_build(slot, c, cfg2, wall)
+               for slot in self._RL_PWM_SLOTS}
+        flying = self._rl_slot_of(self.ctrl)
+        must = [low] + ([flying] if flying in self._RL_PWM_SLOTS and flying != low else [])
+        for slot in must:
+            if res[slot]["kind"] != "ok":
+                self._refuse_rl_pwm_cap(self._rl_pwm_cap_unbuilt(slot, res[slot], c))
+                return
+        if g is not None:
+            if "motor_direction" not in g:
+                self._refuse_rl_pwm_cap(self._sink_no_facts_sentence(g))
+                return
+            if ceiling is not None:
+                gw = dict(g, pwm_cap=min(c, ceiling))
+                for slot in must + [s for s in self._RL_PWM_SLOTS if s not in must]:
+                    if res[slot]["kind"] != "ok":
+                        continue
+                    why = self._rl_pwm_cap_mismatch(slot, res[slot], gw, c)
+                    if not why:
+                        continue
+                    if slot in must:
+                        self._refuse_rl_pwm_cap(why)
+                        return
+                    res[slot] = {"kind": "fail", "name": res[slot]["name"], "why": why}
+        selected = []
+        for slot in self._RL_PWM_SLOTS:
+            r = res[slot]
+            if r["kind"] != "ok":
+                continue
+            was = getattr(self, self._RL_SLOTS[slot][0], None)
+            if str(self.cfg.mode) == slot or (was is not None and self.ctrl is was):
+                # set_mode's reset of the follower it selects — BEFORE the
+                # commit, so a reset that raised leaves nothing half-swapped
+                try:
+                    r["new"].reset()
+                except Exception as e:                           # noqa: BLE001
+                    why = f"{type(e).__name__}: {e}"
+                    if slot in must:
+                        self._refuse_rl_pwm_cap(
+                            f"{LOW_LABELS.get(slot, slot)} cannot fly {r['name']} "
+                            f"at cap {c:g}: {why}")
+                        return
+                    res[slot] = {"kind": "fail", "name": r["name"], "why": why}
+                    continue
+                selected.append(slot)
+        had = {slot: getattr(self, self._RL_SLOTS[slot][0], None) is not None
+               for slot in self._RL_PWM_SLOTS}
+        # ---- COMMIT: plain assignments from here on ---------------------------
+        live = getattr(self.cfg, "rl_pwm", None)
+        if isinstance(live, dict):
+            live["pwm_cap"] = c
+        else:
+            setattr(self.cfg, "rl_pwm", {"pwm_cap": c})
+        self._pwm_cap_src = ("panel", wall)
+        for slot in self._RL_PWM_SLOTS:
+            attr, err_attr = self._RL_SLOTS[slot]
+            r = res[slot]
+            if r["kind"] == "ok":
+                setattr(self, attr, r["new"])
+                setattr(self, err_attr, None)
+                self._rl_prov[slot] = r["prov"]
+                self._rl_prov_obj[slot] = r["new"]
+            elif r["kind"] == "fail":
+                if had[slot]:
+                    # DROPPED: what a launch at this cap gives. The record
+                    # stays (the row names the export with its ERROR); no
+                    # object matches it any more.
+                    setattr(self, attr, None)
+                    self._rl_prov_obj.pop(slot, None)
+                setattr(self, err_attr, f"at cap {c:g}: {r['why']}")
+        # the per-follower pwm records (set_rl_policy's reasons: disengaged
+        # state only, and they would describe the PREVIOUS followers)
+        self._pwm_ilk = None
+        self._pwm_last_sent_us = None
+        self._pwm_guard = 0
+        self._pwm_gate_bad_since = None
+        for slot in selected:
+            # set_mode's selection steps (the outgoing follower is discarded
+            # whole) — the OLD-cap network never flies under the new status
+            self.ctrl = res[slot]["new"]
+            self._path_cursor = None
+            self._path_err = (None, None)
+            self._path_depth = 0.0
+            self._path_yaw_fixed = 0.0
+            self._path_heading_follow = False
+        self._rl_pwm_cap_note = None
+        for slot in self._RL_PWM_SLOTS:
+            self._rl_pick_note.pop(slot, None)
+        self._pwm_cap_commit = (c, now())
+        # ---- the sink, then the record ---------------------------------------
+        self.bus.cmd_pwm_cap.emit(float(c))
+        for slot in self._RL_PWM_SLOTS:
+            if res[slot]["kind"] == "ok":
+                for m in res[slot]["lines"]:
+                    self._log("info", m)
+
+        def _g(v) -> str:
+            f = self._cap_num(v)
+            return "?" if f is None else f"{f:g}"
+
+        parts, short, warn = [], [], False
+        for slot in self._RL_PWM_SLOTS:
+            r = res[slot]
+            label = LOW_LABELS.get(slot, slot)
+            if r["kind"] == "ok":
+                new = r["new"]
+                fc = _g(getattr(new, "pwm_cap", None))
+                parts.append(f"{label} {r['name']} flies {fc} (trained "
+                             f"{_g(getattr(getattr(new, 'model', None), 'cap_trained', None))})")
+                short.append(f"{label} {fc}")
+                warn = warn or bool(getattr(new, "caps_below_trained", False))
+            elif r["kind"] == "fail":
+                parts.append(f"{label} → ERROR ({r['why']})")
+                short.append(f"{label} ERROR")
+                if had[slot]:
+                    warn = True
+                    # file only (not a refusal head): the row shows the ERROR
+                    self._log("warn", f"ctrl: {label} unavailable at cap {c:g} — {r['why']}")
+            else:
+                parts.append(f"{label} not built ({r['why']})")
+        old_txt = "?" if old is None else f"{old:g}"
+        self.reason = f"RL_PWM cap {old_txt} → {c:g} (panel; {', '.join(short) or 'no follower'})"
+        self._log("warn" if warn else "info",
+                  f"ctrl: RL_PWM cap {old_txt} → {c:g} (panel): " + "; ".join(parts))
+        # "RL_PWM cap " heads it: logfilter.MISSION_QUIET (the combo shows the
+        # change); the file half waits for the next run folder (pending)
+        self._event(self.reason, pending=True)
+
     @Slot(str)
     def set_mode(self, mode: str) -> None:
         """The panel's LOW combo (bus.cmd_mpc_mode). ``none`` = TELEOP
@@ -6004,8 +7314,12 @@ class MpcWorker(TimerWorker):
                    else getattr(self, "_rl7d_error", None) if mode == "rl_7d"
                    else getattr(self, "_pid7d_error", None) if mode == "pid_7d"
                    else None) or self._setup_error or "not built"
-            self.reason = f"mode {mode} unavailable ({why})"
-            self._log("error", f"ctrl: mode {mode} unavailable ({why})"
+            # review D3 (2026-11-02): a pwm LOW refused for a cap a higher
+            # transport cap cures names the running-GUI remedy when it can
+            # be reached (_rl_cap_hint)
+            hint = self._rl_cap_hint(mode, why)
+            self.reason = f"mode {mode} unavailable ({why}){hint}"
+            self._log("error", f"ctrl: mode {mode} unavailable ({why}){hint}"
                                        f" — staying on {self.cfg.mode}")
             return
         prev = str(self.cfg.mode)
@@ -6821,28 +8135,20 @@ class MpcWorker(TimerWorker):
             return False, "rl_pwm gate status is stale (command sink silent)"
         if not bool(g.get("ok", False)):
             return False, str(g.get("why") or "rl_pwm gate not ok")
-        # The sink built its gate from the export named in the config; this
-        # follower was built from the config too. If the two ever disagree
-        # about the thruster directions, the gate checked the wrong vehicle.
-        want = list(getattr(getattr(self.ctrl, "model", None),
-                            "motor_direction", []) or [])
-        if want and list(g.get("motor_direction") or []) != want:
-            return False, (f"the command sink's gate was built for motor "
-                           f"directions {g.get('motor_direction')}, this "
-                           f"policy expects {want} — restart the station "
-                           f"(the gate is built from rl_pwm.policy_dir's export; "
-                           f"every pwm LOW must expect the same directions)")
-        # ...and about the cap: a sink whose window is tighter than the
-        # follower's cap would refuse every frame (2026-10-10: it refuses,
-        # never clamps), one that is wider would let a bug through.
-        cap = getattr(self.ctrl, "pwm_cap", None)
-        if cap is not None and "pwm_cap" in g and \
-                abs(float(g["pwm_cap"]) - float(cap)) > 1e-9:
-            return False, (f"the command sink caps |throttle| at "
-                           f"{float(g['pwm_cap']):.2f}, this follower at "
-                           f"{float(cap):.2f} — restart the station (both read "
-                           f"rl_pwm.pwm_cap, each clipped to its own export's "
-                           f"pwm_cap_trained: the exports differ)")
+        # The sink built its gate ONCE, at launch, from hw_mpc.yaml
+        # rl_pwm.policy_dir's export; this follower may be another export (the
+        # RL policy picker, 2026-11-01 — set_rl_policy already refuses such a
+        # pick on a fresh snapshot; this is the engage-time and per-tick copy,
+        # same grace path). They must agree on the thruster directions (else
+        # the gate checked the wrong vehicle), on sigma when both know it (the
+        # sink's sign-probe check and the follower's judge one artefact), and
+        # on the cap (a tighter sink window refuses every frame, a wider one
+        # would let a bug through). Until 2026-11-01 both texts said "restart
+        # the station" — but a restart rebuilds the gate from the same file;
+        # the sentence now names the sink's export and the real remedies.
+        why = self._sink_gate_mismatch(g, self.ctrl)
+        if why:
+            return False, (self._sink_cap_unconfirmed(g, self.ctrl) or why)
         return True, "ok"
 
     #: While RL_PWM is the selected follower but not engaged, the worker
@@ -12215,6 +13521,20 @@ class MpcWorker(TimerWorker):
         s.rp_residual_rp_deg = health.get("rp_residual_rp_deg")
         (s.mpc_tune, s.mpc_tune_path, s.mpc_tune_state,
          s.mpc_tune_note) = self._tune_status()
+        # The RL export each RL LOW holds (2026-11-01, the LOW row's policy
+        # widgets). Guarded: this runs on EVERY tick, engaged too, and a fault
+        # in a status row must never cost a flying tick — the row then says
+        # nothing rather than something false.
+        try:
+            s.rl_policy = self._rl_policy_status()
+        except Exception:                                        # noqa: BLE001
+            s.rl_policy = {}
+        # The pwm transport cap (2026-11-02, the LOW row's cap ▾) — same rule:
+        # _rl_pwm_cap_status never raises, and is guarded here once more.
+        try:
+            s.rl_pwm_cap = self._rl_pwm_cap_status()
+        except Exception:                                        # noqa: BLE001
+            s.rl_pwm_cap = {}
         # THE FOLLOW LOOP's own three numbers. The OBJECT's position is
         # deliberately NOT here — it rides `bus.object_fix` in the map frame,
         # because it exists with nothing engaged and must not move on screen
@@ -13696,6 +15016,27 @@ class MpcWorker(TimerWorker):
                                      "thresholds": dict(
                                          (self.cfg.engage.get("per_thruster")
                                           or {}) if self.cfg else {})})
+            # 2026-11-02 (the LOW row's cap ▾): WHO set the transport cap the
+            # follower was built at — hw_mpc.yaml (launch) or the panel —
+            # when, and its value (RECORD BOUNDARY with the follower's own
+            # pwm_cap / pwm_cap_config: a session can now fly two caps). Its
+            # own key (review D1): HwRlPwm7d.meta()'s "pwm_cap_source" string
+            # says which CONFIG KEY the cap comes from and stays untouched.
+            m["pwm_cap_origin"] = self._pwm_cap_origin_meta()
+        rl_low = self._rl_slot_of(self.ctrl)
+        if rl_low is not None and isinstance(m, dict):
+            # 2026-11-01 (RL policy picker): WHICH export flew — content sha1s,
+            # id, source (hw_mpc.yaml | panel), and the sink gate's export on
+            # the pwm transport. Added here, around the follower's own meta(),
+            # whose keys and the golden tests on them are untouched. Guarded:
+            # this meta is written at engage (CSV open) and by REC — a fault in
+            # the record must say so, never cost the engagement.
+            m = dict(m)
+            try:
+                m["rl_policy"] = self._rl_policy_meta(rl_low)
+            except Exception as e:                               # noqa: BLE001
+                m["rl_policy"] = {"low": rl_low, "source": "unknown",
+                                  "error": f"{type(e).__name__}: {e}"}
         return m
 
     def _attitude_axes_meta(self) -> dict:

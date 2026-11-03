@@ -1139,6 +1139,12 @@ class DemoBackend(Backend):
             bus.cmd_mpc_start.connect(self.mpc.start_mission)
             bus.cmd_mpc_mode.connect(self.mpc.set_mode)
             bus.cmd_mpc_tune.connect(self.mpc.set_mpc_tune)
+            # the LOW row's RL policy picker (2026-11-01), as the hardware wires it
+            bus.cmd_rl_policy.connect(self.mpc.set_rl_policy)
+            # ...and its pwm transport cap ▾ (2026-11-02). The demo has no pwm
+            # sink: bus.cmd_pwm_cap (the worker's word to the sink after a
+            # commit) is connected to nothing here, as bus.cmd_pwm is not.
+            bus.cmd_rl_pwm_cap.connect(self.mpc.set_rl_pwm_cap)
             bus.cmd_mpc_scenario.connect(self.mpc.set_scenario)
             bus.cmd_mpc_dump_meta.connect(self.mpc.dump_run_meta)
             bus.cmd_enable.connect(self.mpc.on_enable)

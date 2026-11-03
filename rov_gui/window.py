@@ -57,7 +57,16 @@ boundary (see widgets/teleop.py).
     Esc                ALL STOP + disable commands
                        (also inside the checkpoint picker, which closes —
                         widgets/trajectory.py CkptDialog; the keyboard is
-                        NOT flying while that dialog is up, the joystick is)
+                        NOT flying while that dialog is up, the joystick is;
+                        the same inside the RL policy picker,
+                        widgets/rl_policy_dialog.py, 2026-11-01)
+                       One gap, in every picker: an Esc pressed while it is
+                       still OPENING — after the click, before its dialog
+                       has the focus (tens of ms [예측: review 2026-11-02
+                       F4, no artifact]; the RL picker scans the library
+                       first) — is DROPPED by Qt, no E-STOP: the main window
+                       is already blocked by the modal dialog, which does
+                       not have the key yet. Press Esc again.
 
 The command heartbeat
 ---------------------
@@ -783,6 +792,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self._traj_panel.mpc_tune_pick_requested.connect(
                 self._pick_mpc_tune)
             self._traj_panel.mpc_tune_requested.connect(b.cmd_mpc_tune)
+            # The RL policy picker (2026-11-01, control/rl_library.py): the
+            # same split — the panel asks, the window owns the dialog, the
+            # worker answers (MpcStatus.rl_policy); the pick is (LOW, dir).
+            self._traj_panel.rl_policy_pick_requested.connect(
+                self._pick_rl_policy)
+            self._traj_panel.rl_policy_requested.connect(b.cmd_rl_policy)
+            # ...and the RL_PWM transport cap on the same row (2026-11-02):
+            # no dialog (a NoFocus combo, its open list's Esc = E-STOP in the
+            # panel), but the WINDOW sends it — after the request it re-writes
+            # a running recording's controller.json, like a policy pick.
+            self._traj_panel.rl_pwm_cap_requested.connect(
+                self._request_rl_pwm_cap)
             self._traj_panel.dvl_use_requested.connect(b.cmd_dvl_use)
             self._traj_panel.estimator_requested.connect(b.cmd_estimator)
             # --dvl_pose's TAG FIX switch (2026-10-18): the same request /
@@ -1165,7 +1186,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         The path goes through the panel's `_apply_ckpt_choice`, which shows it
         as a REQUEST and emits it to the bus; whether it loads is the
-        PolicyWorker's answer (PolicyStatus), never assumed here."""
+        PolicyWorker's answer (PolicyStatus), never assumed here.
+
+        One gap (review 2026-11-02, F4; module docstring "Keyboard"): an Esc
+        pressed while the picker is still OPENING — after the click, before
+        the dialog has the focus, tens of ms [예측: no artifact] — reaches
+        nothing. Qt drops it (the main window is already blocked by the
+        modal dialog, which does not have the key yet): no E-STOP, press it
+        again. Deliberately NOT closed with a processEvents() before exec:
+        that would also run every QUEUED input — a click on ENGAGE / START,
+        a WASD press — in the middle of opening the picker, and it would
+        still miss the window manager's map-to-focus delay after show."""
         panel = self._traj_panel
         if panel is None:
             return
@@ -1206,7 +1237,10 @@ class MainWindow(QtWidgets.QMainWindow):
         SAME dialog and keyboard contract as `_pick_policy_ckpt` (keys handed
         back first, Esc closes AND is E-STOP, the joystick keeps flying), on
         config/mpc_tuned_profiles/. Whether it is held is the MpcWorker's
-        answer (MpcStatus.mpc_tune), never assumed here."""
+        answer (MpcStatus.mpc_tune), never assumed here. The same Esc gap
+        too (review 2026-11-02, F4): an Esc pressed while the picker is
+        still OPENING, before its dialog has the focus, is dropped by Qt —
+        no E-STOP, press it again (`_pick_policy_ckpt` says why)."""
         panel = self._traj_panel
         if panel is None:
             return
@@ -1230,6 +1264,116 @@ class MainWindow(QtWidgets.QMainWindow):
             (dlg.exec_ if hasattr(dlg, "exec_") else dlg.exec)()
         finally:
             dlg.deleteLater()
+
+    def _pick_rl_policy(self) -> None:
+        """The RL policy row's `…` button (LOW = RL / RL_7D / RL_PWM /
+        RL_PWM_7D). 2026-11-01, operator request: the export an RL LOW flies
+        is chosen here instead of hw_mpc.yaml <low>.policy_dir before launch
+        (which stays the launch default — a pick is session only).
+
+        The SAME keyboard contract as `_pick_policy_ckpt` (keys handed back
+        first, the log says the keyboard is not flying, Esc anywhere in the
+        dialog closes it AND is E-STOP, the joystick keeps flying), with a
+        table instead of a file dialog (widgets/rl_policy_dialog.py): the
+        station folder and the library data/rl_policies/, deduped by content
+        id. The dialog opens on the LOW the panel shows and its Slot combo
+        may switch to another RL LOW; the slot travels WITH the export dir,
+        so a LOW snap-back under the modal dialog cannot re-route the pick.
+        Whether it flies is the MpcWorker's answer (MpcStatus.rl_policy),
+        never assumed here.
+
+        The Esc gap of `_pick_policy_ckpt` (review 2026-11-02, F4) is widest
+        here: the library scan and the table build run on this thread before
+        the dialog shows, and an Esc pressed while the picker is still
+        OPENING — before its dialog has the focus, tens of ms [예측: no
+        artifact] — is dropped by Qt: no E-STOP, press it again.
+
+        A pick made while REC NAV / REC UI records re-writes that recording's
+        controller.json (review 2026-11-02, F3 — see the comment at the
+        emit)."""
+        panel = self._traj_panel
+        if panel is None:
+            return
+        from .control import rl_library
+        from .widgets.rl_policy_dialog import DEFAULT_SLOT, RlPolicyDialog
+
+        self.teleop.all_stop()
+        self.bus.log.emit("warn", "choosing an RL policy — the keyboard is NOT "
+                                  "flying the vehicle; Esc closes the dialog "
+                                  "AND is E-STOP")
+        try:
+            # On the GUI thread: stat-cached after the first open (rl_library
+            # scan(): hashes only files whose (mtime, size, inode) changed).
+            entries = rl_library.dedupe(rl_library.scan())
+        except Exception as e:                                # noqa: BLE001
+            self.bus.log.emit("error", f"RL policy picker not opened — the "
+                                       f"library could not be listed "
+                                       f"({type(e).__name__}: {e})")
+            return
+        low = panel.current_mode()
+        # the row (and its `…`) shows only for an RL LOW; a direct call on
+        # any other LOW opens on RL_PWM_7D (DEFAULT_SLOT)
+        slot = low if low in rl_library.RL_LOWS else DEFAULT_SLOT
+        # cap_status (2026-11-02): the worker's transport cap as the panel
+        # last saw it — the dialog judges the pwm slots at the cap in force
+        # ({} from a worker that reports none = the rule without the cap)
+        dlg = RlPolicyDialog(self, entries, slot, panel.rl_policy_status(),
+                             cap_status=panel.rl_pwm_cap_status())
+        dlg.estop_requested.connect(self.estop)
+        try:
+            accepted = (dlg.exec_ if hasattr(dlg, "exec_") else dlg.exec)()
+            chosen = dlg.chosen()
+            if accepted and chosen:
+                panel._apply_rl_policy_choice(*chosen)
+                # 2026-11-02 (review F3): a REC NAV / REC UI recording still
+                # running wrote its controller.json at the REC press
+                # (MpcWorker.dump_run_meta), naming the export held THEN,
+                # while what it records from here on flies this pick. Write
+                # it again into each running recording's folder —
+                # dump_run_meta's own rule: a later press "is the more recent
+                # truth". Queued AFTER cmd_rl_policy (emitted just now by
+                # _apply_rl_policy_choice) to the SAME MpcWorker, and Qt
+                # delivers one receiver's queued calls in order, so the dump
+                # sees the post-pick state; after a pick the worker refuses
+                # it records the export still held (a new `written` stamp,
+                # nothing else of the pick). Not on a cancel, not without a
+                # recording. Each engagement's own mpc_*.meta.json
+                # (controller.rl_policy) stays the record of what it flew.
+                self._redump_running_recordings()
+        finally:
+            dlg.deleteLater()
+
+    def _redump_running_recordings(self) -> None:
+        """controller.json again, into each RUNNING recording's folder — the
+        folders the REC buttons gave it (_toggle_nav_record: the
+        nav_<hhmmss> dir; _toggle_record: the UI video's folder), each once.
+        Factored out of `_pick_rl_policy` (review 2026-11-02, F3) for the
+        RL_PWM cap combo (`_request_rl_pwm_cap`, 2026-11-02): the caller
+        emits its request to the MpcWorker FIRST, so this dump — queued to
+        the same worker — runs after it. Nothing without a recording."""
+        dirs = []
+        if self._nav_rec is not None:
+            dirs.append(str(self._nav_rec["dir"]))
+        if (self.recorder.stats.recording
+                and self.recorder.stats.path is not None):
+            dirs.append(str(self.recorder.stats.path.parent))
+        for d in dict.fromkeys(dirs):
+            self.bus.cmd_mpc_dump_meta.emit(d)
+
+    def _request_rl_pwm_cap(self, low: str, cap: float) -> None:
+        """The LOW row's RL_PWM cap combo (2026-11-02, operator request: "…
+        이렇게 gui를 열면 거기서 바꿀 수 있게 해달라는 소리였어. 그리고 캡도"):
+        (the LOW the row showed, the requested transport cap) ->
+        bus.cmd_rl_pwm_cap -> MpcWorker.set_rl_pwm_cap, which rebuilds both
+        pwm followers at that cap and tells the thruster sink, or refuses and
+        says why (MpcStatus.rl_pwm_cap; the panel shows only that). Session
+        only — hw_mpc.yaml rl_pwm.pwm_cap stays the launch default. Then a
+        running recording's controller.json is written again, as after a
+        policy pick (`_redump_running_recordings`; after a refused change it
+        records the cap still in force). No dialog, so no keyboard hand-back:
+        the combo is NoFocus and Esc in its open list is the panel's E-STOP."""
+        self.bus.cmd_rl_pwm_cap.emit(str(low), float(cap))
+        self._redump_running_recordings()
 
     def _on_nav_fix(self, f) -> None:
         self._last_fix = f

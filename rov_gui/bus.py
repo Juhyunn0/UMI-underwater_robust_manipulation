@@ -118,6 +118,11 @@ class DataBus(QObject):
     # cmd_pilot on purpose: the pilot's sticks, the keyboard and every other controller can only ever emit axes, so
     # nothing but the rl_pwm follower can put a raw pulse on the wire. Backends without the transport do not connect it.
     cmd_pwm = Signal(object)          # state.PwmCommand
+    # The pwm TRANSPORT's |throttle| cap changed at runtime (2026-11-02, the LOW row's cap ▾): MpcWorker.set_rl_pwm_cap
+    # -> the command sink's set_pwm_cap, emitted ONLY after the worker COMMITTED the change (both pwm followers rebuilt
+    # at the new rl_pwm.pwm_cap). The sink's window becomes min(cap, its gate export's trained cap); it refuses the
+    # change while policy pulses flow. Backends without the transport do not connect it (the null sink drops it).
+    cmd_pwm_cap = Signal(float)
     cmd_gripper = Signal(float)       # 0 closed .. 1 open
     cmd_lights = Signal(float)        # 0 .. 1
     cmd_estop = Signal()              # zero everything, now
@@ -205,6 +210,24 @@ class DataBus(QObject):
     # mpc_tuned / mpc_tuned_7d — or refuses (engaged, CSV open, bad file) and
     # says why in MpcStatus.mpc_tune_note. The row shows MpcStatus.mpc_tune.
     cmd_mpc_tune = Signal(str)
+    # The RL POLICY pick (2026-11-01, control/rl_library.py): (LOW key, export
+    # dir) from the LOW row's picker. MpcWorker.set_rl_policy rebuilds that
+    # LOW's follower from the export — or refuses (not ready, engaged, CSV
+    # open, not an export, no-fly, thruster-sink gate mismatch, the follower's
+    # own build gates) and says why in MpcStatus.rl_policy[low]["note"].
+    # Session only: hw_mpc.yaml <low>.policy_dir stays the launch default.
+    cmd_rl_policy = Signal(str, str)
+    # The pwm transport CAP (2026-11-02, the LOW row's cap ▾ beside the RL
+    # policy widgets): (the LOW the panel showed, the requested
+    # rl_pwm.pwm_cap). Panel/window -> MpcWorker.set_rl_pwm_cap, which
+    # rebuilds RL_PWM and RL_PWM_7D at that cap — the cap is the TRANSPORT's
+    # one value, both LOWs fly it — or refuses (not an RL_PWM LOW, not ready,
+    # engaged, CSV open, not in (0, 1], above the thruster sink's export's
+    # trained cap, the requested LOW's own build gates, a sink-gate
+    # mismatch) and says why in MpcStatus.rl_pwm_cap["note"]. On a commit
+    # the worker tells the sink over cmd_pwm_cap. Session only: hw_mpc.yaml
+    # rl_pwm.pwm_cap stays the launch default.
+    cmd_rl_pwm_cap = Signal(str, float)
     # Payload keys are PER SHAPE: station {} | line {length} |
     # square {size, size_y} | circle {radius}, all beside {shape, origin_tag,
     # speed}. Merged over hw_mpc.yaml's `square:` block by the worker.

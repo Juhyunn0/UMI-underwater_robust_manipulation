@@ -12,6 +12,7 @@ the 3 s in link.stop() is a timeout, not a sleep).
 """
 from __future__ import annotations
 
+import csv
 import json
 import os
 import re
@@ -1192,6 +1193,126 @@ def test_plus_jog_without_a_home_is_a_piece_not_a_run_to_the_firmware_stop():
         assert abs(jogs[-1][2] * 2.5 - (50.0 - P.LIMIT_EDGE_MM)) < 0.05
         _release(btn)
         assert _released(w)
+
+
+class _Fw1101(SimGantryController):
+    """The real controller on 2026-11-01: VALID X/Y firmware limits, X −33.0..2805.0
+    and Y −10.0..1205.0 mm, Z still factory (stop at 100 mm)
+    (data/20261101/1101_190552_disturb/meta.json, gantry.link_limits_at_connect_mm)."""
+
+    def get_device_parameters(self):
+        from motion_simulator import _SimDeviceParams
+        return _SimDeviceParams(soft_limit_min=(-4, -4, 200),
+                                soft_limit_max=(340, 482, 200))
+
+
+def _njogs(sim):
+    return sum(1 for e in sim.call_log if e[0] == "jog")
+
+
+def _land(w, axis):
+    """The running move lands now (a stand-in for its travel time), the button
+    still held. Under the link's SDK lock: the sim's _advance() rewrites _pos,
+    and jog_single_axis logs the call BEFORE it sets _target."""
+    sim = w._gantry._controller
+    with w._gantry._sdk_lock:
+        sim._pos[int(axis)] = sim._target[int(axis)]
+
+
+def _event_details(w, kind):
+    with open(w._log.dir / "events.csv", newline="") as fh:
+        return [r["detail"] for r in csv.DictReader(fh) if r["kind"] == kind]
+
+
+def test_jog_toward_a_home_further_than_one_press_goes_one_press():
+    """2026-11-01 hardware: X at 636.9, its (fw) + home at 2805.0 — 2168 mm away,
+    more than one press may move (2000 mm). Every +X press was REFUSED with "one
+    press moves at most 2000 mm" and nothing moved. The press budget must
+    SHORTEN the move, not refuse it; the next press goes on to the home."""
+    budget, x0, hi = P.JOG_PRESS_MAX_MM, 636.9, 2805.0
+    x1 = x0 + budget                               # where the first press ends
+    assert budget <= P.JOG_MAX_MOVE_MM, "a cut move must fit the link's per-move cap"
+    assert hi - x0 - P.LIMIT_EDGE_MM > budget >= hi - x1 - P.LIMIT_EDGE_MM, \
+        "scenario: the home is beyond one press, and within the next"
+    with _Window("--speed", "50", builders=_rig(_Fw1101)) as s:
+        w = s.connect_all()
+        w.show()
+        assert w._effective_limits(Axis.X) == (-33.0, hi)
+        _put(w, Axis.X, x0)
+        sim = w._gantry._controller
+        n = _njogs(sim)
+        btn = w._jog_buttons[(Axis.X, 1)]
+        _press(btn)
+        assert w._jog is not None, w.status_label.text()
+        assert w._jog["end"] == hi
+        assert f"stops at {x1:.1f} mm" in w.status_label.text(), w.status_label.text()
+        assert _pump(lambda: _njogs(sim) > n, 2)
+        jogs = [e for e in sim.call_log if e[0] == "jog"][n:]
+        assert len(jogs) == 1 and jogs[0][1] == Axis.X
+        assert abs(jogs[0][2] * 8.25 - budget) < 0.05
+        start = _event_details(w, "jog_start")[-1]
+        assert f"→ {x1:.1f} mm (press budget)" in start, start   # the end is on record
+        _land(w, Axis.X)
+        assert _pump(lambda: w._jog is None, 3), w.status_label.text()
+        assert "one press moves at most" in w.status_label.text()
+        assert _njogs(sim) == n + 1                # no second move in the same press
+        _release(btn)
+        assert _released(w) and not w._latched, w.status_label.text()
+        assert abs(w._gantry.positions_mm()[0] - x1) < 0.1
+        _press(btn)                                # the next press: on to the home
+        assert w._jog is not None, w.status_label.text()
+        assert f"stops at {hi:.1f} mm" in w.status_label.text(), w.status_label.text()
+        assert _pump(lambda: _njogs(sim) > n + 1, 2)
+        jogs = [e for e in sim.call_log if e[0] == "jog"][n:]
+        assert abs(jogs[-1][2] * 8.25 - (hi - x1 - P.LIMIT_EDGE_MM)) < 0.05
+        _release(btn)
+        assert _released(w) and not w._latched, w.status_label.text()
+        _settle(w)
+        _put(w, Axis.X, 2700.0)                    # the − home is as far: same rule
+        n = _njogs(sim)
+        btn = w._jog_buttons[(Axis.X, -1)]
+        _press(btn)
+        assert w._jog is not None, w.status_label.text()
+        assert f"stops at {2700.0 - budget:.1f} mm" in w.status_label.text(), \
+            w.status_label.text()
+        assert _pump(lambda: _njogs(sim) > n, 2)
+        jogs = [e for e in sim.call_log if e[0] == "jog"][n:]
+        assert abs(jogs[0][2] * 8.25 + budget) < 0.05
+        _release(btn)
+        assert _released(w) and not w._latched, w.status_label.text()
+        _settle(w)
+
+
+def test_free_press_pieces_are_cut_to_the_press_budget():
+    """No home on −X: pieces of jog_piece_mm while held; the piece that would pass
+    JOG_PRESS_MAX_MM is SHORTENED to what is left (before 11-01: refused, so a
+    press of 900 mm pieces stopped at 1800 mm). Each piece's end is logged."""
+    with _Window("--speed", "100", "--jog-piece", "900",
+                 builders=_rig(_FactoryLimits)) as s:
+        w = s.connect_all()
+        w.show()
+        sim = w._gantry._controller
+        n = _njogs(sim)
+        btn = w._jog_buttons[(Axis.X, -1)]
+        _press(btn)
+        assert w._jog is not None and w._jog["end"] is None, w.status_label.text()
+        sizes = []
+        for k in range(1, 4):
+            assert _pump(lambda: _njogs(sim) >= n + k or w._jog is None, 6), \
+                w.status_label.text()
+            assert w._jog is not None, (sizes, w.status_label.text())
+            sizes.append(round([e for e in sim.call_log if e[0] == "jog"][n + k - 1][2]
+                               * 8.25, 1))
+            _land(w, Axis.X)
+        assert sizes == [-900.0, -900.0, -(P.JOG_PRESS_MAX_MM - 1800.0)], sizes
+        assert _pump(lambda: w._jog is None, 3), w.status_label.text()
+        assert "one press moves at most" in w.status_label.text()
+        assert _njogs(sim) == n + 3
+        assert abs(w._gantry.positions_mm()[0] + P.JOG_PRESS_MAX_MM) < 0.1
+        cmds = _event_details(w, "jog_cmd")
+        assert len(cmds) == 2 and "(press budget)" in cmds[-1], cmds
+        _release(btn)
+        assert _released(w) and not w._latched, w.status_label.text()
 
 
 def test_reset_is_refused_while_an_axis_still_moves():

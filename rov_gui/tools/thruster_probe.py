@@ -164,7 +164,8 @@ NV_LEVELS_US = (0, 100, 200, 300)
 NV_HOLD_S = 5.0
 #: Leak thresholds and the plant constants that turn a slope into a force / moment:
 #: heave linear damping 15 N*s/m [예측 RL_controller configs/rov_params.yaml hydro.linear_damping_nominal[2]],
-#: pitch/roll stiffness 6.7 N*m/rad [유도 rov_params buoyancy.cob_arm_effective_m 0.05 x 134.6 N].
+#: pitch/roll stiffness 6.7 N*m/rad [유도 rov_params buoyancy.cob_arm_effective_m 0.05 x 134.6 N; since the 2026-10-29
+#: weighing 0.039 x 172.7 N — the arm was re-derived so this pool-measured-range nominal k stays the same].
 D_HEAVE_NSM = 15.0
 K_NOMINAL_NM_PER_RAD = 6.7
 NV_LEAK_N_PER_100US = 5.0
@@ -1521,7 +1522,7 @@ def _nv_regress(steps: list) -> dict:
             flags.append(f"{ax} leak {v:+.2f} N*m per 100 us")
     out["findings"] = flags
     out["conversion_note"] = (f"force = depth-rate slope x {D_HEAVE_NSM} N*s/m [예측 rov_params linear_damping heave]; "
-                              f"moment = angle slope x {K_NOMINAL_NM_PER_RAD} N*m/rad [유도 rov_params cob_arm 0.05 m]")
+                              f"moment = angle slope x {K_NOMINAL_NM_PER_RAD} N*m/rad [유도 rov_params B x cob_arm, nominal k]")
     return out
 
 

@@ -59,15 +59,23 @@ _MODELS = {
         # subtree (incl. jaws); inertia = TOTAL composite about the total COM
         # (Ixz=+0.064, 16.8% of Ixx, DROPPED by the diagonal-inertia constraint --
         # see tools/gen_gripper_variant.py / KNOWN_ISSUES). volume adds the payloads'
-        # displaced water -> net buoyancy ~ -5.7 N (SINKS: real payload, no trim
-        # foam, per the 2026-07-12 decision). Hydro added-mass/damping stay the
-        # heavy set (increments documented in the YAML). C3 placement measured from
-        # the user's Onshape assembly 2026-07-19 (front-bottom, lens forward level).
+        # displaced water. Hydro added-mass/damping stay the heavy set (increments
+        # documented in the YAML). C3 placement measured from the user's Onshape
+        # assembly 2026-07-19 (front-bottom, lens forward level).
+        # MASS AND VOLUME ARE MEASURED (2026-10-29): the real vehicle weighed 17.5 kg in
+        # air with 17.6 kgf buoyancy [측정: data/20261029/1029_mass_buoyancy/README.md,
+        # operator-reported] -> volume 17.6/997 m^3, net buoyancy +0.98 N (floats
+        # slightly; ±~1 N from two 0.1 kg readings). The itemized parts compose only
+        # 13.724 kg / 0.0131815 m^3 (-5.7 N, sinking — the pre-2026-10-29 model); the
+        # residual 3.776 kg / 4.4715 L (ballast, foam, DVL, tether ... not itemized) sits
+        # at the vehicle COM/CB in compute_payload_inertia.py [예측: location unknown], so
+        # the inertia below is still essentially the composed one (+0.5-0.7 %) and the
+        # real one is likely larger. RECORD BOUNDARY: run metas carry plant mass_kg.
         xml="bluerov_heavy_gripper.xml",
         yaml="BlueROVHeavyGripper.yaml",
-        mass=17.5,
-        inertia=(0.38154, 0.77780, 0.70954),
-        volume=0.017653,
+        mass=17.5000,
+        inertia=(0.38352, 0.78337, 0.71314),
+        volume=0.0176530,
         n_thrusters=8,
         fully_actuated=True,
     ),

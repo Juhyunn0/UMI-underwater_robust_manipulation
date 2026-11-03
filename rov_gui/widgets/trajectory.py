@@ -23,6 +23,7 @@ single clicks — a stop must never be gated (teleop.py's rule).
 
 from __future__ import annotations
 
+import copy
 import math
 import os
 import time
@@ -31,6 +32,15 @@ from collections import deque
 from .. import theme
 from ..qt import (QColor, QPainter, QRectF, Qt, QtCore, QtGui, QtWidgets,
                   Signal)
+# Qt-free and stdlib-only (its docstring): RL_LOWS / LOW_LABELS and the export
+# naming the LOW row's RL policy widgets speak (2026-11-01)
+from ..control import rl_library
+# ONE reader of the worker's no-fly / cap note for the LOW row and the picker's
+# held line (2026-11-02, review F1); that module imports nothing from here.
+# PWM_SLOTS / cap_in_force: the two LOWs that share the transport cap, and the
+# one reader of MpcStatus.rl_pwm_cap["cap"] (the LOW row's cap combo, 2026-11-02)
+from .rl_policy_dialog import (CAP_NOTE_MARK, PWM_SLOTS, cap_in_force,
+                               nofly_note_rest)
 from ..control.geometry import (LOW_7D_BASE, LOW_RP_TRACK_BASE,
                                 LOW_RP_TRACK_SIBLING, SHAPES,
                                 policy_rp_tracked, resolve_policy_action_repr)
@@ -2306,6 +2316,59 @@ class ElidingLabel(QtWidgets.QLabel):
                                  max(0, r.width())))
 
 
+class ElidingCombo(QtWidgets.QComboBox):
+    """A combo whose minimum is its CONTENT width — never Qt 5's cached
+    empty-combo minimum — and whose paint elides rather than clips if it is
+    ever forced below that (2026-11-02: the LOW row's RL_PWM cap combo,
+    `rlcap_box`). The LOW row also carries START / HOLD and, for an RL LOW,
+    the policy widgets; with the theme applied a PLAIN combo and its label
+    pushed that row's minimum past row 0's, i.e. the cap would have driven
+    the panel's minimum width (seen offscreen while writing this,
+    2026-11-02; nothing stores the figures, so none is quoted).
+
+    First written with minimum width 0 (it yielded like ElidingLabel). The
+    UI tests found that a box layout takes a deficit EQUALLY from every
+    shrinkable item, so a long policy-row text — a refused cap change's
+    "cap refused: …" face, exactly when the operator looks at the cap —
+    squeezed the combo to an unreadable "0…" or to nothing at the station's
+    sizes, while the long labels kept most of theirs. Now the policy name /
+    state labels after it yield (they elide) and the cap keeps its digits;
+    the station's minimum size does not move (both pinned by
+    rov_gui/tests/test_rl_pwm_cap_panel.py
+    test_the_cap_stays_readable_at_the_station_and_moves_no_minimum).
+
+    Below its minimum (a window manager that ignores minimum sizes) the
+    PAINT elides the current text ("0.2…", "…") instead of clipping it: a
+    clipped "0.25" would read "0.2", another valid cap. The full value
+    stays in currentText() and the tooltip, and the popup list sizes itself
+    to its rows (Qt widens it past a narrow combo)."""
+
+    def minimumSizeHint(self):                      # noqa: N802 - Qt naming
+        # sizeHint, not super().minimumSizeHint(): under AdjustToContents Qt
+        # 5 resets only the size hint when the items change, and keeps the
+        # minimum it computed for the EMPTY combo (wider than "0.25")
+        h = super().minimumSizeHint()
+        return QtCore.QSize(self.sizeHint().width(), h.height())
+
+    def paintEvent(self, _ev) -> None:              # noqa: N802 - Qt naming
+        # QComboBox::paintEvent, with the label's text elided to the style's
+        # own edit-field rect (the sheet's padding and the arrow already out;
+        # -2 for the 1 px inset the base style draws the text with)
+        S = QtWidgets.QStyle
+        p = QtWidgets.QStylePainter(self)
+        p.setPen(self.palette().color(QtGui.QPalette.ColorRole.Text))
+        opt = QtWidgets.QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        p.drawComplexControl(S.ComplexControl.CC_ComboBox, opt)
+        r = self.style().subControlRect(S.ComplexControl.CC_ComboBox, opt,
+                                        S.SubControl.SC_ComboBoxEditField,
+                                        self)
+        opt.currentText = QtGui.QFontMetrics(self.font()).elidedText(
+            opt.currentText, Qt.TextElideMode.ElideRight,
+            max(0, r.width() - 2))
+        p.drawControl(S.ControlElement.CE_ComboBoxLabel, opt)
+
+
 class TrajectoryWindow(QtWidgets.QWidget):
     """Controls + the view, a GRID CELL of the main window (window.py ~450:
     `grid.addWidget(self._traj_panel, 3, 2, 1, 2)` — the bottom row's columns
@@ -2363,6 +2426,27 @@ class TrajectoryWindow(QtWidgets.QWidget):
     # comes back only through MpcStatus.mpc_tune.
     mpc_tune_pick_requested = Signal()
     mpc_tune_requested = Signal(str)
+    # The RL POLICY row (2026-11-01, control/rl_library.py), the tune row's
+    # twin for the four RL LOWs: `…` asks the WINDOW to open the picker
+    # (MainWindow._pick_rl_policy — keyboard hand-back, Esc = E-STOP), and the
+    # pick goes out as (LOW key, export dir) -> bus.cmd_rl_policy ->
+    # MpcWorker.set_rl_policy, which rebuilds that LOW's follower or refuses;
+    # the CONFIRMED export comes back only through MpcStatus.rl_policy. The
+    # key rides WITH the path: the dialog's slot is captured when it is
+    # accepted, so a status-driven LOW snap-back under the modal dialog
+    # cannot re-route the pick to another LOW.
+    rl_policy_pick_requested = Signal()
+    rl_policy_requested = Signal(str, str)
+    # The RL_PWM transport CAP on the same row (2026-11-02, operator request:
+    # "… 이렇게 gui를 열면 거기서 바꿀 수 있게 해달라는 소리였어. 그리고
+    # 캡도"): (the LOW the row showed, the requested rl_pwm.pwm_cap) -> the
+    # WINDOW (MainWindow._request_rl_pwm_cap) -> bus.cmd_rl_pwm_cap ->
+    # MpcWorker.set_rl_pwm_cap, which rebuilds BOTH pwm followers at that cap
+    # (it lives in the transport block they share) and tells the thruster
+    # sink, or refuses and says why; the cap in force comes back only through
+    # MpcStatus.rl_pwm_cap. A combo, not a picker: no dialog to hand the keys
+    # to — NoFocus, the wheel swallowed, Esc in its open list = E-STOP.
+    rl_pwm_cap_requested = Signal(str, float)
     # The DVL button -> bus.cmd_dvl_use -> MpcWorker.set_dvl_use: True = IN
     # (the estimator consumes the DVL's velocity), False = OUT (shadow). The
     # worker may refuse (engaged, CSV open, mount not measured / not proven)
@@ -2476,10 +2560,16 @@ class TrajectoryWindow(QtWidgets.QWidget):
             "7-dim Diffusion Policy's roll/pitch, levels otherwise (K/M on "
             "MANUAL_CONTROL s/t, MANUAL only; refused unless the station was "
             "launched with engage.attitude_axes.enabled + its probe gates). "
-            "RL_7D needs a policy trained with a roll/pitch goal (none yet)\n"
+            "RL_7D needs a policy trained with a roll/pitch goal (none in "
+            "the station folder as of 2026-11-01)\n"
             "RL_PWM_7D: the per-thruster RL policy trained to track roll/pitch — "
             "roll/pitch go out as PULSES (no s/t, no engage.attitude_axes); "
-            "MANUAL + the RL_PWM vehicle gate; tilt ceiling armed")
+            "MANUAL + the RL_PWM vehicle gate; tilt ceiling armed\n"
+            "RL / RL_7D / RL_PWM / RL_PWM_7D: the export each one flies is "
+            "chosen with the policy `…` picker on this row (session only — "
+            "hw_mpc.yaml <low>.policy_dir is the launch default); RL_PWM and "
+            "RL_PWM_7D share the transport cap on the `cap` combo after it "
+            "(rl_pwm.pwm_cap, session only too)")
         self.mode_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.mode_box.currentIndexChanged.connect(self._mode_changed)
 
@@ -2836,6 +2926,95 @@ class TrajectoryWindow(QtWidgets.QWidget):
         self._tune_requested_t = 0.0
         self._tune_css = ""
 
+        # ---- the RL policy widgets (LOW = RL / RL_7D / RL_PWM / RL_PWM_7D) --
+        # 2026-11-01, operator request: "rl_7d_pwm 여러 개를 훈련해 왔다. GUI
+        # 켜기 전에 hw_mpc.yaml 에서 policy_dir 을 정하는 대신 GUI 에서 바로
+        # 바꾸고 싶다." The tune row's pattern, on the LOW row for the same
+        # height reason (no new row; it never shows together with the tune
+        # widgets — TUNE_LOWS and RL_LOWS are disjoint): name = the export the
+        # WORKER holds for the current LOW's slot (MpcStatus.rl_policy; "→ name"
+        # while a pick is in flight), state = OK / WARN (flies below its
+        # trained cap) / NO-FLY (banned from flight — a launch config named
+        # it; FAIL red, 2026-11-02, review F1) / ERROR (the LOW has no
+        # follower) or the worker's refusal for a few seconds. The dialog
+        # (widgets/rl_policy_dialog.py)
+        # belongs to the window. Display names come from rl_library.export_name,
+        # never os.path.basename: every raw RL_controller export ends in
+        # ".../exported", which would label them all "exported".
+        self.lbl_rlpol = QtWidgets.QLabel("policy")
+        self.lbl_rlpol.setStyleSheet(f"color:{theme.TEXT_DIM}; font-size:11px;")
+        self.rlpol_name = ElidingLabel("")
+        self.rlpol_name.setStyleSheet(f"color:{theme.TEXT_DIM}; font-size:11px;")
+        self.rlpol_state = ElidingLabel("")
+        self.rlpol_state.setStyleSheet(f"color:{theme.TEXT_DIM}; font-size:11px;")
+        self.btn_rlpol = QtWidgets.QPushButton("…")
+        self.btn_rlpol.setStyleSheet(self._CKPT_BTN_CSS)
+        self.btn_rlpol.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_rlpol.setToolTip(
+            "choose the RL policy export an RL LOW flies (the dialog's Slot "
+            "picks which: RL / RL_7D / RL_PWM / RL_PWM_7D — it opens on this "
+            "LOW). Lists the station folder rov_gui/control/rl_policies/ and "
+            "the library data/rl_policies/ (./c3 rl-policies sync imports new "
+            "RL_controller exports); exports that do not fit the slot or are "
+            "banned from flight are hidden until \"show refused / no-fly\".\n"
+            "The worker rebuilds the follower from the export with every "
+            "build gate, or refuses and says why; refused while engaged or "
+            "while a REC controller CSV is open. Session only — hw_mpc.yaml "
+            "<low>.policy_dir stays the launch default.\n"
+            "While the dialog is up the KEYBOARD is not flying the vehicle "
+            "(Esc closes it AND is E-STOP); the joystick still flies.")
+        self.btn_rlpol.clicked.connect(self.rl_policy_pick_requested)
+        self.rlpol_widgets = (self.lbl_rlpol, self.rlpol_name,
+                              self.rlpol_state, self.btn_rlpol)
+        self._rl_policy: dict = {}      # the last MpcStatus.rl_policy (worker truth)
+        # a pick in flight, until the status answers: (low, path, t, the
+        # slot's refusal note when the pick was sent — None if not refused)
+        self._rlpol_req = None
+        self._rlpol_css = ""
+
+        # ---- the RL_PWM transport cap (LOW = RL_PWM / RL_PWM_7D) -------------
+        # 2026-11-02, operator request: "./c3 gui … --dvl-trust --policy-dr
+        # 이렇게 gui를 열면 거기서 바꿀 수 있게 해달라는 소리였어. 그리고 캡도"
+        # — the export AND the cap, from the running station. rl_pwm.pwm_cap
+        # (hw_mpc.yaml: the launch default) is the |throttle| ceiling both pwm
+        # LOWs SHARE — it lives in the transport block — so ONE combo, after
+        # the policy `…`, serves both. It shows MpcStatus.rl_pwm_cap["cap"],
+        # the cap the WORKER holds, and lists the worker's "choices" (it knows
+        # the thruster sink's trained ceiling); nothing else (honesty rule) —
+        # hidden until the worker reports a cap. A pick is a REQUEST until the
+        # status answers (`_rlpol_req`'s rule, `_rlcap_req`), and only
+        # `activated` — the user's signal; a status sync's blocked
+        # setCurrentIndex never sends one — asks. NoFocus (a focused combo eats
+        # the pilot's keys), the wheel swallowed, Esc in its open list = E-STOP
+        # (eventFilter: the yaw box's rules); a small font rather than a widget
+        # sheet (the yaw box's note: a widget sheet replaces the app sheet).
+        # The LOW row also carries START / HOLD: the label and the combo keep
+        # their width (a plain QLabel; ElidingCombo — the digits are the
+        # point) and the policy name / state labels after them yield (they
+        # elide) — the station's minimum width does not move. A plain label,
+        # not ElidingLabel, since 2026-11-02 (review): a yielding label
+        # shrank exactly when a long face squeezed the row, and slid the
+        # combo along with it (row1 below).
+        self.lbl_rlcap = QtWidgets.QLabel("cap")
+        self.lbl_rlcap.setStyleSheet(f"color:{theme.TEXT_DIM}; font-size:11px;")
+        self.lbl_rlcap.setToolTip(self._RLCAP_TIP)
+        self.rlcap_box = ElidingCombo()
+        self.rlcap_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        cap_font = QtGui.QFont()
+        cap_font.setPointSize(8)
+        self.rlcap_box.setFont(cap_font)
+        # its items are "0.25"-wide: sized by them whenever they are rebuilt
+        self.rlcap_box.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.rlcap_box.setToolTip(self._RLCAP_TIP)
+        self.rlcap_box.activated.connect(self._rlcap_activated)
+        self.rlcap_widgets = (self.lbl_rlcap, self.rlcap_box)
+        self._rl_pwm_cap: dict = {}     # the last MpcStatus.rl_pwm_cap (worker truth)
+        # a cap pick in flight, until the status answers: (low, cap, t, the
+        # cap refusal note showing when it was sent — None if not refused)
+        self._rlcap_req = None
+        self._rlcap_items: tuple = ()   # the values the combo lists, in order
+
         # The last START refusal and when it arrived — see add_status.
         self._ref_msg = ""
         self._ref_t = 0.0
@@ -2908,6 +3087,27 @@ class TrajectoryWindow(QtWidgets.QWidget):
         # mpc_tuned / mpc_tuned_7d — `_refresh_tune_row`)
         for w in self.tune_widgets:
             row1.addWidget(w)
+        # ...and the RL policy in the same place (shown only for the four RL
+        # LOWs — `_refresh_rlpol_row`; never together with the tune widgets),
+        # then, for the two pwm LOWs, the transport cap they share (shown
+        # only once the worker reports one — `_refresh_rlcap_row`, 2026-11-02).
+        # The CONTROLS come first and the policy's name / state labels last,
+        # right before START (2026-11-02, review): the labels' widths follow
+        # their text, and a refused pick or cap change shows a long face for
+        # the worker's ~6 s (RL_PICK_NOTE_S). With the labels first that face
+        # pushed `…` and the cap right, and when it expired they jumped back
+        # and START took the spot the operator was reaching for — one click
+        # engages in a Diffusion Policy session (no hold). Now a face or a
+        # name moves only START's left edge, beside the labels; `…` and the
+        # cap stay put at every width down to the station's minimum. Pinned
+        # by rov_gui/tests/test_rl_pwm_cap_panel.py
+        # test_the_low_row_controls_never_move_with_the_policy_texts.
+        row1.addWidget(self.lbl_rlpol)
+        row1.addWidget(self.btn_rlpol)
+        for w in self.rlcap_widgets:
+            row1.addWidget(w)
+        row1.addWidget(self.rlpol_name)
+        row1.addWidget(self.rlpol_state)
         row1.addWidget(self.btn_start, 1)
         row1.addWidget(self.btn_hold)
         row2 = QtWidgets.QHBoxLayout()
@@ -2965,16 +3165,19 @@ class TrajectoryWindow(QtWidgets.QWidget):
         self._len_shape = None
         # Each combo's popup list -> the combo (Esc = E-STOP, eventFilter).
         self._combo_views = {}
-        for cb in (self.shape_box, self.mode_box, self.yaw_box):
+        for cb in (self.shape_box, self.mode_box, self.yaw_box,
+                   self.rlcap_box):
             view = cb.view()
             view.installEventFilter(self)
             self._combo_views[view] = cb
         self.yaw_box.installEventFilter(self)       # wheel guard
+        self.rlcap_box.installEventFilter(self)     # wheel guard (2026-11-02)
         self.shape_box.currentIndexChanged.connect(self._shape_index_changed)
         self.yaw_box.currentIndexChanged.connect(
             lambda _i: self._emit_scenario())
         self._shape_changed(self.current_shape())
         self._refresh_tune_row()
+        self._refresh_rlpol_row()
 
     # ------------------------------------------------------------- keyboard
     _EDIT_KEYS = frozenset((
@@ -2994,7 +3197,9 @@ class TrajectoryWindow(QtWidgets.QWidget):
         here as the E-STOP it is everywhere else (the CkptFileDialog rule);
         and the yaw box ignores the mouse wheel — a notch over a NoFocus combo
         changes it without a click, and that one flips the heading of the
-        whole mission."""
+        whole mission. The RL_PWM cap box too (2026-11-02): Qt 5's wheel
+        handler EMITS `activated`, the one signal that sends a cap request —
+        a notch would ask the worker to rebuild both pwm followers."""
         kind = ev.type()
         if (kind == QtCore.QEvent.Type.KeyPress
                 and ev.key() == Qt.Key.Key_Escape
@@ -3003,7 +3208,8 @@ class TrajectoryWindow(QtWidgets.QWidget):
             self.estop_requested.emit()
             return True
         if (kind == QtCore.QEvent.Type.Wheel
-                and obj is getattr(self, "yaw_box", None)):
+                and (obj is getattr(self, "yaw_box", None)
+                     or obj is getattr(self, "rlcap_box", None))):
             return True
         if (kind == QtCore.QEvent.Type.KeyPress
                 and obj in getattr(self, "_num_fields", ())):
@@ -3054,6 +3260,7 @@ class TrajectoryWindow(QtWidgets.QWidget):
         self.mode_box.setCurrentIndex(i)
         self.mode_box.blockSignals(False)
         self._refresh_tune_row()
+        self._refresh_rlpol_row()
         # The mission label depends on the LOW level (LOW None changes what
         # START does), and the blocked combo fires nothing — so re-word it
         # here. Without this the window's seeding order (set_mission_defaults
@@ -3072,6 +3279,7 @@ class TrajectoryWindow(QtWidgets.QWidget):
         re-worded here WITHOUT re-sending the scenario."""
         self._refresh_mission_lbl()
         self._refresh_tune_row()
+        self._refresh_rlpol_row()
         key = self.current_mode()
         if key:
             self.mode_requested.emit(key)
@@ -3706,6 +3914,432 @@ class TrajectoryWindow(QtWidgets.QWidget):
         self.btn_tune.setEnabled(not s.engaged
                                  and not getattr(s, "csv_open", False))
 
+    # ------------------------------------------------------- RL policy row
+    # (2026-11-01, control/rl_library.py) — the tune row's twin for the four
+    # RL LOWs. Everything it shows is MpcStatus.rl_policy[<current LOW>] — the
+    # export the WORKER holds for that slot — and nothing else (honesty rule);
+    # a pick is a REQUEST ("→ name") until the status answers.
+
+    def _refresh_rlpol_row(self) -> None:
+        on = self.current_mode() in rl_library.RL_LOWS
+        for w in self.rlpol_widgets:
+            w.setVisible(on)
+        if on:
+            # the row describes the slot it is SHOWN for: a LOW switch (RL ->
+            # RL_PWM) re-renders from the last status at once, never with the
+            # previous slot's export for up to one status period
+            self._render_rlpol()
+        # the cap combo rides this row (2026-11-02): the same LOW switch shows
+        # or hides it, and the same callers (set_mode_default, _mode_changed,
+        # __init__) re-paint it
+        self._refresh_rlcap_row()
+
+    def rl_policy_status(self) -> dict:
+        """The last MpcStatus.rl_policy ({} before any): {slot: {name, path,
+        rel, id, source, state, note, no_fly}} — a copy, so the picker it is
+        handed to (window._pick_rl_policy) cannot edit the panel's truth."""
+        return {k: dict(v) for k, v in self._rl_policy.items()}
+
+    def _apply_rl_policy_choice(self, low: str, path: str) -> None:
+        """A pick from the window's dialog — (slot, export dir), the slot as
+        the DIALOG had it when accepted, which need not be the LOW the row
+        shows. Shown as a REQUEST ("→ name", when it is for the row's LOW)
+        and sent; only MpcStatus.rl_policy makes it the held export. A plain
+        method so tests need no dialog."""
+        low, path = str(low or "").strip(), str(path or "").strip()
+        if not low or not path:
+            return
+        held = self._rl_policy.get(low) or {}
+        # The worker's "refused" lasts ~6 s (its clock, workers.py
+        # _rl_policy_status): a refusal still showing from the PREVIOUS pick
+        # must not end this one's "→ name" at the very next status — only a
+        # refusal with another note does (or 1.5 s, which then shows the
+        # identical refusal of this pick; the DP row's lesson, review
+        # 2026-09-11: an identical refusal is no value change).
+        was = (str(held.get("note") or "") if held.get("state") == "refused"
+               else None)
+        self._rlpol_req = (low, path, time.monotonic(), was)
+        if low == self.current_mode():
+            self._render_rlpol()
+        self.rl_policy_requested.emit(low, path)
+
+    def _set_rl_policy(self, s: MpcStatus) -> None:
+        """Reflect the worker's RL policy truth (called from add_status)."""
+        rp = getattr(s, "rl_policy", None)
+        self._rl_policy = ({str(k): dict(v) for k, v in rp.items()
+                            if isinstance(v, dict)}
+                           if isinstance(rp, dict) else {})
+        req = self._rlpol_req
+        if req is not None:
+            low, path, t, was = req
+            d = self._rl_policy.get(low) or {}
+            held = str(d.get("path") or "")
+            # answered: accepted (the held dir IS the requested one —
+            # rl_library.resolve_dir, the worker's own resolution), refused
+            # (a refusal that is not the one already showing at the pick),
+            # or 1.5 s of silence (the row falls back to the held truth)
+            accepted = bool(held) and (rl_library.resolve_dir(held)
+                                       == rl_library.resolve_dir(path))
+            refused = (d.get("state") == "refused"
+                       and (was is None or str(d.get("note") or "") != was))
+            if accepted or refused or time.monotonic() - t >= 1.5:
+                self._rlpol_req = None
+        if self._rl_policy:
+            self._refresh_rl_unavailable()
+        if self.current_mode() in rl_library.RL_LOWS:
+            self._render_rlpol()
+        self.btn_rlpol.setEnabled(not s.engaged
+                                  and not getattr(s, "csv_open", False))
+
+    def _render_rlpol(self) -> None:
+        """Paint the row for the CURRENT LOW's slot from the last status (and
+        a pick in flight for that slot)."""
+        low = self.current_mode()
+        label = rl_library.LOW_LABELS.get(low, low)
+        d = self._rl_policy.get(low) or {}
+        name = str(d.get("name") or "")
+        st = str(d.get("state") or "")
+        note = str(d.get("note") or "")
+        # "" or the HELD export's flight ban — in every state, a refusal's
+        # included (workers.py _rl_policy_status, 2026-11-02, review F1)
+        nf = str(d.get("no_fly") or "")
+        where = str(d.get("rel") or d.get("path") or "")
+        base_tip = (f"{where or 'no export held'}\nid {d.get('id') or '—'}"
+                    f" · source {d.get('source') or '—'}")
+        req = self._rlpol_req
+        if req is not None and req[0] == low:
+            # A REQUEST, not a fact: the arrow says "asked for", the held
+            # export is untouched until the worker's status replaces it.
+            shown = f"→ {elide_ckpt_name(rl_library.export_name(req[1]))}"
+            tip = f"requested for {label}: {req[1]}"
+        elif not self._rl_policy:
+            shown = "—"
+            tip = ("the worker has not reported which RL exports it holds "
+                   "(yet)")
+        else:
+            shown = elide_ckpt_name(name) if name else "—"
+            tip = base_tip + (f"\n{note}" if note else "")
+            if nf and nf not in note:
+                tip += f"\nNO-FLY: {nf}"        # a refusal note never hides it
+        # setText FIRST: ElidingLabel.setText writes its own tooltip (the text)
+        if self.rlpol_name.text() != shown:
+            self.rlpol_name.setText(shown)
+        if self.rlpol_name.toolTip() != tip:
+            self.rlpol_name.setToolTip(tip)
+        # The cap sentence explains a note that SAYS the export flies below
+        # its trained cap (CAP_NOTE_MARK) — and nothing else: until 2026-11-02
+        # (review F1) it explained every WARN that way, a banned export's too.
+        rest = nofly_note_rest(note, nf)    # the note minus its ban head
+        cap_why = ("\n\nWARN = it flies, but below the export's trained cap "
+                   "(allow_caps_below_trained) — the run meta records the "
+                   "export") if CAP_NOTE_MARK in rest else ""
+        ban = (f"\nNO-FLY: the held export ({name or '—'}) is banned from "
+               f"flight — {nf}") if nf else ""
+        cap_refused = self._rlcap_refusal()
+        if cap_refused is not None:
+            # 2026-11-02: a REFUSED cap change (the combo beside this label;
+            # the worker's note, its RL_PICK_NOTE_S) answers the pick just
+            # made, so it takes this label over the slot's own face while it
+            # lasts — the combo is back on the cap in force by then; this says
+            # why. The two pwm LOWs only (`_rlcap_refusal`); every face below
+            # is unchanged without one.
+            text = (f"cap refused: {cap_refused}" if cap_refused
+                    else "cap refused")
+            colour = theme.FAIL
+            stip = (f"cap change REFUSED: {cap_refused or '(no reason given)'}"
+                    f"\n(the cap in force is unchanged: {self._rlcap_now()}; "
+                    f"{label} holds {name or '—'}){ban}\n{base_tip}")
+        elif st == "error":
+            text, colour = f"ERROR: {note or 'not built'}", theme.FAIL
+            stip = (f"{text}\n— {label} has no follower; picking an export "
+                    f"that builds gives it one{ban}\n{base_tip}")
+        elif st == "refused":
+            # the refusal keeps the face for its ~6 s — it answers the pick
+            # just made; the held export's ban rides in the tooltip, and the
+            # face is NO-FLY again once the refusal note expires
+            text, colour = (note or "pick refused"), theme.FAIL
+            stip = (f"pick REFUSED: {note}\n(the held export is unchanged: "
+                    f"{name or '—'}){ban}\n{base_tip}")
+        elif nf:
+            # 2026-11-02 (review F1): a banned HELD export — a pick of one is
+            # refused (set_rl_policy), but hw_mpc.yaml can still name one at
+            # launch and it builds — reads NO-FLY in FAIL red. Until then it
+            # read as the amber "WARN" of any export flying below its trained
+            # cap, and the cap note masked the ban: the banned station copies
+            # are trained at cap 1.0 (output.pwm_model.pwm_cap_trained in
+            # rov_gui/control/rl_policies/{pwm10_s1,att7pwm_s0}/obs_spec.json)
+            # while config/hw_mpc.yaml flies rl_pwm.pwm_cap 0.25.
+            text, colour = "NO-FLY", theme.FAIL
+            stip = (f"NO-FLY: {nf}\n— {label} holds an export that is banned "
+                    f"from flight (a launch config can still name one; a pick "
+                    f"of one is refused): pick another with '…' before you "
+                    f"engage"
+                    + (f"\n\n{'WARN: ' if st == 'warn' else ''}{rest}"
+                       if rest else "")
+                    + f"{cap_why}\n{base_tip}")
+        elif st == "warn":
+            text, colour = "WARN", theme.WARN
+            stip = f"WARN: {note}{cap_why}\n{base_tip}"
+        elif st == "ok":
+            text, colour = "OK", theme.OK
+            stip = f"OK — {label} flies this export\n{base_tip}"
+        else:
+            text, colour, stip = "", theme.TEXT_DIM, tip
+        short = text if len(text) <= 48 else text[:47] + "…"
+        if self.rlpol_state.text() != short:
+            self.rlpol_state.setText(short)
+        if self.rlpol_state.toolTip() != stip:
+            self.rlpol_state.setToolTip(stip)
+        css = f"color:{colour}; font-size:11px;"
+        if css != self._rlpol_css:
+            self._rlpol_css = css
+            self.rlpol_state.setStyleSheet(css)
+
+    def _refresh_rl_unavailable(self) -> None:
+        """The DP forecast names an RL *_7d sibling ("; RL_PWM_7D tracks")
+        only when it can fly. The window seeds `_pol_unavailable` once at
+        launch from the YAML (a policy_dir is named — no build, no exists
+        check); once the worker reports a slot, ITS truth replaces the seed
+        for that slot: state "error" = no follower (the launch build failed
+        or nothing was named), and a "refused" pick on a slot that holds
+        nothing is still none. A slot holding a flight-banned export (its
+        "no_fly", 2026-11-02 review) is not named either — its own row says
+        NO-FLY only once that LOW is selected. A slot the worker does not
+        report keeps the seed's verdict. Display only — the worker refuses
+        the LOW itself."""
+        cur = tuple(self._pol_unavailable)
+        out = []
+        for k in ("rl_7d", "rl_pwm_7d"):
+            d = self._rl_policy.get(k)
+            if isinstance(d, dict) and d.get("state"):
+                gone = (d.get("state") == "error"
+                        or (d.get("state") == "refused" and not d.get("path"))
+                        or bool(d.get("no_fly")))
+            else:
+                gone = k in cur
+            if gone:
+                out.append(k)
+        new = tuple(out) + tuple(k for k in cur
+                                 if k not in ("rl_7d", "rl_pwm_7d"))
+        if new != cur:
+            self._pol_unavailable = new
+            self._refresh_mission_lbl()
+
+    # ------------------------------------------------------- RL_PWM cap combo
+    # (2026-11-02) — the policy row's neighbour for the two pwm LOWs: the
+    # transport cap rl_pwm.pwm_cap they share. Everything it shows is
+    # MpcStatus.rl_pwm_cap (and, in its tooltip, the current slot's "cap" /
+    # "cap_trained" from MpcStatus.rl_policy) and nothing else (honesty
+    # rule); a pick is a REQUEST until the status answers.
+
+    #: LOW keys the cap applies to (MpcWorker._RL_PWM_SLOTS)
+    RL_PWM_LOWS = PWM_SLOTS
+    _RLCAP_TIP = (
+        "transport cap rl_pwm.pwm_cap — the |throttle| ceiling RL_PWM and "
+        "RL_PWM_7D share (session only; hw_mpc.yaml stays the launch "
+        "default). A follower flies min(cap, its trained cap); the thruster "
+        "sink enforces the same window. Refused while engaged or while a REC "
+        "controller CSV is open.")
+
+    @staticmethod
+    def _cap_txt(v) -> str:
+        """A cap for the tooltip: '0.25' / '0.5' (:g, the worker's notes'
+        format), '—' for None or anything that is not a finite number."""
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return "—"
+        return f"{v:g}" if math.isfinite(v) else "—"
+
+    def rl_pwm_cap_status(self) -> dict:
+        """The last MpcStatus.rl_pwm_cap ({} before any, and from a worker
+        that reports none): {cap, source, at, choices, ceiling, sink_cap,
+        allow_below, state, note} — a deep copy, so the picker it is handed
+        to (window._pick_rl_policy -> RlPolicyDialog(cap_status=…)) cannot
+        edit the panel's truth."""
+        return copy.deepcopy(self._rl_pwm_cap)
+
+    def _rlcap_cap(self):
+        """The cap in force the worker reported, or None (no status yet, a
+        worker without the cap, or not a finite number)."""
+        return cap_in_force(self._rl_pwm_cap)
+
+    def _rlcap_now(self) -> str:
+        """'0.25 (hw_mpc.yaml)' / '0.50 (panel, <at>)' — the cap in force and
+        where it came from, as the worker says it; '—' before it does."""
+        cap = self._rlcap_cap()
+        if cap is None:
+            return "—"
+        src = str(self._rl_pwm_cap.get("source") or "—")
+        at = str(self._rl_pwm_cap.get("at") or "")
+        return f"{cap:.2f} ({src}{', ' + at if at else ''})"
+
+    def _rlcap_refusal(self):
+        """The worker's cap refusal note — state "refused", for its
+        RL_PICK_NOTE_S after a refused change; "" if it gave none — while the
+        row shows a pwm LOW, else None. `_render_rlpol` shows it on the
+        policy row's state label, over the slot's own face."""
+        if self.current_mode() not in self.RL_PWM_LOWS:
+            return None
+        if self._rl_pwm_cap.get("state") != "refused":
+            return None
+        return str(self._rl_pwm_cap.get("note") or "")
+
+    def _rlcap_values(self, cap: float) -> tuple:
+        """What the combo lists: the worker's "choices" (finite numbers
+        only) plus the cap in force — should a worker ever leave it out, the
+        combo must still be able to SHOW the truth — ascending, deduplicated
+        to 1e-9. Display rounding (:.2f) is the combo's only addition."""
+        ch = self._rl_pwm_cap.get("choices")
+        vals = [float(cap)]
+        for v in (ch if isinstance(ch, (list, tuple)) else ()):
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(f):
+                vals.append(f)
+        vals.sort()
+        out: list = []
+        for v in vals:
+            if not out or abs(v - out[-1]) > 1e-9:
+                out.append(v)
+        return tuple(out)
+
+    def _rlcap_index(self, v) -> int:
+        """The combo row whose value is ``v`` (to 1e-9), or -1."""
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return -1
+        for i, x in enumerate(self._rlcap_items):
+            if abs(x - v) <= 1e-9:
+                return i
+        return -1
+
+    def _refresh_rlcap_row(self) -> None:
+        """Show the combo for RL_PWM / RL_PWM_7D once the worker reports a
+        cap — hidden otherwise: no number the worker did not give — and
+        paint it from the last status."""
+        on = (self.current_mode() in self.RL_PWM_LOWS
+              and self._rlcap_cap() is not None)
+        for w in self.rlcap_widgets:
+            w.setVisible(on)
+        if on:
+            self._render_rlcap()
+
+    def _render_rlcap(self) -> None:
+        """The items (rebuilt only when the worker's choices change), the
+        current row (the cap in force — or the pick in flight, until the
+        status answers) and the tooltip. Signals blocked throughout: a sync
+        REFLECTS, it never commands (and setCurrentIndex never fires
+        `activated` anyway)."""
+        cap = self._rlcap_cap()
+        if cap is None:
+            return
+        box = self.rlcap_box
+        req = self._rlcap_req
+        # An OPEN list is the operator choosing: neither its rows nor its
+        # current row move under the pointer — the next status after it
+        # closes re-syncs both.
+        if not box.view().isVisible():
+            items = self._rlcap_values(cap)
+            box.blockSignals(True)
+            try:
+                if (len(items) != len(self._rlcap_items)
+                        or any(abs(a - b) > 1e-9
+                               for a, b in zip(items, self._rlcap_items))):
+                    box.clear()
+                    for v in items:
+                        box.addItem(f"{v:.2f}", float(v))
+                    self._rlcap_items = items
+                i = self._rlcap_index(req[1]) if req is not None else -1
+                if i < 0:
+                    i = self._rlcap_index(cap)
+                if i >= 0 and box.currentIndex() != i:
+                    box.setCurrentIndex(i)
+            finally:
+                box.blockSignals(False)
+        cs = self._rl_pwm_cap
+        d = self._rl_policy.get(self.current_mode()) or {}
+        tip = (f"{self._RLCAP_TIP}\n"
+               f"now {self._rlcap_now()} · sink window "
+               f"{self._cap_txt(cs.get('sink_cap'))} · this LOW flies "
+               f"{self._cap_txt(d.get('cap'))} (trained "
+               f"{self._cap_txt(d.get('cap_trained'))})")
+        if req is not None:
+            tip += (f"\nrequested {self._cap_txt(req[1])} — the worker has "
+                    f"not answered yet")
+        if cs.get("state") == "refused":
+            tip += f"\nlast change REFUSED: {cs.get('note') or '—'}"
+        if box.toolTip() != tip:
+            box.setToolTip(tip)
+            self.lbl_rlcap.setToolTip(tip)
+
+    def _rlcap_activated(self, i: int) -> None:
+        """`activated` — the operator chose a row in the open list (the only
+        way: the wheel is swallowed, and a status sync's blocked
+        setCurrentIndex fires nothing)."""
+        i = int(i)
+        if not 0 <= i < len(self._rlcap_items):
+            self._refresh_rlcap_row()
+            return
+        self._apply_rl_pwm_cap_choice(self._rlcap_items[i])
+
+    def _apply_rl_pwm_cap_choice(self, cap) -> None:
+        """A cap pick for the LOW the row shows (what `activated` calls; a
+        plain method so tests need no popup). Sent only when it differs from
+        the cap in force — or, while a pick is still in flight, from that
+        pick: choosing the cap in force again then takes the pick back. A
+        REQUEST: the combo shows it until the worker's status answers —
+        accepted (the cap in force IS it), refused (a cap refusal other than
+        the one showing when it was sent), or 1.5 s of silence — and then
+        the worker's truth (`_set_rl_pwm_cap`)."""
+        try:
+            cap = float(cap)
+        except (TypeError, ValueError):
+            self._refresh_rlcap_row()
+            return
+        req = self._rlcap_req
+        asked = req[1] if req is not None else self._rlcap_cap()
+        if asked is not None and abs(cap - asked) <= 1e-9:
+            self._refresh_rlcap_row()               # nothing new to ask
+            return
+        cs = self._rl_pwm_cap
+        # The worker's "refused" lasts ~6 s (RL_PICK_NOTE_S): a refusal still
+        # showing from the PREVIOUS change must not end this request at the
+        # very next status — only a refusal with another note does, or 1.5 s
+        # (the policy row's rule, `_apply_rl_policy_choice`).
+        was = (str(cs.get("note") or "") if cs.get("state") == "refused"
+               else None)
+        low = self.current_mode()
+        self._rlcap_req = (low, cap, time.monotonic(), was)
+        self._refresh_rlcap_row()
+        self.rl_pwm_cap_requested.emit(low, cap)
+
+    def _set_rl_pwm_cap(self, s: MpcStatus) -> None:
+        """The worker's cap truth and the answer to a pick in flight (called
+        from add_status). MpcStatus.rl_pwm_cap is read with getattr and
+        anything but a dict counts as {} (a worker without a config yet, or
+        one that predates the cap): the combo then hides. Enabled iff not
+        engaged and no controller CSV open — btn_rlpol's rule; the worker
+        refuses then too. Paints nothing: add_status paints the policy row
+        and then the combo, with both truths in hand."""
+        cs = getattr(s, "rl_pwm_cap", None)
+        self._rl_pwm_cap = copy.deepcopy(cs) if isinstance(cs, dict) else {}
+        req = self._rlcap_req
+        if req is not None:
+            _low, want, t, was = req
+            have = self._rlcap_cap()
+            accepted = have is not None and abs(have - want) <= 1e-9
+            refused = (self._rl_pwm_cap.get("state") == "refused"
+                       and (was is None
+                            or str(self._rl_pwm_cap.get("note") or "") != was))
+            if accepted or refused or time.monotonic() - t >= 1.5:
+                self._rlcap_req = None
+        self.rlcap_box.setEnabled(not s.engaged
+                                  and not getattr(s, "csv_open", False))
+
     def _three_d_toggled(self, on: bool) -> None:
         self.view.set_three_d(on)
 
@@ -4076,6 +4710,12 @@ class TrajectoryWindow(QtWidgets.QWidget):
         self._set_tagfix(s)
         self._set_noise(s)
         self._set_tune(s)
+        # The RL_PWM cap (2026-11-02): its truth BEFORE the policy row paints
+        # (the row's state label shows a cap refusal over the slot's face),
+        # the combo's paint AFTER it (its tooltip names what the slot flies).
+        self._set_rl_pwm_cap(s)
+        self._set_rl_policy(s)
+        self._refresh_rlcap_row()
         self._engaged = s.engaged
         self._traj_on = s.traj_on
         kind_now = (s.scenario or {}).get("kind")
